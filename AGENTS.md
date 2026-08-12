@@ -1,0 +1,61 @@
+# Agent guide
+
+<!-- toimija:adopt:v1:begin -->
+Read `.toimija/current.md` before reading anything else in this repo; it is your workset contract. Under a toimija session your launch prompt names your live packet — that file supersedes this one.
+<!-- toimija:adopt:v1:end -->
+
+This repo is **ohjaa**, an internal False Systems tool: the deciding layer above
+toimija. Toimija reports facts and refuses to decide (no dispatch, no
+assignment, no network). Ohjaa is where deciding is allowed to live.
+
+Keep changes small and reviewable. The value of this repo is what it refuses to
+become.
+
+## Boundaries
+
+These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
+
+- One executable script, Python standard library only. No third-party
+  dependencies, no packaging, no build step.
+- **Ohjaa decides; toimija reports.** Never reimplement anything toimija or
+  sauma already derives — shell out to their CLIs and consume their `--json`.
+  Ohjaa never speaks the plugin protocol and never compiles a packet.
+- **Derive, never store.** No inbox, no index, no cache, no database, no daemon,
+  no persistence. The configured root list holds paths, never contents.
+- **Cross-repo yes, messaging no.** Permanently refused: an inbox,
+  request/response, task dispatch or handoff between agents, and presence. A
+  message that can go stale without confessing it does not belong here — the
+  admission test from `toimija`'s proposal 0010 applies to this repo too.
+- Anything crossing a repo boundary travels as a **digest anchored to a
+  repository point**, verified by sauma, so it self-invalidates when the tree
+  moves. Nothing is trusted because it was sent.
+- **No network.** Cross-repo is filesystem reads. Cross-machine is a separate,
+  explicit boundary decision — not a side effect of cross-repo.
+- Failed coverage is never rendered as an empty result. If a scan could not
+  look, it says so and exits non-zero.
+
+## Validation
+
+Before claiming completion, run:
+
+```bash
+python3 -m unittest discover -s tests
+python3 -m compileall -q ohjaa
+```
+
+## The policy hook
+
+`choose_seat()` is intentionally unimplemented and belongs to the human. It
+encodes how much friction is worth accepting to prevent collisions between
+agents. Do not implement it on your own initiative; if it blocks you, say so
+and stop.
+
+## Working with other agents
+
+Several agents may work this repo at once. Coordinate through Git and GitHub
+primitives, not assumptions: claim an issue before starting, re-orient with
+`toimija context` and `git fetch` before acting, keep branches small and
+short-lived, and rebase on `origin/main` right before opening or merging.
+
+`ohjaa fleet` will show you live sibling sessions across every repo — including
+siblings whose declared scope reaches into this one.

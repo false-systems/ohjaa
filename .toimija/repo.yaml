@@ -1,0 +1,41 @@
+repo:
+  name: ohjaa
+  role: internal tool — the deciding layer above toimija; seats agents and derives fleet-wide views
+  not:
+    - inbox
+    - message bus
+    - dispatcher
+    - scheduler
+    - index
+    - database
+    - daemon
+    - network client
+
+context:
+  default_budget: 4000
+  important_docs:
+    - README.md
+    - AGENTS.md
+  read_first: []
+  safe_to_ignore:
+    - __pycache__/
+
+validation:
+  replace_inferred: true
+  fast:
+    - python3 -m unittest discover -s tests
+  strict:
+    - python3 -m compileall -q ohjaa
+    - python3 -m unittest discover -s tests
+  full:
+    - python3 -m unittest discover -s tests
+  privileged: []
+
+boundaries:
+  - One executable script, Python standard library only. No third-party dependencies, no packaging, no build step.
+  - Ohjaa decides; toimija reports. Never reimplement anything toimija or sauma already derives — shell out to their CLIs and consume their --json. Ohjaa never speaks the plugin protocol and never compiles a packet.
+  - Derive, never store. No inbox, no index, no cache, no database, no daemon, no persistence. The configured root list holds paths, never contents.
+  - Cross-repo yes, messaging no. Permanently refused - an inbox, request/response, task dispatch or handoff between agents, and presence. A message that can go stale without confessing it does not belong here.
+  - Anything crossing a repo boundary travels as a digest anchored to a repository point, verified by sauma, so it self-invalidates when the tree moves. Nothing is trusted because it was sent.
+  - No network. Cross-repo is filesystem reads. Cross-machine is a separate, explicit boundary decision — not a side effect of cross-repo.
+  - Failed coverage is never rendered as an empty result. If a scan could not look, it says so and exits non-zero.

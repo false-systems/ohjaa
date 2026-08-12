@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""ohjaa — the deciding layer above toimija.
+
+Toimija reports facts and refuses to decide (`.toimija/repo.yaml`: no dispatch,
+no assignment, no network). That refusal is deliberate, so the deciding lives
+out here. ohjaa does three things and stores nothing:
+
+    ohjaa fleet                    who is live, across every repo
+    ohjaa why <digest|token>       provenance walk across every repo
+    ohjaa run <agent> --intent ..  seat an agent safely, then hand off
+
+Everything is derived on demand. There is no inbox, no index, and no cache:
+a scan reflects now, whereas a delivered message is stale the moment the
+sender's world moves. Cross-repo facts travel as digests anchored to a
+repository point, so they self-invalidate exactly like a gate receipt does
+when the tree moves.
+
+Exit codes: 0 ok · 3 refused · 4 scan coverage incomplete.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+REFUSED = 3
+INCOMPLETE = 4
+
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ohjaa" / "roots"
+STALE_AFTER = 90 * 60  # matches toimija's own inactivity rule (proposal 0002)
+
+
+# --------------------------------------------------------------------------
+# Types
+# --------------------------------------------------------------------------
+@dataclass
+class Session:
+    """One session, as toimija reports it. `liveness` is toimija's call, not ours."""
+
+    id: str
+    agent: str
+    worktree: Path
+    branch: str | None
+    intent: str
+    scope: list = field(default_factory=list)
+    liveness: str = "unknown"
+    last_seen_at: int = 0
+
+    @property
+    def idle_seconds(self) -> int:
+        return max(0, int(time.time()) - self.last_seen_at) if self.last_seen_at else -1
+
+
+@dataclass
+class Scan:
+    """One repo's scan result. `error` is not an empty result — see coverage."""
+
+    repo: Path
+    sessions: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+    coverage: str = "available"
+    error: str | None = None
+
+
+@dataclass
+class Request:
+    agent: str
+    intent: str
+    scope: list
+    worktree: Path
+
+
+@dataclass
+class Seat:
+    """The decision. `worktree` is where the agent runs; None means refuse."""
+
+    worktree: Path | None
+    reason: str
+
+
+# --------------------------------------------------------------------------
+# Roots — derived by default, configured only if you insist
+# --------------------------------------------------------------------------
+def default_roots() -> list:
+    """The sibling directories of this repo.
+
+    Zero-config and honest: if you work in ~/projects/toimija, the fleet is
+    ~/projects/*. Storing a root list is the first step toward storing a fleet
+    index, so we avoid it until you actually override.
+    """
+    try:
+        here = Path(git(["rev-parse", "--show-toplevel"]).strip())
+    except subprocess.CalledProcessError:
+        return [Path.cwd()]
+    return [here.parent]
+
+
+def load_roots(explicit: list) -> list:
+    if explicit:
+        return [Path(r).expanduser() for r in explicit]
+    if CONFIG.is_file():
+        roots = []
+        for line in CONFIG.read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                roots.append(Path(line).expanduser())
+        if roots:
+            return roots
+    return default_roots()
+
+
+def toimija_repos(roots: list) -> list:
+    """Every toimija-prepared repo under the roots. A root may itself be one."""
+    found, seen = [], set()
+    for root in roots:
+        candidates = [root] + sorted(p for p in root.glob("*") if p.is_dir())
+        for path in candidates:
+            if (path / ".toimija").is_dir() and path not in seen:
+                seen.add(path)
+                found.append(path)
+    return found
+
+
+# --------------------------------------------------------------------------
+# Scanning
+# --------------------------------------------------------------------------
+def git(args: list, cwd: Path | None = None) -> str:
+    return subprocess.run(
+        ["git"] + args, cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout
+
+
+def scan_repo(repo: Path) -> Scan:
+    """Ask one repo's toimija who is live. Never raises: a failure is a fact."""
+    try:
+        out = subprocess.run(
+            ["toimija", "sessions", "--json"],
+            cwd=repo, capture_output=True, text=True, timeout=20,
+        )
+        if out.returncode != 0:
+            return Scan(repo, coverage="failed", error=(out.stderr.strip().splitlines() or ["exit %d" % out.returncode])[-1])
+        payload = json.loads(out.stdout)
+    except Exception as exc:  # timeout, bad json, missing binary
+        return Scan(repo, coverage="failed", error=f"{type(exc).__name__}: {exc}")
+
+    sessions = [
+        Session(
+            id=s["id"],
+            agent=(s.get("agent") or ["unknown"])[0],
+            worktree=Path(s["worktree"]),
+            branch=s.get("branch"),
+            intent=s.get("intent") or "",
+            scope=s.get("scope") or [],
+            liveness=s.get("liveness", "unknown"),
+            last_seen_at=s.get("last_seen_at") or 0,
+        )
+        for s in payload.get("sessions", [])
+    ]
+    return Scan(
+        repo,
+        sessions=sessions,
+        warnings=payload.get("warnings") or [],
+        coverage=(payload.get("coverage") or {}).get("status", "available"),
+    )
+
+
+def scan_fleet(repos: list) -> list:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(scan_repo, repos))
+
+
+def ago(seconds: int) -> str:
+    if seconds < 0:
+        return "never"
+    if seconds < 90:
+        return f"{seconds}s ago"
+    if seconds < 5400:
+        return f"{seconds // 60}m ago"
+    return f"{seconds // 3600}h ago"
+
+
+# --------------------------------------------------------------------------
+# THE POLICY — this is yours to write.
+# --------------------------------------------------------------------------
+def choose_seat(req: Request, live: list) -> Seat:
+    """Decide where `req` may run, given the live siblings.
+
+    Return `Seat(worktree=path, ...)` to launch there, `Seat(None, ...)` to refuse.
+
+    You get every live session's worktree, branch, declared scope and intent,
+    plus `scopes_intersect()`. `req.worktree` is where the human invoked.
+
+    TODO(yair): implement. The decisions this encodes:
+      1. Same worktree as a live sibling → always refuse? Two agents sharing one
+         working tree share an index; gates stay safe (they snapshot against a
+         repository point) but edits collide. The one case with no upside.
+      2. Different worktree, intersecting scope → refuse, or allow and let the
+         merge-tree proof tier catch a real conflict later?
+      3. Undeclared scope (empty) → `scopes_intersect` treats it as touching
+         everything, so it collides with everyone. Right pressure, or too blunt?
+      4. On refusal, offer a fresh worktree path rather than just saying no?
+      5. Cross-repo scopes are real, not hypothetical: `ohjaa fleet` found a live
+         codex session in vartio declaring scope over /Users/yair/projects/ahti,
+         /ruuma, /jalki, /tapio — and paths outside any repo entirely. A sibling
+         in another repo can therefore declare scope reaching into yours. Does
+         that count as occupancy, and is `run` even the place to check it?
+    """
+    raise NotImplementedError("choose_seat: see the TODO above")
+
+
+def scopes_intersect(a: list, b: list) -> bool:
+    """True when two declared scopes could touch the same files.
+
+    An empty scope is undeclared, not empty — it could be anything, so it
+    intersects everything. Prefix comparison over-reports rather than missing a
+    real collision.
+    """
+    if not a or not b:
+        return True
+    return any(x.startswith(y) or y.startswith(x) for x in a for y in b)
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+def cmd_fleet(args) -> int:
+    repos = toimija_repos(load_roots(args.root))
+    scans = scan_fleet(repos)
+
+    if args.json:
+        print(json.dumps({
+            "repos": [
+                {
+                    "repo": str(s.repo), "coverage": s.coverage, "error": s.error,
+                    "warnings": s.warnings,
+                    "sessions": [
+                        {"id": x.id, "agent": x.agent, "worktree": str(x.worktree),
+                         "branch": x.branch, "intent": x.intent, "scope": x.scope,
+                         "liveness": x.liveness, "idle_seconds": x.idle_seconds}
+                        for x in s.sessions if x.liveness == "active"
+                    ],
+                } for s in scans
+            ],
+        }, indent=2))
+    else:
+        any_live = False
+        for s in sorted(scans, key=lambda s: s.repo.name):
+            live = [x for x in s.sessions if x.liveness == "active"]
+            if not live and not s.error:
+                continue
+            any_live = any_live or bool(live)
+            print(f"{s.repo.name}")
+            if s.error:
+                print(f"    ! scan failed: {s.error}")
+            for x in live:
+                print(f"    {x.agent}  {x.id}")
+                print(f"      branch: {x.branch or 'detached'}   seen: {ago(x.idle_seconds)}"
+                      + ("   IDLE" if x.idle_seconds > STALE_AFTER else ""))
+                print(f"      intent: {x.intent or '(undeclared)'}")
+                if x.scope:
+                    print(f"      scope:  {', '.join(x.scope)}")
+            for w in s.warnings:
+                print(f"    warning: {w}")
+        if not any_live:
+            print("no live sessions")
+
+    failed = [s for s in scans if s.coverage == "failed"]
+    sys.stdout.flush()  # stdout is block-buffered when piped; keep the report in order
+    print(f"\ncoverage: scanned {len(scans) - len(failed)}/{len(scans)} repo(s)", file=sys.stderr)
+    if failed:
+        # joskus-contract rule: an empty result under failed coverage is not
+        # evidence that nothing exists. Say so rather than implying quiet.
+        print("  incomplete — absence here is not evidence of absence:", file=sys.stderr)
+        for s in failed:
+            print(f"    {s.repo.name}: {s.error}", file=sys.stderr)
+        return INCOMPLETE
+    return 0
+
+
+def cmd_why(args) -> int:
+    repos = toimija_repos(load_roots(args.root))
+    cmd = ["sauma", "why", args.query]
+    for r in repos:
+        cmd += ["--root", str(r)]
+    if args.json:
+        cmd.append("--json")
+    print(f"ohjaa: walking {len(repos)} repo(s)", file=sys.stderr)
+    return subprocess.run(cmd).returncode
+
+
+def cmd_run(args) -> int:
+    root = Path(git(["rev-parse", "--show-toplevel"]).strip())
+    req = Request(args.agent, args.intent, args.scope, root)
+
+    scan = scan_repo(root)
+    if scan.coverage == "failed":
+        print(f"ohjaa: cannot read sessions in {root}: {scan.error}", file=sys.stderr)
+        print("ohjaa: refusing to seat blind", file=sys.stderr)
+        return REFUSED
+
+    seat = choose_seat(req, [s for s in scan.sessions if s.liveness == "active"])
+    if seat.worktree is None:
+        print(f"ohjaa: refused — {seat.reason}", file=sys.stderr)
+        return REFUSED
+
+    print(f"ohjaa: {seat.reason}", file=sys.stderr)
+    if args.dry_run:
+        return 0
+
+    if not seat.worktree.exists():
+        git(["worktree", "add", "-b", f"agent/{seat.worktree.name}",
+             str(seat.worktree), args.base], cwd=root)
+
+    cmd = ["toimija", "run", "--intent", req.intent]
+    for path in req.scope:
+        cmd += ["--scope", path]
+    cmd += ["--", req.agent]
+    os.chdir(seat.worktree)
+    return subprocess.run(cmd).returncode
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="ohjaa", description=__doc__.split("\n")[0])
+    ap.add_argument("--root", action="append", default=[],
+                    help="repeatable; defaults to the config file, else this repo's siblings")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    f = sub.add_parser("fleet", help="who is live, across every repo")
+    f.add_argument("--json", action="store_true")
+    f.set_defaults(fn=cmd_fleet)
+
+    w = sub.add_parser("why", help="provenance walk across every repo")
+    w.add_argument("query", help="digest, token, or artifact id")
+    w.add_argument("--json", action="store_true")
+    w.set_defaults(fn=cmd_why)
+
+    r = sub.add_parser("run", help="seat an agent safely, then hand off to toimija run")
+    r.add_argument("agent")
+    r.add_argument("--intent", required=True)
+    r.add_argument("--scope", action="append", default=[])
+    r.add_argument("--base", default="origin/main")
+    r.add_argument("--dry-run", action="store_true")
+    r.set_defaults(fn=cmd_run)
+
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
