@@ -9,7 +9,7 @@ deciding has to live somewhere else. This is that somewhere.
 ```bash
 ohjaa fleet                        # who is live, across every repo
 ohjaa why <digest|token>           # provenance walk, every root filled in
-ohjaa run claude --intent "…" --scope src/  # admit, then hand off
+ohjaa run claude --intent "…"      # admit, then hand off
 ```
 
 ## What it is
@@ -30,21 +30,20 @@ sauma                    verifies envelopes, walks provenance across repos
 
 ## Two agents, one repo
 
-Give them separate Git worktrees and explicit turf:
+Give them separate Git worktrees:
 
 ```bash
 git worktree add ../project-docs -b agent/docs origin/main
 
 # terminal 1, in the original worktree
-ohjaa run codex --intent "change the parser" --scope src/parser.rs
+ohjaa run codex --intent "change the parser"
 
 # terminal 2, in ../project-docs
-ohjaa run claude --intent "refresh the guide" --scope docs/
+ohjaa run claude --intent "refresh the guide"
 ```
 
-Same repository, separate indexes. If either agent shares a worktree, omits
-its scope, or overlaps a live sibling's scope, Ohjaa refuses to launch it and
-says why.
+Same repository, separate indexes. If an agent tries to share a live sibling's
+worktree, Ohjaa refuses to launch it and says why.
 
 ## Derive, never store
 
@@ -97,9 +96,8 @@ Permanently refused, for the reasons proposal 0010 refused them:
 ## Status
 
 Early, but real: `fleet`, `why`, and `run` work today. Admission is deliberately
-strict: declared scope, free worktree, no overlap with a live sibling. The
-policy is repo-local for now; cross-repo scopes remain visible in `fleet` but do
-not block `run`.
+simple: one live agent per worktree. Separate worktrees can work in the same
+repository without declaring path scopes.
 
 ## Install
 

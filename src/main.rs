@@ -17,7 +17,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use policy::{admit, Request};
+use policy::admit;
 use scan::{ago, scan_fleet, scan_repo, Coverage, Scan};
 
 /// The agent was not admitted.
@@ -66,12 +66,6 @@ enum Cmd {
         /// Why this session exists.
         #[arg(long)]
         intent: String,
-        /// What it expects to touch. Repeatable.
-        #[arg(long, value_name = "PATH")]
-        scope: Vec<String>,
-        /// Base ref for a freshly created worktree.
-        #[arg(long, default_value = "origin/main")]
-        base: String,
         /// Decide and explain, but do not launch.
         #[arg(long)]
         dry_run: bool,
@@ -207,14 +201,8 @@ fn cmd_why(explicit: &[PathBuf], query: &str, json: bool) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
-fn cmd_run(agent: &str, intent: &str, scope: &[String], base: &str, dry_run: bool) -> Result<i32> {
+fn cmd_run(agent: &str, intent: &str, dry_run: bool) -> Result<i32> {
     let root = git_root().context("not inside a Git repository")?;
-    let request = Request {
-        agent: agent.to_string(),
-        intent: intent.to_string(),
-        scope: scope.to_vec(),
-        worktree: root.clone(),
-    };
 
     let scan = scan_repo(&root);
     if scan.coverage == Coverage::Failed {
@@ -228,7 +216,7 @@ fn cmd_run(agent: &str, intent: &str, scope: &[String], base: &str, dry_run: boo
     }
 
     let live: Vec<_> = scan.active().cloned().collect();
-    let admission = admit(&request, &live)?;
+    let admission = admit(&root, &live);
 
     let Some(worktree) = admission.worktree else {
         eprintln!("ohjaa: refused — {}", admission.reason);
@@ -240,26 +228,8 @@ fn cmd_run(agent: &str, intent: &str, scope: &[String], base: &str, dry_run: boo
         return Ok(0);
     }
 
-    if !worktree.exists() {
-        let name = worktree.file_name().unwrap_or_default().to_string_lossy();
-        git(
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &format!("agent/{name}"),
-                &worktree.to_string_lossy(),
-                base,
-            ],
-            Some(&root),
-        )?;
-    }
-
     let mut command = Command::new("toimija");
     command.arg("run").arg("--intent").arg(intent);
-    for path in scope {
-        command.arg("--scope").arg(path);
-    }
     command.arg("--").arg(agent).current_dir(&worktree);
     let status = command.status().context("failed to run toimija")?;
     Ok(status.code().unwrap_or(1))
@@ -273,10 +243,8 @@ fn main() {
         Cmd::Run {
             agent,
             intent,
-            scope,
-            base,
             dry_run,
-        } => cmd_run(agent, intent, scope, base, *dry_run),
+        } => cmd_run(agent, intent, *dry_run),
     };
     match result {
         Ok(code) => std::process::exit(code),

@@ -4,24 +4,9 @@
 //! refusal is the first-class outcome; a worktree is what you get when the
 //! answer is yes.
 
-use std::path::PathBuf;
-
-use anyhow::Result;
+use std::path::{Path, PathBuf};
 
 use crate::scan::Session;
-
-/// What the human is asking to start.
-///
-/// `agent` and `intent` are carried for the policy to use and passed through to
-/// `toimija run`; `admit` itself reads only scope and worktree.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct Request {
-    pub agent: String,
-    pub intent: String,
-    pub scope: Vec<String>,
-    pub worktree: PathBuf,
-}
 
 /// The decision. `worktree` is where the agent runs; `None` is a refusal.
 ///
@@ -49,145 +34,47 @@ impl Admission {
     }
 }
 
-/// True when two declared scopes could touch the same files.
-///
-/// An empty scope is *undeclared*, not empty — it could be anything, so it
-/// intersects everything. Prefix comparison is coarse but honest: it
-/// over-reports rather than missing a real collision.
-///
-pub fn scopes_intersect(a: &[String], b: &[String]) -> bool {
-    if a.is_empty() || b.is_empty() {
-        return true;
-    }
-    a.iter()
-        .any(|x| b.iter().any(|y| x.starts_with(y) || y.starts_with(x)))
-}
-
-/// Admit only declared, non-overlapping work in an unoccupied worktree.
-pub fn admit(request: &Request, live: &[Session]) -> Result<Admission> {
-    if request.scope.is_empty() {
-        return Ok(Admission::refused("declare at least one scope"));
-    }
-
+/// Admit an agent only when its worktree is unoccupied.
+pub fn admit(worktree: &Path, live: &[Session]) -> Admission {
     for sibling in live {
-        if sibling.worktree == request.worktree {
-            return Ok(Admission::refused(format!(
+        if sibling.worktree == worktree {
+            return Admission::refused(format!(
                 "worktree is already used by session {}",
                 sibling.id
-            )));
-        }
-        if scopes_intersect(&request.scope, &sibling.scope) {
-            return Ok(Admission::refused(format!(
-                "scope overlaps session {}",
-                sibling.id
-            )));
+            ));
         }
     }
 
-    // ponytail: admission is repo-local; scan the fleet if cross-repo scopes must block.
-    Ok(Admission::to(
-        request.worktree.clone(),
-        "worktree is free and scope does not overlap a live session",
-    ))
+    Admission::to(worktree.to_path_buf(), "worktree is free")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn scope(paths: &[&str]) -> Vec<String> {
-        paths.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn identical_paths_intersect() {
-        assert!(scopes_intersect(
-            &scope(&["src/gates.rs"]),
-            &scope(&["src/gates.rs"])
-        ));
-    }
-
-    #[test]
-    fn disjoint_paths_do_not() {
-        assert!(!scopes_intersect(
-            &scope(&["src/a.rs"]),
-            &scope(&["src/b.rs"])
-        ));
-    }
-
-    #[test]
-    fn a_directory_contains_its_files() {
-        assert!(scopes_intersect(
-            &scope(&["docs/"]),
-            &scope(&["docs/proposals/0003.md"])
-        ));
-    }
-
-    #[test]
-    fn undeclared_scope_intersects_everything() {
-        assert!(scopes_intersect(&[], &scope(&["src/a.rs"])));
-        assert!(scopes_intersect(&scope(&["src/a.rs"]), &[]));
-    }
-
-    #[test]
-    fn cross_repo_absolute_scope_reaches_in() {
-        assert!(scopes_intersect(
-            &scope(&["/Users/x/projects"]),
-            &scope(&["/Users/x/projects/ahti/PROTOCOL.md"])
-        ));
-    }
-
-    fn request(worktree: &str, paths: &[&str]) -> Request {
-        Request {
-            agent: "claude".into(),
-            intent: "why".into(),
-            scope: scope(paths),
-            worktree: PathBuf::from(worktree),
-        }
-    }
-
-    fn session(worktree: &str, paths: &[&str]) -> Session {
+    fn session(worktree: &str) -> Session {
         Session {
             id: "1-2".into(),
             agent: "codex".into(),
             worktree: PathBuf::from(worktree),
             branch: Some("agent/a".into()),
             intent: "work".into(),
-            scope: scope(paths),
+            scope: Vec::new(),
             liveness: "active".into(),
             idle_seconds: 0,
         }
     }
 
     #[test]
-    fn unsafe_requests_are_refused() {
-        assert!(admit(&request("/tmp/a", &[]), &[])
-            .unwrap()
+    fn occupied_worktree_is_refused() {
+        assert!(admit(Path::new("/tmp/a"), &[session("/tmp/a")])
             .worktree
             .is_none());
-        assert!(admit(
-            &request("/tmp/a", &["src/a.rs"]),
-            &[session("/tmp/a", &["src/b.rs"])]
-        )
-        .unwrap()
-        .worktree
-        .is_none());
-        assert!(admit(
-            &request("/tmp/a", &["src/a.rs"]),
-            &[session("/tmp/b", &["src/"])]
-        )
-        .unwrap()
-        .worktree
-        .is_none());
     }
 
     #[test]
-    fn disjoint_worktrees_and_scopes_are_admitted() {
-        let admission = admit(
-            &request("/tmp/a", &["src/a.rs"]),
-            &[session("/tmp/b", &["src/b.rs"])],
-        )
-        .unwrap();
+    fn separate_worktree_is_admitted() {
+        let admission = admit(Path::new("/tmp/a"), &[session("/tmp/b")]);
         assert_eq!(admission.worktree, Some(PathBuf::from("/tmp/a")));
     }
 }
