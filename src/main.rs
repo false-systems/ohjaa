@@ -6,7 +6,6 @@
 //! out of the way. It never speaks the plugin protocol, never compiles a
 //! packet, and stores nothing.
 
-mod policy;
 mod roots;
 mod scan;
 
@@ -17,10 +16,9 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use policy::admit;
 use scan::{ago, scan_fleet, scan_repo, Coverage, Scan};
 
-/// The agent was not admitted.
+/// The launch was refused.
 const REFUSED: i32 = 3;
 /// At least one repo could not be scanned, so absence proves nothing.
 const INCOMPLETE: i32 = 4;
@@ -59,7 +57,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Admit an agent to a worktree, then hand off to `toimija run`.
+    /// Inspect live siblings, then hand off to `toimija run`.
     Run {
         /// Agent command, e.g. claude / codex.
         agent: String,
@@ -211,26 +209,22 @@ fn cmd_run(agent: &str, intent: &str, dry_run: bool) -> Result<i32> {
             root.display(),
             scan.error.as_deref().unwrap_or("unknown failure")
         );
-        eprintln!("ohjaa: refusing to admit blind");
+        eprintln!("ohjaa: refusing to launch blind");
         return Ok(REFUSED);
     }
 
-    let live: Vec<_> = scan.active().cloned().collect();
-    let admission = admit(&root, &live);
-
-    let Some(worktree) = admission.worktree else {
-        eprintln!("ohjaa: refused — {}", admission.reason);
-        return Ok(REFUSED);
-    };
-
-    eprintln!("ohjaa: {}", admission.reason);
+    let live = scan.active().count();
+    eprintln!("ohjaa: {live} live sibling session(s) in this checkout");
+    for warning in &scan.warnings {
+        eprintln!("ohjaa: warning: {warning}");
+    }
     if dry_run {
         return Ok(0);
     }
 
     let mut command = Command::new("toimija");
     command.arg("run").arg("--intent").arg(intent);
-    command.arg("--").arg(agent).current_dir(&worktree);
+    command.arg("--").arg(agent).current_dir(&root);
     let status = command.status().context("failed to run toimija")?;
     Ok(status.code().unwrap_or(1))
 }

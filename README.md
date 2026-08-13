@@ -9,7 +9,7 @@ deciding has to live somewhere else. This is that somewhere.
 ```bash
 ohjaa fleet                        # who is live, across every repo
 ohjaa why <digest|token>           # provenance walk, every root filled in
-ohjaa run claude --intent "…"      # admit, then hand off
+ohjaa run claude --intent "…"      # inspect siblings, then hand off
 ```
 
 ## What it is
@@ -20,7 +20,7 @@ reads a repository point. It asks the tools that own those things, decides, and
 gets out of the way.
 
 ```
-ohjaa                    admits an agent · derives the fleet view
+ohjaa                    checks coverage · derives the fleet view
  └─ toimija run          packet · session · heartbeat
      ├─ teko  work.v1    ── stdio JSON-RPC ──┐
      └─ kisko worker.v1  ── stdio JSON-RPC ──┘   (repository_point on every call)
@@ -28,22 +28,22 @@ ohjaa                    admits an agent · derives the fleet view
 sauma                    verifies envelopes, walks provenance across repos
 ```
 
-## Two agents, one repo
+## Two agents, one checkout
 
-Give them separate Git worktrees:
+Run both from the repository they will share:
 
 ```bash
-git worktree add ../project-docs -b agent/docs origin/main
-
-# terminal 1, in the original worktree
+# terminal 1
 ohjaa run codex --intent "change the parser"
 
-# terminal 2, in ../project-docs
+# terminal 2, same directory
 ohjaa run claude --intent "refresh the guide"
 ```
 
-Same repository, separate indexes. If an agent tries to share a live sibling's
-worktree, Ohjaa refuses to launch it and says why.
+Each agent gets its own Toimija session and live packet. They still share files
+and Git's index, so Ohjaa reports sibling warnings but does not pretend it can
+prevent edit collisions without scopes or isolation. If Toimija cannot inspect
+the sessions, Ohjaa refuses to launch blind.
 
 ## Derive, never store
 
@@ -95,9 +95,9 @@ Permanently refused, for the reasons proposal 0010 refused them:
 
 ## Status
 
-Early, but real: `fleet`, `why`, and `run` work today. Admission is deliberately
-simple: one live agent per worktree. Separate worktrees can work in the same
-repository without declaring path scopes.
+Early, but real: `fleet`, `why`, and `run` work today. `run` requires complete
+local session coverage, reports live siblings, and then hands the agent to
+Toimija. Existing sessions are facts, not locks.
 
 ## Install
 

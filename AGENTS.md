@@ -44,13 +44,6 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-## The policy hook
-
-`admit()` is intentionally unimplemented and belongs to the human. It
-encodes how much friction is worth accepting to prevent collisions between
-agents. Do not implement it on your own initiative; if it blocks you, say so
-and stop.
-
 ## Working with other agents
 
 Several agents may work this repo at once. Coordinate through Git and GitHub
