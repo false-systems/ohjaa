@@ -9,7 +9,7 @@ deciding has to live somewhere else. This is that somewhere.
 ```bash
 ohjaa fleet                        # who is live, across every repo
 ohjaa why <digest|token>           # provenance walk, every root filled in
-ohjaa run claude --intent "…"      # admit an agent to a worktree, then hand off
+ohjaa run claude --intent "…" --scope src/  # admit, then hand off
 ```
 
 ## What it is
@@ -27,6 +27,24 @@ ohjaa                    admits an agent · derives the fleet view
 
 sauma                    verifies envelopes, walks provenance across repos
 ```
+
+## Two agents, one repo
+
+Give them separate Git worktrees and explicit turf:
+
+```bash
+git worktree add ../project-docs -b agent/docs origin/main
+
+# terminal 1, in the original worktree
+ohjaa run codex --intent "change the parser" --scope src/parser.rs
+
+# terminal 2, in ../project-docs
+ohjaa run claude --intent "refresh the guide" --scope docs/
+```
+
+Same repository, separate indexes. If either agent shares a worktree, omits
+its scope, or overlaps a live sibling's scope, Ohjaa refuses to launch it and
+says why.
 
 ## Derive, never store
 
@@ -78,12 +96,10 @@ Permanently refused, for the reasons proposal 0010 refused them:
 
 ## Status
 
-Early, but real: `fleet` and `why` work today.
-
-`admit()` is **intentionally unimplemented**. It encodes how much friction
-is worth accepting to prevent collisions between agents, and that is a human
-call — so `ohjaa run` refuses with a message pointing at the five decisions it
-needs, and a test guards it against being quietly filled in.
+Early, but real: `fleet`, `why`, and `run` work today. Admission is deliberately
+strict: declared scope, free worktree, no overlap with a live sibling. The
+policy is repo-local for now; cross-repo scopes remain visible in `fleet` but do
+not block `run`.
 
 ## Install
 
