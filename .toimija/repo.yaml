@@ -1,6 +1,6 @@
 repo:
   name: ohjaa
-  role: internal tool — the deciding layer above toimija; seats agents and derives fleet-wide views
+  role: internal tool — the deciding layer above toimija; admits agents to worktrees and derives fleet-wide views
   not:
     - inbox
     - message bus

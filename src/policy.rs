@@ -1,4 +1,8 @@
-//! The seating policy — the one part of this repo that is a human decision.
+//! The admission policy — the one part of this repo that is a human decision.
+//!
+//! Admission answers two things at once: may this agent start, and where. The
+//! refusal is the first-class outcome; a worktree is what you get when the
+//! answer is yes.
 
 use std::path::PathBuf;
 
@@ -8,8 +12,8 @@ use crate::scan::Session;
 
 /// What the human is asking to start.
 ///
-/// Every field is read by `choose_seat` once it is written; until then the
-/// compiler correctly sees them as unused.
+/// Every field is read by `admit` once it is written; until then the compiler
+/// correctly sees them as unused.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Request {
@@ -19,25 +23,28 @@ pub struct Request {
     pub worktree: PathBuf,
 }
 
-/// The decision. `worktree` is where the agent runs; `None` means refuse.
+/// The decision. `worktree` is where the agent runs; `None` is a refusal.
+///
+/// The `reason` is not decoration — it is printed either way, so a refusal
+/// tells the human what to do next and an admission says what it observed.
 #[derive(Debug, Clone)]
-pub struct Seat {
+pub struct Admission {
     pub worktree: Option<PathBuf>,
     pub reason: String,
 }
 
-impl Seat {
-    #[allow(dead_code)] // used once `choose_seat` is written
-    pub fn at(worktree: PathBuf, reason: impl Into<String>) -> Self {
-        Seat {
+impl Admission {
+    #[allow(dead_code)] // used once `admit` is written
+    pub fn to(worktree: PathBuf, reason: impl Into<String>) -> Self {
+        Admission {
             worktree: Some(worktree),
             reason: reason.into(),
         }
     }
 
-    #[allow(dead_code)] // used once `choose_seat` is written
-    pub fn refuse(reason: impl Into<String>) -> Self {
-        Seat {
+    #[allow(dead_code)] // used once `admit` is written
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Admission {
             worktree: None,
             reason: reason.into(),
         }
@@ -50,7 +57,7 @@ impl Seat {
 /// intersects everything. Prefix comparison is coarse but honest: it
 /// over-reports rather than missing a real collision.
 ///
-/// Unused until `choose_seat` is written; it is the tool that function needs.
+/// Unused until `admit` is written; it is the tool that function needs.
 #[allow(dead_code)]
 pub fn scopes_intersect(a: &[String], b: &[String]) -> bool {
     if a.is_empty() || b.is_empty() {
@@ -60,12 +67,12 @@ pub fn scopes_intersect(a: &[String], b: &[String]) -> bool {
         .any(|x| b.iter().any(|y| x.starts_with(y) || y.starts_with(x)))
 }
 
-/// Decide where `request` may run, given the live siblings.
+/// Decide whether `request` may run, and where, given the live siblings.
 ///
-/// Return `Ok(Seat::at(path, why))` to launch there, or `Ok(Seat::refuse(why))`
-/// to decline. You get every live session's worktree, branch, declared scope and
-/// intent, plus [`scopes_intersect`]. `request.worktree` is where the human
-/// invoked.
+/// Return `Ok(Admission::to(path, why))` to launch there, or
+/// `Ok(Admission::refused(why))` to decline. You get every live session's
+/// worktree, branch, declared scope and intent, plus [`scopes_intersect`].
+/// `request.worktree` is where the human invoked.
 ///
 /// TODO(yair): implement. This is deliberately unwritten — it encodes how much
 /// friction is worth accepting to prevent collisions, and you are the one who
@@ -87,9 +94,9 @@ pub fn scopes_intersect(a: &[String], b: &[String]) -> bool {
 ///    `tapio`, and a path inside no repo at all. A sibling in another repo can
 ///    therefore declare scope reaching into yours. Does that count as
 ///    occupancy, and is `run` even the right place to check it?
-pub fn choose_seat(_request: &Request, _live: &[Session]) -> Result<Seat> {
+pub fn admit(_request: &Request, _live: &[Session]) -> Result<Admission> {
     bail!(
-        "choose_seat is unimplemented: the seating policy is a human decision.\n\
+        "admit is unimplemented: the admission policy is a human decision.\n\
          See the TODO in src/policy.rs — it lists the five calls it has to make."
     )
 }
@@ -141,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn choose_seat_is_unimplemented_on_purpose() {
+    fn admit_is_unimplemented_on_purpose() {
         // Guards the human's decision: nobody should quietly fill this in.
         let request = Request {
             agent: "claude".into(),
@@ -149,6 +156,6 @@ mod tests {
             scope: Vec::new(),
             worktree: PathBuf::from("/tmp/r"),
         };
-        assert!(choose_seat(&request, &[]).is_err());
+        assert!(admit(&request, &[]).is_err());
     }
 }

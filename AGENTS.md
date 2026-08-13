@@ -46,7 +46,7 @@ cargo test
 
 ## The policy hook
 
-`choose_seat()` is intentionally unimplemented and belongs to the human. It
+`admit()` is intentionally unimplemented and belongs to the human. It
 encodes how much friction is worth accepting to prevent collisions between
 agents. Do not implement it on your own initiative; if it blocks you, say so
 and stop.

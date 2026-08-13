@@ -17,10 +17,10 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use policy::{choose_seat, Request};
+use policy::{admit, Request};
 use scan::{ago, scan_fleet, scan_repo, Coverage, Scan};
 
-/// The seating request was declined.
+/// The agent was not admitted.
 const REFUSED: i32 = 3;
 /// At least one repo could not be scanned, so absence proves nothing.
 const INCOMPLETE: i32 = 4;
@@ -59,7 +59,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Seat an agent safely, then hand off to `toimija run`.
+    /// Admit an agent to a worktree, then hand off to `toimija run`.
     Run {
         /// Agent command, e.g. claude / codex.
         agent: String,
@@ -223,19 +223,19 @@ fn cmd_run(agent: &str, intent: &str, scope: &[String], base: &str, dry_run: boo
             root.display(),
             scan.error.as_deref().unwrap_or("unknown failure")
         );
-        eprintln!("ohjaa: refusing to seat blind");
+        eprintln!("ohjaa: refusing to admit blind");
         return Ok(REFUSED);
     }
 
     let live: Vec<_> = scan.active().cloned().collect();
-    let seat = choose_seat(&request, &live)?;
+    let admission = admit(&request, &live)?;
 
-    let Some(worktree) = seat.worktree else {
-        eprintln!("ohjaa: refused — {}", seat.reason);
+    let Some(worktree) = admission.worktree else {
+        eprintln!("ohjaa: refused — {}", admission.reason);
         return Ok(REFUSED);
     };
 
-    eprintln!("ohjaa: {}", seat.reason);
+    eprintln!("ohjaa: {}", admission.reason);
     if dry_run {
         return Ok(0);
     }

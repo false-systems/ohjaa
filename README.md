@@ -9,7 +9,7 @@ deciding has to live somewhere else. This is that somewhere.
 ```bash
 ohjaa fleet                        # who is live, across every repo
 ohjaa why <digest|token>           # provenance walk, every root filled in
-ohjaa run claude --intent "…"      # seat an agent safely, then hand off
+ohjaa run claude --intent "…"      # admit an agent to a worktree, then hand off
 ```
 
 ## What it is
@@ -20,7 +20,7 @@ reads a repository point. It asks the tools that own those things, decides, and
 gets out of the way.
 
 ```
-ohjaa                    decides a seat · derives the fleet view
+ohjaa                    admits an agent · derives the fleet view
  └─ toimija run          packet · session · heartbeat
      ├─ teko  work.v1    ── stdio JSON-RPC ──┐
      └─ kisko worker.v1  ── stdio JSON-RPC ──┘   (repository_point on every call)
@@ -80,7 +80,7 @@ Permanently refused, for the reasons proposal 0010 refused them:
 
 Early, but real: `fleet` and `why` work today.
 
-`choose_seat()` is **intentionally unimplemented**. It encodes how much friction
+`admit()` is **intentionally unimplemented**. It encodes how much friction
 is worth accepting to prevent collisions between agents, and that is a human
 call — so `ohjaa run` refuses with a message pointing at the five decisions it
 needs, and a test guards it against being quietly filled in.
