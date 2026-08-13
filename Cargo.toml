@@ -1,0 +1,16 @@
+[package]
+name = "ohjaa"
+version = "0.1.0"
+edition = "2021"
+description = "The deciding layer above toimija — seats agents and derives fleet-wide views."
+license = "MIT"
+
+[[bin]]
+name = "ohjaa"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

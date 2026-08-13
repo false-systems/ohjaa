@@ -14,10 +14,10 @@ ohjaa run claude --intent "…"      # seat an agent safely, then hand off
 
 ## What it is
 
-One script that shells out to `toimija` and `sauma` and stores nothing. It
-never speaks the plugin protocol, never compiles a packet, never reads a
-repository point. It asks the tools that own those things, decides, and gets
-out of the way.
+One small Rust binary that shells out to `toimija` and `sauma` and stores
+nothing. It never speaks the plugin protocol, never compiles a packet, never
+reads a repository point. It asks the tools that own those things, decides, and
+gets out of the way.
 
 ```
 ohjaa                    decides a seat · derives the fleet view
@@ -78,23 +78,23 @@ Permanently refused, for the reasons proposal 0010 refused them:
 
 ## Status
 
-Prototype, Python stdlib only — deliberately, so it stays trivial to change
-while the policy is still being decided. The rest of the fleet is Rust; moving
-ohjaa to Rust is a clean swap once `choose_seat` settles, and is not a decision
-this repo has made yet.
+Early, but real: `fleet` and `why` work today.
 
 `choose_seat()` is **intentionally unimplemented**. It encodes how much friction
-is worth accepting to prevent collisions, and that is a human call. `ohjaa run`
-raises until it is written.
+is worth accepting to prevent collisions between agents, and that is a human
+call — so `ohjaa run` refuses with a message pointing at the five decisions it
+needs, and a test guards it against being quietly filled in.
 
 ## Install
 
 ```bash
-ln -s "$PWD/ohjaa" ~/.local/bin/ohjaa
+cargo install --path .
 ```
 
-## Tests
+## Validation
 
 ```bash
-python3 -m unittest discover -s tests -v
+cargo fmt
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```

@@ -18,21 +18,22 @@ context:
     - AGENTS.md
   read_first: []
   safe_to_ignore:
-    - __pycache__/
+    - target/
 
 validation:
   replace_inferred: true
   fast:
-    - python3 -m unittest discover -s tests
+    - cargo test
   strict:
-    - python3 -m compileall -q ohjaa
-    - python3 -m unittest discover -s tests
+    - cargo fmt --check
+    - cargo clippy --all-targets -- -D warnings
+    - cargo test
   full:
-    - python3 -m unittest discover -s tests
+    - cargo test
   privileged: []
 
 boundaries:
-  - One executable script, Python standard library only. No third-party dependencies, no packaging, no build step.
+  - One Rust crate producing a single `ohjaa` binary. Dependencies stay minimal — anyhow, clap, serde, serde_json — and every addition needs a reason.
   - Ohjaa decides; toimija reports. Never reimplement anything toimija or sauma already derives — shell out to their CLIs and consume their --json. Ohjaa never speaks the plugin protocol and never compiles a packet.
   - Derive, never store. No inbox, no index, no cache, no database, no daemon, no persistence. The configured root list holds paths, never contents.
   - Cross-repo yes, messaging no. Permanently refused - an inbox, request/response, task dispatch or handoff between agents, and presence. A message that can go stale without confessing it does not belong here.

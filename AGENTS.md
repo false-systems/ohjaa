@@ -15,8 +15,8 @@ become.
 
 These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 
-- One executable script, Python standard library only. No third-party
-  dependencies, no packaging, no build step.
+- One Rust crate producing a single `ohjaa` binary. Dependencies stay minimal —
+  `anyhow`, `clap`, `serde`, `serde_json` — and every addition needs a reason.
 - **Ohjaa decides; toimija reports.** Never reimplement anything toimija or
   sauma already derives — shell out to their CLIs and consume their `--json`.
   Ohjaa never speaks the plugin protocol and never compiles a packet.
@@ -39,8 +39,9 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 Before claiming completion, run:
 
 ```bash
-python3 -m unittest discover -s tests
-python3 -m compileall -q ohjaa
+cargo fmt
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
 ## The policy hook
