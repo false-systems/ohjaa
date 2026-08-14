@@ -65,9 +65,15 @@ impl Session {
         self.liveness != "closed"
     }
 
-    /// True when toimija cannot tell "gone" from "quiet" for this session.
+    /// True when this session's occupancy is inferred rather than observed.
+    ///
+    /// Anything that is neither `active` nor `closed`: `stale`, a liveness this
+    /// build does not recognise, or none at all. Matching only `stale` would
+    /// render the others unlabelled and so indistinguishable from an observed
+    /// `active` session — presenting inferred occupancy as observed activity,
+    /// which is the same overclaim this module exists to avoid, mirrored.
     pub fn is_quiet(&self) -> bool {
-        self.liveness == "stale"
+        self.liveness != "active" && self.liveness != "closed"
     }
 }
 
@@ -364,6 +370,25 @@ mod tests {
         let raw = payload(r#"{"id":"1-2","worktree":"/tmp/r","liveness":"suspended"}"#);
         let scan = parse(Path::new(REPO), &raw, 100).unwrap();
         assert!(scan.sessions[0].occupies());
+        assert!(
+            scan.sessions[0].is_quiet(),
+            "an unrecognised verdict is uncertain, and must not render like an observed active one"
+        );
+    }
+
+    #[test]
+    fn a_missing_liveness_is_uncertain_not_active() {
+        let raw = payload(r#"{"id":"1-2","worktree":"/tmp/r"}"#);
+        let scan = parse(Path::new(REPO), &raw, 100).unwrap();
+        assert!(scan.sessions[0].occupies());
+        assert!(scan.sessions[0].is_quiet());
+    }
+
+    #[test]
+    fn an_observed_active_session_is_not_marked_uncertain() {
+        let raw = payload(r#"{"id":"1-2","worktree":"/tmp/r","liveness":"active"}"#);
+        let scan = parse(Path::new(REPO), &raw, 100).unwrap();
+        assert!(!scan.sessions[0].is_quiet());
     }
 
     #[test]
