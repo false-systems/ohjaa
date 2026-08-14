@@ -77,6 +77,19 @@ coverage: scanned 17/18 repo(s)
 `ohjaa fleet` exits `4` when coverage is incomplete. Reporting quiet when you
 could not look is the failure mode this whole stack exists to prevent.
 
+The same rule governs staleness. Toimija reports `stale` both for a session
+whose process is gone and for one that has merely been quiet past its
+threshold — an agent thinking hard for ninety minutes looks exactly like a
+dead one. Ohjaa therefore counts every session that is not `closed` as still
+occupying the checkout, and marks the uncertain ones `stale` rather than
+quietly dropping them. Only `closed` is something Toimija observed rather than
+inferred from silence.
+
+The label says only `stale`; the `seen:` age beside it carries the judgment. A
+session last seen 491 hours ago is almost certainly gone and one last seen 95
+minutes ago is probably thinking, and neither claim is Ohjaa's to make — the
+timestamp is the confession, so the reader decides.
+
 ## What it will never do
 
 Permanently refused, for the reasons proposal 0010 refused them:
@@ -96,8 +109,14 @@ Permanently refused, for the reasons proposal 0010 refused them:
 ## Status
 
 Early, but real: `fleet`, `why`, and `run` work today. `run` requires complete
-local session coverage, reports live siblings, and then hands the agent to
-Toimija. Existing sessions are facts, not locks.
+local session coverage, reports every sibling that may still be working the
+checkout, and then hands the agent to Toimija. Existing sessions are facts,
+not locks.
+
+Known gap: nothing serializes the window between reading the sessions and
+launching, so two `ohjaa run` invocations started at the same instant each
+report the other as absent. Closing that needs a lock, which is stored state
+— a boundary decision, not a bug fix.
 
 ## Install
 
