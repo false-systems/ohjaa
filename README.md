@@ -113,10 +113,21 @@ local session coverage, reports every sibling that may still be working the
 checkout, and then hands the agent to Toimija. Existing sessions are facts,
 not locks.
 
-Known gap: nothing serializes the window between reading the sessions and
-launching, so two `ohjaa run` invocations started at the same instant each
-report the other as absent. Closing that needs a lock, which is stored state
-— a boundary decision, not a bug fix.
+The sibling count is a reading taken just before launch, not a standing fact:
+nothing serializes the window between the scan and `toimija run`, so two
+invocations started in the same instant each miss the other. That is inherent
+to deriving rather than locking, and it is deliberately not being fixed.
+
+A lock would be stored state — the one thing this repo refuses — and it would
+buy nothing, because nothing is gated on the count. Ohjaa reports who is here
+and launches either way; a number that is milliseconds stale changes no
+decision. Serializing launches to make an advisory line exact, in a tool whose
+whole claim is that sessions are facts and not locks, would be the tail
+wagging the dog. The line says "at launch" so it does not sound like a
+guarantee it cannot give.
+
+If a future policy ever *does* gate on occupancy, this stops being cosmetic
+and the lock becomes a real boundary decision. It is not one today.
 
 ## Install
 

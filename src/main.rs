@@ -216,7 +216,12 @@ fn cmd_run(agent: &str, intent: &str, dry_run: bool) -> Result<i32> {
     // is the one thing this line must never do.
     let live = scan.occupying().count();
     let quiet = scan.occupying().filter(|s| s.is_quiet()).count();
-    eprintln!("ohjaa: {live} sibling session(s) in this checkout");
+    // "at launch", because this is a reading taken a moment ago, not a
+    // standing fact: a session starting in the same instant will not be in it.
+    // Nothing is gated on the number, so a slightly stale count costs nothing —
+    // but a line that sounds like a guarantee it cannot give is the habit this
+    // whole tool exists to avoid.
+    eprintln!("ohjaa: {live} sibling session(s) in this checkout at launch");
     if quiet > 0 {
         eprintln!(
             "ohjaa: {quiet} of them stale — toimija cannot tell a finished agent \
