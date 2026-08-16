@@ -23,9 +23,6 @@ const REFUSED: i32 = 3;
 /// At least one repo could not be scanned, so absence proves nothing.
 const INCOMPLETE: i32 = 4;
 
-/// Matches toimija's own inactivity rule (its proposal 0002).
-const IDLE_AFTER_SECONDS: i64 = 90 * 60;
-
 #[derive(Parser)]
 #[command(
     name = "ohjaa",
@@ -140,7 +137,7 @@ fn cmd_fleet(explicit: &[PathBuf], json: bool) -> Result<i32> {
 
     let mut any_live = false;
     for scan in &scans {
-        let live: Vec<_> = scan.active().collect();
+        let live: Vec<_> = scan.occupying().collect();
         if live.is_empty() && scan.error.is_none() {
             continue;
         }
@@ -158,11 +155,12 @@ fn cmd_fleet(explicit: &[PathBuf], json: bool) -> Result<i32> {
                 "      branch: {}   seen: {}{}",
                 session.branch.as_deref().unwrap_or("detached"),
                 ago(session.idle_seconds),
-                if session.idle_seconds > IDLE_AFTER_SECONDS {
-                    "   IDLE"
-                } else {
-                    ""
-                }
+                // Just the label. Asserting "may still be running" next to
+                // `seen: 486h ago` would be its own overclaim; the age is the
+                // evidence and the reader can judge it. Proposal 0010's rule —
+                // a signal belongs only if it cannot go stale without
+                // confessing it — and the timestamp is the confession.
+                if session.is_quiet() { "   stale" } else { "" }
             );
             let intent = if session.intent.is_empty() {
                 "(undeclared)"
@@ -213,8 +211,23 @@ fn cmd_run(agent: &str, intent: &str, dry_run: bool) -> Result<i32> {
         return Ok(REFUSED);
     }
 
-    let live = scan.active().count();
-    eprintln!("ohjaa: {live} live sibling session(s) in this checkout");
+    // Counts every session that may still be working here, not just the ones
+    // toimija currently calls active: reporting an occupied checkout as empty
+    // is the one thing this line must never do.
+    let live = scan.occupying().count();
+    let quiet = scan.occupying().filter(|s| s.is_quiet()).count();
+    // "at launch", because this is a reading taken a moment ago, not a
+    // standing fact: a session starting in the same instant will not be in it.
+    // Nothing is gated on the number, so a slightly stale count costs nothing —
+    // but a line that sounds like a guarantee it cannot give is the habit this
+    // whole tool exists to avoid.
+    eprintln!("ohjaa: {live} sibling session(s) in this checkout at launch");
+    if quiet > 0 {
+        eprintln!(
+            "ohjaa: {quiet} of them stale — toimija cannot tell a finished agent \
+             from a quiet one; `toimija sessions` shows their last heartbeat"
+        );
+    }
     for warning in &scan.warnings {
         eprintln!("ohjaa: warning: {warning}");
     }

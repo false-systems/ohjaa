@@ -48,8 +48,32 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn is_active(&self) -> bool {
-        self.liveness == "active"
+    /// Whether this session may still be working the checkout.
+    ///
+    /// Deliberately *not* `is_active`. Toimija's `stale` conflates two very
+    /// different situations — its own rule is
+    /// `if pid == Dead || idle > threshold { Stale }`, and it has a test named
+    /// `open_marker_past_threshold_is_stale_even_if_pid_alive`. So an agent
+    /// thinking hard for ninety minutes is reported exactly like one whose
+    /// process is gone.
+    ///
+    /// Only `closed` means the session is finished, because only `closed` is
+    /// something toimija observed rather than inferred from silence. Treating
+    /// stale as absent is how a checkout gets reported empty while someone is
+    /// still working in it.
+    pub fn occupies(&self) -> bool {
+        self.liveness != "closed"
+    }
+
+    /// True when this session's occupancy is inferred rather than observed.
+    ///
+    /// Anything that is neither `active` nor `closed`: `stale`, a liveness this
+    /// build does not recognise, or none at all. Matching only `stale` would
+    /// render the others unlabelled and so indistinguishable from an observed
+    /// `active` session — presenting inferred occupancy as observed activity,
+    /// which is the same overclaim this module exists to avoid, mirrored.
+    pub fn is_quiet(&self) -> bool {
+        self.liveness != "active" && self.liveness != "closed"
     }
 }
 
@@ -74,8 +98,9 @@ impl Scan {
         }
     }
 
-    pub fn active(&self) -> impl Iterator<Item = &Session> {
-        self.sessions.iter().filter(|s| s.is_active())
+    /// Every session that may still be working here. See [`Session::occupies`].
+    pub fn occupying(&self) -> impl Iterator<Item = &Session> {
+        self.sessions.iter().filter(|s| s.occupies())
     }
 }
 
@@ -269,7 +294,7 @@ mod tests {
         assert_eq!(session.agent, "codex");
         assert_eq!(session.branch.as_deref(), Some("main"));
         assert_eq!(session.idle_seconds, 10);
-        assert!(session.is_active());
+        assert!(session.occupies());
     }
 
     #[test]
@@ -284,7 +309,10 @@ mod tests {
             session.idle_seconds, -1,
             "no heartbeat means unknown, not fresh"
         );
-        assert!(!session.is_active());
+        assert!(
+            session.occupies(),
+            "unknown liveness is not proof of absence"
+        );
     }
 
     #[test]
@@ -306,6 +334,61 @@ mod tests {
             scan.warnings[3].contains("unrecognised"),
             "an unknown shape must degrade, never fail the scan"
         );
+    }
+
+    #[test]
+    fn a_quiet_session_still_occupies_the_checkout() {
+        // Toimija reports `stale` for BOTH a dead process and a live one that
+        // has simply been quiet past the threshold — its own test is named
+        // `open_marker_past_threshold_is_stale_even_if_pid_alive`. An agent
+        // thinking for ninety minutes must not read as an empty checkout.
+        let raw = payload(
+            r#"{"id":"1-2","agent":["codex"],"worktree":"/tmp/r",
+                "liveness":"stale","last_seen_at":1}"#,
+        );
+        let scan = parse(Path::new(REPO), &raw, 100_000).unwrap();
+        let session = &scan.sessions[0];
+        assert!(session.occupies(), "stale is not proof of absence");
+        assert!(session.is_quiet(), "and its uncertainty must be visible");
+        assert_eq!(scan.occupying().count(), 1);
+    }
+
+    #[test]
+    fn only_a_closed_session_frees_the_checkout() {
+        // `closed` is the one verdict toimija observed rather than inferred
+        // from silence.
+        let raw = payload(r#"{"id":"1-2","worktree":"/tmp/r","liveness":"closed"}"#);
+        let scan = parse(Path::new(REPO), &raw, 100).unwrap();
+        assert!(!scan.sessions[0].occupies());
+        assert_eq!(scan.occupying().count(), 0);
+    }
+
+    #[test]
+    fn an_unrecognised_liveness_is_treated_as_occupying() {
+        // A verdict this build does not know is not permission to assume the
+        // checkout is free.
+        let raw = payload(r#"{"id":"1-2","worktree":"/tmp/r","liveness":"suspended"}"#);
+        let scan = parse(Path::new(REPO), &raw, 100).unwrap();
+        assert!(scan.sessions[0].occupies());
+        assert!(
+            scan.sessions[0].is_quiet(),
+            "an unrecognised verdict is uncertain, and must not render like an observed active one"
+        );
+    }
+
+    #[test]
+    fn a_missing_liveness_is_uncertain_not_active() {
+        let raw = payload(r#"{"id":"1-2","worktree":"/tmp/r"}"#);
+        let scan = parse(Path::new(REPO), &raw, 100).unwrap();
+        assert!(scan.sessions[0].occupies());
+        assert!(scan.sessions[0].is_quiet());
+    }
+
+    #[test]
+    fn an_observed_active_session_is_not_marked_uncertain() {
+        let raw = payload(r#"{"id":"1-2","worktree":"/tmp/r","liveness":"active"}"#);
+        let scan = parse(Path::new(REPO), &raw, 100).unwrap();
+        assert!(!scan.sessions[0].is_quiet());
     }
 
     #[test]
