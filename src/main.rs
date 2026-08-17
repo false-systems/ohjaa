@@ -238,8 +238,21 @@ fn cmd_run(agent: &str, intent: &str, dry_run: bool) -> Result<i32> {
     let mut command = Command::new("toimija");
     command.arg("run").arg("--intent").arg(intent);
     command.arg("--").arg(agent).current_dir(&root);
-    let status = command.status().context("failed to run toimija")?;
-    Ok(status.code().unwrap_or(1))
+    // Replace this process with toimija instead of wrapping it: one fewer
+    // parent above the agent tree, so killing "the session" cannot leave an
+    // orphaned toimija/agent pair behind, and signals aimed at this PID reach
+    // toimija itself. On success exec never returns.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let error = command.exec();
+        Err(error).context("failed to exec toimija")
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command.status().context("failed to run toimija")?;
+        Ok(status.code().unwrap_or(1))
+    }
 }
 
 fn main() {
