@@ -23,7 +23,7 @@ gets out of the way.
 ohjaa                    checks coverage · derives the fleet view
  └─ toimija run          packet · session · heartbeat
      ├─ teko  work.v1    ── stdio JSON-RPC ──┐
-     └─ kisko worker.v1  ── stdio JSON-RPC ──┘   (repository_point on every call)
+     └─ named worker     ── direct or worker.v1 ──┘   (repository_point on every call)
 
 sauma                    verifies envelopes, walks provenance across repos
 ```
