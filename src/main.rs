@@ -61,9 +61,20 @@ enum Cmd {
         /// Why this session exists.
         #[arg(long)]
         intent: String,
+        /// What to do; forwarded to `toimija run --task` so it travels in the
+        /// composed launch prompt.
+        #[arg(long)]
+        task: Option<String>,
+        /// Paths this session expects to touch (repeatable); forwarded to
+        /// `toimija run --scope`.
+        #[arg(long = "scope", value_name = "PATH")]
+        scope: Vec<String>,
         /// Decide and explain, but do not launch.
         #[arg(long)]
         dry_run: bool,
+        /// Everything after `--` is passed through to the agent command.
+        #[arg(last = true)]
+        passthrough: Vec<String>,
     },
 }
 
@@ -207,7 +218,14 @@ fn cmd_why(explicit: &[PathBuf], query: &str, json: bool) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
-fn cmd_run(agent: &str, intent: &str, dry_run: bool) -> Result<i32> {
+fn cmd_run(
+    agent: &str,
+    intent: &str,
+    task: Option<&str>,
+    scope: &[String],
+    dry_run: bool,
+    passthrough: &[String],
+) -> Result<i32> {
     let root = git_root().context("not inside a Git repository")?;
 
     let scan = scan_repo(&root);
@@ -241,13 +259,41 @@ fn cmd_run(agent: &str, intent: &str, dry_run: bool) -> Result<i32> {
     for warning in &scan.warnings {
         eprintln!("ohjaa: warning: {warning}");
     }
-    if dry_run {
-        return Ok(0);
+
+    // A footgun guard, earned the hard way: ohjaa flags after `--` belong to
+    // the agent, so `-- --dry-run` launches for real instead of explaining.
+    // Passing ohjaa's own flags through is sometimes legitimate (an agent that
+    // itself takes --task, say), so this warns loudly rather than refusing —
+    // but nobody should lose a launch to a silent misplacement.
+    for misplaced in [
+        "--dry-run",
+        "--no-briefing",
+        "--intent",
+        "--task",
+        "--scope",
+    ] {
+        if passthrough.iter().any(|arg| arg == misplaced) {
+            eprintln!(
+                "ohjaa: `{misplaced}` after `--` was passed to the agent, not ohjaa — \
+                 ohjaa flags go before `--`"
+            );
+        }
     }
 
     let mut command = Command::new("toimija");
     command.arg("run").arg("--intent").arg(intent);
-    command.arg("--").arg(agent).current_dir(&root);
+    if let Some(task) = task {
+        command.arg("--task").arg(task);
+    }
+    for scope_path in scope {
+        command.arg("--scope").arg(scope_path);
+    }
+    command.arg("--").arg(agent).args(passthrough);
+    command.current_dir(&root);
+    if dry_run {
+        eprintln!("ohjaa: dry-run; would exec: {}", render_command(&command));
+        return Ok(0);
+    }
     // Replace this process with toimija instead of wrapping it: one fewer
     // parent above the agent tree, so killing "the session" cannot leave an
     // orphaned toimija/agent pair behind, and signals aimed at this PID reach
@@ -265,6 +311,31 @@ fn cmd_run(agent: &str, intent: &str, dry_run: bool) -> Result<i32> {
     }
 }
 
+/// One command line for humans: each argument shell-quoted only when it needs
+/// it. It is a rendering, not a promise — the exec'd argv is the truth.
+fn render_command(command: &Command) -> String {
+    #[allow(deprecated)] // get_args/get_program are the stable cross-version view
+    let mut words = vec![shell_word(command.get_program().to_string_lossy().as_ref())];
+    words.extend(
+        command
+            .get_args()
+            .map(|arg| shell_word(&arg.to_string_lossy())),
+    );
+    words.join(" ")
+}
+
+fn shell_word(word: &str) -> String {
+    if word.is_empty()
+        || word
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\' | '$' | '`'))
+    {
+        format!("'{}'", word.replace('\'', "'\\\"'"))
+    } else {
+        word.to_string()
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
@@ -273,8 +344,11 @@ fn main() {
         Cmd::Run {
             agent,
             intent,
+            task,
+            scope,
             dry_run,
-        } => cmd_run(agent, intent, *dry_run),
+            passthrough,
+        } => cmd_run(agent, intent, task.as_deref(), scope, *dry_run, passthrough),
     };
     match result {
         Ok(code) => std::process::exit(code),

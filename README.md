@@ -34,16 +34,23 @@ Run both from the repository they will share:
 
 ```bash
 # terminal 1
-ohjaa run codex --intent "change the parser"
+ohjaa run codex --intent "change the parser" --task "fix the lexer" --scope src/parser/
 
 # terminal 2, same directory
 ohjaa run claude --intent "refresh the guide"
+
+# everything after `--` reaches the agent command itself
+ohjaa run codex --intent "change the parser" -- --model o3
 ```
 
-Each agent gets its own Toimija session and live packet. They still share files
-and Git's index, so Ohjaa reports sibling warnings but does not pretend it can
-prevent edit collisions without scopes or isolation. If Toimija cannot inspect
-the sessions, Ohjaa refuses to launch blind.
+Each agent gets its own Toimija session and live packet. `--task` and
+`--scope` are forwarded to `toimija run` (the task travels in the composed
+launch prompt), and anything after `--` is passed through to the agent
+command; `--dry-run` decides and explains, printing the exact command it
+would exec, without launching. The agents still share files and Git's index,
+so Ohjaa reports sibling warnings but does not pretend it can prevent edit
+collisions without scopes or isolation. If Toimija cannot inspect the
+sessions, Ohjaa refuses to launch blind.
 
 ## Derive, never store
 
