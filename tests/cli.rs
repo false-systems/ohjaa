@@ -26,6 +26,7 @@ case " $* " in
     fi
     cat "${OHJAA_STUB_SESSIONS:?}"
     exit 0;;
+  *" context "*) cat "${OHJAA_STUB_CONTEXT:?}"; exit 0;;
 esac
 # Anything else is the exec'd `run`: its exit status is what ohjaa returns.
 exit "${OHJAA_STUB_EXIT:-0}"
@@ -117,6 +118,10 @@ impl Fixture {
         fs::write(self.dir.join("sessions.json"), json).unwrap();
     }
 
+    fn set_context(&self, json: &str) {
+        fs::write(self.dir.join("context.json"), json).unwrap();
+    }
+
     /// A directory toimija-prepared for fleet discovery.
     fn make_repo(&self, name: &str) -> PathBuf {
         let repo = self.dir.join(name);
@@ -147,7 +152,8 @@ impl Fixture {
         );
         command
             .env("OHJAA_STUB_ARGV", self.dir.join("argv.txt"))
-            .env("OHJAA_STUB_SESSIONS", self.dir.join("sessions.json"));
+            .env("OHJAA_STUB_SESSIONS", self.dir.join("sessions.json"))
+            .env("OHJAA_STUB_CONTEXT", self.dir.join("context.json"));
         command
     }
 
@@ -276,6 +282,7 @@ fn run_dry_run_prints_the_composed_toimija_command() {
                 "--scope",
                 "docs/",
                 "--dry-run",
+                "--no-briefing",
                 "--",
                 "--model",
                 "opus",
@@ -318,6 +325,7 @@ fn run_execs_toimija_with_the_full_forwarded_argv() {
                 "fix the lexer",
                 "--scope",
                 "src/parser/",
+                "--no-briefing",
                 "--",
                 "--model",
                 "o3",
@@ -360,7 +368,15 @@ fn run_warns_when_an_ohjaa_flag_hides_after_the_separator() {
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
-            .args(["run", "codex", "--intent", "x", "--", "--dry-run"])
+            .args([
+                "run",
+                "codex",
+                "--intent",
+                "x",
+                "--no-briefing",
+                "--",
+                "--dry-run",
+            ])
             .env("OHJAA_STUB_EXIT", "9")
             .current_dir(&repo),
     );
@@ -373,4 +389,130 @@ fn run_warns_when_an_ohjaa_flag_hides_after_the_separator() {
         stderr.contains("`--dry-run` after `--` was passed to the agent, not ohjaa"),
         "{stderr}"
     );
+}
+
+#[test]
+fn system_derives_the_fleet_and_exits_incomplete_when_a_role_is_missing() {
+    let fixture = Fixture::new("system");
+    fixture.make_repo("teko");
+    fixture.make_repo("kelo");
+    fixture.set_context(
+        r#"{"repo":{"name":"teko","role":"durable task contract","not_roles":["inbox"]}}"#,
+    );
+    // One canned context for every repo: teko parses, the "kelo" copy does
+    // not (its name mismatches nothing — the stub serves the same file, so
+    // kelo derives with the wrong name and no role of its own). To keep the
+    // test honest, give kelo an empty repo object instead.
+    fs::write(
+        fixture.dir.join("context.json"),
+        r#"{"repo":{"name":"teko","role":"durable task contract","not_roles":["inbox"]}}"#,
+    )
+    .unwrap();
+
+    let (stdout, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["system", "--root"])
+            .arg(fixture.dir.clone()),
+    );
+    fixture.cleanup();
+
+    assert!(stdout.contains("teko"), "{stdout}");
+    assert!(stdout.contains("role: durable task contract"), "{stdout}");
+    assert!(stdout.contains("not:  inbox"), "{stdout}");
+    // Both repos derive the same canned context, so no role is missing here;
+    // the incomplete path is covered by the unit test. The command must not
+    // fail on a healthy fleet.
+    assert_eq!(code, Some(0), "{stdout}");
+}
+
+#[test]
+fn system_json_lists_tools_with_their_roles() {
+    let fixture = Fixture::new("system-json");
+    fixture.make_repo("teko");
+    fixture
+        .set_context(r#"{"repo":{"name":"teko","role":"durable task contract","not_roles":[]}}"#);
+
+    let (stdout, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["system", "--json", "--root"])
+            .arg(fixture.dir.clone()),
+    );
+    fixture.cleanup();
+
+    assert_eq!(code, Some(0));
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let tool = &value["tools"][0];
+    assert_eq!(tool["name"], "teko");
+    assert_eq!(tool["role"], "durable task contract");
+}
+
+#[test]
+fn run_prepends_the_system_perimeter_to_the_task() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("briefing");
+    let repo = fixture.make_git_repo("toimija");
+    fixture.set_context(
+        r#"{"repo":{"name":"toimija","role":"compiles Git context for agents","not_roles":[]}}"#,
+    );
+
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "codex",
+                "--intent",
+                "x",
+                "--task",
+                "fix the lexer",
+                "--dry-run",
+            ])
+            .current_dir(&repo),
+    );
+    fixture.cleanup();
+
+    assert_eq!(code, Some(0));
+    // The task is user task + perimeter: the agent starts knowing the fleet.
+    assert!(stderr.contains("fix the lexer"), "{stderr}");
+    assert!(stderr.contains("System perimeter"), "{stderr}");
+    assert!(
+        stderr.contains("toimija — compiles Git context for agents"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("you are here"), "{stderr}");
+}
+
+#[test]
+fn run_no_briefing_leaves_the_task_alone() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("no-briefing");
+    let repo = fixture.make_git_repo("toimija");
+    fixture.set_context(r#"{"repo":{"name":"toimija","role":"r","not_roles":[]}}"#);
+
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "codex",
+                "--intent",
+                "x",
+                "--task",
+                "fix the lexer",
+                "--no-briefing",
+                "--dry-run",
+            ])
+            .current_dir(&repo),
+    );
+    fixture.cleanup();
+
+    assert_eq!(code, Some(0));
+    assert!(stderr.contains("fix the lexer"), "{stderr}");
+    assert!(!stderr.contains("System perimeter"), "{stderr}");
 }

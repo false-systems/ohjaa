@@ -8,6 +8,7 @@
 
 mod roots;
 mod scan;
+mod system;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -72,9 +73,17 @@ enum Cmd {
         /// Decide and explain, but do not launch.
         #[arg(long)]
         dry_run: bool,
+        /// Do not prepend the derived system perimeter to the task.
+        #[arg(long = "no-briefing")]
+        no_briefing: bool,
         /// Everything after `--` is passed through to the agent command.
         #[arg(last = true)]
         passthrough: Vec<String>,
+    },
+    /// The system perimeter: what every tool in the fleet is, derived now.
+    System {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -218,14 +227,44 @@ fn cmd_why(explicit: &[PathBuf], query: &str, json: bool) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
-fn cmd_run(
-    agent: &str,
-    intent: &str,
-    task: Option<&str>,
-    scope: &[String],
+fn cmd_system(explicit: &[PathBuf], json: bool) -> Result<i32> {
+    let repos = repos(explicit)?;
+    if repos.is_empty() {
+        eprintln!("ohjaa: no toimija-prepared repos under the roots");
+        return Ok(0);
+    }
+    let view = system::system_view(&repos);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&view)?);
+    } else {
+        print!("{}", system::render_system(&view));
+    }
+    Ok(view.exit_code())
+}
+
+/// Everything `run` needs, bundled so the signature stays honest.
+struct RunOptions<'a> {
+    agent: &'a str,
+    intent: &'a str,
+    task: Option<&'a str>,
+    scope: &'a [String],
     dry_run: bool,
-    passthrough: &[String],
-) -> Result<i32> {
+    no_briefing: bool,
+    passthrough: &'a [String],
+    roots: &'a [PathBuf],
+}
+
+fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
+    let RunOptions {
+        agent,
+        intent,
+        task,
+        scope,
+        dry_run,
+        no_briefing,
+        passthrough,
+        roots,
+    } = options;
     let root = git_root().context("not inside a Git repository")?;
 
     let scan = scan_repo(&root);
@@ -280,9 +319,25 @@ fn cmd_run(
         }
     }
 
+    // The perimeter: the agent starts knowing what system it operates in —
+    // the fleet's self-declared tools plus who is live — delivered inside the
+    // task so it travels in toimija's composed launch prompt. Derived here,
+    // re-derivable by the agent (`ohjaa system`, `ohjaa fleet`), never stored.
+    let task = if no_briefing {
+        task.map(String::from)
+    } else {
+        let fleet = repos(roots)?;
+        let view = system::system_view(&fleet);
+        let perimeter = system::briefing(&view, &root);
+        Some(match task {
+            Some(task) => format!("{task}\n\n{perimeter}"),
+            None => perimeter,
+        })
+    };
+
     let mut command = Command::new("toimija");
     command.arg("run").arg("--intent").arg(intent);
-    if let Some(task) = task {
+    if let Some(task) = &task {
         command.arg("--task").arg(task);
     }
     for scope_path in scope {
@@ -347,8 +402,19 @@ fn main() {
             task,
             scope,
             dry_run,
+            no_briefing,
             passthrough,
-        } => cmd_run(agent, intent, task.as_deref(), scope, *dry_run, passthrough),
+        } => cmd_run(RunOptions {
+            agent,
+            intent,
+            task: task.as_deref(),
+            scope,
+            dry_run: *dry_run,
+            no_briefing: *no_briefing,
+            passthrough,
+            roots: &cli.root,
+        }),
+        Cmd::System { json } => cmd_system(&cli.root, *json),
     };
     match result {
         Ok(code) => std::process::exit(code),
