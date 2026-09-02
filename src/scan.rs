@@ -404,6 +404,13 @@ mod tests {
     }
 
     #[test]
+    fn toimija_reported_degraded_coverage_is_preserved() {
+        let raw = r#"{"sessions":[],"coverage":{"status":"degraded"}}"#;
+        let scan = parse(Path::new(REPO), raw, 0).unwrap();
+        assert_eq!(scan.coverage, Coverage::Degraded);
+    }
+
+    #[test]
     fn failed_scan_is_not_an_empty_scan() {
         let scan = Scan::failed(Path::new(REPO), "not a Git repository".into());
         assert_eq!(scan.coverage, Coverage::Failed);

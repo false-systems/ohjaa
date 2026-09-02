@@ -74,8 +74,9 @@ coverage: scanned 17/18 repo(s)
     somerepo: not a Git repository
 ```
 
-`ohjaa fleet` exits `4` when coverage is incomplete. Reporting quiet when you
-could not look is the failure mode this whole stack exists to prevent.
+`ohjaa fleet` exits `4` when coverage is degraded or failed. `ohjaa run` also
+refuses either state. Reporting quiet when you could not fully look is the
+failure mode this whole stack exists to prevent.
 
 The same rule governs staleness. Toimija reports `stale` both for a session
 whose process is gone and for one that has merely been quiet past its
