@@ -99,30 +99,40 @@ fn repos(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 ///
 /// A scan that failed is not a scan that found nothing. Saying so is the point.
 fn report_coverage(scans: &[Scan]) -> i32 {
-    let failed: Vec<&Scan> = scans
+    let incomplete: Vec<&Scan> = scans
         .iter()
-        .filter(|s| s.coverage == Coverage::Failed)
+        .filter(|s| s.coverage != Coverage::Available)
         .collect();
 
     // stdout is block-buffered when piped; keep the report in order.
     let _ = std::io::stdout().flush();
     eprintln!(
         "\ncoverage: scanned {}/{} repo(s)",
-        scans.len() - failed.len(),
+        scans.len() - incomplete.len(),
         scans.len()
     );
-    if failed.is_empty() {
+    if incomplete.is_empty() {
         return 0;
     }
     eprintln!("  incomplete — absence here is not evidence of absence:");
-    for scan in failed {
+    for scan in incomplete {
         eprintln!(
             "    {}: {}",
             scan.repo.file_name().unwrap_or_default().to_string_lossy(),
-            scan.error.as_deref().unwrap_or("unknown failure")
+            coverage_detail(scan)
         );
     }
     INCOMPLETE
+}
+
+/// What to say about an incomplete scan: the failure if there was one, else
+/// the first warning, else the bare verdict. A degraded scan with no detail
+/// would otherwise render as a bare word that explains nothing.
+fn coverage_detail(scan: &Scan) -> &str {
+    scan.error
+        .as_deref()
+        .or_else(|| scan.warnings.first().map(String::as_str))
+        .unwrap_or("degraded coverage")
 }
 
 fn cmd_fleet(explicit: &[PathBuf], json: bool) -> Result<i32> {
@@ -201,11 +211,11 @@ fn cmd_run(agent: &str, intent: &str, dry_run: bool) -> Result<i32> {
     let root = git_root().context("not inside a Git repository")?;
 
     let scan = scan_repo(&root);
-    if scan.coverage == Coverage::Failed {
+    if scan.coverage != Coverage::Available {
         eprintln!(
-            "ohjaa: cannot read sessions in {}: {}",
+            "ohjaa: cannot completely read sessions in {}: {}",
             root.display(),
-            scan.error.as_deref().unwrap_or("unknown failure")
+            coverage_detail(&scan)
         );
         eprintln!("ohjaa: refusing to launch blind");
         return Ok(REFUSED);
