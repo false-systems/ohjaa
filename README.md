@@ -8,6 +8,7 @@ deciding has to live somewhere else. This is that somewhere.
 
 ```bash
 ohjaa fleet                        # who is live, across every repo
+ohjaa system                       # what every tool in the fleet is, derived now
 ohjaa why <digest|token>           # provenance walk, every root filled in
 ohjaa run claude --intent "…"      # inspect siblings, then hand off
 ```
@@ -28,6 +29,23 @@ ohjaa                    checks coverage · derives the fleet view
 sauma                    verifies envelopes, walks provenance across repos
 ```
 
+## The system perimeter
+
+An agent launched into this stack should not have to discover the stack by
+guessing. Every repo in the fleet self-declares what it is in
+`.toimija/repo.yaml`, and toimija surfaces that as the `repo` object of
+`toimija context --json`. `ohjaa system` derives the whole picture from those
+declarations plus live occupancy — nothing is stored, and the view cannot be
+staler than the moment it was computed. A repo whose role cannot be derived
+is reported as unknown and makes the exit code `4`: absence is not evidence.
+
+`ohjaa run` delivers the same picture to the agent it launches: the perimeter
+— fleet, roles, who is live, "you are here", the coordination rules — is
+prepended to the task, so it travels in toimija's composed launch prompt and
+the agent cannot not-see it. The briefing tells the agent how to re-derive
+every claim (`ohjaa system`, `ohjaa fleet`), because a derived view is never
+stale and a delivered one always is. `--no-briefing` opts out.
+
 ## Two agents, one checkout
 
 Run both from the repository they will share:
@@ -45,12 +63,12 @@ ohjaa run codex --intent "change the parser" -- --model o3
 
 Each agent gets its own Toimija session and live packet. `--task` and
 `--scope` are forwarded to `toimija run` (the task travels in the composed
-launch prompt), and anything after `--` is passed through to the agent
-command; `--dry-run` decides and explains, printing the exact command it
-would exec, without launching. The agents still share files and Git's index,
-so Ohjaa reports sibling warnings but does not pretend it can prevent edit
-collisions without scopes or isolation. If Toimija cannot inspect the
-sessions, Ohjaa refuses to launch blind.
+launch prompt, with the system perimeter prepended), and anything after `--`
+is passed through to the agent command; `--dry-run` decides and explains,
+printing the exact command it would exec, without launching. The agents still
+share files and Git's index, so Ohjaa reports sibling warnings but does not
+pretend it can prevent edit collisions without scopes or isolation. If
+Toimija cannot inspect the sessions, Ohjaa refuses to launch blind.
 
 ## Derive, never store
 
@@ -116,9 +134,10 @@ Permanently refused, for the reasons proposal 0010 refused them:
 
 ## Status
 
-Early, but real: `fleet`, `why`, and `run` work today. `run` requires complete
-local session coverage, reports every sibling that may still be working the
-checkout, and then hands the agent to Toimija. Existing sessions are facts,
+Early, but real: `fleet`, `system`, `why`, and `run` work today. `run`
+requires complete local session coverage, reports every sibling that may
+still be working the checkout, derives the system perimeter into the agent's
+task, and then hands the agent to Toimija. Existing sessions are facts,
 not locks.
 
 The sibling count is a reading taken just before launch, not a standing fact:
