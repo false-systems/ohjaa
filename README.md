@@ -11,6 +11,8 @@ ohjaa fleet                        # who is live, across every repo
 ohjaa system                       # what every tool in the fleet is, derived now
 ohjaa why <digest|token>           # provenance walk, every root filled in
 ohjaa run claude --intent "…"      # inspect siblings, then hand off
+ohjaa cycle step --facts cycle.json # reduce verified cycle facts to one action
+ohjaa cycle run --facts cycle.json codex --intent "implement" --dry-run
 ```
 
 ## What it is
@@ -123,8 +125,11 @@ Permanently refused, for the reasons proposal 0010 refused them:
 - **No inbox, no messaging, no request/response.** A message from an agent that
   has since died is a silent lie. An inbox is a second database with
   last-writer-wins races — exactly what proposal 0004 was killed for.
-- **No task dispatch or handoff between agents.** The human remains the
-  orchestrator. Claiming work stays in GitHub issues, draft PRs, and labels.
+- **No agent-to-agent handoff.** `ohjaa cycle step` derives exactly one action
+  from a verified facts snapshot. `ohjaa cycle run` can launch only its next
+  implementation or QA leg through Toimija; it never stores workflow state or
+  schedules future work. Claiming work stays in GitHub issues, draft PRs, and
+  labels.
 - **No presence.** "Is that agent online?" is unanswerable without heartbeats,
   and heartbeats lie by default. The truthful ceiling is a timestamped last
   observation, which toimija already provides.

@@ -23,7 +23,9 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 - **Derive, never store.** No inbox, no index, no cache, no database, no daemon,
   no persistence. The configured root list holds paths, never contents.
 - **Cross-repo yes, messaging no.** Permanently refused: an inbox,
-  request/response, task dispatch or handoff between agents, and presence. A
+  request/response, and presence. `ohjaa cycle` may derive and launch one
+  declared leg from a facts snapshot; it stores no workflow state and is not
+  a scheduler or agent-to-agent handoff. A
   message that can go stale without confessing it does not belong here — the
   admission test from `toimija`'s proposal 0010 applies to this repo too.
 - Anything crossing a repo boundary travels as a **digest anchored to a
