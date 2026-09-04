@@ -7,6 +7,7 @@
 //! packet, and stores nothing.
 
 mod cycle;
+mod facts;
 mod roots;
 mod scan;
 mod system;
@@ -93,19 +94,72 @@ enum Cmd {
     },
 }
 
+/// Where the sealed upstream artifacts of a cycle live. Ohjaa derives the
+/// rest — repository point, sessions, gate receipts, Teko state — on demand.
+#[derive(clap::Args)]
+struct ArtifactArgs {
+    /// Sealed teko-work.v1 artifact (`teko packet --artifact`).
+    #[arg(long, requires = "decision")]
+    work: Option<PathBuf>,
+    /// Sealed kisko.decision.v1 artifact (`kisko decide --json`).
+    #[arg(long, requires = "qa_plan")]
+    decision: Option<PathBuf>,
+    /// Sealed kelpo-plan.v1 artifact (`kelpo seal-plan`).
+    #[arg(long = "qa-plan", requires = "work")]
+    qa_plan: Option<PathBuf>,
+    /// Sealed kelpo-verdict.v1 artifact; absent or missing means not yet judged.
+    #[arg(long)]
+    verdict: Option<PathBuf>,
+}
+
+impl ArtifactArgs {
+    fn paths(&self) -> Option<facts::ArtifactPaths> {
+        Some(facts::ArtifactPaths {
+            work: self.work.clone()?,
+            decision: self.decision.clone()?,
+            qa_plan: self.qa_plan.clone()?,
+            verdict: self.verdict.clone(),
+        })
+    }
+}
+
 #[derive(Subcommand)]
 enum CycleCmd {
-    /// Print the one action legal for this declared facts snapshot.
-    Step {
-        /// A ohjaa-cycle-facts.v1 JSON document.
+    /// Derive and print the sealed ohjaa-cycle-facts.v1 snapshot for a cycle.
+    Facts {
+        /// A sealed cycle.v1 JSON document.
         #[arg(long)]
-        facts: PathBuf,
+        cycle: PathBuf,
+        #[command(flatten)]
+        artifacts: ArtifactArgs,
     },
-    /// Launch the one legal agent leg through `toimija run`.
-    Run {
-        /// A ohjaa-cycle-facts.v1 JSON document.
+    /// Print the one action legal for this cycle: from a supplied facts
+    /// snapshot, or from facts derived now.
+    Step {
+        /// A sealed cycle.v1 JSON document.
         #[arg(long)]
-        facts: PathBuf,
+        cycle: PathBuf,
+        /// A ohjaa-cycle-facts.v1 JSON document; omit to derive facts now.
+        #[arg(long, conflicts_with_all = ["work", "decision", "qa_plan", "verdict"])]
+        facts: Option<PathBuf>,
+        #[command(flatten)]
+        artifacts: ArtifactArgs,
+    },
+    /// Advance the cycle: launch the one legal agent leg through
+    /// `toimija run`, or — with derived facts — loop over `step`, running
+    /// gates and closure through Toimija, until closed, held, or failed.
+    Run {
+        /// A sealed cycle.v1 JSON document.
+        #[arg(long)]
+        cycle: PathBuf,
+        /// A ohjaa-cycle-facts.v1 JSON document; omit to derive facts and loop.
+        #[arg(long, conflicts_with_all = ["work", "decision", "qa_plan", "verdict"])]
+        facts: Option<PathBuf>,
+        #[command(flatten)]
+        artifacts: ArtifactArgs,
+        /// Upper bound on reducer steps before giving up (derived mode).
+        #[arg(long, default_value_t = 12)]
+        max_steps: u32,
         /// Agent command, e.g. claude / codex.
         agent: String,
         /// Why this session exists.
@@ -284,23 +338,79 @@ fn cmd_system(explicit: &[PathBuf], json: bool) -> Result<i32> {
     Ok(view.exit_code())
 }
 
-fn cycle_action(path: &Path) -> Result<cycle::Next> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("cannot read cycle facts {}", path.display()))?;
-    let facts: cycle::Facts = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid cycle facts {}", path.display()))?;
-    cycle::next(&facts).map_err(anyhow::Error::msg)
+fn verified<T: serde::de::DeserializeOwned>(path: &Path, name: &str) -> Result<T> {
+    let status = Command::new("sauma")
+        .arg("verify")
+        .arg(path)
+        .status()
+        .with_context(|| format!("cannot run sauma verify for {}", path.display()))?;
+    anyhow::ensure!(
+        status.success(),
+        "{} is not a verified Sauma artifact",
+        path.display()
+    );
+    let bytes =
+        std::fs::read(path).with_context(|| format!("cannot read {name} {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("invalid {name} {}", path.display()))
+}
+
+fn load_cycle(cycle_path: &Path) -> Result<cycle::Cycle> {
+    verified(cycle_path, "cycle")
+}
+
+fn supplied_facts(cycle: &cycle::Cycle, facts_path: &Path) -> Result<cycle::Next> {
+    let facts: cycle::Facts = verified(facts_path, "cycle facts")?;
+    cycle::next(cycle, &facts).map_err(anyhow::Error::msg)
+}
+
+fn derived_facts(cycle: &cycle::Cycle, artifacts: &ArtifactArgs) -> Result<facts::Derived> {
+    let paths = artifacts
+        .paths()
+        .context("derived facts need --work, --decision, and --qa-plan (or pass --facts)")?;
+    let root = git_root().context("not inside a Git repository")?;
+    facts::derive(&root, cycle, &paths)
+}
+
+/// Exit code for a terminal reducer outcome. `closed` is success; `held` and
+/// a non-launch action are the fleet's REFUSED; a declared failure is 1.
+fn action_exit(action: &cycle::Next) -> i32 {
+    match action {
+        cycle::Next::Closed => 0,
+        cycle::Next::Failed { .. } => 1,
+        _ => REFUSED,
+    }
 }
 
 fn cmd_cycle(command: &CycleCmd, roots: &[PathBuf]) -> Result<i32> {
     match command {
-        CycleCmd::Step { facts } => {
-            let action = cycle_action(facts)?;
+        CycleCmd::Facts { cycle, artifacts } => {
+            let cycle = load_cycle(cycle)?;
+            let derived = derived_facts(&cycle, artifacts)?;
+            println!("{}", serde_json::to_string(&derived.sealed)?);
+            Ok(0)
+        }
+        CycleCmd::Step {
+            cycle,
+            facts,
+            artifacts,
+        } => {
+            let cycle = load_cycle(cycle)?;
+            let action = match facts {
+                Some(facts) => supplied_facts(&cycle, facts)?,
+                None => {
+                    let derived = derived_facts(&cycle, artifacts)?;
+                    eprintln!("ohjaa: facts {}", derived.sealed);
+                    cycle::next(&cycle, &derived.facts).map_err(anyhow::Error::msg)?
+                }
+            };
             println!("{}", serde_json::to_string(&action)?);
             Ok(0)
         }
         CycleCmd::Run {
+            cycle: cycle_path,
             facts,
+            artifacts,
+            max_steps,
             agent,
             intent,
             task,
@@ -308,30 +418,111 @@ fn cmd_cycle(command: &CycleCmd, roots: &[PathBuf]) -> Result<i32> {
             dry_run,
             no_briefing,
             passthrough,
-        } => match cycle_action(facts)? {
-            cycle::Next::Launch { leg } => cmd_run(RunOptions {
-                agent,
-                intent,
-                task: Some(&match task {
-                    Some(task) => format!("Cycle leg: {leg}\n\n{task}"),
-                    None => format!("Cycle leg: {leg}"),
-                }),
-                scope,
-                dry_run: *dry_run,
-                no_briefing: *no_briefing,
-                passthrough,
-                roots,
-            }),
-            action => {
-                println!("{}", serde_json::to_string(&action)?);
-                eprintln!("ohjaa: cycle action is not an agent launch");
-                Ok(REFUSED)
+        } => {
+            let cycle = load_cycle(cycle_path)?;
+            let leg_task = |leg: &str| match task {
+                Some(task) => format!("Cycle leg: {leg}\n\n{task}"),
+                None => format!("Cycle leg: {leg}"),
+            };
+            if let Some(facts) = facts {
+                // Single shot from a supplied snapshot: launch the one leg and
+                // hand the process to toimija, exactly like `ohjaa run`.
+                return match supplied_facts(&cycle, facts)? {
+                    cycle::Next::Launch { leg } => cmd_run(RunOptions {
+                        agent,
+                        intent,
+                        task: Some(&leg_task(leg)),
+                        scope,
+                        dry_run: *dry_run,
+                        no_briefing: *no_briefing,
+                        passthrough,
+                        roots,
+                        cycle_action: Some((&cycle.sauma.digest, leg, 0)),
+                        wait: false,
+                    }),
+                    action => {
+                        println!("{}", serde_json::to_string(&action)?);
+                        eprintln!("ohjaa: cycle action is not an agent launch");
+                        Ok(REFUSED)
+                    }
+                };
             }
-        },
+            // Derived mode: a loop over `step`. Every iteration re-derives the
+            // facts, so a leg that another process completed meanwhile is
+            // consumed, not duplicated. No state survives between iterations.
+            let root = git_root().context("not inside a Git repository")?;
+            for step in 0..*max_steps {
+                let derived = derived_facts(&cycle, artifacts)?;
+                let action = cycle::next(&cycle, &derived.facts).map_err(anyhow::Error::msg)?;
+                eprintln!(
+                    "ohjaa: step {step} at {} (tree {}) -> {}",
+                    derived.repository_point.id,
+                    derived.repository_point.tree_oid,
+                    serde_json::to_string(&action)?
+                );
+                let status = match &action {
+                    cycle::Next::Launch { leg } => {
+                        let attempt = if *leg == "qa" {
+                            derived.qa_attempt
+                        } else {
+                            derived.implementation_attempt
+                        };
+                        cmd_run(RunOptions {
+                            agent,
+                            intent,
+                            task: Some(&leg_task(leg)),
+                            scope,
+                            dry_run: *dry_run,
+                            no_briefing: *no_briefing,
+                            passthrough,
+                            roots,
+                            cycle_action: Some((&cycle.sauma.digest, leg, attempt)),
+                            wait: true,
+                        })?
+                    }
+                    cycle::Next::RunGates => toimija_step(&root, "verify-work", *dry_run)?,
+                    cycle::Next::CloseWork => toimija_step(&root, "close-work", *dry_run)?,
+                    terminal => {
+                        println!("{}", serde_json::to_string(terminal)?);
+                        return Ok(action_exit(terminal));
+                    }
+                };
+                if *dry_run {
+                    println!("{}", serde_json::to_string(&action)?);
+                    return Ok(0);
+                }
+                if status != 0 {
+                    eprintln!("ohjaa: step {step} exited {status}; re-deriving facts");
+                }
+            }
+            eprintln!("ohjaa: step budget of {max_steps} exhausted");
+            println!(
+                "{}",
+                serde_json::to_string(&cycle::Next::Held {
+                    reason: "step_budget"
+                })?
+            );
+            Ok(REFUSED)
+        }
     }
 }
 
-/// Everything `run` needs, bundled so the signature stays honest.
+/// Run one Toimija verification or closure command in the repository and
+/// return its exit status. Toimija stays the authority: ohjaa never runs a
+/// gate or closes work itself.
+fn toimija_step(root: &Path, subcommand: &str, dry_run: bool) -> Result<i32> {
+    let mut command = Command::new("toimija");
+    command.arg(subcommand).current_dir(root);
+    if dry_run {
+        eprintln!("ohjaa: dry-run; would run: {}", render_command(&command));
+        return Ok(0);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run toimija {subcommand}"))?;
+    Ok(status.code().unwrap_or(1))
+}
+
 struct RunOptions<'a> {
     agent: &'a str,
     intent: &'a str,
@@ -341,6 +532,9 @@ struct RunOptions<'a> {
     no_briefing: bool,
     passthrough: &'a [String],
     roots: &'a [PathBuf],
+    cycle_action: Option<(&'a str, &'a str, u32)>,
+    /// Wait for toimija and return its status instead of exec'ing into it.
+    wait: bool,
 }
 
 fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
@@ -353,6 +547,8 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         no_briefing,
         passthrough,
         roots,
+        cycle_action,
+        wait,
     } = options;
     let root = git_root().context("not inside a Git repository")?;
 
@@ -432,11 +628,21 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     for scope_path in scope {
         command.arg("--scope").arg(scope_path);
     }
+    if let Some((cycle, leg, attempt)) = cycle_action {
+        command.args(["--cycle", cycle, "--cycle-leg", leg]);
+        command.arg("--cycle-attempt").arg(attempt.to_string());
+    }
     command.arg("--").arg(agent).args(passthrough);
     command.current_dir(&root);
     if dry_run {
         eprintln!("ohjaa: dry-run; would exec: {}", render_command(&command));
         return Ok(0);
+    }
+    if wait {
+        // A cycle leg is one step of a loop that must observe its outcome, so
+        // the process stays; the agent tree is still toimija's, not ohjaa's.
+        let status = command.status().context("failed to run toimija")?;
+        return Ok(status.code().unwrap_or(1));
     }
     // Replace this process with toimija instead of wrapping it: one fewer
     // parent above the agent tree, so killing "the session" cannot leave an
@@ -455,8 +661,6 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     }
 }
 
-/// One command line for humans: each argument shell-quoted only when it needs
-/// it. It is a rendering, not a promise — the exec'd argv is the truth.
 fn render_command(command: &Command) -> String {
     #[allow(deprecated)] // get_args/get_program are the stable cross-version view
     let mut words = vec![shell_word(command.get_program().to_string_lossy().as_ref())];
@@ -503,6 +707,8 @@ fn main() {
             no_briefing: *no_briefing,
             passthrough,
             roots: &cli.root,
+            cycle_action: None,
+            wait: false,
         }),
         Cmd::System { json } => cmd_system(&cli.root, *json),
     };

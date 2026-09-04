@@ -23,8 +23,9 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 - **Derive, never store.** No inbox, no index, no cache, no database, no daemon,
   no persistence. The configured root list holds paths, never contents.
 - **Cross-repo yes, messaging no.** Permanently refused: an inbox,
-  request/response, and presence. `ohjaa cycle` may derive and launch one
-  declared leg from a facts snapshot; it stores no workflow state and is not
+  request/response, and presence. `ohjaa cycle` may derive the facts snapshot
+  from Toimija, Teko, and sealed artifacts, reduce it to one action, and act
+  on that one action through Toimija; it stores no workflow state and is not
   a scheduler or agent-to-agent handoff. A
   message that can go stale without confessing it does not belong here — the
   admission test from `toimija`'s proposal 0010 applies to this repo too.

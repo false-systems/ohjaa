@@ -11,8 +11,10 @@ ohjaa fleet                        # who is live, across every repo
 ohjaa system                       # what every tool in the fleet is, derived now
 ohjaa why <digest|token>           # provenance walk, every root filled in
 ohjaa run claude --intent "…"      # inspect siblings, then hand off
-ohjaa cycle step --facts cycle.json # reduce verified cycle facts to one action
-ohjaa cycle run --facts cycle.json codex --intent "implement" --dry-run
+ohjaa cycle facts --cycle cycle.v1.json --work work.json --decision decision.json --qa-plan plan.json
+ohjaa cycle step  --cycle cycle.v1.json --facts cycle-facts.json          # reduce a supplied snapshot
+ohjaa cycle run   --cycle cycle.v1.json --work work.json --decision decision.json --qa-plan plan.json \
+                  --verdict verdict.json codex --intent "implement"        # loop: derive, step, act
 ```
 
 ## What it is
@@ -126,10 +128,48 @@ Permanently refused, for the reasons proposal 0010 refused them:
   has since died is a silent lie. An inbox is a second database with
   last-writer-wins races — exactly what proposal 0004 was killed for.
 - **No agent-to-agent handoff.** `ohjaa cycle step` derives exactly one action
-  from a verified facts snapshot. `ohjaa cycle run` can launch only its next
+  from a Sauma-verified `cycle.v1` plan and facts snapshot linked by its digest.
+  `ohjaa cycle run` can launch only its next
   implementation or QA leg through Toimija; it never stores workflow state or
   schedules future work. Claiming work stays in GitHub issues, draft PRs, and
   labels.
+
+## The autonomous cycle
+
+`cycle.v1` is sealed upstream and names three immutable inputs by digest: the
+Teko work artifact, the Kisko decision, and the Kelpo QA plan. Ohjaa never
+trusts a path — every artifact is `sauma verify`'d and its envelope digest
+compared with the cycle before it counts.
+
+`ohjaa cycle facts` derives the `ohjaa-cycle-facts.v1` snapshot the reducer
+consumes, asking each owner for its fact and sealing the result through
+`sauma stamp`, anchored to the current repository point:
+
+| Fact | Derived from |
+| --- | --- |
+| `decision` | the Kisko artifact's status: `decided` → allow, `inconclusive` → hold, `refused` → deny (escalate on a hard policy conflict) |
+| `qa_plan` | the sealed plan's digest matching the cycle |
+| `implementation`, `qa` | `toimija sessions --json`: sessions carrying this cycle's leg identity — a closed exit-0 session is current, a live one holds, a spent budget fails |
+| `gates` | `toimija gates status --json` for the work artifact's required gates, plus each current receipt's exit code |
+| `verdict` | the sealed Kelpo verdict: plan digest, final point, and test-session independence from the implementation leg |
+| `closure` | `teko current`, else the Sauma-verified `.teko/witness.jsonl` |
+
+An inspection that cannot complete is `inconclusive`, which the reducer holds
+on. Nothing is ever rendered as an empty list or a passing gate.
+
+`ohjaa cycle run` without `--facts` is only a loop over `step`: derive, reduce,
+act once, repeat. A `launch` runs `toimija run --cycle … --cycle-leg … --cycle-attempt …`
+and waits; `run_gates` runs `toimija verify-work`; `close_work` runs
+`toimija close-work`. Every other action — `held`, `failed`, `judge_qa`,
+`closed` — ends the loop and is printed. Toimija refuses a duplicate live leg
+for the same cycle, leg, attempt, and point, so two loops cannot race the same
+action. The retry budgets and the step bound are the only limits; there is no
+daemon and no schedule.
+
+What Ohjaa does not do: judge QA (the QA leg produces the Kelpo verdict), run
+gates itself, close work itself, or attempt any declared effect — `commit`,
+`push`, `open_pr` are the worker's to honour and the composition owner's to
+audit.
 - **No presence.** "Is that agent online?" is unanswerable without heartbeats,
   and heartbeats lie by default. The truthful ceiling is a timestamped last
   observation, which toimija already provides.
