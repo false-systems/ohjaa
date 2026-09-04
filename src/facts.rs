@@ -285,12 +285,22 @@ fn run_json<T: serde::de::DeserializeOwned>(mut command: Command, what: &str) ->
         .stdin(Stdio::null())
         .output()
         .with_context(|| format!("cannot run {what}"))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "{what} failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    serde_json::from_slice(&output.stdout).with_context(|| format!("{what} returned invalid JSON"))
+    // A non-zero exit that still carries the versioned answer is the answer:
+    // `toimija gates status` exits 1 to say "stale", not "could not look".
+    // Only an unparseable answer is a failed inspection.
+    if output.stdout.trim_ascii().is_empty() {
+        anyhow::bail!(
+            "{what} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "{what} returned invalid JSON (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    })
 }
 
 fn toimija(root: &Path, args: &[&str]) -> Command {

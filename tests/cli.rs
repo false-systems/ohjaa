@@ -28,7 +28,7 @@ case " $* " in
     exit 0;;
   *" context "*) cat "${OHJAA_STUB_CONTEXT:?}"; exit 0;;
   *" repository-point "*) cat "${OHJAA_STUB_POINT:?}"; exit 0;;
-  *" gates status "*) cat "${OHJAA_STUB_GATES:?}"; exit 0;;
+  *" gates status "*) cat "${OHJAA_STUB_GATES:?}"; exit "${OHJAA_STUB_GATES_EXIT:-0}";;
   *" verify-work "*|*" close-work "*) exit 0;;
 esac
 # Anything else is the exec'd `run`: its exit status is what ohjaa returns.
@@ -780,6 +780,37 @@ fn golden_2_an_inconclusive_decision_holds_before_any_launch() {
         cycle.action(),
         r#"{"action":"held","reason":"decision_held"}"#
     );
+    cycle.fixture.cleanup();
+}
+
+#[test]
+fn a_stale_gate_reported_with_a_non_zero_exit_is_still_pending() {
+    if !git_available() {
+        return;
+    }
+    let cycle = CycleFixture::new("stale-exit");
+    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed", "0")]);
+    cycle.fixture.set_file(
+        "gates.json",
+        r#"[{"gate":"sykli-full","status":"stale repository point","receipt":"gatercpt_0"}]"#,
+    );
+    let (stdout, stderr, code) = output_of(
+        cycle
+            .fixture
+            .ohjaa()
+            .env("OHJAA_STUB_GATES_EXIT", "1")
+            .args(["cycle", "step", "--cycle"])
+            .arg(&cycle.cycle)
+            .arg("--work")
+            .arg(&cycle.work)
+            .arg("--decision")
+            .arg(&cycle.decision)
+            .arg("--qa-plan")
+            .arg(&cycle.plan)
+            .current_dir(&cycle.repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stdout.trim(), r#"{"action":"run_gates"}"#);
     cycle.fixture.cleanup();
 }
 
