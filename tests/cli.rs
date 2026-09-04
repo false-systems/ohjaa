@@ -45,7 +45,13 @@ exit 0
 "#;
 
 /// `teko current` answers from a file; nothing else is asked of it.
-const TEKO_STUB: &str = "#!/bin/sh\ncat \"${OHJAA_STUB_TEKO:?}\"\n";
+const TEKO_STUB: &str = r#"#!/bin/sh
+printf 'teko %s\n' "$*" >> "$OHJAA_STUB_TEKO_ARGV"
+case "$1" in
+  current) cat "${OHJAA_STUB_TEKO:?}";;
+esac
+exit 0
+"#;
 
 /// A session payload exactly as `toimija sessions --json` emits it.
 fn sessions_json(sessions: &str, coverage: &str) -> String {
@@ -177,7 +183,8 @@ impl Fixture {
             .env("OHJAA_STUB_CONTEXT", self.dir.join("context.json"))
             .env("OHJAA_STUB_POINT", self.dir.join("point.json"))
             .env("OHJAA_STUB_GATES", self.dir.join("gates.json"))
-            .env("OHJAA_STUB_TEKO", self.dir.join("teko.json"));
+            .env("OHJAA_STUB_TEKO", self.dir.join("teko.json"))
+            .env("OHJAA_STUB_TEKO_ARGV", self.dir.join("teko-argv.txt"));
         command
     }
 
@@ -945,5 +952,54 @@ fn cycle_run_loop_acts_through_toimija_and_stops_on_a_terminal_action() {
     );
     let argv = fs::read_to_string(cycle.fixture.dir.join("argv.txt")).unwrap();
     assert!(argv.contains("verify-work"), "{argv}");
+    cycle.fixture.cleanup();
+}
+
+#[test]
+fn cycle_run_delivers_the_verdict_to_teko_before_asking_toimija_to_close() {
+    if !git_available() {
+        return;
+    }
+    let cycle = CycleFixture::new("close");
+    cycle.set_sessions(&[
+        cycle.session("impl-1", "implementation", "closed", "0"),
+        cycle.session("qa-1", "qa", "closed", "0"),
+    ]);
+    cycle.current_gate(0);
+    cycle.verdict("pass", TOKEN, "qa-1");
+    let (stdout, stderr, code) = output_of(
+        cycle
+            .fixture
+            .ohjaa()
+            .args(["cycle", "run", "--cycle"])
+            .arg(&cycle.cycle)
+            .arg("--work")
+            .arg(&cycle.work)
+            .arg("--decision")
+            .arg(&cycle.decision)
+            .arg("--qa-plan")
+            .arg(&cycle.plan)
+            .arg("--verdict")
+            .arg(&cycle.verdict)
+            .args([
+                "--max-steps",
+                "1",
+                "sh",
+                "--intent",
+                "close",
+                "--no-briefing",
+            ])
+            .current_dir(&cycle.repo),
+    );
+    assert_eq!(code, Some(3), "{stderr}");
+    assert_eq!(stdout.trim(), r#"{"action":"held","reason":"step_budget"}"#);
+    assert!(stderr.contains("close_work"), "{stderr}");
+    let argv = fs::read_to_string(cycle.fixture.dir.join("argv.txt")).unwrap();
+    assert!(argv.contains("close-work"), "{argv}");
+    let teko_argv = fs::read_to_string(cycle.fixture.dir.join("teko-argv.txt")).unwrap();
+    assert!(
+        teko_argv.contains("teko observe-verdict --verdict"),
+        "{teko_argv}"
+    );
     cycle.fixture.cleanup();
 }

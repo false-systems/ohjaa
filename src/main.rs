@@ -481,7 +481,10 @@ fn cmd_cycle(command: &CycleCmd, roots: &[PathBuf]) -> Result<i32> {
                         })?
                     }
                     cycle::Next::RunGates => toimija_step(&root, "verify-work", *dry_run)?,
-                    cycle::Next::CloseWork => toimija_step(&root, "close-work", *dry_run)?,
+                    cycle::Next::CloseWork => {
+                        deliver_verdict(&root, artifacts.verdict.as_deref(), *dry_run)?;
+                        toimija_step(&root, "close-work", *dry_run)?
+                    }
                     terminal => {
                         println!("{}", serde_json::to_string(terminal)?);
                         return Ok(action_exit(terminal));
@@ -505,6 +508,48 @@ fn cmd_cycle(command: &CycleCmd, roots: &[PathBuf]) -> Result<i32> {
             Ok(REFUSED)
         }
     }
+}
+
+/// Hand the sealed Kelpo verdict to Teko at the current repository point.
+/// Teko's store is single-process and Toimija holds it open for the whole
+/// worker session, so a QA leg cannot deliver its own verdict; the loop does
+/// it between legs, and Teko alone decides what the verdict discharges.
+fn deliver_verdict(root: &Path, verdict: Option<&Path>, dry_run: bool) -> Result<()> {
+    let Some(verdict) = verdict.filter(|path| path.exists()) else {
+        return Ok(());
+    };
+    let point = Command::new("toimija")
+        .args(["-q", "repository-point", "--json"])
+        .current_dir(root)
+        .output()
+        .context("failed to run toimija repository-point")?;
+    anyhow::ensure!(
+        point.status.success(),
+        "toimija repository-point failed: {}",
+        String::from_utf8_lossy(&point.stderr).trim()
+    );
+    let point_path = std::env::temp_dir().join(format!("ohjaa-point-{}.json", std::process::id()));
+    std::fs::write(&point_path, &point.stdout)?;
+    let mut command = Command::new("teko");
+    command
+        .arg("observe-verdict")
+        .arg("--verdict")
+        .arg(verdict)
+        .arg("--repository-point")
+        .arg(&point_path)
+        .current_dir(root);
+    if dry_run {
+        eprintln!("ohjaa: dry-run; would run: {}", render_command(&command));
+    } else {
+        let status = command
+            .status()
+            .context("failed to run teko observe-verdict")?;
+        if !status.success() {
+            eprintln!("ohjaa: teko did not accept the verdict; closure will say why");
+        }
+    }
+    let _ = std::fs::remove_file(&point_path);
+    Ok(())
 }
 
 /// Run one Toimija verification or closure command in the repository and
