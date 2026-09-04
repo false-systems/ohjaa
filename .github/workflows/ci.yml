@@ -9,19 +9,25 @@ on:
 permissions:
   contents: read
 
+# One run per ref: a superseded push cancels the run it replaced instead of
+# both finishing on hosted minutes. Pushes to main are never cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   rust:
     name: Rust
-    runs-on: arc-arm64
+    runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # Same runner-pool reality as toimija's CI: the arc runners' egress is
-      # rate-limited for anonymous git-over-HTTPS to github.com. Ohjaa has no
-      # git dependencies today; this stays so a future one cannot break CI the
-      # way it broke toimija's (PR #203). Scoped to false-systems only.
+      # Kept from the arc-runner days, when anonymous git-over-HTTPS egress was
+      # rate-limited and broke toimija's CI (PR #203). Ohjaa has no git
+      # dependencies today; it stays so a future one cannot break CI on any
+      # runner. Scoped to false-systems only.
       - name: Authenticate git dependency fetches
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -40,7 +46,7 @@ jobs:
             exit 0
           fi
           if ! command -v apt-get >/dev/null 2>&1; then
-            echo "::error::runner is missing cc and apt-get; install a C toolchain on the arc-arm64 runner image"
+            echo "::error::runner is missing cc and apt-get; the hosted arm64 image should already carry cc"
             exit 1
           fi
           sudo_cmd=""
