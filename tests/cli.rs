@@ -516,3 +516,42 @@ fn run_no_briefing_leaves_the_task_alone() {
     assert!(stderr.contains("fix the lexer"), "{stderr}");
     assert!(!stderr.contains("System perimeter"), "{stderr}");
 }
+
+#[test]
+fn cycle_run_launches_only_the_current_leg() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("cycle-run");
+    let repo = fixture.make_git_repo("only");
+    let facts = fixture.dir.join("cycle.json");
+    fs::write(
+        &facts,
+        r#"{"schema":"ohjaa-cycle-facts.v1","decision":"allow","qa_plan":"current","implementation":"pending","gates":"pending","qa":"pending","verdict":"pending","closure":"pending"}"#,
+    )
+    .unwrap();
+
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "cycle",
+                "run",
+                "--facts",
+                facts.to_str().unwrap(),
+                "codex",
+                "--intent",
+                "implement",
+                "--task",
+                "change the parser",
+                "--no-briefing",
+                "--dry-run",
+            ])
+            .current_dir(&repo),
+    );
+    fixture.cleanup();
+
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("Cycle leg: implementation"), "{stderr}");
+    assert!(stderr.contains("change the parser"), "{stderr}");
+}

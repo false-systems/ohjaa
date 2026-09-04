@@ -6,6 +6,7 @@
 //! out of the way. It never speaks the plugin protocol, never compiles a
 //! packet, and stores nothing.
 
+mod cycle;
 mod roots;
 mod scan;
 mod system;
@@ -43,6 +44,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Reduce a cycle facts snapshot to exactly one legal next action.
+    Cycle {
+        #[command(subcommand)]
+        command: CycleCmd,
+    },
     /// Who is live, across every repo.
     Fleet {
         #[arg(long)]
@@ -84,6 +90,42 @@ enum Cmd {
     System {
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CycleCmd {
+    /// Print the one action legal for this declared facts snapshot.
+    Step {
+        /// A ohjaa-cycle-facts.v1 JSON document.
+        #[arg(long)]
+        facts: PathBuf,
+    },
+    /// Launch the one legal agent leg through `toimija run`.
+    Run {
+        /// A ohjaa-cycle-facts.v1 JSON document.
+        #[arg(long)]
+        facts: PathBuf,
+        /// Agent command, e.g. claude / codex.
+        agent: String,
+        /// Why this session exists.
+        #[arg(long)]
+        intent: String,
+        /// Work for the selected leg.
+        #[arg(long)]
+        task: Option<String>,
+        /// Paths this session expects to touch (repeatable).
+        #[arg(long = "scope", value_name = "PATH")]
+        scope: Vec<String>,
+        /// Decide and explain, but do not launch.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not prepend the derived system perimeter to the task.
+        #[arg(long = "no-briefing")]
+        no_briefing: bool,
+        /// Everything after `--` is passed through to the agent command.
+        #[arg(last = true)]
+        passthrough: Vec<String>,
     },
 }
 
@@ -242,6 +284,53 @@ fn cmd_system(explicit: &[PathBuf], json: bool) -> Result<i32> {
     Ok(view.exit_code())
 }
 
+fn cycle_action(path: &Path) -> Result<cycle::Next> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("cannot read cycle facts {}", path.display()))?;
+    let facts: cycle::Facts = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid cycle facts {}", path.display()))?;
+    cycle::next(&facts).map_err(anyhow::Error::msg)
+}
+
+fn cmd_cycle(command: &CycleCmd, roots: &[PathBuf]) -> Result<i32> {
+    match command {
+        CycleCmd::Step { facts } => {
+            let action = cycle_action(facts)?;
+            println!("{}", serde_json::to_string(&action)?);
+            Ok(0)
+        }
+        CycleCmd::Run {
+            facts,
+            agent,
+            intent,
+            task,
+            scope,
+            dry_run,
+            no_briefing,
+            passthrough,
+        } => match cycle_action(facts)? {
+            cycle::Next::Launch { leg } => cmd_run(RunOptions {
+                agent,
+                intent,
+                task: Some(&match task {
+                    Some(task) => format!("Cycle leg: {leg}\n\n{task}"),
+                    None => format!("Cycle leg: {leg}"),
+                }),
+                scope,
+                dry_run: *dry_run,
+                no_briefing: *no_briefing,
+                passthrough,
+                roots,
+            }),
+            action => {
+                println!("{}", serde_json::to_string(&action)?);
+                eprintln!("ohjaa: cycle action is not an agent launch");
+                Ok(REFUSED)
+            }
+        },
+    }
+}
+
 /// Everything `run` needs, bundled so the signature stays honest.
 struct RunOptions<'a> {
     agent: &'a str,
@@ -394,6 +483,7 @@ fn shell_word(word: &str) -> String {
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
+        Cmd::Cycle { command } => cmd_cycle(command, &cli.root),
         Cmd::Fleet { json } => cmd_fleet(&cli.root, *json),
         Cmd::Why { query, json } => cmd_why(&cli.root, query, *json),
         Cmd::Run {
