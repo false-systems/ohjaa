@@ -13,6 +13,12 @@
 # example binary>. Run after `teko begin …`.
 set -euo pipefail
 
+# One file instead of a handful of variables: cycle.env next to the artifacts.
+CYCLE_ENV=${CYCLE_ENV:-${CYCLE_DIR:-.}/cycle.env}
+if [ -f "$CYCLE_ENV" ]; then
+  # shellcheck disable=SC1090
+  . "$CYCLE_ENV"
+fi
 : "${CYCLE_DIR:?CYCLE_DIR must point at a directory outside the repository}"
 : "${KELPO:?KELPO must point at kelpo.py}"
 : "${KISKO_SEED:?KISKO_SEED must point at the kisko seed_store example binary}"
@@ -20,39 +26,57 @@ REPO_ID=${CYCLE_REPOSITORY_ID:-repo:$(basename "$(git rev-parse --show-toplevel)
 SIGNER=${CYCLE_SIGNER:-operator}
 RIGOR=${CYCLE_RIGOR:-smoke}
 SUITE_ROOT=${CYCLE_SUITE_ROOT:-tests}
+# The QA contract: the graph Sykli runs as Kelpo's tests. It must already be
+# committed, so its hash can be sealed into the plan before any implementation
+# evidence exists. Smoke rigor may point at the main graph.
+QA_CONTRACT=${CYCLE_QA_CONTRACT:-sykli.json}
+[ -f "$QA_CONTRACT" ] || { echo "QA contract $QA_CONTRACT does not exist in the tree" >&2; exit 3; }
+if [ "$RIGOR" != smoke ] && [ "$QA_CONTRACT" = sykli.json ]; then
+  echo "$RIGOR rigor needs a QA contract of its own (CYCLE_QA_CONTRACT), not the main graph" >&2; exit 3
+fi
 mkdir -p "$CYCLE_DIR/kisko/.kisko"
 
 echo "== teko work artifact"
 teko packet --artifact > "$CYCLE_DIR/work.json"
 sauma verify "$CYCLE_DIR/work.json" >/dev/null
-toimija -q repository-point --json > "$CYCLE_DIR/baseline-point.json"
-git rev-parse HEAD > "$CYCLE_DIR/baseline-commit"
 WD=$(jq -r .sauma.digest "$CYCLE_DIR/work.json")
 WID=$(jq -r .packet.work.id "$CYCLE_DIR/work.json")
+WTOKEN=$(jq -r .repository.token "$CYCLE_DIR/work.json")
+# The baseline is the point the work was activated at. Sealing normally
+# happens there; re-sealing later (a new budget after a failed cycle) reuses
+# the baseline point captured the first time, never the moved tree.
+if [ -f "$CYCLE_DIR/baseline-point.json" ] && [ "$(jq -r .repository.consistency_token "$CYCLE_DIR/baseline-point.json")" = "$WTOKEN" ]; then
+  echo "reusing the baseline point sealed earlier"
+else
+  toimija -q repository-point --json > "$CYCLE_DIR/baseline-point.json"
+  git rev-parse HEAD > "$CYCLE_DIR/baseline-commit"
+fi
 TOKEN=$(jq -r .repository.consistency_token "$CYCLE_DIR/baseline-point.json")
 RP=$(jq -r .repository.id "$CYCLE_DIR/baseline-point.json")
-WTOKEN=$(jq -r .repository.token "$CYCLE_DIR/work.json")
 if [ "$TOKEN" != "$WTOKEN" ]; then
-  echo "work artifact token $WTOKEN is not Toimija's current token $TOKEN — begin the work under a Toimija session" >&2
+  echo "work artifact token $WTOKEN is not Toimija's token at the baseline ($TOKEN) — begin the work under a Toimija session, and seal before implementing" >&2
   exit 3
 fi
 
 echo "== kisko decision (signed by $SIGNER)"
 cd "$CYCLE_DIR/kisko"
 [ -f judgements.redb ] || "$KISKO_SEED" seed judgements.redb "$REPO_ID"
-PDIG="sha256:$(shasum -a 256 "$CYCLE_DIR/baseline-point.json" | cut -d' ' -f1)"
+# Facts come from Toimija and Teko, materialized by Kisko itself; the
+# obligation is the Teko work artifact. The request names the context
+# digest a deliberation must bind to.
+(cd "$OLDPWD" && toimija -q gates status --json > "$CYCLE_DIR/kisko/gates.json" 2>/dev/null || true)
 jq -n --arg id "$WID" --arg d "$WD" --arg repo "$REPO_ID" \
   '{obligation:{id:$id,digest:$d},scopes:[{kind:"global"},{kind:"repository",id:$repo},{kind:"obligation",id:$id}]}' > obligation.json
-jq -n --arg t "$TOKEN" --arg d "$PDIG" --arg wd "$WD" \
-  '{repository_point:{repository:"'"$REPO_ID"'",consistency_token:$t,digest:$d},labels:[],
-    facts:[{id:"F-1",kind:"observed",statement:"The active Teko work artifact and its declared scope",source:$wd}]}' > context.json
-kisko decide --obligation obligation.json --repository-context context.json --store judgements.redb --json > inconclusive.json
-CTX=$("$KISKO_SEED" context-digest inconclusive.json)
+(cd "$OLDPWD" && kisko facts --repository-point "$CYCLE_DIR/baseline-point.json" --work "$CYCLE_DIR/work.json" --gates "$CYCLE_DIR/kisko/gates.json") > context.json
+kisko decide --obligation obligation.json --repository-context context.json --store judgements.redb --request > request.json
+sauma verify request.json >/dev/null
+CTX=$(jq -r .context_digest request.json)
 python3 - "$CTX" "${CYCLE_DECISION_SUMMARY:-Do the declared work within its scope}" <<'PY'
 import json, hashlib, sys
 ctx, summary = sys.argv[1], sys.argv[2]
+context = json.load(open("context.json"))
 analysis = {
-  "facts_used": ["F-1"],
+  "facts_used": [fact["id"] for fact in context["facts"]],
   "criteria_used": [{"logical_id": "C-1", "version": 1}],
   "alternatives": [
     {"id": "declared", "summary": summary, "invariant": "Only the declared write scope changes",
@@ -81,30 +105,40 @@ sauma verify "$CYCLE_DIR/decision.json" >/dev/null
 DD=$(jq -r .sauma.digest "$CYCLE_DIR/decision.json")
 cd - >/dev/null
 
-echo "== kelpo plan ($RIGOR, one sykli task per obligation)"
-CH=$(jq -r .contract_hash sykli.lock)
-TASKS=$(sykli plan sykli.json --json 2>/dev/null | jq -c '.tasks' || echo '[]')
-jq -n --arg w "$WID" --arg d "$WD" --arg t "$WTOKEN" --arg ch "$CH" --arg rigor "$RIGOR" --arg root "$SUITE_ROOT" \
-  --argjson tasks "$TASKS" --argjson obligations "$(jq -c '[.packet.obligations[].id]' "$CYCLE_DIR/work.json")" '
-  ($obligations | to_entries | map({obligation: .value, task: $tasks[.key % ($tasks|length)]})) as $pairs |
+echo "== kelpo plan ($RIGOR, cases are the tasks of $QA_CONTRACT)"
+CH=$(sykli plan "$QA_CONTRACT" --json | jq -r .contract_hash)
+TASKS=$(sykli plan "$QA_CONTRACT" --json | jq -c '.tasks')
+[ "$(echo "$TASKS" | jq length)" -gt 0 ] || { echo "QA contract $QA_CONTRACT has no tasks" >&2; exit 3; }
+# Which QA tasks test which obligation. CYCLE_CASES is a JSON object
+# {obligation: [task, ...]}; every obligation needs at least one task and
+# every task belongs to exactly one obligation. Manual goals get $RIGOR;
+# Teko's mechanical obligations (gate, scope, repository-changed) get smoke,
+# since Teko proves those itself and the QA task only checks the final tree.
+: "${CYCLE_CASES:?CYCLE_CASES must map each obligation to its QA tasks}"
+jq -n --arg w "$WID" --arg d "$WD" --arg t "$WTOKEN" --arg ch "$CH" --arg rigor "$RIGOR" --arg root "$SUITE_ROOT" --arg contract "$QA_CONTRACT" \
+  --argjson tasks "$TASKS" --argjson cases "$CYCLE_CASES" \
+  --argjson obligations "$(jq -c '[.packet.obligations[] | {id, kind}]' "$CYCLE_DIR/work.json")" '
+  ($obligations | map(.id)) as $ids |
+  if ($cases | keys | sort) != ($ids | sort) then error("CYCLE_CASES obligations \($cases|keys) differ from the work obligations \($ids)") else . end |
+  if ([$cases[] | .[]] | sort) != ($tasks | sort) then error("CYCLE_CASES tasks \([$cases[]|.[]]) differ from the QA contract tasks \($tasks)") else . end |
   {schema:"kelpo-plan.v1", teko:{work:$w,digest:$d}, repository:{token:$t},
-   obligations: ($pairs | map({obligation: .obligation, rigor: $rigor})),
-   cases: ($pairs | map({id: .task, obligation: .obligation, layer: "unit",
-            claim: ("sykli task " + .task + " passes at the final tree"),
-            setup: "Evaluate the locked graph in a fresh worktree of the final tree",
-            stimulus: ("sykli run — task " + .task), oracle: "outcome passed"})),
-   gaps: [], suite: {roots: [$root], contract_hash: $ch}}' > "$CYCLE_DIR/plan-body.json"
+   obligations: ($obligations | map({obligation: .id, rigor: (if .kind == "manual" then $rigor else "smoke" end)})),
+   cases: [ $ids[] as $o | $cases[$o][] | {id: ., obligation: $o, layer: "unit",
+            claim: ("QA task " + . + " passes at the final tree" + (if ($obligations[] | select(.id == $o) | .kind) == "manual" and $rigor != "smoke" then " and fails at the baseline" else "" end)),
+            setup: ("Evaluate " + $contract + " in a fresh worktree"),
+            stimulus: ("sykli run " + $contract + " — task " + .), oracle: "outcome passed at final"} ],
+   gaps: [], suite: {roots: [$root], contract_path: $contract, contract_hash: $ch}}' > "$CYCLE_DIR/plan-body.json"
 python3 "$KELPO" seal-plan "$CYCLE_DIR/plan-body.json" --work-artifact "$CYCLE_DIR/work.json" > "$CYCLE_DIR/plan.json"
 sauma verify "$CYCLE_DIR/plan.json" >/dev/null
 PD=$(jq -r .sauma.digest "$CYCLE_DIR/plan.json")
 
 echo "== cycle.v1"
-jq -n --arg wd "$WD" --arg dd "$DD" --arg pd "$PD" --arg rp "$RP" \
+jq -n --arg wd "$WD" --arg dd "$DD" --arg pd "$PD" --arg rp "$RP" --arg signer "$SIGNER" \
   --argjson effects "${CYCLE_EFFECTS:-[\"commit\"]}" \
   --argjson max "${CYCLE_MAX_ATTEMPTS:-2}" --argjson retry "${CYCLE_WORKER_RETRY:-1}" '
   {schema:"cycle.v1",
    work:{artifact:"teko-work.v1",digest:$wd,repository_point:$rp},
-   decision:{artifact:"kisko.decision.v1",digest:$dd,repository_point:$rp},
+   decision:{artifact:"kisko.decision.v1",digest:$dd,repository_point:$rp,signers:[$signer]},
    qa_plan:{artifact:"kelpo-plan.v1",digest:$pd,repository_point:$rp},
    implementation:{worker_role:"implementation",max_attempts:$max},
    qa:{worker_role:"qa",must_differ_from:"implementation"},

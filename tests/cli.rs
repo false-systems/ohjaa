@@ -570,7 +570,7 @@ fn cycle_run_launches_only_the_current_leg() {
     let facts = fixture.dir.join("cycle.json");
     fs::write(
         &facts,
-        r#"{"schema":"ohjaa-cycle-facts.v1","cycle":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sauma":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"decision":"allow","qa_plan":"current","implementation":"pending","gates":"pending","qa":"pending","verdict":"pending","closure":"pending"}"#,
+        r#"{"schema":"ohjaa-cycle-facts.v1","cycle":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sauma":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"decision":"allow","effects":"current","qa_plan":"current","implementation":"pending","gates":"pending","qa":"pending","verdict":"pending","closure":"pending"}"#,
     )
     .unwrap();
 
@@ -635,7 +635,9 @@ impl CycleFixture {
         );
         let decision = fixture.set_file(
             "decision.json",
-            &format!(r#"{{"schema":"kisko.decision.v1","status":"decided","sauma":{{"digest":"{DIGEST_A}"}}}}"#),
+            &format!(
+                r#"{{"schema":"kisko.decision.v1","status":"decided","signer":{{"identity":"operator"}},"expires_at":"2999-01-01T00:00:00Z","repository_point":{{"consistency_token":"{TOKEN}"}},"sauma":{{"digest":"{DIGEST_A}"}}}}"#
+            ),
         );
         let plan = fixture.set_file(
             "plan.json",
@@ -652,7 +654,10 @@ impl CycleFixture {
             "gates.json",
             r#"[{"gate":"sykli-full","status":"stale","receipt":null}]"#,
         );
-        fixture.set_file("teko.json", r#"{"active":{"work":{"id":"w1"}}}"#);
+        fixture.set_file(
+            "teko.json",
+            r#"{"active":{"work":{"id":"w1"},"status":{"obligations":[{"id":"scope","status":"resolved"},{"id":"repository-changed","status":"unresolved"}]}}}"#,
+        );
         Self {
             fixture,
             repo,
@@ -664,10 +669,22 @@ impl CycleFixture {
         }
     }
 
-    fn session(&self, id: &str, leg: &str, liveness: &str, exit: &str) -> String {
+    fn session(&self, id: &str, leg: &str, liveness: &str) -> String {
+        self.session_with_effects(id, leg, liveness, "[]")
+    }
+
+    fn session_with_effects(&self, id: &str, leg: &str, liveness: &str, effects: &str) -> String {
         format!(
-            r#"{{"id":"{id}","agent":["sh"],"worktree":"/tmp/r","branch":"main","intent":"x","scope":[],"liveness":"{liveness}","exit_status":{exit},"cycle_action":{{"cycle":"{DIGEST_A}","leg":"{leg}","attempt":0,"repository_point":"rpoint_x"}}}}"#
+            r#"{{"id":"{id}","agent":["sh"],"worktree":"/tmp/r","branch":"main","intent":"x","scope":[],"liveness":"{liveness}","exit_status":0,"effects_observed":{effects},"cycle_action":{{"cycle":"{DIGEST_A}","leg":"{leg}","attempt":0,"repository_point":"rpoint_x"}}}}"#
         )
+    }
+
+    /// Teko reports the tree changed within scope: the implementation is done.
+    fn implemented(&self) {
+        self.fixture.set_file(
+            "teko.json",
+            r#"{"active":{"work":{"id":"w1"},"status":{"obligations":[{"id":"scope","status":"resolved"},{"id":"repository-changed","status":"resolved"}]}}}"#,
+        );
     }
 
     fn set_sessions(&self, sessions: &[String]) {
@@ -734,19 +751,28 @@ fn golden_1_derived_facts_walk_the_cycle_to_closed() {
         r#"{"action":"launch","leg":"implementation"}"#
     );
 
-    // The implementation leg closed cleanly: gates are next, and the leg is
+    // A closed session alone proves nothing: Teko has not seen the tree
+    // change, so the leg is relaunched (attempt 1 of 2).
+    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed")]);
+    assert_eq!(
+        cycle.action(),
+        r#"{"action":"launch","leg":"implementation"}"#
+    );
+    // Teko reports the change within scope: gates are next, and the leg is
     // consumed rather than launched again (golden case 5).
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed", "0")]);
+    cycle.implemented();
     assert_eq!(cycle.action(), r#"{"action":"run_gates"}"#);
 
     cycle.current_gate(0);
     assert_eq!(cycle.action(), r#"{"action":"launch","leg":"qa"}"#);
 
+    // A closed QA session without a verdict is a spent attempt, not QA done:
+    // relaunch within budget (1 + worker_failure 1 = 2 attempts).
     cycle.set_sessions(&[
-        cycle.session("impl-1", "implementation", "closed", "0"),
-        cycle.session("qa-1", "qa", "closed", "0"),
+        cycle.session("impl-1", "implementation", "closed"),
+        cycle.session("qa-1", "qa", "closed"),
     ]);
-    assert_eq!(cycle.action(), r#"{"action":"judge_qa"}"#);
+    assert_eq!(cycle.action(), r#"{"action":"launch","leg":"qa"}"#);
 
     cycle.verdict("pass", TOKEN, "qa-1");
     assert_eq!(cycle.action(), r#"{"action":"close_work"}"#);
@@ -796,7 +822,8 @@ fn a_stale_gate_reported_with_a_non_zero_exit_is_still_pending() {
         return;
     }
     let cycle = CycleFixture::new("stale-exit");
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed", "0")]);
+    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed")]);
+    cycle.implemented();
     cycle.fixture.set_file(
         "gates.json",
         r#"[{"gate":"sykli-full","status":"stale repository point","receipt":"gatercpt_0"}]"#,
@@ -827,7 +854,8 @@ fn golden_3_a_failed_gate_receipt_is_a_failure_not_a_rerun() {
         return;
     }
     let cycle = CycleFixture::new("golden-3");
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed", "0")]);
+    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed")]);
+    cycle.implemented();
     cycle.current_gate(1);
     assert_eq!(
         cycle.action(),
@@ -843,20 +871,22 @@ fn golden_4_qa_evidence_from_the_implementation_session_is_inconclusive() {
     }
     let cycle = CycleFixture::new("golden-4");
     cycle.set_sessions(&[
-        cycle.session("impl-1", "implementation", "closed", "0"),
-        cycle.session("qa-1", "qa", "closed", "0"),
+        cycle.session("impl-1", "implementation", "closed"),
+        cycle.session("qa-1", "qa", "closed"),
     ]);
+    cycle.implemented();
     cycle.current_gate(0);
     cycle.verdict("pass", TOKEN, "impl-1");
     assert_eq!(cycle.action(), r#"{"action":"held","reason":"qa_verdict"}"#);
 
-    // A verdict anchored to a point the tree has left is stale, not false.
+    // A verdict anchored to a point the tree has left is stale, not false:
+    // QA runs again (the one closed session leaves one attempt in budget).
     cycle.verdict(
         "pass",
         "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "qa-1",
     );
-    assert_eq!(cycle.action(), r#"{"action":"held","reason":"qa_verdict"}"#);
+    assert_eq!(cycle.action(), r#"{"action":"launch","leg":"qa"}"#);
     cycle.fixture.cleanup();
 }
 
@@ -866,7 +896,7 @@ fn golden_6_a_live_leg_holds_instead_of_duplicating_work() {
         return;
     }
     let cycle = CycleFixture::new("golden-6");
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "active", "null")]);
+    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "active")]);
     assert_eq!(
         cycle.action(),
         r#"{"action":"held","reason":"implementation"}"#
@@ -880,14 +910,15 @@ fn golden_8_an_exhausted_worker_budget_fails_without_another_launch() {
         return;
     }
     let cycle = CycleFixture::new("golden-8");
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed", "1")]);
+    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed")]);
     assert_eq!(
         cycle.action(),
         r#"{"action":"launch","leg":"implementation"}"#
     );
+    // A session that went quiet is a finished attempt too, never waited on.
     cycle.set_sessions(&[
-        cycle.session("impl-1", "implementation", "closed", "1"),
-        cycle.session("impl-2", "implementation", "closed", "null"),
+        cycle.session("impl-1", "implementation", "closed"),
+        cycle.session("impl-2", "implementation", "stale"),
     ]);
     assert_eq!(
         cycle.action(),
@@ -905,10 +936,9 @@ fn an_unreadable_session_listing_holds_rather_than_launching_blind() {
     cycle.fixture.set_sessions(&sessions_json("", "degraded"));
     let (stdout, stderr, code) = cycle.step();
     assert_eq!(code, Some(0), "{stderr}");
-    assert_eq!(
-        stdout.trim(),
-        r#"{"action":"held","reason":"implementation"}"#
-    );
+    // Sessions unreadable means effects unobservable: the first thing the
+    // reducer cannot vouch for is the first thing it holds on.
+    assert_eq!(stdout.trim(), r#"{"action":"held","reason":"effects"}"#);
     assert!(stderr.contains("absence is not evidence"), "{stderr}");
     cycle.fixture.cleanup();
 }
@@ -919,7 +949,8 @@ fn cycle_run_loop_acts_through_toimija_and_stops_on_a_terminal_action() {
         return;
     }
     let cycle = CycleFixture::new("loop");
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed", "0")]);
+    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed")]);
+    cycle.implemented();
     // Gates are stale, so the loop runs `toimija verify-work` once; the stub
     // leaves them stale, so the second step repeats — and the bound ends it.
     let (stdout, stderr, code) = output_of(
@@ -962,9 +993,10 @@ fn cycle_run_delivers_the_verdict_to_teko_before_asking_toimija_to_close() {
     }
     let cycle = CycleFixture::new("close");
     cycle.set_sessions(&[
-        cycle.session("impl-1", "implementation", "closed", "0"),
-        cycle.session("qa-1", "qa", "closed", "0"),
+        cycle.session("impl-1", "implementation", "closed"),
+        cycle.session("qa-1", "qa", "closed"),
     ]);
+    cycle.implemented();
     cycle.current_gate(0);
     cycle.verdict("pass", TOKEN, "qa-1");
     let (stdout, stderr, code) = output_of(
@@ -1002,4 +1034,102 @@ fn cycle_run_delivers_the_verdict_to_teko_before_asking_toimija_to_close() {
         "{teko_argv}"
     );
     cycle.fixture.cleanup();
+}
+
+#[test]
+fn golden_7_an_undeclared_effect_holds_before_the_next_action() {
+    if !git_available() {
+        return;
+    }
+    let cycle = CycleFixture::new("golden-7");
+    // The cycle declares no effects; Toimija saw the implementation push.
+    cycle.set_sessions(&[cycle.session_with_effects(
+        "impl-1",
+        "implementation",
+        "closed",
+        r#"["commit","push"]"#,
+    )]);
+    cycle.implemented();
+    assert_eq!(
+        cycle.action(),
+        r#"{"action":"held","reason":"undeclared_effect"}"#
+    );
+
+    // Partial observation is not absence of effects.
+    cycle.fixture.set_sessions(&sessions_json(
+        &format!(
+            r#"{{"id":"impl-1","agent":["sh"],"worktree":"/tmp/r","branch":"main","intent":"x","scope":[],"liveness":"closed","effects_observed":[],"effects_coverage":"partial","cycle_action":{{"cycle":"{DIGEST_A}","leg":"implementation","attempt":0,"repository_point":"rpoint_x"}}}}"#
+        ),
+        "available",
+    ));
+    assert_eq!(cycle.action(), r#"{"action":"held","reason":"effects"}"#);
+    cycle.fixture.cleanup();
+}
+
+#[test]
+fn a_decision_launches_only_at_its_point_before_expiry_from_an_allowed_signer() {
+    if !git_available() {
+        return;
+    }
+    let cycle = CycleFixture::new("decision-binding");
+    let decision = |signer: &str, expires: &str, token: &str| {
+        format!(
+            r#"{{"schema":"kisko.decision.v1","status":"decided","signer":{{"identity":"{signer}"}},"expires_at":"{expires}","repository_point":{{"consistency_token":"{token}"}},"sauma":{{"digest":"{DIGEST_A}"}}}}"#
+        )
+    };
+    // The cycle names who may launch and where it was sealed.
+    cycle.fixture.set_file(
+        "cycle.v1.json",
+        &format!(
+            r#"{{"schema":"cycle.v1","work":{{"artifact":"teko-work.v1","digest":"{DIGEST_A}","repository_point":"rpoint_x"}},"decision":{{"artifact":"kisko.decision.v1","digest":"{DIGEST_A}","repository_point":"rpoint_x","signers":["operator"]}},"qa_plan":{{"artifact":"kelpo-plan.v1","digest":"{DIGEST_A}","repository_point":"rpoint_x"}},"implementation":{{"worker_role":"implementation","max_attempts":2}},"qa":{{"worker_role":"qa","must_differ_from":"implementation"}},"effects":[],"retry":{{"gate_failure":1,"worker_failure":1}},"sauma":{{"digest":"{DIGEST_A}","anchored_at":"{TOKEN}"}}}}"#
+        ),
+    );
+    cycle.fixture.set_file(
+        "decision.json",
+        &decision("stranger", "2999-01-01T00:00:00Z", TOKEN),
+    );
+    assert_eq!(
+        cycle.action(),
+        r#"{"action":"held","reason":"decision_held"}"#
+    );
+    cycle.fixture.set_file(
+        "decision.json",
+        &decision("operator", "2000-01-01T00:00:00Z", TOKEN),
+    );
+    assert_eq!(
+        cycle.action(),
+        r#"{"action":"held","reason":"decision_held"}"#
+    );
+    cycle.fixture.set_file(
+        "decision.json",
+        &decision(
+            "operator",
+            "2999-01-01T00:00:00Z",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+    );
+    assert_eq!(
+        cycle.action(),
+        r#"{"action":"held","reason":"decision_held"}"#
+    );
+    cycle.fixture.set_file(
+        "decision.json",
+        &decision("operator", "2999-01-01T00:00:00Z", TOKEN),
+    );
+    assert_eq!(
+        cycle.action(),
+        r#"{"action":"launch","leg":"implementation"}"#
+    );
+    cycle.fixture.cleanup();
+}
+
+#[test]
+fn cycle_doctor_names_every_tool_and_the_session() {
+    let fixture = Fixture::new("doctor");
+    let (stdout, _, code) = output_of(fixture.ohjaa().args(["cycle", "doctor"]));
+    assert!(stdout.contains("toimija"), "{stdout}");
+    assert!(stdout.contains("session"), "{stdout}");
+    assert!(stdout.contains("ready"), "{stdout}");
+    assert!(code == Some(0) || code == Some(3), "{stdout}");
+    fixture.cleanup();
 }

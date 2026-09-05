@@ -6,11 +6,10 @@ The composition owner's side of the autonomous cycle v0 (sykli
 `$CYCLE_DIR`, a directory outside the repository tree.
 
 ```bash
+ohjaa cycle doctor                                # what is missing, before anything runs
+mkdir -p /tmp/cycle-1 && cp examples/cycle/cycle.env.example /tmp/cycle-1/cycle.env
+$EDITOR /tmp/cycle-1/cycle.env                    # paths only; the kit sources it
 export CYCLE_DIR=/tmp/cycle-1
-export KELPO=~/projects/kelpo/kelpo.py
-export KELPO_ASSEMBLE=~/projects/kelpo/examples/assemble_smoke_verdict.py
-export KISKO_SEED=$(cd ~/projects/kisko && cargo build -q --example seed_store && \
-                    echo "$(cargo metadata --format-version 1 | jq -r .target_directory)/debug/examples/seed_store")
 
 # inside a Toimija session for the repository, so Teko records Toimija's point
 teko begin "record the run" --goal note="the doc has a section" --gate sykli-full --scope docs
@@ -33,9 +32,14 @@ current token, which means `teko begin` ran outside a Toimija session.
 
 `worker.sh` is a scripted worker for both legs. The implementation leg runs
 `$CYCLE_IMPLEMENTATION` and commits within scope, idempotently. The QA leg
-evaluates the locked Sykli graph in a fresh worktree so outcomes are observed,
-normalizes the receipt through Kelpo, assembles and judges a verdict, and
-writes it to `$CYCLE_DIR/verdict.json`. It never talks to Teko: the loop
+runs the plan's QA contract (`suite.contract_path`, a second Sykli contract
+whose tasks are the plan's cases) in a fresh worktree of the final tree for
+green evidence and, at standard rigor, in a worktree of the baseline for red
+evidence: the cases must fail there. Kelpo assembles and judges; a case that
+fails at the final tree refutes its obligation and the verdict is `fail`. The
+verdict lands at `$CYCLE_DIR/verdict.json`. The QA contract is committed
+before `teko begin`, so its hash is sealed into the plan before any
+implementation evidence exists. It never talks to Teko: the loop
 delivers the verdict between legs, because Toimija holds Teko's single-process
 store for the whole session.
 

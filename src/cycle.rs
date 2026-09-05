@@ -27,6 +27,11 @@ pub struct Artifact {
     pub artifact: String,
     pub digest: String,
     pub repository_point: String,
+    /// Identities whose signature makes this artifact acceptable; absent means
+    /// any signer the artifact's own trust root accepted. Used for the
+    /// decision: who may launch a cycle is the composition owner's policy.
+    #[serde(default)]
+    pub signers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +66,10 @@ pub struct Retry {
 #[derive(Debug, Deserialize)]
 pub struct Envelope {
     pub digest: String,
+    /// The consistency token the artifact was sealed at. For the cycle, this
+    /// is its input repository point, which every sealed input must share.
+    #[serde(default)]
+    pub anchored_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +79,10 @@ pub struct Facts {
     pub cycle: String,
     pub sauma: Envelope,
     pub decision: Decision,
+    /// Whether every effect observed on this cycle's sessions was declared.
+    /// `current` means within the allowlist, `failed` means an undeclared
+    /// effect was observed, `inconclusive` means observation was incomplete.
+    pub effects: Evidence,
     pub qa_plan: Evidence,
     pub implementation: Evidence,
     pub gates: Evidence,
@@ -136,6 +149,15 @@ pub fn next(cycle: &Cycle, facts: &Facts) -> Result<Next, &'static str> {
                 reason: "decision_escalated",
             })
         }
+    }
+    match facts.effects {
+        Evidence::Current | Evidence::Pending => {}
+        Evidence::Failed => {
+            return Ok(Next::Held {
+                reason: "undeclared_effect",
+            })
+        }
+        Evidence::Inconclusive => return Ok(Next::Held { reason: "effects" }),
     }
     match facts.qa_plan {
         Evidence::Current => {}
@@ -259,8 +281,10 @@ mod tests {
             sauma: Envelope {
                 digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .into(),
+                anchored_at: None,
             },
             decision: Decision::Allow,
+            effects: Evidence::Current,
             qa_plan: Evidence::Current,
             implementation: Evidence::Pending,
             gates: Evidence::Pending,
@@ -385,16 +409,19 @@ mod tests {
                 artifact: "teko-work.v1".into(),
                 digest: digest.into(),
                 repository_point: "rpoint_x".into(),
+                signers: None,
             },
             decision: Artifact {
                 artifact: "kisko-decision.v1".into(),
                 digest: digest.into(),
                 repository_point: "rpoint_x".into(),
+                signers: None,
             },
             qa_plan: Artifact {
                 artifact: "kelpo-plan.v1".into(),
                 digest: digest.into(),
                 repository_point: "rpoint_x".into(),
+                signers: None,
             },
             implementation: Implementation {
                 worker_role: "implementation".into(),
@@ -411,7 +438,27 @@ mod tests {
             },
             sauma: Envelope {
                 digest: digest.into(),
+                anchored_at: None,
             },
         }
+    }
+
+    #[test]
+    fn golden_7_an_undeclared_effect_holds_before_the_next_action() {
+        let cycle = cycle();
+        let mut facts = facts();
+        facts.implementation = Evidence::Current;
+        facts.effects = Evidence::Failed;
+        assert_eq!(
+            next(&cycle, &facts).unwrap(),
+            Next::Held {
+                reason: "undeclared_effect"
+            }
+        );
+        facts.effects = Evidence::Inconclusive;
+        assert_eq!(
+            next(&cycle, &facts).unwrap(),
+            Next::Held { reason: "effects" }
+        );
     }
 }

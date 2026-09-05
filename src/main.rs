@@ -125,6 +125,8 @@ impl ArtifactArgs {
 
 #[derive(Subcommand)]
 enum CycleCmd {
+    /// Check that everything a cycle needs is present, and name what is not.
+    Doctor,
     /// Derive and print the sealed ohjaa-cycle-facts.v1 snapshot for a cycle.
     Facts {
         /// A sealed cycle.v1 JSON document.
@@ -134,7 +136,8 @@ enum CycleCmd {
         artifacts: ArtifactArgs,
     },
     /// Print the one action legal for this cycle: from a supplied facts
-    /// snapshot, or from facts derived now.
+    /// snapshot, or from facts derived now. `status` is the same question.
+    #[command(visible_alias = "status")]
     Step {
         /// A sealed cycle.v1 JSON document.
         #[arg(long)]
@@ -381,8 +384,83 @@ fn action_exit(action: &cycle::Next) -> i32 {
     }
 }
 
+/// Everything a cycle shells out to, checked before anything runs. A second
+/// person should learn what is missing from this, not from a failure three
+/// steps in. Required tools fail the check; optional ones are reported.
+fn cmd_cycle_doctor() -> Result<i32> {
+    let required = [
+        ("toimija", "sessions, gates, repository points"),
+        ("teko", "work, closure"),
+        ("kisko", "decisions"),
+        ("sauma", "envelopes, stamp, verify"),
+        ("sykli", "the declared graph"),
+        ("git", "the repository"),
+        ("ssh-keygen", "deliberation signatures"),
+        ("jq", "the cycle kit scripts"),
+        ("python3", "kelpo.py"),
+    ];
+    let optional = [("gh", "open_pr effect detection")];
+    let mut missing = Vec::new();
+    for (tool, purpose) in required {
+        match Command::new(tool).arg("--version").output() {
+            Ok(output) if output.status.code().is_some() => {
+                let version = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                println!("ok       {tool:<11} {version}  ({purpose})");
+            }
+            _ => {
+                println!("MISSING  {tool:<11} needed for {purpose}");
+                missing.push(tool);
+            }
+        }
+    }
+    for (tool, purpose) in optional {
+        match Command::new(tool).arg("--version").output() {
+            Ok(output) if output.status.success() => println!("ok       {tool:<11} ({purpose})"),
+            _ => println!("absent   {tool:<11} optional: {purpose}"),
+        }
+    }
+    match (
+        std::env::var_os("TOIMIJA_SESSION"),
+        std::env::var_os("TOIMIJA_REPO_ROOT"),
+        git_root(),
+    ) {
+        (Some(session), Some(root), Some(here))
+            if Path::new(&root)
+                .canonicalize()
+                .ok()
+                .is_some_and(|root| here.canonicalize().ok() == Some(root)) =>
+        {
+            println!(
+                "ok       session     {} for this repository (Teko will record Toimija's point)",
+                session.to_string_lossy()
+            );
+        }
+        (Some(_), _, _) => {
+            println!("WARN     session     a Toimija session exists but not for this repository");
+        }
+        _ => {
+            println!(
+                "WARN     session     none: run under `toimija run` (or `ohjaa run`) so Teko records Toimija's point"
+            );
+        }
+    }
+    if missing.is_empty() {
+        println!("ready");
+        Ok(0)
+    } else {
+        println!("not ready: missing {}", missing.join(", "));
+        Ok(REFUSED)
+    }
+}
+
 fn cmd_cycle(command: &CycleCmd, roots: &[PathBuf]) -> Result<i32> {
     match command {
+        CycleCmd::Doctor => cmd_cycle_doctor(),
         CycleCmd::Facts { cycle, artifacts } => {
             let cycle = load_cycle(cycle)?;
             let derived = derived_facts(&cycle, artifacts)?;
@@ -420,9 +498,35 @@ fn cmd_cycle(command: &CycleCmd, roots: &[PathBuf]) -> Result<i32> {
             passthrough,
         } => {
             let cycle = load_cycle(cycle_path)?;
-            let leg_task = |leg: &str| match task {
-                Some(task) => format!("Cycle leg: {leg}\n\n{task}"),
-                None => format!("Cycle leg: {leg}"),
+            // The whole leg contract, in one paragraph: which leg, what done
+            // means, and the one rule about Teko. The obligations themselves
+            // travel in toimija's packet (Active Teko Work); nothing here is
+            // repeated from it.
+            let verdict_path = artifacts
+                .verdict
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<the verdict path the loop was given>".into());
+            let leg_task = |leg: &str| {
+                let contract = match leg {
+                    "qa" => format!(
+                        "You are the QA leg of cycle {}. Done means a sealed kelpo-verdict.v1 at {} \
+                         that verifies and is anchored to the current repository point; tests you add \
+                         must be able to fail (red at the baseline, green at the final tree). Never run \
+                         `teko` yourself: Toimija holds its store, and the loop delivers your verdict.",
+                        cycle.sauma.digest, verdict_path
+                    ),
+                    _ => format!(
+                        "You are the implementation leg of cycle {}. Done means the declared write \
+                         scope changed and is committed; Teko judges it, not your exit code. Never run \
+                         `teko` yourself: Toimija holds its store.",
+                        cycle.sauma.digest
+                    ),
+                };
+                match task {
+                    Some(task) => format!("Cycle leg: {leg}\n\n{contract}\n\n{task}"),
+                    None => format!("Cycle leg: {leg}\n\n{contract}"),
+                }
             };
             if let Some(facts) = facts {
                 // Single shot from a supplied snapshot: launch the one leg and
