@@ -11,9 +11,14 @@
 #   verdict from the sealed plan, and judges it. It never touches the tree and
 #   never talks to Teko: the cycle loop delivers the verdict between legs.
 set -eu
+CYCLE_ENV=${CYCLE_ENV:-${CYCLE_DIR:-.}/cycle.env}
+if [ -f "$CYCLE_ENV" ]; then
+  # shellcheck disable=SC1090
+  . "$CYCLE_ENV"
+fi
 CD=${CYCLE_DIR:?CYCLE_DIR must point at the cycle artifact directory}
 KELPO=${KELPO:?KELPO must point at kelpo.py}
-ASSEMBLE=${KELPO_ASSEMBLE:?KELPO_ASSEMBLE must point at assemble_smoke_verdict.py from kelpo}
+ASSEMBLE=${KELPO_ASSEMBLE:?KELPO_ASSEMBLE must point at assemble_verdict.py from kelpo}
 SYKLI_BIN=${SYKLI_BIN:-sykli}
 LEG=$(toimija -q sessions --json | jq -r --arg id "$TOIMIJA_SESSION" '.sessions[] | select(.id==$id) | .cycle_action.leg')
 echo "worker: session $TOIMIJA_SESSION leg=$LEG" >&2
@@ -33,20 +38,31 @@ implementation)
 qa)
   cp "$TOIMIJA_LIVE_JSON" "$CD/ctx-qa.json"
   toimija -q repository-point --json > "$CD/final-point.json"
+  QA_CONTRACT=$(jq -r '.suite.contract_path // "sykli.json"' "$CD/plan.json")
+  RIGOR=$(jq -r '.obligations[0].rigor' "$CD/plan.json")
+  ROOT=$(jq -r '.suite.roots[0]' "$CD/plan.json")
+  # Green: the QA graph at the final tree, in a fresh worktree so every task
+  # is observed. The verdict is whatever comes out — a failing task refutes.
   W=$(mktemp -d "${TMPDIR:-/tmp}/cycle-qa-XXXXXX")
   git worktree add -q --detach "$W" HEAD
-  ( cd "$W" && "$SYKLI_BIN" run sykli.json --json > "$CD/receipt.json" )
+  ( cd "$W" && "$SYKLI_BIN" run "$QA_CONTRACT" --json > "$CD/receipt-green.json" ) || true
   git worktree remove --force "$W"
-  python3 "$KELPO" evidence --receipt "$CD/receipt.json" --point "$CD/final-point.json" --context "$CD/ctx-qa.json" > "$CD/evidence.json"
+  python3 "$KELPO" evidence --role green --receipt "$CD/receipt-green.json" --point "$CD/final-point.json" --context "$CD/ctx-qa.json" > "$CD/evidence-green.json"
+  # Baseline: the tree the work started from, for manifests and, at standard
+  # rigor, for red evidence: the same QA graph must fail there.
   B=$(mktemp -d "${TMPDIR:-/tmp}/cycle-baseline-XXXXXX")
   git worktree add -q --detach "$B" "$(cat "$CD/baseline-commit")"
-  ROOT=$(jq -r '.suite.roots[0]' "$CD/plan.json")
   python3 "$KELPO" suite-manifest --repository "$B" --point "$CD/baseline-point.json" --root "$ROOT" > "$CD/baseline-manifest.json"
   python3 "$KELPO" suite-manifest --repository "$PWD" --point "$CD/final-point.json" --root "$ROOT" > "$CD/final-manifest.json"
+  rm -f "$CD/evidence-red.json"
+  if [ "$RIGOR" != smoke ]; then
+    ( cd "$B" && "$SYKLI_BIN" run "$QA_CONTRACT" --json > "$CD/receipt-red.json" ) || true
+    python3 "$KELPO" evidence --role red --receipt "$CD/receipt-red.json" --point "$CD/baseline-point.json" --context "$CD/ctx-qa.json" > "$CD/evidence-red.json"
+  fi
   python3 "$ASSEMBLE" "$CD"
   python3 "$KELPO" judge --plan "$CD/plan.json" --verdict "$CD/verdict-body.json" \
-    --evidence "$CD/evidence.json" --baseline-manifest "$CD/baseline-manifest.json" \
-    --final-manifest "$CD/final-manifest.json" \
+    --evidence "$CD/evidence-green.json" $( [ -f "$CD/evidence-red.json" ] && printf -- '--evidence %s' "$CD/evidence-red.json" ) \
+    --baseline-manifest "$CD/baseline-manifest.json" --final-manifest "$CD/final-manifest.json" \
     $(for c in "$CD"/ctx-implementation-*.json; do printf -- '--session-context %s ' "$c"; done) \
     --session-context "$CD/ctx-qa.json" --baseline-root "$B" --final-root "$PWD" > "$CD/verdict.json"
   git worktree remove --force "$B"

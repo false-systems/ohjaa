@@ -13,6 +13,12 @@
 # example binary>. Run after `teko begin …`.
 set -euo pipefail
 
+# One file instead of a handful of variables: cycle.env next to the artifacts.
+CYCLE_ENV=${CYCLE_ENV:-${CYCLE_DIR:-.}/cycle.env}
+if [ -f "$CYCLE_ENV" ]; then
+  # shellcheck disable=SC1090
+  . "$CYCLE_ENV"
+fi
 : "${CYCLE_DIR:?CYCLE_DIR must point at a directory outside the repository}"
 : "${KELPO:?KELPO must point at kelpo.py}"
 : "${KISKO_SEED:?KISKO_SEED must point at the kisko seed_store example binary}"
@@ -20,6 +26,14 @@ REPO_ID=${CYCLE_REPOSITORY_ID:-repo:$(basename "$(git rev-parse --show-toplevel)
 SIGNER=${CYCLE_SIGNER:-operator}
 RIGOR=${CYCLE_RIGOR:-smoke}
 SUITE_ROOT=${CYCLE_SUITE_ROOT:-tests}
+# The QA contract: the graph Sykli runs as Kelpo's tests. It must already be
+# committed, so its hash can be sealed into the plan before any implementation
+# evidence exists. Smoke rigor may point at the main graph.
+QA_CONTRACT=${CYCLE_QA_CONTRACT:-sykli.json}
+[ -f "$QA_CONTRACT" ] || { echo "QA contract $QA_CONTRACT does not exist in the tree" >&2; exit 3; }
+if [ "$RIGOR" != smoke ] && [ "$QA_CONTRACT" = sykli.json ]; then
+  echo "$RIGOR rigor needs a QA contract of its own (CYCLE_QA_CONTRACT), not the main graph" >&2; exit 3
+fi
 mkdir -p "$CYCLE_DIR/kisko/.kisko"
 
 echo "== teko work artifact"
@@ -81,30 +95,31 @@ sauma verify "$CYCLE_DIR/decision.json" >/dev/null
 DD=$(jq -r .sauma.digest "$CYCLE_DIR/decision.json")
 cd - >/dev/null
 
-echo "== kelpo plan ($RIGOR, one sykli task per obligation)"
-CH=$(jq -r .contract_hash sykli.lock)
-TASKS=$(sykli plan sykli.json --json 2>/dev/null | jq -c '.tasks' || echo '[]')
-jq -n --arg w "$WID" --arg d "$WD" --arg t "$WTOKEN" --arg ch "$CH" --arg rigor "$RIGOR" --arg root "$SUITE_ROOT" \
+echo "== kelpo plan ($RIGOR, cases are the tasks of $QA_CONTRACT)"
+CH=$(sykli plan "$QA_CONTRACT" --json | jq -r .contract_hash)
+TASKS=$(sykli plan "$QA_CONTRACT" --json | jq -c '.tasks')
+[ "$(echo "$TASKS" | jq length)" -gt 0 ] || { echo "QA contract $QA_CONTRACT has no tasks" >&2; exit 3; }
+jq -n --arg w "$WID" --arg d "$WD" --arg t "$WTOKEN" --arg ch "$CH" --arg rigor "$RIGOR" --arg root "$SUITE_ROOT" --arg contract "$QA_CONTRACT" \
   --argjson tasks "$TASKS" --argjson obligations "$(jq -c '[.packet.obligations[].id]' "$CYCLE_DIR/work.json")" '
   ($obligations | to_entries | map({obligation: .value, task: $tasks[.key % ($tasks|length)]})) as $pairs |
   {schema:"kelpo-plan.v1", teko:{work:$w,digest:$d}, repository:{token:$t},
    obligations: ($pairs | map({obligation: .obligation, rigor: $rigor})),
    cases: ($pairs | map({id: .task, obligation: .obligation, layer: "unit",
-            claim: ("sykli task " + .task + " passes at the final tree"),
-            setup: "Evaluate the locked graph in a fresh worktree of the final tree",
-            stimulus: ("sykli run — task " + .task), oracle: "outcome passed"})),
-   gaps: [], suite: {roots: [$root], contract_hash: $ch}}' > "$CYCLE_DIR/plan-body.json"
+            claim: ("QA task " + .task + " fails at the baseline and passes at the final tree"),
+            setup: ("Evaluate " + $contract + " in a fresh worktree"),
+            stimulus: ("sykli run " + $contract + " — task " + .task), oracle: "outcome passed at final; failed at baseline for standard rigor"})),
+   gaps: [], suite: {roots: [$root], contract_path: $contract, contract_hash: $ch}}' > "$CYCLE_DIR/plan-body.json"
 python3 "$KELPO" seal-plan "$CYCLE_DIR/plan-body.json" --work-artifact "$CYCLE_DIR/work.json" > "$CYCLE_DIR/plan.json"
 sauma verify "$CYCLE_DIR/plan.json" >/dev/null
 PD=$(jq -r .sauma.digest "$CYCLE_DIR/plan.json")
 
 echo "== cycle.v1"
-jq -n --arg wd "$WD" --arg dd "$DD" --arg pd "$PD" --arg rp "$RP" \
+jq -n --arg wd "$WD" --arg dd "$DD" --arg pd "$PD" --arg rp "$RP" --arg signer "$SIGNER" \
   --argjson effects "${CYCLE_EFFECTS:-[\"commit\"]}" \
   --argjson max "${CYCLE_MAX_ATTEMPTS:-2}" --argjson retry "${CYCLE_WORKER_RETRY:-1}" '
   {schema:"cycle.v1",
    work:{artifact:"teko-work.v1",digest:$wd,repository_point:$rp},
-   decision:{artifact:"kisko.decision.v1",digest:$dd,repository_point:$rp},
+   decision:{artifact:"kisko.decision.v1",digest:$dd,repository_point:$rp,signers:[$signer]},
    qa_plan:{artifact:"kelpo-plan.v1",digest:$pd,repository_point:$rp},
    implementation:{worker_role:"implementation",max_attempts:$max},
    qa:{worker_role:"qa",must_differ_from:"implementation"},

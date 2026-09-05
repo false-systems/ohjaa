@@ -157,6 +157,20 @@ consumes, asking each owner for its fact and sealing the result through
 An inspection that cannot complete is `inconclusive`, which the reducer holds
 on. Nothing is ever rendered as an empty list or a passing gate.
 
+Three facts are judged by their owners, never by a process exit code: the
+implementation is done when Teko reports the tree changed within scope; QA is
+done when a sealed Kelpo verdict exists at the current point, pass or fail;
+and a session that went quiet is a spent attempt, relaunched within budget.
+The decision must have been made at the cycle's input point, must not have
+expired, and must be signed by an identity the cycle's `decision.signers`
+allows. Every effect Toimija observed on a cycle's sessions must be declared
+in `cycle.v1.effects`, or the cycle holds on `undeclared_effect` before its
+next action; partial observation holds too.
+
+`ohjaa cycle doctor` lists every tool a cycle shells out to, with versions and
+provenance, and whether a Toimija session covers this repository. `ohjaa cycle
+status` is `step` with derived facts: the current action, without acting.
+
 `ohjaa cycle run` without `--facts` is only a loop over `step`: derive, reduce,
 act once, repeat. A `launch` runs `toimija run --cycle … --cycle-leg … --cycle-attempt …`
 and waits; `run_gates` runs `toimija verify-work`; `close_work` runs
