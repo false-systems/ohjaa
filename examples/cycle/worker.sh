@@ -11,6 +11,7 @@
 #   verdict from the sealed plan, and judges it. It never touches the tree and
 #   never talks to Teko: the cycle loop delivers the verdict between legs.
 set -eu
+trap 'rm -f "${CYCLE_DIR:-.}/verdict.json.tmp"' EXIT
 CYCLE_ENV=${CYCLE_ENV:-${CYCLE_DIR:-.}/cycle.env}
 if [ -f "$CYCLE_ENV" ]; then
   # shellcheck disable=SC1090
@@ -64,8 +65,11 @@ qa)
     --evidence "$CD/evidence-green.json" $( [ -f "$CD/evidence-red.json" ] && printf -- '--evidence %s' "$CD/evidence-red.json" ) \
     --baseline-manifest "$CD/baseline-manifest.json" --final-manifest "$CD/final-manifest.json" \
     $(for c in "$CD"/ctx-implementation-*.json; do printf -- '--session-context %s ' "$c"; done) \
-    --session-context "$CD/ctx-qa.json" --baseline-root "$B" --final-root "$PWD" > "$CD/verdict.json"
+    --session-context "$CD/ctx-qa.json" --baseline-root "$B" --final-root "$PWD" > "$CD/verdict.json.tmp"
   git worktree remove --force "$B"
+  # Only a verdict Kelpo sealed lands at the path the loop reads; a refused
+  # body leaves nothing behind, so the leg counts as spent, not as judged.
+  mv "$CD/verdict.json.tmp" "$CD/verdict.json"
   sauma verify "$CD/verdict.json" >/dev/null
   echo "worker: verdict $(jq -r .verdict "$CD/verdict.json") sealed at $(jq -r .sauma.digest "$CD/verdict.json")" >&2
   ;;
