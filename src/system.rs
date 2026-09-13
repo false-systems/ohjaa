@@ -157,11 +157,18 @@ pub fn render_system(view: &SystemView) -> String {
             }
         }
         if let Some(scan) = view.scan_for(tool) {
+            if scan.coverage != crate::scan::Coverage::Available {
+                let _ = writeln!(
+                    out,
+                    "  sessions: incomplete — {}",
+                    crate::coverage_detail(scan)
+                );
+            }
             let occupying: Vec<&Session> = scan.occupying().collect();
-            if occupying.is_empty() {
-                let _ = writeln!(out, "  live:  nobody");
-            } else {
-                let _ = writeln!(out, "  live:  {}", occupying.len());
+            if occupying.is_empty() && scan.coverage == crate::scan::Coverage::Available {
+                let _ = writeln!(out, "  sessions: none reported");
+            } else if !occupying.is_empty() {
+                let _ = writeln!(out, "  possibly running sessions: {}", occupying.len());
                 for session in occupying {
                     let intent = if session.intent.is_empty() {
                         "(undeclared)"
@@ -170,14 +177,17 @@ pub fn render_system(view: &SystemView) -> String {
                     };
                     let _ = writeln!(
                         out,
-                        "    {}  {}  \"{}\"  seen {}",
+                        "    {}  {}  \"{}\"  {}  seen {}",
                         session.agent,
                         session.id,
                         intent,
+                        session.liveness,
                         crate::scan::ago(session.idle_seconds)
                     );
                 }
             }
+        } else {
+            out.push_str("  sessions: unknown — no scan available\n");
         }
         out.push('\n');
     }
@@ -201,7 +211,7 @@ pub fn briefing(view: &SystemView, here: &Path) -> String {
 
     let mut out = String::from(
         "System perimeter (derived by ohjaa at launch; re-derive with\n\
-         `ohjaa system`, live view via `ohjaa fleet`):\n\n\
+         `ohjaa system`, session observations via `ohjaa fleet`):\n\n\
          Fleet — each tool self-declares its role in its repo:\n",
     );
     for tool in &view.tools {
@@ -228,10 +238,23 @@ pub fn briefing(view: &SystemView, here: &Path) -> String {
         .iter()
         .flat_map(|scan| scan.occupying())
         .collect();
+    out.push_str(
+        "\nSession observations at launch (Toimija liveness; not proof of current work):\n",
+    );
+    for scan in &view.scans {
+        if scan.coverage != crate::scan::Coverage::Available {
+            let _ = writeln!(
+                out,
+                "- {}: incomplete — {}",
+                scan.repo.display(),
+                crate::coverage_detail(scan)
+            );
+        }
+    }
     if live.is_empty() {
-        out.push_str("\nLive now: nobody else is working the fleet.\n");
+        out.push_str("No possibly running sessions reported by available scans.\n");
     } else {
-        let _ = writeln!(out, "\nLive now ({} session(s)):", live.len());
+        let _ = writeln!(out, "{} possibly running session(s):", live.len());
         for scan in &view.scans {
             let name = scan
                 .repo
@@ -246,10 +269,11 @@ pub fn briefing(view: &SystemView, here: &Path) -> String {
                 };
                 let _ = writeln!(
                     out,
-                    "- {} in {}: \"{}\" (seen {})",
+                    "- {} in {}: \"{}\" ({}; seen {})",
                     session.agent,
                     name,
                     intent,
+                    session.liveness,
                     crate::scan::ago(session.idle_seconds)
                 );
             }
@@ -257,8 +281,9 @@ pub fn briefing(view: &SystemView, here: &Path) -> String {
     }
     out.push_str(
         "\nCoordination: claiming work stays in GitHub issues/PRs; sessions are\n\
-         facts, not locks. Cross-repo facts travel as sauma-anchored digests —\n\
-         nothing is trusted because it was sent.",
+         observations, not locks. These local CLI observations are not Sauma-verified\n\
+         digests; re-derive them before acting. Cross-repo artifacts must be\n\
+         Sauma-verified and anchored to a repository point.",
     );
     out
 }
@@ -295,8 +320,8 @@ mod tests {
     }
 
     #[test]
-    fn the_briefing_names_the_system_marks_home_and_confesses_live_sessions() {
-        let view = SystemView {
+    fn the_briefing_preserves_session_liveness_and_marks_home() {
+        let mut view = SystemView {
             tools: vec![
                 tool("teko", Some("durable task contract")),
                 tool("kelo", None),
@@ -312,6 +337,7 @@ mod tests {
                     intent: "change the parser".into(),
                     scope: vec![],
                     liveness: "stale".into(),
+                    pid_check: "unknown".into(),
                     idle_seconds: 600,
                 }],
                 warnings: vec![],
@@ -331,8 +357,12 @@ mod tests {
             text.contains("codex in teko: \"change the parser\""),
             "{text}"
         );
-        assert!(text.contains("10m ago"), "{text}");
-        assert!(text.contains("sessions are\nfacts, not locks"), "{text}");
+        assert!(text.contains("(stale; seen 10m ago)"), "{text}");
+        assert!(!text.contains("Live now"), "{text}");
+        assert!(
+            text.contains("sessions are\nobservations, not locks"),
+            "{text}"
+        );
 
         assert_eq!(
             view.exit_code(),
@@ -342,12 +372,31 @@ mod tests {
 
         let rendered = render_system(&view);
         assert!(rendered.contains("role: unknown"), "{rendered}");
-        assert!(rendered.contains("live:  1"), "{rendered}");
+        assert!(
+            rendered.contains("possibly running sessions: 1"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("stale  seen 10m ago"), "{rendered}");
+
+        for liveness in ["active", "unknown", "suspended", "closed"] {
+            view.scans[0].sessions[0].liveness = liveness.into();
+            for text in [
+                briefing(&view, Path::new("/fleet/teko")),
+                render_system(&view),
+            ] {
+                assert!(!text.contains("Live now"), "{text}");
+                if liveness == "closed" {
+                    assert!(!text.contains("change the parser"), "{text}");
+                } else {
+                    assert!(text.contains(liveness), "{text}");
+                }
+            }
+        }
     }
 
     #[test]
     fn a_fully_derived_quiet_fleet_is_complete() {
-        let view = SystemView {
+        let mut view = SystemView {
             tools: vec![tool("teko", Some("durable task contract"))],
             unknown: vec![],
             scans: vec![Scan {
@@ -361,6 +410,26 @@ mod tests {
         assert_eq!(view.exit_code(), 0);
 
         let text = briefing(&view, Path::new("/fleet/teko"));
-        assert!(text.contains("nobody else is working the fleet"), "{text}");
+        assert!(
+            text.contains("No possibly running sessions reported"),
+            "{text}"
+        );
+
+        for coverage in [Coverage::Degraded, Coverage::Failed] {
+            view.scans[0].coverage = coverage;
+            view.scans[0].error = Some("cannot inspect sessions".into());
+            assert_eq!(view.exit_code(), 4);
+            for text in [
+                briefing(&view, Path::new("/fleet/teko")),
+                render_system(&view),
+            ] {
+                assert!(
+                    text.contains("incomplete — cannot inspect sessions"),
+                    "{text}"
+                );
+                assert!(!text.contains("sessions: none reported"), "{text}");
+                assert!(!text.contains("nobody"), "{text}");
+            }
+        }
     }
 }

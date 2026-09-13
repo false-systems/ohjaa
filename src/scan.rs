@@ -44,6 +44,7 @@ pub struct Session {
     pub intent: String,
     pub scope: Vec<String>,
     pub liveness: String,
+    pub pid_check: String,
     pub idle_seconds: i64,
 }
 
@@ -57,12 +58,11 @@ impl Session {
     /// thinking hard for ninety minutes is reported exactly like one whose
     /// process is gone.
     ///
-    /// Only `closed` means the session is finished, because only `closed` is
-    /// something toimija observed rather than inferred from silence. Treating
-    /// stale as absent is how a checkout gets reported empty while someone is
-    /// still working in it.
+    /// Toimija's separate PID check can prove that the recorded process is
+    /// gone. Older versions omit it: keep their stale sessions, since silence
+    /// alone is not proof of absence.
     pub fn occupies(&self) -> bool {
-        self.liveness != "closed"
+        self.liveness != "closed" && self.pid_check != "dead"
     }
 
     /// True when this session's occupancy is inferred rather than observed.
@@ -164,6 +164,8 @@ struct RawSession {
     #[serde(default)]
     liveness: Option<String>,
     #[serde(default)]
+    pid_check: Option<String>,
+    #[serde(default)]
     last_seen_at: Option<i64>,
 }
 
@@ -191,6 +193,7 @@ fn parse(repo: &Path, stdout: &str, at: i64) -> Result<Scan, serde_json::Error> 
             intent: s.intent.unwrap_or_default(),
             scope: s.scope,
             liveness: s.liveness.unwrap_or_else(|| "unknown".into()),
+            pid_check: s.pid_check.unwrap_or_else(|| "unknown".into()),
             idle_seconds: match s.last_seen_at {
                 Some(seen) if seen > 0 => (at - seen).max(0),
                 _ => -1,
@@ -354,13 +357,29 @@ mod tests {
     }
 
     #[test]
-    fn only_a_closed_session_frees_the_checkout() {
-        // `closed` is the one verdict toimija observed rather than inferred
-        // from silence.
+    fn a_closed_session_does_not_occupy_the_checkout() {
+        // An explicit close needs no process evidence.
         let raw = payload(r#"{"id":"1-2","worktree":"/tmp/r","liveness":"closed"}"#);
         let scan = parse(Path::new(REPO), &raw, 100).unwrap();
         assert!(!scan.sessions[0].occupies());
         assert_eq!(scan.occupying().count(), 0);
+    }
+
+    #[test]
+    fn only_confirmed_dead_processes_are_excluded_from_open_sessions() {
+        for (pid_check, occupies) in [
+            ("dead", false),
+            ("alive", true),
+            ("unknown", true),
+            ("unrecognised", true),
+        ] {
+            let raw = payload(&format!(
+                r#"{{"id":"1-2","worktree":"/tmp/r","liveness":"stale","pid_check":"{pid_check}"}}"#
+            ));
+            let scan = parse(Path::new(REPO), &raw, 100).unwrap();
+            assert_eq!(scan.sessions[0].pid_check, pid_check);
+            assert_eq!(scan.occupying().count(), usize::from(occupies));
+        }
     }
 
     #[test]
