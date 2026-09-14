@@ -110,10 +110,10 @@ failure mode this whole stack exists to prevent.
 The same rule governs staleness. Toimija reports `stale` both for a session
 whose process is gone and for one that has merely been quiet past its
 threshold — an agent thinking hard for ninety minutes looks exactly like a
-dead one. Ohjaa therefore counts every session that is not `closed` as still
-occupying the checkout, and marks the uncertain ones `stale` rather than
-quietly dropping them. Only `closed` is something Toimija observed rather than
-inferred from silence.
+dead one. Ohjaa excludes sessions reported `closed` or whose separate `pid_check` is
+`dead`. It keeps uncertain sessions visible as `stale`. Older Toimija versions
+without `pid_check` remain conservative: stale sessions stay visible until
+closed. No age threshold in Ohjaa guesses whether a process is dead.
 
 The label says only `stale`; the `seen:` age beside it carries the judgment. A
 session last seen 491 hours ago is almost certainly gone and one last seen 95

@@ -306,7 +306,7 @@ fn cmd_fleet(explicit: &[PathBuf], json: bool) -> Result<i32> {
         }
     }
     if !any_live {
-        println!("no live sessions");
+        println!("no possibly running sessions reported by available scans");
     }
     Ok(report_coverage(&scans))
 }

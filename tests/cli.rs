@@ -233,7 +233,40 @@ fn fleet_renders_occupancy_and_exits_incomplete_when_a_scan_fails() {
 }
 
 #[test]
-fn fleet_says_no_live_sessions_when_every_scan_saw_clearly() {
+fn confirmed_dead_sessions_do_not_occupy_the_fleet_system_or_launch() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("dead-session");
+    let repo = fixture.make_git_repo("only");
+    fixture.set_context(r#"{"repo":{"name":"only","role":"test repo"}}"#);
+    let mut dead: serde_json::Value = serde_json::from_str(&live_session()).unwrap();
+    dead["pid_check"] = "dead".into();
+    dead["intent"] = "obsolete session".into();
+    fixture.set_sessions(&sessions_json(
+        &format!("{dead},{}", live_session()),
+        "available",
+    ));
+    for command in ["fleet", "system", "run"] {
+        let mut cli = fixture.ohjaa();
+        cli.arg(command);
+        if command == "run" {
+            cli.args(["codex", "--intent", "test", "--dry-run"]);
+        }
+        let (stdout, stderr, code) = output_of(cli.arg("--root").arg(&repo).current_dir(&repo));
+        assert_eq!(code, Some(0), "{stderr}");
+        let text = format!("{stdout}\n{stderr}");
+        assert!(!text.contains("obsolete session"), "{text}");
+        assert!(text.contains("change the parser"), "{text}");
+        if command == "run" {
+            assert!(stderr.contains("1 sibling session(s)"), "{stderr}");
+        }
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn fleet_reports_no_non_closed_sessions_when_every_scan_saw_clearly() {
     let fixture = Fixture::new("quiet");
     fixture.make_repo("alpha");
     fixture.set_sessions(&sessions_json("", "available"));
@@ -247,7 +280,10 @@ fn fleet_says_no_live_sessions_when_every_scan_saw_clearly() {
     fixture.cleanup();
 
     assert_eq!(code, Some(0));
-    assert!(stdout.contains("no live sessions"), "{stdout}");
+    assert!(
+        stdout.contains("no possibly running sessions reported"),
+        "{stdout}"
+    );
     assert!(stderr.contains("coverage: scanned 1/1 repo(s)"), "{stderr}");
     assert!(!stderr.contains("incomplete"), "{stderr}");
 }
