@@ -316,6 +316,11 @@ pub fn derive(root: &Path, cycle: &Cycle, paths: &ArtifactPaths) -> Result<Deriv
         "gates": evidence_label(&gates),
         "qa": evidence_label(&qa),
         "verdict": evidence_label(&verdict),
+        // Sufficiency is Kelpo's answer about an assurance case. `cycle.v1`
+        // names no such input, so this cycle declares none and the reducer has
+        // nothing to judge. Adding an `assurance_case` input is what turns the
+        // bar from available into enforced.
+        "assurance": null,
         "closure": evidence_label(&closure),
     });
     let sealed = stamp(
