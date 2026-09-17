@@ -151,6 +151,10 @@ pub enum Next {
     Establish {
         obligation: String,
     },
+    /// The assurance obligation is unresolved and no per-obligation detail is
+    /// available: the next step is a Kelpo judgement, not a guess at which
+    /// requirement is missing.
+    JudgeAssurance,
     Held {
         reason: &'static str,
     },
@@ -273,11 +277,9 @@ pub fn next(cycle: &Cycle, facts: &Facts) -> Result<Next, &'static str> {
                 Some(obligation) => Next::Establish {
                     obligation: obligation.clone(),
                 },
-                // Pending with nothing missing is a producer contradicting
-                // itself; hold rather than guess which half is true.
-                None => Next::Held {
-                    reason: "assurance",
-                },
+                // Unresolved with no detail: Teko knows the obligation is not
+                // satisfied, Kelpo knows why. Get the judgement.
+                None => Next::JudgeAssurance,
             });
         }
         Some(Evidence::Failed) => {
@@ -581,19 +583,14 @@ mod tests {
     }
 
     #[test]
-    fn pending_with_nothing_missing_is_a_contradiction_and_holds() {
+    fn unresolved_without_detail_asks_for_a_judgement() {
         let cycle = cycle();
         let mut facts = ready_to_close();
         facts.assurance = Some(Assurance {
             state: Evidence::Pending,
             missing: Vec::new(),
         });
-        assert_eq!(
-            next(&cycle, &facts).unwrap(),
-            Next::Held {
-                reason: "assurance"
-            }
-        );
+        assert_eq!(next(&cycle, &facts).unwrap(), Next::JudgeAssurance);
     }
 
     #[test]
