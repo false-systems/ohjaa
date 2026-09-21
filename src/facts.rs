@@ -316,6 +316,12 @@ pub fn derive(root: &Path, cycle: &Cycle, paths: &ArtifactPaths) -> Result<Deriv
         "gates": evidence_label(&gates),
         "qa": evidence_label(&qa),
         "verdict": evidence_label(&verdict),
+        // Teko owns whether the assurance obligation is resolved, and Ohjaa
+        // asks the owner rather than re-deriving the bar.
+        "assurance": match &teko {
+            Ok(current) => assurance(current, &work_id),
+            Err(_) => None,
+        },
         "closure": evidence_label(&closure),
     });
     let sealed = stamp(
@@ -740,6 +746,36 @@ fn verdict(
     })
 }
 
+/// Whether Teko's assurance obligation is resolved.
+///
+/// Asked of the tool that owns it. `None` means this work carries no assurance
+/// obligation, so there is nothing to judge and nothing to hold on — distinct
+/// from an obligation that exists and has not been satisfied.
+///
+/// Teko reports whether the obligation is resolved, not which individual
+/// requirement is missing: that detail lives in Kelpo's verdict, so a cycle in
+/// this state is steered toward getting a judgement rather than toward a
+/// specific piece of knowledge Ohjaa would be guessing at.
+fn assurance(current: &TekoCurrent, work_id: &str) -> Option<serde_json::Value> {
+    let raw_id = work_id.strip_prefix("work_").unwrap_or(work_id);
+    let active = current.active.as_ref()?;
+    if active.work.id != raw_id {
+        return None;
+    }
+    let obligation = active
+        .status
+        .as_ref()?
+        .obligations
+        .iter()
+        .find(|obligation| obligation.id == "assurance")?;
+    let state = if obligation.status == "resolved" {
+        "current"
+    } else {
+        "pending"
+    };
+    Some(serde_json::json!({ "state": state, "missing": [] }))
+}
+
 fn closure(root: &Path, current: &TekoCurrent, work_id: &str) -> Evidence {
     // Teko's packet prefixes work ids with `work_`; its status document does not.
     let raw_id = work_id.strip_prefix("work_").unwrap_or(work_id);
@@ -805,4 +841,63 @@ fn stamp(body: &Value, anchor: &str, cycle_digest: &str) -> Result<Value> {
     let output = child.wait_with_output()?;
     anyhow::ensure!(output.status.success(), "sauma stamp failed");
     serde_json::from_slice(&output.stdout).context("sauma stamp returned invalid JSON")
+}
+
+#[cfg(test)]
+mod assurance_fact_tests {
+    use super::*;
+
+    fn current(obligations: serde_json::Value, work_id: &str) -> TekoCurrent {
+        serde_json::from_value(serde_json::json!({
+            "active": {
+                "work": {"id": work_id},
+                "status": {"obligations": obligations}
+            }
+        }))
+        .expect("fixture parses")
+    }
+
+    #[test]
+    fn work_without_an_assurance_obligation_has_nothing_to_judge() {
+        let teko = current(
+            serde_json::json!([{"id": "scope", "status": "resolved"}]),
+            "w1",
+        );
+        assert!(assurance(&teko, "work_w1").is_none());
+    }
+
+    #[test]
+    fn an_unresolved_obligation_is_pending() {
+        let teko = current(
+            serde_json::json!([{"id": "assurance", "status": "unresolved"}]),
+            "w1",
+        );
+        let fact = assurance(&teko, "work_w1").expect("a fact");
+        assert_eq!(fact["state"], "pending");
+    }
+
+    #[test]
+    fn a_resolved_obligation_is_current() {
+        let teko = current(
+            serde_json::json!([{"id": "assurance", "status": "resolved"}]),
+            "w1",
+        );
+        assert_eq!(
+            assurance(&teko, "work_w1").expect("a fact")["state"],
+            "current"
+        );
+    }
+
+    /// Teko's packet prefixes work ids with `work_`; its status document does
+    /// not. Comparing the wrong spelling would silently report no obligation.
+    #[test]
+    fn the_work_id_prefix_is_handled() {
+        let teko = current(
+            serde_json::json!([{"id": "assurance", "status": "unresolved"}]),
+            "w1",
+        );
+        assert!(assurance(&teko, "w1").is_some());
+        // A different work cannot answer for this one.
+        assert!(assurance(&teko, "work_other").is_none());
+    }
 }

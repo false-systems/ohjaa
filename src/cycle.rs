@@ -88,7 +88,31 @@ pub struct Facts {
     pub gates: Evidence,
     pub qa: Evidence,
     pub verdict: Evidence,
+    /// Whether the assurance case discharges the bar Teko ratified.
+    ///
+    /// `None` means this cycle declares no assurance case, so no obligations
+    /// are in play — the cycle is the contract and it did not ask for one.
+    /// `Some(..)` means a case exists and its sufficiency governs closure.
+    ///
+    /// **Limitation.** `cycle.v1` has no `assurance_case` input yet, so this is
+    /// always `None` in practice and a cycle can still close without an examined
+    /// bar. Adding that input is what turns the bar from available into
+    /// enforced; the reducer below is already ready for it.
+    #[serde(default)]
+    pub assurance: Option<Assurance>,
     pub closure: Evidence,
+}
+
+/// Kelpo's answer about the assurance case, plus what it found missing.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Assurance {
+    #[serde(default)]
+    pub state: Evidence,
+    /// Obligations the bar requires and the case has not discharged, in the
+    /// order Teko declared them. Steering names the first; it does not choose.
+    #[serde(default)]
+    pub missing: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,25 +124,43 @@ pub enum Decision {
     Escalate,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Evidence {
     Pending,
     Current,
     Failed,
+    /// The default: absence of an answer is not an answer.
+    #[default]
     Inconclusive,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "action")]
 pub enum Next {
-    Launch { leg: &'static str },
+    Launch {
+        leg: &'static str,
+    },
     RunGates,
     JudgeQa,
     CloseWork,
     Closed,
-    Held { reason: &'static str },
-    Failed { reason: &'static str },
+    /// Knowledge the bar requires and the assurance case has not established.
+    /// Named, not chosen: the obligation is the first one Kelpo reported
+    /// missing, in the order Teko declared them.
+    Establish {
+        obligation: String,
+    },
+    /// The assurance obligation is unresolved and no per-obligation detail is
+    /// available: the next step is a Kelpo judgement, not a guess at which
+    /// requirement is missing.
+    JudgeAssurance,
+    Held {
+        reason: &'static str,
+    },
+    Failed {
+        reason: &'static str,
+    },
 }
 
 pub fn next(cycle: &Cycle, facts: &Facts) -> Result<Next, &'static str> {
@@ -222,6 +264,35 @@ pub fn next(cycle: &Cycle, facts: &Facts) -> Result<Next, &'static str> {
             })
         }
     }
+    // A change can work and still be unfinished. Closure requires the
+    // understanding, so the assurance case is checked before closing — never
+    // before implementing, because experiment is often how the defect is found.
+    match facts.assurance.as_ref().map(|a| &a.state) {
+        // No case declared by this cycle: nothing to judge, so nothing to hold.
+        None => {}
+        Some(Evidence::Current) => {}
+        Some(Evidence::Pending) => {
+            let missing = facts.assurance.as_ref().map(|a| &a.missing);
+            return Ok(match missing.and_then(|m| m.first()) {
+                Some(obligation) => Next::Establish {
+                    obligation: obligation.clone(),
+                },
+                // Unresolved with no detail: Teko knows the obligation is not
+                // satisfied, Kelpo knows why. Get the judgement.
+                None => Next::JudgeAssurance,
+            });
+        }
+        Some(Evidence::Failed) => {
+            return Ok(Next::Failed {
+                reason: "assurance_failed",
+            })
+        }
+        Some(Evidence::Inconclusive) => {
+            return Ok(Next::Held {
+                reason: "assurance",
+            })
+        }
+    }
     match facts.closure {
         Evidence::Current => Ok(Next::Closed),
         Evidence::Pending => Ok(Next::CloseWork),
@@ -290,6 +361,7 @@ mod tests {
             gates: Evidence::Pending,
             qa: Evidence::Pending,
             verdict: Evidence::Pending,
+            assurance: None,
             closure: Evidence::Pending,
         }
     }
@@ -460,5 +532,71 @@ mod tests {
             next(&cycle, &facts).unwrap(),
             Next::Held { reason: "effects" }
         );
+    }
+
+    fn ready_to_close() -> Facts {
+        let mut facts = facts();
+        facts.implementation = Evidence::Current;
+        facts.gates = Evidence::Current;
+        facts.qa = Evidence::Current;
+        facts.verdict = Evidence::Current;
+        facts.closure = Evidence::Pending;
+        facts
+    }
+
+    #[test]
+    fn a_missing_obligation_becomes_the_next_action() {
+        let cycle = cycle();
+        let mut facts = ready_to_close();
+        facts.assurance = Some(Assurance {
+            state: Evidence::Pending,
+            missing: vec!["root_cause_established".into(), "verification".into()],
+        });
+        assert_eq!(
+            next(&cycle, &facts).unwrap(),
+            Next::Establish {
+                // The first Teko declared, not the cheapest to satisfy.
+                obligation: "root_cause_established".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_cycle_declaring_no_assurance_case_is_not_held_by_one() {
+        let cycle = cycle();
+        let mut facts = ready_to_close();
+        facts.assurance = None;
+        assert_eq!(next(&cycle, &facts).unwrap(), Next::CloseWork);
+    }
+
+    #[test]
+    fn a_case_that_could_not_be_judged_holds_rather_than_closes() {
+        let cycle = cycle();
+        let mut facts = ready_to_close();
+        facts.assurance = Some(Assurance::default());
+        assert_eq!(
+            next(&cycle, &facts).unwrap(),
+            Next::Held {
+                reason: "assurance"
+            }
+        );
+    }
+
+    #[test]
+    fn unresolved_without_detail_asks_for_a_judgement() {
+        let cycle = cycle();
+        let mut facts = ready_to_close();
+        facts.assurance = Some(Assurance {
+            state: Evidence::Pending,
+            missing: Vec::new(),
+        });
+        assert_eq!(next(&cycle, &facts).unwrap(), Next::JudgeAssurance);
+    }
+
+    #[test]
+    fn a_discharged_case_lets_closure_proceed() {
+        let cycle = cycle();
+        let facts = ready_to_close();
+        assert_eq!(next(&cycle, &facts).unwrap(), Next::CloseWork);
     }
 }

@@ -74,6 +74,20 @@ share files and Git's index, so Ohjaa reports sibling warnings but does not
 pretend it can prevent edit collisions without scopes or isolation. If
 Toimija cannot inspect the sessions, Ohjaa refuses to launch blind.
 
+Ohjaa discovers **Toimija sessions**, not every running agent. An agent started
+directly, without `ohjaa run` or `toimija run`, has no session marker and is
+invisible to these scans, even if it edits this repository. Its process name
+or current directory cannot establish which repositories it is working on.
+Launch through either wrapper from inside the target repository to make the
+session discoverable; both wrappers refuse launches outside a Git repository.
+
+A session belongs to its launch repository. If a wrapped agent later works
+on another repo, fleet discovery can still find its session in the original
+repo, provided that repo is scanned. The target repo's launch check currently
+counts only its own sessions, not external sessions whose scope reaches it.
+Complete scan coverage means the recorded sessions were readable; **no sessions
+found does not mean no agents are working**.
+
 ## Derive, never store
 
 The whole stack is **pull-based**: toimija compiles the packet on demand, sauma
