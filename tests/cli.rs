@@ -35,11 +35,20 @@ esac
 exit "${OHJAA_STUB_EXIT:-0}"
 "#;
 
-/// `verify` accepts everything; `stamp -` echoes stdin with an envelope so the
-/// derived facts parse as a sealed `ohjaa-cycle-facts.v1`.
+/// `stamp -` echoes stdin with an envelope so the derived facts parse as a
+/// sealed `ohjaa-cycle-facts.v1`. The envelope is `sauma-envelope.v2`, which is
+/// what every producer in the stack emits — toimija, teko, kisko and kelpo all
+/// name v2, and sauma keeps v1 only as `LEGACY_ENVELOPE_SCHEMA`.
+///
+/// `verify` accepts by default and fails when `OHJAA_STUB_SAUMA_VERIFY_EXIT`
+/// says so. Ohjaa reads no envelope field but `digest` — it delegates the
+/// judgement to `sauma verify` and reads the digest out of the file afterwards
+/// — so the only thing that proves it honours the verdict is a verify that
+/// refuses.
 const SAUMA_STUB: &str = r#"#!/bin/sh
 case "$1" in
-  stamp) sed 's/}$/,"sauma":{"envelope":"sauma-envelope.v1","schema":"ohjaa-cycle-facts.v1","digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","provenance":[],"producer":{"tool":"stub","version":"0","run":null},"anchored_at":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}/';;
+  verify) exit "${OHJAA_STUB_SAUMA_VERIFY_EXIT:-0}";;
+  stamp) sed 's/}$/,"sauma":{"envelope":"sauma-envelope.v2","schema":"ohjaa-cycle-facts.v1","digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","provenance":[],"producer":{"tool":"stub","version":"0","run":null},"anchored_at":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}/';;
 esac
 exit 0
 "#;
@@ -848,6 +857,49 @@ fn golden_2_an_inconclusive_decision_holds_before_any_launch() {
     assert_eq!(
         cycle.action(),
         r#"{"action":"held","reason":"decision_held"}"#
+    );
+    cycle.fixture.cleanup();
+}
+
+#[test]
+fn a_sauma_verdict_of_unverified_stops_the_cycle() {
+    let cycle = CycleFixture::new("sauma-refuses");
+    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed")]);
+    cycle.implemented();
+
+    // Ohjaa reads no envelope field but `digest`: whether an artifact is intact
+    // is Sauma's answer, not one Ohjaa re-derives. So a refusal from `sauma
+    // verify` has to stop the cycle, and nothing else in this suite makes it
+    // refuse — the stub accepted everything, which meant a regression that
+    // ignored the exit status and read the digest out of the file anyway would
+    // have passed every test here.
+    let (stdout, stderr, code) = output_of(
+        cycle
+            .fixture
+            .ohjaa()
+            .env("OHJAA_STUB_SAUMA_VERIFY_EXIT", "1")
+            .args(["cycle", "step", "--cycle"])
+            .arg(&cycle.cycle)
+            .arg("--work")
+            .arg(&cycle.work)
+            .arg("--decision")
+            .arg(&cycle.decision)
+            .arg("--qa-plan")
+            .arg(&cycle.plan)
+            .current_dir(&cycle.repo),
+    );
+    assert_ne!(
+        code,
+        Some(0),
+        "an unverified artifact must not step: {stdout}"
+    );
+    assert!(
+        stderr.contains("not a verified Sauma artifact"),
+        "expected the refusal to name the unverified artifact, got {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a refused cycle must not also emit an action: {stdout}"
     );
     cycle.fixture.cleanup();
 }
