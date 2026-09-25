@@ -25,11 +25,23 @@ pub enum Coverage {
 }
 
 impl Coverage {
+    /// Only an explicit `available` is complete coverage. A missing or
+    /// unrecognised status means we cannot say we looked, and a scan that
+    /// cannot say it looked must never read as an empty checkout.
     fn parse(value: Option<&str>) -> Self {
         match value {
+            Some("available") => Coverage::Available,
             Some("failed") => Coverage::Failed,
-            Some("degraded") => Coverage::Degraded,
-            _ => Coverage::Available,
+            _ => Coverage::Degraded,
+        }
+    }
+
+    /// Why a status is not complete coverage, when toimija did not say.
+    fn unexplained(value: Option<&str>) -> Option<String> {
+        match value {
+            None => Some("toimija did not report its session coverage".to_owned()),
+            Some("available" | "failed" | "degraded") => None,
+            Some(other) => Some(format!("toimija reported an unknown coverage `{other}`")),
         }
     }
 }
@@ -209,20 +221,24 @@ fn parse(repo: &Path, stdout: &str, at: i64) -> Result<Scan, serde_json::Error> 
             .map(RawWarning::render)
             .collect(),
         coverage: Coverage::parse(payload.coverage.status.as_deref()),
-        error: None,
+        error: Coverage::unexplained(payload.coverage.status.as_deref()),
     })
 }
 
 /// Ask one repo's toimija who is live. Never fails: a failure is itself a fact.
 pub fn scan_repo(repo: &Path) -> Scan {
-    let output = Command::new("toimija")
-        .args(["sessions", "--json"])
-        .current_dir(repo)
-        .output();
+    let output = crate::process::run(
+        Command::new("toimija")
+            .args(["sessions", "--json"])
+            .current_dir(repo),
+        None,
+        crate::process::LOCAL,
+    );
 
+    // A toimija that hangs is a failed scan, reported, never a silent wait.
     let output = match output {
         Ok(output) => output,
-        Err(error) => return Scan::failed(repo, format!("cannot run toimija: {error}")),
+        Err(error) => return Scan::failed(repo, format!("toimija: {error:#}")),
     };
 
     if !output.status.success() {
@@ -413,6 +429,20 @@ mod tests {
     #[test]
     fn unparseable_output_is_an_error_not_an_empty_scan() {
         assert!(parse(Path::new(REPO), "{not json", 0).is_err());
+    }
+
+    #[test]
+    fn an_unreported_or_unknown_coverage_is_not_complete() {
+        for raw in [
+            r#"{}"#,
+            r#"{"error":"store locked"}"#,
+            r#"{"sessions":[],"coverage":{}}"#,
+            r#"{"sessions":[],"coverage":{"status":"partial"}}"#,
+        ] {
+            let scan = parse(Path::new(REPO), raw, 0).unwrap();
+            assert_eq!(scan.coverage, Coverage::Degraded, "{raw}");
+            assert!(scan.error.is_some(), "{raw}: the reason must be said");
+        }
     }
 
     #[test]

@@ -1,11 +1,9 @@
-//! CLI integration tests: the real binary against a stub `toimija` on PATH.
+//! CLI integration tests: the real binary against a stub `toimija` on PATH, in
+//! a sandboxed HOME and XDG config/state, so no test ever reads or writes the
+//! person's real knowledge.
 //!
-//! Ohjaa owns no facts — it shells out to toimija and decides — so every
-//! behavior worth testing end-to-end is observable through what it does with
-//! toimija's answers: the rendering, the exit codes, and the argv it execs.
 //! The stub differentiates per repo by cwd (`*broken*`) and per invocation by
-//! `OHJAA_STUB_EXIT`, so one script covers fleet, refusal, and launch paths.
-//! Std-only on purpose: the dependency list is a boundary of this repo.
+//! environment, so one script covers fleet, refusal and launch paths.
 
 #![cfg(unix)]
 
@@ -27,39 +25,9 @@ case " $* " in
     cat "${OHJAA_STUB_SESSIONS:?}"
     exit 0;;
   *" context "*) cat "${OHJAA_STUB_CONTEXT:?}"; exit 0;;
-  *" repository-point "*) cat "${OHJAA_STUB_POINT:?}"; exit 0;;
-  *" gates status "*) cat "${OHJAA_STUB_GATES:?}"; exit "${OHJAA_STUB_GATES_EXIT:-0}";;
-  *" verify-work "*|*" close-work "*) exit 0;;
 esac
 # Anything else is the exec'd `run`: its exit status is what ohjaa returns.
 exit "${OHJAA_STUB_EXIT:-0}"
-"#;
-
-/// `stamp -` echoes stdin with an envelope so the derived facts parse as a
-/// sealed `ohjaa-cycle-facts.v1`. The envelope is `sauma-envelope.v2`, which is
-/// what every producer in the stack emits — toimija, teko, kisko and kelpo all
-/// name v2, and sauma keeps v1 only as `LEGACY_ENVELOPE_SCHEMA`.
-///
-/// `verify` accepts by default and fails when `OHJAA_STUB_SAUMA_VERIFY_EXIT`
-/// says so. Ohjaa reads no envelope field but `digest` — it delegates the
-/// judgement to `sauma verify` and reads the digest out of the file afterwards
-/// — so the only thing that proves it honours the verdict is a verify that
-/// refuses.
-const SAUMA_STUB: &str = r#"#!/bin/sh
-case "$1" in
-  verify) exit "${OHJAA_STUB_SAUMA_VERIFY_EXIT:-0}";;
-  stamp) sed 's/}$/,"sauma":{"envelope":"sauma-envelope.v2","schema":"ohjaa-cycle-facts.v1","digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","provenance":[],"producer":{"tool":"stub","version":"0","run":null},"anchored_at":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}/';;
-esac
-exit 0
-"#;
-
-/// `teko current` answers from a file; nothing else is asked of it.
-const TEKO_STUB: &str = r#"#!/bin/sh
-printf 'teko %s\n' "$*" >> "$OHJAA_STUB_TEKO_ARGV"
-case "$1" in
-  current) cat "${OHJAA_STUB_TEKO:?}";;
-esac
-exit 0
 "#;
 
 /// A session payload exactly as `toimija sessions --json` emits it.
@@ -135,15 +103,10 @@ impl Fixture {
         ));
         let stub_dir = dir.join("bin");
         fs::create_dir_all(&stub_dir).unwrap();
+        fs::create_dir_all(dir.join("home")).unwrap();
         let stub = stub_dir.join("toimija");
         fs::write(&stub, STUB).unwrap();
         make_executable(&stub);
-        let sauma = stub_dir.join("sauma");
-        fs::write(&sauma, SAUMA_STUB).unwrap();
-        make_executable(&sauma);
-        let teko = stub_dir.join("teko");
-        fs::write(&teko, TEKO_STUB).unwrap();
-        make_executable(&teko);
         let fixture = Fixture { dir, stub_dir };
         // Default: an empty, fully available scan.
         fixture.set_sessions(&sessions_json("", "available"));
@@ -175,7 +138,8 @@ impl Fixture {
         repo
     }
 
-    /// The real binary with the stubbed PATH and env wired up.
+    /// The real binary with the stubbed PATH, a sandboxed HOME and XDG dirs,
+    /// and a shared-knowledge checkout inside the fixture.
     fn ohjaa(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ohjaa"));
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -187,20 +151,15 @@ impl Fixture {
             .unwrap(),
         );
         command
+            .env("HOME", self.dir.join("home"))
+            .env("XDG_CONFIG_HOME", self.dir.join("config"))
+            .env("XDG_STATE_HOME", self.dir.join("state"))
+            .env("OHJAA_OURS", self.dir.join("ours"))
+            .env("OHJAA_TODAY", "2026-09-24")
             .env("OHJAA_STUB_ARGV", self.dir.join("argv.txt"))
             .env("OHJAA_STUB_SESSIONS", self.dir.join("sessions.json"))
-            .env("OHJAA_STUB_CONTEXT", self.dir.join("context.json"))
-            .env("OHJAA_STUB_POINT", self.dir.join("point.json"))
-            .env("OHJAA_STUB_GATES", self.dir.join("gates.json"))
-            .env("OHJAA_STUB_TEKO", self.dir.join("teko.json"))
-            .env("OHJAA_STUB_TEKO_ARGV", self.dir.join("teko-argv.txt"));
+            .env("OHJAA_STUB_CONTEXT", self.dir.join("context.json"));
         command
-    }
-
-    fn set_file(&self, name: &str, json: &str) -> PathBuf {
-        let path = self.dir.join(name);
-        fs::write(&path, json).unwrap();
-        path
     }
 
     fn argv(&self) -> Vec<String> {
@@ -209,6 +168,20 @@ impl Fixture {
             .lines()
             .map(String::from)
             .collect()
+    }
+
+    /// Write a current node straight into a scope directory, as an accepted
+    /// and committed node would be.
+    fn node(&self, dir: &Path, id: &str, kind: &str, body: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join(format!("{id}.md")),
+            format!(
+                "+++\nid = \"{id}\"\nkind = \"{kind}\"\nstatus = \"current\"\n\
+                 as_of = 2026-09-20\norigin = [\"a test\"]\n+++\n{body}\n"
+            ),
+        )
+        .unwrap();
     }
 
     fn cleanup(self) {
@@ -600,624 +573,545 @@ fn run_no_briefing_leaves_the_task_alone() {
 }
 
 #[test]
-fn cycle_run_launches_only_the_current_leg() {
+fn a_missing_root_is_an_error_not_an_empty_fleet() {
+    let fixture = Fixture::new("noroot");
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["fleet", "--root"])
+            .arg(fixture.dir.join("does-not-exist")),
+    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("is not a directory"), "{stderr}");
+    fixture.cleanup();
+}
+
+#[test]
+fn run_refuses_when_toimija_does_not_report_coverage() {
     if !git_available() {
         return;
     }
-    let fixture = Fixture::new("cycle-run");
-    let repo = fixture.make_git_repo("only");
-    let cycle = fixture.dir.join("cycle.v1.json");
-    fs::write(
-        &cycle,
-        r#"{"schema":"cycle.v1","work":{"artifact":"teko-work.v1","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository_point":"rpoint_x"},"decision":{"artifact":"kisko-decision.v1","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository_point":"rpoint_x"},"qa_plan":{"artifact":"kelpo-plan.v1","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository_point":"rpoint_x"},"implementation":{"worker_role":"implementation","max_attempts":2},"qa":{"worker_role":"qa","must_differ_from":"implementation"},"effects":[],"retry":{"gate_failure":1,"worker_failure":1},"sauma":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
-    )
-    .unwrap();
-    let facts = fixture.dir.join("cycle.json");
-    fs::write(
-        &facts,
-        r#"{"schema":"ohjaa-cycle-facts.v1","cycle":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sauma":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"decision":"allow","effects":"current","qa_plan":"current","implementation":"pending","gates":"pending","qa":"pending","verdict":"pending","closure":"pending"}"#,
-    )
-    .unwrap();
+    let fixture = Fixture::new("nocoverage");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_sessions(r#"{"error":"store locked"}"#);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "codex", "--intent", "x", "--dry-run"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        stderr.contains("did not report its session coverage"),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
 
+#[test]
+fn an_agent_proposes_and_only_a_person_accepts() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("propose");
+    let repo = fixture.make_git_repo("work");
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "propose",
+                "--scope",
+                "ours",
+                "--id",
+                "rust-only",
+                "--kind",
+                "decision",
+                "--origin",
+                "2026-09-16: 'we dont do python'",
+                "Code",
+                "is",
+                "Rust.",
+            ])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let waiting = fixture.dir.join("state/ohjaa/proposals/ours/rust-only.md");
+    assert!(
+        waiting.is_file(),
+        "the proposal waits outside every repository"
+    );
+    assert!(fs::read_to_string(&waiting)
+        .unwrap()
+        .contains("status = \"proposed\""));
+
+    let (stdout, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["brief", "--knowledge-only"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0));
+    assert!(
+        stdout.contains("No knowledge recorded yet"),
+        "a proposal is not knowledge: {stdout}"
+    );
+
+    let (stdout, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["review", "--list"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0));
+    assert!(
+        stdout.contains("rust-only") && stdout.contains("we dont do python"),
+        "{stdout}"
+    );
+
+    // Tests run without a terminal, exactly like an agent.
+    for decision in [
+        vec!["accept", "rust-only"],
+        vec!["reject", "rust-only"],
+        vec!["review"],
+    ] {
+        let (_, stderr, code) = output_of(fixture.ohjaa().args(&decision).current_dir(&repo));
+        assert_eq!(code, Some(3), "{decision:?}: {stderr}");
+        assert!(stderr.contains("only a person may"), "{stderr}");
+    }
+    assert!(waiting.is_file(), "a refused decision changes nothing");
+    assert!(!fixture.dir.join("ours/knowledge/rust-only.md").exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn a_proposal_that_would_not_hold_is_refused_and_written_nowhere() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("refuse");
+    let repo = fixture.make_git_repo("work");
+    fixture.node(
+        &fixture.dir.join("ours/knowledge"),
+        "team-rule",
+        "decision",
+        "Shared.",
+    );
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
             .args([
-                "cycle",
+                "propose",
+                "--scope",
+                "mine",
+                "--id",
+                "my-override",
+                "--kind",
+                "decision",
+                "--origin",
+                "why",
+                "--supersedes",
+                "team-rule",
+                "Mine instead.",
+            ])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(stderr.contains("cross-scope-supersedes"), "{stderr}");
+    assert!(!fixture
+        .dir
+        .join("state/ohjaa/proposals/mine/my-override.md")
+        .exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn the_briefing_orders_knowledge_by_scope_then_kind() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("order");
+    let repo = fixture.make_git_repo("work");
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/machine"),
+        "lima",
+        "fact",
+        "Lima is here.",
+    );
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        "answer-first",
+        "taste",
+        "Answer first.",
+    );
+    fixture.node(
+        &repo.join(".ohjaa/knowledge"),
+        "uploader",
+        "fact",
+        "Dima owns the uploader.",
+    );
+    fixture.node(
+        &fixture.dir.join("ours/knowledge"),
+        "plain",
+        "taste",
+        "Plain English.",
+    );
+    fixture.node(
+        &fixture.dir.join("ours/knowledge"),
+        "rust",
+        "decision",
+        "Rust only.",
+    );
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["brief", "--knowledge-only"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let order: Vec<usize> = [
+        "Rust only.",
+        "Plain English.",
+        "Dima owns",
+        "Answer first.",
+        "Lima is here.",
+    ]
+    .iter()
+    .map(|text| {
+        stdout
+            .find(text)
+            .unwrap_or_else(|| panic!("{text} missing: {stdout}"))
+    })
+    .collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{stdout}");
+    assert!(stdout.contains("(rust · as of 2026-09-20)"), "{stdout}");
+    fixture.cleanup();
+}
+
+#[test]
+fn run_briefs_knowledge_before_the_perimeter() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("runbrief");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    fixture.node(
+        &fixture.dir.join("ours/knowledge"),
+        "rust",
+        "decision",
+        "Rust only.",
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
                 "run",
-                "--cycle",
-                cycle.to_str().unwrap(),
-                "--facts",
-                facts.to_str().unwrap(),
                 "codex",
                 "--intent",
-                "implement",
+                "x",
                 "--task",
-                "change the parser",
-                "--no-briefing",
+                "fix the lexer",
                 "--dry-run",
             ])
             .current_dir(&repo),
     );
-    fixture.cleanup();
-
     assert_eq!(code, Some(0), "{stderr}");
-    assert!(stderr.contains("Cycle leg: implementation"), "{stderr}");
-    assert!(stderr.contains("change the parser"), "{stderr}");
-}
-
-const DIGEST_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const TOKEN: &str = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-
-/// Everything a derived cycle needs, staged so each test perturbs one fact.
-/// The stubs verify anything, so the fixtures carry only the fields ohjaa
-/// reads; the digests are what bind them to the cycle.
-struct CycleFixture {
-    fixture: Fixture,
-    repo: PathBuf,
-    cycle: PathBuf,
-    work: PathBuf,
-    decision: PathBuf,
-    plan: PathBuf,
-    verdict: PathBuf,
-}
-
-impl CycleFixture {
-    fn new(tag: &str) -> Self {
-        let fixture = Fixture::new(tag);
-        let repo = fixture.make_git_repo("cycle");
-        let cycle = fixture.set_file(
-            "cycle.v1.json",
-            &format!(
-                r#"{{"schema":"cycle.v1","work":{{"artifact":"teko-work.v1","digest":"{DIGEST_A}","repository_point":"rpoint_x"}},"decision":{{"artifact":"kisko.decision.v1","digest":"{DIGEST_A}","repository_point":"rpoint_x"}},"qa_plan":{{"artifact":"kelpo-plan.v1","digest":"{DIGEST_A}","repository_point":"rpoint_x"}},"implementation":{{"worker_role":"implementation","max_attempts":2}},"qa":{{"worker_role":"qa","must_differ_from":"implementation"}},"effects":[],"retry":{{"gate_failure":1,"worker_failure":1}},"sauma":{{"digest":"{DIGEST_A}"}}}}"#
-            ),
-        );
-        let work = fixture.set_file(
-            "work.json",
-            &format!(
-                r#"{{"schema":"teko-work.v1","packet":{{"work":{{"id":"work_w1"}},"extensions":{{"toimija.required_gates.v1":["sykli-full"]}}}},"sauma":{{"digest":"{DIGEST_A}"}}}}"#
-            ),
-        );
-        let decision = fixture.set_file(
-            "decision.json",
-            &format!(
-                r#"{{"schema":"kisko.decision.v1","status":"decided","signer":{{"identity":"operator"}},"expires_at":"2999-01-01T00:00:00Z","repository_point":{{"consistency_token":"{TOKEN}"}},"sauma":{{"digest":"{DIGEST_A}"}}}}"#
-            ),
-        );
-        let plan = fixture.set_file(
-            "plan.json",
-            &format!(r#"{{"schema":"kelpo-plan.v1","sauma":{{"digest":"{DIGEST_A}"}}}}"#),
-        );
-        let verdict = fixture.dir.join("verdict.json");
-        fixture.set_file(
-            "point.json",
-            &format!(
-                r#"{{"repository":{{"id":"rpoint_x","consistency_token":"{TOKEN}","tree_oid":"abc"}}}}"#
-            ),
-        );
-        fixture.set_file(
-            "gates.json",
-            r#"[{"gate":"sykli-full","status":"stale","receipt":null}]"#,
-        );
-        fixture.set_file(
-            "teko.json",
-            r#"{"active":{"work":{"id":"w1"},"status":{"obligations":[{"id":"scope","status":"resolved"},{"id":"repository-changed","status":"unresolved"}]}}}"#,
-        );
-        Self {
-            fixture,
-            repo,
-            cycle,
-            work,
-            decision,
-            plan,
-            verdict,
-        }
-    }
-
-    fn session(&self, id: &str, leg: &str, liveness: &str) -> String {
-        self.session_with_effects(id, leg, liveness, "[]")
-    }
-
-    fn session_with_effects(&self, id: &str, leg: &str, liveness: &str, effects: &str) -> String {
-        format!(
-            r#"{{"id":"{id}","agent":["sh"],"worktree":"/tmp/r","branch":"main","intent":"x","scope":[],"liveness":"{liveness}","exit_status":0,"effects_observed":{effects},"cycle_action":{{"cycle":"{DIGEST_A}","leg":"{leg}","attempt":0,"repository_point":"rpoint_x"}}}}"#
-        )
-    }
-
-    /// Teko reports the tree changed within scope: the implementation is done.
-    fn implemented(&self) {
-        self.fixture.set_file(
-            "teko.json",
-            r#"{"active":{"work":{"id":"w1"},"status":{"obligations":[{"id":"scope","status":"resolved"},{"id":"repository-changed","status":"resolved"}]}}}"#,
-        );
-    }
-
-    fn set_sessions(&self, sessions: &[String]) {
-        self.fixture
-            .set_sessions(&sessions_json(&sessions.join(","), "available"));
-    }
-
-    fn current_gate(&self, exit_code: i32) {
-        let receipts = self.repo.join(".toimija/runs/gates");
-        fs::create_dir_all(&receipts).unwrap();
-        fs::write(
-            receipts.join("gatercpt_1.json"),
-            format!(r#"{{"gate":"sykli-full","exit_code":{exit_code},"sauma":{{"digest":"sha256:ff"}}}}"#),
-        )
-        .unwrap();
-        self.fixture.set_file(
-            "gates.json",
-            r#"[{"gate":"sykli-full","status":"current","receipt":"gatercpt_1"}]"#,
-        );
-    }
-
-    fn verdict(&self, verdict: &str, final_token: &str, test_session: &str) {
-        self.fixture.set_file(
-            "verdict.json",
-            &format!(
-                r#"{{"schema":"kelpo-verdict.v1","verdict":"{verdict}","plan":{{"digest":"{DIGEST_A}"}},"repository":{{"baseline":"sha256:00","final":"{final_token}"}},"independence":{{"code_sessions":[{{"id":"impl-1"}}],"test_sessions":[{{"id":"{test_session}"}}]}},"sauma":{{"digest":"sha256:bb"}}}}"#
-            ),
-        );
-    }
-
-    fn step(&self) -> (String, String, Option<i32>) {
-        output_of(
-            self.fixture
-                .ohjaa()
-                .args(["cycle", "step", "--cycle"])
-                .arg(&self.cycle)
-                .arg("--work")
-                .arg(&self.work)
-                .arg("--decision")
-                .arg(&self.decision)
-                .arg("--qa-plan")
-                .arg(&self.plan)
-                .arg("--verdict")
-                .arg(&self.verdict)
-                .current_dir(&self.repo),
-        )
-    }
-
-    fn action(&self) -> String {
-        let (stdout, stderr, code) = self.step();
-        assert_eq!(code, Some(0), "{stderr}");
-        stdout.trim().to_string()
-    }
+    let task = stderr.find("fix the lexer").expect("task");
+    let knowledge = stderr.find("Rust only.").expect("knowledge in the task");
+    let perimeter = stderr.find("System perimeter").expect("perimeter");
+    assert!(task < knowledge && knowledge < perimeter, "{stderr}");
+    fixture.cleanup();
 }
 
 #[test]
-fn golden_1_derived_facts_walk_the_cycle_to_closed() {
+fn check_reports_broken_nodes_and_flags() {
     if !git_available() {
         return;
     }
-    let cycle = CycleFixture::new("golden-1");
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"launch","leg":"implementation"}"#
+    let fixture = Fixture::new("check");
+    let repo = fixture.make_git_repo("work");
+    let mine = fixture.dir.join("config/ohjaa/mine");
+    fixture.node(&mine, "fine", "taste", "Fine.");
+    fs::write(mine.join("broken.md"), "no frontmatter\n").unwrap();
+    let (stdout, _, code) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(
+        stdout.contains("broken.md") && stdout.contains("missing-frontmatter"),
+        "{stdout}"
     );
 
-    // A closed session alone proves nothing: Teko has not seen the tree
-    // change, so the leg is relaunched (attempt 1 of 2).
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed")]);
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"launch","leg":"implementation"}"#
-    );
-    // Teko reports the change within scope: gates are next, and the leg is
-    // consumed rather than launched again (golden case 5).
-    cycle.implemented();
-    assert_eq!(cycle.action(), r#"{"action":"run_gates"}"#);
-
-    cycle.current_gate(0);
-    assert_eq!(cycle.action(), r#"{"action":"launch","leg":"qa"}"#);
-
-    // A closed QA session without a verdict is a spent attempt, not QA done:
-    // relaunch within budget (1 + worker_failure 1 = 2 attempts).
-    cycle.set_sessions(&[
-        cycle.session("impl-1", "implementation", "closed"),
-        cycle.session("qa-1", "qa", "closed"),
-    ]);
-    assert_eq!(cycle.action(), r#"{"action":"launch","leg":"qa"}"#);
-
-    cycle.verdict("pass", TOKEN, "qa-1");
-    assert_eq!(cycle.action(), r#"{"action":"close_work"}"#);
-
-    cycle.fixture.set_file("teko.json", r#"{"active":null}"#);
-    fs::create_dir_all(cycle.repo.join(".teko")).unwrap();
+    fs::remove_file(mine.join("broken.md")).unwrap();
+    let machine = fixture.dir.join("config/ohjaa/machine");
+    fs::create_dir_all(&machine).unwrap();
     fs::write(
-        cycle.repo.join(".teko/witness.jsonl"),
-        r#"{"record":"teko-completion-witness.v1","work":"w1","sauma":{"digest":"sha256:aa"}}
-"#,
+        machine.join("old-tool.md"),
+        "+++\nid = \"old-tool\"\nkind = \"fact\"\nstatus = \"current\"\nas_of = 2026-01-01\n\
+         origin = [\"t\"]\nholds_while = [\"command:no-such-command-ohjaa-test\"]\n+++\nA tool.\n",
     )
     .unwrap();
-    assert_eq!(cycle.action(), r#"{"action":"closed"}"#);
-    cycle.fixture.cleanup();
-}
-
-#[test]
-fn golden_2_an_inconclusive_decision_holds_before_any_launch() {
-    if !git_available() {
-        return;
-    }
-    let cycle = CycleFixture::new("golden-2");
-    cycle.fixture.set_file(
-        "decision.json",
-        &format!(r#"{{"schema":"kisko.decision.v1","status":"inconclusive","problem":{{"code":"kisko.model_absent"}},"sauma":{{"digest":"{DIGEST_A}"}}}}"#),
-    );
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"held","reason":"decision_held"}"#
-    );
-
-    // A decision the cycle did not seal is not a decision at all.
-    cycle.fixture.set_file(
-        "decision.json",
-        r#"{"schema":"kisko.decision.v1","status":"decided","sauma":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
-    );
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"held","reason":"decision_held"}"#
-    );
-    cycle.fixture.cleanup();
-}
-
-#[test]
-fn a_sauma_verdict_of_unverified_stops_the_cycle() {
-    let cycle = CycleFixture::new("sauma-refuses");
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed")]);
-    cycle.implemented();
-
-    // Ohjaa reads no envelope field but `digest`: whether an artifact is intact
-    // is Sauma's answer, not one Ohjaa re-derives. So a refusal from `sauma
-    // verify` has to stop the cycle, and nothing else in this suite makes it
-    // refuse — the stub accepted everything, which meant a regression that
-    // ignored the exit status and read the digest out of the file anyway would
-    // have passed every test here.
-    let (stdout, stderr, code) = output_of(
-        cycle
-            .fixture
-            .ohjaa()
-            .env("OHJAA_STUB_SAUMA_VERIFY_EXIT", "1")
-            .args(["cycle", "step", "--cycle"])
-            .arg(&cycle.cycle)
-            .arg("--work")
-            .arg(&cycle.work)
-            .arg("--decision")
-            .arg(&cycle.decision)
-            .arg("--qa-plan")
-            .arg(&cycle.plan)
-            .current_dir(&cycle.repo),
-    );
-    assert_ne!(
-        code,
-        Some(0),
-        "an unverified artifact must not step: {stdout}"
+    let (stdout, _, code) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert_eq!(code, Some(0), "flags alone are not errors: {stdout}");
+    assert!(
+        stdout.contains("command:no-such-command-ohjaa-test is false"),
+        "{stdout}"
     );
     assert!(
-        stderr.contains("not a verified Sauma artifact"),
-        "expected the refusal to name the unverified artifact, got {stderr}"
+        stdout.contains("fact last confirmed 266 days ago"),
+        "{stdout}"
     );
+    let (_, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["check", "--strict"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(1));
+    fixture.cleanup();
+}
+
+#[test]
+fn brief_write_replaces_only_its_own_block() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("write");
+    let repo = fixture.make_git_repo("work");
+    fixture.node(
+        &fixture.dir.join("ours/knowledge"),
+        "rust",
+        "decision",
+        "Rust only.",
+    );
+    let target = fixture.dir.join("home/.claude/CLAUDE.md");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "# Mine\n\nKeep this line.\n").unwrap();
+    for _ in 0..2 {
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args(["brief", "--write"])
+                .arg(&target)
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+    }
+    let written = fs::read_to_string(&target).unwrap();
     assert!(
-        stdout.trim().is_empty(),
-        "a refused cycle must not also emit an action: {stdout}"
+        written.starts_with("# Mine\n\nKeep this line.\n"),
+        "{written}"
     );
-    cycle.fixture.cleanup();
+    assert_eq!(
+        written.matches("ohjaa:knowledge begin").count(),
+        1,
+        "{written}"
+    );
+    assert!(written.contains("Rust only."), "{written}");
+    fixture.cleanup();
 }
 
 #[test]
-fn a_stale_gate_reported_with_a_non_zero_exit_is_still_pending() {
+fn intake_turns_a_correction_into_a_proposal_through_the_drafter() {
     if !git_available() {
         return;
     }
-    let cycle = CycleFixture::new("stale-exit");
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed")]);
-    cycle.implemented();
-    cycle.fixture.set_file(
-        "gates.json",
-        r#"[{"gate":"sykli-full","status":"stale repository point","receipt":"gatercpt_0"}]"#,
-    );
+    let fixture = Fixture::new("intake");
+    let repo = fixture.make_git_repo("work");
+    let project = fixture.dir.join("home/.claude/projects/-work");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("session.jsonl"),
+        [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Linux tests are blocked on macOS."}]}}"#,
+            r#"{"type":"user","timestamp":"2026-09-20T10:00:00Z","cwd":"/p/work","message":{"content":"we have lima baba"}}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ncat > {}\ncat <<'JSON'\nSure:\n[{{\"scope\":\"machine\",\"repo\":null,\"id\":\"lima-for-linux\",\
+             \"kind\":\"fact\",\"body\":\"Linux tests run in Lima.\",\"origin\":[\"2026-09-20 work: 'we have lima baba'\"],\
+             \"refines\":null,\"supersedes\":[]}},{{\"scope\":\"nowhere\",\"id\":\"bad\",\"kind\":\"fact\",\"body\":\"x\"}}]\nJSON\n",
+            fixture.dir.join("prompt.txt").display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+
     let (stdout, stderr, code) = output_of(
-        cycle
-            .fixture
+        fixture
             .ohjaa()
-            .env("OHJAA_STUB_GATES_EXIT", "1")
-            .args(["cycle", "step", "--cycle"])
-            .arg(&cycle.cycle)
-            .arg("--work")
-            .arg(&cycle.work)
-            .arg("--decision")
-            .arg(&cycle.decision)
-            .arg("--qa-plan")
-            .arg(&cycle.plan)
-            .current_dir(&cycle.repo),
-    );
-    assert_eq!(code, Some(0), "{stderr}");
-    assert_eq!(stdout.trim(), r#"{"action":"run_gates"}"#);
-    cycle.fixture.cleanup();
-}
-
-#[test]
-fn golden_3_a_failed_gate_receipt_is_a_failure_not_a_rerun() {
-    if !git_available() {
-        return;
-    }
-    let cycle = CycleFixture::new("golden-3");
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed")]);
-    cycle.implemented();
-    cycle.current_gate(1);
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"failed","reason":"gates_failed"}"#
-    );
-    cycle.fixture.cleanup();
-}
-
-#[test]
-fn golden_4_qa_evidence_from_the_implementation_session_is_inconclusive() {
-    if !git_available() {
-        return;
-    }
-    let cycle = CycleFixture::new("golden-4");
-    cycle.set_sessions(&[
-        cycle.session("impl-1", "implementation", "closed"),
-        cycle.session("qa-1", "qa", "closed"),
-    ]);
-    cycle.implemented();
-    cycle.current_gate(0);
-    cycle.verdict("pass", TOKEN, "impl-1");
-    assert_eq!(cycle.action(), r#"{"action":"held","reason":"qa_verdict"}"#);
-
-    // A verdict anchored to a point the tree has left is stale, not false:
-    // QA runs again (the one closed session leaves one attempt in budget).
-    cycle.verdict(
-        "pass",
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        "qa-1",
-    );
-    assert_eq!(cycle.action(), r#"{"action":"launch","leg":"qa"}"#);
-    cycle.fixture.cleanup();
-}
-
-#[test]
-fn golden_6_a_live_leg_holds_instead_of_duplicating_work() {
-    if !git_available() {
-        return;
-    }
-    let cycle = CycleFixture::new("golden-6");
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "active")]);
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"held","reason":"implementation"}"#
-    );
-    cycle.fixture.cleanup();
-}
-
-#[test]
-fn golden_8_an_exhausted_worker_budget_fails_without_another_launch() {
-    if !git_available() {
-        return;
-    }
-    let cycle = CycleFixture::new("golden-8");
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed")]);
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"launch","leg":"implementation"}"#
-    );
-    // A session that went quiet is a finished attempt too, never waited on.
-    cycle.set_sessions(&[
-        cycle.session("impl-1", "implementation", "closed"),
-        cycle.session("impl-2", "implementation", "stale"),
-    ]);
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"failed","reason":"implementation_failed"}"#
-    );
-    cycle.fixture.cleanup();
-}
-
-#[test]
-fn an_unreadable_session_listing_holds_rather_than_launching_blind() {
-    if !git_available() {
-        return;
-    }
-    let cycle = CycleFixture::new("blind");
-    cycle.fixture.set_sessions(&sessions_json("", "degraded"));
-    let (stdout, stderr, code) = cycle.step();
-    assert_eq!(code, Some(0), "{stderr}");
-    // Sessions unreadable means effects unobservable: the first thing the
-    // reducer cannot vouch for is the first thing it holds on.
-    assert_eq!(stdout.trim(), r#"{"action":"held","reason":"effects"}"#);
-    assert!(stderr.contains("absence is not evidence"), "{stderr}");
-    cycle.fixture.cleanup();
-}
-
-#[test]
-fn cycle_run_loop_acts_through_toimija_and_stops_on_a_terminal_action() {
-    if !git_available() {
-        return;
-    }
-    let cycle = CycleFixture::new("loop");
-    cycle.set_sessions(&[cycle.session("impl-1", "implementation", "closed")]);
-    cycle.implemented();
-    // Gates are stale, so the loop runs `toimija verify-work` once; the stub
-    // leaves them stale, so the second step repeats — and the bound ends it.
-    let (stdout, stderr, code) = output_of(
-        cycle
-            .fixture
-            .ohjaa()
-            .args(["cycle", "run", "--cycle"])
-            .arg(&cycle.cycle)
-            .arg("--work")
-            .arg(&cycle.work)
-            .arg("--decision")
-            .arg(&cycle.decision)
-            .arg("--qa-plan")
-            .arg(&cycle.plan)
             .args([
-                "--max-steps",
-                "2",
-                "sh",
-                "--intent",
-                "loop",
-                "--no-briefing",
+                "intake",
+                "--source",
+                "transcripts",
+                "--since",
+                "2026-09-01",
+                "--drafter",
             ])
-            .current_dir(&cycle.repo),
+            .arg(&drafter)
+            .current_dir(&repo),
     );
-    assert_eq!(code, Some(3), "{stderr}");
-    assert_eq!(stdout.trim(), r#"{"action":"held","reason":"step_budget"}"#);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let prompt = fs::read_to_string(fixture.dir.join("prompt.txt")).unwrap();
     assert!(
-        stderr.contains("step 0") && stderr.contains("run_gates"),
+        prompt.contains("we have lima baba"),
+        "the candidate reaches the drafter"
+    );
+    assert!(
+        prompt.contains("Linux tests are blocked on macOS."),
+        "with what the agent said"
+    );
+    assert!(stdout.contains("proposed lima-for-linux"), "{stdout}");
+    assert!(
+        stderr.contains("draft `bad` refused"),
+        "an invalid draft is refused, loudly: {stderr}"
+    );
+    assert!(fixture
+        .dir
+        .join("state/ohjaa/proposals/machine/lima-for-linux.md")
+        .is_file());
+    let cursor = fs::read_to_string(fixture.dir.join("state/ohjaa/intake-since")).unwrap();
+    assert!(
+        cursor.starts_with("20"),
+        "the cursor moves once everything was drafted: {cursor}"
+    );
+
+    // A second run from the cursor finds nothing new and asks the drafter nothing.
+    fs::remove_file(fixture.dir.join("prompt.txt")).unwrap();
+    let (stdout, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--source", "transcripts", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0));
+    assert!(stdout.contains("nothing new"), "{stdout}");
+    assert!(!fixture.dir.join("prompt.txt").exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn a_failing_drafter_stops_intake_without_moving_the_cursor() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakefail");
+    let repo = fixture.make_git_repo("work");
+    let project = fixture.dir.join("home/.claude/projects/-work");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("s.jsonl"),
+        r#"{"type":"user","timestamp":"2026-09-20T10:00:00Z","message":{"content":"never python"}}"#,
+    )
+    .unwrap();
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "intake",
+                "--source",
+                "transcripts",
+                "--since",
+                "2026-09-01",
+                "--drafter",
+                "echo no array; exit 0",
+            ])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(stderr.contains("intake stopped"), "{stderr}");
+    assert!(!fixture.dir.join("state/ohjaa/intake-since").exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn a_file_inside_a_repository_gets_only_shared_knowledge() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("sharedwrite");
+    let repo = fixture.make_git_repo("work");
+    fixture.node(
+        &fixture.dir.join("ours/knowledge"),
+        "rust",
+        "decision",
+        "Rust only.",
+    );
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        "answer-first",
+        "taste",
+        "Answer first.",
+    );
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/machine"),
+        "lima",
+        "fact",
+        "Lima is here.",
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["brief", "--write", "AGENTS.md"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("shared (ours, repo)"), "{stderr}");
+    let written = fs::read_to_string(repo.join("AGENTS.md")).unwrap();
+    assert!(written.contains("Rust only."), "{written}");
+    assert!(
+        !written.contains("Answer first.") && !written.contains("Lima is here."),
+        "one person's knowledge never lands in a shared file: {written}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_deleted_configured_root_is_skipped_not_fatal() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("staleroot");
+    let repo = fixture.make_git_repo("work");
+    let config = fixture.dir.join("config/ohjaa");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("roots"),
+        format!(
+            "{}\n{}\n",
+            fixture.dir.join("gone").display(),
+            fixture.dir.display()
+        ),
+    )
+    .unwrap();
+    let (stdout, stderr, code) = output_of(fixture.ohjaa().arg("fleet").current_dir(&repo));
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("skipping root") && stderr.contains("gone"),
         "{stderr}"
     );
-    let argv = fs::read_to_string(cycle.fixture.dir.join("argv.txt")).unwrap();
-    assert!(argv.contains("verify-work"), "{argv}");
-    cycle.fixture.cleanup();
+    fixture.cleanup();
 }
 
 #[test]
-fn cycle_run_delivers_the_verdict_to_teko_before_asking_toimija_to_close() {
+fn check_counts_an_unreadable_proposal_as_an_error() {
     if !git_available() {
         return;
     }
-    let cycle = CycleFixture::new("close");
-    cycle.set_sessions(&[
-        cycle.session("impl-1", "implementation", "closed"),
-        cycle.session("qa-1", "qa", "closed"),
-    ]);
-    cycle.implemented();
-    cycle.current_gate(0);
-    cycle.verdict("pass", TOKEN, "qa-1");
-    let (stdout, stderr, code) = output_of(
-        cycle
-            .fixture
-            .ohjaa()
-            .args(["cycle", "run", "--cycle"])
-            .arg(&cycle.cycle)
-            .arg("--work")
-            .arg(&cycle.work)
-            .arg("--decision")
-            .arg(&cycle.decision)
-            .arg("--qa-plan")
-            .arg(&cycle.plan)
-            .arg("--verdict")
-            .arg(&cycle.verdict)
-            .args([
-                "--max-steps",
-                "1",
-                "sh",
-                "--intent",
-                "close",
-                "--no-briefing",
-            ])
-            .current_dir(&cycle.repo),
-    );
-    assert_eq!(code, Some(3), "{stderr}");
-    assert_eq!(stdout.trim(), r#"{"action":"held","reason":"step_budget"}"#);
-    assert!(stderr.contains("close_work"), "{stderr}");
-    let argv = fs::read_to_string(cycle.fixture.dir.join("argv.txt")).unwrap();
-    assert!(argv.contains("close-work"), "{argv}");
-    let teko_argv = fs::read_to_string(cycle.fixture.dir.join("teko-argv.txt")).unwrap();
+    let fixture = Fixture::new("badproposal");
+    let repo = fixture.make_git_repo("work");
+    let waiting = fixture.dir.join("state/ohjaa/proposals/mine");
+    fs::create_dir_all(&waiting).unwrap();
+    fs::write(waiting.join("half.md"), "+++\nid = \"half\"\n").unwrap();
+    let (stdout, _, code) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert_eq!(code, Some(1), "{stdout}");
     assert!(
-        teko_argv.contains("teko observe-verdict --verdict"),
-        "{teko_argv}"
+        stdout.contains("proposal") && stdout.contains("half.md"),
+        "{stdout}"
     );
-    cycle.fixture.cleanup();
-}
-
-#[test]
-fn golden_7_an_undeclared_effect_holds_before_the_next_action() {
-    if !git_available() {
-        return;
-    }
-    let cycle = CycleFixture::new("golden-7");
-    // The cycle declares no effects; Toimija saw the implementation push.
-    cycle.set_sessions(&[cycle.session_with_effects(
-        "impl-1",
-        "implementation",
-        "closed",
-        r#"["commit","push"]"#,
-    )]);
-    cycle.implemented();
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"held","reason":"undeclared_effect"}"#
-    );
-
-    // Partial observation is not absence of effects.
-    cycle.fixture.set_sessions(&sessions_json(
-        &format!(
-            r#"{{"id":"impl-1","agent":["sh"],"worktree":"/tmp/r","branch":"main","intent":"x","scope":[],"liveness":"closed","effects_observed":[],"effects_coverage":"partial","cycle_action":{{"cycle":"{DIGEST_A}","leg":"implementation","attempt":0,"repository_point":"rpoint_x"}}}}"#
-        ),
-        "available",
-    ));
-    assert_eq!(cycle.action(), r#"{"action":"held","reason":"effects"}"#);
-    cycle.fixture.cleanup();
-}
-
-#[test]
-fn a_decision_launches_only_at_its_point_before_expiry_from_an_allowed_signer() {
-    if !git_available() {
-        return;
-    }
-    let cycle = CycleFixture::new("decision-binding");
-    let decision = |signer: &str, expires: &str, token: &str| {
-        format!(
-            r#"{{"schema":"kisko.decision.v1","status":"decided","signer":{{"identity":"{signer}"}},"expires_at":"{expires}","repository_point":{{"consistency_token":"{token}"}},"sauma":{{"digest":"{DIGEST_A}"}}}}"#
-        )
-    };
-    // The cycle names who may launch and where it was sealed.
-    cycle.fixture.set_file(
-        "cycle.v1.json",
-        &format!(
-            r#"{{"schema":"cycle.v1","work":{{"artifact":"teko-work.v1","digest":"{DIGEST_A}","repository_point":"rpoint_x"}},"decision":{{"artifact":"kisko.decision.v1","digest":"{DIGEST_A}","repository_point":"rpoint_x","signers":["operator"]}},"qa_plan":{{"artifact":"kelpo-plan.v1","digest":"{DIGEST_A}","repository_point":"rpoint_x"}},"implementation":{{"worker_role":"implementation","max_attempts":2}},"qa":{{"worker_role":"qa","must_differ_from":"implementation"}},"effects":[],"retry":{{"gate_failure":1,"worker_failure":1}},"sauma":{{"digest":"{DIGEST_A}","anchored_at":"{TOKEN}"}}}}"#
-        ),
-    );
-    cycle.fixture.set_file(
-        "decision.json",
-        &decision("stranger", "2999-01-01T00:00:00Z", TOKEN),
-    );
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"held","reason":"decision_held"}"#
-    );
-    cycle.fixture.set_file(
-        "decision.json",
-        &decision("operator", "2000-01-01T00:00:00Z", TOKEN),
-    );
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"held","reason":"decision_held"}"#
-    );
-    cycle.fixture.set_file(
-        "decision.json",
-        &decision(
-            "operator",
-            "2999-01-01T00:00:00Z",
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        ),
-    );
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"held","reason":"decision_held"}"#
-    );
-    cycle.fixture.set_file(
-        "decision.json",
-        &decision("operator", "2999-01-01T00:00:00Z", TOKEN),
-    );
-    assert_eq!(
-        cycle.action(),
-        r#"{"action":"launch","leg":"implementation"}"#
-    );
-    cycle.fixture.cleanup();
-}
-
-#[test]
-fn cycle_doctor_names_every_tool_and_the_session() {
-    let fixture = Fixture::new("doctor");
-    let (stdout, _, code) = output_of(fixture.ohjaa().args(["cycle", "doctor"]));
-    assert!(stdout.contains("toimija"), "{stdout}");
-    assert!(stdout.contains("session"), "{stdout}");
-    assert!(stdout.contains("ready"), "{stdout}");
-    assert!(code == Some(0) || code == Some(3), "{stdout}");
     fixture.cleanup();
 }

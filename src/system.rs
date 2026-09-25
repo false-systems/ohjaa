@@ -41,11 +41,13 @@ impl Tool {
             role: None,
             not: Vec::new(),
         };
-        let Ok(output) = Command::new("toimija")
-            .args(["context", "--json"])
-            .current_dir(repo)
-            .output()
-        else {
+        let Ok(output) = crate::process::run(
+            Command::new("toimija")
+                .args(["context", "--json"])
+                .current_dir(repo),
+            None,
+            crate::process::LOCAL,
+        ) else {
             return unknown();
         };
         if !output.status.success() {
@@ -281,9 +283,7 @@ pub fn briefing(view: &SystemView, here: &Path) -> String {
     }
     out.push_str(
         "\nCoordination: claiming work stays in GitHub issues/PRs; sessions are\n\
-         observations, not locks. These local CLI observations are not Sauma-verified\n\
-         digests; re-derive them before acting. Cross-repo artifacts must be\n\
-         Sauma-verified and anchored to a repository point.",
+         observations, not locks. Re-derive them before acting.",
     );
     out
 }
