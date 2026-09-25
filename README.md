@@ -18,6 +18,8 @@ ohjaa propose --scope ours --id rust-only --kind decision \
 ohjaa review                           # a person decides what becomes current
 ohjaa intake                           # draft proposals from what people said
 ohjaa check                            # validate, and flag what may no longer hold
+ohjaa session                          # the record of the last session here
+ohjaa graph rust-only                  # a node, its neighbours, who was briefed with it
 ohjaa fleet                            # who is live, across every repo
 ohjaa system                           # what every tool in the fleet is, derived now
 ```
@@ -113,6 +115,61 @@ node that is not reaching agents gets noticed.
 Every draft is validated like any proposal, and an invalid one is refused out
 loud. The cursor moves only past what was actually drafted from.
 
+## Sessions: entering to leaving
+
+`ohjaa run` runs each agent session through five states, and stays its parent
+until it ends so the last one always happens:
+
+```
+1 entering → 2 oriented → 3 working, phase 1 … n → 4 finished work → 5 leaving
+```
+
+| State | What happens | Written by |
+|---|---|---|
+| 1 entering | the briefing: knowledge, the last session here, how this session works, the perimeter | ohjaa |
+| 2 oriented | the agent reads back what it knows: `ohjaa oriented "<goal; rules; who else>"` | the agent |
+| 3 working | small phases, each a commit and a `sykli run` on it | observed from git and `.sykli/receipts` |
+| 4 finished | the branch's pull request, and whether its head has evidence | observed through `gh` |
+| 5 leaving | the record: observed part, then the handover (`ohjaa handover`) | ohjaa, and the agent's testimony |
+
+States are **observed, not declared**: the agent writes only its read-back and
+its handover, and the record shows them as its words. Leaving always writes the
+record, crash or not; a missing handover is recorded as none. The next session
+here is briefed with it:
+
+```
+session oh-1790… · claude · selko · 10:02 → 11:47 · ended: clean (exit 0)
+─ observed (written by ohjaa; the agent cannot change it) ─
+intent        retry uploads
+knew          14 knowledge node(s) delivered · read back at 10:04
+phases        a1b2c3d passed · d4e5f6a passed · 0718abc failed · 9c0d1e2 passed
+finished      https://github.com/…/pull/57 (open) · evidence on its head: passed
+─ handover (the agent's own words) ─
+unfinished    Windows paths in uploader/retry.rs
+next agent    Dima owns the queue; ask first
+surprised by  the fixture helper silently skips when git is missing
+```
+
+The records live in a **session log**, redb at
+`~/.local/state/ohjaa/sessions.redb`, on this machine only. Knowledge never
+lives there, so deleting the log loses no knowledge. A busy or broken log never
+blocks a launch; a broken one is reported and left alone, never replaced.
+`ohjaa intake` drafts proposals from each ended session once: its handover and
+what was said in its window.
+
+Signals, while a session runs (unix):
+
+- **Ctrl-C** reaches the agent directly (it is in the same process group).
+  ohjaa survives it and never passes it on: a second Ctrl-C makes agents like
+  `claude` quit instead of interrupt.
+- **SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2** sent to ohjaa are survived and
+  passed on to the session once each. To stop a session from outside, send
+  SIGTERM to ohjaa.
+- **After the session ends**, any of these cuts leaving short (the tools still
+  running are killed) and the record is still written, with what was known by
+  then; the normal dispositions come back once it is saved.
+- **SIGKILL** cannot be caught: it loses the record.
+
 ## Keeping it true
 
 `ohjaa check` validates every node and the rules across them. It also flags
@@ -177,5 +234,6 @@ coverage: scanned 17/18 repo(s)
   from an agent that has since died is a silent lie. Knowledge is not a
   message: it carries its time, its why and whose it is, and a person reviewed
   it.
-- **No scheduler and no agent-to-agent handoff.** Claiming work stays in GitHub
-  issues and pull requests.
+- **No scheduler and no dispatch.** Claiming work stays in GitHub issues and
+  pull requests. A handover is a record for whoever comes next here, shown in
+  the next briefing, never a message addressed to a particular agent.
