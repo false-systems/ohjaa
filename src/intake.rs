@@ -455,6 +455,56 @@ pub fn reverts(repos: &[PathBuf], since_ms: i64, warnings: &mut Vec<String>) -> 
     out
 }
 
+// ---- sessions ---------------------------------------------------------------
+
+/// What each ended session's agent said at leaving, as candidates. Its
+/// testimony, not a fact: the drafter weighs it, and a person decides.
+pub fn handover_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for session in sessions {
+        let Some(handover) = &session.handover else {
+            continue;
+        };
+        for (label, value) in [
+            ("unfinished", &handover.unfinished),
+            ("for the next agent", &handover.next),
+            ("surprised by", &handover.surprised),
+        ] {
+            if let Some(value) = value.as_deref().and_then(clean) {
+                out.push(Candidate {
+                    source: "handover",
+                    at_ms: handover.at_ms,
+                    at: rfc3339(handover.at_ms.div_euclid(1000)),
+                    place: session.repo.clone(),
+                    who: session.agent.clone(),
+                    context: format!("session {} ({}), its handover", session.id, session.intent),
+                    text: format!("{label}: {value}"),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The transcript candidates that fall inside one of these sessions: its time
+/// window, in its repository (or below it).
+pub fn within_sessions(
+    window: Vec<Candidate>,
+    sessions: &[crate::sessions::Session],
+) -> Vec<Candidate> {
+    window
+        .into_iter()
+        .filter(|candidate| {
+            sessions.iter().any(|session| {
+                let ended = session.left.as_ref().map_or(i64::MAX, |left| left.ended_ms);
+                candidate.at_ms >= session.started_ms
+                    && candidate.at_ms <= ended
+                    && Path::new(&candidate.place).starts_with(&session.repo)
+            })
+        })
+        .collect()
+}
+
 // ---- drafting ---------------------------------------------------------------
 
 const INSTRUCTIONS: &str = "\

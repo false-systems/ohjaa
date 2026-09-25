@@ -8,9 +8,11 @@
 
 mod intake;
 mod knowledge;
+mod lifecycle;
 mod process;
 mod roots;
 mod scan;
+mod sessions;
 mod system;
 
 use std::io::{BufRead, Write};
@@ -181,6 +183,31 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// State 2, from inside a session: read back what you know before the
+    /// first change. The goal in one line, the rules that apply, who else is
+    /// working.
+    Oriented {
+        #[arg(required = true, num_args = 1..)]
+        readback: Vec<String>,
+    },
+    /// State 5, from inside a session: the handover for whoever comes next.
+    /// Write it before you finish.
+    Handover {
+        /// What is not done, and where to pick it up.
+        #[arg(long)]
+        unfinished: Option<String>,
+        /// What the next agent should know.
+        #[arg(long)]
+        next: Option<String>,
+        /// What caught you out that the briefing did not say.
+        #[arg(long)]
+        surprised: Option<String>,
+    },
+    /// Show a session record: the latest one here, or one by id.
+    Session { id: Option<String> },
+    /// A knowledge node and its neighbours: what it builds on, what builds on
+    /// it, what it replaced, and which sessions were briefed with it.
+    Graph { id: String },
 }
 
 fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
@@ -341,11 +368,24 @@ fn dirs() -> Result<Dirs> {
 /// Broken files and flags are said out loud; they never make the briefing
 /// silently smaller.
 fn knowledge_briefing(dirs: &Dirs) -> Result<String> {
-    knowledge_briefing_for(dirs, &Scope::ALL)
+    Ok(knowledge_briefing_for(dirs, &Scope::ALL)?.0)
 }
 
-fn knowledge_briefing_for(dirs: &Dirs, scopes: &[Scope]) -> Result<String> {
+/// The knowledge section, and exactly which nodes it delivers.
+fn knowledge_briefing_for(
+    dirs: &Dirs,
+    scopes: &[Scope],
+) -> Result<(String, Vec<sessions::Delivered>)> {
     let loaded = knowledge::load(dirs)?;
+    let delivered = fk::briefing(&loaded.nodes)
+        .into_iter()
+        .filter(|located| scopes.contains(&located.scope))
+        .map(|located| sessions::Delivered {
+            id: located.node.id.clone(),
+            scope: located.scope.name().to_owned(),
+            as_of: located.node.as_of.to_string(),
+        })
+        .collect();
     for broken in &loaded.broken {
         eprintln!(
             "ohjaa: unreadable knowledge {}: {}",
@@ -366,7 +406,7 @@ fn knowledge_briefing_for(dirs: &Dirs, scopes: &[Scope]) -> Result<String> {
             knowledge::DEFAULT_BUDGET
         );
     }
-    Ok(text)
+    Ok((text, delivered))
 }
 
 fn cmd_brief(roots: &[PathBuf], knowledge_only: bool, write: &[PathBuf]) -> Result<i32> {
@@ -381,7 +421,7 @@ fn cmd_brief(roots: &[PathBuf], knowledge_only: bool, write: &[PathBuf]) -> Resu
             } else {
                 (&Scope::ALL, "all")
             };
-            let knowledge = knowledge_briefing_for(&dirs, scopes)?;
+            let (knowledge, _) = knowledge_briefing_for(&dirs, scopes)?;
             let text = if knowledge.is_empty() {
                 "No knowledge recorded yet.".to_owned()
             } else {
@@ -415,10 +455,250 @@ fn cmd_brief(roots: &[PathBuf], knowledge_only: bool, write: &[PathBuf]) -> Resu
         return Ok(0);
     }
     let here = git_root().unwrap_or_else(|| PathBuf::from("."));
+    if let Some(last) = last_session_here(&dirs, &here) {
+        print!("\n{last}");
+    }
     let view = system::system_view(&repos(roots)?);
     println!("\n{}", system::briefing(&view, &here));
     // An incomplete perimeter is said with the exit code, as `system` does.
     Ok(view.exit_code())
+}
+
+// ---- the session log ---------------------------------------------------------
+
+/// Open the session log, or say why not. The log is never a reason to stop.
+fn session_store(dirs: &Dirs) -> Option<sessions::Store> {
+    match sessions::Store::open(&sessions::store_path(&dirs.state)) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            eprintln!("ohjaa: {error}; carrying on without the session log");
+            None
+        }
+    }
+}
+
+fn repo_key(repo: &Path) -> String {
+    std::fs::canonicalize(repo)
+        .unwrap_or_else(|_| repo.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// "Last session here", when the log knows one.
+fn last_session_here(dirs: &Dirs, repo: &Path) -> Option<String> {
+    let store = session_store(dirs)?;
+    match store.latest_for(&repo_key(repo)) {
+        Ok(Some(session)) => Some(sessions::render_last(&session)),
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!("ohjaa: {error}");
+            None
+        }
+    }
+}
+
+/// The session this command runs inside, named by `ohjaa run`.
+fn current_session_id() -> Result<String> {
+    let id = std::env::var(sessions::SESSION_ENV).map_err(|_| {
+        anyhow::anyhow!(
+            "not inside an ohjaa session: start the agent with `ohjaa run` (it sets {})",
+            sessions::SESSION_ENV
+        )
+    })?;
+    if !sessions::is_valid_id(&id) {
+        bail!("{} is not a session id: `{id}`", sessions::SESSION_ENV);
+    }
+    Ok(id)
+}
+
+/// Record something the agent says about its own session.
+fn record_testimony(what: &str, change: impl FnOnce(&mut sessions::Session)) -> Result<i32> {
+    let id = current_session_id()?;
+    let dirs = dirs()?;
+    let store = sessions::Store::open(&sessions::store_path(&dirs.state))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    match store
+        .update(&id, change)
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+    {
+        Some(_) => {
+            println!("recorded the {what} for session {id}");
+            Ok(0)
+        }
+        None => bail!("session {id} is not in the log (its entering was not recorded)"),
+    }
+}
+
+fn cmd_oriented(readback: &[String]) -> Result<i32> {
+    let text = readback.join(" ").trim().to_owned();
+    if text.is_empty() {
+        bail!("say what you know: the goal in one line, the rules that apply, who else is working");
+    }
+    let at_ms = intake::now_seconds() * 1000;
+    record_testimony("read-back", move |session| {
+        session.readback = Some(sessions::Readback { at_ms, text });
+    })
+}
+
+fn cmd_handover(
+    unfinished: Option<&str>,
+    next: Option<&str>,
+    surprised: Option<&str>,
+) -> Result<i32> {
+    let clean = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    let handover = sessions::Handover {
+        at_ms: intake::now_seconds() * 1000,
+        unfinished: clean(unfinished),
+        next: clean(next),
+        surprised: clean(surprised),
+    };
+    if handover.unfinished.is_none() && handover.next.is_none() && handover.surprised.is_none() {
+        bail!("a handover needs at least one of --unfinished, --next or --surprised");
+    }
+    record_testimony("handover", move |session| {
+        session.handover = Some(handover);
+    })
+}
+
+fn cmd_session(id: Option<&str>) -> Result<i32> {
+    let dirs = dirs()?;
+    let store = sessions::Store::open(&sessions::store_path(&dirs.state))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let session = match id {
+        Some(id) => store.get(id).map_err(|e| anyhow::anyhow!("{e}"))?,
+        None => {
+            let repo = git_root().context("not inside a Git repository; name a session id")?;
+            store
+                .latest_for(&repo_key(&repo))
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+    };
+    match session {
+        Some(session) => {
+            print!("{}", sessions::render_record(&session));
+            Ok(0)
+        }
+        None => {
+            println!("no session recorded");
+            Ok(1)
+        }
+    }
+}
+
+fn cmd_graph(id: &str) -> Result<i32> {
+    use std::fmt::Write as _;
+    let dirs = dirs()?;
+    let loaded = knowledge::load(&dirs)?;
+    let Some(node) = loaded.get(id) else {
+        bail!("no knowledge named `{id}` here");
+    };
+    let describe = |located: &fk::Located| {
+        format!(
+            "{} [{} · {} · {} · as of {}]",
+            located.node.id,
+            located.scope.name(),
+            located.node.kind.name(),
+            located.node.status.name(),
+            located.node.as_of
+        )
+    };
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", describe(node));
+    for line in node.node.body.lines() {
+        let _ = writeln!(out, "    {line}");
+    }
+    // What it builds on, all the way up; the files are the graph.
+    let mut chain = Vec::new();
+    let mut cursor = node.node.refines.clone();
+    while let Some(base) = cursor {
+        if chain.contains(&base) || chain.len() > 32 {
+            break;
+        }
+        cursor = loaded.get(&base).and_then(|l| l.node.refines.clone());
+        chain.push(base);
+    }
+    let _ = writeln!(
+        out,
+        "builds on     {}",
+        if chain.is_empty() {
+            "—".to_owned()
+        } else {
+            chain.join(" → ")
+        }
+    );
+    let built_on: Vec<&str> = loaded
+        .nodes
+        .iter()
+        .filter(|l| l.node.refines.as_deref() == Some(id))
+        .map(|l| l.node.id.as_str())
+        .collect();
+    let _ = writeln!(
+        out,
+        "built on by   {}",
+        if built_on.is_empty() {
+            "—".to_owned()
+        } else {
+            built_on.join(", ")
+        }
+    );
+    let _ = writeln!(
+        out,
+        "replaced      {}",
+        if node.node.supersedes.is_empty() {
+            "—".to_owned()
+        } else {
+            node.node.supersedes.join(", ")
+        }
+    );
+    let replaced_by: Vec<&str> = loaded
+        .nodes
+        .iter()
+        .filter(|l| l.node.supersedes.iter().any(|s| s == id))
+        .map(|l| l.node.id.as_str())
+        .collect();
+    let _ = writeln!(
+        out,
+        "replaced by   {}",
+        if replaced_by.is_empty() {
+            "—".to_owned()
+        } else {
+            replaced_by.join(", ")
+        }
+    );
+    if let Some(store) = session_store(&dirs) {
+        if let Ok((all, _)) = store.all() {
+            let briefed: Vec<&sessions::Session> = all
+                .iter()
+                .rev()
+                .filter(|s| s.delivered.iter().any(|d| d.id == id))
+                .collect();
+            let recent: Vec<String> = briefed
+                .iter()
+                .take(5)
+                .map(|s| {
+                    let repo = Path::new(&s.repo)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    format!("{} ({repo})", s.id)
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "briefed in    {} session(s){}{}",
+                briefed.len(),
+                if recent.is_empty() { "" } else { ", latest: " },
+                recent.join(", ")
+            );
+        }
+    }
+    print!("{out}");
+    Ok(0)
 }
 
 fn scope_arg(name: &str) -> Result<Scope> {
@@ -715,6 +995,36 @@ fn cmd_intake(
             other => bail!("`{other}` is not a source: transcripts, reviews or reverts"),
         }
     }
+    // Sessions that ended and were never drafted from: the agent's own
+    // handover, and what was said in that session's window, even when the
+    // window lies before the cursor.
+    let store = session_store(&dirs);
+    let queued: Vec<sessions::Session> = store
+        .as_ref()
+        .and_then(|store| store.all().ok())
+        .map(|(all, _)| {
+            all.into_iter()
+                .filter(|s| s.left.is_some() && !s.drafted)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !queued.is_empty() {
+        candidates.extend(intake::handover_candidates(&queued));
+        if sources.contains(&"transcripts") {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .context("HOME is not set")?;
+            let earliest = queued.iter().map(|s| s.started_ms).min().unwrap_or(since);
+            let window = intake::transcripts(&home, earliest - 1, &mut warnings);
+            candidates.extend(intake::within_sessions(window, &queued));
+        }
+        eprintln!(
+            "ohjaa: {} ended session(s) queued for drafting",
+            queued.len()
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|c| seen.insert((c.at_ms, c.text.clone())));
     for warning in &warnings {
         eprintln!("ohjaa: intake: {warning}");
     }
@@ -727,9 +1037,19 @@ fn cmd_intake(
         candidates.len(),
         intake::rfc3339(since.div_euclid(1000))
     );
+    let mark_drafted = || {
+        if let Some(store) = &store {
+            for session in &queued {
+                if let Err(error) = store.update(&session.id, |s| s.drafted = true) {
+                    eprintln!("ohjaa: {error}");
+                }
+            }
+        }
+    };
     if candidates.is_empty() {
         if !dry_run && warnings.is_empty() {
             intake::write_cursor(&dirs, started)?;
+            mark_drafted();
         }
         println!("nothing new to draft from");
         return Ok(0);
@@ -792,6 +1112,9 @@ fn cmd_intake(
             through
         };
         intake::write_cursor(&dirs, cursor)?;
+    }
+    if finished_all {
+        mark_drafted();
     }
     println!(
         "{proposed} proposal(s) waiting for review (`ohjaa review`), {refused} draft(s) refused"
@@ -868,21 +1191,33 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         }
     }
 
-    // The briefing: knowledge first (what to know before acting), then the
+    // State 1, entering. The briefing: knowledge first (what to know before
+    // acting), then the last session here and how this one works, then the
     // perimeter (who and what is around). Delivered inside the task so it
     // travels in toimija's composed launch prompt.
+    let dirs = Dirs::resolve(Some(&root))?;
+    let started_ms = intake::now_seconds() * 1000;
+    let session_id = sessions::new_id(started_ms);
+    let mut delivered = Vec::new();
     let task = if no_briefing {
         task.map(String::from)
     } else {
-        let knowledge = knowledge_briefing(&Dirs::resolve(Some(&root))?)?;
+        let (knowledge, nodes) = knowledge_briefing_for(&dirs, &Scope::ALL)?;
+        delivered = nodes;
+        let last = last_session_here(&dirs, &root).unwrap_or_default();
         let fleet = repos(roots)?;
         let view = system::system_view(&fleet);
         let perimeter = system::briefing(&view, &root);
-        let briefing = if knowledge.is_empty() {
-            perimeter
-        } else {
-            format!("{knowledge}\n{perimeter}")
-        };
+        let parts: Vec<&str> = [
+            knowledge.as_str(),
+            last.as_str(),
+            LIFECYCLE,
+            perimeter.as_str(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect();
+        let briefing = parts.join("\n");
         Some(match task {
             Some(task) => format!("{task}\n\n{briefing}"),
             None => briefing,
@@ -900,23 +1235,87 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     command.arg("--").arg(agent).args(passthrough);
     command.current_dir(&root);
     if dry_run {
-        eprintln!("ohjaa: dry-run; would exec: {}", render_command(&command));
+        eprintln!("ohjaa: dry-run; would run: {}", render_command(&command));
         return Ok(0);
     }
-    // Replace this process with toimija instead of wrapping it: one fewer
-    // parent above the agent tree, and signals aimed at this PID reach toimija.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        let error = command.exec();
-        Err(error).context("failed to exec toimija")
+    command.env(sessions::SESSION_ENV, &session_id);
+
+    let mut session = sessions::Session {
+        id: session_id.clone(),
+        agent: agent.to_owned(),
+        repo: repo_key(&root),
+        intent: intent.to_owned(),
+        started_ms,
+        branch: lifecycle::branch(&root),
+        head_at_start: lifecycle::head(&root),
+        delivered,
+        readback: None,
+        handover: None,
+        left: None,
+        drafted: false,
+    };
+    if let Some(store) = session_store(&dirs) {
+        if let Err(error) = store.put(&session) {
+            eprintln!("ohjaa: {error}; this session will not be recorded");
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let status = command.status().context("failed to run toimija")?;
-        Ok(status.code().unwrap_or(1))
+    eprintln!("ohjaa: session {session_id} entering");
+
+    // Stay the parent: leaving must run when the session ends, however it ends.
+    let mut child = command.spawn().context("failed to run toimija")?;
+    lifecycle::survive_signals();
+    let status = lifecycle::wait(&mut child).context("lost track of the session")?;
+
+    // State 5, leaving: observe what happened, keep the agent's testimony,
+    // write the record, print it. Always, whatever the exit.
+    let exit = lifecycle::exit_of(status);
+    let left = sessions::Left {
+        ended_ms: intake::now_seconds() * 1000,
+        exit,
+        toimija_session: lifecycle::toimija_session(&root, child.id()),
+        phases: lifecycle::phases(&root, session.head_at_start.as_deref()),
+        finished: lifecycle::finished(&root),
+    };
+    let recorded = session_store(&dirs).and_then(|store| {
+        match store.update(&session_id, |s| s.left = Some(left.clone())) {
+            Ok(Some(updated)) => Some(updated),
+            Ok(None) => {
+                // Entering was not recorded (the log was busy then): write it all now.
+                let mut whole = session.clone();
+                whole.left = Some(left.clone());
+                store.put(&whole).ok().map(|()| whole)
+            }
+            Err(error) => {
+                eprintln!("ohjaa: {error}");
+                None
+            }
+        }
+    });
+    let recorded_ok = recorded.is_some();
+    session = recorded.unwrap_or_else(|| {
+        let mut unrecorded = session;
+        unrecorded.left = Some(left);
+        unrecorded
+    });
+    let _ = std::io::stdout().flush();
+    eprintln!("\n{}", sessions::render_record(&session));
+    if recorded_ok {
+        eprintln!("ohjaa: recorded; queued for `ohjaa intake`");
+    } else {
+        eprintln!("ohjaa: this record could not be saved; it is shown above only");
     }
+    Ok(lifecycle::exit_code(exit))
 }
+
+/// How a session works, told to the agent at entering.
+const LIFECYCLE: &str = "\
+How this session works (ohjaa):
+1. Before your first change, read back what you know:
+   ohjaa oriented \"<the goal in one line; the rules that apply; who else is working>\"
+2. Work in small phases; end each with a commit and `sykli run`.
+3. Before you finish, write the handover for whoever comes next:
+   ohjaa handover --unfinished \"…\" --next \"…\" --surprised \"…\"
+";
 
 fn render_command(command: &Command) -> String {
     let mut words = vec![shell_word(command.get_program().to_string_lossy().as_ref())];
@@ -997,6 +1396,14 @@ fn main() {
         Cmd::Retire { id, why } => cmd_decide("retire", id, Some(why)),
         Cmd::Confirm { id } => cmd_decide("confirm", id, None),
         Cmd::Check { budget, strict } => cmd_check(*budget, *strict),
+        Cmd::Oriented { readback } => cmd_oriented(readback),
+        Cmd::Handover {
+            unfinished,
+            next,
+            surprised,
+        } => cmd_handover(unfinished.as_deref(), next.as_deref(), surprised.as_deref()),
+        Cmd::Session { id } => cmd_session(id.as_deref()),
+        Cmd::Graph { id } => cmd_graph(id),
         Cmd::Intake {
             since,
             sources,

@@ -18,6 +18,12 @@ clap = { version = "4", features = ["derive"] }
 faija-knowledge = { path = "vendor/faija-knowledge" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The machine-local session log (what each session was briefed, read back,
+# committed and handed over). Same store teko used; knowledge never lives here.
+redb = "4.1.0"
+# Signal dispositions: `ohjaa run` must outlive Ctrl-C to write the leaving
+# record, and forward SIGTERM to the session it launched.
+libc = "0.2"
 
 [dev-dependencies]
 sha2 = "0.10"

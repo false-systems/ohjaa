@@ -12,21 +12,27 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const STUB: &str = r#"#!/bin/sh
-printf '%s\n' "$@" > "$OHJAA_STUB_ARGV"
+if [ "$1" = run ]; then printf '%s\n' "$@" > "$OHJAA_STUB_ARGV"; fi
 case "$PWD" in
   *broken*) echo "boom: not a Git repository" >&2; exit 1;;
 esac
-case " $* " in
-  *" sessions "*)
+case "$1" in
+  sessions)
     if [ -n "${OHJAA_STUB_SESSIONS_EXIT:-}" ]; then
       echo "stub failure on demand" >&2
       exit "$OHJAA_STUB_SESSIONS_EXIT"
     fi
     cat "${OHJAA_STUB_SESSIONS:?}"
     exit 0;;
-  *" context "*) cat "${OHJAA_STUB_CONTEXT:?}"; exit 0;;
+  context) cat "${OHJAA_STUB_CONTEXT:?}"; exit 0;;
 esac
-# Anything else is the exec'd `run`: its exit status is what ohjaa returns.
+# Anything else is `run`. With OHJAA_STUB_RUN_AGENT set it runs the agent
+# command after `--`, as toimija would; its exit status is what ohjaa returns.
+if [ -n "${OHJAA_STUB_RUN_AGENT:-}" ]; then
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
+  shift
+  exec "$@"
+fi
 exit "${OHJAA_STUB_EXIT:-0}"
 "#;
 
@@ -107,6 +113,10 @@ impl Fixture {
         let stub = stub_dir.join("toimija");
         fs::write(&stub, STUB).unwrap();
         make_executable(&stub);
+        // Never the real gh: no network, and a controlled answer.
+        let gh = stub_dir.join("gh");
+        fs::write(&gh, "#!/bin/sh\necho \"gh: To get started with GitHub CLI, please run:  gh auth login\" >&2\nexit 4\n").unwrap();
+        make_executable(&gh);
         let fixture = Fixture { dir, stub_dir };
         // Default: an empty, fully available scan.
         fixture.set_sessions(&sessions_json("", "available"));
@@ -354,14 +364,14 @@ fn run_dry_run_prints_the_composed_toimija_command() {
     );
     assert!(
         stderr.contains(
-            "would exec: toimija run --intent 'refresh the guide' --task 'update the quick start' --scope docs/ -- claude --model opus"
+            "would run: toimija run --intent 'refresh the guide' --task 'update the quick start' --scope docs/ -- claude --model opus"
         ),
         "{stderr}"
     );
 }
 
 #[test]
-fn run_execs_toimija_with_the_full_forwarded_argv() {
+fn run_launches_toimija_with_the_full_forwarded_argv() {
     if !git_available() {
         return;
     }
@@ -391,8 +401,8 @@ fn run_execs_toimija_with_the_full_forwarded_argv() {
     let argv = fixture.argv();
     fixture.cleanup();
 
-    // exec semantics: the stub's exit status becomes ohjaa's.
-    assert_eq!(code, Some(7), "exec must replace the process: {stderr}");
+    // The session's exit status becomes ohjaa's.
+    assert_eq!(code, Some(7), "{stderr}");
     assert_eq!(
         argv,
         vec![
@@ -408,7 +418,7 @@ fn run_execs_toimija_with_the_full_forwarded_argv() {
             "--model",
             "o3",
         ],
-        "the exec'd argv is the truth"
+        "the launched argv is the truth"
     );
 }
 
@@ -1113,5 +1123,347 @@ fn check_counts_an_unreadable_proposal_as_an_error() {
         stdout.contains("proposal") && stdout.contains("half.md"),
         "{stdout}"
     );
+    fixture.cleanup();
+}
+
+// ---- the session lifecycle ---------------------------------------------------
+
+fn ohjaa_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_ohjaa")
+}
+
+/// `ohjaa run` whose stub toimija really runs `sh -c <script>` as the agent.
+fn run_session(fixture: &Fixture, repo: &Path, script: &str) -> (String, String, Option<i32>) {
+    output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "retry uploads",
+                "--no-briefing",
+                "--",
+                "-c",
+                script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(repo),
+    )
+}
+
+#[test]
+fn leaving_always_writes_a_record_even_when_the_agent_says_nothing() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("silent");
+    let repo = fixture.make_git_repo("work");
+    let (_, stderr, code) = run_session(&fixture, &repo, "exit 3");
+    assert_eq!(code, Some(3), "the session's exit is ohjaa's: {stderr}");
+    for said in [
+        "ended: exit 3",
+        "─ observed",
+        "no read-back",
+        "phases        no commits",
+        "─ handover",
+        "none written",
+        "queued for `ohjaa intake`",
+    ] {
+        assert!(stderr.contains(said), "missing `{said}`: {stderr}");
+    }
+    let (stdout, _, code) = output_of(fixture.ohjaa().arg("session").current_dir(&repo));
+    assert_eq!(code, Some(0));
+    assert!(
+        stdout.contains("ended: exit 3") && stdout.contains("none written"),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn the_agent_reads_back_and_hands_over_from_inside_its_session() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("testimony");
+    let repo = fixture.make_git_repo("work");
+    let script = format!(
+        "{o} oriented 'goal: retry uploads; rules: rust only; nobody else here' && \
+         {o} handover --unfinished 'windows paths' --surprised 'the fixture skips without git'",
+        o = ohjaa_bin()
+    );
+    let (stdout, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("recorded the read-back"), "{stdout}");
+    assert!(stderr.contains("read back at"), "{stderr}");
+    assert!(stderr.contains("unfinished    windows paths"), "{stderr}");
+    assert!(
+        stderr.contains("surprised by  the fixture skips without git"),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn testimony_outside_a_session_is_refused() {
+    let fixture = Fixture::new("nosession");
+    for args in [vec!["oriented", "I know"], vec!["handover", "--next", "x"]] {
+        let (_, stderr, code) = output_of(fixture.ohjaa().args(&args).env_remove("OHJAA_SESSION"));
+        assert_eq!(code, Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains("not inside an ohjaa session"), "{stderr}");
+    }
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["oriented", "x"])
+            .env("OHJAA_SESSION", "../../x"),
+    );
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("is not a session id"), "{stderr}");
+    fixture.cleanup();
+}
+
+#[test]
+fn phases_are_observed_from_commits_and_their_sykli_receipts() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("phases");
+    let repo = fixture.make_git_repo("work");
+    // Two phases; sykli ran on the first only. The receipt is written the way
+    // sykli writes it: keyed by the tree HEAD had when it ran.
+    let script = r#"
+        set -e
+        echo one > a.txt && git add a.txt && git commit -q -m 'first phase'
+        tree=$(git rev-parse HEAD^{tree})
+        mkdir -p .sykli/receipts
+        printf '{"schema":"sykli-receipt.v1","contract_hash":"c","started_at_ms":1,"subject":{"repository":"r","tree_oid":"%s","inputs_digest":"d","head_tree_oid":"%s","dirty":false},"tasks":[],"outcome":"passed"}' "$tree" "$tree" > .sykli/receipts/rcpt_1.json
+        echo two > b.txt && git add b.txt && git commit -q -m 'second phase'
+    "#;
+    let (_, stderr, code) = run_session(&fixture, &repo, script);
+    assert_eq!(code, Some(0), "{stderr}");
+    let phases = stderr
+        .lines()
+        .find(|l| l.starts_with("phases"))
+        .expect(&stderr);
+    assert!(
+        phases.contains(" passed · ") && phases.ends_with("no sykli run"),
+        "{phases}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn the_next_briefing_says_what_the_last_session_left() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("next");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let script = format!("{} handover --unfinished 'windows paths'", ohjaa_bin());
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(stdout.contains("Last session here (oh-"), "{stdout}");
+    assert!(stdout.contains("- unfinished: windows paths"), "{stdout}");
+    // And the next agent is told it, and told how its own session works.
+    let (_, stderr, _) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "codex", "--intent", "next", "--dry-run"])
+            .current_dir(&repo),
+    );
+    assert!(stderr.contains("Last session here"), "{stderr}");
+    assert!(stderr.contains("ohjaa oriented"), "{stderr}");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_broken_session_log_never_blocks_a_launch_and_is_left_untouched() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("badlog");
+    let repo = fixture.make_git_repo("work");
+    let log = fixture.dir.join("state/ohjaa/sessions.redb");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::write(&log, b"").unwrap();
+    let (_, stderr, code) = run_session(&fixture, &repo, "exit 0");
+    assert_eq!(code, Some(0), "the agent still ran: {stderr}");
+    assert!(
+        stderr.contains("is unreadable") && stderr.contains("carrying on"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("could not be saved; it is shown above only"),
+        "{stderr}"
+    );
+    assert_eq!(fs::metadata(&log).unwrap().len(), 0, "never replaced");
+    fixture.cleanup();
+}
+
+fn spawn_session(fixture: &Fixture, repo: &Path, script: &str) -> std::process::Child {
+    fixture
+        .ohjaa()
+        .args([
+            "run",
+            "sh",
+            "--intent",
+            "long",
+            "--no-briefing",
+            "--",
+            "-c",
+            script,
+        ])
+        .env("OHJAA_STUB_RUN_AGENT", "1")
+        .current_dir(repo)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn signal(pid: u32, name: &str) {
+    assert!(Command::new("kill")
+        .args([&format!("-{name}"), &pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+}
+
+#[test]
+fn sigterm_to_ohjaa_reaches_the_session_and_leaving_still_runs() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("sigterm");
+    let repo = fixture.make_git_repo("work");
+    let started = std::time::Instant::now();
+    let child = spawn_session(&fixture, &repo, "sleep 30");
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    signal(child.id(), "TERM");
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the session was not stopped"
+    );
+    assert_eq!(output.status.code(), Some(143), "{stderr}");
+    assert!(stderr.contains("ended: killed by signal 15"), "{stderr}");
+    fixture.cleanup();
+}
+
+#[test]
+fn sigint_aimed_at_ohjaa_alone_does_not_cut_the_session_short() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("sigint");
+    let repo = fixture.make_git_repo("work");
+    let child = spawn_session(&fixture, &repo, "sleep 1; exit 4");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    signal(child.id(), "INT");
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "ohjaa waited for the session: {stderr}"
+    );
+    assert!(stderr.contains("ended: exit 4"), "{stderr}");
+    fixture.cleanup();
+}
+
+#[test]
+fn graph_shows_a_nodes_neighbours_and_the_sessions_briefed_with_it() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("graph");
+    let repo = fixture.make_git_repo("work");
+    let ours = fixture.dir.join("ours/knowledge");
+    fixture.node(&ours, "lean", "taste", "Lean first.");
+    fs::write(
+        ours.join("rust.md"),
+        "+++\nid = \"rust\"\nkind = \"decision\"\nstatus = \"current\"\nas_of = 2026-09-20\n\
+         origin = [\"t\"]\nrefines = \"lean\"\nsupersedes = [\"go-ok\"]\n+++\nRust only.\n",
+    )
+    .unwrap();
+    fs::write(
+        ours.join("go-ok.md"),
+        "+++\nid = \"go-ok\"\nkind = \"decision\"\nstatus = \"superseded\"\nas_of = 2026-01-01\n\
+         origin = [\"t\"]\n+++\nGo is fine.\n",
+    )
+    .unwrap();
+    // A briefed session, so the graph can say who read it.
+    let (_, stderr, _) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent", "x", "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    let (stdout, _, code) = output_of(fixture.ohjaa().args(["graph", "rust"]).current_dir(&repo));
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("builds on     lean"), "{stdout}");
+    assert!(stdout.contains("replaced      go-ok"), "{stdout}");
+    assert!(stdout.contains("briefed in    1 session(s)"), "{stdout}");
+    let (stdout, _, _) = output_of(fixture.ohjaa().args(["graph", "lean"]).current_dir(&repo));
+    assert!(stdout.contains("built on by   rust"), "{stdout}");
+    fixture.cleanup();
+}
+
+#[test]
+fn intake_drafts_from_a_sessions_handover_once() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("sessionintake");
+    let repo = fixture.make_git_repo("work");
+    let script = format!(
+        "{} handover --surprised 'the fixture helper skips without git'",
+        ohjaa_bin()
+    );
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ncat > {}\necho '[]'\n",
+            fixture.dir.join("prompt.txt").display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--source", "reverts", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let prompt = fs::read_to_string(fixture.dir.join("prompt.txt")).unwrap();
+    assert!(
+        prompt.contains("surprised by: the fixture helper skips without git"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("its handover"), "{prompt}");
+
+    // Drafted once: the next intake does not bring it back.
+    fs::remove_file(fixture.dir.join("prompt.txt")).unwrap();
+    let (stdout, stderr, _) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--source", "reverts", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert!(!fixture.dir.join("prompt.txt").exists(), "{stdout}{stderr}");
     fixture.cleanup();
 }
