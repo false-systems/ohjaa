@@ -106,8 +106,14 @@ pub struct Left {
     pub exit: Exit,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toimija_session: Option<String>,
-    pub phases: Vec<Phase>,
+    /// `None` when they could not be observed (no starting commit, git
+    /// failed, or leaving was interrupted): never shown as "no commits".
+    #[serde(default)]
+    pub phases: Option<Vec<Phase>>,
     pub finished: Finished,
+    /// A signal cut leaving short; the record holds what was known by then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
 }
 
 /// One session, entering to leaving.
@@ -237,11 +243,8 @@ impl Store {
             sessions
                 .insert(session.id.as_str(), bytes.as_slice())
                 .map_err(other)?;
-            let mut latest = tx.open_table(LATEST).map_err(other)?;
-            latest
-                .insert(session.repo.as_str(), session.id.as_str())
-                .map_err(other)?;
         }
+        note_latest(&tx, session)?;
         tx.commit().map_err(other)
     }
 
@@ -273,6 +276,8 @@ impl Store {
             change(&mut session);
             let bytes = serde_json::to_vec(&session).map_err(other)?;
             sessions.insert(id, bytes.as_slice()).map_err(other)?;
+            drop(sessions);
+            note_latest(&tx, &session)?;
             session
         };
         tx.commit().map_err(other)?;
@@ -308,6 +313,37 @@ impl Store {
         out.sort_by_key(|session| session.started_ms);
         Ok((out, unreadable))
     }
+}
+
+/// Keep `LATEST` pointing at each repository's latest *ended* session. A
+/// session still running is never "the last session here": the perimeter
+/// already shows who is live, and an unfinished record must not read as a
+/// crash.
+fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), StoreError> {
+    let Some(left) = &session.left else {
+        return Ok(());
+    };
+    let sessions = tx.open_table(SESSIONS).map_err(other)?;
+    let mut latest = tx.open_table(LATEST).map_err(other)?;
+    let newer = match latest.get(session.repo.as_str()).map_err(other)? {
+        None => true,
+        Some(id) if id.value() == session.id => true,
+        Some(id) => {
+            let current = sessions
+                .get(id.value())
+                .map_err(other)?
+                .and_then(|value| serde_json::from_slice::<Session>(value.value()).ok());
+            current
+                .and_then(|current| current.left.map(|l| l.ended_ms))
+                .is_none_or(|ended| left.ended_ms >= ended)
+        }
+    };
+    if newer {
+        latest
+            .insert(session.repo.as_str(), session.id.as_str())
+            .map_err(other)?;
+    }
+    Ok(())
 }
 
 /// A fresh session id: when it started, and which ohjaa started it.
@@ -416,11 +452,11 @@ pub fn render_record(session: &Session) -> String {
         session.delivered.len()
     );
     if let Some(left) = &session.left {
-        if left.phases.is_empty() {
-            out.push_str("phases        no commits\n");
-        } else {
-            let phases: Vec<String> = left
-                .phases
+        let phases_line = match &left.phases {
+            None if left.interrupted => "not observed (leaving was interrupted)".to_owned(),
+            None => "not observed".to_owned(),
+            Some(phases) if phases.is_empty() => "no commits".to_owned(),
+            Some(phases) => phases
                 .iter()
                 .map(|p| {
                     format!(
@@ -429,9 +465,10 @@ pub fn render_record(session: &Session) -> String {
                         describe_evidence(p.evidence.as_ref())
                     )
                 })
-                .collect();
-            let _ = writeln!(out, "phases        {}", phases.join(" · "));
-        }
+                .collect::<Vec<_>>()
+                .join(" · "),
+        };
+        let _ = writeln!(out, "phases        {phases_line}");
         let finished = match &left.finished {
             Finished::Unknown { why } => format!("unknown ({why})"),
             Finished::NoPullRequest => "no pull request".to_owned(),
@@ -458,8 +495,10 @@ pub fn render_record(session: &Session) -> String {
 /// "Last session here", for the next session's entering briefing.
 pub fn render_last(session: &Session) -> String {
     let mut out = String::new();
+    // Only ended sessions are "the last session here" (see `note_latest`);
+    // a record without its leaving is said as exactly that, never as a crash.
     let ended = session.left.as_ref().map_or_else(
-        || "did not record its leaving".to_owned(),
+        || "leaving not recorded".to_owned(),
         |left| {
             format!(
                 "ended {} UTC, {}",
@@ -475,11 +514,19 @@ pub fn render_last(session: &Session) -> String {
     );
     let _ = writeln!(out, "- intent: {}", session.intent);
     if let Some(left) = &session.left {
-        let with_evidence = left
-            .phases
-            .iter()
-            .filter(|p| p.evidence.as_ref().is_some_and(|e| e.outcome == "passed"))
-            .count();
+        let work = match &left.phases {
+            Some(phases) => {
+                let with_evidence = phases
+                    .iter()
+                    .filter(|p| p.evidence.as_ref().is_some_and(|e| e.outcome == "passed"))
+                    .count();
+                format!(
+                    "{} commit(s), {with_evidence} with a passing sykli run",
+                    phases.len()
+                )
+            }
+            None => "commits not observed".to_owned(),
+        };
         let finished = match &left.finished {
             Finished::PullRequest { url, state, .. } => {
                 format!("{url} ({})", state.to_lowercase())
@@ -487,11 +534,7 @@ pub fn render_last(session: &Session) -> String {
             Finished::NoPullRequest => "no pull request".to_owned(),
             Finished::Unknown { .. } => "unknown".to_owned(),
         };
-        let _ = writeln!(
-            out,
-            "- work: {} commit(s), {with_evidence} with a passing sykli run; finished: {finished}",
-            left.phases.len()
-        );
+        let _ = writeln!(out, "- work: {work}; finished: {finished}");
     }
     match &session.handover {
         None => out.push_str("- it left no handover\n"),
@@ -543,13 +586,57 @@ mod tests {
         }
     }
 
+    fn ended(mut session: Session, ended_ms: i64) -> Session {
+        session.left = Some(Left {
+            ended_ms,
+            exit: Exit::Code { code: 0 },
+            toimija_session: None,
+            phases: Some(Vec::new()),
+            finished: Finished::NoPullRequest,
+            interrupted: false,
+        });
+        session
+    }
+
+    #[test]
+    fn the_last_session_here_is_the_latest_ended_never_a_live_one() {
+        let dir = temp("latestended");
+        let store = Store::open(&store_path(&dir)).unwrap();
+        store
+            .put(&ended(session("oh-1", "/r/a", 1_000), 1_500))
+            .unwrap();
+        // Entering records a live session: it is not "the last session here".
+        store.put(&session("oh-2", "/r/a", 2_000)).unwrap();
+        assert_eq!(store.latest_for("/r/a").unwrap().unwrap().id, "oh-1");
+        // Two overlapping sessions: the one that ended last is the latest.
+        store.put(&session("oh-3", "/r/a", 3_000)).unwrap();
+        store
+            .update("oh-3", |s| *s = ended(s.clone(), 3_500))
+            .unwrap();
+        store
+            .update("oh-2", |s| *s = ended(s.clone(), 3_200))
+            .unwrap();
+        assert_eq!(store.latest_for("/r/a").unwrap().unwrap().id, "oh-3");
+        store
+            .update("oh-2", |s| *s = ended(s.clone(), 4_000))
+            .unwrap();
+        assert_eq!(store.latest_for("/r/a").unwrap().unwrap().id, "oh-2");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn sessions_round_trip_and_the_latest_per_repo_is_found() {
         let dir = temp("roundtrip");
         let store = Store::open(&store_path(&dir)).unwrap();
-        store.put(&session("oh-1", "/r/a", 1_000)).unwrap();
-        store.put(&session("oh-2", "/r/b", 2_000)).unwrap();
-        store.put(&session("oh-3", "/r/a", 3_000)).unwrap();
+        store
+            .put(&ended(session("oh-1", "/r/a", 1_000), 1_500))
+            .unwrap();
+        store
+            .put(&ended(session("oh-2", "/r/b", 2_000), 2_500))
+            .unwrap();
+        store
+            .put(&ended(session("oh-3", "/r/a", 3_000), 3_500))
+            .unwrap();
         assert_eq!(store.latest_for("/r/a").unwrap().unwrap().id, "oh-3");
         assert_eq!(store.latest_for("/r/b").unwrap().unwrap().id, "oh-2");
         assert!(store.latest_for("/r/c").unwrap().is_none());
@@ -635,7 +722,7 @@ mod tests {
             ended_ms: 1_790_003_600_000,
             exit: Exit::Code { code: 0 },
             toimija_session: Some("1790000000-42".to_owned()),
-            phases: vec![
+            phases: Some(vec![
                 Phase {
                     commit: "a1b2c3d4e5".to_owned(),
                     subject: "one".to_owned(),
@@ -649,8 +736,9 @@ mod tests {
                     subject: "two".to_owned(),
                     evidence: None,
                 },
-            ],
+            ]),
             finished: Finished::NoPullRequest,
+            interrupted: false,
         });
         let record = render_record(&s);
         let observed = record.find("─ observed").unwrap();

@@ -115,7 +115,11 @@ impl Fixture {
         make_executable(&stub);
         // Never the real gh: no network, and a controlled answer.
         let gh = stub_dir.join("gh");
-        fs::write(&gh, "#!/bin/sh\necho \"gh: To get started with GitHub CLI, please run:  gh auth login\" >&2\nexit 4\n").unwrap();
+        fs::write(
+            &gh,
+            "#!/bin/sh\nif [ -n \"${OHJAA_STUB_GH_SLEEP:-}\" ]; then sleep \"$OHJAA_STUB_GH_SLEEP\"; fi\necho \"gh: To get started with GitHub CLI, please run:  gh auth login\" >&2\nexit 4\n",
+        )
+        .unwrap();
         make_executable(&gh);
         let fixture = Fixture { dir, stub_dir };
         // Default: an empty, fully available scan.
@@ -1305,25 +1309,35 @@ fn a_broken_session_log_never_blocks_a_launch_and_is_left_untouched() {
     fixture.cleanup();
 }
 
+/// Spawn `ohjaa run` whose agent runs `script`, and return once the agent is
+/// running (it touches a mark first), so a signal lands while ohjaa waits.
 fn spawn_session(fixture: &Fixture, repo: &Path, script: &str) -> std::process::Child {
-    fixture
+    let mark = fixture.dir.join(format!(
+        "agent-started-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let child = fixture
         .ohjaa()
-        .args([
-            "run",
-            "sh",
-            "--intent",
-            "long",
-            "--no-briefing",
-            "--",
-            "-c",
-            script,
-        ])
+        .args(["run", "sh", "--intent", "long", "--no-briefing", "--", "-c"])
+        .arg(format!("touch '{}'; {script}", mark.display()))
         .env("OHJAA_STUB_RUN_AGENT", "1")
         .current_dir(repo)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .unwrap()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !mark.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the agent never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child
 }
 
 fn signal(pid: u32, name: &str) {
@@ -1342,7 +1356,7 @@ fn sigterm_to_ohjaa_reaches_the_session_and_leaving_still_runs() {
     let fixture = Fixture::new("sigterm");
     let repo = fixture.make_git_repo("work");
     let started = std::time::Instant::now();
-    let child = spawn_session(&fixture, &repo, "sleep 30");
+    let child = spawn_session(&fixture, &repo, "exec sleep 30");
     std::thread::sleep(std::time::Duration::from_millis(800));
     signal(child.id(), "TERM");
     let output = child.wait_with_output().unwrap();
@@ -1443,7 +1457,7 @@ fn intake_drafts_from_a_sessions_handover_once() {
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
-            .args(["intake", "--source", "reverts", "--drafter"])
+            .args(["intake", "--source", "transcripts", "--drafter"])
             .arg(&drafter)
             .current_dir(&repo),
     );
@@ -1460,10 +1474,262 @@ fn intake_drafts_from_a_sessions_handover_once() {
     let (stdout, stderr, _) = output_of(
         fixture
             .ohjaa()
-            .args(["intake", "--source", "reverts", "--drafter"])
+            .args(["intake", "--source", "transcripts", "--drafter"])
             .arg(&drafter)
             .current_dir(&repo),
     );
     assert!(!fixture.dir.join("prompt.txt").exists(), "{stdout}{stderr}");
+    fixture.cleanup();
+}
+
+// ---- review fixes: each test failed before its fix -----------------------------
+
+/// A drafter that, while intake is drafting, checks the session log can be
+/// opened by another ohjaa (as `oriented`, `handover` and leaving must).
+fn drafter_that_opens_the_log(fixture: &Fixture) -> PathBuf {
+    let drafter = fixture.stub_dir.join("drafter-opens-log");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ncat > {prompt}\n{ohjaa} session > {during} 2>&1\necho \"exit $?\" >> {during}\necho '[]'\n",
+            prompt = fixture.dir.join("prompt.txt").display(),
+            ohjaa = ohjaa_bin(),
+            during = fixture.dir.join("during.txt").display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    drafter
+}
+
+#[test]
+fn intake_never_holds_the_session_log_while_the_drafter_runs() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("heldlog");
+    let repo = fixture.make_git_repo("work");
+    let script = format!("{} handover --next 'x'", ohjaa_bin());
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+    let drafter = drafter_that_opens_the_log(&fixture);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--source", "transcripts", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let during = fs::read_to_string(fixture.dir.join("during.txt")).unwrap();
+    assert!(
+        during.contains("ended:") && during.ends_with("exit 0\n"),
+        "{during}"
+    );
+    fixture.cleanup();
+}
+
+fn wait_with_deadline(
+    child: std::process::Child,
+    limit: std::time::Duration,
+) -> (String, Option<i32>, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let output = child.wait_with_output().unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < limit,
+        "took {elapsed:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code(),
+        elapsed,
+    )
+}
+
+#[test]
+fn sigquit_and_sighup_to_ohjaa_reach_the_session_and_leaving_still_runs() {
+    if !git_available() {
+        return;
+    }
+    for (name, number) in [("QUIT", 3), ("HUP", 1)] {
+        let fixture = Fixture::new(&format!("sig{name}"));
+        let repo = fixture.make_git_repo("work");
+        let child = spawn_session(&fixture, &repo, "exec sleep 10");
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        signal(child.id(), name);
+        let (stderr, code, _) = wait_with_deadline(child, std::time::Duration::from_secs(7));
+        assert_eq!(code, Some(128 + number), "{name}: {stderr}");
+        assert!(
+            stderr.contains(&format!("ended: killed by signal {number}")),
+            "{name}: {stderr}"
+        );
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn a_signal_during_leaving_cuts_it_short_and_the_record_is_still_written() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("leavingint");
+    let repo = fixture.make_git_repo("work");
+    let mark = fixture.dir.join("agent-done");
+    let child = fixture
+        .ohjaa()
+        .args([
+            "run",
+            "sh",
+            "--intent",
+            "slow leaving",
+            "--no-briefing",
+            "--",
+            "-c",
+        ])
+        .arg(format!("touch '{}'; exit 0", mark.display()))
+        .env("OHJAA_STUB_RUN_AGENT", "1")
+        .env("OHJAA_STUB_GH_SLEEP", "30")
+        .current_dir(&repo)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !mark.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    signal(child.id(), "INT");
+    let (stderr, code, _) = wait_with_deadline(child, std::time::Duration::from_secs(8));
+    assert_eq!(code, Some(0), "the session itself ended cleanly: {stderr}");
+    assert!(
+        stderr.contains("finished      unknown (interrupted)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("recorded; queued"), "{stderr}");
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("session").current_dir(&repo));
+    assert!(
+        stdout.contains("unknown (interrupted)"),
+        "the record was saved: {stdout}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn sessions_are_drafted_only_once_their_transcript_window_was_read() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("draftedwhen");
+    let repo = fixture.make_git_repo("work");
+    let script = format!("{} handover --surprised 'the handover text'", ohjaa_bin());
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ncat > {}\necho '[]'\n",
+            fixture.dir.join("prompt.txt").display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = |source: &str| {
+        let _ = fs::remove_file(fixture.dir.join("prompt.txt"));
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--source", source, "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        );
+        fs::read_to_string(fixture.dir.join("prompt.txt")).unwrap_or_default()
+    };
+    // A run that never reads transcripts leaves the session alone and queued...
+    let prompt = intake("reviews");
+    assert!(
+        !prompt.contains("the handover text"),
+        "a session is drafted whole, with its transcript window: {prompt}"
+    );
+    // ...and so does one whose transcripts could not all be read.
+    let projects = fixture.dir.join("home/.claude/projects/-work");
+    fs::create_dir_all(&projects).unwrap();
+    let unreadable = projects.join("locked.jsonl");
+    fs::write(&unreadable, "{}").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let prompt = intake("transcripts");
+    assert!(prompt.contains("the handover text"), "{prompt}");
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
+    // Read cleanly: drafted, and only now marked so.
+    let prompt = intake("transcripts");
+    assert!(
+        prompt.contains("the handover text"),
+        "still queued after a warning: {prompt}"
+    );
+    let prompt = intake("transcripts");
+    assert!(
+        !prompt.contains("the handover text"),
+        "drafted once: {prompt}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn last_session_here_is_the_latest_ended_one_never_a_live_session() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("lastended");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let first = format!(
+        "{} handover --unfinished 'from the first session'",
+        ohjaa_bin()
+    );
+    let (_, stderr, code) = run_session(&fixture, &repo, &first);
+    assert_eq!(code, Some(0), "{stderr}");
+    let seen = fixture.dir.join("brief-inside.txt");
+    let second = format!("{} brief > '{}' 2>&1", ohjaa_bin(), seen.display());
+    let (_, stderr, code) = run_session(&fixture, &repo, &second);
+    assert_eq!(code, Some(0), "{stderr}");
+    let inside = fs::read_to_string(&seen).unwrap();
+    assert!(
+        inside.contains("- unfinished: from the first session"),
+        "{inside}"
+    );
+    assert!(
+        !inside.contains("did not record its leaving"),
+        "a live session is not a crash: {inside}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_second_handover_changes_only_the_fields_it_names() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("mergehandover");
+    let repo = fixture.make_git_repo("work");
+    let script = format!(
+        "{o} handover --unfinished 'windows paths' --surprised 'old surprise' && \
+         {o} handover --next 'ask Dima' --surprised ''",
+        o = ohjaa_bin()
+    );
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("unfinished    windows paths"),
+        "kept: {stderr}"
+    );
+    assert!(stderr.contains("next agent    ask Dima"), "added: {stderr}");
+    assert!(
+        !stderr.contains("old surprise"),
+        "cleared with '': {stderr}"
+    );
     fixture.cleanup();
 }

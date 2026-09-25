@@ -8,6 +8,7 @@
 
 use std::io::{Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,21 @@ use anyhow::{Context, Result};
 
 /// Long enough for a cold `toimija` or `git` on a large repository.
 pub const LOCAL: Duration = Duration::from_secs(60);
+
+/// Set when the person asked ohjaa to stop what it is doing now (a signal while
+/// a session is leaving). Every child still running is killed and reported as
+/// interrupted, and nothing new is started, so the caller can finish quickly
+/// with what it already knows.
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Async-signal-safe: a single atomic store.
+pub fn cancel() {
+    CANCELLED.store(true, Ordering::SeqCst);
+}
+
+pub fn cancelled() -> bool {
+    CANCELLED.load(Ordering::SeqCst)
+}
 
 pub struct Output {
     pub status: ExitStatus,
@@ -64,6 +80,9 @@ fn kill_group(child: &mut std::process::Child) {
 /// once `timeout` has passed.
 pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
     let program = command.get_program().to_string_lossy().into_owned();
+    if cancelled() {
+        anyhow::bail!("{program} was not started: interrupted");
+    }
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -103,6 +122,10 @@ pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Re
         if let Some(status) = child.try_wait()? {
             break status;
         }
+        if cancelled() {
+            kill_group(&mut child);
+            anyhow::bail!("{program} was stopped: interrupted");
+        }
         if Instant::now() >= deadline {
             kill_group(&mut child);
             anyhow::bail!("{program} did not finish within {}s", timeout.as_secs());
@@ -112,8 +135,13 @@ pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Re
 
     // The child has exited, but something it started may still hold the
     // pipes open. Wait for them only until the same deadline.
-    let collect = |receiver: &mpsc::Receiver<Vec<u8>>| {
-        receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    // Polled in short steps, so an interruption is noticed here too.
+    let collect = |receiver: &mpsc::Receiver<Vec<u8>>| loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(left.min(Duration::from_millis(50))) {
+            Err(mpsc::RecvTimeoutError::Timeout) if !left.is_zero() && !cancelled() => continue,
+            other => break other,
+        }
     };
     match (collect(&stdout), collect(&stderr)) {
         (Ok(stdout), Ok(stderr)) => Ok(Output {
@@ -123,6 +151,9 @@ pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Re
         }),
         _ => {
             kill_group(&mut child);
+            if cancelled() {
+                anyhow::bail!("{program} was stopped: interrupted");
+            }
             anyhow::bail!(
                 "{program} exited, but a process it started kept its output open past {}s",
                 timeout.as_secs()

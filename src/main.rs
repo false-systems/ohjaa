@@ -191,7 +191,9 @@ enum Cmd {
         readback: Vec<String>,
     },
     /// State 5, from inside a session: the handover for whoever comes next.
-    /// Write it before you finish.
+    /// Write it before you finish. Run it again to add or change a field: each
+    /// field given replaces only itself, `--next ''` clears one, and the fields
+    /// not given are kept.
     Handover {
         /// What is not done, and where to pick it up.
         #[arg(long)]
@@ -545,23 +547,29 @@ fn cmd_handover(
     next: Option<&str>,
     surprised: Option<&str>,
 ) -> Result<i32> {
-    let clean = |value: Option<&str>| {
-        value
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned)
-    };
-    let handover = sessions::Handover {
-        at_ms: intake::now_seconds() * 1000,
-        unfinished: clean(unfinished),
-        next: clean(next),
-        surprised: clean(surprised),
-    };
-    if handover.unfinished.is_none() && handover.next.is_none() && handover.surprised.is_none() {
+    if unfinished.is_none() && next.is_none() && surprised.is_none() {
         bail!("a handover needs at least one of --unfinished, --next or --surprised");
     }
+    // A field given replaces only itself; given as '' it is cleared; a field
+    // not given is kept. So a handover can be written as the work goes.
+    let apply = |field: &mut Option<String>, given: Option<&str>| {
+        if let Some(given) = given {
+            let given = given.trim();
+            *field = (!given.is_empty()).then(|| given.to_owned());
+        }
+    };
+    let at_ms = intake::now_seconds() * 1000;
+    let (unfinished, next, surprised) = (
+        unfinished.map(str::to_owned),
+        next.map(str::to_owned),
+        surprised.map(str::to_owned),
+    );
     record_testimony("handover", move |session| {
-        session.handover = Some(handover);
+        let handover = session.handover.get_or_insert_with(Default::default);
+        handover.at_ms = at_ms;
+        apply(&mut handover.unfinished, unfinished.as_deref());
+        apply(&mut handover.next, next.as_deref());
+        apply(&mut handover.surprised, surprised.as_deref());
     })
 }
 
@@ -976,7 +984,34 @@ fn cmd_intake(
     } else {
         sources.iter().map(String::as_str).collect()
     };
+    // Sessions that ended and were never drafted from: the agent's own
+    // handover, and what was said in that session's window, even when the
+    // window lies before the cursor. Read in one short open of the log; no
+    // store is held across the slow calls below.
+    let queued: Vec<sessions::Session> = session_store(&dirs)
+        .and_then(|store| store.all().ok())
+        .map(|(all, _)| {
+            all.into_iter()
+                .filter(|s| s.left.is_some() && !s.drafted)
+                .collect()
+        })
+        .unwrap_or_default();
+    // A session is drafted as a whole, its handover with its transcript
+    // window, so only a run that reads transcripts takes it on.
+    let reads_transcripts = sources.contains(&"transcripts");
+    let queued = if reads_transcripts {
+        queued
+    } else {
+        if !queued.is_empty() {
+            eprintln!(
+                "ohjaa: {} ended session(s) wait for a run that reads transcripts",
+                queued.len()
+            );
+        }
+        Vec::new()
+    };
     let mut warnings = Vec::new();
+    let mut transcripts_read_cleanly = false;
     let mut candidates = Vec::new();
     let git_repos = || -> Result<Vec<PathBuf>> {
         let roots = roots::load(roots, git_root().as_deref());
@@ -988,36 +1023,29 @@ fn cmd_intake(
                 let home = std::env::var_os("HOME")
                     .map(PathBuf::from)
                     .context("HOME is not set")?;
-                candidates.extend(intake::transcripts(&home, since, &mut warnings));
+                // One pass, from the earliest point anything needs: the cursor,
+                // or the start of the oldest queued session.
+                let from = queued
+                    .iter()
+                    .map(|s| s.started_ms - 1)
+                    .min()
+                    .map_or(since, |earliest| earliest.min(since));
+                let before = warnings.len();
+                let read = intake::transcripts(&home, from, &mut warnings);
+                transcripts_read_cleanly = warnings.len() == before;
+                let (new, older): (Vec<_>, Vec<_>) = read
+                    .into_iter()
+                    .partition(|candidate| candidate.at_ms > since);
+                candidates.extend(new);
+                candidates.extend(intake::within_sessions(older, &queued));
             }
             "reviews" => candidates.extend(intake::reviews(&git_repos()?, since, &mut warnings)),
             "reverts" => candidates.extend(intake::reverts(&git_repos()?, since, &mut warnings)),
             other => bail!("`{other}` is not a source: transcripts, reviews or reverts"),
         }
     }
-    // Sessions that ended and were never drafted from: the agent's own
-    // handover, and what was said in that session's window, even when the
-    // window lies before the cursor.
-    let store = session_store(&dirs);
-    let queued: Vec<sessions::Session> = store
-        .as_ref()
-        .and_then(|store| store.all().ok())
-        .map(|(all, _)| {
-            all.into_iter()
-                .filter(|s| s.left.is_some() && !s.drafted)
-                .collect()
-        })
-        .unwrap_or_default();
     if !queued.is_empty() {
         candidates.extend(intake::handover_candidates(&queued));
-        if sources.contains(&"transcripts") {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .context("HOME is not set")?;
-            let earliest = queued.iter().map(|s| s.started_ms).min().unwrap_or(since);
-            let window = intake::transcripts(&home, earliest - 1, &mut warnings);
-            candidates.extend(intake::within_sessions(window, &queued));
-        }
         eprintln!(
             "ohjaa: {} ended session(s) queued for drafting",
             queued.len()
@@ -1037,8 +1065,14 @@ fn cmd_intake(
         candidates.len(),
         intake::rfc3339(since.div_euclid(1000))
     );
+    // Drafted only when its whole window was read: a transcript that could
+    // not be read leaves the session queued for the next run.
     let mark_drafted = || {
-        if let Some(store) = &store {
+        if !transcripts_read_cleanly || queued.is_empty() {
+            return;
+        }
+        // Opened again only for this short write, after the drafter is done.
+        if let Some(store) = session_store(&dirs) {
             for session in &queued {
                 if let Err(error) = store.update(&session.id, |s| s.drafted = true) {
                     eprintln!("ohjaa: {error}");
@@ -1254,6 +1288,8 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         left: None,
         drafted: false,
     };
+    // From here to the end of leaving, a signal is kept, not fatal.
+    lifecycle::supervise();
     if let Some(store) = session_store(&dirs) {
         if let Err(error) = store.put(&session) {
             eprintln!("ohjaa: {error}; this session will not be recorded");
@@ -1262,20 +1298,64 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     eprintln!("ohjaa: session {session_id} entering");
 
     // Stay the parent: leaving must run when the session ends, however it ends.
-    let mut child = command.spawn().context("failed to run toimija")?;
-    lifecycle::survive_signals();
-    let status = lifecycle::wait(&mut child).context("lost track of the session")?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            // No session ran; still, no entering is left without its leaving.
+            let left = sessions::Left {
+                ended_ms: intake::now_seconds() * 1000,
+                exit: sessions::Exit::Unknown,
+                toimija_session: None,
+                phases: None,
+                finished: sessions::Finished::Unknown {
+                    why: format!("toimija could not be started: {error}"),
+                },
+                interrupted: false,
+            };
+            if let Some(store) = session_store(&dirs) {
+                let _ = store.update(&session_id, |s| s.left = Some(left));
+            }
+            lifecycle::restore_signals();
+            return Err(error).context("failed to run toimija");
+        }
+    };
+    let waited = lifecycle::wait(&mut child);
 
     // State 5, leaving: observe what happened, keep the agent's testimony,
-    // write the record, print it. Always, whatever the exit.
-    let exit = lifecycle::exit_of(status);
+    // write the record, print it. Always, whatever the exit. A signal from
+    // here on cuts the observing short, never the record.
+    lifecycle::leaving();
+    let exit = match &waited {
+        Ok(status) => lifecycle::exit_of(*status),
+        Err(error) => {
+            eprintln!("ohjaa: lost track of the session: {error}");
+            sessions::Exit::Unknown
+        }
+    };
+    let receipts = unless_interrupted(|| lifecycle::receipts_by_tree(&root)).unwrap_or_default();
+    let toimija_session =
+        unless_interrupted(|| lifecycle::toimija_session(&root, child.id(), started_ms)).flatten();
+    let phases = unless_interrupted(|| {
+        lifecycle::phases(&root, session.head_at_start.as_deref(), &receipts)
+    })
+    .flatten();
+    let finished = match unless_interrupted(|| lifecycle::finished(&root, &receipts)) {
+        Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
+        other => other,
+    }
+    .unwrap_or_else(|| sessions::Finished::Unknown {
+        why: "interrupted".to_owned(),
+    });
     let left = sessions::Left {
         ended_ms: intake::now_seconds() * 1000,
         exit,
-        toimija_session: lifecycle::toimija_session(&root, child.id()),
-        phases: lifecycle::phases(&root, session.head_at_start.as_deref()),
-        finished: lifecycle::finished(&root),
+        toimija_session,
+        phases,
+        finished,
+        interrupted: process::cancelled(),
     };
+    // The store is opened only now, after every slow call, and held only for
+    // this one write.
     let recorded = session_store(&dirs).and_then(|store| {
         match store.update(&session_id, |s| s.left = Some(left.clone())) {
             Ok(Some(updated)) => Some(updated),
@@ -1298,13 +1378,31 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         unrecorded
     });
     let _ = std::io::stdout().flush();
-    eprintln!("\n{}", sessions::render_record(&session));
-    if recorded_ok {
-        eprintln!("ohjaa: recorded; queued for `ohjaa intake`");
-    } else {
-        eprintln!("ohjaa: this record could not be saved; it is shown above only");
+    // Written with `let _`: a closed terminal must not turn printing into a
+    // panic after the record is already safe.
+    let mut stderr = std::io::stderr();
+    let _ = writeln!(stderr, "\n{}", sessions::render_record(&session));
+    if session.left.as_ref().is_some_and(|left| left.interrupted) {
+        let _ = writeln!(
+            stderr,
+            "ohjaa: leaving was interrupted; the record holds what was known by then"
+        );
     }
+    let _ = if recorded_ok {
+        writeln!(stderr, "ohjaa: recorded; queued for `ohjaa intake`")
+    } else {
+        writeln!(
+            stderr,
+            "ohjaa: this record could not be saved; it is shown above only"
+        )
+    };
+    lifecycle::restore_signals();
     Ok(lifecycle::exit_code(exit))
+}
+
+/// Run one step of leaving's observing, unless a signal has cut leaving short.
+fn unless_interrupted<T>(step: impl FnOnce() -> T) -> Option<T> {
+    (!process::cancelled()).then(step)
 }
 
 /// How a session works, told to the agent at entering.

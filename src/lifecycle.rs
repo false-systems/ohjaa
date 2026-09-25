@@ -1,21 +1,37 @@
 //! Running a session from entering to leaving.
 //!
 //! `ohjaa run` stays the parent of `toimija run` so that it is still there when
-//! the session ends: leaving must always write a record, crash or not. While
-//! it waits it must not die of a signal meant for the session:
+//! the session ends: leaving must always write a record, crash or not. So
+//! while it waits it must not die of a signal, and it must never swallow one
+//! that was meant to stop the session.
 //!
-//! - Ctrl-C (SIGINT) and a closed terminal (SIGHUP) go to the whole foreground
-//!   process group, so toimija and the agent already receive them. Ohjaa only
-//!   survives them; forwarding would deliver them twice.
-//! - SIGTERM aimed at ohjaa alone does not reach the session, so ohjaa passes
-//!   it on to toimija, which passes it on to the agent.
+//! The rule, per signal, while the session runs (unix):
+//!
+//! | signal | ohjaa | why |
+//! |---|---|---|
+//! | SIGINT | survives, never forwards | Ctrl-C already reaches the whole foreground group; a second copy makes agents like `claude` quit instead of interrupt |
+//! | SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 | survives, forwards the first of each to `toimija run` | a supervisor may aim them at ohjaa alone; when the whole group got them too, the session receives them twice |
+//! | SIGALRM, SIGVTALRM, SIGPROF, SIGXCPU, SIGXFSZ | survives | they concern ohjaa's own timers and limits, which it never sets |
+//! | SIGKILL, SIGSTOP | cannot be caught | SIGKILL loses the record |
+//!
+//! To stop a session from outside, send SIGTERM to ohjaa, or SIGINT to the
+//! whole process group.
+//!
+//! The handlers go in just before the session is recorded and spawned, so a
+//! signal in that window is kept and passed on once the child exists (SIGINT
+//! included, since the group could not have delivered it to the child).
+//!
+//! Once the session has ended, leaving begins: any of these signals now cuts
+//! leaving short (the child tools still running are killed, nothing new is
+//! started) and the record is written with what is known so far. The default
+//! dispositions come back once the record is written.
 //!
 //! Handlers, not `SIG_IGN`: an ignored disposition is inherited across exec,
 //! and the agent must still stop on Ctrl-C.
 
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::time::Duration;
 
 use serde_json::Value;
@@ -23,43 +39,133 @@ use serde_json::Value;
 use crate::process;
 use crate::sessions::{Evidence, Exit, Finished, Phase};
 
-static TERM_RECEIVED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+mod signals {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-extern "C" fn on_signal(signal: libc::c_int) {
-    // Only an atomic store: the one thing that is safe inside a handler.
-    if signal == libc::SIGTERM {
-        TERM_RECEIVED.store(true, Ordering::SeqCst);
-    }
-}
+    /// Every signal ohjaa handles while a session runs, and whether it is
+    /// forwarded to the session. See the table in the module docs.
+    const HANDLED: [(libc::c_int, bool); 11] = [
+        (libc::SIGINT, false),
+        (libc::SIGTERM, true),
+        (libc::SIGHUP, true),
+        (libc::SIGQUIT, true),
+        (libc::SIGUSR1, true),
+        (libc::SIGUSR2, true),
+        (libc::SIGALRM, false),
+        (libc::SIGVTALRM, false),
+        (libc::SIGPROF, false),
+        (libc::SIGXCPU, false),
+        (libc::SIGXFSZ, false),
+    ];
 
-/// Install the waiting parent's handlers. Call only after the child exists.
-pub fn survive_signals() {
-    let handler = on_signal as extern "C" fn(libc::c_int);
-    // SAFETY: `on_signal` only performs an atomic store, which is
-    // async-signal-safe; the handler stays valid for the life of the process.
-    unsafe {
-        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, handler as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
-    }
-}
+    /// One bit per signal received (all handled signals are below 32).
+    static PENDING: AtomicU32 = AtomicU32::new(0);
+    static LEAVING: AtomicBool = AtomicBool::new(false);
 
-/// Wait for the session to end, forwarding SIGTERM to it once.
-pub fn wait(child: &mut Child) -> std::io::Result<ExitStatus> {
-    let mut forwarded = false;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
+    fn bit(signal: libc::c_int) -> u32 {
+        if (0..32).contains(&signal) {
+            1 << signal
+        } else {
+            0
         }
-        if !forwarded && TERM_RECEIVED.load(Ordering::SeqCst) {
-            forwarded = true;
-            // SAFETY: plain kill(2) on the pid of a child we have not reaped.
+    }
+
+    extern "C" fn on_signal(signal: libc::c_int) {
+        // Only atomic operations: the one thing that is safe inside a handler.
+        PENDING.fetch_or(bit(signal), Ordering::SeqCst);
+        if LEAVING.load(Ordering::SeqCst) {
+            crate::process::cancel();
+        }
+    }
+
+    fn set_all(disposition: libc::sighandler_t) {
+        for (signal, _) in HANDLED {
+            // SAFETY: installing a disposition for a catchable signal; the
+            // handler only performs atomic operations and lives for the
+            // whole process.
             unsafe {
-                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+                libc::signal(signal, disposition);
             }
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
+
+    pub fn supervise() {
+        let handler = on_signal as extern "C" fn(libc::c_int);
+        set_all(handler as libc::sighandler_t);
+    }
+
+    /// Forward the first of each forwardable signal received so far. With
+    /// `before_spawn`, SIGINT too: one that arrived before the child existed
+    /// never reached it through the process group.
+    pub fn forward_pending(child: u32, forwarded: &mut u32, before_spawn: bool) {
+        let pending = PENDING.load(Ordering::SeqCst);
+        for (signal, forward) in HANDLED {
+            let b = bit(signal);
+            let forward = forward || (before_spawn && signal == libc::SIGINT);
+            if forward && pending & b != 0 && *forwarded & b == 0 {
+                *forwarded |= b;
+                // SAFETY: plain kill(2) on the pid of a child not yet reaped.
+                unsafe {
+                    libc::kill(child as libc::pid_t, signal);
+                }
+            }
+        }
+    }
+
+    /// From now on a signal cuts leaving short. What stopped the session
+    /// itself (the Ctrl-C that ended it) must not count against leaving.
+    pub fn leaving() {
+        PENDING.store(0, Ordering::SeqCst);
+        LEAVING.store(true, Ordering::SeqCst);
+    }
+
+    pub fn restore() {
+        LEAVING.store(false, Ordering::SeqCst);
+        set_all(libc::SIG_DFL);
+    }
+}
+
+/// Install the waiting parent's handlers, just before the session is recorded
+/// and spawned: a signal from here on is kept, and passed to the session once
+/// it exists, instead of killing ohjaa half way through entering. The child
+/// starts with default dispositions (caught signals reset across exec).
+pub fn supervise() {
+    #[cfg(unix)]
+    signals::supervise();
+}
+
+/// Wait for the session to end, forwarding stop signals aimed at ohjaa.
+pub fn wait(child: &mut Child) -> std::io::Result<ExitStatus> {
+    #[cfg(unix)]
+    {
+        let mut forwarded = 0;
+        // Whatever arrived while the session was being started.
+        signals::forward_pending(child.id(), &mut forwarded, true);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            signals::forward_pending(child.id(), &mut forwarded, false);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        child.wait()
+    }
+}
+
+/// The session has ended; a signal from here on cuts leaving short.
+pub fn leaving() {
+    #[cfg(unix)]
+    signals::leaving();
+}
+
+/// The record is written: signals mean what they normally mean again.
+pub fn restore_signals() {
+    #[cfg(unix)]
+    signals::restore();
 }
 
 pub fn exit_of(status: ExitStatus) -> Exit {
@@ -106,10 +212,14 @@ pub fn branch(repo: &Path) -> Option<String> {
     git(repo, &["symbolic-ref", "--short", "-q", "HEAD"])
 }
 
+/// Sykli receipts keyed by the HEAD tree they ran on, with when they started.
+pub type Receipts = std::collections::HashMap<String, (i64, Evidence)>;
+
 /// The sykli receipts in a repository, keyed by the HEAD tree they ran on.
 /// Reads `sykli-receipt.v1`: `subject.head_tree_oid`, `subject.dirty`,
-/// `outcome`, `started_at_ms`. The newest receipt for a tree wins.
-pub fn receipts_by_tree(repo: &Path) -> std::collections::HashMap<String, (i64, Evidence)> {
+/// `outcome`, `started_at_ms`. The newest receipt for a tree wins. Read once
+/// per leaving and shared by `phases` and `finished`.
+pub fn receipts_by_tree(repo: &Path) -> Receipts {
     let mut found = std::collections::HashMap::new();
     let Ok(entries) = std::fs::read_dir(repo.join(".sykli").join("receipts")) else {
         return found;
@@ -150,14 +260,12 @@ pub fn receipts_by_tree(repo: &Path) -> std::collections::HashMap<String, (i64, 
 }
 
 /// State 3, observed: every commit made since the session started, each with
-/// whatever sykli saw on its tree.
-pub fn phases(repo: &Path, head_at_start: Option<&str>) -> Vec<Phase> {
-    // No starting point means no way to tell this session's commits apart.
-    let Some(start) = head_at_start else {
-        return Vec::new();
-    };
+/// whatever sykli saw on its tree. `None` when that cannot be observed: no
+/// starting commit to tell this session's commits apart, or git failed.
+pub fn phases(repo: &Path, head_at_start: Option<&str>, receipts: &Receipts) -> Option<Vec<Phase>> {
+    let start = head_at_start?;
     let range = format!("{start}..HEAD");
-    let Some(log) = git(
+    let log = git(
         repo,
         &[
             "log",
@@ -166,11 +274,9 @@ pub fn phases(repo: &Path, head_at_start: Option<&str>) -> Vec<Phase> {
             "--format=%H%x1f%T%x1f%s",
             &range,
         ],
-    ) else {
-        return Vec::new();
-    };
-    let receipts = receipts_by_tree(repo);
-    log.lines()
+    )?;
+    let phases = log
+        .lines()
         .filter_map(|line| {
             let mut fields = line.split('\u{1f}');
             let (commit, tree, subject) = (fields.next()?, fields.next()?, fields.next()?);
@@ -180,17 +286,18 @@ pub fn phases(repo: &Path, head_at_start: Option<&str>) -> Vec<Phase> {
                 evidence: receipts.get(tree).map(|(_, evidence)| evidence.clone()),
             })
         })
-        .collect()
+        .collect();
+    Some(phases)
 }
 
 /// State 4, observed: the branch's pull request, if `gh` can say.
-pub fn finished(repo: &Path) -> Finished {
+pub fn finished(repo: &Path, receipts: &Receipts) -> Finished {
     let output = process::run(
         Command::new("gh")
             .args(["pr", "view", "--json", "url,state,headRefOid"])
             .current_dir(repo),
         None,
-        Duration::from_secs(20),
+        std::time::Duration::from_secs(20),
     );
     let output = match output {
         Ok(output) => output,
@@ -222,7 +329,7 @@ pub fn finished(repo: &Path) -> Finished {
     let head_evidence = pr["headRefOid"]
         .as_str()
         .and_then(|head| git(repo, &["rev-parse", &format!("{head}^{{tree}}")]))
-        .and_then(|tree| receipts_by_tree(repo).remove(&tree).map(|(_, e)| e));
+        .and_then(|tree| receipts.get(&tree).map(|(_, e)| e.clone()));
     Finished::PullRequest {
         url: pr["url"].as_str().unwrap_or("").to_owned(),
         state: pr["state"].as_str().unwrap_or("unknown").to_owned(),
@@ -233,7 +340,7 @@ pub fn finished(repo: &Path) -> Finished {
 /// The toimija session the child ran: toimija names it `<secs>-<pid>` after
 /// its own process, which is ohjaa's child. Asked of toimija, never read from
 /// its files.
-pub fn toimija_session(repo: &Path, child_pid: u32) -> Option<String> {
+pub fn toimija_session(repo: &Path, child_pid: u32, started_ms: i64) -> Option<String> {
     let output = process::run(
         Command::new("toimija")
             .args(["sessions", "--json"])
@@ -243,13 +350,25 @@ pub fn toimija_session(repo: &Path, child_pid: u32) -> Option<String> {
     )
     .ok()?;
     let payload: Value = serde_json::from_slice(&output.stdout).ok()?;
-    let suffix = format!("-{child_pid}");
+    pick_toimija_session(&payload, child_pid, started_ms)
+}
+
+/// Pids are reused, so the pid alone is not enough: the session must also
+/// have started no earlier than ohjaa did (a second of slack for the clock
+/// tick between the two), and the closest such session wins.
+pub fn pick_toimija_session(payload: &Value, child_pid: u32, started_ms: i64) -> Option<String> {
+    let earliest = started_ms.div_euclid(1000) - 1;
     payload["sessions"]
         .as_array()?
         .iter()
         .filter_map(|session| session["id"].as_str())
-        .find(|id| id.ends_with(&suffix))
-        .map(str::to_owned)
+        .filter_map(|id| {
+            let (secs, pid) = id.split_once('-')?;
+            let secs: i64 = secs.parse().ok()?;
+            (pid.parse::<u32>().ok()? == child_pid && secs >= earliest).then_some((secs, id))
+        })
+        .min_by_key(|(secs, _)| *secs)
+        .map(|(_, id)| id.to_owned())
 }
 
 #[cfg(test)]
@@ -316,7 +435,7 @@ mod tests {
         receipt(&dir, "old", &first, "failed", 1, false);
         receipt(&dir, "new", &first, "passed", 2, false);
         receipt(&dir, "dirty", &second, "passed", 3, true);
-        let found = phases(&dir, Some(&start));
+        let found = phases(&dir, Some(&start), &receipts_by_tree(&dir)).unwrap();
         assert_eq!(
             found.len(),
             2,
@@ -330,15 +449,23 @@ mod tests {
         );
         assert!(found[1].evidence.as_ref().unwrap().dirty);
 
-        let third = commit(&dir, "c.txt", "third phase");
-        let _ = third;
+        commit(&dir, "c.txt", "third phase");
+        let receipts = receipts_by_tree(&dir);
         assert!(
-            phases(&dir, Some(&start))[2].evidence.is_none(),
+            phases(&dir, Some(&start), &receipts).unwrap()[2]
+                .evidence
+                .is_none(),
             "no run is said, not guessed"
         );
-        assert!(
-            phases(&dir, None).is_empty(),
-            "without a start, no phase is claimed"
+        assert_eq!(
+            phases(&dir, None, &receipts),
+            None,
+            "without a start, phases are not observed, not claimed empty"
+        );
+        assert_eq!(
+            phases(&dir, Some(&head(&dir).unwrap()), &receipts),
+            Some(Vec::new()),
+            "no commits since the start is an observation"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -356,6 +483,27 @@ mod tests {
         .unwrap();
         assert!(receipts_by_tree(&dir).is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_toimija_session_is_the_closest_one_started_after_ohjaa_for_its_pid() {
+        let payload: Value = serde_json::from_str(
+            r#"{"sessions":[{"id":"100-42"},{"id":"2003-42"},{"id":"2000-42"},{"id":"2000-7"}]}"#,
+        )
+        .unwrap();
+        // pid 42 was reused: the session from 100 is not ours; 2000 is closer than 2003.
+        assert_eq!(
+            pick_toimija_session(&payload, 42, 1_999_600).as_deref(),
+            Some("2000-42")
+        );
+        // A second of slack for the clock tick between ohjaa and toimija.
+        assert_eq!(
+            pick_toimija_session(&payload, 42, 2_000_900).as_deref(),
+            Some("2000-42")
+        );
+        // Started more than a second before ohjaa did: not this session.
+        assert_eq!(pick_toimija_session(&payload, 42, 2_005_000), None);
+        assert_eq!(pick_toimija_session(&payload, 9, 0), None);
     }
 
     #[test]
