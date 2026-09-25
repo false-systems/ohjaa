@@ -9,18 +9,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-/// Config file holding one path per line; `#` starts a comment.
+/// Config file holding one path per line; `#` starts a comment. Lives in
+/// `$XDG_CONFIG_HOME/ohjaa/roots`, else `~/.config/ohjaa/roots`; an empty
+/// `XDG_CONFIG_HOME` counts as unset.
 pub fn config_path() -> Option<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME")?),
-    };
-    let base = if base.ends_with(".config") || std::env::var_os("XDG_CONFIG_HOME").is_some() {
-        base
-    } else {
-        base.join(".config")
-    };
-    Some(base.join("ohjaa").join("roots"))
+    crate::knowledge::config_home()
+        .ok()
+        .map(|config| config.join("ohjaa").join("roots"))
 }
 
 /// The sibling directories of this repo.
@@ -69,8 +64,22 @@ pub fn load(explicit: &[PathBuf], git_root: Option<&Path>) -> Vec<PathBuf> {
 
 /// Every toimija-prepared repo under the roots. A root may itself be one.
 pub fn toimija_repos(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    repos_under(roots, |path| path.join(".toimija").is_dir())
+}
+
+/// Every Git repository under the roots. A root may itself be one.
+pub fn git_repos(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    repos_under(roots, |path| path.join(".git").exists())
+}
+
+/// A root that is not a directory is an error, never an empty fleet: a typo in
+/// `--root` must not read as "nobody is working anywhere".
+fn repos_under(roots: &[PathBuf], is_repo: impl Fn(&Path) -> bool) -> Result<Vec<PathBuf>> {
     let mut found: Vec<PathBuf> = Vec::new();
     for root in roots {
+        if !root.is_dir() {
+            anyhow::bail!("root {} is not a directory", root.display());
+        }
         let mut candidates = vec![root.clone()];
         if let Ok(entries) = std::fs::read_dir(root) {
             let mut children: Vec<PathBuf> = entries
@@ -82,7 +91,7 @@ pub fn toimija_repos(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
             candidates.extend(children);
         }
         for path in candidates {
-            if path.join(".toimija").is_dir() && !found.contains(&path) {
+            if is_repo(&path) && !found.contains(&path) {
                 found.push(path);
             }
         }

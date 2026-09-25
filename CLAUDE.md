@@ -1,7 +1,4 @@
-<!-- toimija:adopt:v1:begin -->
 Read `.toimija/current.md` before reading anything else in this repo; it is your workset contract. Under a toimija session your launch prompt names your live packet — that file supersedes this one.
-<!-- toimija:adopt:v1:end -->
-
 @AGENTS.md
 
 ## Claude Code notes
@@ -9,11 +6,11 @@ Read `.toimija/current.md` before reading anything else in this repo; it is your
 Do not start with a broad file crawl. Read `.toimija/current.md` first, then
 declare why you are here: `toimija intent "<why>" [--scope <path>]`.
 
-This repo is one small crate — four modules, no lib. Read them before proposing
-structure for it.
+This repo is one small crate — seven modules, no lib, plus the vendored
+`faija-knowledge`. Read them before proposing structure for it.
 
-Do not implement `admit()` — it is the human's policy call. Do not add an
-inbox, messaging, dispatch, presence, caching, or a dependency, unless a human
+Only a person accepts, rejects, retires or confirms Knowledge. Do not add
+messaging, dispatch, presence, caching, or a dependency unless a human
 explicitly moves it into scope and updates `.toimija/repo.yaml` and `AGENTS.md`
 together.
 

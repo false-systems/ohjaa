@@ -1,8 +1,8 @@
 [package]
 name = "ohjaa"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "The deciding layer above toimija — seats agents and derives fleet-wide views."
+description = "Steering knowledge for agents: the graph of what the people they work for know and have decided."
 license = "MIT"
 
 [[bin]]
@@ -12,5 +12,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# knowledge-node.v1, carried rather than fetched: faija is private and publishes
+# nothing. Pinned and drift-checked by `vendor/faija-knowledge.contract` and
+# `tests/vendored_knowledge.rs`; refresh with the script beside it.
+faija-knowledge = { path = "vendor/faija-knowledge" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+sha2 = "0.10"
