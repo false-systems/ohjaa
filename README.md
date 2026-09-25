@@ -157,9 +157,18 @@ blocks a launch; a broken one is reported and left alone, never replaced.
 `ohjaa intake` drafts proposals from each ended session once: its handover and
 what was said in its window.
 
-Signals: Ctrl-C reaches the agent directly (it is in the same process group);
-ohjaa survives it to write the record. A SIGTERM sent to ohjaa is passed on to
-the session.
+Signals, while a session runs (unix):
+
+- **Ctrl-C** reaches the agent directly (it is in the same process group).
+  ohjaa survives it and never passes it on: a second Ctrl-C makes agents like
+  `claude` quit instead of interrupt.
+- **SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2** sent to ohjaa are survived and
+  passed on to the session once each. To stop a session from outside, send
+  SIGTERM to ohjaa.
+- **After the session ends**, any of these cuts leaving short (the tools still
+  running are killed) and the record is still written, with what was known by
+  then; the normal dispositions come back once it is saved.
+- **SIGKILL** cannot be caught: it loses the record.
 
 ## Keeping it true
 
