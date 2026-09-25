@@ -41,11 +41,13 @@ impl Tool {
             role: None,
             not: Vec::new(),
         };
-        let Ok(output) = Command::new("toimija")
-            .args(["context", "--json"])
-            .current_dir(repo)
-            .output()
-        else {
+        let Ok(output) = crate::process::run(
+            Command::new("toimija")
+                .args(["context", "--json"])
+                .current_dir(repo),
+            None,
+            crate::process::LOCAL,
+        ) else {
             return unknown();
         };
         if !output.status.success() {

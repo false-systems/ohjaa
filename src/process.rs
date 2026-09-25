@@ -2,13 +2,19 @@
 //!
 //! Every tool ohjaa asks something of (toimija, git, gh, the drafter) can hang.
 //! A hang must end as a reported failure, never as a silent wait, so every
-//! child runs under a deadline and is killed when it passes.
+//! child runs under a deadline. The child leads its own process group, so a
+//! deadline kills everything it started, including helpers that inherited its
+//! output pipes and would otherwise keep them open forever.
 
 use std::io::{Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+
+/// Long enough for a cold `toimija` or `git` on a large repository.
+pub const LOCAL: Duration = Duration::from_secs(60);
 
 pub struct Output {
     pub status: ExitStatus,
@@ -31,7 +37,31 @@ impl Output {
     }
 }
 
-/// Run `command` with `input` on stdin, killing it after `timeout`.
+#[cfg(unix)]
+fn own_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn own_group(_: &mut Command) {}
+
+/// Kill the child's whole process group (the child leads it).
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Run `command` with `input` on stdin, killing it and everything it started
+/// once `timeout` has passed.
 pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
     let program = command.get_program().to_string_lossy().into_owned();
     command
@@ -42,25 +72,28 @@ pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Re
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    own_group(command);
     let mut child = command
         .spawn()
         .with_context(|| format!("cannot run {program}"))?;
 
     // Feed stdin and drain both pipes on their own threads, so a child that
     // fills a pipe buffer can never deadlock against us.
-    let writer = input.map(|bytes| {
+    if let Some(bytes) = input {
         let mut stdin = child.stdin.take().expect("piped stdin");
         let bytes = bytes.to_vec();
         std::thread::spawn(move || {
             let _ = stdin.write_all(&bytes);
-        })
-    });
+        });
+    }
     let drain = |mut pipe: Box<dyn Read + Send>| {
+        let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buffer = Vec::new();
             let _ = pipe.read_to_end(&mut buffer);
-            buffer
-        })
+            let _ = sender.send(buffer);
+        });
+        receiver
     };
     let stdout = drain(Box::new(child.stdout.take().expect("piped stdout")));
     let stderr = drain(Box::new(child.stderr.take().expect("piped stderr")));
@@ -71,20 +104,31 @@ pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Re
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_group(&mut child);
             anyhow::bail!("{program} did not finish within {}s", timeout.as_secs());
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    if let Some(writer) = writer {
-        let _ = writer.join();
+
+    // The child has exited, but something it started may still hold the
+    // pipes open. Wait for them only until the same deadline.
+    let collect = |receiver: &mpsc::Receiver<Vec<u8>>| {
+        receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    };
+    match (collect(&stdout), collect(&stderr)) {
+        (Ok(stdout), Ok(stderr)) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        _ => {
+            kill_group(&mut child);
+            anyhow::bail!(
+                "{program} exited, but a process it started kept its output open past {}s",
+                timeout.as_secs()
+            )
+        }
     }
-    Ok(Output {
-        status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
-    })
 }
 
 #[cfg(test)]
@@ -115,6 +159,24 @@ mod tests {
         .err()
         .expect("a hang must fail");
         assert!(error.to_string().contains("did not finish"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_helper_holding_the_pipes_cannot_outlive_the_deadline() {
+        // The shell exits at once, but its background child keeps stdout open.
+        let started = Instant::now();
+        let error = run(
+            Command::new("sh").args(["-c", "sleep 30 & echo started"]),
+            None,
+            Duration::from_millis(500),
+        )
+        .err()
+        .expect("a held pipe must fail, not hang");
+        assert!(
+            error.to_string().contains("kept its output open"),
+            "{error}"
+        );
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

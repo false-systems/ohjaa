@@ -227,14 +227,18 @@ fn parse(repo: &Path, stdout: &str, at: i64) -> Result<Scan, serde_json::Error> 
 
 /// Ask one repo's toimija who is live. Never fails: a failure is itself a fact.
 pub fn scan_repo(repo: &Path) -> Scan {
-    let output = Command::new("toimija")
-        .args(["sessions", "--json"])
-        .current_dir(repo)
-        .output();
+    let output = crate::process::run(
+        Command::new("toimija")
+            .args(["sessions", "--json"])
+            .current_dir(repo),
+        None,
+        crate::process::LOCAL,
+    );
 
+    // A toimija that hangs is a failed scan, reported, never a silent wait.
     let output = match output {
         Ok(output) => output,
-        Err(error) => return Scan::failed(repo, format!("cannot run toimija: {error}")),
+        Err(error) => return Scan::failed(repo, format!("toimija: {error:#}")),
     };
 
     if !output.status.success() {

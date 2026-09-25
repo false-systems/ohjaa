@@ -1027,3 +1027,91 @@ fn a_failing_drafter_stops_intake_without_moving_the_cursor() {
     assert!(!fixture.dir.join("state/ohjaa/intake-since").exists());
     fixture.cleanup();
 }
+
+#[test]
+fn a_file_inside_a_repository_gets_only_shared_knowledge() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("sharedwrite");
+    let repo = fixture.make_git_repo("work");
+    fixture.node(
+        &fixture.dir.join("ours/knowledge"),
+        "rust",
+        "decision",
+        "Rust only.",
+    );
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        "answer-first",
+        "taste",
+        "Answer first.",
+    );
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/machine"),
+        "lima",
+        "fact",
+        "Lima is here.",
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["brief", "--write", "AGENTS.md"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("shared (ours, repo)"), "{stderr}");
+    let written = fs::read_to_string(repo.join("AGENTS.md")).unwrap();
+    assert!(written.contains("Rust only."), "{written}");
+    assert!(
+        !written.contains("Answer first.") && !written.contains("Lima is here."),
+        "one person's knowledge never lands in a shared file: {written}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_deleted_configured_root_is_skipped_not_fatal() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("staleroot");
+    let repo = fixture.make_git_repo("work");
+    let config = fixture.dir.join("config/ohjaa");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("roots"),
+        format!(
+            "{}\n{}\n",
+            fixture.dir.join("gone").display(),
+            fixture.dir.display()
+        ),
+    )
+    .unwrap();
+    let (stdout, stderr, code) = output_of(fixture.ohjaa().arg("fleet").current_dir(&repo));
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("skipping root") && stderr.contains("gone"),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn check_counts_an_unreadable_proposal_as_an_error() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("badproposal");
+    let repo = fixture.make_git_repo("work");
+    let waiting = fixture.dir.join("state/ohjaa/proposals/mine");
+    fs::create_dir_all(&waiting).unwrap();
+    fs::write(waiting.join("half.md"), "+++\nid = \"half\"\n").unwrap();
+    let (stdout, _, code) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(
+        stdout.contains("proposal") && stdout.contains("half.md"),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}

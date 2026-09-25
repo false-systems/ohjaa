@@ -34,28 +34,34 @@ fn parse_config(contents: &str) -> Vec<PathBuf> {
         .lines()
         .filter_map(|line| {
             let line = line.split('#').next().unwrap_or("").trim();
-            (!line.is_empty()).then(|| PathBuf::from(expand_home(line)))
+            (!line.is_empty()).then(|| crate::knowledge::expand_home(line))
         })
         .collect()
 }
 
-fn expand_home(path: &str) -> String {
-    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => Path::new(&home).join(rest).to_string_lossy().into_owned(),
-        _ => path.to_string(),
-    }
-}
-
 /// Explicit `--root` wins, then the config file, then derivation.
+///
+/// An explicit root that does not exist is an error later (a typo must not
+/// read as an empty fleet). A configured one is only skipped, with a warning:
+/// a project deleted since the config was written must not block every launch.
 pub fn load(explicit: &[PathBuf], git_root: Option<&Path>) -> Vec<PathBuf> {
     if !explicit.is_empty() {
         return explicit.to_vec();
     }
     if let Some(path) = config_path() {
         if let Ok(contents) = std::fs::read_to_string(&path) {
-            let roots = parse_config(&contents);
-            if !roots.is_empty() {
-                return roots;
+            let (present, missing): (Vec<PathBuf>, Vec<PathBuf>) = parse_config(&contents)
+                .into_iter()
+                .partition(|root| root.is_dir());
+            for root in &missing {
+                eprintln!(
+                    "ohjaa: skipping root {} from {}: not a directory",
+                    root.display(),
+                    path.display()
+                );
+            }
+            if !present.is_empty() {
+                return present;
             }
         }
     }

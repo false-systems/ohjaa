@@ -42,7 +42,10 @@ const SKIP_PREFIXES: [&str; 12] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub source: &'static str,
-    /// RFC 3339, UTC.
+    /// When, in milliseconds since the epoch. Sources report local offsets,
+    /// UTC and fractions of a second; only this number is ever compared.
+    pub at_ms: i64,
+    /// The same instant as RFC 3339 UTC, for people and the drafter.
     pub at: String,
     /// Where: a repository path, a project, or a pull request URL.
     pub place: String,
@@ -67,19 +70,63 @@ pub fn now_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-/// Accept `YYYY-MM-DD` or a full RFC 3339 UTC time; return RFC 3339.
-pub fn normalize_since(text: &str) -> Result<String> {
+/// Milliseconds since the epoch for `YYYY-MM-DD` (midnight UTC) or an RFC 3339
+/// time with `Z` or a `±HH:MM` offset and optional fraction of a second.
+pub fn parse_time(text: &str) -> Option<i64> {
     let text = text.trim();
-    let date = parse_date(text).with_context(|| format!("`{text}` is not a date"))?;
-    Ok(if text.len() > 10 {
-        text.to_owned()
-    } else {
-        format!("{date}T00:00:00Z")
-    })
+    let date = parse_date(text)?;
+    let days = day_number(date);
+    if text.len() == 10 {
+        return Some(days * 86_400_000);
+    }
+    let rest = text.get(10..)?;
+    let rest = rest.strip_prefix('T').or_else(|| rest.strip_prefix('t'))?;
+    let number = |s: &str| s.parse::<i64>().ok();
+    let (hours, minutes, seconds) = (
+        number(rest.get(0..2)?)?,
+        number(rest.get(3..5)?)?,
+        number(rest.get(6..8)?)?,
+    );
+    if rest.get(2..3)? != ":"
+        || rest.get(5..6)? != ":"
+        || hours > 23
+        || minutes > 59
+        || seconds > 60
+    {
+        return None;
+    }
+    let mut rest = &rest[8..];
+    let mut millis = 0;
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let padded = format!("{:0<3}", &fraction[..digits.min(3)]);
+        millis = number(&padded)?;
+        rest = &fraction[digits..];
+    }
+    let offset_minutes = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.get(0..1)? {
+                "+" => 1,
+                "-" => -1,
+                _ => return None,
+            };
+            if rest.len() != 6 || rest.get(3..4)? != ":" {
+                return None;
+            }
+            sign * (number(rest.get(1..3)?)? * 60 + number(rest.get(4..6)?)?)
+        }
+    };
+    let local = ((days * 24 + hours) * 60 + minutes) * 60 + seconds;
+    Some((local - offset_minutes * 60) * 1000 + millis)
 }
 
-fn since_seconds(since: &str) -> i64 {
-    parse_date(since).map_or(0, |date| day_number(date) * 86_400)
+/// The start of an intake window, from `YYYY-MM-DD` or an RFC 3339 time.
+pub fn normalize_since(text: &str) -> Result<i64> {
+    parse_time(text).with_context(|| format!("`{}` is not a date or RFC 3339 time", text.trim()))
 }
 
 // ---- transcripts ------------------------------------------------------------
@@ -128,7 +175,7 @@ fn texts(content: &Value, key: &str) -> Option<String> {
 }
 
 /// One Claude Code transcript (`~/.claude/projects/*/*.jsonl`).
-pub fn claude_transcript(text: &str, since: &str, out: &mut Vec<Candidate>) {
+pub fn claude_transcript(text: &str, since_ms: i64, out: &mut Vec<Candidate>) {
     let mut agent_said = String::new();
     for line in text.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
@@ -145,14 +192,18 @@ pub fn claude_transcript(text: &str, since: &str, out: &mut Vec<Candidate>) {
                 }
             }
             Some("user") if entry["isMeta"] != true => {
-                let at = entry["timestamp"].as_str().unwrap_or("");
+                // A message that cannot be placed in time cannot be windowed.
+                let Some(at_ms) = entry["timestamp"].as_str().and_then(parse_time) else {
+                    continue;
+                };
                 let Some(message) = texts(content, "text").and_then(|t| clean(&t)) else {
                     continue;
                 };
-                if at > since {
+                if at_ms > since_ms {
                     out.push(Candidate {
                         source: "claude",
-                        at: at.to_owned(),
+                        at_ms,
+                        at: rfc3339(at_ms.div_euclid(1000)),
                         place: entry["cwd"].as_str().unwrap_or("").to_owned(),
                         who: "person".to_owned(),
                         context: tail(&agent_said, CONTEXT_TAIL),
@@ -167,7 +218,7 @@ pub fn claude_transcript(text: &str, since: &str, out: &mut Vec<Candidate>) {
 
 /// One Codex session (`~/.codex/sessions/**/*.jsonl`). Subagent sessions,
 /// whose "user" is another agent, are skipped whole.
-pub fn codex_session(text: &str, since: &str, out: &mut Vec<Candidate>) {
+pub fn codex_session(text: &str, since_ms: i64, out: &mut Vec<Candidate>) {
     let mut place = String::new();
     let mut agent_said = String::new();
     for line in text.lines() {
@@ -191,12 +242,15 @@ pub fn codex_session(text: &str, since: &str, out: &mut Vec<Candidate>) {
         match payload["role"].as_str() {
             Some("assistant") => agent_said = said,
             Some("user") => {
-                let at = entry["timestamp"].as_str().unwrap_or("");
+                let Some(at_ms) = entry["timestamp"].as_str().and_then(parse_time) else {
+                    continue;
+                };
                 if let Some(message) = clean(&said) {
-                    if at > since {
+                    if at_ms > since_ms {
                         out.push(Candidate {
                             source: "codex",
-                            at: at.to_owned(),
+                            at_ms,
+                            at: rfc3339(at_ms.div_euclid(1000)),
                             place: place.clone(),
                             who: "person".to_owned(),
                             context: tail(&agent_said, CONTEXT_TAIL),
@@ -232,20 +286,24 @@ fn jsonl_files(dir: &Path, modified_after: i64, out: &mut Vec<PathBuf>) {
     }
 }
 
-pub fn transcripts(home: &Path, since: &str) -> Vec<Candidate> {
-    let floor = since_seconds(since);
+/// A transcript that cannot be read is said out loud: skipping it silently
+/// would move the cursor past corrections nobody ever looked at.
+pub fn transcripts(home: &Path, since_ms: i64, warnings: &mut Vec<String>) -> Vec<Candidate> {
+    let floor = since_ms.div_euclid(1000);
     let mut out = Vec::new();
     let mut files = Vec::new();
     jsonl_files(&home.join(".claude").join("projects"), floor, &mut files);
     for path in files.drain(..) {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            claude_transcript(&text, since, &mut out);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => claude_transcript(&text, since_ms, &mut out),
+            Err(error) => warnings.push(format!("cannot read {}: {error}", path.display())),
         }
     }
     jsonl_files(&home.join(".codex").join("sessions"), floor, &mut files);
     for path in files {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            codex_session(&text, since, &mut out);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => codex_session(&text, since_ms, &mut out),
+            Err(error) => warnings.push(format!("cannot read {}: {error}", path.display())),
         }
     }
     out
@@ -281,7 +339,8 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// Human comments on pull requests and issues since `since`, through `gh`.
-pub fn reviews(repos: &[PathBuf], since: &str, warnings: &mut Vec<String>) -> Vec<Candidate> {
+pub fn reviews(repos: &[PathBuf], since_ms: i64, warnings: &mut Vec<String>) -> Vec<Candidate> {
+    let since = rfc3339(since_ms.div_euclid(1000));
     let mut out = Vec::new();
     for repo in repos {
         let Some(slug) = git(repo, &["remote", "get-url", "origin"])
@@ -323,10 +382,16 @@ pub fn reviews(repos: &[PathBuf], since: &str, warnings: &mut Vec<String>) -> Ve
                 if kind == "Bot" || login.ends_with("[bot]") {
                     continue;
                 }
+                // GitHub's `since` filters on when a comment was last
+                // *updated*; an old comment edited today is not new.
+                let Some(at_ms) = parse_time(field(0)).filter(|at| *at > since_ms) else {
+                    continue;
+                };
                 if let Some(text) = clean(field(4)) {
                     out.push(Candidate {
                         source: "review",
-                        at: field(0).to_owned(),
+                        at_ms,
+                        at: rfc3339(at_ms.div_euclid(1000)),
                         place: field(3).to_owned(),
                         who: login.to_owned(),
                         context: repo.display().to_string(),
@@ -340,18 +405,19 @@ pub fn reviews(repos: &[PathBuf], since: &str, warnings: &mut Vec<String>) -> Ve
 }
 
 /// Reverted commits since `since`: each is an Outcome that went wrong.
-pub fn reverts(repos: &[PathBuf], since: &str, warnings: &mut Vec<String>) -> Vec<Candidate> {
+pub fn reverts(repos: &[PathBuf], since_ms: i64, warnings: &mut Vec<String>) -> Vec<Candidate> {
     let mut out = Vec::new();
     for repo in repos {
+        // `%at` is seconds since the epoch: no author offset to misorder.
         let log = git(
             repo,
             &[
                 "log",
-                &format!("--since={since}"),
+                &format!("--since=@{}", since_ms.div_euclid(1000)),
                 "--regexp-ignore-case",
                 "--grep=^revert",
                 "--max-count=50",
-                "--format=%aI%x1f%an%x1f%s%x1f%b%x1e",
+                "--format=%at%x1f%an%x1f%s%x1f%b%x1e",
             ],
         );
         let log = match log {
@@ -366,10 +432,18 @@ pub fn reverts(repos: &[PathBuf], since: &str, warnings: &mut Vec<String>) -> Ve
             if fields.len() < 4 {
                 continue;
             }
+            let Some(seconds) = fields[0].trim().parse::<i64>().ok() else {
+                continue;
+            };
+            let at_ms = seconds * 1000;
+            if at_ms <= since_ms {
+                continue;
+            }
             if let Some(text) = clean(&format!("{}\n\n{}", fields[2], fields[3])) {
                 out.push(Candidate {
                     source: "revert",
-                    at: fields[0].to_owned(),
+                    at_ms,
+                    at: rfc3339(seconds),
                     place: repo.display().to_string(),
                     who: fields[1].to_owned(),
                     context: String::new(),
@@ -534,16 +608,28 @@ fn cursor_path(dirs: &Dirs) -> PathBuf {
     dirs.state.join("intake-since")
 }
 
-pub fn read_cursor(dirs: &Dirs) -> Option<String> {
-    std::fs::read_to_string(cursor_path(dirs))
-        .ok()
-        .map(|text| text.trim().to_owned())
-        .filter(|text| !text.is_empty())
+/// Where the last intake stopped. An unreadable cursor is an error, never a
+/// silent restart from some default.
+pub fn read_cursor(dirs: &Dirs) -> Result<Option<i64>> {
+    match std::fs::read_to_string(cursor_path(dirs)) {
+        Ok(text) => parse_time(&text)
+            .map(Some)
+            .with_context(|| format!("{} does not hold a time", cursor_path(dirs).display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("cannot read the intake cursor"),
+    }
 }
 
-pub fn write_cursor(dirs: &Dirs, at: &str) -> Result<()> {
+/// Record where intake stopped. The cursor only ever moves forward.
+pub fn write_cursor(dirs: &Dirs, at_ms: i64) -> Result<()> {
+    if read_cursor(dirs)?.is_some_and(|previous| previous >= at_ms) {
+        return Ok(());
+    }
     std::fs::create_dir_all(&dirs.state)?;
-    std::fs::write(cursor_path(dirs), format!("{at}\n"))?;
+    let at = rfc3339(at_ms.div_euclid(1000));
+    // Keep the millisecond, so a message in the same second is not re-read.
+    let text = format!("{}.{:03}Z\n", &at[..at.len() - 1], at_ms.rem_euclid(1000));
+    std::fs::write(cursor_path(dirs), text)?;
     Ok(())
 }
 
@@ -564,7 +650,11 @@ mod tests {
             "not json",
         ];
         let mut out = Vec::new();
-        claude_transcript(&lines.join("\n"), "2026-09-10T00:00:00Z", &mut out);
+        claude_transcript(
+            &lines.join("\n"),
+            parse_time("2026-09-10").unwrap(),
+            &mut out,
+        );
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].text, "please dont merge PRs u open ok");
         assert_eq!(out[0].context, "I pushed to main.");
@@ -580,7 +670,7 @@ mod tests {
             r#"{"timestamp":"2026-09-20T10:02:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"we have lima baba"}]}}"#,
         ];
         let mut out = Vec::new();
-        codex_session(&own.join("\n"), "2026-09-10T00:00:00Z", &mut out);
+        codex_session(&own.join("\n"), parse_time("2026-09-10").unwrap(), &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "we have lima baba");
         assert_eq!(out[0].context, "Blocked on macOS.");
@@ -590,7 +680,7 @@ mod tests {
             .join("\n")
             .replace(r#""source":"cli""#, r#""source":{"subagent":"review"}"#);
         let mut out = Vec::new();
-        codex_session(&sub, "2026-09-10T00:00:00Z", &mut out);
+        codex_session(&sub, parse_time("2026-09-10").unwrap(), &mut out);
         assert!(out.is_empty(), "a subagent's user is another agent");
     }
 
@@ -661,8 +751,56 @@ mod tests {
         assert_eq!(rfc3339(1_790_000_000), "2026-09-21T14:13:20Z");
         assert_eq!(
             normalize_since("2026-09-10").unwrap(),
-            "2026-09-10T00:00:00Z"
+            parse_time("2026-09-10T00:00:00Z").unwrap()
         );
         assert!(normalize_since("yesterday").is_err());
+    }
+
+    #[test]
+    fn times_compare_as_instants_not_strings() {
+        let utc = parse_time("2026-09-25T10:00:00Z").unwrap();
+        // The same instant, written by an author at +02:00.
+        assert_eq!(parse_time("2026-09-25T12:00:00+02:00"), Some(utc));
+        assert_eq!(parse_time("2026-09-25T05:30:00-04:30"), Some(utc));
+        // As strings, ".123Z" sorts *before* "Z"; as instants it is later.
+        assert!("2026-09-25T10:00:00.123Z" < "2026-09-25T10:00:00Z");
+        assert_eq!(parse_time("2026-09-25T10:00:00.123Z"), Some(utc + 123));
+        assert_eq!(parse_time("2026-09-25T10:00:00.5Z"), Some(utc + 500));
+        assert_eq!(parse_time("2026-09-25T10:00:00.123456Z"), Some(utc + 123));
+        for bad in [
+            "2026-09-25T10:00:00",
+            "2026-09-25T25:00:00Z",
+            "2026-09-25T10:00:00.Z",
+            "2026-09-25 10:00:00Z",
+            "2026-09-25T10:00:00+0200",
+        ] {
+            assert_eq!(parse_time(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_cursor_only_moves_forward_and_keeps_milliseconds() {
+        let root = std::env::temp_dir().join(format!("ohjaa-cursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dirs = Dirs {
+            ours_checkout: None,
+            repo_root: None,
+            mine: root.join("mine"),
+            machine: root.join("machine"),
+            proposals: root.join("proposals"),
+            state: root.clone(),
+        };
+        assert_eq!(read_cursor(&dirs).unwrap(), None);
+        let later = parse_time("2026-09-25T10:00:00.250Z").unwrap();
+        write_cursor(&dirs, later).unwrap();
+        assert_eq!(read_cursor(&dirs).unwrap(), Some(later));
+        write_cursor(&dirs, later - 86_400_000).unwrap();
+        assert_eq!(read_cursor(&dirs).unwrap(), Some(later), "never backwards");
+        std::fs::write(root.join("intake-since"), "garbage").unwrap();
+        assert!(
+            read_cursor(&dirs).is_err(),
+            "an unreadable cursor is an error"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

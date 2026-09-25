@@ -189,15 +189,28 @@ fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = command.output().context("failed to run git")?;
+    let output = process::run(&mut command, None, process::LOCAL).context("failed to run git")?;
     if !output.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("git {} failed: {}", args.join(" "), output.failure_detail());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(output.stdout_text().trim().to_string())
+}
+
+/// Whether `path` lies inside a Git work tree, i.e. in a file other people
+/// may read once it is committed.
+fn inside_work_tree(path: &Path) -> bool {
+    let dir = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => parent.to_path_buf(),
+        None => PathBuf::from("."),
+    };
+    let mut existing = dir.as_path();
+    while !existing.exists() {
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => return false,
+        }
+    }
+    git(&["rev-parse", "--is-inside-work-tree"], Some(existing)).is_ok_and(|out| out == "true")
 }
 
 fn git_root() -> Option<PathBuf> {
@@ -328,6 +341,10 @@ fn dirs() -> Result<Dirs> {
 /// Broken files and flags are said out loud; they never make the briefing
 /// silently smaller.
 fn knowledge_briefing(dirs: &Dirs) -> Result<String> {
+    knowledge_briefing_for(dirs, &Scope::ALL)
+}
+
+fn knowledge_briefing_for(dirs: &Dirs, scopes: &[Scope]) -> Result<String> {
     let loaded = knowledge::load(dirs)?;
     for broken in &loaded.broken {
         eprintln!(
@@ -340,7 +357,7 @@ fn knowledge_briefing(dirs: &Dirs) -> Result<String> {
         eprintln!("ohjaa: knowledge does not hold together: {error}");
     }
     let flags = knowledge::flags(&loaded, dirs.repo_root.as_deref(), knowledge::today());
-    let text = knowledge::render(&loaded, &flags);
+    let text = knowledge::render_scopes(&loaded, &flags, scopes);
     if text.len() > knowledge::DEFAULT_BUDGET {
         eprintln!(
             "ohjaa: the knowledge briefing is {} characters, over the {} an agent will \
@@ -354,14 +371,22 @@ fn knowledge_briefing(dirs: &Dirs) -> Result<String> {
 
 fn cmd_brief(roots: &[PathBuf], knowledge_only: bool, write: &[PathBuf]) -> Result<i32> {
     let dirs = dirs()?;
-    let knowledge = knowledge_briefing(&dirs)?;
     if !write.is_empty() {
-        let text = if knowledge.is_empty() {
-            "No knowledge recorded yet.".to_owned()
-        } else {
-            knowledge
-        };
         for file in write {
+            // A file inside a repository is read by everyone the repository
+            // is shared with: only shared Knowledge goes there. One person's
+            // `mine` and `machine` go only into files outside every repo.
+            let (scopes, which): (&[Scope], &str) = if inside_work_tree(file) {
+                (&[Scope::Ours, Scope::Repo], "shared (ours, repo)")
+            } else {
+                (&Scope::ALL, "all")
+            };
+            let knowledge = knowledge_briefing_for(&dirs, scopes)?;
+            let text = if knowledge.is_empty() {
+                "No knowledge recorded yet.".to_owned()
+            } else {
+                knowledge
+            };
             let existing = match std::fs::read_to_string(file) {
                 Ok(existing) => existing,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -369,26 +394,31 @@ fn cmd_brief(roots: &[PathBuf], knowledge_only: bool, write: &[PathBuf]) -> Resu
                     return Err(error).with_context(|| format!("cannot read {}", file.display()))
                 }
             };
+            let updated = knowledge::write_block(&existing, &text)
+                .with_context(|| format!("not writing {}", file.display()))?;
             if let Some(parent) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(file, knowledge::write_block(&existing, &text))
+            std::fs::write(file, updated)
                 .with_context(|| format!("cannot write {}", file.display()))?;
-            eprintln!("ohjaa: wrote the knowledge block into {}", file.display());
+            eprintln!("ohjaa: wrote {which} knowledge into {}", file.display());
         }
         return Ok(0);
     }
+    let knowledge = knowledge_briefing(&dirs)?;
     if knowledge.is_empty() {
         println!("No knowledge recorded yet (`ohjaa propose`, then `ohjaa review`).");
     } else {
         print!("{knowledge}");
     }
-    if !knowledge_only {
-        let here = git_root().unwrap_or_else(|| PathBuf::from("."));
-        let view = system::system_view(&repos(roots)?);
-        println!("\n{}", system::briefing(&view, &here));
+    if knowledge_only {
+        return Ok(0);
     }
-    Ok(0)
+    let here = git_root().unwrap_or_else(|| PathBuf::from("."));
+    let view = system::system_view(&repos(roots)?);
+    println!("\n{}", system::briefing(&view, &here));
+    // An incomplete perimeter is said with the exit code, as `system` does.
+    Ok(view.exit_code())
 }
 
 fn scope_arg(name: &str) -> Result<Scope> {
@@ -495,14 +525,17 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     knowledge::require_person(action)?;
     let dirs = dirs()?;
     let today = knowledge::today();
-    let outcome = match action {
-        "accept" => knowledge::accept(&dirs, id, today)?,
-        "reject" => knowledge::reject(&dirs, id)?,
-        "retire" => knowledge::retire(&dirs, id, why.unwrap_or(""), today)?,
-        "confirm" => knowledge::confirm(&dirs, id, today)?,
+    let (outcome, done) = match action {
+        "accept" => (knowledge::accept(&dirs, id, today)?, "accepted"),
+        "reject" => (knowledge::reject(&dirs, id)?, "rejected"),
+        "retire" => (
+            knowledge::retire(&dirs, id, why.unwrap_or(""), today)?,
+            "retired",
+        ),
+        "confirm" => (knowledge::confirm(&dirs, id, today)?, "confirmed"),
         other => bail!("unknown decision `{other}`"),
     };
-    println!("{action}ed {id}");
+    println!("{done} {id}");
     report(&outcome);
     Ok(0)
 }
@@ -598,7 +631,15 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
     if over {
         println!("flag     the briefing is {size} characters, over the budget of {budget}: merge or retire");
     }
-    let (waiting, _) = knowledge::pending(&dirs, &loaded)?;
+    let (waiting, broken_proposals) = knowledge::pending(&dirs, &loaded)?;
+    for broken in &broken_proposals {
+        println!(
+            "error    proposal {}: {}",
+            broken.path.display(),
+            broken.reason
+        );
+        errors += 1;
+    }
     let current = loaded
         .nodes
         .iter()
@@ -642,12 +683,12 @@ fn cmd_intake(
     dry_run: bool,
 ) -> Result<i32> {
     let dirs = dirs()?;
-    let started = intake::rfc3339(intake::now_seconds());
+    let started = intake::now_seconds() * 1000;
     let since = match since {
         Some(since) => intake::normalize_since(since)?,
-        None => match intake::read_cursor(&dirs) {
+        None => match intake::read_cursor(&dirs)? {
             Some(cursor) => cursor,
-            None => intake::rfc3339(intake::now_seconds() - 14 * 86_400),
+            None => started - 14 * 86_400_000,
         },
     };
     let sources: Vec<&str> = if sources.is_empty() {
@@ -667,27 +708,28 @@ fn cmd_intake(
                 let home = std::env::var_os("HOME")
                     .map(PathBuf::from)
                     .context("HOME is not set")?;
-                candidates.extend(intake::transcripts(&home, &since));
+                candidates.extend(intake::transcripts(&home, since, &mut warnings));
             }
-            "reviews" => candidates.extend(intake::reviews(&git_repos()?, &since, &mut warnings)),
-            "reverts" => candidates.extend(intake::reverts(&git_repos()?, &since, &mut warnings)),
+            "reviews" => candidates.extend(intake::reviews(&git_repos()?, since, &mut warnings)),
+            "reverts" => candidates.extend(intake::reverts(&git_repos()?, since, &mut warnings)),
             other => bail!("`{other}` is not a source: transcripts, reviews or reverts"),
         }
     }
     for warning in &warnings {
         eprintln!("ohjaa: intake: {warning}");
     }
-    candidates.sort_by(|a, b| a.at.cmp(&b.at));
+    candidates.sort_by_key(|candidate| candidate.at_ms);
     let batch = batch.max(1);
     let limit = batch.saturating_mul(max_batches);
     let taken = candidates.len().min(limit);
     eprintln!(
-        "ohjaa: {} candidate(s) since {since}; drafting from {taken}",
-        candidates.len()
+        "ohjaa: {} candidate(s) since {}; drafting from {taken}",
+        candidates.len(),
+        intake::rfc3339(since.div_euclid(1000))
     );
     if candidates.is_empty() {
         if !dry_run && warnings.is_empty() {
-            intake::write_cursor(&dirs, &started)?;
+            intake::write_cursor(&dirs, started)?;
         }
         println!("nothing new to draft from");
         return Ok(0);
@@ -706,7 +748,8 @@ fn cmd_intake(
 
     let today = knowledge::today();
     let (mut proposed, mut refused) = (0, 0);
-    let mut completed_through: Option<String> = None;
+    let mut completed_through: Option<i64> = None;
+    let mut drafted = 0usize;
     for chunk in candidates[..taken].chunks(batch) {
         // Re-read each time, so a draft from an earlier batch counts as existing.
         let loaded = knowledge::load(&dirs)?;
@@ -733,18 +776,22 @@ fn cmd_intake(
                 }
             }
         }
-        completed_through = chunk.last().map(|c| c.at.clone());
+        completed_through = chunk.last().map(|c| c.at_ms);
+        drafted += chunk.len();
     }
     // Move the cursor only past what was actually drafted from, so an
-    // interrupted or partial run resumes instead of skipping.
-    let finished_all = completed_through.is_some() && taken == candidates.len();
+    // interrupted or partial run resumes instead of skipping. It never moves
+    // backwards (`write_cursor` refuses to).
+    // Finished only when every candidate went through the drafter: a batch
+    // that failed part-way leaves the rest for the next run.
+    let finished_all = drafted == candidates.len();
     if let Some(through) = completed_through {
         let cursor = if finished_all && warnings.is_empty() {
             started
         } else {
             through
         };
-        intake::write_cursor(&dirs, &cursor)?;
+        intake::write_cursor(&dirs, cursor)?;
     }
     println!(
         "{proposed} proposal(s) waiting for review (`ohjaa review`), {refused} draft(s) refused"
@@ -883,29 +930,12 @@ fn render_command(command: &Command) -> String {
 
 /// Quote a word so `sh` reads it back unchanged.
 fn shell_word(word: &str) -> String {
-    if word.is_empty()
-        || word.chars().any(|c| {
-            c.is_whitespace()
-                || matches!(
-                    c,
-                    '\'' | '"'
-                        | '\\'
-                        | '$'
-                        | '`'
-                        | ';'
-                        | '&'
-                        | '|'
-                        | '<'
-                        | '>'
-                        | '('
-                        | ')'
-                        | '*'
-                        | '?'
-                        | '#'
-                        | '~'
-                )
-        })
-    {
+    // Anything outside a small, always-literal set is quoted.
+    let literal = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '@' | '%' | '+' | ',')
+    };
+    if word.is_empty() || !word.chars().all(literal) {
         format!("'{}'", word.replace('\'', "'\\''"))
     } else {
         word.to_string()
@@ -990,8 +1020,9 @@ fn main() {
             eprintln!("ohjaa: {error:#}");
             // A refusal to act (a person-only change, a set that would not
             // hold) is the one error with its own code.
-            let text = format!("{error:#}");
-            let refused = text.contains("only a person may") || text.contains("refused");
+            let refused = error
+                .chain()
+                .any(|cause| cause.downcast_ref::<knowledge::Refused>().is_some());
             std::process::exit(if refused { REFUSED } else { 1 });
         }
     }
@@ -1009,5 +1040,8 @@ mod tests {
         assert_eq!(shell_word("a b"), "'a b'");
         assert_eq!(shell_word("$HOME"), "'$HOME'");
         assert_eq!(shell_word("a;b"), "'a;b'");
+        for special in ["a[1]", "{x}", "a!b", "'*'", "~"] {
+            assert!(shell_word(special).starts_with('\''), "{special}");
+        }
     }
 }
