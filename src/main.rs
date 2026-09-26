@@ -262,23 +262,32 @@ fn report_coverage(scans: &[Scan]) -> i32 {
         .filter(|s| s.coverage != Coverage::Available)
         .collect();
 
+    let repos = scans.iter().filter(|s| !s.outside);
+    let seen = repos
+        .clone()
+        .filter(|s| s.coverage == Coverage::Available)
+        .count();
+    let outside_seen = scans
+        .iter()
+        .any(|s| s.outside && s.coverage == Coverage::Available);
+
     // stdout is block-buffered when piped; keep the report in order.
     let _ = std::io::stdout().flush();
     eprintln!(
-        "\ncoverage: scanned {}/{} repo(s)",
-        scans.len() - incomplete.len(),
-        scans.len()
+        "\ncoverage: scanned {seen}/{} repo(s){}",
+        repos.count(),
+        if outside_seen {
+            " and the sessions outside repositories"
+        } else {
+            ""
+        }
     );
     if incomplete.is_empty() {
         return 0;
     }
     eprintln!("  incomplete — absence here is not evidence of absence:");
     for scan in incomplete {
-        eprintln!(
-            "    {}: {}",
-            scan.repo.file_name().unwrap_or_default().to_string_lossy(),
-            coverage_detail(scan)
-        );
+        eprintln!("    {}: {}", scan.name(), coverage_detail(scan));
     }
     INCOMPLETE
 }
@@ -295,7 +304,7 @@ fn coverage_detail(scan: &Scan) -> &str {
 fn cmd_fleet(explicit: &[PathBuf], json: bool) -> Result<i32> {
     let repos = repos(explicit)?;
     let mut scans = scan_fleet(&repos);
-    scans.sort_by_key(|scan| scan.repo.file_name().map(|n| n.to_os_string()));
+    scans.sort_by_key(|scan| (scan.outside, scan.name()));
 
     if json {
         println!("{}", serde_json::to_string_pretty(&scans)?);
@@ -309,18 +318,23 @@ fn cmd_fleet(explicit: &[PathBuf], json: bool) -> Result<i32> {
             continue;
         }
         any_live |= !live.is_empty();
-        println!(
-            "{}",
-            scan.repo.file_name().unwrap_or_default().to_string_lossy()
-        );
+        println!("{}", scan.name());
         if let Some(error) = &scan.error {
             println!("    ! scan failed: {error}");
         }
         for session in live {
             println!("    {}  {}", session.agent, session.id);
+            // Outside a repo there is no branch: where it works is the folder.
+            let place = if scan.outside {
+                format!("folder: {}", session.worktree.display())
+            } else {
+                format!(
+                    "branch: {}",
+                    session.branch.as_deref().unwrap_or("detached")
+                )
+            };
             println!(
-                "      branch: {}   seen: {}{}",
-                session.branch.as_deref().unwrap_or("detached"),
+                "      {place}   seen: {}{}",
                 ago(session.idle_seconds),
                 // The age is the evidence; the label only says it is inferred.
                 if session.is_quiet() { "   stale" } else { "" }
@@ -580,7 +594,11 @@ fn cmd_session(id: Option<&str>) -> Result<i32> {
     let session = match id {
         Some(id) => store.get(id).map_err(|e| anyhow::anyhow!("{e}"))?,
         None => {
-            let repo = git_root().context("not inside a Git repository; name a session id")?;
+            // "Here" is the repository, or outside one the folder, as for `run`.
+            let repo = match git_root() {
+                Some(repo) => repo,
+                None => std::env::current_dir().context("failed to read the current directory")?,
+            };
             let key = repo_key(&repo);
             let latest = store.latest_for(&key).map_err(|e| anyhow::anyhow!("{e}"))?;
             if latest.is_none() {
@@ -1194,12 +1212,29 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         passthrough,
         roots,
     } = options;
-    let root = git_root().context("not inside a Git repository")?;
+    // Outside any Git repository the session is the folder's: toimija keeps it
+    // outside every repo, and there are no commits or pull request to observe.
+    let (root, in_repo) = match git_root() {
+        Some(root) => (root, true),
+        None => (
+            std::env::current_dir().context("failed to read the current directory")?,
+            false,
+        ),
+    };
 
-    let scan = scan_repo(&root);
+    let scan = if in_repo {
+        scan_repo(&root)
+    } else {
+        scan::scan_outside()
+    };
     if scan.coverage != Coverage::Available {
         eprintln!(
-            "ohjaa: cannot completely read sessions in {}: {}",
+            "ohjaa: cannot completely read sessions {} {}: {}",
+            if in_repo {
+                "in"
+            } else {
+                "outside repositories, for"
+            },
             root.display(),
             coverage_detail(&scan)
         );
@@ -1209,10 +1244,30 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
 
     // Counts every session that may still be working here, not just the ones
     // toimija currently calls active: reporting an occupied checkout as empty
-    // is the one thing this line must never do.
-    let live = scan.occupying().count();
-    let quiet = scan.occupying().filter(|s| s.is_quiet()).count();
-    eprintln!("ohjaa: {live} sibling session(s) in this checkout at launch");
+    // is the one thing this line must never do. Outside a repo, "here" is
+    // this folder.
+    let folder = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    let here = |session: &&scan::Session| {
+        in_repo || std::fs::canonicalize(&session.worktree).is_ok_and(|path| path == folder)
+    };
+    let live = scan.occupying().filter(here).count();
+    let quiet = scan
+        .occupying()
+        .filter(here)
+        .filter(|s| s.is_quiet())
+        .count();
+    if in_repo {
+        eprintln!("ohjaa: {live} sibling session(s) in this checkout at launch");
+    } else {
+        eprintln!(
+            "ohjaa: {} is not a Git repository; {live} sibling session(s) in this folder at launch",
+            root.display()
+        );
+        eprintln!(
+            "ohjaa: sessions in the repos this agent touches will not count it as a sibling; \
+             name them with --scope"
+        );
+    }
     if quiet > 0 {
         eprintln!(
             "ohjaa: {quiet} of them stale — toimija cannot tell a finished agent \
@@ -1243,7 +1298,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // acting), then the last session here and how this one works, then the
     // perimeter (who and what is around). Delivered inside the task so it
     // travels in toimija's composed launch prompt.
-    let dirs = Dirs::resolve(Some(&root))?;
+    let dirs = Dirs::resolve(in_repo.then_some(root.as_path()))?;
     let started_ms = intake::now_seconds() * 1000;
     let session_id = sessions::new_id(started_ms);
     let mut delivered = Vec::new();
@@ -1256,7 +1311,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         let fleet = repos(roots)?;
         let view = system::system_view(&fleet);
         let perimeter = system::briefing(&view, &root);
-        let how = lifecycle_briefing(&root);
+        let how = lifecycle_briefing(&root, in_repo);
         let parts: Vec<&str> = [
             knowledge.as_str(),
             last.as_str(),
@@ -1293,10 +1348,11 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         id: session_id.clone(),
         agent: agent.to_owned(),
         repo: repo_key(&root),
+        outside_repo: !in_repo,
         intent: intent.to_owned(),
         started_ms,
-        branch: lifecycle::branch(&root),
-        head_at_start: lifecycle::head(&root),
+        branch: in_repo.then(|| lifecycle::branch(&root)).flatten(),
+        head_at_start: in_repo.then(|| lifecycle::head(&root)).flatten(),
         delivered,
         readback: None,
         handover: None,
@@ -1347,25 +1403,37 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             sessions::Exit::Unknown
         }
     };
-    let receipts = unless_interrupted(|| lifecycle::receipts_by_tree(&root)).unwrap_or_default();
     let toimija_session =
-        unless_interrupted(|| lifecycle::toimija_session(&root, child.id(), started_ms)).flatten();
-    let phases = unless_interrupted(|| {
-        lifecycle::phases(
-            &root,
-            session.head_at_start.as_deref(),
-            started_ms,
-            &receipts,
-        )
-    })
-    .flatten();
-    let finished = match unless_interrupted(|| lifecycle::finished(&root, &receipts)) {
-        Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
-        other => other,
-    }
-    .unwrap_or_else(|| sessions::Finished::Unknown {
-        why: "interrupted".to_owned(),
-    });
+        unless_interrupted(|| lifecycle::toimija_session(&root, !in_repo, child.id(), started_ms))
+            .flatten();
+    // Outside a repository there are no commits or pull request to observe;
+    // the record says why, and asks neither git nor gh.
+    let (phases, finished) = if in_repo {
+        let receipts =
+            unless_interrupted(|| lifecycle::receipts_by_tree(&root)).unwrap_or_default();
+        let phases = unless_interrupted(|| {
+            lifecycle::phases(
+                &root,
+                session.head_at_start.as_deref(),
+                started_ms,
+                &receipts,
+            )
+        })
+        .flatten();
+        let finished = match unless_interrupted(|| lifecycle::finished(&root, &receipts)) {
+            Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
+            other => other,
+        }
+        .unwrap_or_else(|| sessions::Finished::Unknown {
+            why: "interrupted".to_owned(),
+        });
+        (phases, finished)
+    } else {
+        let finished = sessions::Finished::Unknown {
+            why: "not a Git repository".to_owned(),
+        };
+        (None, finished)
+    };
     let left = sessions::Left {
         ended_ms: intake::now_seconds() * 1000,
         exit,
@@ -1426,9 +1494,15 @@ fn unless_interrupted<T>(step: impl FnOnce() -> T) -> Option<T> {
 }
 
 /// How a session works, told to the agent at entering. `sykli run` is asked
-/// for only where there is a contract for it to run.
-fn lifecycle_briefing(root: &Path) -> String {
-    let phases = if lifecycle::has_sykli_contract(root) {
+/// for only where there is a contract for it to run; outside a repository
+/// there are no commits to observe, and the handover has to say what changed.
+fn lifecycle_briefing(root: &Path, in_repo: bool) -> String {
+    let phases = if !in_repo {
+        "2. This folder is not a Git repository, so ohjaa cannot observe your commits
+   or pull requests. Say in your handover what you changed, and in which repos.
+   Sessions in those repos do not count you as a sibling: declare what you
+   touch with `toimija intent \"<why>\" --scope <path>`."
+    } else if lifecycle::has_sykli_contract(root) {
         "2. Work in small phases; end each with a commit and `sykli run`."
     } else {
         "2. Work in small phases; end each with a commit. There is no sykli contract

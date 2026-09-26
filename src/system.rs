@@ -235,6 +235,13 @@ pub fn briefing(view: &SystemView, here: &Path) -> String {
             marker
         );
     }
+    if !view.tools.iter().any(|tool| tool.path == here) {
+        let _ = writeln!(
+            out,
+            "You are in {}, which is not one of these repositories.",
+            here.display()
+        );
+    }
     let live: Vec<&Session> = view
         .scans
         .iter()
@@ -245,10 +252,14 @@ pub fn briefing(view: &SystemView, here: &Path) -> String {
     );
     for scan in &view.scans {
         if scan.coverage != crate::scan::Coverage::Available {
+            let what = if scan.outside {
+                scan.name()
+            } else {
+                scan.repo.display().to_string()
+            };
             let _ = writeln!(
                 out,
-                "- {}: incomplete — {}",
-                scan.repo.display(),
+                "- {what}: incomplete — {}",
                 crate::coverage_detail(scan)
             );
         }
@@ -258,22 +269,26 @@ pub fn briefing(view: &SystemView, here: &Path) -> String {
     } else {
         let _ = writeln!(out, "{} possibly running session(s):", live.len());
         for scan in &view.scans {
-            let name = scan
-                .repo
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
             for session in scan.occupying() {
                 let intent = if session.intent.is_empty() {
                     "(undeclared)"
                 } else {
                     &session.intent
                 };
+                let place = if scan.outside {
+                    format!(
+                        "{} (in {})",
+                        crate::scan::OUTSIDE,
+                        session.worktree.display()
+                    )
+                } else {
+                    format!("in {}", scan.name())
+                };
                 let _ = writeln!(
                     out,
-                    "- {} in {}: \"{}\" ({}; seen {})",
+                    "- {} {}: \"{}\" ({}; seen {})",
                     session.agent,
-                    name,
+                    place,
                     intent,
                     session.liveness,
                     crate::scan::ago(session.idle_seconds)
@@ -329,6 +344,7 @@ mod tests {
             unknown: vec![PathBuf::from("/fleet/kelo")],
             scans: vec![Scan {
                 repo: PathBuf::from("/fleet/teko"),
+                outside: false,
                 sessions: vec![Session {
                     id: "1-1".into(),
                     agent: "codex".into(),
@@ -401,6 +417,7 @@ mod tests {
             unknown: vec![],
             scans: vec![Scan {
                 repo: PathBuf::from("/fleet/teko"),
+                outside: false,
                 sessions: vec![],
                 warnings: vec![],
                 coverage: Coverage::Available,

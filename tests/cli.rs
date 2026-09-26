@@ -18,6 +18,16 @@ case "$PWD" in
 esac
 case "$1" in
   sessions)
+    case " $* " in
+      *" --outside-repos "*)
+        if [ -n "${OHJAA_STUB_NO_OUTSIDE:-}" ]; then
+          echo "error: unexpected argument '--outside-repos' found" >&2
+          echo "For more information, try '--help'." >&2
+          exit 2
+        fi
+        cat "${OHJAA_STUB_OUTSIDE_SESSIONS:?}"
+        exit 0;;
+    esac
     if [ -n "${OHJAA_STUB_SESSIONS_EXIT:-}" ]; then
       echo "stub failure on demand" >&2
       exit "$OHJAA_STUB_SESSIONS_EXIT"
@@ -122,13 +132,38 @@ impl Fixture {
         .unwrap();
         make_executable(&gh);
         let fixture = Fixture { dir, stub_dir };
-        // Default: an empty, fully available scan.
+        // Default: an empty, fully available scan, in repos and outside them.
         fixture.set_sessions(&sessions_json("", "available"));
+        fixture.set_outside_sessions(&sessions_json("", "available"));
         fixture
     }
 
     fn set_sessions(&self, json: &str) {
         fs::write(self.dir.join("sessions.json"), json).unwrap();
+    }
+
+    /// What `toimija sessions --outside-repos` reports.
+    fn set_outside_sessions(&self, json: &str) {
+        fs::write(self.dir.join("outside.json"), json).unwrap();
+    }
+
+    /// A folder that is not a Git repository. Git may not look above the
+    /// fixture for one (`GIT_CEILING_DIRECTORIES` in [`Fixture::ohjaa_in`]).
+    fn make_folder(&self, name: &str) -> PathBuf {
+        let folder = self.dir.join(name);
+        fs::create_dir_all(&folder).unwrap();
+        folder
+    }
+
+    /// The real binary run from `folder`, where no repository can be found.
+    fn ohjaa_in(&self, folder: &Path) -> Command {
+        let mut command = self.ohjaa();
+        command
+            .current_dir(folder)
+            .env("GIT_CEILING_DIRECTORIES", &self.dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE");
+        command
     }
 
     fn set_context(&self, json: &str) {
@@ -172,6 +207,7 @@ impl Fixture {
             .env("OHJAA_TODAY", "2026-09-24")
             .env("OHJAA_STUB_ARGV", self.dir.join("argv.txt"))
             .env("OHJAA_STUB_SESSIONS", self.dir.join("sessions.json"))
+            .env("OHJAA_STUB_OUTSIDE_SESSIONS", self.dir.join("outside.json"))
             .env("OHJAA_STUB_CONTEXT", self.dir.join("context.json"));
         command
     }
@@ -1343,6 +1379,188 @@ fn the_briefing_asks_for_sykli_run_only_where_there_is_a_contract() {
     let with = briefing();
     assert!(with.contains("with a commit and `sykli run`."), "{with}");
     assert!(!with.contains("There is no sykli contract"), "{with}");
+    fixture.cleanup();
+}
+
+/// A session as `toimija sessions --outside-repos` reports it: its worktree
+/// is the folder the agent works in.
+fn outside_session(id: &str, folder: &str, intent: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    format!(
+        "{{\"id\":\"{id}\",\"agent\":[\"claude\"],\"worktree\":\"{folder}\",\"intent\":\"{intent}\",\
+         \"scope\":[],\"liveness\":\"active\",\"pid_check\":\"alive\",\"last_seen_at\":{now}}}"
+    )
+}
+
+#[test]
+fn run_outside_a_repo_launches_from_the_folder_and_says_what_it_cannot_see() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("outside-run");
+    let folder = fixture.make_folder("projects");
+    let (_, stderr, code) = output_of(fixture.ohjaa_in(&folder).args([
+        "run",
+        "claude",
+        "--intent",
+        "sweep the fleet",
+        "--scope",
+        "/r/a",
+        "--dry-run",
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    for said in [
+        "is not a Git repository; 0 sibling session(s) in this folder at launch",
+        "will not count it as a sibling; name them with --scope",
+        "This folder is not a Git repository, so ohjaa cannot observe your commits",
+        "which is not one of these repositories",
+        "would run: toimija run --intent 'sweep the fleet'",
+        "--scope /r/a -- claude",
+    ] {
+        assert!(stderr.contains(said), "missing `{said}`: {stderr}");
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn run_outside_a_repo_counts_only_the_siblings_in_its_folder() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("outside-siblings");
+    let folder = fixture.make_folder("projects");
+    let here = fs::canonicalize(&folder).unwrap();
+    fixture.set_outside_sessions(&sessions_json(
+        &format!(
+            "{},{}",
+            outside_session("1-1", &here.display().to_string(), "here too"),
+            outside_session("2-2", "/somewhere/else", "elsewhere")
+        ),
+        "available",
+    ));
+    let (_, stderr, code) =
+        output_of(
+            fixture
+                .ohjaa_in(&folder)
+                .args(["run", "claude", "--intent", "x", "--dry-run"]),
+        );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("1 sibling session(s) in this folder at launch"),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_session_outside_a_repo_is_recorded_without_commits_to_observe() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("outside-session");
+    let folder = fixture.make_folder("projects");
+    let script = format!(
+        "{} handover --unfinished 'renamed the flag in two repos'",
+        ohjaa_bin()
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa_in(&folder)
+            .args(["run", "sh", "--intent", "sweep", "--no-briefing", "--"])
+            .args(["-c", &script])
+            .env("OHJAA_STUB_RUN_AGENT", "1"),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    for said in [
+        "phases        none to observe (not a Git repository)",
+        "finished      none to observe (not a Git repository)",
+        "unfinished    renamed the flag in two repos",
+    ] {
+        assert!(stderr.contains(said), "missing `{said}`: {stderr}");
+    }
+
+    // The folder's last session is found from the folder, and the next agent
+    // launched there is told what it left.
+    let (stdout, _, code) = output_of(fixture.ohjaa_in(&folder).arg("session"));
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(stdout.contains("renamed the flag in two repos"), "{stdout}");
+    let (_, stderr, _) = output_of(fixture.ohjaa_in(&folder).args([
+        "run",
+        "claude",
+        "--intent",
+        "next",
+        "--dry-run",
+    ]));
+    assert!(
+        stderr.contains("not a Git repository, so no commits or pull request to observe"),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_toimija_without_outside_sessions_is_named_never_read_as_empty() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("outside-old");
+    let folder = fixture.make_folder("projects");
+    fixture.make_repo("alpha");
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa_in(&folder)
+            .args(["run", "claude", "--intent", "x", "--dry-run"])
+            .env("OHJAA_STUB_NO_OUTSIDE", "1"),
+    );
+    assert_eq!(
+        code,
+        Some(3),
+        "a run outside a repo refuses to launch blind: {stderr}"
+    );
+    assert!(
+        stderr.contains("this toimija cannot list sessions outside repositories"),
+        "{stderr}"
+    );
+
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .arg("fleet")
+            .arg("--root")
+            .arg(&fixture.dir)
+            .env("OHJAA_STUB_NO_OUTSIDE", "1"),
+    );
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(
+        stderr.contains("coverage: scanned 1/1 repo(s)\n")
+            && stderr.contains("outside any repository: this toimija cannot list"),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn fleet_lists_sessions_outside_repos_by_their_folder() {
+    let fixture = Fixture::new("outside-fleet");
+    fixture.make_repo("alpha");
+    fixture.set_outside_sessions(&sessions_json(
+        &outside_session("5-5", "/Users/x/projects", "sweep the fleet"),
+        "available",
+    ));
+    let (stdout, stderr, code) =
+        output_of(fixture.ohjaa().arg("fleet").arg("--root").arg(&fixture.dir));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains("outside any repository\n    claude  5-5\n      folder: /Users/x/projects"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("coverage: scanned 1/1 repo(s) and the sessions outside repositories"),
+        "{stderr}"
+    );
     fixture.cleanup();
 }
 

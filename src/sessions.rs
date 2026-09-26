@@ -121,7 +121,12 @@ pub struct Left {
 pub struct Session {
     pub id: String,
     pub agent: String,
+    /// The repository the session ran in; outside one, the folder.
     pub repo: String,
+    /// The session ran in a folder that is not a Git repository: there were no
+    /// commits or pull request to observe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outside_repo: bool,
     pub intent: String,
     pub started_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -455,6 +460,7 @@ pub fn render_record(session: &Session) -> String {
     );
     if let Some(left) = &session.left {
         let phases_line = match &left.phases {
+            None if session.outside_repo => "none to observe (not a Git repository)".to_owned(),
             None if left.interrupted => "not observed (leaving was interrupted)".to_owned(),
             None => "not observed".to_owned(),
             Some(phases) if phases.is_empty() => "no commits".to_owned(),
@@ -472,6 +478,7 @@ pub fn render_record(session: &Session) -> String {
         };
         let _ = writeln!(out, "phases        {phases_line}");
         let finished = match &left.finished {
+            _ if session.outside_repo => "none to observe (not a Git repository)".to_owned(),
             Finished::Unknown { why } => format!("unknown ({why})"),
             Finished::NoPullRequest => "no pull request".to_owned(),
             Finished::PullRequest {
@@ -545,7 +552,12 @@ pub fn render_last(session: &Session) -> String {
         session.id, session.agent
     );
     let _ = writeln!(out, "- intent: {}", session.intent);
-    if let Some(left) = &session.left {
+    if session.outside_repo {
+        out.push_str(
+            "- work: not a Git repository, so no commits or pull request to observe; \
+             its handover says what changed\n",
+        );
+    } else if let Some(left) = &session.left {
         let work = match &left.phases {
             Some(phases) => {
                 let with_evidence = phases
@@ -602,6 +614,7 @@ mod tests {
             id: id.to_owned(),
             agent: "claude".to_owned(),
             repo: repo.to_owned(),
+            outside_repo: false,
             intent: "retry uploads".to_owned(),
             started_ms,
             branch: Some("main".to_owned()),

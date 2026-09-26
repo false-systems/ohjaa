@@ -89,10 +89,15 @@ impl Session {
     }
 }
 
-/// One repo's scan result.
+/// One repo's scan result, or the scan of sessions outside every repo.
 #[derive(Debug, Clone, Serialize)]
 pub struct Scan {
+    /// The repo scanned; empty for the scan outside every repo.
     pub repo: PathBuf,
+    /// This scan is of the sessions toimija opened outside any Git
+    /// repository, not of one repo.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub outside: bool,
     pub sessions: Vec<Session>,
     pub warnings: Vec<String>,
     pub coverage: Coverage,
@@ -103,6 +108,7 @@ impl Scan {
     fn failed(repo: &Path, error: String) -> Self {
         Scan {
             repo: repo.to_path_buf(),
+            outside: false,
             sessions: Vec::new(),
             warnings: Vec::new(),
             coverage: Coverage::Failed,
@@ -114,7 +120,24 @@ impl Scan {
     pub fn occupying(&self) -> impl Iterator<Item = &Session> {
         self.sessions.iter().filter(|s| s.occupies())
     }
+
+    /// What the scan covered, for people: the repo's name, or "outside any
+    /// repository".
+    pub fn name(&self) -> String {
+        if self.outside {
+            OUTSIDE.to_owned()
+        } else {
+            self.repo
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
 }
+
+/// How the scan outside every repository is named to people.
+pub const OUTSIDE: &str = "outside any repository";
 
 #[derive(Debug, Deserialize)]
 struct Payload {
@@ -214,6 +237,7 @@ fn parse(repo: &Path, stdout: &str, at: i64) -> Result<Scan, serde_json::Error> 
         .collect();
     Ok(Scan {
         repo: repo.to_path_buf(),
+        outside: false,
         sessions,
         warnings: payload
             .warnings
@@ -227,13 +251,30 @@ fn parse(repo: &Path, stdout: &str, at: i64) -> Result<Scan, serde_json::Error> 
 
 /// Ask one repo's toimija who is live. Never fails: a failure is itself a fact.
 pub fn scan_repo(repo: &Path) -> Scan {
-    let output = crate::process::run(
+    scan(
         Command::new("toimija")
             .args(["sessions", "--json"])
             .current_dir(repo),
-        None,
-        crate::process::LOCAL,
+        repo,
+    )
+}
+
+/// Ask toimija who is live outside every repository: the sessions `toimija
+/// run` opened in folders that are not Git repositories. Run from `/`: the
+/// flag, not the folder, chooses them. Never fails, like [`scan_repo`].
+pub fn scan_outside() -> Scan {
+    let mut scan = scan(
+        Command::new("toimija")
+            .args(["sessions", "--json", "--outside-repos"])
+            .current_dir("/"),
+        Path::new(""),
     );
+    scan.outside = true;
+    scan
+}
+
+fn scan(command: &mut Command, repo: &Path) -> Scan {
+    let output = crate::process::run(command, None, crate::process::LOCAL);
 
     // A toimija that hangs is a failed scan, reported, never a silent wait.
     let output = match output {
@@ -243,6 +284,14 @@ pub fn scan_repo(repo: &Path) -> Scan {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // A toimija from before sessions outside repos rejects the flag.
+        if stderr.contains("--outside-repos") {
+            return Scan::failed(
+                repo,
+                "this toimija cannot list sessions outside repositories; install a newer one"
+                    .to_owned(),
+            );
+        }
         let last = stderr
             .trim()
             .lines()
@@ -265,16 +314,20 @@ pub fn scan_repo(repo: &Path) -> Scan {
     }
 }
 
-/// Scan every repo concurrently. Order is preserved so output stays stable.
+/// Scan every repo concurrently, and the sessions outside every repo. Order is
+/// preserved so output stays stable; the outside scan comes last.
 pub fn scan_fleet(repos: &[PathBuf]) -> Vec<Scan> {
     std::thread::scope(|scope| {
-        repos
+        let outside = scope.spawn(scan_outside);
+        let mut scans: Vec<Scan> = repos
             .iter()
             .map(|repo| scope.spawn(move || scan_repo(repo)))
             .collect::<Vec<_>>()
             .into_iter()
             .map(|handle| handle.join().expect("scan thread panicked"))
-            .collect()
+            .collect();
+        scans.push(outside.join().expect("scan thread panicked"));
+        scans
     })
 }
 
