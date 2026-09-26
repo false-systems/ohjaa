@@ -18,7 +18,7 @@ ohjaa propose --scope ours --id rust-only --kind decision \
 ohjaa review                           # a person decides what becomes current
 ohjaa intake                           # draft proposals from what people said
 ohjaa check                            # validate, and flag what may no longer hold
-ohjaa session                          # the record of the last session here
+ohjaa session                          # the record of the last ended session here, or of one by id
 ohjaa graph rust-only                  # a node, its neighbours, who was briefed with it
 ohjaa fleet                            # who is live, across every repo
 ohjaa system                           # what every tool in the fleet is, derived now

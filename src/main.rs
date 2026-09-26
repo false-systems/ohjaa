@@ -581,9 +581,23 @@ fn cmd_session(id: Option<&str>) -> Result<i32> {
         Some(id) => store.get(id).map_err(|e| anyhow::anyhow!("{e}"))?,
         None => {
             let repo = git_root().context("not inside a Git repository; name a session id")?;
-            store
-                .latest_for(&repo_key(&repo))
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+            let key = repo_key(&repo);
+            let latest = store.latest_for(&key).map_err(|e| anyhow::anyhow!("{e}"))?;
+            if latest.is_none() {
+                // Only ended sessions are the latest here; say what else is
+                // recorded rather than "none".
+                let (all, unreadable) = store.all().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let unended: Vec<_> = all
+                    .into_iter()
+                    .filter(|s| s.repo == key && s.left.is_none())
+                    .collect();
+                print!(
+                    "{}",
+                    sessions::render_none_ended(&unended, unreadable.len())
+                );
+                return Ok(1);
+            }
+            latest
         }
     };
     match session {
@@ -592,7 +606,7 @@ fn cmd_session(id: Option<&str>) -> Result<i32> {
             Ok(0)
         }
         None => {
-            println!("no session recorded");
+            println!("no session recorded with that id");
             Ok(1)
         }
     }

@@ -492,6 +492,36 @@ pub fn render_record(session: &Session) -> String {
     out
 }
 
+/// What `ohjaa session` says when no session here has ended: never "none",
+/// while records exist that have not ended or could not be read.
+pub fn render_none_ended(unended: &[Session], unreadable: usize) -> String {
+    let mut out = String::new();
+    if unended.is_empty() {
+        out.push_str("no session recorded here\n");
+    } else {
+        out.push_str("no session here has ended yet\n");
+        out.push_str("not ended (still running, or its leaving was never recorded):\n");
+        for session in unended {
+            let _ = writeln!(
+                out,
+                "  {} · {} · started {} · {}",
+                session.id,
+                session.agent,
+                clock(session.started_ms),
+                session.intent
+            );
+        }
+        out.push_str("see one with `ohjaa session <id>`\n");
+    }
+    if unreadable > 0 {
+        let _ = writeln!(
+            out,
+            "{unreadable} record(s) in the log could not be read; they may be from here"
+        );
+    }
+    out
+}
+
 /// "Last session here", for the next session's entering briefing.
 pub fn render_last(session: &Session) -> String {
     let mut out = String::new();
