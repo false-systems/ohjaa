@@ -1336,7 +1336,12 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let toimija_session =
         unless_interrupted(|| lifecycle::toimija_session(&root, child.id(), started_ms)).flatten();
     let phases = unless_interrupted(|| {
-        lifecycle::phases(&root, session.head_at_start.as_deref(), &receipts)
+        lifecycle::phases(
+            &root,
+            session.head_at_start.as_deref(),
+            started_ms,
+            &receipts,
+        )
     })
     .flatten();
     let finished = match unless_interrupted(|| lifecycle::finished(&root, &receipts)) {

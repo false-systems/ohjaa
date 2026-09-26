@@ -29,6 +29,7 @@
 //! Handlers, not `SIG_IGN`: an ignored disposition is inherited across exec,
 //! and the agent must still stop on Ctrl-C.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 #[cfg(unix)]
@@ -259,35 +260,109 @@ pub fn receipts_by_tree(repo: &Path) -> Receipts {
     found
 }
 
-/// State 3, observed: every commit made since the session started, each with
-/// whatever sykli saw on its tree. `None` when that cannot be observed: no
-/// starting commit to tell this session's commits apart, or git failed.
-pub fn phases(repo: &Path, head_at_start: Option<&str>, receipts: &Receipts) -> Option<Vec<Phase>> {
+/// The most phases a record keeps: the newest ones.
+const MAX_PHASES: usize = 50;
+
+/// State 3, observed: every commit this session made, each with whatever
+/// sykli saw on its tree. A commit is this session's when it is on HEAD but
+/// not on the starting commit, and HEAD's reflog shows it created in this
+/// checkout since the session started. Commits a pull, merge or reset brought
+/// in were made elsewhere, and are not phases. `None` when that cannot be
+/// observed: no starting commit, git failed, or HEAD moved while its reflog
+/// recorded nothing.
+pub fn phases(
+    repo: &Path,
+    head_at_start: Option<&str>,
+    started_ms: i64,
+    receipts: &Receipts,
+) -> Option<Vec<Phase>> {
     let start = head_at_start?;
     let range = format!("{start}..HEAD");
     let log = git(
         repo,
-        &[
-            "log",
-            "--reverse",
-            "--max-count=50",
-            "--format=%H%x1f%T%x1f%s",
-            &range,
-        ],
+        &["log", "--reverse", "--format=%H%x1f%T%x1f%s", &range],
     )?;
-    let phases = log
+    if log.is_empty() {
+        return Some(Vec::new());
+    }
+    let created = created_since(repo, started_ms)?;
+    let mut phases: Vec<Phase> = log
         .lines()
         .filter_map(|line| {
-            let mut fields = line.split('\u{1f}');
+            let mut fields = line.splitn(3, '\u{1f}');
             let (commit, tree, subject) = (fields.next()?, fields.next()?, fields.next()?);
-            Some(Phase {
+            created.contains(commit).then(|| Phase {
                 commit: commit.to_owned(),
                 subject: subject.to_owned(),
                 evidence: receipts.get(tree).map(|(_, evidence)| evidence.clone()),
             })
         })
         .collect();
+    phases.drain(..phases.len().saturating_sub(MAX_PHASES));
     Some(phases)
+}
+
+/// The commits HEAD's reflog shows created in this checkout since
+/// `started_ms`. `None` when the reflog cannot be read, or has no entry since
+/// then at all: the caller has seen HEAD move, so an empty reflog means it is
+/// not being kept, never that nothing was made.
+fn created_since(repo: &Path, started_ms: i64) -> Option<HashSet<String>> {
+    let since = started_ms.div_euclid(1000);
+    let log = git(
+        repo,
+        &[
+            "log",
+            "--walk-reflogs",
+            "--date=unix",
+            "--format=%gd%x1f%H%x1f%gs",
+            "HEAD",
+        ],
+    )?;
+    let mut moves = 0;
+    let mut created = HashSet::new();
+    for line in log.lines() {
+        let mut fields = line.splitn(3, '\u{1f}');
+        let (Some(selector), Some(commit), Some(subject)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        // `HEAD@{1790380435}`, with --date=unix.
+        let at = selector
+            .rsplit_once("@{")
+            .and_then(|(_, rest)| rest.strip_suffix('}'))
+            .and_then(|secs| secs.parse::<i64>().ok());
+        if at.is_none_or(|at| at < since) {
+            continue;
+        }
+        moves += 1;
+        if created_here(subject) {
+            created.insert(commit.to_owned());
+        }
+    }
+    (moves > 0).then_some(created)
+}
+
+/// Whether a reflog entry records HEAD arriving at a commit this checkout
+/// created, rather than moving to one that already existed (a checkout, a
+/// reset, a fast-forward, a rebase's start or finish). Judged by git's own
+/// wording, `<action>: <message>`. The action carries the command's
+/// arguments (`pull -q --rebase (pick)`), so replays match by their suffix.
+fn created_here(subject: &str) -> bool {
+    const REPLAYED: [&str; 7] = [
+        "(pick)",
+        "(reword)",
+        "(edit)",
+        "(squash)",
+        "(fixup)",
+        "(merge)",
+        "(continue)",
+    ];
+    let (action, message) = subject.split_once(": ").unwrap_or((subject, ""));
+    action.starts_with("commit")
+        || ["cherry-pick", "revert", "am"].contains(&action)
+        || REPLAYED.iter().any(|step| action.ends_with(step))
+        || message.starts_with("Merge made by")
 }
 
 /// State 4, observed: the branch's pull request, if `gh` can say.
@@ -426,16 +501,34 @@ mod tests {
         .unwrap();
     }
 
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "git {args:?}: {status:?}");
+    }
+
+    fn now_ms() -> i64 {
+        crate::intake::now_seconds() * 1000
+    }
+
+    fn subjects(found: &[Phase]) -> Vec<&str> {
+        found.iter().map(|p| p.subject.as_str()).collect()
+    }
+
     #[test]
     fn phases_are_this_sessions_commits_with_what_sykli_saw() {
         let dir = repo("phases");
         let start = head(&dir).unwrap();
+        let started_ms = now_ms();
         let first = commit(&dir, "a.txt", "first phase");
         let second = commit(&dir, "b.txt", "second phase");
         receipt(&dir, "old", &first, "failed", 1, false);
         receipt(&dir, "new", &first, "passed", 2, false);
         receipt(&dir, "dirty", &second, "passed", 3, true);
-        let found = phases(&dir, Some(&start), &receipts_by_tree(&dir)).unwrap();
+        let found = phases(&dir, Some(&start), started_ms, &receipts_by_tree(&dir)).unwrap();
         assert_eq!(
             found.len(),
             2,
@@ -452,22 +545,155 @@ mod tests {
         commit(&dir, "c.txt", "third phase");
         let receipts = receipts_by_tree(&dir);
         assert!(
-            phases(&dir, Some(&start), &receipts).unwrap()[2]
+            phases(&dir, Some(&start), started_ms, &receipts).unwrap()[2]
                 .evidence
                 .is_none(),
             "no run is said, not guessed"
         );
         assert_eq!(
-            phases(&dir, None, &receipts),
+            phases(&dir, None, started_ms, &receipts),
             None,
             "without a start, phases are not observed, not claimed empty"
         );
         assert_eq!(
-            phases(&dir, Some(&head(&dir).unwrap()), &receipts),
+            phases(&dir, Some(&head(&dir).unwrap()), started_ms, &receipts),
             Some(Vec::new()),
             "no commits since the start is an observation"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn commits_a_pull_brought_in_are_not_this_sessions_phases() {
+        let upstream = repo("pull-upstream");
+        let dir = std::env::temp_dir().join(format!("ohjaa-life-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let status = Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&upstream)
+            .arg(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        git_ok(&dir, &["config", "user.email", "t@example.invalid"]);
+        git_ok(&dir, &["config", "user.name", "T"]);
+        let start = head(&dir).unwrap();
+        let started_ms = now_ms();
+        let seen = |dir: &Path| phases(dir, Some(&start), started_ms, &Receipts::new()).unwrap();
+
+        commit(&upstream, "u1.txt", "theirs 1");
+        commit(&upstream, "u2.txt", "theirs 2");
+        git_ok(&dir, &["pull", "-q", "--ff-only"]);
+        assert!(
+            seen(&dir).is_empty(),
+            "a fast-forward brings in commits made elsewhere"
+        );
+
+        commit(&dir, "m.txt", "mine");
+        assert_eq!(subjects(&seen(&dir)), ["mine"]);
+
+        commit(&upstream, "u3.txt", "theirs 3");
+        git_ok(&dir, &["pull", "-q", "--rebase"]);
+        assert_eq!(
+            subjects(&seen(&dir)),
+            ["mine"],
+            "a rebased commit is still this session's; what it was rebased onto is not"
+        );
+
+        commit(&upstream, "u4.txt", "theirs 4");
+        git_ok(&dir, &["pull", "-q", "--no-rebase", "--no-edit"]);
+        let found = seen(&dir);
+        assert_eq!(found.len(), 2, "{:?}", subjects(&found));
+        assert_eq!(found[0].subject, "mine");
+        assert!(
+            found[1].subject.starts_with("Merge"),
+            "a merge made here is this session's commit; the merged one is not"
+        );
+        let _ = std::fs::remove_dir_all(upstream);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_commit_made_before_the_session_is_not_a_phase() {
+        let dir = repo("before");
+        git_ok(&dir, &["switch", "-q", "-c", "side"]);
+        std::fs::write(dir.join("s.txt"), "s").unwrap();
+        git_ok(&dir, &["add", "s.txt"]);
+        let status = Command::new("git")
+            .args(["commit", "-q", "-m", "made before the session"])
+            .env("GIT_COMMITTER_DATE", "@1000000000 +0000")
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        git_ok(&dir, &["switch", "-q", "-"]);
+        let start = head(&dir).unwrap();
+        let started_ms = now_ms();
+        git_ok(&dir, &["merge", "-q", "--ff-only", "side"]);
+        assert_eq!(
+            phases(&dir, Some(&start), started_ms, &Receipts::new()),
+            Some(Vec::new()),
+            "created here, but before the session: its reflog entry is older than the start"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn without_a_reflog_phases_are_not_observed() {
+        let dir = repo("no-reflog");
+        let start = head(&dir).unwrap();
+        let started_ms = now_ms();
+        std::fs::remove_dir_all(dir.join(".git/logs")).unwrap();
+        git_ok(
+            &dir,
+            &[
+                "-c",
+                "core.logAllRefUpdates=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "unlogged",
+            ],
+        );
+        assert_eq!(
+            phases(&dir, Some(&start), started_ms, &Receipts::new()),
+            None,
+            "HEAD moved and the reflog saw nothing: not observed, never \"no commits\""
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn created_here_reads_gits_own_reflog_wording() {
+        // Written by git 2.54 for each kind of move.
+        for made in [
+            "commit (initial): start",
+            "commit: mine",
+            "commit (amend): mine, amended",
+            "commit (merge): Merge branch 'side'",
+            "cherry-pick: side-a",
+            "revert: Revert \"side-a\"",
+            "pull -q --rebase (pick): mine",
+            "rebase (reword): mine",
+            "rebase -i (squash): # This is a combination of 2 commits.",
+            "pull -q --no-rebase --no-edit: Merge made by the 'ort' strategy.",
+            "merge side: Merge made by the 'ort' strategy.",
+        ] {
+            assert!(created_here(made), "{made}");
+        }
+        for moved in [
+            "clone: from /somewhere",
+            "pull -q: Fast-forward",
+            "merge side: Fast-forward",
+            "checkout: moving from side to main",
+            "reset: moving to HEAD~1",
+            "pull -q --rebase (start): checkout 2ecb28b",
+            "pull -q --rebase (finish): returning to refs/heads/main",
+            "rebase (abort): returning to refs/heads/main",
+        ] {
+            assert!(!created_here(moved), "{moved}");
+        }
     }
 
     #[test]
