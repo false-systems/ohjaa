@@ -422,16 +422,19 @@ pub fn finished(repo: &Path, receipts: &Receipts) -> Finished {
 
 /// The toimija session the child ran: toimija names it `<secs>-<pid>` after
 /// its own process, which is ohjaa's child. Asked of toimija, never read from
-/// its files.
-pub fn toimija_session(repo: &Path, child_pid: u32, started_ms: i64) -> Option<String> {
-    let output = process::run(
-        Command::new("toimija")
-            .args(["sessions", "--json"])
-            .current_dir(repo),
-        None,
-        process::LOCAL,
-    )
-    .ok()?;
+/// its files; with `outside`, among the sessions it keeps outside every repo.
+pub fn toimija_session(
+    repo: &Path,
+    outside: bool,
+    child_pid: u32,
+    started_ms: i64,
+) -> Option<String> {
+    let mut command = Command::new("toimija");
+    command.args(["sessions", "--json"]).current_dir(repo);
+    if outside {
+        command.arg("--outside-repos");
+    }
+    let output = process::run(&mut command, None, process::LOCAL).ok()?;
     let payload: Value = serde_json::from_slice(&output.stdout).ok()?;
     pick_toimija_session(&payload, child_pid, started_ms)
 }

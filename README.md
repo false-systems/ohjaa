@@ -190,13 +190,15 @@ Knowledge as a generated block into an instruction file such as `CLAUDE.md` or
 
 `ohjaa system` derives what every tool in the fleet is, from each repo's own
 `.toimija/repo.yaml`. `ohjaa fleet` reports who is live, from `toimija
-sessions`. Both are **derived now, stored never**: a derived view cannot be
-staler than the moment it was computed. `ohjaa run` adds that perimeter to the
-agent's briefing, after the Knowledge.
+sessions` in each repo and `toimija sessions --outside-repos` for the sessions
+running outside any repo (listed under "outside any repository", by folder).
+Both are **derived now, stored never**: a derived view cannot be staler than
+the moment it was computed. `ohjaa run` adds that perimeter to the agent's
+briefing, after the Knowledge.
 
-The root list is derived as the sibling directories of your git root, unless
-`~/.config/ohjaa/roots` or `--root` overrides it. A root that does not exist is
-an error, never an empty fleet.
+The root list is derived as the sibling directories of your git root (outside
+a repo, the folder you are in), unless `~/.config/ohjaa/roots` or `--root`
+overrides it. A root that does not exist is an error, never an empty fleet.
 
 ## Two agents, one checkout
 
@@ -213,6 +215,31 @@ ohjaa run codex --intent "change the parser" -- --model o3
 - `--dry-run` prints the exact command it would exec, without launching.
 - If toimija cannot fully read the sessions, or does not report its coverage,
   ohjaa refuses to launch blind.
+
+## One agent outside a repo
+
+Sometimes an agent has to work from a folder that is not a Git repository —
+`~/projects`, say, across several repos:
+
+```bash
+cd ~/projects
+ohjaa run claude --intent "rename the flag everywhere" --scope ~/projects/a --scope ~/projects/b
+```
+
+ohjaa briefs it as usual (your Knowledge, the fleet, the last session in this
+folder) and hands it to toimija, which opens a session outside every repo: no
+packet, but visible — `ohjaa fleet` lists it under "outside any repository".
+Siblings are the other sessions in the same folder. What ohjaa cannot see there,
+it says:
+
+- there are no commits or pull request to observe, so the record says "none to
+  observe (not a Git repository)" and the handover has to say what changed,
+  and where;
+- sessions inside the repos it touches do not count it as a sibling, so name
+  those repos with `--scope`.
+
+A toimija too old to list sessions outside repos makes ohjaa refuse to launch
+there, and makes `ohjaa fleet` incomplete — never quietly empty.
 
 ## Coverage is a fact
 
