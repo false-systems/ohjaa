@@ -1242,10 +1242,11 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         let fleet = repos(roots)?;
         let view = system::system_view(&fleet);
         let perimeter = system::briefing(&view, &root);
+        let how = lifecycle_briefing(&root);
         let parts: Vec<&str> = [
             knowledge.as_str(),
             last.as_str(),
-            LIFECYCLE,
+            how.as_str(),
             perimeter.as_str(),
         ]
         .into_iter()
@@ -1410,15 +1411,26 @@ fn unless_interrupted<T>(step: impl FnOnce() -> T) -> Option<T> {
     (!process::cancelled()).then(step)
 }
 
-/// How a session works, told to the agent at entering.
-const LIFECYCLE: &str = "\
+/// How a session works, told to the agent at entering. `sykli run` is asked
+/// for only where there is a contract for it to run.
+fn lifecycle_briefing(root: &Path) -> String {
+    let phases = if lifecycle::has_sykli_contract(root) {
+        "2. Work in small phases; end each with a commit and `sykli run`."
+    } else {
+        "2. Work in small phases; end each with a commit. There is no sykli contract
+   here (sykli.rs or sykli.json), so there is no `sykli run` step."
+    };
+    format!(
+        "\
 How this session works (ohjaa):
 1. Before your first change, read back what you know:
    ohjaa oriented \"<the goal in one line; the rules that apply; who else is working>\"
-2. Work in small phases; end each with a commit and `sykli run`.
+{phases}
 3. Before you finish, write the handover for whoever comes next:
    ohjaa handover --unfinished \"…\" --next \"…\" --surprised \"…\"
-";
+"
+    )
+}
 
 fn render_command(command: &Command) -> String {
     let mut words = vec![shell_word(command.get_program().to_string_lossy().as_ref())];

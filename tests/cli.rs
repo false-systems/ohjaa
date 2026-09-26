@@ -1286,6 +1286,37 @@ fn the_next_briefing_says_what_the_last_session_left() {
 }
 
 #[test]
+fn the_briefing_asks_for_sykli_run_only_where_there_is_a_contract() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("sykli-step");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let briefing = || {
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args(["run", "codex", "--intent", "x", "--dry-run"])
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        stderr
+    };
+    let without = briefing();
+    assert!(
+        without.contains("There is no sykli contract")
+            && !without.contains("with a commit and `sykli run`"),
+        "{without}"
+    );
+    fs::write(repo.join("sykli.rs"), "fn main() {}\n").unwrap();
+    let with = briefing();
+    assert!(with.contains("with a commit and `sykli run`."), "{with}");
+    assert!(!with.contains("There is no sykli contract"), "{with}");
+    fixture.cleanup();
+}
+
+#[test]
 fn a_broken_session_log_never_blocks_a_launch_and_is_left_untouched() {
     if !git_available() {
         return;

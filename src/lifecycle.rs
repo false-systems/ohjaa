@@ -213,6 +213,14 @@ pub fn branch(repo: &Path) -> Option<String> {
     git(repo, &["symbolic-ref", "--short", "-q", "HEAD"])
 }
 
+/// Whether `sykli run` has a contract to run here: it reads `sykli.rs`, or
+/// `sykli.json` when only that exists, from the directory it runs in.
+pub fn has_sykli_contract(repo: &Path) -> bool {
+    ["sykli.rs", "sykli.json"]
+        .iter()
+        .any(|name| repo.join(name).is_file())
+}
+
 /// Sykli receipts keyed by the HEAD tree they ran on, with when they started.
 pub type Receipts = std::collections::HashMap<String, (i64, Evidence)>;
 

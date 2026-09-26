@@ -128,7 +128,7 @@ until it ends so the last one always happens:
 |---|---|---|
 | 1 entering | the briefing: knowledge, the last session here, how this session works, the perimeter | ohjaa |
 | 2 oriented | the agent reads back what it knows: `ohjaa oriented "<goal; rules; who else>"` | the agent |
-| 3 working | small phases, each a commit and a `sykli run` on it | observed from git and `.sykli/receipts`: the commits HEAD's reflog shows made in this checkout since entering, never ones a pull or merge brought in |
+| 3 working | small phases, each a commit and, where the repo has a sykli contract, a `sykli run` on it | observed from git and `.sykli/receipts`: the commits HEAD's reflog shows made in this checkout since entering, never ones a pull or merge brought in |
 | 4 finished | the branch's pull request, and whether its head has evidence | observed through `gh` |
 | 5 leaving | the record: observed part, then the handover (`ohjaa handover`) | ohjaa, and the agent's testimony |
 
