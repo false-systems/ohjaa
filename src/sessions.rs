@@ -362,10 +362,12 @@ pub fn is_valid_id(id: &str) -> bool {
 
 // ---- rendering --------------------------------------------------------------
 
+/// A time for people. Always UTC, and always says so: a bare 23:53 reads as
+/// local time to anyone east or west of Greenwich.
 fn clock(ms: i64) -> String {
     let full = rfc3339(ms.div_euclid(1000));
-    // "2026-09-26T10:02:03Z" → "2026-09-26 10:02"
-    format!("{} {}", &full[..10], &full[11..16])
+    // "2026-09-26T10:02:03Z" → "2026-09-26 10:02 UTC"
+    format!("{} {} UTC", &full[..10], &full[11..16])
 }
 
 fn describe_exit(exit: Exit) -> String {
@@ -531,7 +533,7 @@ pub fn render_last(session: &Session) -> String {
         || "leaving not recorded".to_owned(),
         |left| {
             format!(
-                "ended {} UTC, {}",
+                "ended {}, {}",
                 clock(left.ended_ms),
                 describe_exit(left.exit)
             )
@@ -780,8 +782,12 @@ mod tests {
             "{record}"
         );
         assert!(
-            record.contains("1 knowledge node(s) delivered · read back at"),
+            record.contains("1 knowledge node(s) delivered · read back at 14:14 UTC"),
             "{record}"
+        );
+        assert!(
+            record.contains(" · 2026-09-21 14:13 UTC → 2026-09-21 15:13 UTC · ended"),
+            "every time says its zone: {record}"
         );
         assert!(
             record.contains("none written"),
@@ -796,6 +802,10 @@ mod tests {
         });
         let last = render_last(&s);
         assert!(last.contains("Last session here (oh-9, claude"), "{last}");
+        assert!(
+            last.contains("ended 2026-09-21 15:13 UTC, clean"),
+            "said once, not twice: {last}"
+        );
         assert!(
             last.contains("2 commit(s), 1 with a passing sykli run"),
             "{last}"

@@ -138,10 +138,10 @@ record, crash or not; a missing handover is recorded as none. The next session
 here is briefed with it:
 
 ```
-session oh-1790… · claude · selko · 10:02 → 11:47 · ended: clean (exit 0)
+session oh-1790… · claude · selko · 2026-09-26 10:02 UTC → 2026-09-26 11:47 UTC · ended: clean (exit 0)
 ─ observed (written by ohjaa; the agent cannot change it) ─
 intent        retry uploads
-knew          14 knowledge node(s) delivered · read back at 10:04
+knew          14 knowledge node(s) delivered · read back at 10:04 UTC
 phases        a1b2c3d passed · d4e5f6a passed · 0718abc failed · 9c0d1e2 passed
 finished      https://github.com/…/pull/57 (open) · evidence on its head: passed
 ─ handover (the agent's own words) ─

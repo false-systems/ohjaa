@@ -1231,7 +1231,8 @@ fn session_names_the_open_session_instead_of_saying_none() {
         .expect(&stdout);
     assert!(stdout.contains("no session here has ended yet"), "{stdout}");
     assert!(
-        stdout.contains(&format!("  {id} · sh · started ")) && stdout.contains(" · retry uploads"),
+        stdout.contains(&format!("  {id} · sh · started "))
+            && stdout.contains(" UTC · retry uploads"),
         "{stdout}"
     );
     assert!(!stdout.contains("no session recorded"), "{stdout}");
