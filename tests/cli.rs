@@ -1210,6 +1210,36 @@ fn the_agent_reads_back_and_hands_over_from_inside_its_session() {
 }
 
 #[test]
+fn session_names_the_open_session_instead_of_saying_none() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("open-session");
+    let repo = fixture.make_git_repo("work");
+    let (stdout, _, code) = output_of(fixture.ohjaa().arg("session").current_dir(&repo));
+    assert_eq!(code, Some(1));
+    assert_eq!(stdout, "no session recorded here\n");
+
+    // From inside a running session, nothing here has ended yet, but this
+    // session is recorded, and is named with its id.
+    let script = format!("{} session; echo \"id=$OHJAA_SESSION\"", ohjaa_bin());
+    let (stdout, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+    let id = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("id="))
+        .expect(&stdout);
+    assert!(stdout.contains("no session here has ended yet"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("  {id} · sh · started "))
+            && stdout.contains(" UTC · retry uploads"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("no session recorded"), "{stdout}");
+    fixture.cleanup();
+}
+
+#[test]
 fn testimony_outside_a_session_is_refused() {
     let fixture = Fixture::new("nosession");
     for args in [vec!["oriented", "I know"], vec!["handover", "--next", "x"]] {
@@ -1282,6 +1312,37 @@ fn the_next_briefing_says_what_the_last_session_left() {
     );
     assert!(stderr.contains("Last session here"), "{stderr}");
     assert!(stderr.contains("ohjaa oriented"), "{stderr}");
+    fixture.cleanup();
+}
+
+#[test]
+fn the_briefing_asks_for_sykli_run_only_where_there_is_a_contract() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("sykli-step");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let briefing = || {
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args(["run", "codex", "--intent", "x", "--dry-run"])
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        stderr
+    };
+    let without = briefing();
+    assert!(
+        without.contains("There is no sykli contract")
+            && !without.contains("with a commit and `sykli run`"),
+        "{without}"
+    );
+    fs::write(repo.join("sykli.rs"), "fn main() {}\n").unwrap();
+    let with = briefing();
+    assert!(with.contains("with a commit and `sykli run`."), "{with}");
+    assert!(!with.contains("There is no sykli contract"), "{with}");
     fixture.cleanup();
 }
 

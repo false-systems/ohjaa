@@ -581,9 +581,23 @@ fn cmd_session(id: Option<&str>) -> Result<i32> {
         Some(id) => store.get(id).map_err(|e| anyhow::anyhow!("{e}"))?,
         None => {
             let repo = git_root().context("not inside a Git repository; name a session id")?;
-            store
-                .latest_for(&repo_key(&repo))
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+            let key = repo_key(&repo);
+            let latest = store.latest_for(&key).map_err(|e| anyhow::anyhow!("{e}"))?;
+            if latest.is_none() {
+                // Only ended sessions are the latest here; say what else is
+                // recorded rather than "none".
+                let (all, unreadable) = store.all().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let unended: Vec<_> = all
+                    .into_iter()
+                    .filter(|s| s.repo == key && s.left.is_none())
+                    .collect();
+                print!(
+                    "{}",
+                    sessions::render_none_ended(&unended, unreadable.len())
+                );
+                return Ok(1);
+            }
+            latest
         }
     };
     match session {
@@ -592,7 +606,7 @@ fn cmd_session(id: Option<&str>) -> Result<i32> {
             Ok(0)
         }
         None => {
-            println!("no session recorded");
+            println!("no session recorded with that id");
             Ok(1)
         }
     }
@@ -1242,10 +1256,11 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         let fleet = repos(roots)?;
         let view = system::system_view(&fleet);
         let perimeter = system::briefing(&view, &root);
+        let how = lifecycle_briefing(&root);
         let parts: Vec<&str> = [
             knowledge.as_str(),
             last.as_str(),
-            LIFECYCLE,
+            how.as_str(),
             perimeter.as_str(),
         ]
         .into_iter()
@@ -1336,7 +1351,12 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let toimija_session =
         unless_interrupted(|| lifecycle::toimija_session(&root, child.id(), started_ms)).flatten();
     let phases = unless_interrupted(|| {
-        lifecycle::phases(&root, session.head_at_start.as_deref(), &receipts)
+        lifecycle::phases(
+            &root,
+            session.head_at_start.as_deref(),
+            started_ms,
+            &receipts,
+        )
     })
     .flatten();
     let finished = match unless_interrupted(|| lifecycle::finished(&root, &receipts)) {
@@ -1405,15 +1425,26 @@ fn unless_interrupted<T>(step: impl FnOnce() -> T) -> Option<T> {
     (!process::cancelled()).then(step)
 }
 
-/// How a session works, told to the agent at entering.
-const LIFECYCLE: &str = "\
+/// How a session works, told to the agent at entering. `sykli run` is asked
+/// for only where there is a contract for it to run.
+fn lifecycle_briefing(root: &Path) -> String {
+    let phases = if lifecycle::has_sykli_contract(root) {
+        "2. Work in small phases; end each with a commit and `sykli run`."
+    } else {
+        "2. Work in small phases; end each with a commit. There is no sykli contract
+   here (sykli.rs or sykli.json), so there is no `sykli run` step."
+    };
+    format!(
+        "\
 How this session works (ohjaa):
 1. Before your first change, read back what you know:
    ohjaa oriented \"<the goal in one line; the rules that apply; who else is working>\"
-2. Work in small phases; end each with a commit and `sykli run`.
+{phases}
 3. Before you finish, write the handover for whoever comes next:
    ohjaa handover --unfinished \"…\" --next \"…\" --surprised \"…\"
-";
+"
+    )
+}
 
 fn render_command(command: &Command) -> String {
     let mut words = vec![shell_word(command.get_program().to_string_lossy().as_ref())];

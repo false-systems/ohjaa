@@ -18,7 +18,7 @@ ohjaa propose --scope ours --id rust-only --kind decision \
 ohjaa review                           # a person decides what becomes current
 ohjaa intake                           # draft proposals from what people said
 ohjaa check                            # validate, and flag what may no longer hold
-ohjaa session                          # the record of the last session here
+ohjaa session                          # the record of the last ended session here, or of one by id
 ohjaa graph rust-only                  # a node, its neighbours, who was briefed with it
 ohjaa fleet                            # who is live, across every repo
 ohjaa system                           # what every tool in the fleet is, derived now
@@ -128,7 +128,7 @@ until it ends so the last one always happens:
 |---|---|---|
 | 1 entering | the briefing: knowledge, the last session here, how this session works, the perimeter | ohjaa |
 | 2 oriented | the agent reads back what it knows: `ohjaa oriented "<goal; rules; who else>"` | the agent |
-| 3 working | small phases, each a commit and a `sykli run` on it | observed from git and `.sykli/receipts` |
+| 3 working | small phases, each a commit and, where the repo has a sykli contract, a `sykli run` on it | observed from git and `.sykli/receipts`: the commits HEAD's reflog shows made in this checkout since entering, never ones a pull or merge brought in |
 | 4 finished | the branch's pull request, and whether its head has evidence | observed through `gh` |
 | 5 leaving | the record: observed part, then the handover (`ohjaa handover`) | ohjaa, and the agent's testimony |
 
@@ -138,10 +138,10 @@ record, crash or not; a missing handover is recorded as none. The next session
 here is briefed with it:
 
 ```
-session oh-1790… · claude · selko · 10:02 → 11:47 · ended: clean (exit 0)
+session oh-1790… · claude · selko · 2026-09-26 10:02 UTC → 2026-09-26 11:47 UTC · ended: clean (exit 0)
 ─ observed (written by ohjaa; the agent cannot change it) ─
 intent        retry uploads
-knew          14 knowledge node(s) delivered · read back at 10:04
+knew          14 knowledge node(s) delivered · read back at 10:04 UTC
 phases        a1b2c3d passed · d4e5f6a passed · 0718abc failed · 9c0d1e2 passed
 finished      https://github.com/…/pull/57 (open) · evidence on its head: passed
 ─ handover (the agent's own words) ─
