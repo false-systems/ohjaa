@@ -24,6 +24,9 @@ redb = "4.1.0"
 
 [dev-dependencies]
 sha2 = "0.10"
+# Tests only: the parser toimija reads `.toimija/repo.yaml` with, so a config
+# toimija cannot parse fails CI here instead of every packet refresh.
+serde_yaml = "0.9"
 
 # Signal dispositions (unix only): `ohjaa run` must outlive the signals that
 # would cut the leaving record short, and forward stop signals to the session.
