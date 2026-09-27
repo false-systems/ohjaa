@@ -82,3 +82,11 @@ primitives, not assumptions: claim an issue before starting, re-orient with
 short-lived, and rebase on `origin/main` right before opening or merging.
 
 `ohjaa fleet` shows live sibling sessions across every repo.
+
+## Languages
+
+Code in this repository is **Rust, or Elixir/Erlang**. Never add Python, Go
+or Node (JavaScript/TypeScript): not for tools, scripts, CI helpers, tests,
+dashboards or glue. A thin shell step in a CI workflow is fine; anything with
+logic is Rust. Existing Python or Node files are debt to be rewritten, not
+precedent to follow.
