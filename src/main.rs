@@ -325,11 +325,14 @@ fn cmd_fleet(explicit: &[PathBuf], json: bool) -> Result<i32> {
         for session in live {
             println!("    {}  {}", session.agent, session.id);
             // Outside a repo there is no branch: where it works is the folder.
+            // In one, toimija's marker keeps the branch the session entered on
+            // (later moves show as drift in its packet), so say "at launch":
+            // a session that has since switched branches is not on it now.
             let place = if scan.outside {
                 format!("folder: {}", session.worktree.display())
             } else {
                 format!(
-                    "branch: {}",
+                    "branch at launch: {}",
                     session.branch.as_deref().unwrap_or("detached")
                 )
             };
