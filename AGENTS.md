@@ -18,7 +18,9 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 - One Rust crate producing a single `ohjaa` binary. Dependencies stay minimal —
   `anyhow`, `clap`, `serde`, `serde_json`, the vendored `faija-knowledge`
   (knowledge-node.v1), `redb` (the session log) and `libc` (signal
-  dispositions while a session runs) — and every addition needs a reason.
+  dispositions while a session runs) — and every addition needs a reason. Tests
+  alone also use `sha2` and `serde_yaml` (the parser toimija reads
+  `.toimija/repo.yaml` with, so a config toimija cannot parse fails CI here).
 - **Ohjaa holds Knowledge; toimija reports facts.** Never reimplement anything
   toimija derives — shell out to its CLI and consume its `--json`.
 - **Ohjaa stores two things.** Knowledge, as knowledge-node.v1 files in the
