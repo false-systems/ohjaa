@@ -209,6 +209,14 @@ pub fn head(repo: &Path) -> Option<String> {
     git(repo, &["rev-parse", "--verify", "-q", "HEAD"])
 }
 
+/// The Git repository `path` lies in, canonical. `None` when the path does
+/// not exist or is not inside a repository.
+pub fn repo_of(path: &Path) -> Option<std::path::PathBuf> {
+    let dir = if path.is_dir() { path } else { path.parent()? };
+    let root = git(dir, &["rev-parse", "--show-toplevel"])?;
+    std::fs::canonicalize(root).ok()
+}
+
 pub fn branch(repo: &Path) -> Option<String> {
     git(repo, &["symbolic-ref", "--short", "-q", "HEAD"])
 }

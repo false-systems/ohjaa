@@ -1245,6 +1245,39 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         return Ok(REFUSED);
     }
 
+    // The repositories named with --scope, other than the launch one. Each is
+    // observed like the launch repository: its sessions counted now (blind is
+    // refused there too), its commits and pull request recorded at leaving.
+    let (scoped_repos, unscoped) = scoped_repos(scope, in_repo.then_some(root.as_path()));
+    let mut scoped_scans = Vec::new();
+    for repo in &scoped_repos {
+        let scoped_scan = scan_repo(repo);
+        if scoped_scan.coverage != Coverage::Available {
+            eprintln!(
+                "ohjaa: cannot completely read sessions in {}, named with --scope: {}",
+                repo.display(),
+                coverage_detail(&scoped_scan)
+            );
+            eprintln!("ohjaa: refusing to launch blind");
+            return Ok(REFUSED);
+        }
+        scoped_scans.push(scoped_scan);
+    }
+    // Sessions launched outside every repository count wherever their scope
+    // reaches. Outside a repo, the scan above already is that list.
+    let outside = if in_repo {
+        scan::scan_outside()
+    } else {
+        scan.clone()
+    };
+    let outside_seen = outside.coverage == Coverage::Available;
+    let reaching = |dir: &Path| {
+        outside
+            .occupying()
+            .filter(|s| scope_reaches(s, dir))
+            .count()
+    };
+
     // Counts every session that may still be working here, not just the ones
     // toimija currently calls active: reporting an occupied checkout as empty
     // is the one thing this line must never do. Outside a repo, "here" is
@@ -1261,15 +1294,46 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         .count();
     if in_repo {
         eprintln!("ohjaa: {live} sibling session(s) in this checkout at launch");
+        if !outside_seen {
+            eprintln!(
+                "ohjaa: could not read sessions outside repositories, so any scoped here are \
+                 not counted: {}",
+                coverage_detail(&outside)
+            );
+        } else if reaching(&folder) > 0 {
+            eprintln!(
+                "ohjaa: {} more, launched outside repositories, name this checkout in their --scope",
+                reaching(&folder)
+            );
+        }
     } else {
         eprintln!(
             "ohjaa: {} is not a Git repository; {live} sibling session(s) in this folder at launch",
             root.display()
         );
+        if scoped_repos.is_empty() {
+            eprintln!(
+                "ohjaa: no --scope names a repository, so nothing this agent does in one is \
+                 observed"
+            );
+        }
+    }
+    for (repo, scoped_scan) in scoped_repos.iter().zip(&scoped_scans) {
+        let from_outside = if outside_seen { reaching(repo) } else { 0 };
         eprintln!(
-            "ohjaa: sessions in the repos this agent touches will not count it as a sibling; \
-             name them with --scope"
+            "ohjaa: scoped {}: {} session(s) live there{} at launch; its commits and pull \
+             request will be recorded",
+            repo.file_name().unwrap_or_default().to_string_lossy(),
+            scoped_scan.occupying().count(),
+            if from_outside > 0 {
+                format!(", plus {from_outside} from outside repositories")
+            } else {
+                String::new()
+            }
         );
+    }
+    for raw in &unscoped {
+        eprintln!("ohjaa: --scope {raw} is not inside a Git repository; nothing there is observed");
     }
     if quiet > 0 {
         eprintln!(
@@ -1314,7 +1378,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         let fleet = repos(roots)?;
         let view = system::system_view(&fleet);
         let perimeter = system::briefing(&view, &root);
-        let how = lifecycle_briefing(&root, in_repo);
+        let how = lifecycle_briefing(&root, in_repo, &scoped_repos);
         let parts: Vec<&str> = [
             knowledge.as_str(),
             last.as_str(),
@@ -1356,6 +1420,14 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         started_ms,
         branch: in_repo.then(|| lifecycle::branch(&root)).flatten(),
         head_at_start: in_repo.then(|| lifecycle::head(&root)).flatten(),
+        scoped: scoped_repos
+            .iter()
+            .map(|repo| sessions::Scoped {
+                repo: repo_key(repo),
+                branch: lifecycle::branch(repo),
+                head_at_start: lifecycle::head(repo),
+            })
+            .collect(),
         delivered,
         readback: None,
         handover: None,
@@ -1385,6 +1457,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                     why: format!("toimija could not be started: {error}"),
                 },
                 interrupted: false,
+                scoped: Vec::new(),
             };
             if let Some(store) = session_store(&dirs) {
                 let _ = store.update(&session_id, |s| s.left = Some(left));
@@ -1409,34 +1482,33 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let toimija_session =
         unless_interrupted(|| lifecycle::toimija_session(&root, !in_repo, child.id(), started_ms))
             .flatten();
-    // Outside a repository there are no commits or pull request to observe;
-    // the record says why, and asks neither git nor gh.
+    // Outside a repository the folder itself has no commits or pull request
+    // to observe; the record says why, and asks neither git nor gh there.
     let (phases, finished) = if in_repo {
-        let receipts =
-            unless_interrupted(|| lifecycle::receipts_by_tree(&root)).unwrap_or_default();
-        let phases = unless_interrupted(|| {
-            lifecycle::phases(
-                &root,
-                session.head_at_start.as_deref(),
-                started_ms,
-                &receipts,
-            )
-        })
-        .flatten();
-        let finished = match unless_interrupted(|| lifecycle::finished(&root, &receipts)) {
-            Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
-            other => other,
-        }
-        .unwrap_or_else(|| sessions::Finished::Unknown {
-            why: "interrupted".to_owned(),
-        });
-        (phases, finished)
+        observe_repo(&root, session.head_at_start.as_deref(), started_ms)
     } else {
         let finished = sessions::Finished::Unknown {
             why: "not a Git repository".to_owned(),
         };
         (None, finished)
     };
+    // Every scoped repository is observed the same way as the launch one.
+    let scoped = session
+        .scoped
+        .iter()
+        .map(|scoped| {
+            let (phases, finished) = observe_repo(
+                Path::new(&scoped.repo),
+                scoped.head_at_start.as_deref(),
+                started_ms,
+            );
+            sessions::ScopedLeft {
+                repo: scoped.repo.clone(),
+                phases,
+                finished,
+            }
+        })
+        .collect();
     let left = sessions::Left {
         ended_ms: intake::now_seconds() * 1000,
         exit,
@@ -1444,6 +1516,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         phases,
         finished,
         interrupted: process::cancelled(),
+        scoped,
     };
     // The store is opened only now, after every slow call, and held only for
     // this one write.
@@ -1496,20 +1569,108 @@ fn unless_interrupted<T>(step: impl FnOnce() -> T) -> Option<T> {
     (!process::cancelled()).then(step)
 }
 
+/// Leaving's observation of one repository: the commits this session made
+/// there, with what sykli saw on each, and the branch's pull request.
+fn observe_repo(
+    repo: &Path,
+    head_at_start: Option<&str>,
+    started_ms: i64,
+) -> (Option<Vec<sessions::Phase>>, sessions::Finished) {
+    let receipts = unless_interrupted(|| lifecycle::receipts_by_tree(repo)).unwrap_or_default();
+    let phases =
+        unless_interrupted(|| lifecycle::phases(repo, head_at_start, started_ms, &receipts))
+            .flatten();
+    let finished = match unless_interrupted(|| lifecycle::finished(repo, &receipts)) {
+        Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
+        other => other,
+    }
+    .unwrap_or_else(|| sessions::Finished::Unknown {
+        why: "interrupted".to_owned(),
+    });
+    (phases, finished)
+}
+
+/// The repositories `--scope` names, other than `launch`, each once and
+/// canonical; and the scope paths that lie in no repository. A relative path
+/// is taken from the current directory, `~/` from the home directory.
+fn scoped_repos(scope: &[String], launch: Option<&Path>) -> (Vec<PathBuf>, Vec<String>) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let launch = launch.and_then(|path| std::fs::canonicalize(path).ok());
+    let mut repos: Vec<PathBuf> = Vec::new();
+    let mut unscoped = Vec::new();
+    for raw in scope {
+        let path = knowledge::expand_home(raw);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        match lifecycle::repo_of(&path) {
+            Some(repo) if launch.as_ref() == Some(&repo) => {}
+            Some(repo) => {
+                if !repos.contains(&repo) {
+                    repos.push(repo);
+                }
+            }
+            None => unscoped.push(raw.clone()),
+        }
+    }
+    (repos, unscoped)
+}
+
+/// Whether a session's declared scope reaches `dir`: a scope path inside it,
+/// or one that contains it. A relative scope path is the session's own, taken
+/// from its worktree.
+fn scope_reaches(session: &scan::Session, dir: &Path) -> bool {
+    session.scope.iter().any(|raw| {
+        let path = knowledge::expand_home(raw);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            session.worktree.join(path)
+        };
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        path.starts_with(dir) || dir.starts_with(&path)
+    })
+}
+
 /// How a session works, told to the agent at entering. `sykli run` is asked
-/// for only where there is a contract for it to run; outside a repository
-/// there are no commits to observe, and the handover has to say what changed.
-fn lifecycle_briefing(root: &Path, in_repo: bool) -> String {
-    let phases = if !in_repo {
-        "2. This folder is not a Git repository, so ohjaa cannot observe your commits
-   or pull requests. Say in your handover what you changed, and in which repos.
-   Sessions in those repos do not count you as a sibling: declare what you
-   touch with `toimija intent \"<why>\" --scope <path>`."
+/// for only where there is a contract for it to run. Launched outside a
+/// repository, the agent is told which scoped repositories are observed, and
+/// that work anywhere else has to be named in its handover.
+fn lifecycle_briefing(root: &Path, in_repo: bool, scoped: &[PathBuf]) -> String {
+    let names = scoped
+        .iter()
+        .map(|repo| repo.file_name().unwrap_or_default().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let phases = if !in_repo && scoped.is_empty() {
+        "2. This folder is not a Git repository, and no --scope named one, so ohjaa
+   cannot observe your commits or pull requests. Say in your handover what you
+   changed, and in which repos. Declare any repo you work in with
+   `toimija intent \"<why>\" --scope <path>` so sessions there can see you."
+            .to_owned()
+    } else if !in_repo {
+        format!(
+            "2. You were launched for: {names}. Work in small phases there; end each with a
+   commit, and `sykli run` where that repository has a sykli contract. ohjaa
+   records your commits and pull request in each of them. Work in any other
+   repository is not observed: name it in your handover."
+        )
     } else if lifecycle::has_sykli_contract(root) {
-        "2. Work in small phases; end each with a commit and `sykli run`."
+        "2. Work in small phases; end each with a commit and `sykli run`.".to_owned()
     } else {
         "2. Work in small phases; end each with a commit. There is no sykli contract
    here (sykli.rs or sykli.json), so there is no `sykli run` step."
+            .to_owned()
+    };
+    let phases = if in_repo && !scoped.is_empty() {
+        format!(
+            "{phases}
+   Also scoped: {names}. Your commits and pull requests there are recorded too."
+        )
+    } else {
+        phases
     };
     format!(
         "\

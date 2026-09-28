@@ -216,10 +216,10 @@ ohjaa run codex --intent "change the parser" -- --model o3
 - If toimija cannot fully read the sessions, or does not report its coverage,
   ohjaa refuses to launch blind.
 
-## One agent outside a repo
+## Agents launched from the root
 
-Sometimes an agent has to work from a folder that is not a Git repository —
-`~/projects`, say, across several repos:
+Launch agents from the folder that holds your repositories, and name the ones
+each agent will work in with `--scope`:
 
 ```bash
 cd ~/projects
@@ -229,17 +229,24 @@ ohjaa run claude --intent "rename the flag everywhere" --scope ~/projects/a --sc
 ohjaa briefs it as usual (your Knowledge, the fleet, the last session in this
 folder) and hands it to toimija, which opens a session outside every repo: no
 packet, but visible — `ohjaa fleet` lists it under "outside any repository".
-Siblings are the other sessions in the same folder. What ohjaa cannot see there,
-it says:
+Every repository named with `--scope` is treated like the one a session is
+launched in:
 
-- there are no commits or pull request to observe, so the record says "none to
-  observe (not a Git repository)" and the handover has to say what changed,
-  and where;
-- sessions inside the repos it touches do not count it as a sibling, so name
-  those repos with `--scope`.
+- **at launch**, ohjaa counts the sessions live in each scoped repo, and
+  refuses to launch blind if it cannot read them;
+- **at leaving**, it records, per scoped repo, the commits the agent made there
+  (with what sykli saw on each) and the branch's pull request;
+- **the other way round**, a session launched inside a repo counts the sessions
+  from the root whose `--scope` names it (`ohjaa fleet` lists them under
+  "outside any repository", with their scope).
+
+What ohjaa still cannot see, it says: a `--scope` path outside every repository
+is named as unobserved, and work in a repository nobody named is not recorded,
+so the handover has to say what changed there. Scope can be named from inside
+a repo too, for a second repository an agent will touch.
 
 A toimija too old to list sessions outside repos makes ohjaa refuse to launch
-there, and makes `ohjaa fleet` incomplete — never quietly empty.
+from the root, and makes `ohjaa fleet` incomplete — never quietly empty.
 
 ## Coverage is a fact
 
