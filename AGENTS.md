@@ -1,6 +1,9 @@
 # Agent guide
 
+<!-- toimija:adopt:v1:begin -->
 Read `.toimija/current.md` before reading anything else in this repo; it is your workset contract. Under a toimija session your launch prompt names your live packet — that file supersedes this one.
+<!-- toimija:adopt:v1:end -->
+
 This repo is **ohjaa**, an internal False Systems tool: steering knowledge for
 agents. Toimija reports facts and refuses to decide. Ohjaa holds what the
 people agents work for know and have decided (faija-ontology.v2 *Knowledge*,
