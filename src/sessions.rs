@@ -352,30 +352,33 @@ impl Store {
 /// Keep `LATEST` pointing at each repository's latest *ended* session. A
 /// session still running is never "the last session here": the perimeter
 /// already shows who is live, and an unfinished record must not read as a
-/// crash.
+/// crash. "Here" is where a session was launched and every repository it
+/// named with `--scope`: the one that ended last wins, wherever it started.
 fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), StoreError> {
     let Some(left) = &session.left else {
         return Ok(());
     };
     let sessions = tx.open_table(SESSIONS).map_err(other)?;
     let mut latest = tx.open_table(LATEST).map_err(other)?;
-    let newer = match latest.get(session.repo.as_str()).map_err(other)? {
-        None => true,
-        Some(id) if id.value() == session.id => true,
-        Some(id) => {
-            let current = sessions
-                .get(id.value())
-                .map_err(other)?
-                .and_then(|value| serde_json::from_slice::<Session>(value.value()).ok());
-            current
-                .and_then(|current| current.left.map(|l| l.ended_ms))
-                .is_none_or(|ended| left.ended_ms >= ended)
+    let heres = std::iter::once(session.repo.as_str())
+        .chain(session.scoped.iter().map(|scoped| scoped.repo.as_str()));
+    for here in heres {
+        let newer = match latest.get(here).map_err(other)? {
+            None => true,
+            Some(id) if id.value() == session.id => true,
+            Some(id) => {
+                let current = sessions
+                    .get(id.value())
+                    .map_err(other)?
+                    .and_then(|value| serde_json::from_slice::<Session>(value.value()).ok());
+                current
+                    .and_then(|current| current.left.map(|l| l.ended_ms))
+                    .is_none_or(|ended| left.ended_ms >= ended)
+            }
+        };
+        if newer {
+            latest.insert(here, session.id.as_str()).map_err(other)?;
         }
-    };
-    if newer {
-        latest
-            .insert(session.repo.as_str(), session.id.as_str())
-            .map_err(other)?;
     }
     Ok(())
 }
@@ -611,8 +614,10 @@ fn summarise_finished(finished: &Finished) -> String {
     }
 }
 
-/// "Last session here", for the next session's entering briefing.
-pub fn render_last(session: &Session) -> String {
+/// "Last session here", for the next session's entering briefing in `here`
+/// (a `LATEST` key). A session launched elsewhere that named `here` with
+/// `--scope` says where it was launched, so it never reads as launched here.
+pub fn render_last(session: &Session, here: &str) -> String {
     let mut out = String::new();
     // Only ended sessions are "the last session here" (see `note_latest`);
     // a record without its leaving is said as exactly that, never as a crash.
@@ -626,9 +631,17 @@ pub fn render_last(session: &Session) -> String {
             )
         },
     );
+    let launched = if session.repo == here {
+        String::new()
+    } else {
+        format!(
+            "; launched from {}, it named this repository with --scope",
+            session.repo
+        )
+    };
     let _ = writeln!(
         out,
-        "Last session here ({}, {}, {ended}):",
+        "Last session here ({}, {}, {ended}{launched}):",
         session.id, session.agent
     );
     let _ = writeln!(out, "- intent: {}", session.intent);
@@ -775,12 +788,62 @@ mod tests {
             record.contains("in toimija    finished no pull request"),
             "{record}"
         );
-        let last = render_last(&s);
+        let last = render_last(&s, &s.repo);
         assert!(
             last.contains("- work in ohjaa: 1 commit(s), 1 with a passing sykli run"),
             "{last}"
         );
         assert!(!last.contains("not a Git repository"), "{last}");
+        assert!(!last.contains("launched from"), "{last}");
+        // Briefed inside a repository it named, it says where it was launched.
+        let there = render_last(&s, "/r/projects/ohjaa");
+        assert!(
+            there.contains("; launched from /r/projects, it named this repository with --scope):"),
+            "{there}"
+        );
+    }
+
+    fn named(mut session: Session, repos: &[&str]) -> Session {
+        session.scoped = repos
+            .iter()
+            .map(|repo| Scoped {
+                repo: (*repo).to_owned(),
+                branch: None,
+                head_at_start: None,
+            })
+            .collect();
+        session
+    }
+
+    #[test]
+    fn a_session_is_the_last_one_in_every_repository_it_named() {
+        let dir = temp("latestnamed");
+        let store = Store::open(&store_path(&dir)).unwrap();
+        store
+            .put(&ended(session("oh-1", "/r/a", 1_000), 1_500))
+            .unwrap();
+        store
+            .put(&ended(session("oh-2", "/r/b", 1_000), 3_000))
+            .unwrap();
+        // From the root, naming a and b; it ends after oh-1, before oh-2.
+        let root = named(session("oh-3", "/r", 2_000), &["/r/a", "/r/b"]);
+        store.put(&root).unwrap();
+        assert_eq!(
+            store.latest_for("/r/a").unwrap().unwrap().id,
+            "oh-1",
+            "a session still running is never the last one, wherever it was named"
+        );
+        store
+            .update("oh-3", |s| *s = ended(s.clone(), 2_500))
+            .unwrap();
+        assert_eq!(store.latest_for("/r").unwrap().unwrap().id, "oh-3");
+        assert_eq!(store.latest_for("/r/a").unwrap().unwrap().id, "oh-3");
+        assert_eq!(
+            store.latest_for("/r/b").unwrap().unwrap().id,
+            "oh-2",
+            "the one that ended last wins, wherever it was launched"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -954,7 +1017,7 @@ mod tests {
             next: None,
             surprised: Some("the fixture skips".to_owned()),
         });
-        let last = render_last(&s);
+        let last = render_last(&s, &s.repo);
         assert!(last.contains("Last session here (oh-9, claude"), "{last}");
         assert!(
             last.contains("ended 2026-09-21 15:13 UTC, clean"),

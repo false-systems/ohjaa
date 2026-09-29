@@ -1570,6 +1570,53 @@ fn a_scope_path_not_created_yet_is_observed_in_its_repo() {
 }
 
 #[test]
+fn a_root_session_is_the_last_session_in_the_repos_it_named() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("root-last");
+    let folder = fixture.make_folder("projects");
+    let repo = fixture.make_git_repo("work");
+    let script = format!(
+        "cd '{}' && echo x > f.txt && git add f.txt && git commit -q -m 'scoped work' \
+         && {} handover --unfinished 'rename half done'",
+        repo.display(),
+        ohjaa_bin()
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa_in(&folder)
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "root work",
+                "--no-briefing",
+                "--scope",
+            ])
+            .arg(&repo)
+            .args(["--", "-c", &script])
+            .env("OHJAA_STUB_RUN_AGENT", "1"),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+
+    // The next agent launched inside the repository is briefed with it.
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    for said in [
+        "Last session here (oh-",
+        "projects, it named this repository with --scope):",
+        "- work in work: 1 commit(s)",
+        "- unfinished: rename half done",
+    ] {
+        assert!(stdout.contains(said), "missing `{said}`: {stdout}");
+    }
+    let (stdout, stderr, code) = output_of(fixture.ohjaa().arg("session").current_dir(&repo));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("rename half done"), "{stdout}");
+    fixture.cleanup();
+}
+
+#[test]
 fn run_outside_a_repo_counts_only_the_siblings_in_its_folder() {
     if !git_available() {
         return;
