@@ -209,10 +209,11 @@ pub fn head(repo: &Path) -> Option<String> {
     git(repo, &["rev-parse", "--verify", "-q", "HEAD"])
 }
 
-/// The Git repository `path` lies in, canonical. `None` when the path does
-/// not exist or is not inside a repository.
+/// The Git repository `path` lies in, canonical. A path not created yet (a
+/// file the agent will write) is looked up from its nearest existing
+/// directory. `None` when that directory is not inside a repository.
 pub fn repo_of(path: &Path) -> Option<std::path::PathBuf> {
-    let dir = if path.is_dir() { path } else { path.parent()? };
+    let dir = path.ancestors().find(|dir| dir.is_dir())?;
     let root = git(dir, &["rev-parse", "--show-toplevel"])?;
     std::fs::canonicalize(root).ok()
 }
