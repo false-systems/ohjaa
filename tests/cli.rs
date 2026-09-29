@@ -1414,14 +1414,130 @@ fn run_outside_a_repo_launches_from_the_folder_and_says_what_it_cannot_see() {
     assert_eq!(code, Some(0), "{stderr}");
     for said in [
         "is not a Git repository; 0 sibling session(s) in this folder at launch",
-        "will not count it as a sibling; name them with --scope",
-        "This folder is not a Git repository, so ohjaa cannot observe your commits",
+        "--scope /r/a is not inside a Git repository; nothing there is observed",
+        "no --scope names a repository, so nothing this agent does in one is",
+        "This folder is not a Git repository, and no --scope named one",
         "which is not one of these repositories",
         "would run: toimija run --intent 'sweep the fleet'",
         "--scope /r/a -- claude",
     ] {
         assert!(stderr.contains(said), "missing `{said}`: {stderr}");
     }
+    fixture.cleanup();
+}
+
+/// A live session launched outside every repository, scoped to `scope`.
+fn scoped_session(id: &str, scope: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    format!(
+        "{{\"id\":\"{id}\",\"agent\":[\"claude\"],\"worktree\":\"/somewhere\",\"intent\":\"sweep\",\
+         \"scope\":[\"{scope}\"],\"liveness\":\"active\",\"pid_check\":\"alive\",\"last_seen_at\":{now}}}"
+    )
+}
+
+#[test]
+fn a_root_session_records_the_commits_it_made_in_a_scoped_repo() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("root-scoped");
+    let folder = fixture.make_folder("projects");
+    let repo = fixture.make_git_repo("work");
+    let script = format!(
+        "cd '{}' && echo x > f.txt && git add f.txt && git commit -q -m 'scoped work'",
+        repo.display()
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa_in(&folder)
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "root work",
+                "--no-briefing",
+                "--scope",
+            ])
+            .arg(&repo)
+            .args(["--", "-c", &script])
+            .env("OHJAA_STUB_RUN_AGENT", "1"),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(
+            "scoped work: 0 session(s) live there at launch; its commits and pull request will be recorded"
+        ),
+        "{stderr}"
+    );
+    let phases = stderr
+        .lines()
+        .find(|l| l.starts_with("in work") && l.contains(" phases "))
+        .expect(&stderr);
+    assert!(
+        phases.ends_with("no sykli run"),
+        "the commit made in the scoped repo is its phase: {phases}"
+    );
+    assert!(
+        stderr.contains("in work       finished unknown (gh is not signed in)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("none to observe"), "{stderr}");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_repo_launch_counts_root_sessions_scoped_to_it() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("scoped-here");
+    let repo = fixture.make_git_repo("work");
+    let here = fs::canonicalize(&repo).unwrap();
+    fixture.set_outside_sessions(&sessions_json(
+        &format!(
+            "{},{}",
+            scoped_session("3-3", &here.join("src").display().to_string()),
+            scoped_session("4-4", "/somewhere/else")
+        ),
+        "available",
+    ));
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "codex", "--intent", "x", "--dry-run"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr
+            .contains("1 more, launched outside repositories, name this checkout in their --scope"),
+        "only the session whose scope reaches this checkout counts: {stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_root_launch_refuses_when_a_scoped_repo_cannot_be_read() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("scoped-blind");
+    let folder = fixture.make_folder("projects");
+    let repo = fixture.make_git_repo("broken-work");
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa_in(&folder)
+            .args(["run", "claude", "--intent", "x", "--dry-run", "--scope"])
+            .arg(&repo),
+    );
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        stderr.contains("named with --scope") && stderr.contains("refusing to launch blind"),
+        "{stderr}"
+    );
     fixture.cleanup();
 }
 

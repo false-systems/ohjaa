@@ -114,6 +114,32 @@ pub struct Left {
     /// A signal cut leaving short; the record holds what was known by then.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interrupted: bool,
+    /// What leaving observed in each repository the session named with
+    /// `--scope`, beyond the one it was launched in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped: Vec<ScopedLeft>,
+}
+
+/// A repository a session named with `--scope`, as it stood at entering. It
+/// is observed like the one the session was launched in: its sessions counted
+/// at launch, its commits and pull request at leaving.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scoped {
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_at_start: Option<String>,
+}
+
+/// What leaving observed in one scoped repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedLeft {
+    pub repo: String,
+    /// `None` when they could not be observed, as for the launch repository.
+    #[serde(default)]
+    pub phases: Option<Vec<Phase>>,
+    pub finished: Finished,
 }
 
 /// One session, entering to leaving.
@@ -133,6 +159,9 @@ pub struct Session {
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_at_start: Option<String>,
+    /// The repositories named with `--scope`, other than the launch one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped: Vec<Scoped>,
     pub delivered: Vec<Delivered>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readback: Option<Readback>,
@@ -459,39 +488,31 @@ pub fn render_record(session: &Session) -> String {
         session.delivered.len()
     );
     if let Some(left) = &session.left {
-        let phases_line = match &left.phases {
-            None if session.outside_repo => "none to observe (not a Git repository)".to_owned(),
-            None if left.interrupted => "not observed (leaving was interrupted)".to_owned(),
-            None => "not observed".to_owned(),
-            Some(phases) if phases.is_empty() => "no commits".to_owned(),
-            Some(phases) => phases
-                .iter()
-                .map(|p| {
-                    format!(
-                        "{} {}",
-                        short(&p.commit),
-                        describe_evidence(p.evidence.as_ref())
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" · "),
-        };
-        let _ = writeln!(out, "phases        {phases_line}");
-        let finished = match &left.finished {
-            _ if session.outside_repo => "none to observe (not a Git repository)".to_owned(),
-            Finished::Unknown { why } => format!("unknown ({why})"),
-            Finished::NoPullRequest => "no pull request".to_owned(),
-            Finished::PullRequest {
-                url,
-                state,
-                head_evidence,
-            } => format!(
-                "{url} ({}) · evidence on its head: {}",
-                state.to_lowercase(),
-                describe_evidence(head_evidence.as_ref())
-            ),
-        };
-        let _ = writeln!(out, "finished      {finished}");
+        if !session.outside_repo {
+            let _ = writeln!(
+                out,
+                "phases        {}",
+                describe_phases(left.phases.as_ref(), left.interrupted)
+            );
+            let _ = writeln!(out, "finished      {}", describe_finished(&left.finished));
+        } else if left.scoped.is_empty() {
+            // The folder has nothing to observe, and no --scope named a repository.
+            out.push_str("phases        none to observe (not a Git repository)\n");
+            out.push_str("finished      none to observe (not a Git repository)\n");
+        }
+        for scoped in &left.scoped {
+            let label = format!("in {}", repo_name(&scoped.repo));
+            let _ = writeln!(
+                out,
+                "{label:<13} phases {}",
+                describe_phases(scoped.phases.as_ref(), left.interrupted)
+            );
+            let _ = writeln!(
+                out,
+                "{label:<13} finished {}",
+                describe_finished(&scoped.finished)
+            );
+        }
         if let Some(toimija) = &left.toimija_session {
             let _ = writeln!(out, "toimija       {toimija}");
         }
@@ -531,6 +552,65 @@ pub fn render_none_ended(unended: &[Session], unreadable: usize) -> String {
     out
 }
 
+fn describe_phases(phases: Option<&Vec<Phase>>, interrupted: bool) -> String {
+    match phases {
+        None if interrupted => "not observed (leaving was interrupted)".to_owned(),
+        None => "not observed".to_owned(),
+        Some(phases) if phases.is_empty() => "no commits".to_owned(),
+        Some(phases) => phases
+            .iter()
+            .map(|p| {
+                format!(
+                    "{} {}",
+                    short(&p.commit),
+                    describe_evidence(p.evidence.as_ref())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" · "),
+    }
+}
+
+fn describe_finished(finished: &Finished) -> String {
+    match finished {
+        Finished::Unknown { why } => format!("unknown ({why})"),
+        Finished::NoPullRequest => "no pull request".to_owned(),
+        Finished::PullRequest {
+            url,
+            state,
+            head_evidence,
+        } => format!(
+            "{url} ({}) · evidence on its head: {}",
+            state.to_lowercase(),
+            describe_evidence(head_evidence.as_ref())
+        ),
+    }
+}
+
+fn summarise_work(phases: Option<&Vec<Phase>>) -> String {
+    match phases {
+        Some(phases) => {
+            let with_evidence = phases
+                .iter()
+                .filter(|p| p.evidence.as_ref().is_some_and(|e| e.outcome == "passed"))
+                .count();
+            format!(
+                "{} commit(s), {with_evidence} with a passing sykli run",
+                phases.len()
+            )
+        }
+        None => "commits not observed".to_owned(),
+    }
+}
+
+fn summarise_finished(finished: &Finished) -> String {
+    match finished {
+        Finished::PullRequest { url, state, .. } => format!("{url} ({})", state.to_lowercase()),
+        Finished::NoPullRequest => "no pull request".to_owned(),
+        Finished::Unknown { .. } => "unknown".to_owned(),
+    }
+}
+
 /// "Last session here", for the next session's entering briefing.
 pub fn render_last(session: &Session) -> String {
     let mut out = String::new();
@@ -552,33 +632,33 @@ pub fn render_last(session: &Session) -> String {
         session.id, session.agent
     );
     let _ = writeln!(out, "- intent: {}", session.intent);
-    if session.outside_repo {
+    let scoped = session
+        .left
+        .as_ref()
+        .map_or(&[][..], |left| &left.scoped[..]);
+    if session.outside_repo && scoped.is_empty() {
         out.push_str(
             "- work: not a Git repository, so no commits or pull request to observe; \
              its handover says what changed\n",
         );
     } else if let Some(left) = &session.left {
-        let work = match &left.phases {
-            Some(phases) => {
-                let with_evidence = phases
-                    .iter()
-                    .filter(|p| p.evidence.as_ref().is_some_and(|e| e.outcome == "passed"))
-                    .count();
-                format!(
-                    "{} commit(s), {with_evidence} with a passing sykli run",
-                    phases.len()
-                )
-            }
-            None => "commits not observed".to_owned(),
-        };
-        let finished = match &left.finished {
-            Finished::PullRequest { url, state, .. } => {
-                format!("{url} ({})", state.to_lowercase())
-            }
-            Finished::NoPullRequest => "no pull request".to_owned(),
-            Finished::Unknown { .. } => "unknown".to_owned(),
-        };
-        let _ = writeln!(out, "- work: {work}; finished: {finished}");
+        if !session.outside_repo {
+            let _ = writeln!(
+                out,
+                "- work: {}; finished: {}",
+                summarise_work(left.phases.as_ref()),
+                summarise_finished(&left.finished)
+            );
+        }
+        for scoped in scoped {
+            let _ = writeln!(
+                out,
+                "- work in {}: {}; finished: {}",
+                repo_name(&scoped.repo),
+                summarise_work(scoped.phases.as_ref()),
+                summarise_finished(&scoped.finished)
+            );
+        }
     }
     match &session.handover {
         None => out.push_str("- it left no handover\n"),
@@ -619,6 +699,7 @@ mod tests {
             started_ms,
             branch: Some("main".to_owned()),
             head_at_start: None,
+            scoped: Vec::new(),
             delivered: vec![Delivered {
                 id: "rust-only".to_owned(),
                 scope: "ours".to_owned(),
@@ -639,8 +720,67 @@ mod tests {
             phases: Some(Vec::new()),
             finished: Finished::NoPullRequest,
             interrupted: false,
+            scoped: Vec::new(),
         });
         session
+    }
+
+    #[test]
+    fn a_root_session_is_recorded_repository_by_repository() {
+        let mut s = session("oh-7", "/r/projects", 1_790_000_000_000);
+        s.outside_repo = true;
+        s.left = Some(Left {
+            ended_ms: 1_790_003_600_000,
+            exit: Exit::Code { code: 0 },
+            toimija_session: None,
+            phases: None,
+            finished: Finished::Unknown {
+                why: "not a Git repository".to_owned(),
+            },
+            interrupted: false,
+            scoped: vec![
+                ScopedLeft {
+                    repo: "/r/projects/ohjaa".to_owned(),
+                    phases: Some(vec![Phase {
+                        commit: "a1b2c3d4e5".to_owned(),
+                        subject: "fix".to_owned(),
+                        evidence: Some(Evidence {
+                            outcome: "passed".to_owned(),
+                            dirty: false,
+                        }),
+                    }]),
+                    finished: Finished::NoPullRequest,
+                },
+                ScopedLeft {
+                    repo: "/r/projects/toimija".to_owned(),
+                    phases: Some(Vec::new()),
+                    finished: Finished::NoPullRequest,
+                },
+            ],
+        });
+        let record = render_record(&s);
+        assert!(
+            !record.contains("none to observe"),
+            "a root session with scoped repositories has work to show: {record}"
+        );
+        assert!(
+            record.contains("in ohjaa      phases a1b2c3d passed"),
+            "{record}"
+        );
+        assert!(
+            record.contains("in toimija    phases no commits"),
+            "{record}"
+        );
+        assert!(
+            record.contains("in toimija    finished no pull request"),
+            "{record}"
+        );
+        let last = render_last(&s);
+        assert!(
+            last.contains("- work in ohjaa: 1 commit(s), 1 with a passing sykli run"),
+            "{last}"
+        );
+        assert!(!last.contains("not a Git repository"), "{last}");
     }
 
     #[test]
@@ -784,6 +924,7 @@ mod tests {
             ]),
             finished: Finished::NoPullRequest,
             interrupted: false,
+            scoped: Vec::new(),
         });
         let record = render_record(&s);
         let observed = record.find("─ observed").unwrap();
