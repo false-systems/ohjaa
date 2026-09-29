@@ -1542,6 +1542,34 @@ fn a_root_launch_refuses_when_a_scoped_repo_cannot_be_read() {
 }
 
 #[test]
+fn a_scope_path_not_created_yet_is_observed_in_its_repo() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("scoped-new-path");
+    let folder = fixture.make_folder("projects");
+    let repo = fixture.make_git_repo("work");
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa_in(&folder)
+            .args(["run", "claude", "--intent", "x", "--dry-run", "--scope"])
+            .arg(repo.join("src").join("new_module.rs")),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(
+            "scoped work: 0 session(s) live there at launch; its commits and pull request will be recorded"
+        ),
+        "a file the agent will create is still in its repository: {stderr}"
+    );
+    assert!(
+        !stderr.contains("is not inside a Git repository"),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
 fn run_outside_a_repo_counts_only_the_siblings_in_its_folder() {
     if !git_available() {
         return;
