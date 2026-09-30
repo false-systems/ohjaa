@@ -192,6 +192,15 @@ refused so an old receipt cannot be accidentally reused. Missing/invalid
 receipts are reported and never change the agent's exit status. No automatic
 time-window or directory matching is performed between concurrent sessions.
 
+For Codex launches, ohjaa also passes the generated `OHJAA_SESSION`, the
+resolved `XDG_STATE_HOME`, and optional `OHJAA_USAGE_FILE` through per-session
+`shell_environment_policy.set` overrides. Codex tool commands can run in a
+persistent daemon that did not inherit the wrapper environment. Toimija passes
+its own handshake independently. Neither wrapper modifies global Codex config
+or relaxes environment filtering or sandbox permissions. Existing sessions need
+a fresh wrapped launch; no session is recovered by guessing from directory or
+time. See [Codex's configuration reference](https://developers.openai.com/codex/config-reference/).
+
 `agent-usage.v1` is a cumulative snapshot of one native session. It contains
 `agent`, `session_id`, `source`, `observed_at_ms`, `complete`, `limitations`,
 and `entries` grouped by `provider` and `model`. Each entry has nullable

@@ -417,6 +417,7 @@ fn run_launches_toimija_with_the_full_forwarded_argv() {
     }
     let fixture = Fixture::new("exec");
     let repo = fixture.make_git_repo("only");
+    let usage_path = fixture.dir.join("receipt with \"quotes\".json");
 
     let (_, stderr, code) = output_of(
         fixture
@@ -431,6 +432,8 @@ fn run_launches_toimija_with_the_full_forwarded_argv() {
                 "--scope",
                 "src/parser/",
                 "--no-briefing",
+                "--usage-file",
+                usage_path.to_str().unwrap(),
                 "--",
                 "--model",
                 "o3",
@@ -439,6 +442,23 @@ fn run_launches_toimija_with_the_full_forwarded_argv() {
             .current_dir(&repo),
     );
     let argv = fixture.argv();
+    let (export, _, export_code) =
+        output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(export_code, Some(0));
+    let export: serde_json::Value = serde_json::from_str(&export).unwrap();
+    let session_id = export["sessions"][0]["id"].as_str().unwrap();
+    let session_config = format!(
+        "shell_environment_policy.set.OHJAA_SESSION={}",
+        serde_json::to_string(session_id).unwrap()
+    );
+    let state_config = format!(
+        "shell_environment_policy.set.XDG_STATE_HOME={}",
+        serde_json::to_string(&fixture.dir.join("state").display().to_string()).unwrap()
+    );
+    let usage_config = format!(
+        "shell_environment_policy.set.OHJAA_USAGE_FILE={}",
+        serde_json::to_string(&usage_path.display().to_string()).unwrap()
+    );
     fixture.cleanup();
 
     // The session's exit status becomes ohjaa's.
@@ -455,6 +475,12 @@ fn run_launches_toimija_with_the_full_forwarded_argv() {
             "src/parser/",
             "--",
             "codex",
+            "-c",
+            &session_config,
+            "-c",
+            &state_config,
+            "-c",
+            &usage_config,
             "--model",
             "o3",
         ],

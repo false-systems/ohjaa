@@ -1465,20 +1465,46 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     for scope_path in scope {
         command.arg("--scope").arg(scope_path);
     }
-    command.arg("--").arg(agent).args(passthrough);
+    let usage_path = usage_file.map(std::path::absolute).transpose()?;
+    if let Some(path) = &usage_path {
+        anyhow::ensure!(
+            !path.exists(),
+            "usage file already exists; use a fresh path for this run"
+        );
+    }
+    command.arg("--").arg(agent);
+    // A persistent Codex tool daemon is not a child of this wrapper. Deliver
+    // our identity and log location through its per-thread shell configuration.
+    if std::path::Path::new(agent)
+        .file_name()
+        .is_some_and(|name| name == "codex")
+    {
+        let mut handshake = vec![
+            (sessions::SESSION_ENV, std::ffi::OsString::from(&session_id)),
+            ("XDG_STATE_HOME", knowledge::state_home()?.into_os_string()),
+        ];
+        if let Some(path) = &usage_path {
+            handshake.push(("OHJAA_USAGE_FILE", path.as_os_str().to_owned()));
+        }
+        for (key, value) in handshake {
+            let value = value.to_str().with_context(|| {
+                format!("{key} is not UTF-8; cannot deliver the Codex session handshake")
+            })?;
+            command.arg("-c").arg(format!(
+                "shell_environment_policy.set.{key}={}",
+                serde_json::to_string(value)?
+            ));
+        }
+    }
+    command.args(passthrough);
     command.current_dir(&root);
     if dry_run {
         eprintln!("ohjaa: dry-run; would run: {}", render_command(&command));
         return Ok(0);
     }
     command.env(sessions::SESSION_ENV, &session_id);
-    if let Some(path) = usage_file {
-        let path = std::path::absolute(path)?;
-        anyhow::ensure!(
-            !path.exists(),
-            "usage file already exists; use a fresh path for this run"
-        );
-        command.env("OHJAA_USAGE_FILE", &path);
+    if let Some(path) = &usage_path {
+        command.env("OHJAA_USAGE_FILE", path);
     }
 
     let mut session = sessions::Session {
