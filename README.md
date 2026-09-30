@@ -170,6 +170,50 @@ Signals, while a session runs (unix):
   then; the normal dispositions come back once it is saved.
 - **SIGKILL** cannot be caught: it loses the record.
 
+## Session usage
+
+Usage stays in the existing session log. It is **imported source testimony**,
+separate from ohjaa's observed work and from provider billing. No new service,
+database or sibling-repository dependency is required.
+
+```bash
+# A local collector such as Vessa creates a native-session snapshot.
+vessa receipt --input /path/to/session.jsonl > /tmp/session-usage.json
+ohjaa usage import /tmp/session-usage.json --session oh-EXISTING-ID
+ohjaa usage export > /tmp/ohjaa-sessions.json
+```
+
+Inside a run, `usage import` defaults to `OHJAA_SESSION`. To pick up a receipt
+automatically when the agent command ends, use `ohjaa run ... --usage-file
+/path/to/fresh-receipt.json`. Ohjaa passes that path as `OHJAA_USAGE_FILE`; the
+launched command or its wrapper must write an `agent-usage.v1` receipt there.
+Native agent transcripts are not that receipt format. Existing paths are
+refused so an old receipt cannot be accidentally reused. Missing/invalid
+receipts are reported and never change the agent's exit status. No automatic
+time-window or directory matching is performed between concurrent sessions.
+
+`agent-usage.v1` is a cumulative snapshot of one native session. It contains
+`agent`, `session_id`, `source`, `observed_at_ms`, `complete`, `limitations`,
+and `entries` grouped by `provider` and `model`. Each entry has nullable
+`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
+`estimated_usd_micros`, `estimate_basis`, `credits` and `billed`. Input excludes
+cache categories. An amount is `{unit, micros, source}`: credit units are
+provider-specific; billed units are currencies. `null` means unknown, never
+zero. Estimates require their rate basis; amounts require their source.
+
+Imports validate the shape and agent, not the truth of a provider claim.
+Repeating an identical snapshot changes nothing; a newer snapshot replaces
+the earlier one, rather than adding its cumulative totals. Stale/conflicting
+snapshots are refused. A native session can belong to only one wrapper
+session; after resuming it, update that original association rather than
+double-attribute its entire history to a second run. This first contract does
+not split a native session's consumption across several wrapper runs.
+
+`usage export` emits `ohjaa-sessions.v1`, with `sessions` and `unreadable`.
+Unreadable records produce exit 4. `--session ID` selects one record. Existing
+records without usage remain readable and explicitly show "not collected".
+Exports contain private session context; choose their destination accordingly.
+
 ## Keeping it true
 
 `ohjaa check` validates every node and the rules across them. It also flags

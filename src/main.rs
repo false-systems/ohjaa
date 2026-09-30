@@ -14,6 +14,7 @@ mod roots;
 mod scan;
 mod sessions;
 mod system;
+mod usage;
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -71,6 +72,10 @@ enum Cmd {
         /// Do not brief the agent with knowledge and the perimeter.
         #[arg(long = "no-briefing")]
         no_briefing: bool,
+        /// Import an agent-usage.v1 receipt written by the launched command at exit.
+        /// The path is passed to the child as OHJAA_USAGE_FILE. No file is required at launch.
+        #[arg(long)]
+        usage_file: Option<PathBuf>,
         /// Everything after `--` is passed through to the agent command.
         #[arg(last = true)]
         passthrough: Vec<String>,
@@ -207,9 +212,59 @@ enum Cmd {
     },
     /// Show a session record: the latest one here, or one by id.
     Session { id: Option<String> },
+    /// Import explicit usage attribution or export session history for analysis.
+    Usage {
+        #[command(subcommand)]
+        action: UsageCmd,
+    },
     /// A knowledge node and its neighbours: what it builds on, what builds on
     /// it, what it replaced, and which sessions were briefed with it.
     Graph { id: String },
+}
+
+#[derive(Subcommand)]
+enum UsageCmd {
+    /// Attach a native-session snapshot. Reimports replace, never add totals.
+    Import {
+        file: PathBuf,
+        /// Wrapper session ID; defaults to OHJAA_SESSION inside a run.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Versioned JSON export; no database access needed by consumers.
+    Export {
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+fn cmd_usage(action: &UsageCmd) -> Result<i32> {
+    let dirs = dirs()?;
+    let store = sessions::Store::open(&sessions::store_path(&dirs.state))?;
+    match action {
+        UsageCmd::Import { file, session } => {
+            let id = session.clone().map(Ok).unwrap_or_else(current_session_id)?;
+            anyhow::ensure!(sessions::is_valid_id(&id), "invalid session id");
+            store.attach_usage(&id, usage::Receipt::read(file)?)?;
+            println!("recorded usage snapshot for {id}");
+            Ok(0)
+        }
+        UsageCmd::Export { session } => {
+            let (mut records, unreadable) = store.all()?;
+            if let Some(id) = session {
+                records.retain(|s| s.id == *id);
+                anyhow::ensure!(!records.is_empty(), "session {id} not found");
+            }
+            serde_json::to_writer_pretty(
+                std::io::stdout().lock(),
+                &serde_json::json!({
+                    "schema": "ohjaa-sessions.v1", "sessions": records, "unreadable": unreadable
+                }),
+            )?;
+            println!();
+            Ok(if unreadable.is_empty() { 0 } else { INCOMPLETE })
+        }
+    }
 }
 
 fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
@@ -1204,6 +1259,7 @@ struct RunOptions<'a> {
     scope: &'a [String],
     dry_run: bool,
     no_briefing: bool,
+    usage_file: Option<&'a Path>,
     passthrough: &'a [String],
     roots: &'a [PathBuf],
 }
@@ -1216,6 +1272,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         scope,
         dry_run,
         no_briefing,
+        usage_file,
         passthrough,
         roots,
     } = options;
@@ -1356,6 +1413,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         "--intent",
         "--task",
         "--scope",
+        "--usage-file",
     ] {
         if passthrough.iter().any(|arg| arg == misplaced) {
             eprintln!(
@@ -1414,6 +1472,14 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         return Ok(0);
     }
     command.env(sessions::SESSION_ENV, &session_id);
+    if let Some(path) = usage_file {
+        let path = std::path::absolute(path)?;
+        anyhow::ensure!(
+            !path.exists(),
+            "usage file already exists; use a fresh path for this run"
+        );
+        command.env("OHJAA_USAGE_FILE", &path);
+    }
 
     let mut session = sessions::Session {
         id: session_id.clone(),
@@ -1437,6 +1503,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         handover: None,
         left: None,
         drafted: false,
+        usage: Vec::new(),
     };
     // From here to the end of leaving, a signal is kept, not fatal.
     lifecycle::supervise();
@@ -1545,6 +1612,24 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         unrecorded.left = Some(left);
         unrecorded
     });
+    if let Some(path) = usage_file {
+        let imported = (|| -> Result<()> {
+            let receipt = usage::Receipt::read(path)?;
+            anyhow::ensure!(
+                receipt.observed_at_ms >= started_ms,
+                "usage receipt predates this run"
+            );
+            let store = sessions::Store::open(&sessions::store_path(&dirs.state))?;
+            store.attach_usage(&session_id, receipt)?;
+            session = store
+                .get(&session_id)?
+                .context("session disappeared after usage import")?;
+            Ok(())
+        })();
+        if let Err(error) = imported {
+            eprintln!("ohjaa: usage was not imported: {error:#}; session exit is unchanged");
+        }
+    }
     let _ = std::io::stdout().flush();
     // Written with `let _`: a closed terminal must not turn printing into a
     // panic after the record is already safe.
@@ -1722,6 +1807,7 @@ fn main() {
             scope,
             dry_run,
             no_briefing,
+            usage_file,
             passthrough,
         } => cmd_run(RunOptions {
             agent,
@@ -1730,6 +1816,7 @@ fn main() {
             scope,
             dry_run: *dry_run,
             no_briefing: *no_briefing,
+            usage_file: usage_file.as_deref(),
             passthrough,
             roots: &cli.root,
         }),
@@ -1774,6 +1861,7 @@ fn main() {
             surprised,
         } => cmd_handover(unfinished.as_deref(), next.as_deref(), surprised.as_deref()),
         Cmd::Session { id } => cmd_session(id.as_deref()),
+        Cmd::Usage { action } => cmd_usage(action),
         Cmd::Graph { id } => cmd_graph(id),
         Cmd::Intake {
             since,

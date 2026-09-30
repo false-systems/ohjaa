@@ -1172,6 +1172,142 @@ fn ohjaa_bin() -> &'static str {
     env!("CARGO_BIN_EXE_ohjaa")
 }
 
+#[test]
+fn usage_import_is_attributed_idempotent_and_exportable() {
+    let fixture = Fixture::new("usage");
+    let repo = fixture.make_git_repo("work");
+    let receipt = fixture.dir.join("usage.json");
+    let data = serde_json::json!({
+        "schema":"agent-usage.v1", "agent":"sh", "session_id":"native-1",
+        "source":"synthetic fixture", "observed_at_ms":1790000000000_i64,
+        "complete":false,"limitations":["test source"],"entries":[{
+            "provider":"test", "model":"test", "input_tokens":100,"output_tokens":20,
+            "cache_read_tokens":null,"cache_write_tokens":null,
+            "estimated_usd_micros":25,"estimate_basis":"synthetic rate",
+            "credits":null,"billed":null
+        }]
+    });
+    fs::write(&receipt, serde_json::to_vec(&data).unwrap()).unwrap();
+    let script = format!(
+        "{} usage import '{}'; {} usage import '{}'",
+        ohjaa_bin(),
+        receipt.display(),
+        ohjaa_bin(),
+        receipt.display()
+    );
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+    let (out, err, code) = output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(code, Some(0), "{err}");
+    let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(export["schema"], "ohjaa-sessions.v1");
+    assert_eq!(export["sessions"][0]["usage"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        export["sessions"][0]["usage"][0]["entries"][0]["input_tokens"],
+        100
+    );
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_ne!(code, Some(0));
+    assert!(stderr.contains("already attributed"), "{stderr}");
+    let id = export["sessions"][0]["id"].as_str().unwrap();
+    let mut stale = data;
+    stale["entries"][0]["input_tokens"] = 200.into();
+    fs::write(&receipt, serde_json::to_vec(&stale).unwrap()).unwrap();
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["usage", "import"])
+            .arg(&receipt)
+            .args(["--session", id])
+            .current_dir(&repo),
+    );
+    assert_ne!(code, Some(0));
+    assert!(stderr.contains("stale or conflicting"), "{stderr}");
+    stale["observed_at_ms"] = 1790000000001_i64.into();
+    stale["entries"][0]["input_tokens"] = (-1).into();
+    fs::write(&receipt, serde_json::to_vec(&stale).unwrap()).unwrap();
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["usage", "import"])
+            .arg(&receipt)
+            .args(["--session", id])
+            .current_dir(&repo),
+    );
+    assert_ne!(code, Some(0));
+    assert!(stderr.contains("invalid usage receipt"), "{stderr}");
+    let (out, _, _) = output_of(
+        fixture
+            .ohjaa()
+            .args(["usage", "export", "--session", id])
+            .current_dir(&repo),
+    );
+    let unchanged: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        unchanged["sessions"][0]["usage"][0]["entries"][0]["input_tokens"],
+        100
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn leaving_picks_up_a_fresh_receipt_without_changing_the_agent_exit() {
+    let fixture = Fixture::new("usage-leaving");
+    let repo = fixture.make_git_repo("work");
+    let path = fixture.dir.join("receipt.json");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 1000;
+    let data = serde_json::json!({"schema":"agent-usage.v1","agent":"sh","session_id":"native-leaving","source":"fixture","observed_at_ms":now,"complete":false,"limitations":["fixture"],"entries":[]});
+    let script = format!("printf '%s' '{}' > \"$OHJAA_USAGE_FILE\"; exit 7", data);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "usage test",
+                "--no-briefing",
+                "--usage-file",
+            ])
+            .arg(&path)
+            .args(["--", "-c", &script])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(7), "{stderr}");
+    assert!(stderr.contains("native-leaving"), "{stderr}");
+    let (out, _, code) = output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(code, Some(0));
+    let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        export["sessions"][0]["usage"][0]["session_id"],
+        "native-leaving"
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "do not reuse",
+                "--no-briefing",
+                "--usage-file",
+            ])
+            .arg(&path)
+            .args(["--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("already exists"), "{stderr}");
+    fixture.cleanup();
+}
+
 /// `ohjaa run` whose stub toimija really runs `sh -c <script>` as the agent.
 fn run_session(fixture: &Fixture, repo: &Path, script: &str) -> (String, String, Option<i32>) {
     output_of(

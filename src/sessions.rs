@@ -172,6 +172,9 @@ pub struct Session {
     /// Intake has drafted proposals from this session.
     #[serde(default)]
     pub drafted: bool,
+    /// Source-reported snapshots, separately labelled from observed work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage: Vec<crate::usage::Receipt>,
 }
 
 /// Why the log could not be used. Never a reason to stop a launch.
@@ -219,6 +222,39 @@ pub struct Store {
 }
 
 impl Store {
+    /// One native session belongs to at most one wrapper session. Check and
+    /// attach in one transaction so concurrent imports cannot double attribute it.
+    pub fn attach_usage(&self, id: &str, receipt: crate::usage::Receipt) -> anyhow::Result<()> {
+        receipt.validate()?;
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(SESSIONS)?;
+            for row in table.iter()? {
+                let (key, bytes) = row?;
+                let session: Session = serde_json::from_slice(bytes.value())?;
+                anyhow::ensure!(key.value() == id || !session.usage.iter().any(|r| r.agent == receipt.agent && r.session_id == receipt.session_id), "native session already attributed to {}", key.value());
+            }
+            let mut session: Session = {
+                let bytes = table
+                    .get(id)?
+                    .ok_or_else(|| anyhow::anyhow!("session {id} is not in the log"))?;
+                serde_json::from_slice(bytes.value())?
+            };
+            let agent = Path::new(&session.agent)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&session.agent);
+            anyhow::ensure!(
+                agent == receipt.agent,
+                "receipt agent does not match session agent"
+            );
+            crate::usage::merge(&mut session.usage, receipt)?;
+            let bytes = serde_json::to_vec(&session)?;
+            table.insert(id, bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     /// Open the log, creating it only where no file exists. An empty or
     /// unreadable file is reported, never replaced: redb would treat an empty
     /// file as a fresh database and the history would silently vanish.
@@ -520,6 +556,39 @@ pub fn render_record(session: &Session) -> String {
             let _ = writeln!(out, "toimija       {toimija}");
         }
     }
+    out.push_str("─ usage (imported source assertions; estimates are not bills) ─\n");
+    if session.usage.is_empty() {
+        out.push_str("not collected; unknown, not zero\n");
+    }
+    for receipt in &session.usage {
+        let _ = writeln!(
+            out,
+            "{} {} · {} · {} model row(s) · source {}",
+            receipt.agent,
+            receipt.session_id,
+            if receipt.complete {
+                "complete source snapshot"
+            } else {
+                "partial source snapshot"
+            },
+            receipt.entries.len(),
+            receipt.source
+        );
+        for entry in &receipt.entries {
+            let number = |n: Option<u64>| n.map_or_else(|| "unknown".to_owned(), |n| n.to_string());
+            let _ = writeln!(
+                out,
+                "  {}/{} input={} output={} cache-read={} cache-write={} estimate-usd-micros={}",
+                entry.provider,
+                entry.model,
+                number(entry.input_tokens),
+                number(entry.output_tokens),
+                number(entry.cache_read_tokens),
+                number(entry.cache_write_tokens),
+                number(entry.estimated_usd_micros)
+            );
+        }
+    }
     out.push_str("─ handover (the agent's own words) ─\n");
     handover_lines(session.handover.as_ref(), &mut out);
     out
@@ -722,6 +791,7 @@ mod tests {
             handover: None,
             left: None,
             drafted: false,
+            usage: Vec::new(),
         }
     }
 
