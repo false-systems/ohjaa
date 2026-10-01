@@ -1355,6 +1355,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         passthrough,
         roots,
     } = options;
+    let task = task.filter(|task| !task.trim().is_empty());
     // Outside any Git repository the session is the folder's: toimija keeps it
     // outside every repo, and there are no commits or pull request to observe.
     let (root, in_repo) = match git_root() {
@@ -1504,14 +1505,14 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
 
     // State 1, entering. The briefing: knowledge first (what to know before
     // acting), then the last session here and how this one works, then the
-    // perimeter (who and what is around). Delivered inside the task so it
-    // travels in toimija's composed launch prompt.
+    // perimeter (who and what is around). Keep it separate from a task so an
+    // interactive Codex launch can wait for the person's first message.
     let dirs = Dirs::resolve(in_repo.then_some(root.as_path()))?;
     let started_ms = intake::now_seconds() * 1000;
     let session_id = sessions::new_id(started_ms);
     let mut delivered = Vec::new();
-    let task = if no_briefing {
-        task.map(String::from)
+    let briefing = if no_briefing {
+        None
     } else {
         let (knowledge, nodes) = knowledge_for_work(&dirs, &scoped_repos)?;
         delivered = nodes;
@@ -1534,17 +1535,16 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect();
-        let briefing = parts.join("\n");
-        Some(match task {
-            Some(task) => format!("{task}\n\n{briefing}"),
-            None => briefing,
-        })
+        Some(parts.join("\n"))
     };
 
     let mut command = Command::new("toimija");
     command.arg("run").arg("--intent").arg(intent);
-    if let Some(task) = &task {
+    if let Some(task) = task {
         command.arg("--task").arg(task);
+    }
+    if let Some(briefing) = &briefing {
+        command.arg("--briefing").arg(briefing);
     }
     for scope_path in scope {
         command.arg("--scope").arg(scope_path);

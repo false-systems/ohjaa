@@ -288,6 +288,12 @@ ohjaa run codex --intent "change the parser" -- --model o3
 ```
 
 - Each agent gets its own toimija session.
+- Knowledge and lifecycle context travel as `toimija run --briefing`, separately
+  from `--task`. With an updated Toimija, an idle Codex launch opens without a
+  model acknowledgement turn; the first user message still receives the briefing.
+  Explicit tasks and other agents retain prompt delivery. Update Toimija before
+  using this version of Ohjaa; older versions reject the new flag rather than
+  silently dropping context.
 - `--dry-run` prints the exact command it would exec, without launching.
 - If toimija cannot fully read the sessions, or does not report its coverage,
   ohjaa refuses to launch blind.

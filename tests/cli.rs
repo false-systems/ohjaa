@@ -1034,6 +1034,11 @@ fn unassigned_startup_does_not_derive_the_fleet_and_scope_failures_remain_visibl
     ]));
     assert_eq!(code, Some(0), "{stderr}");
     assert!(stderr.contains("If no concrete task is assigned, acknowledge and wait"));
+    assert!(stderr.contains("--briefing"), "{stderr}");
+    assert!(
+        !stderr.contains("--task "),
+        "idle startup must not manufacture a task: {stderr}"
+    );
     let calls = fs::read_to_string(fixture.dir.join("calls.txt")).unwrap();
     assert_eq!(
         calls.lines().count(),
