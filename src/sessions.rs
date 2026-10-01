@@ -38,6 +38,9 @@ pub struct Delivered {
     pub id: String,
     pub scope: String,
     pub as_of: String,
+    /// Repository identity for repo-scoped knowledge; older records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 /// The agent's read-back: "I know the state".
@@ -786,6 +789,7 @@ mod tests {
                 id: "rust-only".to_owned(),
                 scope: "ours".to_owned(),
                 as_of: "2026-09-24".to_owned(),
+                repo: None,
             }],
             readback: None,
             handover: None,

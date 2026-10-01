@@ -86,6 +86,9 @@ enum Cmd {
         /// Only the knowledge, without the live perimeter.
         #[arg(long)]
         knowledge_only: bool,
+        /// Include knowledge and context for these repositories (repeatable).
+        #[arg(long, value_name = "PATH", conflicts_with = "write")]
+        scope: Vec<String>,
         /// Write the knowledge as a generated block into this file (repeatable),
         /// keeping everything else in it.
         #[arg(long, value_name = "FILE")]
@@ -441,10 +444,6 @@ fn dirs() -> Result<Dirs> {
 /// The knowledge section of the briefing, with its problems reported on stderr.
 /// Broken files and flags are said out loud; they never make the briefing
 /// silently smaller.
-fn knowledge_briefing(dirs: &Dirs) -> Result<String> {
-    Ok(knowledge_briefing_for(dirs, &Scope::ALL)?.0)
-}
-
 /// The knowledge section, and exactly which nodes it delivers.
 fn knowledge_briefing_for(
     dirs: &Dirs,
@@ -458,6 +457,9 @@ fn knowledge_briefing_for(
             id: located.node.id.clone(),
             scope: located.scope.name().to_owned(),
             as_of: located.node.as_of.to_string(),
+            repo: (located.scope == Scope::Repo)
+                .then(|| dirs.repo_root.as_ref().map(|p| repo_key(p)))
+                .flatten(),
         })
         .collect();
     for broken in &loaded.broken {
@@ -483,7 +485,62 @@ fn knowledge_briefing_for(
     Ok((text, delivered))
 }
 
-fn cmd_brief(roots: &[PathBuf], knowledge_only: bool, write: &[PathBuf]) -> Result<i32> {
+/// Shared/personal knowledge once, plus the complete knowledge of each named repo.
+/// No keyword filter is allowed to hide a binding decision.
+fn knowledge_for_work(
+    dirs: &Dirs,
+    scoped: &[PathBuf],
+) -> Result<(String, Vec<sessions::Delivered>)> {
+    let (mut text, mut delivered) = knowledge_briefing_for(dirs, &Scope::ALL)?;
+    for repo in scoped {
+        let mut scoped_dirs = dirs.clone();
+        scoped_dirs.repo_root = Some(repo.clone());
+        let (knowledge, nodes) = knowledge_briefing_for(&scoped_dirs, &[Scope::Repo])?;
+        if !knowledge.is_empty() {
+            text.push_str(&format!(
+                "\nScoped repository {}:\n{knowledge}",
+                repo.display()
+            ));
+        }
+        delivered.extend(nodes);
+    }
+    if !scoped.is_empty() && text.len() > knowledge::DEFAULT_BUDGET {
+        eprintln!("ohjaa: combined scoped knowledge briefing is {} characters, over {}; merge or retire nodes, never truncate", text.len(), knowledge::DEFAULT_BUDGET);
+    }
+    Ok((text, delivered))
+}
+
+fn selected_perimeter(
+    root: &Path,
+    in_repo: bool,
+    scoped: &[PathBuf],
+    mut scans: Vec<Scan>,
+    mut outside: Scan,
+) -> system::SystemView {
+    let selected: Vec<_> = in_repo
+        .then(|| root.to_path_buf())
+        .into_iter()
+        .chain(scoped.iter().cloned())
+        .collect();
+    let folder = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    outside.sessions.retain(|s| {
+        std::fs::canonicalize(&s.worktree).is_ok_and(|p| p == folder)
+            || selected.iter().any(|repo| scope_reaches(s, repo))
+    });
+    scans.push(outside);
+    system::scoped_view(&selected, scans)
+}
+
+fn scoped_perimeter_text(view: &system::SystemView, here: &Path) -> String {
+    format!("{}\n\nOnly the launch repository, declared scope and sessions reaching them are included.\nOther repositories were not scanned. Use `ohjaa system` or `ohjaa fleet` for a\nfleet-wide question; after expanding scope, use `ohjaa brief --scope <path>`.\nUse the delivered facts instead of repeating discovery. Refresh session observations\nbefore editing if work has moved on since this briefing.\n", system::briefing(view, here))
+}
+
+fn cmd_brief(
+    roots: &[PathBuf],
+    knowledge_only: bool,
+    write: &[PathBuf],
+    scope: &[String],
+) -> Result<i32> {
     let dirs = dirs()?;
     if !write.is_empty() {
         for file in write {
@@ -519,23 +576,45 @@ fn cmd_brief(roots: &[PathBuf], knowledge_only: bool, write: &[PathBuf]) -> Resu
         }
         return Ok(0);
     }
-    let knowledge = knowledge_briefing(&dirs)?;
+    let (scoped, unscoped) = scoped_repos(scope, dirs.repo_root.as_deref());
+    let (knowledge, _) = knowledge_for_work(&dirs, &scoped)?;
+    for path in &unscoped {
+        eprintln!("ohjaa: --scope {path} is not inside a Git repository; no repository knowledge or context was read there");
+    }
     if knowledge.is_empty() {
         println!("No knowledge recorded yet (`ohjaa propose`, then `ohjaa review`).");
     } else {
         print!("{knowledge}");
     }
     if knowledge_only {
-        return Ok(0);
+        return Ok(if unscoped.is_empty() { 0 } else { INCOMPLETE });
     }
-    let here = git_root().unwrap_or_else(|| PathBuf::from("."));
+    let here = dirs.repo_root.clone().unwrap_or(std::env::current_dir()?);
     if let Some(last) = last_session_here(&dirs, &here) {
         print!("\n{last}");
     }
-    let view = system::system_view(&repos(roots)?);
-    println!("\n{}", system::briefing(&view, &here));
+    // Validate configured discovery roots; do not derive unrelated repositories.
+    repos(roots)?;
+    let scans = dirs
+        .repo_root
+        .iter()
+        .chain(&scoped)
+        .map(|p| scan_repo(p))
+        .collect();
+    let view = selected_perimeter(
+        &here,
+        dirs.repo_root.is_some(),
+        &scoped,
+        scans,
+        scan::scan_outside(),
+    );
+    println!("\n{}", scoped_perimeter_text(&view, &here));
     // An incomplete perimeter is said with the exit code, as `system` does.
-    Ok(view.exit_code())
+    Ok(if unscoped.is_empty() {
+        view.exit_code()
+    } else {
+        INCOMPLETE
+    })
 }
 
 // ---- the session log ---------------------------------------------------------
@@ -1434,12 +1513,17 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let task = if no_briefing {
         task.map(String::from)
     } else {
-        let (knowledge, nodes) = knowledge_briefing_for(&dirs, &Scope::ALL)?;
+        let (knowledge, nodes) = knowledge_for_work(&dirs, &scoped_repos)?;
         delivered = nodes;
         let last = last_session_here(&dirs, &root).unwrap_or_default();
-        let fleet = repos(roots)?;
-        let view = system::system_view(&fleet);
-        let perimeter = system::briefing(&view, &root);
+        repos(roots)?;
+        let scans = in_repo
+            .then(|| scan.clone())
+            .into_iter()
+            .chain(scoped_scans.iter().cloned())
+            .collect();
+        let view = selected_perimeter(&root, in_repo, &scoped_repos, scans, outside.clone());
+        let perimeter = scoped_perimeter_text(&view, &root);
         let how = lifecycle_briefing(&root, in_repo, &scoped_repos);
         let parts: Vec<&str> = [
             knowledge.as_str(),
@@ -1790,10 +1874,15 @@ fn lifecycle_briefing(root: &Path, in_repo: bool, scoped: &[PathBuf]) -> String 
     format!(
         "\
 How this session works (ohjaa):
+If no concrete task is assigned, acknowledge and wait; the wrapper has already
+recorded entry. Do not run orientation, discovery or handover tools just to start.
+Once a task is assigned, use this briefing and the Toimija packet as your starting
+knowledge. Read the named files to resolve gaps; do not repeat repository discovery.
 1. Before your first change, read back what you know:
    ohjaa oriented \"<the goal in one line; the rules that apply; who else is working>\"
 {phases}
-3. Before you finish, write the handover for whoever comes next:
+3. When finishing the assigned work or leaving the session, write the handover
+   for whoever comes next (not after every conversational reply):
    ohjaa handover --unfinished \"…\" --next \"…\" --surprised \"…\"
 "
     )
@@ -1849,7 +1938,8 @@ fn main() {
         Cmd::Brief {
             knowledge_only,
             write,
-        } => cmd_brief(&cli.root, *knowledge_only, write),
+            scope,
+        } => cmd_brief(&cli.root, *knowledge_only, write, scope),
         Cmd::Fleet { json } => cmd_fleet(&cli.root, *json),
         Cmd::System { json } => cmd_system(&cli.root, *json),
         Cmd::List { all } => cmd_list(*all),

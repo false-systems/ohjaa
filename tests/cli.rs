@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const STUB: &str = r#"#!/bin/sh
+printf '%s|%s\n' "$PWD" "$*" >> "$OHJAA_STUB_CALLS"
 if [ "$1" = run ]; then printf '%s\n' "$@" > "$OHJAA_STUB_ARGV"; fi
 case "$PWD" in
   *broken*) echo "boom: not a Git repository" >&2; exit 1;;
@@ -206,6 +207,7 @@ impl Fixture {
             .env("OHJAA_OURS", self.dir.join("ours"))
             .env("OHJAA_TODAY", "2026-09-24")
             .env("OHJAA_STUB_ARGV", self.dir.join("argv.txt"))
+            .env("OHJAA_STUB_CALLS", self.dir.join("calls.txt"))
             .env("OHJAA_STUB_SESSIONS", self.dir.join("sessions.json"))
             .env("OHJAA_STUB_OUTSIDE_SESSIONS", self.dir.join("outside.json"))
             .env("OHJAA_STUB_CONTEXT", self.dir.join("context.json"));
@@ -607,7 +609,7 @@ fn run_prepends_the_system_perimeter_to_the_task() {
     fixture.cleanup();
 
     assert_eq!(code, Some(0));
-    // The task is user task + perimeter: the agent starts knowing the fleet.
+    // The task includes the selected repository's perimeter, not the whole fleet.
     assert!(stderr.contains("fix the lexer"), "{stderr}");
     assert!(stderr.contains("System perimeter"), "{stderr}");
     assert!(
@@ -896,6 +898,170 @@ fn run_briefs_knowledge_before_the_perimeter() {
     let knowledge = stderr.find("Rust only.").expect("knowledge in the task");
     let perimeter = stderr.find("System perimeter").expect("perimeter");
     assert!(task < knowledge && knowledge < perimeter, "{stderr}");
+    fixture.cleanup();
+}
+
+#[test]
+fn startup_is_scoped_reuses_scans_and_delivers_repo_knowledge_from_the_root() {
+    let fixture = Fixture::new("scoped-startup");
+    let repo = fixture.make_git_repo("selected");
+    fixture.set_context(r#"{"repo":{"name":"selected","role":"selected role","not_roles":[]}}"#);
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        "personal",
+        "decision",
+        "Keep this personal decision.",
+    );
+    fixture.node(
+        &repo.join(".ohjaa/knowledge"),
+        "repo-rule",
+        "decision",
+        "Selected repository rule.",
+    );
+    let launch = || {
+        output_of(fixture.ohjaa_in(&fixture.dir).args([
+            "run",
+            "codex",
+            "--intent",
+            "fix selected",
+            "--dry-run",
+            "--scope",
+            repo.to_str().unwrap(),
+        ]))
+    };
+    let (_, before, code) = launch();
+    assert_eq!(code, Some(0), "{before}");
+    assert!(
+        before.contains("Keep this personal decision.")
+            && before.contains("Selected repository rule.")
+    );
+    let calls = fs::read_to_string(fixture.dir.join("calls.txt")).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.ends_with("|sessions --json --outside-repos"))
+            .count(),
+        1,
+        "{calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.ends_with("|sessions --json"))
+            .count(),
+        1,
+        "{calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.ends_with("|context --json"))
+            .count(),
+        1,
+        "{calls}"
+    );
+
+    // Growing the unrelated fleet must not grow the prompt or trigger its scans.
+    for i in 0..20 {
+        fixture.make_repo(&format!("broken-unrelated-{i}"));
+    }
+    fs::write(fixture.dir.join("calls.txt"), "").unwrap();
+    let (_, after, code) = launch();
+    assert_eq!(code, Some(0), "{after}");
+    assert_eq!(after.len(), before.len());
+    assert!(!after.contains("broken-unrelated"));
+    assert!(!fs::read_to_string(fixture.dir.join("calls.txt"))
+        .unwrap()
+        .contains("broken-unrelated"));
+    assert!(after.contains("Other repositories were not scanned"));
+
+    let (brief, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "brief",
+        "--scope",
+        repo.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(brief.contains("Selected repository rule.") && !brief.contains("broken-unrelated"));
+    let (_, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "run",
+        "codex",
+        "--intent",
+        "fix selected",
+        "--scope",
+        repo.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    let (export, stderr, code) =
+        output_of(fixture.ohjaa_in(&fixture.dir).args(["usage", "export"]));
+    assert_eq!(code, Some(0), "{stderr}");
+    let export: serde_json::Value = serde_json::from_str(&export).unwrap();
+    let delivered = export["sessions"][0]["delivered"].as_array().unwrap();
+    let node = delivered.iter().find(|n| n["id"] == "repo-rule").unwrap();
+    assert_eq!(node["repo"], repo.canonicalize().unwrap().to_str().unwrap());
+    assert_eq!(node["scope"], "repo");
+    fixture.node(
+        &repo.join(".ohjaa/knowledge"),
+        "long-rule",
+        "decision",
+        &"Keep this rule. ".repeat(600),
+    );
+    let (brief, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "brief",
+        "--knowledge-only",
+        "--scope",
+        repo.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("combined scoped knowledge briefing"));
+    assert_eq!(
+        brief.matches("Keep this rule.").count(),
+        600,
+        "knowledge must not be truncated"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn unassigned_startup_does_not_derive_the_fleet_and_scope_failures_remain_visible() {
+    let fixture = Fixture::new("unassigned");
+    fixture.make_repo("broken-unrelated");
+    let (_, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "run",
+        "codex",
+        "--intent",
+        "unknown",
+        "--dry-run",
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("If no concrete task is assigned, acknowledge and wait"));
+    let calls = fs::read_to_string(fixture.dir.join("calls.txt")).unwrap();
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "only the outside-session preflight is needed: {calls}"
+    );
+    assert!(!stderr.contains("broken-unrelated"));
+
+    let selected = fixture.make_git_repo("selected");
+    // Role derivation failed: no context payload exists. It must be marked unknown.
+    let (brief, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "brief",
+        "--scope",
+        selected.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(4), "{brief}{stderr}");
+    assert!(brief.contains("role not derivable"));
+    fixture.set_context(r#"{"repo":{"name":"selected","role":"role"}}"#);
+    fixture.set_outside_sessions(
+        r#"{"sessions":[],"coverage":{"status":"degraded"},"warnings":["partial outside scan"]}"#,
+    );
+    let (brief, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "brief",
+        "--scope",
+        selected.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(4), "{brief}{stderr}");
+    assert!(brief.contains("incomplete") && brief.contains("partial outside scan"));
     fixture.cleanup();
 }
 

@@ -119,6 +119,23 @@ pub fn system_view(repos: &[PathBuf]) -> SystemView {
     })
 }
 
+/// Use the launch preflight's observations instead of scanning the fleet again.
+/// Repositories not selected are unobserved, not empty.
+pub fn scoped_view(repos: &[PathBuf], scans: Vec<Scan>) -> SystemView {
+    let mut tools: Vec<_> = repos.iter().map(|repo| Tool::derive(repo)).collect();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    let unknown = tools
+        .iter()
+        .filter(|t| t.role.is_none())
+        .map(|t| t.path.clone())
+        .collect();
+    SystemView {
+        tools,
+        unknown,
+        scans,
+    }
+}
+
 impl SystemView {
     fn scan_for(&self, tool: &Tool) -> Option<&Scan> {
         self.scans.iter().find(|scan| scan.repo == tool.path)
@@ -214,7 +231,7 @@ pub fn briefing(view: &SystemView, here: &Path) -> String {
     let mut out = String::from(
         "System perimeter (derived by ohjaa at launch; re-derive with\n\
          `ohjaa system`, session observations via `ohjaa fleet`):\n\n\
-         Fleet — each tool self-declares its role in its repo:\n",
+         Repositories — each tool self-declares its role in its repo:\n",
     );
     for tool in &view.tools {
         let role = tool
@@ -298,7 +315,7 @@ pub fn briefing(view: &SystemView, here: &Path) -> String {
     }
     out.push_str(
         "\nCoordination: claiming work stays in GitHub issues/PRs; sessions are\n\
-         observations, not locks. Re-derive them before acting.",
+         observations, not locks. Refresh when scope or session state may have changed.",
     );
     out
 }
