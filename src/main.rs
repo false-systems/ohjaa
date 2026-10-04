@@ -506,8 +506,9 @@ fn repo_key(repo: &Path) -> String {
 /// "Last session here", when the log knows one.
 fn last_session_here(dirs: &Dirs, repo: &Path) -> Option<String> {
     let store = session_store(dirs)?;
-    match store.latest_for(&repo_key(repo)) {
-        Ok(Some(session)) => Some(sessions::render_last(&session)),
+    let here = repo_key(repo);
+    match store.latest_for(&here) {
+        Ok(Some(session)) => Some(sessions::render_last(&session, &here)),
         Ok(None) => None,
         Err(error) => {
             eprintln!("ohjaa: {error}");
@@ -610,7 +611,10 @@ fn cmd_session(id: Option<&str>) -> Result<i32> {
                 let (all, unreadable) = store.all().map_err(|e| anyhow::anyhow!("{e}"))?;
                 let unended: Vec<_> = all
                     .into_iter()
-                    .filter(|s| s.repo == key && s.left.is_none())
+                    .filter(|s| {
+                        s.left.is_none()
+                            && (s.repo == key || s.scoped.iter().any(|scoped| scoped.repo == key))
+                    })
                     .collect();
                 print!(
                     "{}",

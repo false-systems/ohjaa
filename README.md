@@ -135,7 +135,7 @@ until it ends so the last one always happens:
 States are **observed, not declared**: the agent writes only its read-back and
 its handover, and the record shows them as its words. Leaving always writes the
 record, crash or not; a missing handover is recorded as none. The next session
-here is briefed with it:
+here, and in every repository it named with `--scope`, is briefed with it:
 
 ```
 session oh-1790… · claude · selko · 2026-09-26 10:02 UTC → 2026-09-26 11:47 UTC · ended: clean (exit 0)
@@ -238,7 +238,10 @@ launched in:
   (with what sykli saw on each) and the branch's pull request;
 - **the other way round**, a session launched inside a repo counts the sessions
   from the root whose `--scope` names it (`ohjaa fleet` lists them under
-  "outside any repository", with their scope).
+  "outside any repository", with their scope);
+- **the next agent there** is briefed with it: "the last session here" is the
+  one that ended last, launched in that repo or elsewhere with a `--scope`
+  naming it, and one launched elsewhere says where it was launched.
 
 What ohjaa still cannot see, it says: a `--scope` path outside every repository
 is named as unobserved, and work in a repository nobody named is not recorded,
