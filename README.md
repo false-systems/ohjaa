@@ -187,8 +187,11 @@ The records live in a **session log**, redb at
 `~/.local/state/ohjaa/sessions.redb`, on this machine only. Knowledge never
 lives there, so deleting the log loses no knowledge. A busy or broken log never
 blocks a launch; a broken one is reported and left alone, never replaced.
-`ohjaa intake` drafts proposals from each ended session once: its handover and
-what was said in its window.
+`ohjaa intake` drafts proposals from each ended session once: its handover,
+what was said in its window, and what ohjaa observed going wrong in it (source
+`observed`): work that reached the default branch, or a pull request head,
+without passing evidence; a non-zero exit; a missing handover; an orphaned
+session. Those are facts, not anyone's words, and the drafter is told so.
 
 Signals, while a session runs (unix):
 

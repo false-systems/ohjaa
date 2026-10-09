@@ -1261,6 +1261,7 @@ fn cmd_intake(
     }
     if !queued.is_empty() {
         candidates.extend(intake::handover_candidates(&queued));
+        candidates.extend(intake::observed_candidates(&queued));
         eprintln!(
             "ohjaa: {} ended session(s) queued for drafting",
             queued.len()

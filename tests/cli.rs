@@ -3389,3 +3389,66 @@ fn a_session_whose_ohjaa_was_killed_is_closed_as_orphaned_at_the_next_launch() {
     );
     fixture.cleanup();
 }
+
+#[test]
+fn intake_drafts_from_what_ohjaa_observed_going_wrong_not_only_the_handover() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("anomalies");
+    let repo = clone_with_origin(&fixture, "work");
+    // An unchecked commit pushed to main, a failing exit, and no handover.
+    let script = "set -e
+        echo x > x.txt && git add x.txt && git commit -q -m 'unchecked'
+        git push -q origin HEAD:main
+        exit 3";
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "hurry",
+                "--no-briefing",
+                "--",
+                "-c",
+                script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(3), "{stderr}");
+    let pushed = short_head(&repo);
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ncat > {}\necho '[]'\n",
+            fixture.dir.join("prompt.txt").display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--source", "transcripts", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let prompt = fs::read_to_string(fixture.dir.join("prompt.txt")).unwrap();
+    for said in [
+        " · observed · ",
+        &format!(
+            "origin/main at {pushed} in work has no passing evidence — check before building on it \
+             (unchecked: no sykli receipt for its tree)"
+        ),
+        "the agent exited with code 3",
+        "the agent left no handover",
+    ] {
+        assert!(prompt.contains(said), "missing `{said}`: {prompt}");
+    }
+    fixture.cleanup();
+}

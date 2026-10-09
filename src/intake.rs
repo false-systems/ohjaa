@@ -486,6 +486,59 @@ pub fn handover_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candida
     out
 }
 
+/// What ohjaa observed going wrong in each ended session, as candidates: a
+/// commit that reached the default branch, or a pull request head, without
+/// passing evidence; an agent that exited non-zero; a missing handover; a
+/// session whose ohjaa was killed. Observed facts, not anyone's words: the
+/// drafter weighs them like any candidate, and a person decides.
+pub fn observed_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candidate> {
+    use crate::sessions::Exit;
+    let mut out = Vec::new();
+    for session in sessions {
+        let Some(left) = &session.left else {
+            continue;
+        };
+        let mut seen: Vec<String> = crate::sessions::flags(session)
+            .into_iter()
+            .map(|flag| format!("{} ({})", flag.headline, flag.why))
+            .collect();
+        if left.orphaned {
+            seen.push(
+                "its ohjaa was killed before leaving; the session was closed as orphaned at \
+                 a later launch, and nothing it did was observed"
+                    .to_owned(),
+            );
+        } else {
+            match left.exit {
+                Exit::Code { code: 0 } => {}
+                Exit::Code { code } => seen.push(format!("the agent exited with code {code}")),
+                Exit::Signal { signal } => {
+                    seen.push(format!("the agent was killed by signal {signal}"))
+                }
+                Exit::Unknown => seen.push("the agent's exit could not be observed".to_owned()),
+            }
+            if session.handover.is_none() {
+                seen.push("the agent left no handover".to_owned());
+            }
+        }
+        for what in seen {
+            out.push(Candidate {
+                source: "observed",
+                at_ms: left.ended_ms,
+                at: rfc3339(left.ended_ms.div_euclid(1000)),
+                place: session.repo.clone(),
+                who: "ohjaa".to_owned(),
+                context: format!(
+                    "session {} ({}, {}), observed by ohjaa, not said by anyone",
+                    session.id, session.agent, session.intent
+                ),
+                text: format!("in session {}: {what}", session.id),
+            });
+        }
+    }
+    out
+}
+
 /// The transcript candidates that fall inside one of these sessions: its time
 /// window, in its repository (or below it).
 pub fn within_sessions(
@@ -510,7 +563,11 @@ pub fn within_sessions(
 const INSTRUCTIONS: &str = "\
 You maintain a knowledge graph that steers coding agents (Claude, Codex) for the
 people they work for. Below are candidates: messages people wrote while working
-with agents, comments on pull requests, and reverted commits. Find the ones that
+with agents, comments on pull requests, reverted commits, and failures ohjaa
+observed in agent sessions (source \"observed\": work that reached the default
+branch without passing evidence, a non-zero exit, a missing handover, a session
+cut off). An observed failure is a fact, not anyone's words: cite it as observed,
+and draft from it only a lesson that would have prevented it. Find the ones that
 carry durable knowledge an agent should have known: a correction of how an agent
 behaved, a decision, a fact about the environment, a preference about how work
 is done, or a lesson from something that went wrong. Draft each as a node.
@@ -826,6 +883,61 @@ mod tests {
         ] {
             assert_eq!(parse_time(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn observed_failures_are_candidates_and_a_clean_session_raises_none() {
+        use crate::sessions::{Exit, Finished, Handover, Left, Session};
+        let session = |id: &str, left: Left, handover: bool| Session {
+            id: id.to_owned(),
+            agent: "claude".to_owned(),
+            repo: "/r/selko".to_owned(),
+            outside_repo: false,
+            intent: "retry uploads".to_owned(),
+            started_ms: 1_000,
+            branch: None,
+            head_at_start: None,
+            scoped: Vec::new(),
+            delivered: Vec::new(),
+            readback: None,
+            handover: handover.then(Handover::default),
+            left: Some(left),
+            drafted: false,
+            usage: Vec::new(),
+            usage_refused: None,
+        };
+        let ended = |exit: Exit| Left {
+            exit,
+            ..Left::orphaned(2_000)
+        };
+        let clean = Left {
+            orphaned: false,
+            finished: Finished::NoPullRequest,
+            ..ended(Exit::Code { code: 0 })
+        };
+        let killed = Left {
+            orphaned: false,
+            ..ended(Exit::Signal { signal: 9 })
+        };
+        let found = observed_candidates(&[
+            session("oh-1", clean, true),
+            session("oh-2", killed, true),
+            session("oh-3", Left::orphaned(3_000), false),
+        ]);
+        let texts: Vec<&str> = found.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "in session oh-2: the agent was killed by signal 9",
+                "in session oh-3: its ohjaa was killed before leaving; the session was closed as \
+                 orphaned at a later launch, and nothing it did was observed",
+            ],
+            "a clean session with a handover raises nothing; an orphan is not also blamed \
+             for the handover it could not write"
+        );
+        assert!(found
+            .iter()
+            .all(|c| c.source == "observed" && c.who == "ohjaa"));
     }
 
     #[test]
