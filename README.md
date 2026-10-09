@@ -135,8 +135,8 @@ until it ends so the last one always happens:
 |---|---|---|
 | 1 entering | knowledge, the last session here, lifecycle instructions, and scoped context | ohjaa |
 | 2 oriented | the agent reads back what it knows: `ohjaa oriented "<goal; rules; who else>"` | the agent |
-| 3 working | small phases, each a commit and, where the repo has a sykli contract, a `sykli run` on it | observed from git and `.sykli/receipts`: the commits HEAD's reflog shows made in this checkout since entering, never ones a pull or merge brought in |
-| 4 finished | the branch's pull request, and whether its head has evidence | observed through `gh` |
+| 3 working | small phases, each a commit and, where the repo has a sykli contract, a `sykli run` on it | observed from git and `.sykli/receipts` in every checkout `git worktree list` names: the commits a reflog (a checkout's HEAD, or a branch) shows created since entering and still reachable, never ones a pull or merge brought in, nor one an amend or rebase replaced; a checkout where another session was launched is that session's |
+| 4 finished | the pull request of the branch the newest commit was made on, and whether its head has evidence | observed through `gh` |
 | 5 leaving | the record: observed part, then the handover (`ohjaa handover`) | ohjaa, and the agent's testimony |
 
 States are **observed, not declared**: the agent writes only its read-back and

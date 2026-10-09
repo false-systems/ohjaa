@@ -71,12 +71,19 @@ pub struct Evidence {
 }
 
 /// One phase of work: a commit, and what sykli saw on it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Phase {
     pub commit: String,
     pub subject: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Evidence>,
+    /// The commit's tree, which a sykli receipt names; older records omit it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tree: String,
+    /// The checkout it was made in, when that is not the repository the
+    /// record is about (a worktree of it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -664,8 +671,13 @@ fn describe_phases(phases: Option<&Vec<Phase>>, interrupted: bool) -> String {
         Some(phases) => phases
             .iter()
             .map(|p| {
+                let place = p
+                    .worktree
+                    .as_deref()
+                    .map(|path| format!(" (in {})", repo_name(path)))
+                    .unwrap_or_default();
                 format!(
-                    "{} {}",
+                    "{} {}{place}",
                     short(&p.commit),
                     describe_evidence(p.evidence.as_ref())
                 )
@@ -865,6 +877,7 @@ mod tests {
                             outcome: "passed".to_owned(),
                             dirty: false,
                         }),
+                        ..Default::default()
                     }]),
                     finished: Finished::NoPullRequest,
                 },
@@ -1082,11 +1095,13 @@ mod tests {
                         outcome: "passed".to_owned(),
                         dirty: false,
                     }),
+                    ..Default::default()
                 },
                 Phase {
                     commit: "0718abcdef".to_owned(),
                     subject: "two".to_owned(),
                     evidence: None,
+                    ..Default::default()
                 },
             ]),
             finished: Finished::NoPullRequest,
@@ -1204,6 +1219,7 @@ mod tests {
                 outcome: "passed".to_owned(),
                 dirty: false,
             }),
+            ..Default::default()
         };
         let mut s = ended(s, 2_000);
         let left = s.left.as_mut().unwrap();

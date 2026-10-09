@@ -1708,10 +1708,14 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let toimija_session =
         unless_interrupted(|| lifecycle::toimija_session(&root, !in_repo, child.id(), started_ms))
             .flatten();
+    // Checkouts where another session was launched while this one ran hold
+    // that session's work, not this one's.
+    let skip = unless_interrupted(|| other_sessions_checkouts(&dirs, &session_id, started_ms))
+        .unwrap_or_default();
     // Outside a repository the folder itself has no commits or pull request
     // to observe; the record says why, and asks neither git nor gh there.
     let (phases, finished) = if in_repo {
-        observe_repo(&root, session.head_at_start.as_deref(), started_ms)
+        observe_repo(&root, session.head_at_start.as_deref(), started_ms, &skip)
     } else {
         let finished = sessions::Finished::Unknown {
             why: "not a Git repository".to_owned(),
@@ -1727,6 +1731,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 Path::new(&scoped.repo),
                 scoped.head_at_start.as_deref(),
                 started_ms,
+                &skip,
             );
             sessions::ScopedLeft {
                 repo: scoped.repo.clone(),
@@ -1821,23 +1826,43 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     Ok(lifecycle::exit_code(exit))
 }
 
+/// The checkouts other sessions in the log were launched in while this one
+/// ran (`started_ms` to now). Read in one short open of the log.
+fn other_sessions_checkouts(dirs: &Dirs, id: &str, started_ms: i64) -> Vec<PathBuf> {
+    let Some((all, _)) = session_store(dirs).and_then(|store| store.all().ok()) else {
+        return Vec::new();
+    };
+    all.into_iter()
+        .filter(|s| s.id != id && !s.outside_repo)
+        .filter(|s| {
+            s.left
+                .as_ref()
+                .is_none_or(|left| left.ended_ms >= started_ms)
+        })
+        .map(|s| PathBuf::from(s.repo))
+        .collect()
+}
+
 /// Run one step of leaving's observing, unless a signal has cut leaving short.
 fn unless_interrupted<T>(step: impl FnOnce() -> T) -> Option<T> {
     (!process::cancelled()).then(step)
 }
 
 /// Leaving's observation of one repository: the commits this session made
-/// there, with what sykli saw on each, and the branch's pull request.
+/// there, in any of its checkouts, with what sykli saw on each, and the pull
+/// request of the branch the newest one was made on. Checkouts in `skip` are
+/// other sessions'.
 fn observe_repo(
     repo: &Path,
     head_at_start: Option<&str>,
     started_ms: i64,
+    skip: &[PathBuf],
 ) -> (Option<Vec<sessions::Phase>>, sessions::Finished) {
-    let receipts = unless_interrupted(|| lifecycle::receipts_by_tree(repo)).unwrap_or_default();
-    let phases =
-        unless_interrupted(|| lifecycle::phases(repo, head_at_start, started_ms, &receipts))
-            .flatten();
-    let finished = match unless_interrupted(|| lifecycle::finished(repo, &receipts)) {
+    let work = unless_interrupted(|| lifecycle::observe(repo, head_at_start, started_ms, skip))
+        .unwrap_or_default();
+    let phases = work.phases;
+    let finished = match unless_interrupted(|| lifecycle::finished(&work.checkout, &work.receipts))
+    {
         Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
         other => other,
     }

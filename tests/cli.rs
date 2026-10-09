@@ -2790,3 +2790,56 @@ fn a_briefing_too_big_for_one_command_line_argument_is_refused_clearly() {
     );
     fixture.cleanup();
 }
+
+// ---- where work happens (audit 2026-10-09): each test failed before its fix ----
+
+/// A shell function for stub agents: `receipt <outcome>` writes a
+/// sykli-receipt.v1 for HEAD's tree into this checkout, as `sykli run` does.
+const RECEIPT_FN: &str = r#"
+receipt() {
+  tree=$(git rev-parse 'HEAD^{tree}')
+  mkdir -p .sykli/receipts
+  printf '{"schema":"sykli-receipt.v1","contract_hash":"c","started_at_ms":%s000,"subject":{"repository":"r","tree_oid":"%s","inputs_digest":"d","head_tree_oid":"%s","dirty":false},"tasks":[],"outcome":"%s"}' \
+    "$(date +%s)" "$tree" "$tree" "$1" > ".sykli/receipts/rcpt_$tree.json"
+}
+"#;
+
+fn short_head(dir: &Path) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[test]
+fn a_commit_made_in_a_worktree_is_a_phase_with_the_receipt_made_there() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("worktree");
+    let repo = fixture.make_git_repo("work");
+    let worktree = fixture.dir.join("_worktrees").join("work-feat");
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        git worktree add -q -b feat '{wt}'
+        cd '{wt}'
+        echo one > a.txt && git add a.txt && git commit -q -m 'worktree phase'
+        receipt passed",
+        wt = worktree.display()
+    );
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+    let commit = short_head(&worktree);
+    let phases = stderr
+        .lines()
+        .find(|l| l.starts_with("phases"))
+        .expect(&stderr);
+    assert!(
+        phases.contains(&commit) && phases.contains("passed") && phases.contains("in work-feat"),
+        "the worktree's commit is a phase, with the receipt sykli wrote there: {phases}"
+    );
+    fixture.cleanup();
+}

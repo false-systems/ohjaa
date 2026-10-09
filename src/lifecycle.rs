@@ -30,7 +30,7 @@
 //! and the agent must still stop on Ctrl-C.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 #[cfg(unix)]
 use std::time::Duration;
@@ -230,48 +230,127 @@ pub fn has_sykli_contract(repo: &Path) -> bool {
         .any(|name| repo.join(name).is_file())
 }
 
-/// Sykli receipts keyed by the HEAD tree they ran on, with when they started.
-pub type Receipts = std::collections::HashMap<String, (i64, Evidence)>;
+/// One checkout of a repository: its main worktree or a linked one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    /// Canonical.
+    pub path: PathBuf,
+    pub head: Option<String>,
+    /// `refs/heads/<name>`, when a branch is checked out there.
+    pub branch: Option<String>,
+}
 
-/// The sykli receipts in a repository, keyed by the HEAD tree they ran on.
-/// Reads `sykli-receipt.v1`: `subject.head_tree_oid`, `subject.dirty`,
-/// `outcome`, `started_at_ms`. The newest receipt for a tree wins. Read once
-/// per leaving and shared by `phases` and `finished`.
-pub fn receipts_by_tree(repo: &Path) -> Receipts {
-    let mut found = std::collections::HashMap::new();
-    let Ok(entries) = std::fs::read_dir(repo.join(".sykli").join("receipts")) else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "json") {
-            continue;
-        }
-        let Some(receipt) = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        else {
-            continue;
-        };
-        if receipt["schema"] != "sykli-receipt.v1" {
-            continue;
-        }
-        let (Some(tree), Some(outcome)) = (
-            receipt["subject"]["head_tree_oid"].as_str(),
-            receipt["outcome"].as_str(),
-        ) else {
-            continue;
-        };
-        let at = receipt["started_at_ms"].as_i64().unwrap_or(0);
-        let evidence = Evidence {
-            outcome: outcome.to_owned(),
-            dirty: receipt["subject"]["dirty"].as_bool().unwrap_or(true),
-        };
-        match found.get(tree) {
-            Some((seen, _)) if *seen >= at => {}
-            _ => {
-                found.insert(tree.to_owned(), (at, evidence));
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Every checkout of the repository `repo` lies in, the main one first, as
+/// `git worktree list --porcelain` names them. A bare main repository and
+/// checkouts whose folder is gone are left out. Only `repo` itself when git
+/// cannot list them.
+pub fn worktrees(repo: &Path) -> Vec<Worktree> {
+    let listed = git(repo, &["worktree", "list", "--porcelain"])
+        .map(|porcelain| parse_worktrees(&porcelain))
+        .unwrap_or_default();
+    if listed.is_empty() {
+        return vec![Worktree {
+            path: canonical(repo),
+            head: head(repo),
+            branch: git(repo, &["symbolic-ref", "-q", "HEAD"]),
+        }];
+    }
+    listed
+}
+
+fn parse_worktrees(porcelain: &str) -> Vec<Worktree> {
+    porcelain
+        .split("\n\n")
+        .filter_map(|block| {
+            let mut path = None;
+            let mut head = None;
+            let mut branch = None;
+            for line in block.lines() {
+                match line.split_once(' ') {
+                    Some(("worktree", value)) => path = Some(PathBuf::from(value)),
+                    Some(("HEAD", value)) => head = Some(value.to_owned()),
+                    Some(("branch", value)) => branch = Some(value.to_owned()),
+                    _ if line == "bare" => return None,
+                    _ => {}
+                }
             }
+            let path = path.filter(|path| path.is_dir())?;
+            Some(Worktree {
+                path: canonical(&path),
+                head,
+                branch,
+            })
+        })
+        .collect()
+}
+
+/// A sykli receipt: what it says, and where it lies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Receipt {
+    /// When the run started, in milliseconds.
+    pub at: i64,
+    pub evidence: Evidence,
+    pub path: PathBuf,
+    /// The checkout sykli ran in.
+    pub checkout: PathBuf,
+}
+
+/// Sykli receipts keyed by the HEAD tree they ran on.
+pub type Receipts = std::collections::HashMap<String, Receipt>;
+
+/// The sykli receipts in these checkouts, keyed by the HEAD tree they ran on.
+/// Reads `sykli-receipt.v1`: `subject.head_tree_oid`, `subject.dirty`,
+/// `outcome`, `started_at_ms`. A tree is its content, so a receipt is about
+/// that tree in whichever checkout sykli ran; the newest receipt for a tree
+/// wins. Read once per repository at leaving, and shared by its phases and
+/// its pull request.
+pub fn receipts_in<'a>(checkouts: impl IntoIterator<Item = &'a Path>) -> Receipts {
+    let mut found = Receipts::new();
+    for checkout in checkouts {
+        let Ok(entries) = std::fs::read_dir(checkout.join(".sykli").join("receipts")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let Some(receipt) = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            else {
+                continue;
+            };
+            if receipt["schema"] != "sykli-receipt.v1" {
+                continue;
+            }
+            let (Some(tree), Some(outcome)) = (
+                receipt["subject"]["head_tree_oid"].as_str(),
+                receipt["outcome"].as_str(),
+            ) else {
+                continue;
+            };
+            let at = receipt["started_at_ms"].as_i64().unwrap_or(0);
+            if found.get(tree).is_some_and(|seen| seen.at >= at) {
+                continue;
+            }
+            let evidence = Evidence {
+                outcome: outcome.to_owned(),
+                dirty: receipt["subject"]["dirty"].as_bool().unwrap_or(true),
+            };
+            found.insert(
+                tree.to_owned(),
+                Receipt {
+                    at,
+                    evidence,
+                    path,
+                    checkout: checkout.to_path_buf(),
+                },
+            );
         }
     }
     found
@@ -280,84 +359,279 @@ pub fn receipts_by_tree(repo: &Path) -> Receipts {
 /// The most phases a record keeps: the newest ones.
 const MAX_PHASES: usize = 50;
 
-/// State 3, observed: every commit this session made, each with whatever
-/// sykli saw on its tree. A commit is this session's when it is on HEAD but
-/// not on the starting commit, and HEAD's reflog shows it created in this
-/// checkout since the session started. Commits a pull, merge or reset brought
-/// in were made elsewhere, and are not phases. `None` when that cannot be
-/// observed: no starting commit, git failed, or HEAD moved while its reflog
-/// recorded nothing.
-pub fn phases(
+/// One reflog entry: `reference` moved to `commit`, at `at` (unix seconds).
+struct Move {
+    reference: String,
+    at: i64,
+    commit: String,
+    subject: String,
+}
+
+const REFLOG_FORMAT: &str = "--format=%gD%x1f%H%x1f%gs";
+
+/// Reflog entries, newest first per reference, from `git <args>` run with
+/// `--date=unix` and [`REFLOG_FORMAT`].
+fn reflog(dir: &Path, args: &[&str]) -> Option<Vec<Move>> {
+    let log = git(dir, args)?;
+    Some(
+        log.lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(3, '\u{1f}');
+                let (selector, commit, subject) = (fields.next()?, fields.next()?, fields.next()?);
+                // `refs/heads/main@{1790380435}`, with --date=unix.
+                let (reference, rest) = selector.rsplit_once("@{")?;
+                let at = rest.strip_suffix('}')?.parse::<i64>().ok()?;
+                Some(Move {
+                    reference: reference.to_owned(),
+                    at,
+                    commit: commit.to_owned(),
+                    subject: subject.to_owned(),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// What leaving observed of one repository's commits, in all its checkouts.
+#[derive(Debug, Clone, Default)]
+pub struct Work {
+    /// `None` when they could not be observed (see [`observe`]).
+    pub phases: Option<Vec<Phase>>,
+    /// The checkout this session's newest commit was made in, where its
+    /// branch's pull request is looked up; the repository itself otherwise.
+    pub checkout: PathBuf,
+    /// Whether any of its checkouts or branches moved during the session.
+    pub moved: bool,
+    /// The receipts in every checkout read.
+    pub receipts: Receipts,
+}
+
+/// State 3, observed: every commit this session made in `repo`, in any of its
+/// checkouts (`git worktree list`), each with whatever sykli saw on its tree.
+///
+/// A commit is this session's when a reflog — a checkout's HEAD, or a branch
+/// — shows it created since the session started, and it is still reachable
+/// from a branch, a remote branch or a checkout. Commits a pull, merge or
+/// reset brought in were made elsewhere, and are not phases; nor is one that
+/// an amend or a rebase replaced. Checkouts in `skip` (where another session
+/// was launched) are someone else's: neither their HEAD nor the branch checked
+/// out there is read, though `repo` itself is never skipped.
+///
+/// Phases are `None` when they cannot be observed: git failed in `repo`, or
+/// its HEAD moved from `head_at_start` while its reflog recorded nothing.
+pub fn observe(
     repo: &Path,
     head_at_start: Option<&str>,
     started_ms: i64,
-    receipts: &Receipts,
+    skip: &[PathBuf],
+) -> Work {
+    let repo = canonical(repo);
+    let since = started_ms.div_euclid(1000);
+    let all = worktrees(&repo);
+    let skipped = |path: &Path| path != repo && skip.iter().any(|s| s == path);
+    let checkouts: Vec<&Worktree> = all.iter().filter(|w| !skipped(&w.path)).collect();
+    let mut work = Work {
+        checkout: repo.clone(),
+        receipts: receipts_in(checkouts.iter().map(|w| w.path.as_path())),
+        ..Work::default()
+    };
+    // Each commit created since the start, with the checkout it was made in
+    // when known.
+    let mut created: std::collections::HashMap<String, Option<PathBuf>> = Default::default();
+    // What each reference pointed at when the session started: nothing
+    // reachable from those was made by this session.
+    let mut boundaries: Vec<String> = head_at_start.into_iter().map(str::to_owned).collect();
+    let mut repo_moves = None;
+    for checkout in &checkouts {
+        let Some(moves) = reflog(
+            &checkout.path,
+            &[
+                "log",
+                "--walk-reflogs",
+                "--date=unix",
+                REFLOG_FORMAT,
+                "HEAD",
+            ],
+        ) else {
+            continue;
+        };
+        let mut in_window = 0;
+        let mut boundary = None;
+        for entry in moves {
+            if entry.at < since {
+                boundary.get_or_insert(entry.commit);
+                continue;
+            }
+            in_window += 1;
+            if created_here(&entry.subject) {
+                created
+                    .entry(entry.commit)
+                    .or_insert_with(|| Some(checkout.path.clone()));
+            }
+        }
+        boundaries.extend(boundary);
+        work.moved |= in_window > 0;
+        if checkout.path == repo {
+            repo_moves = Some(in_window);
+        }
+    }
+    // Branches and remote branches, shared by every checkout: a commit made in
+    // a checkout removed since is still on its branch's reflog.
+    if let Some(moves) = reflog(
+        &repo,
+        &["reflog", "show", "--all", "--date=unix", REFLOG_FORMAT],
+    ) {
+        let mut bounded = HashSet::new();
+        for entry in moves {
+            if !entry.reference.starts_with("refs/") {
+                continue; // checkouts' HEADs, read above
+            }
+            if entry.at < since {
+                if bounded.insert(entry.reference.clone()) {
+                    boundaries.push(entry.commit);
+                }
+                continue;
+            }
+            if entry.reference.starts_with("refs/heads/") {
+                let there = all
+                    .iter()
+                    .find(|w| w.branch.as_deref() == Some(entry.reference.as_str()));
+                if there.is_some_and(|w| skipped(&w.path)) {
+                    continue;
+                }
+                work.moved = true;
+                if created_here(&entry.subject) {
+                    created
+                        .entry(entry.commit)
+                        .or_insert_with(|| there.map(|w| w.path.clone()));
+                }
+            } else if entry.subject == "update by push" {
+                work.moved = true;
+            }
+        }
+    }
+    let head_now = all
+        .iter()
+        .find(|w| w.path == repo)
+        .and_then(|w| w.head.clone());
+    let unkept = head_at_start.is_some() && head_now.as_deref() != head_at_start;
+    work.phases = match repo_moves {
+        None => None,
+        Some(0) if unkept && created.is_empty() => None,
+        Some(_) => surviving(&repo, &all, &created, &boundaries),
+    };
+    if let Some(phases) = &mut work.phases {
+        for phase in phases.iter_mut() {
+            phase.evidence = work
+                .receipts
+                .get(&phase.tree)
+                .map(|receipt| receipt.evidence.clone());
+        }
+        if let Some(newest) = phases.last() {
+            if let Some(Some(checkout)) = created.get(&newest.commit) {
+                work.checkout = checkout.clone();
+            }
+            for phase in phases.iter_mut() {
+                phase.worktree = created
+                    .get(&phase.commit)
+                    .cloned()
+                    .flatten()
+                    .filter(|path| *path != repo)
+                    .map(|path| path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    work
+}
+
+/// The created commits still reachable from a branch, a remote branch or a
+/// checkout's HEAD, oldest first. Walks only what became reachable since the
+/// start (everything the `boundaries` reach is older).
+fn surviving(
+    repo: &Path,
+    checkouts: &[Worktree],
+    created: &std::collections::HashMap<String, Option<PathBuf>>,
+    boundaries: &[String],
 ) -> Option<Vec<Phase>> {
-    let start = head_at_start?;
-    let range = format!("{start}..HEAD");
-    let log = git(
-        repo,
-        &["log", "--reverse", "--format=%H%x1f%T%x1f%s", &range],
-    )?;
-    if log.is_empty() {
+    if created.is_empty() {
         return Some(Vec::new());
     }
-    let created = created_since(repo, started_ms)?;
-    let mut phases: Vec<Phase> = log
+    let refs = git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    let tips: Vec<&str> = refs
+        .lines()
+        .chain(checkouts.iter().filter_map(|w| w.head.as_deref()))
+        .collect();
+    // A reflog may name an object gc has since removed: `^<missing>` would
+    // fail the whole walk, so only boundaries that exist are used.
+    let boundaries = existing(repo, boundaries)?;
+    let mut input = tips.join("\n");
+    for boundary in &boundaries {
+        input.push_str(&format!("\n^{boundary}"));
+    }
+    input.push('\n');
+    let output = process::run(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["log", "--stdin", "--format=%H%x1f%T%x1f%s"]),
+        Some(input.as_bytes()),
+        process::LOCAL,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut phases: Vec<Phase> = output
+        .stdout_text()
         .lines()
         .filter_map(|line| {
             let mut fields = line.splitn(3, '\u{1f}');
             let (commit, tree, subject) = (fields.next()?, fields.next()?, fields.next()?);
-            created.contains(commit).then(|| Phase {
+            created.contains_key(commit).then(|| Phase {
                 commit: commit.to_owned(),
                 subject: subject.to_owned(),
-                evidence: receipts.get(tree).map(|(_, evidence)| evidence.clone()),
+                evidence: None,
+                tree: tree.to_owned(),
+                worktree: None,
             })
         })
         .collect();
+    phases.reverse();
     phases.drain(..phases.len().saturating_sub(MAX_PHASES));
     Some(phases)
 }
 
-/// The commits HEAD's reflog shows created in this checkout since
-/// `started_ms`. `None` when the reflog cannot be read, or has no entry since
-/// then at all: the caller has seen HEAD move, so an empty reflog means it is
-/// not being kept, never that nothing was made.
-fn created_since(repo: &Path, started_ms: i64) -> Option<HashSet<String>> {
-    let since = started_ms.div_euclid(1000);
-    let log = git(
-        repo,
-        &[
-            "log",
-            "--walk-reflogs",
-            "--date=unix",
-            "--format=%gd%x1f%H%x1f%gs",
-            "HEAD",
-        ],
-    )?;
-    let mut moves = 0;
-    let mut created = HashSet::new();
-    for line in log.lines() {
-        let mut fields = line.splitn(3, '\u{1f}');
-        let (Some(selector), Some(commit), Some(subject)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        // `HEAD@{1790380435}`, with --date=unix.
-        let at = selector
-            .rsplit_once("@{")
-            .and_then(|(_, rest)| rest.strip_suffix('}'))
-            .and_then(|secs| secs.parse::<i64>().ok());
-        if at.is_none_or(|at| at < since) {
-            continue;
-        }
-        moves += 1;
-        if created_here(subject) {
-            created.insert(commit.to_owned());
-        }
+/// The commits among `commits` the repository still has.
+fn existing(repo: &Path, commits: &[String]) -> Option<Vec<String>> {
+    if commits.is_empty() {
+        return Some(Vec::new());
     }
-    (moves > 0).then_some(created)
+    let input = format!("{}\n", commits.join("\n"));
+    let output = process::run(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]),
+        Some(input.as_bytes()),
+        process::LOCAL,
+    )
+    .ok()?;
+    output.status.success().then(|| {
+        output
+            .stdout_text()
+            .lines()
+            .filter_map(|line| line.strip_suffix(" commit"))
+            .map(str::to_owned)
+            .collect()
+    })
 }
 
 /// Whether a reflog entry records HEAD arriving at a commit this checkout
@@ -382,12 +656,13 @@ fn created_here(subject: &str) -> bool {
         || message.starts_with("Merge made by")
 }
 
-/// State 4, observed: the branch's pull request, if `gh` can say.
-pub fn finished(repo: &Path, receipts: &Receipts) -> Finished {
+/// State 4, observed: the pull request of the branch checked out in
+/// `checkout`, if `gh` can say.
+pub fn finished(checkout: &Path, receipts: &Receipts) -> Finished {
     let output = process::run(
         Command::new("gh")
             .args(["pr", "view", "--json", "url,state,headRefOid"])
-            .current_dir(repo),
+            .current_dir(checkout),
         None,
         std::time::Duration::from_secs(20),
     );
@@ -420,8 +695,8 @@ pub fn finished(repo: &Path, receipts: &Receipts) -> Finished {
     };
     let head_evidence = pr["headRefOid"]
         .as_str()
-        .and_then(|head| git(repo, &["rev-parse", &format!("{head}^{{tree}}")]))
-        .and_then(|tree| receipts.get(&tree).map(|(_, e)| e.clone()));
+        .and_then(|head| git(checkout, &["rev-parse", &format!("{head}^{{tree}}")]))
+        .and_then(|tree| receipts.get(&tree).map(|r| r.evidence.clone()));
     Finished::PullRequest {
         url: pr["url"].as_str().unwrap_or("").to_owned(),
         state: pr["state"].as_str().unwrap_or("unknown").to_owned(),
@@ -538,6 +813,11 @@ mod tests {
         found.iter().map(|p| p.subject.as_str()).collect()
     }
 
+    /// The phases leaving observes in `dir`, skipping no checkout.
+    fn phases(dir: &Path, start: Option<&str>, started_ms: i64) -> Option<Vec<Phase>> {
+        observe(dir, start, started_ms, &[]).phases
+    }
+
     #[test]
     fn phases_are_this_sessions_commits_with_what_sykli_saw() {
         let dir = repo("phases");
@@ -548,7 +828,7 @@ mod tests {
         receipt(&dir, "old", &first, "failed", 1, false);
         receipt(&dir, "new", &first, "passed", 2, false);
         receipt(&dir, "dirty", &second, "passed", 3, true);
-        let found = phases(&dir, Some(&start), started_ms, &receipts_by_tree(&dir)).unwrap();
+        let found = phases(&dir, Some(&start), started_ms).unwrap();
         assert_eq!(
             found.len(),
             2,
@@ -563,20 +843,20 @@ mod tests {
         assert!(found[1].evidence.as_ref().unwrap().dirty);
 
         commit(&dir, "c.txt", "third phase");
-        let receipts = receipts_by_tree(&dir);
         assert!(
-            phases(&dir, Some(&start), started_ms, &receipts).unwrap()[2]
+            phases(&dir, Some(&start), started_ms).unwrap()[2]
                 .evidence
                 .is_none(),
             "no run is said, not guessed"
         );
-        assert_eq!(
-            phases(&dir, None, started_ms, &receipts),
-            None,
-            "without a start, phases are not observed, not claimed empty"
+        let without_start = phases(&dir, None, started_ms).expect("still observed");
+        assert!(
+            subjects(&without_start).ends_with(&["first phase", "second phase", "third phase"]),
+            "without a starting commit, the reflogs still say what was made: {:?}",
+            subjects(&without_start)
         );
         assert_eq!(
-            phases(&dir, Some(&head(&dir).unwrap()), started_ms, &receipts),
+            phases(&dir, Some(&head(&dir).unwrap()), started_ms),
             Some(Vec::new()),
             "no commits since the start is an observation"
         );
@@ -599,7 +879,7 @@ mod tests {
         git_ok(&dir, &["config", "user.name", "T"]);
         let start = head(&dir).unwrap();
         let started_ms = now_ms();
-        let seen = |dir: &Path| phases(dir, Some(&start), started_ms, &Receipts::new()).unwrap();
+        let seen = |dir: &Path| phases(dir, Some(&start), started_ms).unwrap();
 
         commit(&upstream, "u1.txt", "theirs 1");
         commit(&upstream, "u2.txt", "theirs 2");
@@ -651,7 +931,7 @@ mod tests {
         let started_ms = now_ms();
         git_ok(&dir, &["merge", "-q", "--ff-only", "side"]);
         assert_eq!(
-            phases(&dir, Some(&start), started_ms, &Receipts::new()),
+            phases(&dir, Some(&start), started_ms),
             Some(Vec::new()),
             "created here, but before the session: its reflog entry is older than the start"
         );
@@ -677,11 +957,148 @@ mod tests {
             ],
         );
         assert_eq!(
-            phases(&dir, Some(&start), started_ms, &Receipts::new()),
+            phases(&dir, Some(&start), started_ms),
             None,
             "HEAD moved and the reflog saw nothing: not observed, never \"no commits\""
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn worktree_path(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("ohjaa-checkout-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    #[test]
+    fn a_commit_made_in_a_linked_worktree_is_a_phase_with_the_receipt_made_there() {
+        let dir = repo("wt-linked");
+        let start = head(&dir).unwrap();
+        let started_ms = now_ms();
+        let wt = worktree_path("linked");
+        git_ok(
+            &dir,
+            &["worktree", "add", "-q", "-b", "feat2", wt.to_str().unwrap()],
+        );
+        let tree = commit(&wt, "w.txt", "made in the worktree");
+        receipt(&wt, "w", &tree, "passed", 5, false);
+        let work = observe(&dir, Some(&start), started_ms, &[]);
+        let found = work.phases.unwrap();
+        assert_eq!(subjects(&found), ["made in the worktree"]);
+        assert_eq!(found[0].evidence.as_ref().unwrap().outcome, "passed");
+        assert_eq!(found[0].tree, tree);
+        let wt = std::fs::canonicalize(&wt).unwrap();
+        assert_eq!(found[0].worktree.as_deref(), Some(wt.to_str().unwrap()));
+        assert_eq!(work.checkout, wt, "its pull request is looked up there");
+        assert!(work.moved);
+        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_commit_in_a_worktree_removed_since_is_still_on_its_branch() {
+        let dir = repo("wt-removed");
+        let start = head(&dir).unwrap();
+        let started_ms = now_ms();
+        let wt = worktree_path("removed");
+        git_ok(
+            &dir,
+            &["worktree", "add", "-q", "-b", "gone", wt.to_str().unwrap()],
+        );
+        commit(&wt, "g.txt", "made, then the worktree went");
+        git_ok(&dir, &["worktree", "remove", wt.to_str().unwrap()]);
+        let found = phases(&dir, Some(&start), started_ms).unwrap();
+        assert_eq!(subjects(&found), ["made, then the worktree went"]);
+        assert_eq!(found[0].worktree, None, "where is no longer known");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_detached_worktree_commit_and_an_amended_one_are_seen_once_each() {
+        let dir = repo("wt-detached");
+        let start = head(&dir).unwrap();
+        let started_ms = now_ms();
+        let wt = worktree_path("detached");
+        git_ok(
+            &dir,
+            &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+        );
+        commit(&wt, "d.txt", "detached work");
+        commit(&dir, "m.txt", "first try");
+        git_ok(&dir, &["commit", "-q", "--amend", "-m", "amended"]);
+        let found = phases(&dir, Some(&start), started_ms).unwrap();
+        let mut seen = subjects(&found);
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            ["amended", "detached work"],
+            "the commit an amend replaced is no longer anyone's work"
+        );
+        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_checkout_another_session_was_launched_in_is_not_this_sessions() {
+        let dir = repo("wt-skip");
+        let start = head(&dir).unwrap();
+        let started_ms = now_ms();
+        let theirs = worktree_path("theirs");
+        git_ok(
+            &dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "theirs",
+                theirs.to_str().unwrap(),
+            ],
+        );
+        commit(&theirs, "t.txt", "another session's work");
+        let theirs = std::fs::canonicalize(&theirs).unwrap();
+        assert_eq!(phases(&dir, Some(&start), started_ms).unwrap().len(), 1);
+        let skipped = observe(
+            &dir,
+            Some(&start),
+            started_ms,
+            std::slice::from_ref(&theirs),
+        );
+        assert_eq!(skipped.phases, Some(Vec::new()));
+        let own = std::fs::canonicalize(&dir).unwrap();
+        commit(&dir, "o.txt", "mine");
+        assert_eq!(
+            subjects(
+                &observe(&dir, Some(&start), started_ms, &[own, theirs.clone()])
+                    .phases
+                    .unwrap()
+            ),
+            ["mine"],
+            "the checkout being observed is never skipped"
+        );
+        let _ = std::fs::remove_dir_all(theirs);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn worktrees_are_read_from_gits_porcelain() {
+        let dir = std::env::temp_dir();
+        let porcelain = format!(
+            "worktree /nonexistent/bare\nbare\n\nworktree {d}\nHEAD abc\nbranch refs/heads/main\n\n\
+             worktree /nonexistent/gone\nHEAD def\ndetached\nprunable gitdir file points to non-existent location",
+            d = dir.display()
+        );
+        let found = parse_worktrees(&porcelain);
+        assert_eq!(
+            found,
+            [Worktree {
+                path: std::fs::canonicalize(&dir).unwrap(),
+                head: Some("abc".to_owned()),
+                branch: Some("refs/heads/main".to_owned()),
+            }],
+            "bare entries and checkouts whose folder is gone are left out"
+        );
     }
 
     #[test]
@@ -727,7 +1144,7 @@ mod tests {
             format!(r#"{{"schema":"other.v1","subject":{{"head_tree_oid":"{tree}"}},"outcome":"passed"}}"#),
         )
         .unwrap();
-        assert!(receipts_by_tree(&dir).is_empty());
+        assert!(receipts_in([dir.as_path()]).is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
