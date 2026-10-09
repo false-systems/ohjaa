@@ -3219,3 +3219,85 @@ fn every_commit_this_session_pushed_to_the_default_branch_is_verified() {
     );
     fixture.cleanup();
 }
+
+#[test]
+fn a_failing_commit_pushed_to_main_flags_the_record_and_tops_the_next_briefing() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("loud");
+    let repo = clone_with_origin(&fixture, "work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'broken build'
+        receipt failed
+        git push -q origin HEAD:main
+        {ohjaa} handover --next 'ship it'",
+        ohjaa = ohjaa_bin()
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "push",
+                "--no-briefing",
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "the agent's exit is still ohjaa's: {stderr}");
+    let pushed = short_head(&repo);
+    let warning = format!(
+        "origin/main at {pushed} in work has no passing evidence — check before building on it"
+    );
+    let flagged = stderr.find("─ FLAGGED").expect(&stderr);
+    assert!(
+        flagged < stderr.find("─ observed").unwrap(),
+        "the flag comes first in the record: {stderr}"
+    );
+    assert!(stderr.contains(&warning), "{stderr}");
+    assert!(
+        stderr.contains("sykli verify: error: outcome failed"),
+        "it says why: {stderr}"
+    );
+    assert!(
+        stderr
+            .trim_end()
+            .ends_with(&format!("ohjaa: flagged: {warning}")),
+        "and says it again last, where the person reads: {stderr}"
+    );
+
+    // The next agent hears it before anything else, the handover included.
+    let (_, stderr, _) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "codex", "--intent", "next", "--dry-run"])
+            .current_dir(&repo),
+    );
+    let briefing = &stderr[stderr.find("--briefing '").expect(&stderr) + 12..];
+    assert!(
+        briefing.starts_with("WARNING from the last session here (oh-"),
+        "{briefing}"
+    );
+    let top = briefing.lines().take(2).collect::<Vec<_>>().join("\n");
+    assert!(top.contains(&warning), "{top}");
+    assert!(
+        briefing.find(&warning).unwrap() < briefing.find("ship it").unwrap(),
+        "{briefing}"
+    );
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(
+        stdout.starts_with("WARNING from the last session here"),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}

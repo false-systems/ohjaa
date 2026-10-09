@@ -168,6 +168,17 @@ in sykli's words. A commit no receipt names is `unchecked`. A sykli without
 `--commit` (`sykli verify --help` does not name it) passes nothing: the record
 says `unverified: sykli has no --commit`.
 
+Anything that reached the default branch without passing evidence, and an open
+or merged pull request whose head lacks it, **flags the record**: the record
+opens with it, leaving ends by saying it again (`ohjaa: flagged: …`), and the
+next briefing here, `ohjaa brief` included, opens with it before the knowledge
+and before the handover:
+
+```
+WARNING from the last session here (oh-1791…, claude, ended 2026-10-09 21:30 UTC):
+- origin/main at 3dbaafd in selko has no passing evidence — check before building on it (FAILED sykli verify: error: outcome failed)
+```
+
 The records live in a **session log**, redb at
 `~/.local/state/ohjaa/sessions.redb`, on this machine only. Knowledge never
 lives there, so deleting the log loses no knowledge. A busy or broken log never

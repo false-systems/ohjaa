@@ -102,6 +102,12 @@ pub enum Check {
     Unverified { why: String },
 }
 
+impl Check {
+    pub fn passed(&self) -> bool {
+        matches!(self, Check::Passed)
+    }
+}
+
 /// A commit that reached the default branch during the session: one this
 /// session made that is on it now, or one it pushed to it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -624,6 +630,13 @@ pub fn render_record(session: &Session) -> String {
         clock(session.started_ms),
         ended
     );
+    let flagged = flags(session);
+    if !flagged.is_empty() {
+        out.push_str("─ FLAGGED (observed by ohjaa; the next briefing opens with it) ─\n");
+        for flag in flagged {
+            let _ = writeln!(out, "! {}\n  ({})", flag.headline, flag.why);
+        }
+    }
     out.push_str("─ observed (written by ohjaa; the agent cannot change it) ─\n");
     let _ = writeln!(out, "intent        {}", session.intent);
     let readback = match &session.readback {
@@ -711,6 +724,88 @@ pub fn render_record(session: &Session) -> String {
     }
     out.push_str("─ handover (the agent's own words) ─\n");
     handover_lines(session.handover.as_ref(), &mut out);
+    out
+}
+
+/// Something leaving observed that whoever comes next must hear first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flag {
+    pub headline: String,
+    /// What sykli said, or why it could not.
+    pub why: String,
+}
+
+/// The flags in a record: every commit that reached the default branch
+/// without passing evidence, and a pull request (open or merged) whose head
+/// lacks it. Derived from what ohjaa observed, never from the agent's words.
+pub fn flags(session: &Session) -> Vec<Flag> {
+    let Some(left) = &session.left else {
+        return Vec::new();
+    };
+    let launch = (!session.outside_repo).then_some((
+        session.repo.as_str(),
+        &left.landed[..],
+        &left.finished,
+    ));
+    let mut out = Vec::new();
+    for (repo, landed, finished) in launch.into_iter().chain(
+        left.scoped
+            .iter()
+            .map(|s| (s.repo.as_str(), &s.landed[..], &s.finished)),
+    ) {
+        for landed in landed.iter().filter(|landed| !landed.check.passed()) {
+            out.push(Flag {
+                headline: format!(
+                    "{} at {} in {} has no passing evidence — check before building on it",
+                    landed.onto,
+                    short(&landed.commit),
+                    repo_name(repo)
+                ),
+                why: describe_check(&landed.check),
+            });
+        }
+        if let Finished::PullRequest {
+            url,
+            state,
+            head: Some(head),
+            head_check: Some(check),
+            ..
+        } = finished
+        {
+            let live = matches!(state.to_uppercase().as_str(), "OPEN" | "MERGED");
+            if live && !check.passed() {
+                out.push(Flag {
+                    headline: format!(
+                        "pull request {url} at {} has no passing evidence — check before \
+                         merging or building on it",
+                        short(head)
+                    ),
+                    why: describe_check(check),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The flags of the last session here, for the very top of the next
+/// briefing: before the knowledge, and before its handover can say "ship it".
+/// Empty when it raised none.
+pub fn render_warnings(session: &Session) -> String {
+    let flags = flags(session);
+    if flags.is_empty() {
+        return String::new();
+    }
+    let ended = session.left.as_ref().map_or_else(String::new, |left| {
+        format!(", ended {}", clock(left.ended_ms))
+    });
+    let mut out = format!(
+        "WARNING from the last session here ({}, {}{ended}):\n",
+        session.id, session.agent
+    );
+    for flag in flags {
+        let _ = writeln!(out, "- {} ({})", flag.headline, flag.why);
+    }
     out
 }
 
@@ -1485,6 +1580,58 @@ mod tests {
             describe_finished(&old),
             "u (merged) · its head, unverified: receipt: passed"
         );
+    }
+
+    #[test]
+    fn a_record_is_flagged_for_what_lacks_passing_evidence_and_only_that() {
+        let pr = |state: &str, check: Check| Finished::PullRequest {
+            url: "u".to_owned(),
+            state: state.to_owned(),
+            head_evidence: None,
+            head: Some("feedface00".to_owned()),
+            head_check: Some(check),
+        };
+        let landed = |check: Check| Landed {
+            commit: "c0ffee1234".to_owned(),
+            subject: "s".to_owned(),
+            onto: "origin/main".to_owned(),
+            check,
+        };
+        let with = |finished: Finished, landed: Vec<Landed>| {
+            let mut s = ended(session("oh-12", "/r/selko", 1_000), 2_000);
+            let left = s.left.as_mut().unwrap();
+            left.finished = finished;
+            left.landed = landed;
+            s
+        };
+        let unverified = || Check::Unverified {
+            why: "sykli has no --commit".to_owned(),
+        };
+        assert!(flags(&with(
+            pr("OPEN", Check::Passed),
+            vec![landed(Check::Passed)]
+        ))
+        .is_empty());
+        assert!(
+            flags(&with(pr("CLOSED", unverified()), Vec::new())).is_empty(),
+            "a closed pull request reaches nothing"
+        );
+        let open = flags(&with(
+            pr("OPEN", unverified()),
+            vec![landed(Check::Unchecked)],
+        ));
+        assert_eq!(
+            open.iter().map(|f| f.headline.as_str()).collect::<Vec<_>>(),
+            [
+                "origin/main at c0ffee1 in selko has no passing evidence — check before building on it",
+                "pull request u at feedfac has no passing evidence — check before merging or building on it",
+            ]
+        );
+        let s = with(pr("MERGED", unverified()), Vec::new());
+        assert!(
+            render_warnings(&s).starts_with("WARNING from the last session here (oh-12, claude")
+        );
+        assert!(render_warnings(&with(Finished::NoPullRequest, Vec::new())).is_empty());
     }
 
     #[test]

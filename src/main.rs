@@ -613,6 +613,13 @@ fn cmd_brief(
     for path in &unscoped {
         eprintln!("ohjaa: --scope {path} is not inside a Git repository; no repository knowledge or context was read there");
     }
+    let here = dirs.repo_root.clone().unwrap_or(std::env::current_dir()?);
+    // The last session's warnings come before anything else; its record after
+    // the knowledge.
+    let (warnings, last) = last_session_here(&dirs, &here).unzip();
+    if let Some(warnings) = warnings.filter(|warnings| !knowledge_only && !warnings.is_empty()) {
+        println!("{warnings}");
+    }
     if knowledge.is_empty() {
         println!("No knowledge recorded yet (`ohjaa propose`, then `ohjaa review`).");
     } else {
@@ -621,8 +628,7 @@ fn cmd_brief(
     if knowledge_only {
         return Ok(if unscoped.is_empty() { 0 } else { INCOMPLETE });
     }
-    let here = dirs.repo_root.clone().unwrap_or(std::env::current_dir()?);
-    if let Some(last) = last_session_here(&dirs, &here) {
+    if let Some(last) = last.filter(|last| !last.is_empty()) {
         print!("\n{last}");
     }
     // Validate configured discovery roots; do not derive unrelated repositories.
@@ -669,12 +675,16 @@ fn repo_key(repo: &Path) -> String {
         .into_owned()
 }
 
-/// "Last session here", when the log knows one.
-fn last_session_here(dirs: &Dirs, repo: &Path) -> Option<String> {
+/// The last session here, when the log knows one: its warnings, for the very
+/// top of a briefing, and "Last session here".
+fn last_session_here(dirs: &Dirs, repo: &Path) -> Option<(String, String)> {
     let store = session_store(dirs)?;
     let here = repo_key(repo);
     match store.latest_for(&here) {
-        Ok(Some(session)) => Some(sessions::render_last(&session, &here)),
+        Ok(Some(session)) => Some((
+            sessions::render_warnings(&session),
+            sessions::render_last(&session, &here),
+        )),
         Ok(None) => None,
         Err(error) => {
             eprintln!("ohjaa: {error}");
@@ -1570,7 +1580,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     } else {
         let (knowledge, nodes) = knowledge_for_work(&dirs, &scoped_repos)?;
         delivered = nodes;
-        let last = last_session_here(&dirs, &root).unwrap_or_default();
+        let (warnings, last) = last_session_here(&dirs, &root).unwrap_or_default();
         repos(roots)?;
         let scans = in_repo
             .then(|| scan.clone())
@@ -1581,6 +1591,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         let perimeter = scoped_perimeter_text(&view, &root);
         let how = lifecycle_briefing(&root, in_repo, &scoped_repos);
         let parts: Vec<&str> = [
+            warnings.as_str(),
             knowledge.as_str(),
             last.as_str(),
             how.as_str(),
@@ -1905,6 +1916,10 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             "ohjaa: this record could not be saved; it is shown above only"
         )
     };
+    // Said again last, where the person looks when the session ends.
+    for flag in sessions::flags(&session) {
+        let _ = writeln!(stderr, "ohjaa: flagged: {}", flag.headline);
+    }
     lifecycle::restore_signals();
     Ok(lifecycle::exit_code(exit))
 }
