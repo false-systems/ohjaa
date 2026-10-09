@@ -226,22 +226,45 @@ pub struct Store {
 
 impl Store {
     /// One native session belongs to at most one wrapper session. Check and
-    /// attach in one transaction so concurrent imports cannot double attribute it.
-    pub fn attach_usage(&self, id: &str, receipt: crate::usage::Receipt) -> anyhow::Result<()> {
+    /// attach in one transaction so concurrent imports cannot double
+    /// attribute it. A row that cannot be read is skipped in that check, never
+    /// fatal to every import: the ids skipped are returned, so the caller can
+    /// name them. The session attached to must itself be readable.
+    pub fn attach_usage(
+        &self,
+        id: &str,
+        receipt: crate::usage::Receipt,
+    ) -> anyhow::Result<Vec<String>> {
         receipt.validate()?;
         let tx = self.db.begin_write()?;
+        let mut skipped = Vec::new();
         {
             let mut table = tx.open_table(SESSIONS)?;
             for row in table.iter()? {
                 let (key, bytes) = row?;
-                let session: Session = serde_json::from_slice(bytes.value())?;
-                anyhow::ensure!(key.value() == id || !session.usage.iter().any(|r| r.agent == receipt.agent && r.session_id == receipt.session_id), "native session already attributed to {}", key.value());
+                if key.value() == id {
+                    continue;
+                }
+                let Ok(other) = serde_json::from_slice::<Session>(bytes.value()) else {
+                    skipped.push(key.value().to_owned());
+                    continue;
+                };
+                let claimed = other
+                    .usage
+                    .iter()
+                    .any(|r| r.agent == receipt.agent && r.session_id == receipt.session_id);
+                anyhow::ensure!(
+                    !claimed,
+                    "native session already attributed to {}",
+                    key.value()
+                );
             }
             let mut session: Session = {
                 let bytes = table
                     .get(id)?
                     .ok_or_else(|| anyhow::anyhow!("session {id} is not in the log"))?;
-                serde_json::from_slice(bytes.value())?
+                serde_json::from_slice(bytes.value())
+                    .map_err(|error| anyhow::anyhow!("session {id} is unreadable: {error}"))?
             };
             let agent = Path::new(&session.agent)
                 .file_name()
@@ -256,7 +279,7 @@ impl Store {
             table.insert(id, bytes.as_slice())?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(skipped)
     }
     /// Open the log, creating it only where no file exists. An empty or
     /// unreadable file is reported, never replaced: redb would treat an empty
@@ -1106,6 +1129,49 @@ mod tests {
             last.contains("- it was surprised by: the fixture skips"),
             "{last}"
         );
+    }
+
+    fn usage_receipt(agent: &str, native: &str) -> crate::usage::Receipt {
+        crate::usage::Receipt {
+            schema: "agent-usage.v1".to_owned(),
+            agent: agent.to_owned(),
+            session_id: native.to_owned(),
+            source: "test".to_owned(),
+            observed_at_ms: 5_000,
+            complete: true,
+            limitations: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn one_unreadable_row_never_blocks_an_import_and_is_named() {
+        let dir = temp("unreadable-row");
+        let store = Store::open(&store_path(&dir)).unwrap();
+        store.put(&session("oh-1", "/r/a", 1_000)).unwrap();
+        {
+            let tx = store.db.begin_write().unwrap();
+            tx.open_table(SESSIONS)
+                .unwrap()
+                .insert("oh-broken", b"\"not a session\"".as_slice())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let skipped = store
+            .attach_usage("oh-1", usage_receipt("claude", "native-1"))
+            .expect("an unrelated unreadable row is skipped, not fatal");
+        assert_eq!(skipped, ["oh-broken"], "and it is named");
+        assert_eq!(store.get("oh-1").unwrap().unwrap().usage.len(), 1);
+        let error = store
+            .attach_usage("oh-broken", usage_receipt("claude", "native-2"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("session oh-broken is unreadable"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

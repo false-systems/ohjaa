@@ -241,6 +241,18 @@ enum UsageCmd {
     },
 }
 
+/// Rows of the session log that could not be read while checking a usage
+/// receipt was not attributed twice, named so they can be looked at.
+fn report_unreadable_rows(ids: &[String]) {
+    if !ids.is_empty() {
+        eprintln!(
+            "ohjaa: session log row(s) {} could not be read; skipped when checking this \
+             receipt is not attributed to another session",
+            ids.join(", ")
+        );
+    }
+}
+
 fn cmd_usage(action: &UsageCmd) -> Result<i32> {
     let dirs = dirs()?;
     let open = || sessions::Store::open(&sessions::store_path(&dirs.state));
@@ -248,7 +260,8 @@ fn cmd_usage(action: &UsageCmd) -> Result<i32> {
         UsageCmd::Import { file, session } => {
             let id = session.clone().map(Ok).unwrap_or_else(current_session_id)?;
             anyhow::ensure!(sessions::is_valid_id(&id), "invalid session id");
-            open()?.attach_usage(&id, usage::Receipt::read(file)?)?;
+            let skipped = open()?.attach_usage(&id, usage::Receipt::read(file)?)?;
+            report_unreadable_rows(&skipped);
             println!("recorded usage snapshot for {id}");
             Ok(0)
         }
@@ -1730,7 +1743,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 "usage receipt predates this run"
             );
             let store = sessions::Store::open(&sessions::store_path(&dirs.state))?;
-            store.attach_usage(&session_id, receipt)?;
+            report_unreadable_rows(&store.attach_usage(&session_id, receipt)?);
             session = store
                 .get(&session_id)?
                 .context("session disappeared after usage import")?;
