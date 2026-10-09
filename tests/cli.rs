@@ -188,6 +188,24 @@ impl Fixture {
         repo
     }
 
+    /// A Git repository whose only commit, and its reflog entry, are long
+    /// past: reflog times are whole seconds, and one written in the second a
+    /// session starts counts as written during it.
+    fn make_settled_git_repo(&self, name: &str) -> PathBuf {
+        let repo = self.make_repo(name);
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "ohjaa@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Ohjaa Test"]);
+        let status = Command::new("git")
+            .args(["commit", "-q", "--allow-empty", "-m", "init"])
+            .env("GIT_COMMITTER_DATE", "@1000000000 +0000")
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        repo
+    }
+
     /// The real binary with the stubbed PATH, a sandboxed HOME and XDG dirs,
     /// and a shared-knowledge checkout inside the fixture.
     fn ohjaa(&self) -> Command {
@@ -1754,7 +1772,7 @@ fn run_outside_a_repo_launches_from_the_folder_and_says_what_it_cannot_see() {
     for said in [
         "is not a Git repository; 0 sibling session(s) in this folder at launch",
         "--scope /r/a is not inside a Git repository; nothing there is observed",
-        "no --scope names a repository, so nothing this agent does in one is",
+        "no --scope names a repository; at leaving, the repositories directly",
         "This folder is not a Git repository, and no --scope named one",
         "which is not one of these repositories",
         "would run: toimija run --intent 'sweep the fleet'",
@@ -2841,5 +2859,102 @@ fn a_commit_made_in_a_worktree_is_a_phase_with_the_receipt_made_there() {
         phases.contains(&commit) && phases.contains("passed") && phases.contains("in work-feat"),
         "the worktree's commit is a phase, with the receipt sykli wrote there: {phases}"
     );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_root_launch_without_scope_records_the_repos_it_worked_in() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("root-found");
+    let folder = fixture.make_folder("projects");
+    let repo = fixture.make_settled_git_repo("projects/work");
+    fixture.make_settled_git_repo("projects/idle");
+    let worktree = folder.join("_worktrees").join("work-feat");
+    let script = format!(
+        "set -e
+        cd '{repo}'
+        git worktree add -q -b feat '{wt}'
+        cd '{wt}'
+        echo x > f.txt && git add f.txt && git commit -q -m 'found work'
+        {ohjaa} handover --unfinished 'half the rename'",
+        repo = repo.display(),
+        wt = worktree.display(),
+        ohjaa = ohjaa_bin()
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa_in(&folder)
+            .args(["run", "sh", "--intent", "root work", "--no-briefing", "--"])
+            .args(["-c", &script])
+            .env("OHJAA_STUB_RUN_AGENT", "1"),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let commit = short_head(&worktree);
+    let phases = stderr
+        .lines()
+        .find(|l| l.starts_with("in work") && l.contains(" phases "))
+        .expect(&stderr);
+    assert!(
+        phases.contains(&commit) && phases.contains("in work-feat"),
+        "the repository the agent committed in is observed, unnamed: {phases}"
+    );
+    assert!(
+        stderr.contains("not named with --scope"),
+        "and says it was found, not named: {stderr}"
+    );
+    assert!(
+        !stderr.contains("in idle"),
+        "a repository nothing moved in is not: {stderr}"
+    );
+    assert!(!stderr.contains("none to observe"), "{stderr}");
+
+    // The next agent launched in that repository is told what this one left.
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    for said in [
+        "Last session here (oh-",
+        "- work in work: 1 commit(s)",
+        "- unfinished: half the rename",
+    ] {
+        assert!(stdout.contains(said), "missing `{said}`: {stdout}");
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn a_scope_naming_the_folder_of_repos_records_the_ones_that_moved() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("scope-folder");
+    let launch = fixture.make_git_repo("launch");
+    let folder = fixture.make_folder("projects");
+    let repo = fixture.make_settled_git_repo("projects/work");
+    let script = format!(
+        "cd '{}' && echo x > f.txt && git add f.txt && git commit -q -m 'in a named folder'",
+        repo.display()
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent", "x", "--no-briefing", "--scope"])
+            .arg(&folder)
+            .args(["--", "-c", &script])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&launch),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(
+            "is not inside a Git repository; at leaving, the repositories directly in it"
+        ),
+        "{stderr}"
+    );
+    let phases = stderr
+        .lines()
+        .find(|l| l.starts_with("in work") && l.contains(" phases "))
+        .expect(&stderr);
+    assert!(phases.contains(&short_head(&repo)), "{phases}");
     fixture.cleanup();
 }

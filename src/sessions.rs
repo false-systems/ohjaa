@@ -150,6 +150,12 @@ pub struct ScopedLeft {
     #[serde(default)]
     pub phases: Option<Vec<Phase>>,
     pub finished: Finished,
+    /// Not named with `--scope`: found at leaving, a repository directly in
+    /// the launch folder (or in a folder `--scope` named) whose branches or
+    /// checkouts moved while the session ran. Another agent may have moved
+    /// them, so it is said as found, never as named.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub found: bool,
 }
 
 /// One session, entering to leaving.
@@ -425,8 +431,9 @@ impl Store {
 /// Keep `LATEST` pointing at each repository's latest *ended* session. A
 /// session still running is never "the last session here": the perimeter
 /// already shows who is live, and an unfinished record must not read as a
-/// crash. "Here" is where a session was launched and every repository it
-/// named with `--scope`: the one that ended last wins, wherever it started.
+/// crash. "Here" is where a session was launched, every repository it
+/// named with `--scope`, and every one leaving found it worked in: the one
+/// that ended last wins, wherever it started.
 fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), StoreError> {
     let Some(left) = &session.left else {
         return Ok(());
@@ -434,7 +441,8 @@ fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), Sto
     let sessions = tx.open_table(SESSIONS).map_err(other)?;
     let mut latest = tx.open_table(LATEST).map_err(other)?;
     let heres = std::iter::once(session.repo.as_str())
-        .chain(session.scoped.iter().map(|scoped| scoped.repo.as_str()));
+        .chain(session.scoped.iter().map(|scoped| scoped.repo.as_str()))
+        .chain(left.scoped.iter().map(|scoped| scoped.repo.as_str()));
     for here in heres {
         let newer = match latest.get(here).map_err(other)? {
             None => true,
@@ -588,6 +596,13 @@ pub fn render_record(session: &Session) -> String {
                 "{label:<13} finished {}",
                 describe_finished(&scoped.finished)
             );
+            if scoped.found {
+                let _ = writeln!(
+                    out,
+                    "{label:<13} not named with --scope: found at leaving because it moved \
+                     (another agent may have moved it)"
+                );
+            }
         }
         if let Some(toimija) = &left.toimija_session {
             let _ = writeln!(out, "toimija       {toimija}");
@@ -744,8 +759,18 @@ pub fn render_last(session: &Session, here: &str) -> String {
             )
         },
     );
+    let found_here = session
+        .left
+        .as_ref()
+        .is_some_and(|left| left.scoped.iter().any(|s| s.repo == here && s.found));
     let launched = if session.repo == here {
         String::new()
+    } else if found_here {
+        format!(
+            "; launched from {} without naming this repository, it was found working here \
+             at leaving",
+            session.repo
+        )
     } else {
         format!(
             "; launched from {}, it named this repository with --scope",
@@ -779,10 +804,15 @@ pub fn render_last(session: &Session, here: &str) -> String {
         for scoped in scoped {
             let _ = writeln!(
                 out,
-                "- work in {}: {}; finished: {}",
+                "- work in {}: {}; finished: {}{}",
                 repo_name(&scoped.repo),
                 summarise_work(scoped.phases.as_ref()),
-                summarise_finished(&scoped.finished)
+                summarise_finished(&scoped.finished),
+                if scoped.found {
+                    "; found at leaving, not named with --scope"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -880,11 +910,13 @@ mod tests {
                         ..Default::default()
                     }]),
                     finished: Finished::NoPullRequest,
+                    found: false,
                 },
                 ScopedLeft {
                     repo: "/r/projects/toimija".to_owned(),
                     phases: Some(Vec::new()),
                     finished: Finished::NoPullRequest,
+                    found: true,
                 },
             ],
         });
@@ -917,6 +949,20 @@ mod tests {
         assert!(
             there.contains("; launched from /r/projects, it named this repository with --scope):"),
             "{there}"
+        );
+        // Found at leaving, it is never said as named.
+        assert!(
+            record.contains("in toimija    not named with --scope: found at leaving"),
+            "{record}"
+        );
+        assert!(
+            last.contains("- work in toimija: 0 commit(s), 0 with a passing sykli run; finished: no pull request; found at leaving, not named with --scope"),
+            "{last}"
+        );
+        let found = render_last(&s, "/r/projects/toimija");
+        assert!(
+            found.contains("; launched from /r/projects without naming this repository, it was found working here at leaving):"),
+            "{found}"
         );
     }
 
@@ -1228,6 +1274,7 @@ mod tests {
             repo: "/r/projects/a".to_owned(),
             phases: Some(vec![phase]),
             finished: Finished::NoPullRequest,
+            found: false,
         }];
         let v1 = serde_json::to_value(&s).unwrap();
         for pointer in [

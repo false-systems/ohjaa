@@ -415,7 +415,8 @@ pub struct Work {
 /// reset brought in were made elsewhere, and are not phases; nor is one that
 /// an amend or a rebase replaced. Checkouts in `skip` (where another session
 /// was launched) are someone else's: neither their HEAD nor the branch checked
-/// out there is read, though `repo` itself is never skipped.
+/// out there is read. That may include `repo` itself, when it was only found
+/// at leaving; a caller that was launched in or named `repo` leaves it out.
 ///
 /// Phases are `None` when they cannot be observed: git failed in `repo`, or
 /// its HEAD moved from `head_at_start` while its reflog recorded nothing.
@@ -428,7 +429,7 @@ pub fn observe(
     let repo = canonical(repo);
     let since = started_ms.div_euclid(1000);
     let all = worktrees(&repo);
-    let skipped = |path: &Path| path != repo && skip.iter().any(|s| s == path);
+    let skipped = |path: &Path| skip.iter().any(|s| s == path);
     let checkouts: Vec<&Worktree> = all.iter().filter(|w| !skipped(&w.path)).collect();
     let mut work = Work {
         checkout: repo.clone(),
@@ -516,6 +517,7 @@ pub fn observe(
         .and_then(|w| w.head.clone());
     let unkept = head_at_start.is_some() && head_now.as_deref() != head_at_start;
     work.phases = match repo_moves {
+        None if skipped(&repo) => surviving(&repo, &all, &created, &boundaries),
         None => None,
         Some(0) if unkept && created.is_empty() => None,
         Some(_) => surviving(&repo, &all, &created, &boundaries),
@@ -654,6 +656,61 @@ fn created_here(subject: &str) -> bool {
         || ["cherry-pick", "revert", "am"].contains(&action)
         || REPLAYED.iter().any(|step| action.ends_with(step))
         || message.starts_with("Merge made by")
+}
+
+/// The Git repositories directly in `folder` (each one's main checkout),
+/// canonical, whose reflogs may have been written since `started_ms`. Only a
+/// filter before git is asked (see [`observe`]): it reads file times in the
+/// repository's `logs`, and passes a repository it cannot judge that way.
+pub fn repos_touched_in(folder: &Path, started_ms: i64) -> Vec<PathBuf> {
+    let since = started_ms.div_euclid(1000);
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join(".git").exists())
+        .filter(|path| reflogs_touched_since(path, since))
+        .map(|path| canonical(&path))
+        .collect();
+    found.sort();
+    found
+}
+
+/// Whether a reflog of the repository whose main checkout is `checkout` may
+/// have been written at or after `since` (unix seconds): its own, or one of
+/// its linked worktrees'. A `.git` file (a submodule, a worktree) or a
+/// reftable store cannot be judged from file times, so it passes.
+fn reflogs_touched_since(checkout: &Path, since: i64) -> bool {
+    let git_dir = checkout.join(".git");
+    if !git_dir.is_dir() || git_dir.join("reftable").exists() {
+        return true;
+    }
+    let mut pending = vec![git_dir.join("logs")];
+    if let Ok(linked) = std::fs::read_dir(git_dir.join("worktrees")) {
+        pending.extend(linked.flatten().map(|entry| entry.path().join("logs")));
+    }
+    while let Some(path) = pending.pop() {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if let Ok(children) = std::fs::read_dir(&path) {
+                pending.extend(children.flatten().map(|entry| entry.path()));
+            }
+            continue;
+        }
+        let written = meta
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|at| at.as_secs() as i64);
+        if written.is_some_and(|at| at >= since) {
+            return true;
+        }
+    }
+    false
 }
 
 /// State 4, observed: the pull request of the branch checked out in
@@ -1067,18 +1124,83 @@ mod tests {
         );
         assert_eq!(skipped.phases, Some(Vec::new()));
         let own = std::fs::canonicalize(&dir).unwrap();
-        commit(&dir, "o.txt", "mine");
+        commit(&dir, "o.txt", "made where another session was launched");
+        let mine = worktree_path("mine");
+        git_ok(
+            &dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "mine",
+                mine.to_str().unwrap(),
+            ],
+        );
+        commit(&mine, "m.txt", "mine");
         assert_eq!(
             subjects(
-                &observe(&dir, Some(&start), started_ms, &[own, theirs.clone()])
+                &observe(&dir, None, started_ms, &[own, theirs.clone()])
                     .phases
                     .unwrap()
             ),
             ["mine"],
-            "the checkout being observed is never skipped"
+            "a repository only found at leaving can be another session's launch checkout too"
         );
+        let _ = std::fs::remove_dir_all(mine);
         let _ = std::fs::remove_dir_all(theirs);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_repositories_whose_reflogs_were_written_since_are_candidates() {
+        let folder = worktree_path("folder");
+        std::fs::create_dir_all(folder.join("not-a-repo")).unwrap();
+        let old = folder.join("old");
+        let fresh = folder.join("fresh");
+        for repo in [&old, &fresh] {
+            std::fs::create_dir_all(repo).unwrap();
+            git_ok(repo, &["init", "-q"]);
+            git_ok(repo, &["config", "user.email", "t@example.invalid"]);
+            git_ok(repo, &["config", "user.name", "T"]);
+            git_ok(repo, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        }
+        // Long after both were written: nothing is a candidate.
+        let later = now_ms() + 120_000;
+        assert!(repos_touched_in(&folder, later).is_empty());
+        // Written long ago, as far as file times say.
+        let mut logs = vec![old.join(".git/logs")];
+        while let Some(path) = logs.pop() {
+            if path.is_dir() {
+                logs.extend(
+                    std::fs::read_dir(&path)
+                        .unwrap()
+                        .flatten()
+                        .map(|e| e.path()),
+                );
+            } else {
+                let long_ago =
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(long_ago)
+                    .unwrap();
+            }
+        }
+        // A worktree's commit writes its own reflog, and the branch's.
+        let wt = worktree_path("fresh-wt");
+        git_ok(
+            &fresh,
+            &["worktree", "add", "-q", "-b", "w", wt.to_str().unwrap()],
+        );
+        let started_ms = now_ms();
+        commit(&wt, "w.txt", "in the worktree");
+        let found = repos_touched_in(&folder, started_ms);
+        assert_eq!(found, [std::fs::canonicalize(&fresh).unwrap()], "{found:?}");
+        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     #[test]

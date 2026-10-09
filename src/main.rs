@@ -1486,8 +1486,8 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         );
         if scoped_repos.is_empty() {
             eprintln!(
-                "ohjaa: no --scope names a repository, so nothing this agent does in one is \
-                 observed"
+                "ohjaa: no --scope names a repository; at leaving, the repositories directly \
+                 in this folder that moved are recorded, as found rather than named"
             );
         }
     }
@@ -1506,8 +1506,30 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         );
     }
     for raw in &unscoped {
-        eprintln!("ohjaa: --scope {raw} is not inside a Git repository; nothing there is observed");
+        if scope_path(raw).is_dir() {
+            eprintln!(
+                "ohjaa: --scope {raw} is not inside a Git repository; at leaving, the \
+                 repositories directly in it that moved are recorded, as found rather than named"
+            );
+        } else {
+            eprintln!(
+                "ohjaa: --scope {raw} is not inside a Git repository; nothing there is observed"
+            );
+        }
     }
+    // Where leaving looks for repositories nobody named: the launch folder
+    // outside a repository, and every folder --scope named that is none.
+    let search: Vec<PathBuf> = (!in_repo)
+        .then(|| folder.clone())
+        .into_iter()
+        .chain(
+            unscoped
+                .iter()
+                .map(|raw| scope_path(raw))
+                .filter(|path| path.is_dir())
+                .map(|path| std::fs::canonicalize(&path).unwrap_or(path)),
+        )
+        .collect();
     if quiet > 0 {
         eprintln!(
             "ohjaa: {quiet} of them stale — toimija cannot tell a finished agent \
@@ -1715,7 +1737,14 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // Outside a repository the folder itself has no commits or pull request
     // to observe; the record says why, and asks neither git nor gh there.
     let (phases, finished) = if in_repo {
-        observe_repo(&root, session.head_at_start.as_deref(), started_ms, &skip)
+        let seen = observe_repo(
+            &root,
+            session.head_at_start.as_deref(),
+            started_ms,
+            &skip,
+            true,
+        );
+        (seen.phases, seen.finished)
     } else {
         let finished = sessions::Finished::Unknown {
             why: "not a Git repository".to_owned(),
@@ -1723,23 +1752,50 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         (None, finished)
     };
     // Every scoped repository is observed the same way as the launch one.
-    let scoped = session
+    let mut scoped: Vec<sessions::ScopedLeft> = session
         .scoped
         .iter()
         .map(|scoped| {
-            let (phases, finished) = observe_repo(
+            let seen = observe_repo(
                 Path::new(&scoped.repo),
                 scoped.head_at_start.as_deref(),
                 started_ms,
                 &skip,
+                true,
             );
             sessions::ScopedLeft {
                 repo: scoped.repo.clone(),
-                phases,
-                finished,
+                phases: seen.phases,
+                finished: seen.finished,
+                found: false,
             }
         })
         .collect();
+    // And every repository nobody named, directly in the launch folder (or a
+    // folder --scope named), that moved while the session ran.
+    let known: Vec<PathBuf> = in_repo
+        .then(|| folder.clone())
+        .into_iter()
+        .chain(session.scoped.iter().map(|s| PathBuf::from(&s.repo)))
+        .collect();
+    for repo in search
+        .iter()
+        .flat_map(|dir| unless_interrupted(|| lifecycle::repos_touched_in(dir, started_ms)))
+        .flatten()
+    {
+        if known.contains(&repo) || scoped.iter().any(|s| Path::new(&s.repo) == repo) {
+            continue;
+        }
+        let seen = observe_repo(&repo, None, started_ms, &skip, false);
+        if seen.moved {
+            scoped.push(sessions::ScopedLeft {
+                repo: repo_key(&repo),
+                phases: seen.phases,
+                finished: seen.finished,
+                found: true,
+            });
+        }
+    }
     let left = sessions::Left {
         ended_ms: intake::now_seconds() * 1000,
         exit,
@@ -1848,19 +1904,44 @@ fn unless_interrupted<T>(step: impl FnOnce() -> T) -> Option<T> {
     (!process::cancelled()).then(step)
 }
 
+/// What leaving observed in one repository.
+struct Observed {
+    phases: Option<Vec<sessions::Phase>>,
+    finished: sessions::Finished,
+    /// Whether any of its checkouts or branches moved during the session.
+    moved: bool,
+}
+
 /// Leaving's observation of one repository: the commits this session made
 /// there, in any of its checkouts, with what sykli saw on each, and the pull
 /// request of the branch the newest one was made on. Checkouts in `skip` are
-/// other sessions'.
+/// other sessions', except `repo` itself when the session was launched in it
+/// or `named` it. A repository it did not name and that did not move is not
+/// asked about its pull request.
 fn observe_repo(
     repo: &Path,
     head_at_start: Option<&str>,
     started_ms: i64,
     skip: &[PathBuf],
-) -> (Option<Vec<sessions::Phase>>, sessions::Finished) {
-    let work = unless_interrupted(|| lifecycle::observe(repo, head_at_start, started_ms, skip))
+    named: bool,
+) -> Observed {
+    let own = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let skip: Vec<PathBuf> = skip
+        .iter()
+        .filter(|path| !named || **path != own)
+        .cloned()
+        .collect();
+    let work = unless_interrupted(|| lifecycle::observe(repo, head_at_start, started_ms, &skip))
         .unwrap_or_default();
-    let phases = work.phases;
+    if !named && !work.moved {
+        return Observed {
+            phases: work.phases,
+            finished: sessions::Finished::Unknown {
+                why: "not looked up: nothing moved".to_owned(),
+            },
+            moved: false,
+        };
+    }
     let finished = match unless_interrupted(|| lifecycle::finished(&work.checkout, &work.receipts))
     {
         Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
@@ -1869,25 +1950,33 @@ fn observe_repo(
     .unwrap_or_else(|| sessions::Finished::Unknown {
         why: "interrupted".to_owned(),
     });
-    (phases, finished)
+    Observed {
+        phases: work.phases,
+        finished,
+        moved: work.moved,
+    }
+}
+
+/// A `--scope` path as given: a relative path is taken from the current
+/// directory, `~/` from the home directory.
+fn scope_path(raw: &str) -> PathBuf {
+    let path = knowledge::expand_home(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    }
 }
 
 /// The repositories `--scope` names, other than `launch`, each once and
-/// canonical; and the scope paths that lie in no repository. A relative path
-/// is taken from the current directory, `~/` from the home directory.
+/// canonical; and the scope paths that lie in no repository (see
+/// [`scope_path`]).
 fn scoped_repos(scope: &[String], launch: Option<&Path>) -> (Vec<PathBuf>, Vec<String>) {
-    let cwd = std::env::current_dir().unwrap_or_default();
     let launch = launch.and_then(|path| std::fs::canonicalize(path).ok());
     let mut repos: Vec<PathBuf> = Vec::new();
     let mut unscoped = Vec::new();
     for raw in scope {
-        let path = knowledge::expand_home(raw);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            cwd.join(path)
-        };
-        match lifecycle::repo_of(&path) {
+        match lifecycle::repo_of(&scope_path(raw)) {
             Some(repo) if launch.as_ref() == Some(&repo) => {}
             Some(repo) => {
                 if !repos.contains(&repo) {
@@ -1927,17 +2016,19 @@ fn lifecycle_briefing(root: &Path, in_repo: bool, scoped: &[PathBuf]) -> String 
         .collect::<Vec<_>>()
         .join(", ");
     let phases = if !in_repo && scoped.is_empty() {
-        "2. This folder is not a Git repository, and no --scope named one, so ohjaa
-   cannot observe your commits or pull requests. Say in your handover what you
-   changed, and in which repos. Declare any repo you work in with
-   `toimija intent \"<why>\" --scope <path>` so sessions there can see you."
+        "2. This folder is not a Git repository, and no --scope named one. At leaving,
+   ohjaa records the repositories directly in it whose branches or worktrees
+   moved, but it cannot tell your work there from another agent's. Say in your
+   handover what you changed, and in which repos. Declare any repo you work in
+   with `toimija intent \"<why>\" --scope <path>` so sessions there can see you."
             .to_owned()
     } else if !in_repo {
         format!(
             "2. You were launched for: {names}. Work in small phases there; end each with a
    commit, and `sykli run` where that repository has a sykli contract. ohjaa
-   records your commits and pull request in each of them. Work in any other
-   repository is not observed: name it in your handover."
+   records your commits and pull request in each of them. Another repository
+   directly in this folder is recorded only as found, if it moved: name it in
+   your handover."
         )
     } else if lifecycle::has_sykli_contract(root) {
         "2. Work in small phases; end each with a commit and `sykli run`.".to_owned()

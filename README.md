@@ -329,10 +329,15 @@ launched in:
   one that ended last, launched in that repo or elsewhere with a `--scope`
   naming it, and one launched elsewhere says where it was launched.
 
-What ohjaa still cannot see, it says: a `--scope` path outside every repository
-is named as unobserved, and work in a repository nobody named is not recorded,
-so the handover has to say what changed there. Scope can be named from inside
-a repo too, for a second repository an agent will touch.
+A repository nobody named is still observed when it moved: at leaving, ohjaa
+looks at the repositories directly in the launch folder (and in any folder
+`--scope` named that is not itself a repository), and records each whose
+checkouts or branches moved while the session ran, in any of its worktrees,
+as **found, not named**. Another agent working there at the same time cannot be
+told apart from this one, and the record says so; name repositories with
+`--scope` wherever you can. A `--scope` path that is neither in a repository nor
+a folder is named as unobserved. Scope can be named from inside a repo too, for
+a second repository an agent will touch.
 
 A toimija too old to list sessions outside repos makes ohjaa refuse to launch
 from the root, and makes `ohjaa fleet` incomplete — never quietly empty.
