@@ -2752,3 +2752,35 @@ fn export_creates_no_log_and_one_bad_row_does_not_fail_an_export_of_another_sess
     );
     fixture.cleanup();
 }
+
+#[test]
+fn a_briefing_too_big_for_one_command_line_argument_is_refused_clearly() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("briefing-cap");
+    let repo = fixture.make_git_repo("work");
+    let mine = fixture.dir.join("config/ohjaa/mine");
+    let launch = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["run", "codex", "--intent", "x", "--dry-run"])
+                .current_dir(&repo),
+        )
+    };
+    fixture.node(&mine, "big", "fact", &"long knowledge ".repeat(500));
+    let (_, stderr, code) = launch();
+    assert_eq!(code, Some(0), "{stderr}");
+    // Linux caps one argument at 128 KiB, and the briefing is one, twice.
+    fixture.node(&mine, "huge", "fact", &"long knowledge ".repeat(8_000));
+    let (_, stderr, code) = launch();
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        stderr.contains("KiB, over the 100 KiB a briefing may be")
+            && stderr.contains("refusing to launch")
+            && !stderr.contains("would run:"),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}

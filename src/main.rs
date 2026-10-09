@@ -31,6 +31,9 @@ use scan::{ago, scan_fleet, scan_repo, Coverage, Scan};
 const REFUSED: i32 = 3;
 /// At least one repo could not be scanned, so absence proves nothing.
 const INCOMPLETE: i32 = 4;
+/// The most a briefing may be: it travels as one command-line argument, to
+/// toimija and on to the agent, and Linux caps one at 128 KiB.
+const MAX_BRIEFING: usize = 100 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -1561,6 +1564,18 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         .collect();
         Some(parts.join("\n"))
     };
+    if let Some(briefing) = briefing.as_ref().filter(|b| b.len() > MAX_BRIEFING) {
+        eprintln!(
+            "ohjaa: the briefing is {} KiB, over the {} KiB a briefing may be: it is one \
+             command-line argument to toimija and again to the agent, and Linux caps one at \
+             128 KiB. Merge or retire knowledge (`ohjaa check`), name fewer repositories \
+             with --scope, or launch with --no-briefing",
+            briefing.len().div_ceil(1024),
+            MAX_BRIEFING / 1024
+        );
+        eprintln!("ohjaa: refusing to launch");
+        return Ok(REFUSED);
+    }
 
     let mut command = Command::new("toimija");
     command.arg("run").arg("--intent").arg(intent);
