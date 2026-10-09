@@ -243,28 +243,28 @@ enum UsageCmd {
 
 fn cmd_usage(action: &UsageCmd) -> Result<i32> {
     let dirs = dirs()?;
-    let store = sessions::Store::open(&sessions::store_path(&dirs.state))?;
+    let open = || sessions::Store::open(&sessions::store_path(&dirs.state));
     match action {
         UsageCmd::Import { file, session } => {
             let id = session.clone().map(Ok).unwrap_or_else(current_session_id)?;
             anyhow::ensure!(sessions::is_valid_id(&id), "invalid session id");
-            store.attach_usage(&id, usage::Receipt::read(file)?)?;
+            open()?.attach_usage(&id, usage::Receipt::read(file)?)?;
             println!("recorded usage snapshot for {id}");
             Ok(0)
         }
         UsageCmd::Export { session } => {
-            let (mut records, unreadable) = store.all()?;
+            // Read, then let the log go before writing: a reader that stops
+            // reading must never hold every other ohjaa off the log.
+            let (mut records, unreadable) = open()?.all()?;
             if let Some(id) = session {
                 records.retain(|s| s.id == *id);
                 anyhow::ensure!(!records.is_empty(), "session {id} not found");
             }
-            serde_json::to_writer_pretty(
-                std::io::stdout().lock(),
-                &serde_json::json!({
-                    "schema": "ohjaa-sessions.v1", "sessions": records, "unreadable": unreadable
-                }),
-            )?;
-            println!();
+            let mut out = serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "ohjaa-sessions.v1", "sessions": records, "unreadable": unreadable
+            }))?;
+            out.push(b'\n');
+            std::io::stdout().lock().write_all(&out)?;
             Ok(if unreadable.is_empty() { 0 } else { INCOMPLETE })
         }
     }

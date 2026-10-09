@@ -2536,3 +2536,63 @@ fn a_second_handover_changes_only_the_fields_it_names() {
     );
     fixture.cleanup();
 }
+
+// ---- review of #38: each test failed before its fix ---------------------------
+
+#[test]
+fn a_stalled_export_reader_never_costs_a_running_session_its_record() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("export-stall");
+    let repo = fixture.make_git_repo("work");
+    // Enough history that the export outgrows a pipe buffer.
+    let long = "x".repeat(60_000);
+    for _ in 0..3 {
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "run",
+                    "sh",
+                    "--intent",
+                    &long,
+                    "--no-briefing",
+                    "--",
+                    "-c",
+                    "exit 0",
+                ])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+    }
+    // A reader that stops reading: the export blocks on its write.
+    let mut export = fixture
+        .ohjaa()
+        .args(["usage", "export"])
+        .current_dir(&repo)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let (_, stderr, code) = run_session(&fixture, &repo, "exit 0");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("recorded; queued") && !stderr.contains("could not be saved"),
+        "the session log was free while the export waited on its reader: {stderr}"
+    );
+    let mut out = String::new();
+    use std::io::Read as _;
+    export
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    assert!(export.wait().unwrap().success());
+    let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(export["sessions"].as_array().unwrap().len(), 3);
+    fixture.cleanup();
+}
