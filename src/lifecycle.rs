@@ -981,6 +981,18 @@ pub fn finished(checkout: &Path, receipts: &Receipts, sykli: &Sykli) -> Finished
     }
 }
 
+/// Whether `branch` (`origin/main`, or a local `main`) in `repo` still sits at
+/// `commit`. False when git cannot say.
+pub fn still_at(repo: &Path, branch: &str, commit: &str) -> bool {
+    [
+        format!("refs/remotes/{branch}"),
+        format!("refs/heads/{branch}"),
+    ]
+    .iter()
+    .filter_map(|reference| git(repo, &["rev-parse", "--verify", "-q", reference]))
+    .any(|at| at == commit)
+}
+
 /// This machine's sykli, asked at most once per leaving whether it can bind
 /// a receipt to a commit (`sykli verify --commit`).
 #[derive(Debug, Default)]

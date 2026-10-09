@@ -183,6 +183,11 @@ WARNING from the last session here (oh-1791…, claude, ended 2026-10-09 21:30 U
 - origin/main at 3dbaafd in selko has no passing evidence — check before building on it (FAILED sykli verify: error: outcome failed)
 ```
 
+An earlier session's flag about a branch keeps opening the briefing for as long
+as that branch still sits at the commit it flagged (`WARNING from an earlier
+session here (…), still true`), so a quiet session in between cannot hide a
+broken main.
+
 The records live in a **session log**, redb at
 `~/.local/state/ohjaa/sessions.redb`, on this machine only. Knowledge never
 lives there, so deleting the log loses no knowledge. A busy or broken log never

@@ -17,6 +17,7 @@
 //! ending. The two things an agent writes — the read-back and the handover —
 //! are kept, and shown, as its testimony.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -766,6 +767,11 @@ pub struct Flag {
     pub headline: String,
     /// What sykli said, or why it could not.
     pub why: String,
+    /// The repository it is about.
+    pub repo: String,
+    /// For a commit that reached a branch: the branch and the commit, so a
+    /// later briefing can tell whether the branch still sits there.
+    pub tip: Option<(String, String)>,
 }
 
 /// The flags in a record: every commit that reached the default branch
@@ -795,6 +801,8 @@ pub fn flags(session: &Session) -> Vec<Flag> {
                     repo_name(repo)
                 ),
                 why: describe_check(&landed.check),
+                repo: repo.to_owned(),
+                tip: Some((landed.onto.clone(), landed.commit.clone())),
             });
         }
         if let Finished::PullRequest {
@@ -814,11 +822,23 @@ pub fn flags(session: &Session) -> Vec<Flag> {
                         short(head)
                     ),
                     why: describe_check(check),
+                    repo: repo.to_owned(),
+                    tip: None,
                 });
             }
         }
     }
     out
+}
+
+/// Whether an ended session was here: launched here, named here with
+/// `--scope`, or found working here at leaving.
+pub fn touches(session: &Session, here: &str) -> bool {
+    session.left.as_ref().is_some_and(|left| {
+        session.repo == here
+            || session.scoped.iter().any(|s| s.repo == here)
+            || left.scoped.iter().any(|s| s.repo == here)
+    })
 }
 
 /// Sessions closed as orphaned at this launch, for the very top of its
@@ -840,23 +860,51 @@ pub fn render_orphaned(orphans: &[Session]) -> String {
     out
 }
 
-/// The flags of the last session here, for the very top of the next
-/// briefing: before the knowledge, and before its handover can say "ship it".
-/// Empty when it raised none.
-pub fn render_warnings(session: &Session) -> String {
-    let flags = flags(session);
-    if flags.is_empty() {
-        return String::new();
-    }
-    let ended = session.left.as_ref().map_or_else(String::new, |left| {
-        format!(", ended {}", clock(left.ended_ms))
-    });
-    let mut out = format!(
-        "WARNING from the last session here ({}, {}{ended}):\n",
-        session.id, session.agent
-    );
-    for flag in flags {
-        let _ = writeln!(out, "- {} ({})", flag.headline, flag.why);
+/// The flags of the last session here, and of earlier ones that still hold,
+/// for the very top of the next briefing: before the knowledge, and before a
+/// handover can say "ship it". Every flag of `last` is said. An earlier
+/// session's flag about a branch is said while `still_at(repo, branch,
+/// commit)` — the branch still sits at the commit it flagged — so a quiet
+/// session in between cannot hide a broken main. `earlier` is newest first.
+/// Empty when nothing is flagged.
+pub fn render_warnings(
+    last: &Session,
+    earlier: &[Session],
+    still_at: impl Fn(&str, &str, &str) -> bool,
+) -> String {
+    let mut out = String::new();
+    let mut said = HashSet::new();
+    let mut block = |session: &Session, whose: &str, still: &str, flags: Vec<Flag>| {
+        let flags: Vec<Flag> = flags
+            .into_iter()
+            .filter(|flag| said.insert(flag.headline.clone()))
+            .collect();
+        if flags.is_empty() {
+            return;
+        }
+        let ended = session.left.as_ref().map_or_else(String::new, |left| {
+            format!(", ended {}", clock(left.ended_ms))
+        });
+        let _ = writeln!(
+            out,
+            "WARNING from {whose} ({}, {}{ended}){still}:",
+            session.id, session.agent
+        );
+        for flag in flags {
+            let _ = writeln!(out, "- {} ({})", flag.headline, flag.why);
+        }
+    };
+    block(last, "the last session here", "", flags(last));
+    for session in earlier {
+        let standing = flags(session)
+            .into_iter()
+            .filter(|flag| {
+                flag.tip
+                    .as_ref()
+                    .is_some_and(|(branch, commit)| still_at(&flag.repo, branch, commit))
+            })
+            .collect();
+        block(session, "an earlier session here", ", still true", standing);
     }
     out
 }
@@ -1683,10 +1731,14 @@ mod tests {
             ]
         );
         let s = with(pr("MERGED", unverified()), Vec::new());
-        assert!(
-            render_warnings(&s).starts_with("WARNING from the last session here (oh-12, claude")
-        );
-        assert!(render_warnings(&with(Finished::NoPullRequest, Vec::new())).is_empty());
+        assert!(render_warnings(&s, &[], |_, _, _| false)
+            .starts_with("WARNING from the last session here (oh-12, claude"));
+        assert!(render_warnings(
+            &with(Finished::NoPullRequest, Vec::new()),
+            &[],
+            |_, _, _| false
+        )
+        .is_empty());
     }
 
     #[test]

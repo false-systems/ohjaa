@@ -3452,3 +3452,70 @@ fn intake_drafts_from_what_ohjaa_observed_going_wrong_not_only_the_handover() {
     }
     fixture.cleanup();
 }
+
+#[test]
+fn a_warning_about_main_stands_while_main_is_still_at_the_flagged_commit() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("standing");
+    let repo = clone_with_origin(&fixture, "work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let session = |script: &str| {
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "run",
+                    "sh",
+                    "--intent",
+                    "x",
+                    "--no-briefing",
+                    "--",
+                    "-c",
+                    script,
+                ])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+    };
+    let briefing = || {
+        let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+        stdout
+    };
+    session(&format!(
+        "{RECEIPT_FN}
+        set -e
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m broken
+        receipt failed
+        git push -q origin HEAD:main"
+    ));
+    let flagged = short_head(&repo);
+    // A later session that changes nothing is now the last session here.
+    session(&format!(
+        "sleep 1; {} handover --next 'all quiet'",
+        ohjaa_bin()
+    ));
+    let text = briefing();
+    assert!(
+        text.starts_with("WARNING from an earlier session here (oh-")
+            && text.contains(&format!(
+                "origin/main at {flagged} in work has no passing evidence"
+            )),
+        "main still sits at the flagged commit: {text}"
+    );
+    // Main moves on, with passing evidence: the warning has nothing left to say.
+    session(&format!(
+        "{RECEIPT_FN}
+        set -e
+        sleep 1
+        echo fixed > fix.txt && git add fix.txt && git commit -q -m fixed
+        receipt passed
+        git push -q origin HEAD:main"
+    ));
+    let text = briefing();
+    assert!(!text.contains("WARNING"), "{text}");
+    fixture.cleanup();
+}
