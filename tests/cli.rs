@@ -47,6 +47,53 @@ fi
 exit "${OHJAA_STUB_EXIT:-0}"
 "#;
 
+/// Never the real gh: no network, and a controlled answer. With
+/// OHJAA_STUB_GH_PR_BRANCH set, the branch of that name has an open pull
+/// request whose head is the commit checked out where gh runs.
+const GH_STUB: &str = r#"#!/bin/sh
+if [ -n "${OHJAA_STUB_GH_SLEEP:-}" ]; then sleep "$OHJAA_STUB_GH_SLEEP"; fi
+if [ -n "${OHJAA_STUB_GH_PR_BRANCH:-}" ]; then
+  if [ "$(git branch --show-current)" = "$OHJAA_STUB_GH_PR_BRANCH" ]; then
+    printf '{"url":"https://github.com/o/r/pull/7","state":"%s","headRefOid":"%s"}\n' \
+      "${OHJAA_STUB_GH_PR_STATE:-OPEN}" "$(git rev-parse HEAD)"
+    exit 0
+  fi
+  echo "no pull requests found for branch \"$(git branch --show-current)\"" >&2
+  exit 1
+fi
+echo "gh: To get started with GitHub CLI, please run:  gh auth login" >&2
+exit 4
+"#;
+
+/// Never the real sykli. `verify --help` names `--commit` only with
+/// OHJAA_STUB_SYKLI_COMMIT set. `verify <receipt> --contract <c> --commit
+/// <sha>` passes only a receipt for exactly that commit's tree that says
+/// passed and was not forged, as sykli's own check would.
+const SYKLI_STUB: &str = r#"#!/bin/sh
+printf '%s|%s\n' "$PWD" "$*" >> "${OHJAA_STUB_SYKLI_CALLS:-/dev/null}"
+if [ "$1" = verify ] && [ "$2" = --help ]; then
+  echo "Usage: sykli verify [OPTIONS] <RECEIPT>"
+  echo "      --contract <CONTRACT>  Path to sykli.rs or a sykli-contract.v1 JSON file"
+  if [ -n "${OHJAA_STUB_SYKLI_COMMIT:-}" ]; then
+    echo "      --commit <SHA>  Fail unless the receipt binds exactly this commit"
+  fi
+  exit 0
+fi
+[ "$1" = verify ] || exit 2
+receipt="$2"; shift 2
+sha=""
+while [ $# -gt 0 ]; do
+  case "$1" in --commit) sha="$2"; shift;; esac
+  shift
+done
+[ -n "$sha" ] || { echo "error: no --commit" >&2; exit 2; }
+tree=$(git rev-parse "$sha^{tree}") || exit 2
+grep -q "\"head_tree_oid\":\"$tree\"" "$receipt" || { echo "error: the receipt is not for $sha" >&2; exit 3; }
+grep -q '"contract_hash":"forged"' "$receipt" && { echo "error: contract mismatch: the receipt was not made under sykli.json" >&2; exit 4; }
+grep -q '"outcome":"passed"' "$receipt" || { echo "error: outcome failed" >&2; exit 1; }
+exit 0
+"#;
+
 /// A session payload exactly as `toimija sessions --json` emits it.
 fn sessions_json(sessions: &str, coverage: &str) -> String {
     format!(
@@ -126,12 +173,12 @@ impl Fixture {
         make_executable(&stub);
         // Never the real gh: no network, and a controlled answer.
         let gh = stub_dir.join("gh");
-        fs::write(
-            &gh,
-            "#!/bin/sh\nif [ -n \"${OHJAA_STUB_GH_SLEEP:-}\" ]; then sleep \"$OHJAA_STUB_GH_SLEEP\"; fi\necho \"gh: To get started with GitHub CLI, please run:  gh auth login\" >&2\nexit 4\n",
-        )
-        .unwrap();
+        fs::write(&gh, GH_STUB).unwrap();
         make_executable(&gh);
+        // Never the real sykli: `verify --help` names --commit only on demand.
+        let sykli = stub_dir.join("sykli");
+        fs::write(&sykli, SYKLI_STUB).unwrap();
+        make_executable(&sykli);
         let fixture = Fixture { dir, stub_dir };
         // Default: an empty, fully available scan, in repos and outside them.
         fixture.set_sessions(&sessions_json("", "available"));
@@ -1675,7 +1722,7 @@ fn phases_are_observed_from_commits_and_their_sykli_receipts() {
         .find(|l| l.starts_with("phases"))
         .expect(&stderr);
     assert!(
-        phases.contains(" passed · ") && phases.ends_with("no sykli run"),
+        phases.contains(" receipt: passed · ") && phases.ends_with("no sykli receipt"),
         "{phases}"
     );
     fixture.cleanup();
@@ -1834,7 +1881,7 @@ fn a_root_session_records_the_commits_it_made_in_a_scoped_repo() {
         .find(|l| l.starts_with("in work") && l.contains(" phases "))
         .expect(&stderr);
     assert!(
-        phases.ends_with("no sykli run"),
+        phases.ends_with("no sykli receipt"),
         "the commit made in the scoped repo is its phase: {phases}"
     );
     assert!(
@@ -2811,13 +2858,14 @@ fn a_briefing_too_big_for_one_command_line_argument_is_refused_clearly() {
 
 // ---- where work happens (audit 2026-10-09): each test failed before its fix ----
 
-/// A shell function for stub agents: `receipt <outcome>` writes a
-/// sykli-receipt.v1 for HEAD's tree into this checkout, as `sykli run` does.
+/// A shell function for stub agents: `receipt <outcome> [<contract hash>]`
+/// writes a sykli-receipt.v1 for HEAD's tree into this checkout, as `sykli
+/// run` does.
 const RECEIPT_FN: &str = r#"
 receipt() {
   tree=$(git rev-parse 'HEAD^{tree}')
   mkdir -p .sykli/receipts
-  printf '{"schema":"sykli-receipt.v1","contract_hash":"c","started_at_ms":%s000,"subject":{"repository":"r","tree_oid":"%s","inputs_digest":"d","head_tree_oid":"%s","dirty":false},"tasks":[],"outcome":"%s"}' \
+  printf '{"schema":"sykli-receipt.v1","contract_hash":"'"${2:-c}"'","started_at_ms":%s000,"subject":{"repository":"r","tree_oid":"%s","inputs_digest":"d","head_tree_oid":"%s","dirty":false},"tasks":[],"outcome":"%s"}' \
     "$(date +%s)" "$tree" "$tree" "$1" > ".sykli/receipts/rcpt_$tree.json"
 }
 "#;
@@ -2956,5 +3004,213 @@ fn a_scope_naming_the_folder_of_repos_records_the_ones_that_moved() {
         .find(|l| l.starts_with("in work") && l.contains(" phases "))
         .expect(&stderr);
     assert!(phases.contains(&short_head(&repo)), "{phases}");
+    fixture.cleanup();
+}
+
+/// A session whose agent commits on branch `feat` in a new worktree `name`
+/// of `repo`, with a sykli contract, and writes a receipt with `receipt`'s
+/// arguments; gh reports a pull request for `feat`. Returns the record and
+/// the commit.
+fn pull_request_session(
+    fixture: &Fixture,
+    repo: &Path,
+    name: &str,
+    receipt: &str,
+    sykli_commit: bool,
+) -> (String, String) {
+    let worktree = fixture.dir.join("_worktrees").join(name);
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        git worktree add -q -b feat-{name} '{wt}'
+        cd '{wt}'
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'ship it'
+        receipt {receipt}",
+        wt = worktree.display()
+    );
+    let mut command = fixture.ohjaa();
+    command
+        .args([
+            "run",
+            "sh",
+            "--intent",
+            "ship",
+            "--no-briefing",
+            "--",
+            "-c",
+            &script,
+        ])
+        .env("OHJAA_STUB_RUN_AGENT", "1")
+        .env("OHJAA_STUB_GH_PR_BRANCH", format!("feat-{name}"))
+        .env(
+            "OHJAA_STUB_SYKLI_CALLS",
+            fixture.dir.join("sykli-calls.txt"),
+        )
+        .current_dir(repo);
+    if sykli_commit {
+        command.env("OHJAA_STUB_SYKLI_COMMIT", "1");
+    }
+    let (_, stderr, code) = output_of(&mut command);
+    assert_eq!(code, Some(0), "{stderr}");
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&worktree)
+        .output()
+        .unwrap();
+    (
+        stderr,
+        String::from_utf8_lossy(&head.stdout).trim().to_owned(),
+    )
+}
+
+fn finished_line(record: &str) -> &str {
+    record
+        .lines()
+        .find(|l| l.starts_with("finished"))
+        .expect(record)
+}
+
+#[test]
+fn the_pull_request_head_is_verified_by_sykli_never_by_the_receipts_word() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("pr-head");
+    let repo = fixture.make_git_repo("work");
+
+    // The receipt says passed; sykli refuses it. The record says what sykli said.
+    let (record, head) = pull_request_session(&fixture, &repo, "forged", "passed forged", true);
+    let finished = finished_line(&record);
+    assert!(
+        finished.contains("https://github.com/o/r/pull/7 (open)")
+            && finished.contains(&format!("head {}", &head[..7]))
+            && finished.contains("FAILED sykli verify: error: contract mismatch"),
+        "{finished}"
+    );
+    assert!(!finished.contains("passed"), "{finished}");
+    let calls = fs::read_to_string(fixture.dir.join("sykli-calls.txt")).unwrap();
+    assert!(
+        calls.contains(&format!("--contract sykli.json --commit {head}")),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("_worktrees/forged|verify "),
+        "sykli verifies in the checkout the receipt is in: {calls}"
+    );
+
+    // An honest receipt, verified by a sykli that can bind a commit.
+    let (record, head) = pull_request_session(&fixture, &repo, "honest", "passed", true);
+    assert!(
+        finished_line(&record).ends_with(&format!(
+            "head {}: verified: passed (sykli verify --commit)",
+            &head[..7]
+        )),
+        "{record}"
+    );
+
+    // The same receipt with a sykli that cannot: never a silent pass.
+    let (record, _) = pull_request_session(&fixture, &repo, "old-sykli", "passed", false);
+    assert!(
+        finished_line(&record).ends_with("unverified: sykli has no --commit"),
+        "{record}"
+    );
+    fixture.cleanup();
+}
+
+/// A clone of a bare origin whose `main` has one commit, as `origin/main`.
+fn clone_with_origin(fixture: &Fixture, name: &str) -> PathBuf {
+    let origin = fixture.dir.join(format!("{name}-origin.git"));
+    let status = Command::new("git")
+        .args(["init", "-q", "--bare", "-b", "main"])
+        .arg(&origin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let repo = fixture.dir.join(name);
+    let status = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(&origin)
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    run_git(&repo, &["config", "user.email", "ohjaa@example.invalid"]);
+    run_git(&repo, &["config", "user.name", "Ohjaa Test"]);
+    // Long before the session, as far as reflog times say.
+    for args in [
+        &["commit", "-q", "--allow-empty", "-m", "init"][..],
+        &["push", "-q", "origin", "HEAD:main"],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .env("GIT_COMMITTER_DATE", "@1000000000 +0000")
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{status:?}");
+    }
+    run_git(&repo, &["remote", "set-head", "origin", "main"]);
+    repo
+}
+
+#[test]
+fn every_commit_this_session_pushed_to_the_default_branch_is_verified() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("landed");
+    let repo = clone_with_origin(&fixture, "work");
+    let worktree = fixture.dir.join("_worktrees").join("work-push");
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        git worktree add -q -b push '{wt}'
+        cd '{wt}'
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'checked'
+        receipt passed
+        echo x > x.txt && git add x.txt && git commit -q -m 'never checked'
+        git push -q origin HEAD:main",
+        wt = worktree.display()
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "push",
+                "--no-briefing",
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let pushed = short_head(&worktree);
+    let checked = {
+        let output = Command::new("git")
+            .args(["rev-parse", "--short=7", "HEAD~1"])
+            .current_dir(&worktree)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    let landed: Vec<&str> = stderr.lines().filter(|l| l.starts_with("landed")).collect();
+    assert_eq!(
+        landed,
+        [
+            format!(
+                "landed        {checked} on origin/main: verified: passed (sykli verify --commit)"
+            ),
+            format!(
+                "landed        {pushed} on origin/main: unchecked: no sykli receipt for its tree"
+            ),
+        ],
+        "{stderr}"
+    );
     fixture.cleanup();
 }

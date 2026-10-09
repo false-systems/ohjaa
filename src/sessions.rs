@@ -86,6 +86,33 @@ pub struct Phase {
     pub worktree: Option<String>,
 }
 
+/// What `sykli verify --commit` said about one commit. A receipt's own
+/// `outcome` is its claim; only this says passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum Check {
+    /// sykli verified a passing, clean receipt bound to exactly this commit.
+    Passed,
+    /// sykli refused it, in its own words.
+    Failed { why: String },
+    /// No sykli receipt names the commit's tree.
+    Unchecked,
+    /// sykli could not be asked: it has no `--commit`, is not installed, or
+    /// gave no answer in time.
+    Unverified { why: String },
+}
+
+/// A commit that reached the default branch during the session: one this
+/// session made that is on it now, or one it pushed to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Landed {
+    pub commit: String,
+    pub subject: String,
+    /// The branch it reached: `origin/main`, or the local `main`.
+    pub onto: String,
+    pub check: Check,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Finished {
@@ -96,8 +123,15 @@ pub enum Finished {
     PullRequest {
         url: String,
         state: String,
+        /// The receipt for its head's tree, as the receipt says it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_evidence: Option<Evidence>,
+        /// Its head commit; older records omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head: Option<String>,
+        /// What sykli said about its head; older records omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_check: Option<Check>,
     },
 }
 
@@ -128,6 +162,10 @@ pub struct Left {
     /// `--scope`, beyond the one it was launched in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scoped: Vec<ScopedLeft>,
+    /// The commits that reached the default branch of the launch repository
+    /// during the session, each with what sykli said about it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub landed: Vec<Landed>,
 }
 
 /// A repository a session named with `--scope`, as it stood at entering. It
@@ -156,6 +194,9 @@ pub struct ScopedLeft {
     /// them, so it is said as found, never as named.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub found: bool,
+    /// As for the launch repository.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub landed: Vec<Landed>,
 }
 
 /// One session, entering to leaving.
@@ -497,11 +538,34 @@ fn describe_exit(exit: Exit) -> String {
     }
 }
 
+/// A receipt's own word, said as its word: only `sykli verify --commit`
+/// ([`describe_check`]) says a commit passed.
 fn describe_evidence(evidence: Option<&Evidence>) -> String {
     match evidence {
-        Some(e) if e.dirty => format!("{} (dirty tree)", e.outcome),
-        Some(e) => e.outcome.clone(),
-        None => "no sykli run".to_owned(),
+        Some(e) if e.dirty => format!("receipt: {} (dirty tree)", e.outcome),
+        Some(e) => format!("receipt: {}", e.outcome),
+        None => "no sykli receipt".to_owned(),
+    }
+}
+
+fn describe_check(check: &Check) -> String {
+    match check {
+        Check::Passed => "verified: passed (sykli verify --commit)".to_owned(),
+        Check::Failed { why } => format!("FAILED sykli verify: {why}"),
+        Check::Unchecked => "unchecked: no sykli receipt for its tree".to_owned(),
+        Check::Unverified { why } => format!("unverified: {why}"),
+    }
+}
+
+fn landed_lines(label: &str, landed: &[Landed], out: &mut String) {
+    for landed in landed {
+        let _ = writeln!(
+            out,
+            "{label}{} on {}: {}",
+            short(&landed.commit),
+            landed.onto,
+            describe_check(&landed.check)
+        );
     }
 }
 
@@ -579,6 +643,7 @@ pub fn render_record(session: &Session) -> String {
                 describe_phases(left.phases.as_ref(), left.interrupted)
             );
             let _ = writeln!(out, "finished      {}", describe_finished(&left.finished));
+            landed_lines("landed        ", &left.landed, &mut out);
         } else if left.scoped.is_empty() {
             // The folder has nothing to observe, and no --scope named a repository.
             out.push_str("phases        none to observe (not a Git repository)\n");
@@ -596,6 +661,7 @@ pub fn render_record(session: &Session) -> String {
                 "{label:<13} finished {}",
                 describe_finished(&scoped.finished)
             );
+            landed_lines(&format!("{label:<13} landed "), &scoped.landed, &mut out);
             if scoped.found {
                 let _ = writeln!(
                     out,
@@ -709,9 +775,23 @@ fn describe_finished(finished: &Finished) -> String {
         Finished::PullRequest {
             url,
             state,
-            head_evidence,
+            head: Some(head),
+            head_check: Some(check),
+            ..
         } => format!(
-            "{url} ({}) · evidence on its head: {}",
+            "{url} ({}) · head {}: {}",
+            state.to_lowercase(),
+            short(head),
+            describe_check(check)
+        ),
+        // Recorded before ohjaa asked sykli.
+        Finished::PullRequest {
+            url,
+            state,
+            head_evidence,
+            ..
+        } => format!(
+            "{url} ({}) · its head, unverified: {}",
             state.to_lowercase(),
             describe_evidence(head_evidence.as_ref())
         ),
@@ -721,12 +801,12 @@ fn describe_finished(finished: &Finished) -> String {
 fn summarise_work(phases: Option<&Vec<Phase>>) -> String {
     match phases {
         Some(phases) => {
-            let with_evidence = phases
+            let claimed = phases
                 .iter()
                 .filter(|p| p.evidence.as_ref().is_some_and(|e| e.outcome == "passed"))
                 .count();
             format!(
-                "{} commit(s), {with_evidence} with a passing sykli run",
+                "{} commit(s), {claimed} whose sykli receipt says passed",
                 phases.len()
             )
         }
@@ -736,6 +816,18 @@ fn summarise_work(phases: Option<&Vec<Phase>>) -> String {
 
 fn summarise_finished(finished: &Finished) -> String {
     match finished {
+        Finished::PullRequest {
+            url,
+            state,
+            head: Some(head),
+            head_check: Some(check),
+            ..
+        } => format!(
+            "{url} ({}), head {} {}",
+            state.to_lowercase(),
+            short(head),
+            describe_check(check)
+        ),
         Finished::PullRequest { url, state, .. } => format!("{url} ({})", state.to_lowercase()),
         Finished::NoPullRequest => "no pull request".to_owned(),
         Finished::Unknown { .. } => "unknown".to_owned(),
@@ -800,6 +892,15 @@ pub fn render_last(session: &Session, here: &str) -> String {
                 summarise_work(left.phases.as_ref()),
                 summarise_finished(&left.finished)
             );
+            for landed in &left.landed {
+                let _ = writeln!(
+                    out,
+                    "- {} reached {}: {}",
+                    short(&landed.commit),
+                    landed.onto,
+                    describe_check(&landed.check)
+                );
+            }
         }
         for scoped in scoped {
             let _ = writeln!(
@@ -814,6 +915,16 @@ pub fn render_last(session: &Session, here: &str) -> String {
                     ""
                 }
             );
+            for landed in &scoped.landed {
+                let _ = writeln!(
+                    out,
+                    "- in {}, {} reached {}: {}",
+                    repo_name(&scoped.repo),
+                    short(&landed.commit),
+                    landed.onto,
+                    describe_check(&landed.check)
+                );
+            }
         }
     }
     match &session.handover {
@@ -880,6 +991,7 @@ mod tests {
             finished: Finished::NoPullRequest,
             interrupted: false,
             scoped: Vec::new(),
+            landed: Vec::new(),
         });
         session
     }
@@ -911,14 +1023,17 @@ mod tests {
                     }]),
                     finished: Finished::NoPullRequest,
                     found: false,
+                    landed: Vec::new(),
                 },
                 ScopedLeft {
                     repo: "/r/projects/toimija".to_owned(),
                     phases: Some(Vec::new()),
                     finished: Finished::NoPullRequest,
                     found: true,
+                    landed: Vec::new(),
                 },
             ],
+            landed: Vec::new(),
         });
         let record = render_record(&s);
         assert!(
@@ -926,7 +1041,7 @@ mod tests {
             "a root session with scoped repositories has work to show: {record}"
         );
         assert!(
-            record.contains("in ohjaa      phases a1b2c3d passed"),
+            record.contains("in ohjaa      phases a1b2c3d receipt: passed"),
             "{record}"
         );
         assert!(
@@ -939,7 +1054,7 @@ mod tests {
         );
         let last = render_last(&s, &s.repo);
         assert!(
-            last.contains("- work in ohjaa: 1 commit(s), 1 with a passing sykli run"),
+            last.contains("- work in ohjaa: 1 commit(s), 1 whose sykli receipt says passed"),
             "{last}"
         );
         assert!(!last.contains("not a Git repository"), "{last}");
@@ -956,7 +1071,7 @@ mod tests {
             "{record}"
         );
         assert!(
-            last.contains("- work in toimija: 0 commit(s), 0 with a passing sykli run; finished: no pull request; found at leaving, not named with --scope"),
+            last.contains("- work in toimija: 0 commit(s), 0 whose sykli receipt says passed; finished: no pull request; found at leaving, not named with --scope"),
             "{last}"
         );
         let found = render_last(&s, "/r/projects/toimija");
@@ -1153,6 +1268,7 @@ mod tests {
             finished: Finished::NoPullRequest,
             interrupted: false,
             scoped: Vec::new(),
+            landed: Vec::new(),
         });
         let record = render_record(&s);
         let observed = record.find("─ observed").unwrap();
@@ -1160,7 +1276,7 @@ mod tests {
         assert!(observed < testimony, "{record}");
         assert!(record.contains("ended: clean (exit 0)"), "{record}");
         assert!(
-            record.contains("a1b2c3d passed · 0718abc no sykli run"),
+            record.contains("a1b2c3d receipt: passed · 0718abc no sykli receipt"),
             "{record}"
         );
         assert!(
@@ -1189,7 +1305,7 @@ mod tests {
             "said once, not twice: {last}"
         );
         assert!(
-            last.contains("2 commit(s), 1 with a passing sykli run"),
+            last.contains("2 commit(s), 1 whose sykli receipt says passed"),
             "{last}"
         );
         assert!(last.contains("- unfinished: windows paths"), "{last}");
@@ -1275,6 +1391,7 @@ mod tests {
             phases: Some(vec![phase]),
             finished: Finished::NoPullRequest,
             found: false,
+            landed: Vec::new(),
         }];
         let v1 = serde_json::to_value(&s).unwrap();
         for pointer in [
@@ -1307,6 +1424,67 @@ mod tests {
                 "{pointer} is gone from v1: {v1}"
             );
         }
+    }
+
+    #[test]
+    fn only_sykli_says_a_commit_passed_never_its_receipt() {
+        let mut s = session("oh-11", "/r/selko", 1_790_000_000_000);
+        let mut left = ended(s.clone(), 1_790_003_600_000).left.unwrap();
+        left.finished = Finished::PullRequest {
+            url: "https://github.com/o/r/pull/7".to_owned(),
+            state: "OPEN".to_owned(),
+            head_evidence: Some(Evidence {
+                outcome: "passed".to_owned(),
+                dirty: false,
+            }),
+            head: Some("feedface00".to_owned()),
+            head_check: Some(Check::Failed {
+                why: "error: tree mismatch".to_owned(),
+            }),
+        };
+        left.landed = vec![
+            Landed {
+                commit: "c0ffee1234".to_owned(),
+                subject: "pushed".to_owned(),
+                onto: "origin/main".to_owned(),
+                check: Check::Unverified {
+                    why: "sykli has no --commit".to_owned(),
+                },
+            },
+            Landed {
+                commit: "abcdef1234".to_owned(),
+                subject: "checked".to_owned(),
+                onto: "origin/main".to_owned(),
+                check: Check::Passed,
+            },
+        ];
+        s.left = Some(left);
+        let record = render_record(&s);
+        for said in [
+            "finished      https://github.com/o/r/pull/7 (open) · head feedfac: FAILED sykli verify: error: tree mismatch",
+            "landed        c0ffee1 on origin/main: unverified: sykli has no --commit",
+            "landed        abcdef1 on origin/main: verified: passed (sykli verify --commit)",
+        ] {
+            assert!(record.contains(said), "missing `{said}`: {record}");
+        }
+        let last = render_last(&s, &s.repo);
+        assert!(
+            last.contains("finished: https://github.com/o/r/pull/7 (open), head feedfac FAILED"),
+            "{last}"
+        );
+        assert!(
+            last.contains("- c0ffee1 reached origin/main: unverified: sykli has no --commit"),
+            "{last}"
+        );
+        // A record written before ohjaa asked sykli says its receipt was not verified.
+        let old: Finished = serde_json::from_str(
+            r#"{"kind":"pull_request","url":"u","state":"MERGED","head_evidence":{"outcome":"passed","dirty":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            describe_finished(&old),
+            "u (merged) · its head, unverified: receipt: passed"
+        );
     }
 
     #[test]

@@ -1706,6 +1706,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 },
                 interrupted: false,
                 scoped: Vec::new(),
+                landed: Vec::new(),
             };
             if let Some(store) = session_store(&dirs) {
                 let _ = store.update(&session_id, |s| s.left = Some(left));
@@ -1734,22 +1735,25 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // that session's work, not this one's.
     let skip = unless_interrupted(|| other_sessions_checkouts(&dirs, &session_id, started_ms))
         .unwrap_or_default();
+    // Asked at most once, and only when a commit needs it.
+    let sykli = lifecycle::Sykli::default();
     // Outside a repository the folder itself has no commits or pull request
     // to observe; the record says why, and asks neither git nor gh there.
-    let (phases, finished) = if in_repo {
+    let (phases, finished, landed) = if in_repo {
         let seen = observe_repo(
             &root,
             session.head_at_start.as_deref(),
             started_ms,
             &skip,
             true,
+            &sykli,
         );
-        (seen.phases, seen.finished)
+        (seen.phases, seen.finished, seen.landed)
     } else {
         let finished = sessions::Finished::Unknown {
             why: "not a Git repository".to_owned(),
         };
-        (None, finished)
+        (None, finished, Vec::new())
     };
     // Every scoped repository is observed the same way as the launch one.
     let mut scoped: Vec<sessions::ScopedLeft> = session
@@ -1762,12 +1766,14 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 started_ms,
                 &skip,
                 true,
+                &sykli,
             );
             sessions::ScopedLeft {
                 repo: scoped.repo.clone(),
                 phases: seen.phases,
                 finished: seen.finished,
                 found: false,
+                landed: seen.landed,
             }
         })
         .collect();
@@ -1786,13 +1792,14 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         if known.contains(&repo) || scoped.iter().any(|s| Path::new(&s.repo) == repo) {
             continue;
         }
-        let seen = observe_repo(&repo, None, started_ms, &skip, false);
+        let seen = observe_repo(&repo, None, started_ms, &skip, false, &sykli);
         if seen.moved {
             scoped.push(sessions::ScopedLeft {
                 repo: repo_key(&repo),
                 phases: seen.phases,
                 finished: seen.finished,
                 found: true,
+                landed: seen.landed,
             });
         }
     }
@@ -1804,6 +1811,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         finished,
         interrupted: process::cancelled(),
         scoped,
+        landed,
     };
     // The store is opened only now, after every slow call, and held only for
     // this one write.
@@ -1908,6 +1916,8 @@ fn unless_interrupted<T>(step: impl FnOnce() -> T) -> Option<T> {
 struct Observed {
     phases: Option<Vec<sessions::Phase>>,
     finished: sessions::Finished,
+    /// The commits that reached the default branch, each with what sykli said.
+    landed: Vec<sessions::Landed>,
     /// Whether any of its checkouts or branches moved during the session.
     moved: bool,
 }
@@ -1917,13 +1927,15 @@ struct Observed {
 /// request of the branch the newest one was made on. Checkouts in `skip` are
 /// other sessions', except `repo` itself when the session was launched in it
 /// or `named` it. A repository it did not name and that did not move is not
-/// asked about its pull request.
+/// asked about its pull request. sykli is asked about the pull request's head
+/// and about every commit that reached the default branch.
 fn observe_repo(
     repo: &Path,
     head_at_start: Option<&str>,
     started_ms: i64,
     skip: &[PathBuf],
     named: bool,
+    sykli: &lifecycle::Sykli,
 ) -> Observed {
     let own = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let skip: Vec<PathBuf> = skip
@@ -1939,20 +1951,37 @@ fn observe_repo(
             finished: sessions::Finished::Unknown {
                 why: "not looked up: nothing moved".to_owned(),
             },
+            landed: Vec::new(),
             moved: false,
         };
     }
-    let finished = match unless_interrupted(|| lifecycle::finished(&work.checkout, &work.receipts))
-    {
-        Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
-        other => other,
-    }
-    .unwrap_or_else(|| sessions::Finished::Unknown {
-        why: "interrupted".to_owned(),
-    });
+    let finished =
+        match unless_interrupted(|| lifecycle::finished(&work.checkout, &work.receipts, sykli)) {
+            Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
+            other => other,
+        }
+        .unwrap_or_else(|| sessions::Finished::Unknown {
+            why: "interrupted".to_owned(),
+        });
+    let landed = work
+        .landed
+        .iter()
+        .map(|arrived| sessions::Landed {
+            commit: arrived.commit.clone(),
+            subject: arrived.subject.clone(),
+            onto: arrived.onto.clone(),
+            check: unless_interrupted(|| {
+                sykli.check(&arrived.commit, &arrived.tree, &work.receipts)
+            })
+            .unwrap_or_else(|| sessions::Check::Unverified {
+                why: "leaving was interrupted".to_owned(),
+            }),
+        })
+        .collect();
     Observed {
         phases: work.phases,
         finished,
+        landed,
         moved: work.moved,
     }
 }

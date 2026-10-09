@@ -29,7 +29,7 @@
 //! Handlers, not `SIG_IGN`: an ignored disposition is inherited across exec,
 //! and the agent must still stop on Ctrl-C.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 #[cfg(unix)]
@@ -38,7 +38,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::process;
-use crate::sessions::{Evidence, Exit, Finished, Phase};
+use crate::sessions::{Check, Evidence, Exit, Finished, Phase};
 
 #[cfg(unix)]
 mod signals {
@@ -404,7 +404,23 @@ pub struct Work {
     pub moved: bool,
     /// The receipts in every checkout read.
     pub receipts: Receipts,
+    /// The commits that reached the default branch during the session, oldest
+    /// first (see [`observe`]); sykli is asked about each by the caller.
+    pub landed: Vec<Arrived>,
 }
+
+/// A commit that reached the default branch, before sykli is asked about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arrived {
+    pub commit: String,
+    pub tree: String,
+    pub subject: String,
+    /// `origin/main`, or the local `main`.
+    pub onto: String,
+}
+
+/// The most landed commits a record keeps: the newest ones.
+const MAX_LANDED: usize = 20;
 
 /// State 3, observed: every commit this session made in `repo`, in any of its
 /// checkouts (`git worktree list`), each with whatever sykli saw on its tree.
@@ -415,8 +431,15 @@ pub struct Work {
 /// reset brought in were made elsewhere, and are not phases; nor is one that
 /// an amend or a rebase replaced. Checkouts in `skip` (where another session
 /// was launched) are someone else's: neither their HEAD nor the branch checked
-/// out there is read. That may include `repo` itself, when it was only found
-/// at leaving; a caller that was launched in or named `repo` leaves it out.
+/// out there is read as this session's. That may include `repo` itself, when
+/// it was only found at leaving; a caller that was launched in or named
+/// `repo` leaves it out.
+///
+/// Also observed: the commits that reached the default branch (`origin/HEAD`,
+/// else `main` or `master`) during the session — every commit a push from
+/// here took to the remote one, and every commit this session made that
+/// arrived on the local one. A push is not told apart by checkout, so the
+/// commits made in a skipped checkout are left out of it.
 ///
 /// Phases are `None` when they cannot be observed: git failed in `repo`, or
 /// its HEAD moved from `head_at_start` while its reflog recorded nothing.
@@ -430,20 +453,25 @@ pub fn observe(
     let since = started_ms.div_euclid(1000);
     let all = worktrees(&repo);
     let skipped = |path: &Path| skip.iter().any(|s| s == path);
-    let checkouts: Vec<&Worktree> = all.iter().filter(|w| !skipped(&w.path)).collect();
     let mut work = Work {
         checkout: repo.clone(),
-        receipts: receipts_in(checkouts.iter().map(|w| w.path.as_path())),
+        receipts: receipts_in(
+            all.iter()
+                .filter(|w| !skipped(&w.path))
+                .map(|w| w.path.as_path()),
+        ),
         ..Work::default()
     };
     // Each commit created since the start, with the checkout it was made in
-    // when known.
-    let mut created: std::collections::HashMap<String, Option<PathBuf>> = Default::default();
+    // when known; and those another session made in a skipped checkout.
+    let mut created: HashMap<String, Option<PathBuf>> = HashMap::new();
+    let mut theirs: HashSet<String> = HashSet::new();
     // What each reference pointed at when the session started: nothing
     // reachable from those was made by this session.
     let mut boundaries: Vec<String> = head_at_start.into_iter().map(str::to_owned).collect();
     let mut repo_moves = None;
-    for checkout in &checkouts {
+    for checkout in &all {
+        let ours = !skipped(&checkout.path);
         let Some(moves) = reflog(
             &checkout.path,
             &[
@@ -464,18 +492,35 @@ pub fn observe(
                 continue;
             }
             in_window += 1;
-            if created_here(&entry.subject) {
+            if !created_here(&entry.subject) {
+                continue;
+            }
+            if ours {
                 created
                     .entry(entry.commit)
                     .or_insert_with(|| Some(checkout.path.clone()));
+            } else {
+                theirs.insert(entry.commit);
             }
         }
         boundaries.extend(boundary);
-        work.moved |= in_window > 0;
-        if checkout.path == repo {
-            repo_moves = Some(in_window);
+        if ours {
+            work.moved |= in_window > 0;
+            if checkout.path == repo {
+                repo_moves = Some(in_window);
+            }
         }
     }
+    let default = default_branch(&repo);
+    // What every remote branch pointed at when the session started: none of
+    // that reached a remote during it.
+    let mut on_remotes: Vec<String> = Vec::new();
+    // Each default-branch reference's moves since the start, newest first,
+    // and where it pointed at the start.
+    let mut arrivals: Vec<(String, Vec<Move>, Option<String>)> = default
+        .iter()
+        .map(|reference| (reference.clone(), Vec::new(), None))
+        .collect();
     // Branches and remote branches, shared by every checkout: a commit made in
     // a checkout removed since is still on its branch's reflog.
     if let Some(moves) = reflog(
@@ -487,8 +532,15 @@ pub fn observe(
             if !entry.reference.starts_with("refs/") {
                 continue; // checkouts' HEADs, read above
             }
+            let arrival = arrivals.iter_mut().find(|(r, _, _)| *r == entry.reference);
             if entry.at < since {
                 if bounded.insert(entry.reference.clone()) {
+                    if let Some((_, _, start)) = arrival {
+                        *start = Some(entry.commit.clone());
+                    }
+                    if entry.reference.starts_with("refs/remotes/") {
+                        on_remotes.push(entry.commit.clone());
+                    }
                     boundaries.push(entry.commit);
                 }
                 continue;
@@ -498,16 +550,22 @@ pub fn observe(
                     .iter()
                     .find(|w| w.branch.as_deref() == Some(entry.reference.as_str()));
                 if there.is_some_and(|w| skipped(&w.path)) {
+                    if created_here(&entry.subject) {
+                        theirs.insert(entry.commit);
+                    }
                     continue;
                 }
                 work.moved = true;
                 if created_here(&entry.subject) {
                     created
-                        .entry(entry.commit)
+                        .entry(entry.commit.clone())
                         .or_insert_with(|| there.map(|w| w.path.clone()));
                 }
             } else if entry.subject == "update by push" {
                 work.moved = true;
+            }
+            if let Some((_, moves, _)) = arrival {
+                moves.push(entry);
             }
         }
     }
@@ -543,7 +601,103 @@ pub fn observe(
             }
         }
     }
+    let mut seen = HashSet::new();
+    for (reference, moves, start) in arrivals {
+        let remote = reference.starts_with("refs/remotes/");
+        let onto = reference
+            .strip_prefix("refs/remotes/")
+            .or_else(|| reference.strip_prefix("refs/heads/"))
+            .unwrap_or(&reference)
+            .to_owned();
+        // Oldest first: each move took the reference from the one before it.
+        let olds: Vec<Option<String>> = moves
+            .iter()
+            .skip(1)
+            .map(|older| Some(older.commit.clone()))
+            .chain(std::iter::once(start))
+            .collect();
+        for (entry, old) in moves.iter().zip(olds).rev() {
+            if remote && entry.subject != "update by push" {
+                continue; // a fetch brings in other people's commits
+            }
+            for commit in range(&repo, &entry.commit, old.as_deref(), &on_remotes) {
+                let ours = if remote {
+                    !theirs.contains(&commit.commit)
+                } else {
+                    created.contains_key(&commit.commit)
+                };
+                if ours && seen.insert(commit.commit.clone()) {
+                    work.landed.push(Arrived {
+                        onto: onto.clone(),
+                        ..commit
+                    });
+                }
+            }
+        }
+    }
+    work.landed
+        .drain(..work.landed.len().saturating_sub(MAX_LANDED));
     work
+}
+
+/// The default branch's references: the remote one first, then the local
+/// one, each when it exists. The default branch is what `origin/HEAD` names,
+/// else `main`, else `master`.
+fn default_branch(repo: &Path) -> Vec<String> {
+    let exists = |reference: &str| git(repo, &["rev-parse", "--verify", "-q", reference]).is_some();
+    let name = git(repo, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+        .and_then(|target| {
+            target
+                .strip_prefix("refs/remotes/origin/")
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            ["main", "master"]
+                .into_iter()
+                .find(|name| {
+                    exists(&format!("refs/remotes/origin/{name}"))
+                        || exists(&format!("refs/heads/{name}"))
+                })
+                .map(str::to_owned)
+        });
+    let Some(name) = name else {
+        return Vec::new();
+    };
+    [
+        format!("refs/remotes/origin/{name}"),
+        format!("refs/heads/{name}"),
+    ]
+    .into_iter()
+    .filter(|reference| exists(reference))
+    .collect()
+}
+
+/// The commits reachable from `new` but from neither `old` nor what was
+/// `already` on a remote, oldest first; at most the newest [`MAX_LANDED`].
+fn range(repo: &Path, new: &str, old: Option<&str>, already: &[String]) -> Vec<Arrived> {
+    let excluded: Vec<String> = old
+        .into_iter()
+        .chain(already.iter().map(String::as_str))
+        .map(|commit| format!("^{commit}"))
+        .collect();
+    let limit = format!("-{MAX_LANDED}");
+    let mut args = vec!["log", "--format=%H%x1f%T%x1f%s", &limit, new];
+    args.extend(excluded.iter().map(String::as_str));
+    let mut found: Vec<Arrived> = git(repo, &args)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\u{1f}');
+            Some(Arrived {
+                commit: fields.next()?.to_owned(),
+                tree: fields.next()?.to_owned(),
+                subject: fields.next()?.to_owned(),
+                onto: String::new(),
+            })
+        })
+        .collect();
+    found.reverse();
+    found
 }
 
 /// The created commits still reachable from a branch, a remote branch or a
@@ -552,7 +706,7 @@ pub fn observe(
 fn surviving(
     repo: &Path,
     checkouts: &[Worktree],
-    created: &std::collections::HashMap<String, Option<PathBuf>>,
+    created: &HashMap<String, Option<PathBuf>>,
     boundaries: &[String],
 ) -> Option<Vec<Phase>> {
     if created.is_empty() {
@@ -714,8 +868,8 @@ fn reflogs_touched_since(checkout: &Path, since: i64) -> bool {
 }
 
 /// State 4, observed: the pull request of the branch checked out in
-/// `checkout`, if `gh` can say.
-pub fn finished(checkout: &Path, receipts: &Receipts) -> Finished {
+/// `checkout`, if `gh` can say, and what sykli says about its head.
+pub fn finished(checkout: &Path, receipts: &Receipts, sykli: &Sykli) -> Finished {
     let output = process::run(
         Command::new("gh")
             .args(["pr", "view", "--json", "url,state,headRefOid"])
@@ -750,14 +904,100 @@ pub fn finished(checkout: &Path, receipts: &Receipts) -> Finished {
             why: "unreadable gh output".to_owned(),
         };
     };
-    let head_evidence = pr["headRefOid"]
-        .as_str()
-        .and_then(|head| git(checkout, &["rev-parse", &format!("{head}^{{tree}}")]))
-        .and_then(|tree| receipts.get(&tree).map(|r| r.evidence.clone()));
+    let head = pr["headRefOid"].as_str().map(str::to_owned);
+    let tree = head
+        .as_deref()
+        .and_then(|head| git(checkout, &["rev-parse", &format!("{head}^{{tree}}")]));
+    let head_evidence = tree
+        .as_ref()
+        .and_then(|tree| receipts.get(tree).map(|r| r.evidence.clone()));
+    let head_check = head.as_deref().map(|head| match &tree {
+        Some(tree) => sykli.check(head, tree, receipts),
+        None => Check::Unverified {
+            why: "its head commit is not in this repository".to_owned(),
+        },
+    });
     Finished::PullRequest {
         url: pr["url"].as_str().unwrap_or("").to_owned(),
         state: pr["state"].as_str().unwrap_or("unknown").to_owned(),
         head_evidence,
+        head,
+        head_check,
+    }
+}
+
+/// This machine's sykli, asked at most once per leaving whether it can bind
+/// a receipt to a commit (`sykli verify --commit`).
+#[derive(Debug, Default)]
+pub struct Sykli {
+    binds_commits: std::cell::OnceCell<Result<(), String>>,
+}
+
+impl Sykli {
+    fn binds_commits(&self) -> Result<(), String> {
+        self.binds_commits
+            .get_or_init(|| {
+                let output = process::run(
+                    Command::new("sykli").args(["verify", "--help"]),
+                    None,
+                    process::LOCAL,
+                )
+                .map_err(|error| format!("sykli could not be asked: {error:#}"))?;
+                let help = format!(
+                    "{}{}",
+                    output.stdout_text(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if help.contains("--commit") {
+                    Ok(())
+                } else {
+                    Err("sykli has no --commit".to_owned())
+                }
+            })
+            .clone()
+    }
+
+    /// What sykli says about `commit`, whose tree is `tree`: `sykli verify
+    /// <receipt> --contract <contract> --commit <commit>`, run in the checkout
+    /// the receipt is in. Exit 0 passes it; any other exit fails it, in
+    /// sykli's words. A receipt's own `outcome` is never read as a pass, and
+    /// a sykli that cannot bind a commit never passes anything.
+    pub fn check(&self, commit: &str, tree: &str, receipts: &Receipts) -> Check {
+        let Some(receipt) = receipts.get(tree) else {
+            return Check::Unchecked;
+        };
+        if let Err(why) = self.binds_commits() {
+            return Check::Unverified { why };
+        }
+        let Some(contract) = ["sykli.json", "sykli.rs"]
+            .into_iter()
+            .find(|name| receipt.checkout.join(name).is_file())
+        else {
+            return Check::Unverified {
+                why: format!(
+                    "no sykli contract (sykli.json or sykli.rs) in {}",
+                    receipt.checkout.display()
+                ),
+            };
+        };
+        let output = process::run(
+            Command::new("sykli")
+                .arg("verify")
+                .arg(&receipt.path)
+                .args(["--contract", contract, "--commit", commit])
+                .current_dir(&receipt.checkout),
+            None,
+            process::LOCAL,
+        );
+        match output {
+            Err(error) => Check::Unverified {
+                why: format!("sykli verify could not run: {error:#}"),
+            },
+            Ok(output) if output.status.success() => Check::Passed,
+            Ok(output) => Check::Failed {
+                why: output.failure_detail(),
+            },
+        }
     }
 }
 
@@ -1201,6 +1441,44 @@ mod tests {
         assert_eq!(found, [std::fs::canonicalize(&fresh).unwrap()], "{found:?}");
         let _ = std::fs::remove_dir_all(wt);
         let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn what_reached_the_default_branch_was_made_or_pushed_here_never_fetched() {
+        let upstream = repo("landed-upstream");
+        let dir = worktree_path("landed-clone");
+        let status = Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&upstream)
+            .arg(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        git_ok(&dir, &["config", "user.email", "t@example.invalid"]);
+        git_ok(&dir, &["config", "user.name", "T"]);
+        let start = head(&dir).unwrap();
+        let started_ms = now_ms();
+        commit(&upstream, "u.txt", "theirs");
+        git_ok(&dir, &["fetch", "-q"]);
+        let work = observe(&dir, Some(&start), started_ms, &[]);
+        assert!(work.landed.is_empty(), "a fetch is not a landing");
+        commit(&dir, "m.txt", "mine, on the default branch");
+        let work = observe(&dir, Some(&start), started_ms, &[]);
+        let default = git(&dir, &["branch", "--show-current"]).unwrap();
+        assert_eq!(
+            work.landed
+                .iter()
+                .map(|a| (a.subject.as_str(), a.onto.as_str()))
+                .collect::<Vec<_>>(),
+            [("mine, on the default branch", default.as_str())]
+        );
+        assert_eq!(
+            Sykli::default().check(&work.landed[0].commit, &work.landed[0].tree, &work.receipts),
+            Check::Unchecked,
+            "no receipt names its tree: sykli is not even asked"
+        );
+        let _ = std::fs::remove_dir_all(upstream);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

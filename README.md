@@ -136,7 +136,7 @@ until it ends so the last one always happens:
 | 1 entering | knowledge, the last session here, lifecycle instructions, and scoped context | ohjaa |
 | 2 oriented | the agent reads back what it knows: `ohjaa oriented "<goal; rules; who else>"` | the agent |
 | 3 working | small phases, each a commit and, where the repo has a sykli contract, a `sykli run` on it | observed from git and `.sykli/receipts` in every checkout `git worktree list` names: the commits a reflog (a checkout's HEAD, or a branch) shows created since entering and still reachable, never ones a pull or merge brought in, nor one an amend or rebase replaced; a checkout where another session was launched is that session's |
-| 4 finished | the pull request of the branch the newest commit was made on, and whether its head has evidence | observed through `gh` |
+| 4 finished | the pull request of the branch the newest commit was made on, and what `sykli verify --commit` says about its head; every commit that reached the default branch during the session, checked the same way | observed through `gh`, git and sykli |
 | 5 leaving | the record: observed part, then the handover (`ohjaa handover`) | ohjaa, and the agent's testimony |
 
 States are **observed, not declared**: the agent writes only its read-back and
@@ -149,13 +149,24 @@ session oh-1790… · claude · selko · 2026-09-26 10:02 UTC → 2026-09-26 11:
 ─ observed (written by ohjaa; the agent cannot change it) ─
 intent        retry uploads
 knew          14 knowledge node(s) delivered · read back at 10:04 UTC
-phases        a1b2c3d passed · d4e5f6a passed · 0718abc failed · 9c0d1e2 passed
-finished      https://github.com/…/pull/57 (open) · evidence on its head: passed
+phases        a1b2c3d receipt: passed · d4e5f6a receipt: passed · 0718abc receipt: failed · 9c0d1e2 receipt: passed
+finished      https://github.com/…/pull/57 (open) · head 9c0d1e2: verified: passed (sykli verify --commit)
 ─ handover (the agent's own words) ─
 unfinished    Windows paths in uploader/retry.rs
 next agent    Dima owns the queue; ask first
 surprised by  the fixture helper silently skips when git is missing
 ```
+
+A receipt's `outcome` is its own claim, and the record says it as one
+(`receipt: passed`). Only sykli says a commit passed: for the pull request's
+head, and for every commit that reached the default branch during the session
+(pushed from here to `origin/<default>`, or made here and now on the local
+one; a fetch is not a landing), leaving runs
+`sykli verify <receipt> --contract sykli.json --commit <sha>` in the checkout
+the receipt is in. Exit 0 is `verified: passed`; any other exit is `FAILED`,
+in sykli's words. A commit no receipt names is `unchecked`. A sykli without
+`--commit` (`sykli verify --help` does not name it) passes nothing: the record
+says `unverified: sykli has no --commit`.
 
 The records live in a **session log**, redb at
 `~/.local/state/ohjaa/sessions.redb`, on this machine only. Knowledge never
