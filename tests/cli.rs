@@ -2596,3 +2596,93 @@ fn a_stalled_export_reader_never_costs_a_running_session_its_record() {
     assert_eq!(export["sessions"].as_array().unwrap().len(), 3);
     fixture.cleanup();
 }
+
+#[test]
+fn a_refused_usage_receipt_is_recorded_as_refused_with_its_reason() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("usage-refused");
+    let repo = fixture.make_git_repo("work");
+    let receipt = |agent: &str, observed: &str, extra: &str| {
+        format!(
+            "printf '%s' '{{\"schema\":\"agent-usage.v1\",\"agent\":\"{agent}\",\"session_id\":\"n\",\
+             \"source\":\"t\",\"observed_at_ms\":{observed},\"complete\":true,\"limitations\":[],\
+             \"entries\":[]{extra}}}' > \"$OHJAA_USAGE_FILE\""
+        )
+    };
+    // Closes the single quotes around the JSON, so the shell expands it.
+    let now = "'\"$(date +%s)000\"'";
+    let cases = [
+        (
+            "symlink",
+            "printf x > \"$OHJAA_USAGE_FILE.real\"; ln -s \"$OHJAA_USAGE_FILE.real\" \"$OHJAA_USAGE_FILE\""
+                .to_owned(),
+            "symbolic links",
+        ),
+        (
+            "fifo",
+            "mkfifo \"$OHJAA_USAGE_FILE\"".to_owned(),
+            "must be a regular file",
+        ),
+        (
+            "size",
+            "head -c 9000000 /dev/zero > \"$OHJAA_USAGE_FILE\"".to_owned(),
+            "exceeds 8 MiB",
+        ),
+        ("predates", receipt("sh", "1", ""), "predates this run"),
+        (
+            "agent",
+            receipt("codex", now, ""),
+            "receipt agent does not match session agent",
+        ),
+        (
+            "unknown-field",
+            receipt("sh", now, ",\"later\":1"),
+            "unknown field `later`",
+        ),
+    ];
+    for (case, write, reason) in cases {
+        let path = fixture.dir.join(format!("usage-{case}.json"));
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "run",
+                    "sh",
+                    "--intent",
+                    case,
+                    "--no-briefing",
+                    "--usage-file",
+                ])
+                .arg(&path)
+                .args(["--", "-c", &format!("{write}; exit 7")])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .current_dir(&repo),
+        );
+        assert_eq!(
+            code,
+            Some(7),
+            "{case}: the agent's exit is unchanged: {stderr}"
+        );
+        let usage = &stderr[stderr.find("─ usage").expect(&stderr)..];
+        assert!(
+            usage.contains("refused: ") && usage.contains(reason),
+            "{case}: the record says it was refused, and why: {usage}"
+        );
+        assert!(!usage.contains("not collected"), "{case}: {usage}");
+        let (out, _, _) = output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+        let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let refused = export["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["intent"] == case)
+            .unwrap()["usage_refused"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(refused.contains(reason), "{case}: exported: {refused}");
+    }
+    fixture.cleanup();
+}

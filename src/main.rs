@@ -1627,6 +1627,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         left: None,
         drafted: false,
         usage: Vec::new(),
+        usage_refused: None,
     };
     // From here to the end of leaving, a signal is kept, not fatal.
     lifecycle::supervise();
@@ -1751,6 +1752,19 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         })();
         if let Err(error) = imported {
             eprintln!("ohjaa: usage was not imported: {error:#}; session exit is unchanged");
+            // Recorded as refused, with why: never shown as "not collected".
+            let why = format!("{error:#}");
+            let stored = session_store(&dirs).and_then(|store| {
+                store
+                    .update(&session_id, |s| s.usage_refused = Some(why.clone()))
+                    .ok()
+                    .flatten()
+            });
+            session = stored.unwrap_or_else(|| {
+                let mut unsaved = session;
+                unsaved.usage_refused = Some(why);
+                unsaved
+            });
         }
     }
     let _ = std::io::stdout().flush();

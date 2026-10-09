@@ -178,6 +178,10 @@ pub struct Session {
     /// Source-reported snapshots, separately labelled from observed work.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub usage: Vec<crate::usage::Receipt>,
+    /// Why the receipt the launched command wrote at exit was refused: a
+    /// refusal is said, never shown as "not collected".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_refused: Option<String>,
 }
 
 /// Why the log could not be used. Never a reason to stop a launch.
@@ -583,7 +587,9 @@ pub fn render_record(session: &Session) -> String {
         }
     }
     out.push_str("─ usage (imported source assertions; estimates are not bills) ─\n");
-    if session.usage.is_empty() {
+    if let Some(why) = &session.usage_refused {
+        let _ = writeln!(out, "refused: {why}");
+    } else if session.usage.is_empty() {
         out.push_str("not collected; unknown, not zero\n");
     }
     for receipt in &session.usage {
@@ -819,6 +825,7 @@ mod tests {
             left: None,
             drafted: false,
             usage: Vec::new(),
+            usage_refused: None,
         }
     }
 
