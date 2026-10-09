@@ -268,17 +268,28 @@ fn cmd_usage(action: &UsageCmd) -> Result<i32> {
         UsageCmd::Export { session } => {
             // Read, then let the log go before writing: a reader that stops
             // reading must never hold every other ohjaa off the log.
-            let (mut records, unreadable) = open()?.all()?;
+            // With no log yet there is nothing to export, and none is created.
+            let (mut records, unreadable) = if sessions::store_path(&dirs.state).exists() {
+                open()?.all()?
+            } else {
+                (Vec::new(), Vec::new())
+            };
             if let Some(id) = session {
                 records.retain(|s| s.id == *id);
+                anyhow::ensure!(
+                    !unreadable.contains(id),
+                    "session {id} is unreadable in the log"
+                );
                 anyhow::ensure!(!records.is_empty(), "session {id} not found");
             }
+            // One session asked for and found is complete, whatever other rows hold.
+            let complete = unreadable.is_empty() || session.is_some();
             let mut out = serde_json::to_vec_pretty(&serde_json::json!({
                 "schema": "ohjaa-sessions.v1", "sessions": records, "unreadable": unreadable
             }))?;
             out.push(b'\n');
             std::io::stdout().lock().write_all(&out)?;
-            Ok(if unreadable.is_empty() { 0 } else { INCOMPLETE })
+            Ok(if complete { 0 } else { INCOMPLETE })
         }
     }
 }

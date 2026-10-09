@@ -2686,3 +2686,69 @@ fn a_refused_usage_receipt_is_recorded_as_refused_with_its_reason() {
     }
     fixture.cleanup();
 }
+
+#[test]
+fn export_creates_no_log_and_one_bad_row_does_not_fail_an_export_of_another_session() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("export-quirks");
+    let repo = fixture.make_git_repo("work");
+    let log = fixture.dir.join("state/ohjaa/sessions.redb");
+    let (out, stderr, code) =
+        output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(code, Some(0), "{stderr}");
+    let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(export["schema"], "ohjaa-sessions.v1");
+    assert_eq!(export["sessions"], serde_json::json!([]));
+    assert_eq!(export["unreadable"], serde_json::json!([]));
+    assert!(!log.exists(), "an export never creates the log");
+
+    let (_, stderr, code) = run_session(&fixture, &repo, "echo \"id=$OHJAA_SESSION\"");
+    assert_eq!(code, Some(0), "{stderr}");
+    let (out, _, _) = output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    let id = serde_json::from_str::<serde_json::Value>(&out).unwrap()["sessions"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    {
+        let db = redb::Database::open(&log).unwrap();
+        let tx = db.begin_write().unwrap();
+        tx.open_table(redb::TableDefinition::<&str, &[u8]>::new("sessions"))
+            .unwrap()
+            .insert("oh-garbage", b"\"not a session\"".as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let (out, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["usage", "export", "--session", &id])
+            .current_dir(&repo),
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "an unrelated bad row does not fail this export: {out}"
+    );
+    let (out, _, code) = output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(
+        code,
+        Some(4),
+        "the whole log is incomplete, and says so: {out}"
+    );
+    let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(export["unreadable"], serde_json::json!(["oh-garbage"]));
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["usage", "export", "--session", "oh-garbage"])
+            .current_dir(&repo),
+    );
+    assert_ne!(code, Some(0));
+    assert!(
+        stderr.contains("session oh-garbage is unreadable"),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}

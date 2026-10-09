@@ -1181,6 +1181,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// `ohjaa usage export` is `ohjaa-sessions.v1`: each session as stored.
+    /// vessa and seula read these fields; renaming one breaks them silently.
+    #[test]
+    fn the_v1_export_keeps_the_field_names_its_readers_use() {
+        let mut s = session("oh-7", "/r/projects", 1_000);
+        s.delivered[0].repo = Some("/r/projects/a".to_owned());
+        s.readback = Some(Readback {
+            at_ms: 1_100,
+            text: "goal".to_owned(),
+        });
+        s.handover = Some(Handover {
+            at_ms: 1_900,
+            next: Some("n".to_owned()),
+            ..Default::default()
+        });
+        s.usage = vec![usage_receipt("claude", "native-7")];
+        let phase = Phase {
+            commit: "c".to_owned(),
+            subject: "s".to_owned(),
+            evidence: Some(Evidence {
+                outcome: "passed".to_owned(),
+                dirty: false,
+            }),
+        };
+        let mut s = ended(s, 2_000);
+        let left = s.left.as_mut().unwrap();
+        left.phases = Some(vec![phase.clone()]);
+        left.scoped = vec![ScopedLeft {
+            repo: "/r/projects/a".to_owned(),
+            phases: Some(vec![phase]),
+            finished: Finished::NoPullRequest,
+        }];
+        let v1 = serde_json::to_value(&s).unwrap();
+        for pointer in [
+            "/id",
+            "/agent",
+            "/repo",
+            "/intent",
+            "/started_ms",
+            "/delivered/0/id",
+            "/delivered/0/scope",
+            "/delivered/0/as_of",
+            "/delivered/0/repo",
+            "/readback/text",
+            "/handover/next",
+            "/left/ended_ms",
+            "/left/exit/how",
+            "/left/finished/kind",
+            "/left/phases/0/commit",
+            "/left/phases/0/evidence/outcome",
+            "/left/scoped/0/repo",
+            "/left/scoped/0/phases/0/evidence/outcome",
+            "/left/scoped/0/phases/0/evidence/dirty",
+            "/usage/0/agent",
+            "/usage/0/session_id",
+            "/usage/0/entries",
+            "/drafted",
+        ] {
+            assert!(
+                v1.pointer(pointer).is_some(),
+                "{pointer} is gone from v1: {v1}"
+            );
+        }
+    }
+
     #[test]
     fn session_ids_are_names_not_paths() {
         assert!(is_valid_id(&new_id(1_790_000_000_000)));
