@@ -595,28 +595,27 @@ fn run_prepends_the_system_perimeter_to_the_task() {
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
-            .args([
-                "run",
-                "codex",
-                "--intent",
-                "x",
-                "--task",
-                "fix the lexer",
-                "--dry-run",
-            ])
+            .args(["run", "codex", "--intent", "x", "--task", "fix the lexer"])
             .current_dir(&repo),
     );
+    let argv = fixture.argv();
     fixture.cleanup();
 
-    assert_eq!(code, Some(0));
-    // The task includes the selected repository's perimeter, not the whole fleet.
-    assert!(stderr.contains("fix the lexer"), "{stderr}");
-    assert!(stderr.contains("System perimeter"), "{stderr}");
+    assert_eq!(code, Some(0), "{stderr}");
+    // The task is exactly what was assigned; the perimeter travels in the
+    // briefing, scoped to the selected repository, not the whole fleet.
+    let task = argv.iter().position(|a| a == "--task").expect("--task");
+    assert_eq!(argv[task + 1], "fix the lexer", "{argv:?}");
+    assert_eq!(argv[task + 2], "--briefing", "{argv:?}");
+    let end = argv.iter().rposition(|a| a == "--").expect("--");
+    let briefing = argv[task + 3..end].join("\n");
+    assert!(briefing.contains("System perimeter"), "{briefing}");
     assert!(
-        stderr.contains("toimija — compiles Git context for agents"),
-        "{stderr}"
+        briefing.contains("toimija — compiles Git context for agents"),
+        "{briefing}"
     );
-    assert!(stderr.contains("you are here"), "{stderr}");
+    assert!(briefing.contains("you are here"), "{briefing}");
+    assert!(!briefing.contains("fix the lexer"), "{briefing}");
 }
 
 #[test]
@@ -982,6 +981,13 @@ fn startup_is_scoped_reuses_scans_and_delivers_repo_knowledge_from_the_root() {
     ]));
     assert_eq!(code, Some(0), "{stderr}");
     assert!(brief.contains("Selected repository rule.") && !brief.contains("broken-unrelated"));
+    assert_eq!(
+        brief
+            .matches("Knowledge (ohjaa, knowledge-node.v1)")
+            .count(),
+        1,
+        "the preamble is said once, not once per scoped repository: {brief}"
+    );
     let (_, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
         "run",
         "codex",

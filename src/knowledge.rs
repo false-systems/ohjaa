@@ -403,6 +403,13 @@ pub fn render(loaded: &Loaded, flags: &[Flag]) -> String {
 
 /// The briefing limited to some scopes: a file other people read gets only
 /// shared Knowledge, never one person's `mine` or `machine`.
+/// What opens the knowledge section of a briefing.
+pub const PREAMBLE: &str =
+    "Knowledge (ohjaa, knowledge-node.v1): what the people you work for know and\n\
+     have decided, as of the date on each entry. Follow it. If an entry looks\n\
+     wrong or stale, say so instead of quietly working around it. Propose new\n\
+     knowledge with `ohjaa propose`; only a person makes it current.\n";
+
 pub fn render_scopes(loaded: &Loaded, flags: &[Flag], scopes: &[Scope]) -> String {
     let current: Vec<&Located> = fk::briefing(&loaded.nodes)
         .into_iter()
@@ -411,12 +418,7 @@ pub fn render_scopes(loaded: &Loaded, flags: &[Flag], scopes: &[Scope]) -> Strin
     if current.is_empty() {
         return String::new();
     }
-    let mut out = String::from(
-        "Knowledge (ohjaa, knowledge-node.v1): what the people you work for know and\n\
-         have decided, as of the date on each entry. Follow it. If an entry looks\n\
-         wrong or stale, say so instead of quietly working around it. Propose new\n\
-         knowledge with `ohjaa propose`; only a person makes it current.\n",
-    );
+    let mut out = String::from(PREAMBLE);
     let mut scope = None;
     for located in current {
         if scope != Some(located.scope) {

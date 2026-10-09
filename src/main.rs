@@ -468,10 +468,9 @@ fn dirs() -> Result<Dirs> {
     Dirs::resolve(git_root().as_deref())
 }
 
-/// The knowledge section of the briefing, with its problems reported on stderr.
-/// Broken files and flags are said out loud; they never make the briefing
-/// silently smaller.
-/// The knowledge section, and exactly which nodes it delivers.
+/// The knowledge section of the briefing for these scopes, and exactly which
+/// nodes it delivers. Broken files and flags are reported on stderr, out loud;
+/// they never make the briefing silently smaller.
 fn knowledge_briefing_for(
     dirs: &Dirs,
     scopes: &[Scope],
@@ -523,6 +522,12 @@ fn knowledge_for_work(
         let mut scoped_dirs = dirs.clone();
         scoped_dirs.repo_root = Some(repo.clone());
         let (knowledge, nodes) = knowledge_briefing_for(&scoped_dirs, &[Scope::Repo])?;
+        // The preamble was said once, above; each repository adds its section.
+        let knowledge = knowledge
+            .strip_prefix(knowledge::PREAMBLE)
+            .unwrap_or(&knowledge)
+            .trim_start_matches('\n')
+            .to_owned();
         if !knowledge.is_empty() {
             text.push_str(&format!(
                 "\nScoped repository {}:\n{knowledge}",

@@ -193,7 +193,10 @@ ohjaa usage export > /tmp/ohjaa-sessions.json
 Inside a run, `usage import` defaults to `OHJAA_SESSION`. To pick up a receipt
 automatically when the agent command ends, use `ohjaa run ... --usage-file
 /path/to/fresh-receipt.json`. Ohjaa passes that path as `OHJAA_USAGE_FILE`; the
-launched command or its wrapper must write an `agent-usage.v1` receipt there.
+launched command or its wrapper must write an `agent-usage.v1` receipt there,
+and its `agent` must be the basename of the command ohjaa launched (a wrapper
+launched as the agent claims its own name, not `claude`). A refused receipt is
+recorded as `refused: <reason>`, never as not collected.
 Native agent transcripts are not that receipt format. Existing paths are
 refused so an old receipt cannot be accidentally reused. Missing/invalid
 receipts are reported and never change the agent's exit status. No automatic

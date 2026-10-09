@@ -222,8 +222,8 @@ pub fn render_system(view: &SystemView) -> String {
     out
 }
 
-/// Compose the launch perimeter: a compact briefing that travels inside
-/// `toimija run --task`, so the agent starts already knowing what system it
+/// Compose the launch perimeter: a compact part of the briefing that travels
+/// in `toimija run --briefing`, so the agent starts already knowing what system it
 /// operates in — and how to re-derive every claim in it.
 pub fn briefing(view: &SystemView, here: &Path) -> String {
     use std::fmt::Write;
