@@ -346,11 +346,12 @@ pub struct Receipt {
 /// Sykli receipts keyed by the HEAD tree they ran on.
 pub type Receipts = std::collections::HashMap<String, Receipt>;
 
-/// The sykli receipts in these checkouts, keyed by the HEAD tree they ran on.
-/// Reads `sykli-receipt.v1`: `subject.head_tree_oid`, `subject.dirty`,
-/// `outcome`, `started_at_ms`. A tree is its content, so a receipt is about
-/// that tree in whichever checkout sykli ran; the newest receipt for a tree
-/// wins. Read once per repository at leaving, and shared by its phases and
+/// The sykli receipts in these checkouts, keyed by the tree that ran.
+/// Reads `sykli-receipt.v1`: `subject.tree_oid`, `subject.head_tree_oid`,
+/// `subject.dirty`, `outcome`, `started_at_ms`. A tree is its content, so a
+/// receipt is about that tree in whichever checkout sykli ran. Of several for
+/// one tree, a clean run (not dirty, and HEAD's own tree) wins, then a
+/// passing one, then the newest. Read once per repository at leaving, and shared by its phases and
 /// its pull request.
 pub fn receipts_in<'a>(checkouts: impl IntoIterator<Item = &'a Path>) -> Receipts {
     let mut found = Receipts::new();
@@ -372,20 +373,28 @@ pub fn receipts_in<'a>(checkouts: impl IntoIterator<Item = &'a Path>) -> Receipt
             if receipt["schema"] != "sykli-receipt.v1" {
                 continue;
             }
+            // Filed under the tree that ran, never HEAD's: a run with changes
+            // beside HEAD ran another tree, and must not shadow HEAD's own run.
             let (Some(tree), Some(outcome)) = (
-                receipt["subject"]["head_tree_oid"].as_str(),
+                receipt["subject"]["tree_oid"].as_str(),
                 receipt["outcome"].as_str(),
             ) else {
                 continue;
             };
             let at = receipt["started_at_ms"].as_i64().unwrap_or(0);
-            if found.get(tree).is_some_and(|seen| seen.at >= at) {
-                continue;
-            }
+            let head = receipt["subject"]["head_tree_oid"].as_str();
             let evidence = Evidence {
                 outcome: outcome.to_owned(),
-                dirty: receipt["subject"]["dirty"].as_bool().unwrap_or(true),
+                dirty: receipt["subject"]["dirty"].as_bool().unwrap_or(true) || head != Some(tree),
             };
+            // A clean run first, then a passing one, then the newest.
+            let rank = |e: &Evidence, at: i64| (!e.dirty, e.outcome == "passed", at);
+            if found
+                .get(tree)
+                .is_some_and(|seen| rank(&seen.evidence, seen.at) >= rank(&evidence, at))
+            {
+                continue;
+            }
             found.insert(
                 tree.to_owned(),
                 Receipt {
@@ -1158,6 +1167,49 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    /// A receipt for a run of `ran` (the tree that ran) with HEAD at `head`.
+    fn receipt_ran(
+        dir: &Path,
+        name: &str,
+        ran: &str,
+        head: &str,
+        outcome: &str,
+        at: i64,
+        dirty: bool,
+    ) {
+        let receipts = dir.join(".sykli/receipts");
+        std::fs::create_dir_all(&receipts).unwrap();
+        std::fs::write(
+            receipts.join(format!("{name}.json")),
+            format!(
+                r#"{{"schema":"sykli-receipt.v1","contract_hash":"x","started_at_ms":{at},
+                   "subject":{{"repository":"/r","tree_oid":"{ran}","inputs_digest":"d",
+                   "head_tree_oid":"{head}","dirty":{dirty}}},"tasks":[],"outcome":"{outcome}"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_receipt_is_for_the_tree_that_ran_and_a_clean_pass_outranks_a_newer_dirty_run() {
+        let dir = repo("receipt-choice");
+        let tree = commit(&dir, "a.txt", "checked");
+        receipt_ran(&dir, "clean", &tree, &tree, "passed", 1, false);
+        // An experiment run on top of HEAD, then reverted: it ran another tree.
+        receipt_ran(&dir, "experiment", "e0e0", &tree, "failed", 2, true);
+        // A newer run of the same tree, with something uncommitted beside it.
+        receipt_ran(&dir, "dirty", &tree, &tree, "passed", 3, true);
+        let receipts = receipts_in([dir.as_path()]);
+        let chosen = &receipts[&tree];
+        assert!(chosen.path.ends_with("clean.json"), "{:?}", chosen.path);
+        assert!(!chosen.evidence.dirty);
+        assert_eq!(
+            receipts["e0e0"].evidence.outcome, "failed",
+            "filed under what ran"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn git_ok(dir: &Path, args: &[&str]) {
