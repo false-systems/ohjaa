@@ -1657,6 +1657,25 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         command.env("OHJAA_USAGE_FILE", path);
     }
 
+    // What every checkout and branch of the launch and scoped repositories
+    // held at entering, kept until leaving: none of it is this session's.
+    let starts: Vec<(PathBuf, lifecycle::Start)> = in_repo
+        .then(|| folder.clone())
+        .into_iter()
+        .chain(scoped_repos.iter().cloned())
+        .map(|repo| {
+            let start = lifecycle::start_of(&repo);
+            (repo, start)
+        })
+        .collect();
+    let start_of = |repo: &Path| {
+        let repo = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+        starts
+            .iter()
+            .find(|(known, _)| *known == repo)
+            .map(|(_, start)| start.clone())
+            .unwrap_or_default()
+    };
     let mut session = sessions::Session {
         id: session_id.clone(),
         agent: agent.to_owned(),
@@ -1745,7 +1764,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             session.head_at_start.as_deref(),
             started_ms,
             &skip,
-            true,
+            Some(&start_of(&root)),
             &sykli,
         );
         (seen.phases, seen.finished, seen.landed)
@@ -1765,7 +1784,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 scoped.head_at_start.as_deref(),
                 started_ms,
                 &skip,
-                true,
+                Some(&start_of(Path::new(&scoped.repo))),
                 &sykli,
             );
             sessions::ScopedLeft {
@@ -1792,7 +1811,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         if known.contains(&repo) || scoped.iter().any(|s| Path::new(&s.repo) == repo) {
             continue;
         }
-        let seen = observe_repo(&repo, None, started_ms, &skip, false, &sykli);
+        let seen = observe_repo(&repo, None, started_ms, &skip, None, &sykli);
         if seen.moved {
             scoped.push(sessions::ScopedLeft {
                 repo: repo_key(&repo),
@@ -1926,25 +1945,38 @@ struct Observed {
 /// there, in any of its checkouts, with what sykli saw on each, and the pull
 /// request of the branch the newest one was made on. Checkouts in `skip` are
 /// other sessions', except `repo` itself when the session was launched in it
-/// or `named` it. A repository it did not name and that did not move is not
-/// asked about its pull request. sykli is asked about the pull request's head
+/// or named it, which is when what it held at entering is known (`start`). A
+/// repository only found at leaving, and that did not move, is not asked
+/// about its pull request. sykli is asked about the pull request's head
 /// and about every commit that reached the default branch.
 fn observe_repo(
     repo: &Path,
     head_at_start: Option<&str>,
     started_ms: i64,
     skip: &[PathBuf],
-    named: bool,
+    start: Option<&lifecycle::Start>,
     sykli: &lifecycle::Sykli,
 ) -> Observed {
+    let named = start.is_some();
     let own = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    // Reflog times are whole seconds. With nothing read at entering, a move in
+    // the second the session started may be from before it: only later ones
+    // count.
+    let (started_ms, start) = match start {
+        Some(start) => (started_ms, start.clone()),
+        None => (
+            (started_ms.div_euclid(1000) + 1) * 1000,
+            lifecycle::Start::default(),
+        ),
+    };
     let skip: Vec<PathBuf> = skip
         .iter()
         .filter(|path| !named || **path != own)
         .cloned()
         .collect();
-    let work = unless_interrupted(|| lifecycle::observe(repo, head_at_start, started_ms, &skip))
-        .unwrap_or_default();
+    let work =
+        unless_interrupted(|| lifecycle::observe(repo, head_at_start, started_ms, &skip, &start))
+            .unwrap_or_default();
     if !named && !work.moved {
         return Observed {
             phases: work.phases,

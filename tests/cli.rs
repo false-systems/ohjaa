@@ -2920,8 +2920,12 @@ fn a_root_launch_without_scope_records_the_repos_it_worked_in() {
     let repo = fixture.make_settled_git_repo("projects/work");
     fixture.make_settled_git_repo("projects/idle");
     let worktree = folder.join("_worktrees").join("work-feat");
+    // A repository only found at leaving counts moves after the second the
+    // session started (nothing was read of it at entering); a real agent reads
+    // its briefing first.
     let script = format!(
         "set -e
+        sleep 1
         cd '{repo}'
         git worktree add -q -b feat '{wt}'
         cd '{wt}'
@@ -2980,7 +2984,7 @@ fn a_scope_naming_the_folder_of_repos_records_the_ones_that_moved() {
     let folder = fixture.make_folder("projects");
     let repo = fixture.make_settled_git_repo("projects/work");
     let script = format!(
-        "cd '{}' && echo x > f.txt && git add f.txt && git commit -q -m 'in a named folder'",
+        "sleep 1; cd '{}' && echo x > f.txt && git add f.txt && git commit -q -m 'in a named folder'",
         repo.display()
     );
     let (_, stderr, code) = output_of(
@@ -3024,7 +3028,8 @@ fn pull_request_session(
         set -e
         git worktree add -q -b feat-{name} '{wt}'
         cd '{wt}'
-        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'ship it'
+        echo '{{}}' > sykli.json && echo '{name}' > name.txt
+        git add sykli.json name.txt && git commit -q -m 'ship {name}'
         receipt {receipt}",
         wt = worktree.display()
     );

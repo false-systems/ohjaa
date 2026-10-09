@@ -230,6 +230,50 @@ pub fn has_sykli_contract(repo: &Path) -> bool {
         .any(|name| repo.join(name).is_file())
 }
 
+/// What a repository's checkouts and branches pointed at when a session
+/// entered, read then and kept in memory until leaving (`ohjaa run` is one
+/// process): nothing reachable from these was made during the session, and
+/// nothing reachable from `remote` reached a remote during it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Start {
+    /// Every checkout's HEAD, and every branch.
+    pub local: Vec<String>,
+    /// Every remote branch.
+    pub remote: Vec<String>,
+}
+
+/// Read `repo`'s [`Start`] now. Empty where git cannot say.
+pub fn start_of(repo: &Path) -> Start {
+    let mut start = Start {
+        local: worktrees(repo).into_iter().filter_map(|w| w.head).collect(),
+        remote: Vec::new(),
+    };
+    let refs = git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .unwrap_or_default();
+    for line in refs.lines() {
+        match line.split_once(' ') {
+            Some((commit, name)) if name.starts_with("refs/remotes/") => {
+                start.remote.push(commit.to_owned())
+            }
+            Some((commit, _)) => start.local.push(commit.to_owned()),
+            None => {}
+        }
+    }
+    for list in [&mut start.local, &mut start.remote] {
+        list.sort_unstable();
+        list.dedup();
+    }
+    start
+}
+
 /// One checkout of a repository: its main worktree or a linked one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
@@ -441,6 +485,10 @@ const MAX_LANDED: usize = 20;
 /// arrived on the local one. A push is not told apart by checkout, so the
 /// commits made in a skipped checkout are left out of it.
 ///
+/// Reflog times are whole seconds, so a move in the second the session started
+/// may be from just before it: what `start` says the repository held at
+/// entering is never this session's.
+///
 /// Phases are `None` when they cannot be observed: git failed in `repo`, or
 /// its HEAD moved from `head_at_start` while its reflog recorded nothing.
 pub fn observe(
@@ -448,6 +496,7 @@ pub fn observe(
     head_at_start: Option<&str>,
     started_ms: i64,
     skip: &[PathBuf],
+    start: &Start,
 ) -> Work {
     let repo = canonical(repo);
     let since = started_ms.div_euclid(1000);
@@ -468,7 +517,12 @@ pub fn observe(
     let mut theirs: HashSet<String> = HashSet::new();
     // What each reference pointed at when the session started: nothing
     // reachable from those was made by this session.
-    let mut boundaries: Vec<String> = head_at_start.into_iter().map(str::to_owned).collect();
+    let mut boundaries: Vec<String> = head_at_start
+        .into_iter()
+        .map(str::to_owned)
+        .chain(start.local.iter().cloned())
+        .chain(start.remote.iter().cloned())
+        .collect();
     let mut repo_moves = None;
     for checkout in &all {
         let ours = !skipped(&checkout.path);
@@ -514,7 +568,7 @@ pub fn observe(
     let default = default_branch(&repo);
     // What every remote branch pointed at when the session started: none of
     // that reached a remote during it.
-    let mut on_remotes: Vec<String> = Vec::new();
+    let mut on_remotes: Vec<String> = start.remote.clone();
     // Each default-branch reference's moves since the start, newest first,
     // and where it pointed at the start.
     let mut arrivals: Vec<(String, Vec<Move>, Option<String>)> = default
@@ -602,7 +656,7 @@ pub fn observe(
         }
     }
     let mut seen = HashSet::new();
-    for (reference, moves, start) in arrivals {
+    for (reference, moves, held) in arrivals {
         let remote = reference.starts_with("refs/remotes/");
         let onto = reference
             .strip_prefix("refs/remotes/")
@@ -614,13 +668,14 @@ pub fn observe(
             .iter()
             .skip(1)
             .map(|older| Some(older.commit.clone()))
-            .chain(std::iter::once(start))
+            .chain(std::iter::once(held))
             .collect();
         for (entry, old) in moves.iter().zip(olds).rev() {
             if remote && entry.subject != "update by push" {
                 continue; // a fetch brings in other people's commits
             }
-            for commit in range(&repo, &entry.commit, old.as_deref(), &on_remotes) {
+            let already = if remote { &on_remotes } else { &start.local };
+            for commit in range(&repo, &entry.commit, old.as_deref(), already) {
                 let ours = if remote {
                     !theirs.contains(&commit.commit)
                 } else {
@@ -1112,7 +1167,7 @@ mod tests {
 
     /// The phases leaving observes in `dir`, skipping no checkout.
     fn phases(dir: &Path, start: Option<&str>, started_ms: i64) -> Option<Vec<Phase>> {
-        observe(dir, start, started_ms, &[]).phases
+        observe(dir, start, started_ms, &[], &Start::default()).phases
     }
 
     #[test]
@@ -1280,7 +1335,7 @@ mod tests {
         );
         let tree = commit(&wt, "w.txt", "made in the worktree");
         receipt(&wt, "w", &tree, "passed", 5, false);
-        let work = observe(&dir, Some(&start), started_ms, &[]);
+        let work = observe(&dir, Some(&start), started_ms, &[], &Start::default());
         let found = work.phases.unwrap();
         assert_eq!(subjects(&found), ["made in the worktree"]);
         assert_eq!(found[0].evidence.as_ref().unwrap().outcome, "passed");
@@ -1361,6 +1416,7 @@ mod tests {
             Some(&start),
             started_ms,
             std::slice::from_ref(&theirs),
+            &Start::default(),
         );
         assert_eq!(skipped.phases, Some(Vec::new()));
         let own = std::fs::canonicalize(&dir).unwrap();
@@ -1380,9 +1436,15 @@ mod tests {
         commit(&mine, "m.txt", "mine");
         assert_eq!(
             subjects(
-                &observe(&dir, None, started_ms, &[own, theirs.clone()])
-                    .phases
-                    .unwrap()
+                &observe(
+                    &dir,
+                    None,
+                    started_ms,
+                    &[own, theirs.clone()],
+                    &Start::default(),
+                )
+                .phases
+                .unwrap()
             ),
             ["mine"],
             "a repository only found at leaving can be another session's launch checkout too"
@@ -1460,10 +1522,10 @@ mod tests {
         let started_ms = now_ms();
         commit(&upstream, "u.txt", "theirs");
         git_ok(&dir, &["fetch", "-q"]);
-        let work = observe(&dir, Some(&start), started_ms, &[]);
+        let work = observe(&dir, Some(&start), started_ms, &[], &Start::default());
         assert!(work.landed.is_empty(), "a fetch is not a landing");
         commit(&dir, "m.txt", "mine, on the default branch");
-        let work = observe(&dir, Some(&start), started_ms, &[]);
+        let work = observe(&dir, Some(&start), started_ms, &[], &Start::default());
         let default = git(&dir, &["branch", "--show-current"]).unwrap();
         assert_eq!(
             work.landed
@@ -1478,6 +1540,26 @@ mod tests {
             "no receipt names its tree: sykli is not even asked"
         );
         let _ = std::fs::remove_dir_all(upstream);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn what_a_repository_held_at_entering_is_never_this_sessions() {
+        let dir = repo("held");
+        let wt = worktree_path("held");
+        git_ok(
+            &dir,
+            &["worktree", "add", "-q", "-b", "held", wt.to_str().unwrap()],
+        );
+        // Made by someone else in the second this session enters: reflog
+        // times cannot tell it from this session's own.
+        commit(&wt, "b.txt", "just before entering");
+        let started_ms = now_ms() - 1000;
+        let start = start_of(&dir);
+        commit(&wt, "a.txt", "after entering");
+        let work = observe(&dir, None, started_ms, &[], &start);
+        assert_eq!(subjects(&work.phases.unwrap()), ["after entering"]);
+        let _ = std::fs::remove_dir_all(wt);
         let _ = std::fs::remove_dir_all(dir);
     }
 
