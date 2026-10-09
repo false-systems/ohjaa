@@ -99,14 +99,11 @@ pub enum Check {
     /// No sykli receipt names the commit's tree.
     Unchecked,
     /// sykli could not be asked: it has no `--commit`, is not installed, or
-    /// gave no answer in time.
+    /// gave no answer in time; or the commit has no sykli contract.
     Unverified { why: String },
-}
-
-impl Check {
-    pub fn passed(&self) -> bool {
-        matches!(self, Check::Passed)
-    }
+    /// sykli refused on the checkout it ran in, not on the commit: a sykli
+    /// that still compares the tree on disk, in a checkout that has moved on.
+    Stale { why: String },
 }
 
 /// A commit that reached the default branch during the session: one this
@@ -117,7 +114,16 @@ pub struct Landed {
     pub subject: String,
     /// The branch it reached: `origin/main`, or the local `main`.
     pub onto: String,
-    pub check: Check,
+    /// What sykli said: asked only of the tip of each push (what a pre-push
+    /// Boundary gates); the commits before it are their receipts' word.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<Check>,
+    /// Its receipt, as the receipt says it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Evidence>,
+    /// The branch still sat at it when the session left.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub at_tip: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -600,6 +606,21 @@ fn describe_check(check: &Check) -> String {
         Check::Failed { why } => format!("FAILED sykli verify: {why}"),
         Check::Unchecked => "unchecked: no sykli receipt for its tree".to_owned(),
         Check::Unverified { why } => format!("unverified: {why}"),
+        Check::Stale { why } => {
+            format!("stale: sykli checked the checkout, not the commit ({why})")
+        }
+    }
+}
+
+/// What is known of a landed commit: sykli's word at a push's tip, its
+/// receipt's word before it.
+fn describe_landed(landed: &Landed) -> String {
+    match &landed.check {
+        Some(check) => describe_check(check),
+        None => format!(
+            "{} (not verified: only a push's tip is)",
+            describe_evidence(landed.evidence.as_ref())
+        ),
     }
 }
 
@@ -607,10 +628,10 @@ fn landed_lines(label: &str, landed: &[Landed], out: &mut String) {
     for landed in landed {
         let _ = writeln!(
             out,
-            "{label}{} on {}: {}",
+            "{label}{} reached {}: {}",
             short(&landed.commit),
             landed.onto,
-            describe_check(&landed.check)
+            describe_landed(landed)
         );
     }
 }
@@ -774,9 +795,8 @@ pub struct Flag {
     pub tip: Option<(String, String)>,
 }
 
-/// The flags in a record: every commit that reached the default branch
-/// without passing evidence, and a pull request (open or merged) whose head
-/// lacks it. Derived from what ohjaa observed, never from the agent's words.
+/// The flags in a record: every push tip on the default branch, and the head
+/// of an open or merged pull request, that sykli refused. Derived from what ohjaa observed, never from the agent's words.
 pub fn flags(session: &Session) -> Vec<Flag> {
     let Some(left) = &session.left else {
         return Vec::new();
@@ -792,15 +812,29 @@ pub fn flags(session: &Session) -> Vec<Flag> {
             .iter()
             .map(|s| (s.repo.as_str(), &s.landed[..], &s.finished)),
     ) {
-        for landed in landed.iter().filter(|landed| !landed.check.passed()) {
+        // Only sykli refusing the commit's own run raises a flag: what could
+        // not be checked (no --commit, no contract, no receipt, a checkout
+        // that moved on) is recorded, never shouted.
+        for landed in landed.iter() {
+            let Some(check @ Check::Failed { .. }) = &landed.check else {
+                continue;
+            };
+            let (commit, repo_name) = (short(&landed.commit), repo_name(repo));
             out.push(Flag {
-                headline: format!(
-                    "{} at {} in {} has no passing evidence — check before building on it",
-                    landed.onto,
-                    short(&landed.commit),
-                    repo_name(repo)
-                ),
-                why: describe_check(&landed.check),
+                headline: if landed.at_tip {
+                    format!(
+                        "{} at {commit} in {repo_name} has no passing evidence — check before \
+                         building on it",
+                        landed.onto
+                    )
+                } else {
+                    format!(
+                        "{commit} reached {} in {repo_name} without passing evidence — check \
+                         {} before building on it",
+                        landed.onto, landed.onto
+                    )
+                },
+                why: describe_check(check),
                 repo: repo.to_owned(),
                 tip: Some((landed.onto.clone(), landed.commit.clone())),
             });
@@ -814,7 +848,7 @@ pub fn flags(session: &Session) -> Vec<Flag> {
         } = finished
         {
             let live = matches!(state.to_uppercase().as_str(), "OPEN" | "MERGED");
-            if live && !check.passed() {
+            if live && matches!(check, Check::Failed { .. }) {
                 out.push(Flag {
                     headline: format!(
                         "pull request {url} at {} has no passing evidence — check before \
@@ -1093,7 +1127,7 @@ pub fn render_last(session: &Session, here: &str) -> String {
                     "- {} reached {}: {}",
                     short(&landed.commit),
                     landed.onto,
-                    describe_check(&landed.check)
+                    describe_landed(landed)
                 );
             }
         }
@@ -1117,7 +1151,7 @@ pub fn render_last(session: &Session, here: &str) -> String {
                     repo_name(&scoped.repo),
                     short(&landed.commit),
                     landed.onto,
-                    describe_check(&landed.check)
+                    describe_landed(landed)
                 );
             }
         }
@@ -1645,23 +1679,27 @@ mod tests {
                 commit: "c0ffee1234".to_owned(),
                 subject: "pushed".to_owned(),
                 onto: "origin/main".to_owned(),
-                check: Check::Unverified {
+                check: Some(Check::Unverified {
                     why: "sykli has no --commit".to_owned(),
-                },
+                }),
+                evidence: None,
+                at_tip: false,
             },
             Landed {
                 commit: "abcdef1234".to_owned(),
                 subject: "checked".to_owned(),
                 onto: "origin/main".to_owned(),
-                check: Check::Passed,
+                check: Some(Check::Passed),
+                evidence: None,
+                at_tip: true,
             },
         ];
         s.left = Some(left);
         let record = render_record(&s);
         for said in [
             "finished      https://github.com/o/r/pull/7 (open) · head feedfac: FAILED sykli verify: error: tree mismatch",
-            "landed        c0ffee1 on origin/main: unverified: sykli has no --commit",
-            "landed        abcdef1 on origin/main: verified: passed (sykli verify --commit)",
+            "landed        c0ffee1 reached origin/main: unverified: sykli has no --commit",
+            "landed        abcdef1 reached origin/main: verified: passed (sykli verify --commit)",
         ] {
             assert!(record.contains(said), "missing `{said}`: {record}");
         }
@@ -1686,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_is_flagged_for_what_lacks_passing_evidence_and_only_that() {
+    fn a_record_is_flagged_only_where_sykli_refused_the_commit() {
         let pr = |state: &str, check: Check| Finished::PullRequest {
             url: "u".to_owned(),
             state: state.to_owned(),
@@ -1694,11 +1732,13 @@ mod tests {
             head: Some("feedface00".to_owned()),
             head_check: Some(check),
         };
-        let landed = |check: Check| Landed {
+        let landed = |check: Check, at_tip: bool| Landed {
             commit: "c0ffee1234".to_owned(),
             subject: "s".to_owned(),
             onto: "origin/main".to_owned(),
-            check,
+            check: Some(check),
+            evidence: None,
+            at_tip,
         };
         let with = |finished: Finished, landed: Vec<Landed>| {
             let mut s = ended(session("oh-12", "/r/selko", 1_000), 2_000);
@@ -1707,38 +1747,47 @@ mod tests {
             left.landed = landed;
             s
         };
-        let unverified = || Check::Unverified {
-            why: "sykli has no --commit".to_owned(),
+        let failed = || Check::Failed {
+            why: "refused: outcome expected passed".to_owned(),
         };
-        assert!(flags(&with(
-            pr("OPEN", Check::Passed),
-            vec![landed(Check::Passed)]
-        ))
-        .is_empty());
+        let headlines = |s: &Session| flags(s).into_iter().map(|f| f.headline).collect::<Vec<_>>();
+        // What could not be checked is recorded, never flagged.
+        for quiet in [
+            Check::Passed,
+            Check::Unchecked,
+            Check::Unverified {
+                why: "sykli has no --commit".to_owned(),
+            },
+            Check::Stale {
+                why: "refused: tree expected a but got b".to_owned(),
+            },
+        ] {
+            let s = with(pr("OPEN", quiet.clone()), vec![landed(quiet.clone(), true)]);
+            assert!(headlines(&s).is_empty(), "{quiet:?}");
+            assert!(
+                render_warnings(&s, &[], |_, _, _| false).is_empty(),
+                "{quiet:?}"
+            );
+        }
         assert!(
-            flags(&with(pr("CLOSED", unverified()), Vec::new())).is_empty(),
+            flags(&with(pr("CLOSED", failed()), Vec::new())).is_empty(),
             "a closed pull request reaches nothing"
         );
-        let open = flags(&with(
-            pr("OPEN", unverified()),
-            vec![landed(Check::Unchecked)],
-        ));
         assert_eq!(
-            open.iter().map(|f| f.headline.as_str()).collect::<Vec<_>>(),
+            headlines(&with(pr("OPEN", failed()), vec![landed(failed(), true)])),
             [
                 "origin/main at c0ffee1 in selko has no passing evidence — check before building on it",
                 "pull request u at feedfac has no passing evidence — check before merging or building on it",
             ]
         );
-        let s = with(pr("MERGED", unverified()), Vec::new());
+        assert_eq!(
+            headlines(&with(Finished::NoPullRequest, vec![landed(failed(), false)])),
+            ["c0ffee1 reached origin/main in selko without passing evidence — check origin/main before building on it"],
+            "\"at\" only of the commit the branch sits at"
+        );
+        let s = with(pr("MERGED", failed()), Vec::new());
         assert!(render_warnings(&s, &[], |_, _, _| false)
             .starts_with("WARNING from the last session here (oh-12, claude"));
-        assert!(render_warnings(
-            &with(Finished::NoPullRequest, Vec::new()),
-            &[],
-            |_, _, _| false
-        )
-        .is_empty());
     }
 
     #[test]

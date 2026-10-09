@@ -2087,14 +2087,15 @@ fn observe_repo(
             moved: false,
         };
     }
-    let finished =
-        match unless_interrupted(|| lifecycle::finished(&work.checkout, &work.receipts, sykli)) {
-            Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
-            other => other,
-        }
-        .unwrap_or_else(|| sessions::Finished::Unknown {
-            why: "interrupted".to_owned(),
-        });
+    let finished = match unless_interrupted(|| {
+        lifecycle::finished(&work.checkout, &work.receipts, &work.checkouts, sykli)
+    }) {
+        Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
+        other => other,
+    }
+    .unwrap_or_else(|| sessions::Finished::Unknown {
+        why: "interrupted".to_owned(),
+    });
     let landed = work
         .landed
         .iter()
@@ -2102,12 +2103,27 @@ fn observe_repo(
             commit: arrived.commit.clone(),
             subject: arrived.subject.clone(),
             onto: arrived.onto.clone(),
-            check: unless_interrupted(|| {
-                sykli.check(&arrived.commit, &arrived.tree, &work.receipts)
-            })
-            .unwrap_or_else(|| sessions::Check::Unverified {
-                why: "leaving was interrupted".to_owned(),
+            // sykli is asked about the tip of each push, as a pre-push Boundary
+            // would be; the commits before it are their receipts' word.
+            check: arrived.tip.then(|| {
+                unless_interrupted(|| {
+                    sykli.check(
+                        repo,
+                        &arrived.commit,
+                        &arrived.tree,
+                        &work.receipts,
+                        &work.checkouts,
+                    )
+                })
+                .unwrap_or_else(|| sessions::Check::Unverified {
+                    why: "leaving was interrupted".to_owned(),
+                })
             }),
+            evidence: work
+                .receipts
+                .get(&arrived.tree)
+                .map(|receipt| receipt.evidence.clone()),
+            at_tip: arrived.at_tip,
         })
         .collect();
     Observed {

@@ -67,15 +67,19 @@ exit 4
 
 /// Never the real sykli. `verify --help` names `--commit` only with
 /// OHJAA_STUB_SYKLI_COMMIT set. `verify <receipt> --contract <c> --commit
-/// <sha>` passes only a receipt for exactly that commit's tree that says
-/// passed and was not forged, as sykli's own check would.
+/// <sha>` checks, in sykli's order and words: the contract the receipt was
+/// made under, that it ran exactly that commit's tree, cleanly, and then its
+/// outcome. With OHJAA_STUB_SYKLI_COMMIT=1 it is sykli#67 as it stands: after
+/// the commit checks it also compares the checkout on disk (its HEAD's tree,
+/// and nothing uncommitted beside it). With `new` it takes everything from the
+/// commit, as sykli#67 is being changed to.
 const SYKLI_STUB: &str = r#"#!/bin/sh
 printf '%s|%s\n' "$PWD" "$*" >> "${OHJAA_STUB_SYKLI_CALLS:-/dev/null}"
 if [ "$1" = verify ] && [ "$2" = --help ]; then
   echo "Usage: sykli verify [OPTIONS] <RECEIPT>"
   echo "      --contract <CONTRACT>  Path to sykli.rs or a sykli-contract.v1 JSON file"
   if [ -n "${OHJAA_STUB_SYKLI_COMMIT:-}" ]; then
-    echo "      --commit <SHA>  Fail unless the receipt binds exactly this commit"
+    echo "      --commit <REV>  Also require a clean run of this commit"
   fi
   exit 0
 fi
@@ -86,11 +90,19 @@ while [ $# -gt 0 ]; do
   case "$1" in --commit) sha="$2"; shift;; esac
   shift
 done
-[ -n "$sha" ] || { echo "error: no --commit" >&2; exit 2; }
+[ -n "$sha" ] || { echo "refused: commit expected a --commit" >&2; exit 2; }
+grep -q '"contract_hash":"forged"' "$receipt" && { echo "refused: contract expected c but got forged" >&2; exit 4; }
 tree=$(git rev-parse "$sha^{tree}") || exit 2
-grep -q "\"head_tree_oid\":\"$tree\"" "$receipt" || { echo "error: the receipt is not for $sha" >&2; exit 3; }
-grep -q '"contract_hash":"forged"' "$receipt" && { echo "error: contract mismatch: the receipt was not made under sykli.json" >&2; exit 4; }
-grep -q '"outcome":"passed"' "$receipt" || { echo "error: outcome failed" >&2; exit 1; }
+ran=$(sed -n 's/.*"tree_oid":"\([0-9a-f]*\)".*/\1/p' "$receipt" | head -1)
+[ "$ran" = "$tree" ] || { echo "refused: commit expected $tree (the tree of commit $sha) but got $ran" >&2; exit 3; }
+grep -q '"dirty":false' "$receipt" || { echo "refused: clean expected a clean run but got dirty true" >&2; exit 3; }
+if [ "${OHJAA_STUB_SYKLI_COMMIT:-}" != new ]; then
+  live=$(git rev-parse 'HEAD^{tree}')
+  if [ "$live" != "$tree" ] || [ -n "$(git status --porcelain -- . ':(exclude).sykli')" ]; then
+    echo "refused: tree expected $live but got $tree" >&2; exit 3
+  fi
+fi
+grep -q '"outcome":"passed"' "$receipt" || { echo "refused: outcome expected passed or cached with complete task records but got failed with 0 task records" >&2; exit 1; }
 exit 0
 "#;
 
@@ -3089,7 +3101,8 @@ fn the_pull_request_head_is_verified_by_sykli_never_by_the_receipts_word() {
     assert!(
         finished.contains("https://github.com/o/r/pull/7 (open)")
             && finished.contains(&format!("head {}", &head[..7]))
-            && finished.contains("FAILED sykli verify: error: contract mismatch"),
+            && finished
+                .contains("FAILED sykli verify: refused: contract expected c but got forged"),
         "{finished}"
     );
     assert!(!finished.contains("passed"), "{finished}");
@@ -3118,6 +3131,10 @@ fn the_pull_request_head_is_verified_by_sykli_never_by_the_receipts_word() {
     assert!(
         finished_line(&record).ends_with("unverified: sykli has no --commit"),
         "{record}"
+    );
+    assert!(
+        !record.contains("FLAGGED"),
+        "a sykli that cannot say flags nothing: {record}"
     );
     fixture.cleanup();
 }
@@ -3158,64 +3175,177 @@ fn clone_with_origin(fixture: &Fixture, name: &str) -> PathBuf {
     repo
 }
 
+/// A session in a worktree of `repo` that runs `work` there, with the stub
+/// sykli in `mode` (`""`: no --commit). Returns the record and the worktree.
+fn worktree_push_session(
+    fixture: &Fixture,
+    repo: &Path,
+    name: &str,
+    work: &str,
+    mode: &str,
+) -> (String, PathBuf) {
+    let worktree = fixture.dir.join("_worktrees").join(name);
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        git worktree add -q -b {name} '{wt}'
+        cd '{wt}'
+        {work}",
+        wt = worktree.display()
+    );
+    let mut command = fixture.ohjaa();
+    command
+        .args([
+            "run",
+            "sh",
+            "--intent",
+            name,
+            "--no-briefing",
+            "--",
+            "-c",
+            &script,
+        ])
+        .env("OHJAA_STUB_RUN_AGENT", "1")
+        .current_dir(repo);
+    if !mode.is_empty() {
+        command.env("OHJAA_STUB_SYKLI_COMMIT", mode);
+    }
+    let (_, stderr, code) = output_of(&mut command);
+    assert_eq!(code, Some(0), "{stderr}");
+    (stderr, worktree)
+}
+
+fn short_of(dir: &Path, rev: &str) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", "--short=7", rev])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn landed_lines(record: &str) -> Vec<&str> {
+    record.lines().filter(|l| l.starts_with("landed")).collect()
+}
+
 #[test]
-fn every_commit_this_session_pushed_to_the_default_branch_is_verified() {
+fn the_documented_flow_pushed_to_main_is_verified_at_its_tip_and_raises_nothing() {
     if !git_available() {
         return;
     }
     let fixture = Fixture::new("landed");
     let repo = clone_with_origin(&fixture, "work");
-    let worktree = fixture.dir.join("_worktrees").join("work-push");
-    let script = format!(
-        "{RECEIPT_FN}
-        set -e
-        git worktree add -q -b push '{wt}'
-        cd '{wt}'
-        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'checked'
+    // Each phase a commit and a sykli run; then one push.
+    let (record, worktree) = worktree_push_session(
+        &fixture,
+        &repo,
+        "flow",
+        "echo '{}' > sykli.json && git add sykli.json && git commit -q -m one
         receipt passed
-        echo x > x.txt && git add x.txt && git commit -q -m 'never checked'
+        echo x > x.txt && git add x.txt && git commit -q -m two
+        receipt passed
         git push -q origin HEAD:main",
-        wt = worktree.display()
+        "1",
     );
-    let (_, stderr, code) = output_of(
-        fixture
-            .ohjaa()
-            .args([
-                "run",
-                "sh",
-                "--intent",
-                "push",
-                "--no-briefing",
-                "--",
-                "-c",
-                &script,
-            ])
-            .env("OHJAA_STUB_RUN_AGENT", "1")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
-            .current_dir(&repo),
-    );
-    assert_eq!(code, Some(0), "{stderr}");
-    let pushed = short_head(&worktree);
-    let checked = {
-        let output = Command::new("git")
-            .args(["rev-parse", "--short=7", "HEAD~1"])
-            .current_dir(&worktree)
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    };
-    let landed: Vec<&str> = stderr.lines().filter(|l| l.starts_with("landed")).collect();
+    let (one, two) = (short_of(&worktree, "HEAD~1"), short_of(&worktree, "HEAD"));
     assert_eq!(
-        landed,
+        landed_lines(&record),
         [
-            format!(
-                "landed        {checked} on origin/main: verified: passed (sykli verify --commit)"
-            ),
-            format!(
-                "landed        {pushed} on origin/main: unchecked: no sykli receipt for its tree"
-            ),
+            format!("landed        {one} reached origin/main: receipt: passed (not verified: only a push's tip is)"),
+            format!("landed        {two} reached origin/main: verified: passed (sykli verify --commit)"),
         ],
-        "{stderr}"
+        "{record}"
+    );
+    assert!(
+        !record.contains("FLAGGED") && !record.contains("ohjaa: flagged"),
+        "{record}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn what_sykli_could_not_check_is_recorded_and_never_flagged() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("not-flagged");
+    let repo = clone_with_origin(&fixture, "work");
+    let quiet = |record: &str| {
+        assert!(
+            !record.contains("FLAGGED") && !record.contains("ohjaa: flagged"),
+            "{record}"
+        );
+    };
+    // A stray file beside the commit: sykli#67 as it stands checks the
+    // checkout, not the commit.
+    let (record, wt) = worktree_push_session(
+        &fixture,
+        &repo,
+        "stray",
+        "echo '{}' > sykli.json && git add sykli.json && git commit -q -m checked
+        receipt passed
+        git push -q origin HEAD:main
+        echo scratch > notes.txt",
+        "1",
+    );
+    assert!(
+        landed_lines(&record).concat().contains(&format!(
+            "{} reached origin/main: stale: sykli checked the checkout, not the commit",
+            short_of(&wt, "HEAD")
+        )),
+        "{record}"
+    );
+    quiet(&record);
+    // A sykli without --commit cannot say.
+    let (record, _) = worktree_push_session(
+        &fixture,
+        &repo,
+        "old-sykli",
+        "git pull -q origin main && echo y > y.txt && git add y.txt && git commit -q -m y
+        receipt passed
+        git push -q origin HEAD:main",
+        "",
+    );
+    assert!(
+        landed_lines(&record)
+            .concat()
+            .contains("unverified: sykli has no --commit"),
+        "{record}"
+    );
+    quiet(&record);
+    // Pushed without a sykli run.
+    let (record, _) = worktree_push_session(
+        &fixture,
+        &repo,
+        "unchecked",
+        "git pull -q origin main && echo z > z.txt && git add z.txt && git commit -q -m z
+        git push -q origin HEAD:main",
+        "1",
+    );
+    assert!(
+        landed_lines(&record)
+            .concat()
+            .contains("unchecked: no sykli receipt for its tree"),
+        "{record}"
+    );
+    quiet(&record);
+    // And nothing of it opens the next briefing.
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(!stdout.contains("WARNING"), "{stdout}");
+    // The commit-based sykli passes the stray-file case.
+    let (record, _) = worktree_push_session(
+        &fixture,
+        &repo,
+        "stray-new",
+        "git pull -q origin main && echo w > w.txt && git add w.txt && git commit -q -m w
+        receipt passed
+        git push -q origin HEAD:main
+        echo scratch > notes.txt",
+        "new",
+    );
+    assert!(
+        landed_lines(&record).concat().contains("verified: passed"),
+        "{record}"
     );
     fixture.cleanup();
 }
@@ -3266,7 +3396,7 @@ fn a_failing_commit_pushed_to_main_flags_the_record_and_tops_the_next_briefing()
     );
     assert!(stderr.contains(&warning), "{stderr}");
     assert!(
-        stderr.contains("sykli verify: error: outcome failed"),
+        stderr.contains("FAILED sykli verify: refused: outcome expected passed"),
         "it says why: {stderr}"
     );
     assert!(
@@ -3397,11 +3527,15 @@ fn intake_drafts_from_what_ohjaa_observed_going_wrong_not_only_the_handover() {
     }
     let fixture = Fixture::new("anomalies");
     let repo = clone_with_origin(&fixture, "work");
-    // An unchecked commit pushed to main, a failing exit, and no handover.
-    let script = "set -e
-        echo x > x.txt && git add x.txt && git commit -q -m 'unchecked'
+    // A commit sykli refuses pushed to main, a failing exit, and no handover.
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m broken
+        receipt failed
         git push -q origin HEAD:main
-        exit 3";
+        exit 3"
+    );
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -3413,9 +3547,10 @@ fn intake_drafts_from_what_ohjaa_observed_going_wrong_not_only_the_handover() {
                 "--no-briefing",
                 "--",
                 "-c",
-                script,
+                &script,
             ])
             .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .current_dir(&repo),
     );
     assert_eq!(code, Some(3), "{stderr}");
@@ -3443,7 +3578,7 @@ fn intake_drafts_from_what_ohjaa_observed_going_wrong_not_only_the_handover() {
         " · observed · ",
         &format!(
             "origin/main at {pushed} in work has no passing evidence — check before building on it \
-             (unchecked: no sykli receipt for its tree)"
+             (FAILED sykli verify: refused: outcome expected passed"
         ),
         "the agent exited with code 3",
         "the agent left no handover",

@@ -460,6 +460,8 @@ pub struct Work {
     /// The commits that reached the default branch during the session, oldest
     /// first (see [`observe`]); sykli is asked about each by the caller.
     pub landed: Vec<Arrived>,
+    /// Every checkout of the repository.
+    pub checkouts: Vec<Worktree>,
 }
 
 /// A commit that reached the default branch, before sykli is asked about it.
@@ -470,6 +472,10 @@ pub struct Arrived {
     pub subject: String,
     /// `origin/main`, or the local `main`.
     pub onto: String,
+    /// The tip of the push (or move) that brought it: what sykli is asked about.
+    pub tip: bool,
+    /// The branch still sits at it.
+    pub at_tip: bool,
 }
 
 /// The most landed commits a record keeps: the newest ones.
@@ -667,6 +673,7 @@ pub fn observe(
     let mut seen = HashSet::new();
     for (reference, moves, held) in arrivals {
         let remote = reference.starts_with("refs/remotes/");
+        let now_at = git(&repo, &["rev-parse", "--verify", "-q", &reference]);
         let onto = reference
             .strip_prefix("refs/remotes/")
             .or_else(|| reference.strip_prefix("refs/heads/"))
@@ -693,6 +700,8 @@ pub fn observe(
                 if ours && seen.insert(commit.commit.clone()) {
                     work.landed.push(Arrived {
                         onto: onto.clone(),
+                        tip: commit.commit == entry.commit,
+                        at_tip: now_at.as_deref() == Some(commit.commit.as_str()),
                         ..commit
                     });
                 }
@@ -701,6 +710,7 @@ pub fn observe(
     }
     work.landed
         .drain(..work.landed.len().saturating_sub(MAX_LANDED));
+    work.checkouts = all;
     work
 }
 
@@ -757,6 +767,8 @@ fn range(repo: &Path, new: &str, old: Option<&str>, already: &[String]) -> Vec<A
                 tree: fields.next()?.to_owned(),
                 subject: fields.next()?.to_owned(),
                 onto: String::new(),
+                tip: false,
+                at_tip: false,
             })
         })
         .collect();
@@ -933,7 +945,12 @@ fn reflogs_touched_since(checkout: &Path, since: i64) -> bool {
 
 /// State 4, observed: the pull request of the branch checked out in
 /// `checkout`, if `gh` can say, and what sykli says about its head.
-pub fn finished(checkout: &Path, receipts: &Receipts, sykli: &Sykli) -> Finished {
+pub fn finished(
+    checkout: &Path,
+    receipts: &Receipts,
+    checkouts: &[Worktree],
+    sykli: &Sykli,
+) -> Finished {
     let output = process::run(
         Command::new("gh")
             .args(["pr", "view", "--json", "url,state,headRefOid"])
@@ -976,7 +993,7 @@ pub fn finished(checkout: &Path, receipts: &Receipts, sykli: &Sykli) -> Finished
         .as_ref()
         .and_then(|tree| receipts.get(tree).map(|r| r.evidence.clone()));
     let head_check = head.as_deref().map(|head| match &tree {
-        Some(tree) => sykli.check(head, tree, receipts),
+        Some(tree) => sykli.check(checkout, head, tree, receipts, checkouts),
         None => Check::Unverified {
             why: "its head commit is not in this repository".to_owned(),
         },
@@ -1033,26 +1050,58 @@ impl Sykli {
             .clone()
     }
 
-    /// What sykli says about `commit`, whose tree is `tree`: `sykli verify
-    /// <receipt> --contract <contract> --commit <commit>`, run in the checkout
-    /// the receipt is in. Exit 0 passes it; any other exit fails it, in
-    /// sykli's words. A receipt's own `outcome` is never read as a pass, and
-    /// a sykli that cannot bind a commit never passes anything.
-    pub fn check(&self, commit: &str, tree: &str, receipts: &Receipts) -> Check {
+    /// What sykli says about `commit` (whose tree is `tree`) in `repo`:
+    /// `sykli verify <receipt> --contract <contract> --commit <commit>`. It
+    /// runs in a checkout at the commit with nothing beside it when there is
+    /// one (`checkouts`), else in the checkout the receipt is in.
+    ///
+    /// Exit 0 passes it. A refusal of the commit's own run (another tree, a
+    /// dirty run, a failed outcome, contradictory records) fails it, in
+    /// sykli's words. A refusal on the tree, inputs or contract on disk fails
+    /// it only where the checkout is the commit; elsewhere it is stale: a
+    /// sykli that checks the checkout, not the commit. A receipt's own
+    /// `outcome` is never read as a pass, a sykli that cannot bind a commit
+    /// never passes anything, and a commit with no contract cannot be checked.
+    pub fn check(
+        &self,
+        repo: &Path,
+        commit: &str,
+        tree: &str,
+        receipts: &Receipts,
+        checkouts: &[Worktree],
+    ) -> Check {
         let Some(receipt) = receipts.get(tree) else {
-            return Check::Unchecked;
+            let has_contract = ["sykli.json", "sykli.rs"]
+                .iter()
+                .any(|name| git(repo, &["cat-file", "-e", &format!("{commit}:{name}")]).is_some());
+            return if has_contract {
+                Check::Unchecked
+            } else {
+                Check::Unverified {
+                    why: "no sykli contract (sykli.json or sykli.rs) in this commit".to_owned(),
+                }
+            };
         };
         if let Err(why) = self.binds_commits() {
             return Check::Unverified { why };
         }
+        let at_commit = checkouts
+            .iter()
+            .filter(|w| w.head.as_deref() == Some(commit))
+            .map(|w| w.path.as_path())
+            .find(|path| clean(path));
+        let (checkout, is_the_commit) = match at_commit {
+            Some(path) => (path, true),
+            None => (receipt.checkout.as_path(), false),
+        };
         let Some(contract) = ["sykli.json", "sykli.rs"]
             .into_iter()
-            .find(|name| receipt.checkout.join(name).is_file())
+            .find(|name| checkout.join(name).is_file())
         else {
             return Check::Unverified {
                 why: format!(
                     "no sykli contract (sykli.json or sykli.rs) in {}",
-                    receipt.checkout.display()
+                    checkout.display()
                 ),
             };
         };
@@ -1061,20 +1110,42 @@ impl Sykli {
                 .arg("verify")
                 .arg(&receipt.path)
                 .args(["--contract", contract, "--commit", commit])
-                .current_dir(&receipt.checkout),
+                .current_dir(checkout),
             None,
             process::LOCAL,
         );
-        match output {
-            Err(error) => Check::Unverified {
-                why: format!("sykli verify could not run: {error:#}"),
-            },
-            Ok(output) if output.status.success() => Check::Passed,
-            Ok(output) => Check::Failed {
-                why: output.failure_detail(),
+        let output = match output {
+            Err(error) => {
+                return Check::Unverified {
+                    why: format!("sykli verify could not run: {error:#}"),
+                }
+            }
+            Ok(output) if output.status.success() => return Check::Passed,
+            Ok(output) => output,
+        };
+        let why = output.failure_detail();
+        // sykli names the first check that failed: `refused: <check> expected …`.
+        let refused = why
+            .strip_prefix("refused: ")
+            .and_then(|rest| rest.split_whitespace().next());
+        match refused {
+            Some("commit" | "clean" | "outcome" | "records" | "schema") => Check::Failed { why },
+            Some("tree" | "inputs" | "contract") if is_the_commit => Check::Failed { why },
+            Some("tree" | "inputs" | "contract") => Check::Stale { why },
+            _ => Check::Unverified {
+                why: format!("sykli verify could not say: {why}"),
             },
         }
     }
+}
+
+/// Whether `checkout` has nothing beside its HEAD, sykli's own `.sykli/` aside.
+fn clean(checkout: &Path) -> bool {
+    git(
+        checkout,
+        &["status", "--porcelain", "--", ".", ":(exclude).sykli"],
+    )
+    .is_some_and(|status| status.is_empty())
 }
 
 /// The toimija session the child ran: toimija names it `<secs>-<pid>` after
@@ -1598,10 +1669,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("mine, on the default branch", default.as_str())]
         );
+        let landed = &work.landed[0];
+        assert!(landed.tip && landed.at_tip);
         assert_eq!(
-            Sykli::default().check(&work.landed[0].commit, &work.landed[0].tree, &work.receipts),
-            Check::Unchecked,
-            "no receipt names its tree: sykli is not even asked"
+            Sykli::default().check(
+                &dir,
+                &landed.commit,
+                &landed.tree,
+                &work.receipts,
+                &work.checkouts
+            ),
+            Check::Unverified {
+                why: "no sykli contract (sykli.json or sykli.rs) in this commit".to_owned()
+            },
+            "no receipt and no contract: sykli is not even asked"
         );
         let _ = std::fs::remove_dir_all(upstream);
         let _ = std::fs::remove_dir_all(dir);

@@ -162,25 +162,33 @@ surprised by  the fixture helper silently skips when git is missing
 ```
 
 A receipt's `outcome` is its own claim, and the record says it as one
-(`receipt: passed`). Only sykli says a commit passed: for the pull request's
-head, and for every commit that reached the default branch during the session
-(pushed from here to `origin/<default>`, or made here and now on the local
-one; a fetch is not a landing), leaving runs
-`sykli verify <receipt> --contract sykli.json --commit <sha>` in the checkout
-the receipt is in. Exit 0 is `verified: passed`; any other exit is `FAILED`,
-in sykli's words. A commit no receipt names is `unchecked`. A sykli without
-`--commit` (`sykli verify --help` does not name it) passes nothing: the record
-says `unverified: sykli has no --commit`.
+(`receipt: passed`); a receipt is filed under the tree that ran, and a clean
+pass outranks a newer dirty run. Only sykli says a commit passed. It is asked
+about the pull request's head, and about the tip of every push that reached
+the default branch during the session (pushed from here to `origin/<default>`,
+or made here and now on the local one; a fetch is not a landing), which is
+what a pre-push Boundary gates. The commits before a tip are shown as their
+receipts' word. Leaving runs `sykli verify <receipt> --contract sykli.json
+--commit <sha>` in a checkout at that commit with nothing beside it, when there
+is one, else where the receipt is:
 
-Anything that reached the default branch without passing evidence, and an open
-or merged pull request whose head lacks it, **flags the record**: the record
-opens with it, leaving ends by saying it again (`ohjaa: flagged: …`), and the
-next briefing here, `ohjaa brief` included, opens with it before the knowledge
-and before the handover:
+| sykli says | the record says | flag |
+|---|---|---|
+| exit 0 | `verified: passed` | no |
+| refused the commit's own run (another tree, a dirty run, a failed outcome, contradictory records) | `FAILED sykli verify: …` | **yes** |
+| refused the tree, inputs or contract on disk, in a checkout that is not the commit | `stale: sykli checked the checkout, not the commit` | no |
+| no `--commit` (`sykli verify --help` does not name it) | `unverified: sykli has no --commit` | no |
+| — the commit has no sykli contract | `unverified: no sykli contract …` | no |
+| — no receipt names the commit's tree | `unchecked` | no |
+
+Only a refusal **flags the record**: the record opens with it, leaving ends by
+saying it again (`ohjaa: flagged: …`), and the next briefing here, `ohjaa
+brief` included, opens with it before the knowledge and before the handover.
+"`origin/main` at `<sha>`" is said only of the commit the branch sits at:
 
 ```
 WARNING from the last session here (oh-1791…, claude, ended 2026-10-09 21:30 UTC):
-- origin/main at 3dbaafd in selko has no passing evidence — check before building on it (FAILED sykli verify: error: outcome failed)
+- origin/main at 3dbaafd in selko has no passing evidence — check before building on it (FAILED sykli verify: refused: outcome expected passed …)
 ```
 
 An earlier session's flag about a branch keeps opening the briefing for as long
