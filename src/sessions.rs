@@ -172,6 +172,30 @@ pub struct Left {
     /// during the session, each with what sykli said about it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub landed: Vec<Landed>,
+    /// Its ohjaa was killed (SIGKILL) before leaving could run: the session
+    /// was closed at a later launch that found that ohjaa gone. `ended_ms` is
+    /// when that was observed, and nothing it did was observed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orphaned: bool,
+}
+
+impl Left {
+    /// The leaving of a session whose ohjaa is gone, observed at `now_ms`.
+    pub fn orphaned(now_ms: i64) -> Left {
+        Left {
+            ended_ms: now_ms,
+            exit: Exit::Unknown,
+            toimija_session: None,
+            phases: None,
+            finished: Finished::Unknown {
+                why: "its ohjaa was killed before leaving".to_owned(),
+            },
+            interrupted: false,
+            scoped: Vec::new(),
+            landed: Vec::new(),
+            orphaned: true,
+        }
+    }
 }
 
 /// A repository a session named with `--scope`, as it stood at entering. It
@@ -516,6 +540,12 @@ pub fn new_id(started_ms: i64) -> String {
     format!("oh-{started_ms}-{}", std::process::id())
 }
 
+/// The pid of the ohjaa that started a session, from its id.
+pub fn pid_of(id: &str) -> Option<u32> {
+    let (_, pid) = id.strip_prefix("oh-")?.rsplit_once('-')?;
+    pid.parse().ok().filter(|pid| *pid > 0)
+}
+
 /// Session ids are names, never paths.
 pub fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
@@ -529,7 +559,7 @@ pub fn is_valid_id(id: &str) -> bool {
 
 /// A time for people. Always UTC, and always says so: a bare 23:53 reads as
 /// local time to anyone east or west of Greenwich.
-fn clock(ms: i64) -> String {
+pub fn clock(ms: i64) -> String {
     let full = rfc3339(ms.div_euclid(1000));
     // "2026-09-26T10:02:03Z" → "2026-09-26 10:02 UTC"
     format!("{} {} UTC", &full[..10], &full[11..16])
@@ -541,6 +571,15 @@ fn describe_exit(exit: Exit) -> String {
         Exit::Code { code } => format!("exit {code}"),
         Exit::Signal { signal } => format!("killed by signal {signal}"),
         Exit::Unknown => "unknown".to_owned(),
+    }
+}
+
+/// How a session ended, as its record says it.
+fn describe_end(left: &Left) -> String {
+    if left.orphaned {
+        "orphaned (observed at next launch)".to_owned()
+    } else {
+        describe_exit(left.exit)
     }
 }
 
@@ -613,13 +652,7 @@ pub fn render_record(session: &Session) -> String {
     let mut out = String::new();
     let ended = session.left.as_ref().map_or_else(
         || "still open".to_owned(),
-        |left| {
-            format!(
-                "{} · ended: {}",
-                clock(left.ended_ms),
-                describe_exit(left.exit)
-            )
-        },
+        |left| format!("{} · ended: {}", clock(left.ended_ms), describe_end(left)),
     );
     let _ = writeln!(
         out,
@@ -653,7 +686,7 @@ pub fn render_record(session: &Session) -> String {
             let _ = writeln!(
                 out,
                 "phases        {}",
-                describe_phases(left.phases.as_ref(), left.interrupted)
+                describe_phases(left.phases.as_ref(), left)
             );
             let _ = writeln!(out, "finished      {}", describe_finished(&left.finished));
             landed_lines("landed        ", &left.landed, &mut out);
@@ -667,7 +700,7 @@ pub fn render_record(session: &Session) -> String {
             let _ = writeln!(
                 out,
                 "{label:<13} phases {}",
-                describe_phases(scoped.phases.as_ref(), left.interrupted)
+                describe_phases(scoped.phases.as_ref(), left)
             );
             let _ = writeln!(
                 out,
@@ -788,6 +821,25 @@ pub fn flags(session: &Session) -> Vec<Flag> {
     out
 }
 
+/// Sessions closed as orphaned at this launch, for the very top of its
+/// briefing: nothing they did was observed.
+pub fn render_orphaned(orphans: &[Session]) -> String {
+    let mut out = String::new();
+    for session in orphans {
+        let _ = writeln!(
+            out,
+            "ORPHANED: session {} ({}, {}), started {}, was never closed: its ohjaa was \
+             killed, so nothing it did was observed. Check `git log` and the worktrees here \
+             before building on its work.",
+            session.id,
+            session.agent,
+            session.intent,
+            clock(session.started_ms)
+        );
+    }
+    out
+}
+
 /// The flags of the last session here, for the very top of the next
 /// briefing: before the knowledge, and before its handover can say "ship it".
 /// Empty when it raised none.
@@ -839,9 +891,10 @@ pub fn render_none_ended(unended: &[Session], unreadable: usize) -> String {
     out
 }
 
-fn describe_phases(phases: Option<&Vec<Phase>>, interrupted: bool) -> String {
+fn describe_phases(phases: Option<&Vec<Phase>>, left: &Left) -> String {
     match phases {
-        None if interrupted => "not observed (leaving was interrupted)".to_owned(),
+        None if left.orphaned => "not observed (its ohjaa was killed before leaving)".to_owned(),
+        None if left.interrupted => "not observed (leaving was interrupted)".to_owned(),
         None => "not observed".to_owned(),
         Some(phases) if phases.is_empty() => "no commits".to_owned(),
         Some(phases) => phases
@@ -938,13 +991,7 @@ pub fn render_last(session: &Session, here: &str) -> String {
     // a record without its leaving is said as exactly that, never as a crash.
     let ended = session.left.as_ref().map_or_else(
         || "leaving not recorded".to_owned(),
-        |left| {
-            format!(
-                "ended {}, {}",
-                clock(left.ended_ms),
-                describe_exit(left.exit)
-            )
-        },
+        |left| format!("ended {}, {}", clock(left.ended_ms), describe_end(left)),
     );
     let found_here = session
         .left
@@ -974,7 +1021,12 @@ pub fn render_last(session: &Session, here: &str) -> String {
         .left
         .as_ref()
         .map_or(&[][..], |left| &left.scoped[..]);
-    if session.outside_repo && scoped.is_empty() {
+    if session.left.as_ref().is_some_and(|left| left.orphaned) {
+        out.push_str(
+            "- work: not observed: its ohjaa was killed before leaving; check `git log` and \
+             the worktrees before building on it\n",
+        );
+    } else if session.outside_repo && scoped.is_empty() {
         out.push_str(
             "- work: not a Git repository, so no commits or pull request to observe; \
              its handover says what changed\n",
@@ -1087,6 +1139,7 @@ mod tests {
             interrupted: false,
             scoped: Vec::new(),
             landed: Vec::new(),
+            orphaned: false,
         });
         session
     }
@@ -1129,6 +1182,7 @@ mod tests {
                 },
             ],
             landed: Vec::new(),
+            orphaned: false,
         });
         let record = render_record(&s);
         assert!(
@@ -1364,6 +1418,7 @@ mod tests {
             interrupted: false,
             scoped: Vec::new(),
             landed: Vec::new(),
+            orphaned: false,
         });
         let record = render_record(&s);
         let observed = record.find("─ observed").unwrap();

@@ -162,9 +162,90 @@ pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Re
     }
 }
 
+/// Whether the ohjaa that started a session at `started_ms` still runs as
+/// `pid`. A pid is reused, so the process there must also be an `ohjaa` that
+/// was already running then (a couple of seconds of slack for the clock
+/// tick). `None` when that cannot be told: a process is never declared gone
+/// on a guess.
+pub fn ohjaa_alive(pid: u32, started_ms: i64) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        let pid_t = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)?;
+        // SAFETY: signal 0 sends nothing; kill(2) only says whether the pid
+        // exists (EPERM: it does, as another user's).
+        let exists = unsafe { libc::kill(pid_t, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !exists {
+            return Some(false);
+        }
+        let output = run(
+            Command::new("ps").args(["-o", "etime=", "-o", "comm=", "-p", &pid.to_string()]),
+            None,
+            LOCAL,
+        )
+        .ok()?;
+        let text = output.stdout_text();
+        let line = text.trim();
+        if !output.status.success() || line.is_empty() {
+            // ps ran and found no such process: gone between kill(2) and ps.
+            return Some(false);
+        }
+        let (elapsed, command) = line.split_once(char::is_whitespace)?;
+        let elapsed = elapsed_seconds(elapsed)?;
+        let is_ohjaa = std::path::Path::new(command.trim())
+            .file_name()
+            .is_some_and(|name| name == "ohjaa");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        Some(is_ohjaa && now - elapsed <= started_ms.div_euclid(1000) + 2)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, started_ms);
+        None
+    }
+}
+
+/// `ps`'s elapsed time, `[[dd-]hh:]mm:ss`, in seconds.
+fn elapsed_seconds(text: &str) -> Option<i64> {
+    let (days, clock) = match text.split_once('-') {
+        Some((days, clock)) => (days.parse::<i64>().ok()?, clock),
+        None => (0, text),
+    };
+    let mut seconds = 0;
+    for part in clock.split(':') {
+        seconds = seconds * 60 + part.parse::<i64>().ok()?;
+    }
+    Some(days * 86_400 + seconds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elapsed_times_read_as_ps_writes_them() {
+        assert_eq!(elapsed_seconds("00:07"), Some(7));
+        assert_eq!(elapsed_seconds("01:02:03"), Some(3723));
+        assert_eq!(elapsed_seconds("2-00:00:01"), Some(172_801));
+        assert_eq!(elapsed_seconds("x"), None);
+    }
+
+    #[test]
+    fn this_ohjaa_is_alive_and_a_gone_pid_is_not() {
+        // The test binary is not named ohjaa: alive, but not an ohjaa.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert_eq!(ohjaa_alive(std::process::id(), now), Some(false));
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let gone = child.id();
+        child.wait().unwrap();
+        assert_eq!(ohjaa_alive(gone, now), Some(false));
+    }
 
     #[test]
     fn output_and_input_pass_through() {

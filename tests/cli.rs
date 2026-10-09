@@ -3301,3 +3301,91 @@ fn a_failing_commit_pushed_to_main_flags_the_record_and_tops_the_next_briefing()
     );
     fixture.cleanup();
 }
+
+#[test]
+fn a_session_whose_ohjaa_was_killed_is_closed_as_orphaned_at_the_next_launch() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("orphan");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let agent_pid = fixture.dir.join("agent.pid");
+    let mut child = spawn_session(
+        &fixture,
+        &repo,
+        &format!("echo $$ > '{}'; exec sleep 30", agent_pid.display()),
+    );
+    signal(child.id(), "KILL");
+    let _ = child.wait();
+    // The agent outlives a SIGKILLed ohjaa; stop it, as a person would.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !agent_pid.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let pid = fs::read_to_string(&agent_pid).unwrap();
+    signal(pid.trim().parse().unwrap(), "KILL");
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("session").current_dir(&repo));
+    let orphan = stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("oh-"))
+        .and_then(|rest| rest.split(' ').next())
+        .map(|rest| format!("oh-{rest}"))
+        .expect(&stdout);
+
+    // The next launch closes it, says so, queues it and briefs with it.
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent", "next", "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!("ohjaa: session {orphan} (sh, started "))
+            && stderr.contains("was left open by an ohjaa that is gone; closed as orphaned"),
+        "{stderr}"
+    );
+    let briefing = fixture.argv().join("\n");
+    assert!(
+        briefing.contains(&format!("ORPHANED: session {orphan} (sh, long)")),
+        "{briefing}"
+    );
+    let (stdout, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["session", &orphan])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0));
+    assert!(
+        stdout.contains("ended: orphaned (observed at next launch)")
+            && stdout.contains("phases        not observed (its ohjaa was killed before leaving)"),
+        "{stdout}"
+    );
+    // Queued for intake, like any ended session.
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ncat > {}\necho '[]'\n",
+            fixture.dir.join("prompt.txt").display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--source", "transcripts", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("2 ended session(s) queued for drafting"),
+        "the orphan and the session that closed it: {stderr}"
+    );
+    fixture.cleanup();
+}

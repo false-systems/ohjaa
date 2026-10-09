@@ -1572,6 +1572,25 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // perimeter (who and what is around). Keep it separate from a task so an
     // interactive Codex launch can wait for the person's first message.
     let dirs = Dirs::resolve(in_repo.then_some(root.as_path()))?;
+    // Sessions an ohjaa killed with SIGKILL left open are closed first, so they
+    // are queued, and the one here is the last session here.
+    let orphans = close_orphans(&dirs, !dry_run);
+    let here_key = repo_key(&root);
+    for orphan in &orphans {
+        eprintln!(
+            "ohjaa: session {} ({}, started {}, in {}) was left open by an ohjaa that is \
+             gone; {} as orphaned and queued for `ohjaa intake`",
+            orphan.id,
+            orphan.agent,
+            sessions::clock(orphan.started_ms),
+            orphan.repo,
+            if dry_run { "would be closed" } else { "closed" }
+        );
+    }
+    let orphaned_here: Vec<sessions::Session> = orphans
+        .into_iter()
+        .filter(|s| s.repo == here_key || s.scoped.iter().any(|scoped| scoped.repo == here_key))
+        .collect();
     let started_ms = intake::now_seconds() * 1000;
     let session_id = sessions::new_id(started_ms);
     let mut delivered = Vec::new();
@@ -1590,7 +1609,9 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         let view = selected_perimeter(&root, in_repo, &scoped_repos, scans, outside.clone());
         let perimeter = scoped_perimeter_text(&view, &root);
         let how = lifecycle_briefing(&root, in_repo, &scoped_repos);
+        let orphaned = sessions::render_orphaned(&orphaned_here);
         let parts: Vec<&str> = [
+            orphaned.as_str(),
             warnings.as_str(),
             knowledge.as_str(),
             last.as_str(),
@@ -1737,6 +1758,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 interrupted: false,
                 scoped: Vec::new(),
                 landed: Vec::new(),
+                orphaned: false,
             };
             if let Some(store) = session_store(&dirs) {
                 let _ = store.update(&session_id, |s| s.left = Some(left));
@@ -1842,6 +1864,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         interrupted: process::cancelled(),
         scoped,
         landed,
+        orphaned: false,
     };
     // The store is opened only now, after every slow call, and held only for
     // this one write.
@@ -1922,6 +1945,51 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     }
     lifecycle::restore_signals();
     Ok(lifecycle::exit_code(exit))
+}
+
+/// Sessions left open by an ohjaa that is gone: killed with SIGKILL, so its
+/// leaving never ran. Each is closed now as orphaned (observed at this
+/// launch), which queues it for `ohjaa intake` and makes it the last session
+/// where it ran; with `write` false (a dry run) it is only said. A session
+/// whose ohjaa may still run, or cannot be told, is left alone.
+fn close_orphans(dirs: &Dirs, write: bool) -> Vec<sessions::Session> {
+    let Some(store) = session_store(dirs) else {
+        return Vec::new();
+    };
+    let Ok((all, _)) = store.all() else {
+        return Vec::new();
+    };
+    let now_ms = intake::now_seconds() * 1000;
+    let mut closed = Vec::new();
+    for session in all.into_iter().filter(|s| s.left.is_none()) {
+        let Some(pid) = sessions::pid_of(&session.id) else {
+            continue;
+        };
+        if pid == std::process::id() || process::ohjaa_alive(pid, session.started_ms) != Some(false)
+        {
+            continue;
+        }
+        let left = sessions::Left::orphaned(now_ms);
+        if !write {
+            let mut session = session;
+            session.left = Some(left);
+            closed.push(session);
+            continue;
+        }
+        let updated = store.update(&session.id, |s| {
+            if s.left.is_none() {
+                s.left = Some(left);
+            }
+        });
+        match updated {
+            Ok(Some(updated)) if updated.left.as_ref().is_some_and(|l| l.orphaned) => {
+                closed.push(updated)
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("ohjaa: {error}"),
+        }
+    }
+    closed
 }
 
 /// The checkouts other sessions in the log were launched in while this one
