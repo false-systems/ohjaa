@@ -499,8 +499,11 @@ pub fn observed_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candida
         let Some(left) = &session.left else {
             continue;
         };
+        // Only the session's own refused work is a lesson: a broken tip it is
+        // not shown to have pushed, or one never checked, is said, not taught.
         let mut seen: Vec<String> = crate::sessions::flags(session)
             .into_iter()
+            .filter(|flag| flag.own)
             .map(|flag| format!("{} ({})", flag.headline, flag.why))
             .collect();
         if left.orphaned {

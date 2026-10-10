@@ -909,10 +909,23 @@ pub struct Flag {
     /// For a commit that reached a branch: the branch and the commit, so a
     /// later briefing can tell whether the branch still sits there.
     pub tip: Option<(String, String)>,
+    /// The session's own work that sykli refused: only these are lessons for
+    /// intake. A broken tip of the default branch it is not shown to have put
+    /// there, or one never checked, is said but is no lesson.
+    pub own: bool,
 }
 
-/// The flags in a record: every push tip on the default branch, and the head
-/// of an open or merged pull request, that sykli refused. Derived from what ohjaa observed, never from the agent's words.
+/// The flags in a record, derived from what ohjaa observed, never from the
+/// agent's words:
+/// - the tip of the remote default branch as the session left it, when sykli
+///   refused it or it has a contract and no run of it at all: a broken main
+///   is the repository's state, whoever pushed it (said as "observed, not
+///   attributed" when it is not shown to be the session's);
+/// - every commit of the session's own that sykli refused on the default
+///   branch, and the head of its open or merged pull request.
+///
+/// What sykli could not say (no --commit, no contract, a checkout that moved
+/// on) is recorded, never shouted.
 pub fn flags(session: &Session) -> Vec<Flag> {
     let Some(left) = &session.left else {
         return Vec::new();
@@ -928,20 +941,31 @@ pub fn flags(session: &Session) -> Vec<Flag> {
             .iter()
             .map(|s| (s.repo.as_str(), &s.landed[..], &s.finished)),
     ) {
-        // Only sykli refusing the commit's own run raises a flag: what could
-        // not be checked (no --commit, no contract, no receipt, a checkout
-        // that moved on) is recorded, never shouted.
-        for landed in landed.iter().filter(|landed| !landed.unattributed) {
-            let Some(check @ Check::Failed { .. }) = &landed.check else {
+        for landed in landed {
+            let Some(check) = &landed.check else {
                 continue;
             };
+            let refused = matches!(check, Check::Failed { .. });
+            let mine = !landed.unattributed;
+            // What others build on: the remote default branch where it is now.
+            let broken_tip = landed.at_tip
+                && is_remote(&landed.onto)
+                && (refused || matches!(check, Check::Unchecked));
+            if !broken_tip && !(mine && refused) {
+                continue;
+            }
             let (commit, repo_name) = (short(&landed.commit), repo_name(repo));
             out.push(Flag {
                 headline: if landed.at_tip {
                     format!(
-                        "{} at {commit} in {repo_name} has no passing evidence — check before \
+                        "{} at {commit} in {repo_name} has no passing evidence{} — check before \
                          building on it",
-                        landed.onto
+                        landed.onto,
+                        if mine {
+                            ""
+                        } else {
+                            " (observed, not attributed)"
+                        }
                     )
                 } else {
                     format!(
@@ -953,6 +977,7 @@ pub fn flags(session: &Session) -> Vec<Flag> {
                 why: describe_check(check),
                 repo: repo.to_owned(),
                 tip: Some((landed.onto.clone(), landed.commit.clone())),
+                own: mine && refused,
             });
         }
         if let Finished::PullRequest {
@@ -974,11 +999,17 @@ pub fn flags(session: &Session) -> Vec<Flag> {
                     why: describe_check(check),
                     repo: repo.to_owned(),
                     tip: None,
+                    own: true,
                 });
             }
         }
     }
     out
+}
+
+/// `origin/main`, not a local `main`.
+fn is_remote(onto: &str) -> bool {
+    onto.contains('/')
 }
 
 /// Whether an ended session was here: launched here, or named here with
@@ -989,6 +1020,16 @@ pub fn touches(session: &Session, here: &str) -> bool {
             || session.scoped.iter().any(|s| s.repo == here)
             || left.scoped.iter().any(|s| s.repo == here && !s.found)
     })
+}
+
+/// Whether an ended session saw `here`: it was here ([`touches`]), or found
+/// it at leaving. What it saw of a branch here can still hold.
+pub fn observed_in(session: &Session, here: &str) -> bool {
+    touches(session, here)
+        || session
+            .left
+            .as_ref()
+            .is_some_and(|left| left.scoped.iter().any(|s| s.repo == here))
 }
 
 /// Sessions closed as orphaned at this launch, for the very top of its
@@ -1012,14 +1053,17 @@ pub fn render_orphaned(orphans: &[Session]) -> String {
 
 /// The flags of the last session here, and of earlier ones that still hold,
 /// for the very top of the next briefing: before the knowledge, and before a
-/// handover can say "ship it". Every flag of `last` is said. An earlier
-/// session's flag about a branch is said while `still_at(repo, branch,
-/// commit)` — the branch still sits at the commit it flagged — so a quiet
-/// session in between cannot hide a broken main. `earlier` is newest first.
-/// Empty when nothing is flagged.
+/// handover can say "ship it". Every flag of `last` about its own work is
+/// said ("<branch> at <sha>" only while the branch still sits there). Any
+/// other flag about a branch — an earlier session's, a broken tip it only
+/// observed, or one a session found working in `here` saw — is said while
+/// `still_at(repo, branch, commit)`: the branch still sits at the commit it
+/// flagged, so a quiet session in between cannot hide a broken main. Each tip
+/// is said once. `earlier` is newest first. Empty when nothing is flagged.
 pub fn render_warnings(
-    last: &Session,
+    last: Option<&Session>,
     earlier: &[Session],
+    here: &str,
     still_at: impl Fn(&str, &str, &str) -> bool,
 ) -> String {
     let mut out = String::new();
@@ -1027,7 +1071,12 @@ pub fn render_warnings(
     let mut block = |session: &Session, whose: &str, still: &str, flags: Vec<Flag>| {
         let flags: Vec<Flag> = flags
             .into_iter()
-            .filter(|flag| said.insert(flag.headline.clone()))
+            .filter(|flag| {
+                said.insert(flag.tip.as_ref().map_or_else(
+                    || flag.headline.clone(),
+                    |(branch, commit)| format!("{}\u{1f}{branch}\u{1f}{commit}", flag.repo),
+                ))
+            })
             .collect();
         if flags.is_empty() {
             return;
@@ -1044,35 +1093,45 @@ pub fn render_warnings(
             let _ = writeln!(out, "- {} ({})", flag.headline, flag.why);
         }
     };
-    // Every flag of the last session is said, but "<branch> at <sha>" only
-    // while the branch still sits there.
-    let last_flags = flags(last)
-        .into_iter()
-        .map(|mut flag| {
-            if let Some((branch, commit)) = &flag.tip {
-                if !still_at(&flag.repo, branch, commit) {
+    let standing = |flag: &Flag| {
+        flag.tip
+            .as_ref()
+            .is_some_and(|(branch, commit)| still_at(&flag.repo, branch, commit))
+    };
+    if let Some(last) = last {
+        let last_flags = flags(last)
+            .into_iter()
+            .filter_map(|mut flag| {
+                if flag.tip.is_none() || standing(&flag) {
+                    return Some(flag);
+                }
+                // Its own refused work once the branch has moved on: said as
+                // reached, never as where the branch is.
+                let (branch, commit) = flag.tip.clone()?;
+                flag.own.then(|| {
                     flag.headline = format!(
                         "{} reached {branch} in {} without passing evidence; {branch} has moved \
                          on since — check what is on it before building on it",
-                        short(commit),
+                        short(&commit),
                         repo_name(&flag.repo)
                     );
-                }
-            }
-            flag
-        })
-        .collect();
-    block(last, "the last session here", "", last_flags);
-    for session in earlier {
-        let standing = flags(session)
-            .into_iter()
-            .filter(|flag| {
-                flag.tip
-                    .as_ref()
-                    .is_some_and(|(branch, commit)| still_at(&flag.repo, branch, commit))
+                    flag
+                })
             })
             .collect();
-        block(session, "an earlier session here", ", still true", standing);
+        block(last, "the last session here", "", last_flags);
+    }
+    for session in earlier {
+        let whose = if touches(session, here) {
+            "an earlier session here"
+        } else {
+            "a session that observed this repository"
+        };
+        let standing = flags(session)
+            .into_iter()
+            .filter(|flag| flag.repo == here && standing(flag))
+            .collect();
+        block(session, whose, ", still true", standing);
     }
     out
 }
@@ -1928,10 +1987,15 @@ mod tests {
             why: "refused: outcome expected passed".to_owned(),
         };
         let headlines = |s: &Session| flags(s).into_iter().map(|f| f.headline).collect::<Vec<_>>();
-        // What could not be checked is recorded, never flagged.
+        // What could not be checked is recorded, never flagged (unchecked
+        // only where it is not the branch's tip: see below).
+        let superseded = with(
+            Finished::NoPullRequest,
+            vec![landed(Check::Unchecked, false)],
+        );
+        assert!(headlines(&superseded).is_empty());
         for quiet in [
             Check::Passed,
-            Check::Unchecked,
             Check::Unverified {
                 why: "sykli has no --commit".to_owned(),
             },
@@ -1942,7 +2006,7 @@ mod tests {
             let s = with(pr("OPEN", quiet.clone()), vec![landed(quiet.clone(), true)]);
             assert!(headlines(&s).is_empty(), "{quiet:?}");
             assert!(
-                render_warnings(&s, &[], |_, _, _| false).is_empty(),
+                render_warnings(Some(&s), &[], "/r/selko", |_, _, _| false).is_empty(),
                 "{quiet:?}"
             );
         }
@@ -1963,13 +2027,13 @@ mod tests {
             "\"at\" only of the commit the branch sits at"
         );
         let s = with(pr("MERGED", failed()), Vec::new());
-        assert!(render_warnings(&s, &[], |_, _, _| false)
+        assert!(render_warnings(Some(&s), &[], "/r/selko", |_, _, _| false)
             .starts_with("WARNING from the last session here (oh-12, claude"));
 
         // Once the branch has moved on, the briefing no longer says it is at
         // the flagged commit; the last session's flag is still said.
         let moved = with(Finished::NoPullRequest, vec![landed(failed(), true)]);
-        let said = render_warnings(&moved, &[], |_, _, _| false);
+        let said = render_warnings(Some(&moved), &[], "/r/selko", |_, _, _| false);
         assert!(
             said.contains(
                 "- c0ffee1 reached origin/main in selko without passing evidence; origin/main \
@@ -1978,7 +2042,7 @@ mod tests {
             "{said}"
         );
         assert!(!said.contains("origin/main at c0ffee1"), "{said}");
-        let still = render_warnings(&moved, &[], |_, _, _| true);
+        let still = render_warnings(Some(&moved), &[], "/r/selko", |_, _, _| true);
         assert!(
             still.contains("- origin/main at c0ffee1 in selko has no passing evidence"),
             "{still}"
@@ -1997,6 +2061,99 @@ mod tests {
             ),
             "{record}"
         );
+    }
+
+    #[test]
+    fn a_broken_tip_of_main_is_flagged_whoever_put_it_there() {
+        let landed = |check: Check, onto: &str, at_tip: bool, unattributed: bool| Landed {
+            commit: "c0ffee1234".to_owned(),
+            subject: "s".to_owned(),
+            onto: onto.to_owned(),
+            check: Some(check),
+            evidence: None,
+            at_tip,
+            unattributed,
+        };
+        let with = |landed: Landed| {
+            let mut s = ended(session("oh-12", "/r/selko", 1_000), 2_000);
+            s.left.as_mut().unwrap().landed = vec![landed];
+            s
+        };
+        let failed = || Check::Failed {
+            why: "refused: outcome expected passed".to_owned(),
+        };
+        let said = |s: &Session| {
+            flags(s)
+                .into_iter()
+                .map(|f| (f.headline, f.own))
+                .collect::<Vec<_>>()
+        };
+        let state = "origin/main at c0ffee1 in selko has no passing evidence (observed, not \
+                     attributed) — check before building on it";
+        // Refused, or never run where there is a contract: the tip of main is
+        // broken whoever pushed it; only the session's own refusal is a lesson.
+        assert_eq!(
+            said(&with(landed(failed(), "origin/main", true, true))),
+            [(state.to_owned(), false)]
+        );
+        assert_eq!(
+            said(&with(landed(Check::Unchecked, "origin/main", true, true))),
+            [(state.to_owned(), false)]
+        );
+        assert_eq!(
+            said(&with(landed(Check::Unchecked, "origin/main", true, false))),
+            [(
+                "origin/main at c0ffee1 in selko has no passing evidence — check before \
+                 building on it"
+                    .to_owned(),
+                false
+            )]
+        );
+        assert!(said(&with(landed(failed(), "origin/main", true, false)))[0].1);
+        // What sykli could not say, a commit main has moved on from, and a
+        // local branch nobody else builds on raise nothing unless the session's
+        // own commit was refused.
+        for quiet in [
+            landed(
+                Check::Unverified {
+                    why: "sykli has no --commit".to_owned(),
+                },
+                "origin/main",
+                true,
+                true,
+            ),
+            landed(
+                Check::Unverified {
+                    why: "no sykli contract (sykli.json or sykli.rs) in this commit".to_owned(),
+                },
+                "origin/main",
+                true,
+                false,
+            ),
+            landed(
+                Check::Stale {
+                    why: "refused: tree expected a but got b".to_owned(),
+                },
+                "origin/main",
+                true,
+                true,
+            ),
+            landed(failed(), "origin/main", false, true),
+            landed(failed(), "main", true, true),
+            landed(Check::Unchecked, "main", true, false),
+        ] {
+            assert!(said(&with(quiet.clone())).is_empty(), "{quiet:?}");
+        }
+        // Two records of one broken tip say it once.
+        let mut theirs = with(landed(failed(), "origin/main", true, false));
+        theirs.id = "oh-13".to_owned();
+        let warnings = render_warnings(
+            Some(&with(landed(failed(), "origin/main", true, true))),
+            &[theirs],
+            "/r/selko",
+            |_, _, _| true,
+        );
+        assert_eq!(warnings.matches("c0ffee1").count(), 1, "{warnings}");
     }
 
     #[test]

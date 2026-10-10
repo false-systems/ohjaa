@@ -679,34 +679,39 @@ fn repo_key(repo: &Path) -> String {
 /// that still hold.
 const STANDING_LOOKBACK: usize = 50;
 
-/// The last session here, when the log knows one: the warnings for the very
-/// top of a briefing (its flags, and earlier sessions' flags about a branch
-/// that still sits at the flagged commit), and "Last session here".
+/// What the log knows of this repository: the warnings for the very top of a
+/// briefing (the last session's flags, and any earlier session's flag about a
+/// branch that still sits at the flagged commit, including one a session only
+/// found here saw), and "Last session here". `None` when it knows neither.
 fn last_session_here(dirs: &Dirs, repo: &Path) -> Option<(String, String)> {
     let store = session_store(dirs)?;
     let here = repo_key(repo);
-    match store.latest_for(&here) {
-        Ok(Some(session)) => {
-            let mut earlier: Vec<sessions::Session> = store
-                .all()
-                .map(|(all, _)| all)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|s| s.id != session.id && sessions::touches(s, &here))
-                .collect();
-            earlier.sort_by_key(|s| std::cmp::Reverse(s.ended_rank()));
-            earlier.truncate(STANDING_LOOKBACK);
-            let warnings = sessions::render_warnings(&session, &earlier, |repo, branch, commit| {
-                lifecycle::still_at(Path::new(repo), branch, commit)
-            });
-            Some((warnings, sessions::render_last(&session, &here)))
-        }
-        Ok(None) => None,
+    let latest = match store.latest_for(&here) {
+        Ok(latest) => latest,
         Err(error) => {
             eprintln!("ohjaa: {error}");
-            None
+            return None;
         }
-    }
+    };
+    let latest_id = latest.as_ref().map(|s| s.id.clone());
+    let mut earlier: Vec<sessions::Session> = store
+        .all()
+        .map(|(all, _)| all)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| Some(&s.id) != latest_id.as_ref() && sessions::observed_in(s, &here))
+        .collect();
+    earlier.sort_by_key(|s| std::cmp::Reverse(s.ended_rank()));
+    earlier.truncate(STANDING_LOOKBACK);
+    let warnings =
+        sessions::render_warnings(latest.as_ref(), &earlier, &here, |repo, branch, commit| {
+            lifecycle::still_at(Path::new(repo), branch, commit)
+        });
+    let last = latest
+        .as_ref()
+        .map(|session| sessions::render_last(session, &here))
+        .unwrap_or_default();
+    (!warnings.is_empty() || !last.is_empty()).then_some((warnings, last))
 }
 
 /// The session this command runs inside, named by `ohjaa run`.
@@ -2206,9 +2211,13 @@ fn observe_repo(
             subject: arrived.subject.clone(),
             onto: arrived.onto.clone(),
             // sykli is asked about the tip of each of this session's pushes, as a
-            // pre-push Boundary would be; the commits before it, and what is not
-            // shown to be this session's, are their receipts' word.
-            check: (arrived.tip && arrived.attributed).then(|| {
+            // pre-push Boundary would be, and about where the remote default
+            // branch is now, whoever pushed it: a broken main is the
+            // repository's state. The commits before a tip are their receipts'
+            // word.
+            check: ((arrived.tip && arrived.attributed)
+                || (arrived.at_tip && arrived.onto.contains('/')))
+            .then(|| {
                 unless_interrupted(|| {
                     sykli.check(
                         repo,

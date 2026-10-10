@@ -3294,6 +3294,148 @@ fn the_documented_flow_pushed_to_main_is_verified_at_its_tip_and_raises_nothing(
         !record.contains("FLAGGED") && !record.contains("ohjaa: flagged"),
         "{record}"
     );
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(!stdout.contains("WARNING"), "{stdout}");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_push_to_main_with_no_sykli_run_where_there_is_a_contract_warns() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("unchecked-push");
+    let repo = clone_with_origin(&fixture, "work");
+    let (record, wt) = worktree_push_session(
+        &fixture,
+        &repo,
+        "unchecked",
+        "echo '{}' > sykli.json && git add sykli.json && git commit -q -m 'no run'
+        git push -q origin HEAD:main",
+        "new",
+    );
+    let warning = format!(
+        "origin/main at {} in work has no passing evidence — check before building on it",
+        short_of(&wt, "HEAD")
+    );
+    assert!(
+        record.contains("─ FLAGGED") && record.contains(&warning),
+        "{record}"
+    );
+    assert!(
+        record.contains("unchecked: no sykli receipt for its tree"),
+        "{record}"
+    );
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(
+        stdout.starts_with("WARNING from the last session here") && stdout.contains(&warning),
+        "{stdout}"
+    );
+    // A commit with no contract has nothing to run: recorded, never flagged,
+    // and main has moved on from the unchecked commit.
+    let (record, _) = worktree_push_session(
+        &fixture,
+        &repo,
+        "no-contract",
+        "git pull -q origin main && git rm -q sykli.json && git commit -q -m 'drop the contract'
+        git push -q origin HEAD:main",
+        "new",
+    );
+    assert!(
+        landed_lines(&record)
+            .concat()
+            .contains("unverified: no sykli contract"),
+        "{record}"
+    );
+    assert!(!record.contains("FLAGGED"), "{record}");
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(!stdout.contains("WARNING"), "{stdout}");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_broken_main_pushed_from_a_shared_clone_warns_whoever_pushed_it() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("shared-failing");
+    let repo = clone_with_origin(&fixture, "work");
+    let mark = |name: &str| fixture.dir.join(name);
+    // Y sits idle in the clone while X, in a worktree of its own, pushes a
+    // failing commit to main past every hook: neither is shown to have done it.
+    let idle = format!(
+        "touch '{}'; while [ ! -e '{}' ]; do sleep 0.1; done",
+        mark("y-started").display(),
+        mark("x-done").display()
+    );
+    let broken = format!(
+        "{RECEIPT_FN}
+        set -e
+        while [ ! -e '{y}' ]; do sleep 0.1; done
+        sleep 1
+        git worktree add -q -b x '{wt}' origin/main
+        cd '{wt}'
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q --no-verify -m broken
+        receipt failed
+        git push -q --no-verify origin HEAD:main
+        touch '{done}'",
+        y = mark("y-started").display(),
+        wt = fixture.dir.join("_worktrees").join("x").display(),
+        done = mark("x-done").display()
+    );
+    let launch = |intent: &str, script: &str| {
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                intent,
+                "--no-briefing",
+                "--",
+                "-c",
+                script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .current_dir(&repo)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let y = launch("y", &idle);
+    let x = launch("x", &broken);
+    let records: Vec<String> = [x, y]
+        .into_iter()
+        .map(|child| {
+            String::from_utf8_lossy(&child.wait_with_output().unwrap().stderr).into_owned()
+        })
+        .collect();
+    let warning = format!(
+        "origin/main at {} in work has no passing evidence (observed, not attributed) — check \
+         before building on it",
+        short_of(&repo, "origin/main")
+    );
+    for record in &records {
+        assert!(
+            record.contains("(not attributed)"),
+            "neither session is shown to have pushed it: {record}"
+        );
+        assert!(
+            record.contains("─ FLAGGED") && record.contains(&warning),
+            "a broken main is said whoever pushed it: {record}"
+        );
+        assert!(
+            record.contains("FAILED sykli verify: refused: outcome"),
+            "{record}"
+        );
+    }
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(
+        stdout.starts_with("WARNING from the last session here") && stdout.contains(&warning),
+        "{stdout}"
+    );
     fixture.cleanup();
 }
 
@@ -3344,22 +3486,6 @@ fn what_sykli_could_not_check_is_recorded_and_never_flagged() {
         landed_lines(&record)
             .concat()
             .contains("unverified: sykli has no --commit"),
-        "{record}"
-    );
-    quiet(&record);
-    // Pushed without a sykli run.
-    let (record, _) = worktree_push_session(
-        &fixture,
-        &repo,
-        "unchecked",
-        "git pull -q origin main && echo z > z.txt && git add z.txt && git commit -q -m z
-        git push -q origin HEAD:main",
-        "1",
-    );
-    assert!(
-        landed_lines(&record)
-            .concat()
-            .contains("unchecked: no sykli receipt for its tree"),
         "{record}"
     );
     quiet(&record);
@@ -3870,16 +3996,20 @@ fn a_hand_push_during_a_root_session_is_never_credited_to_it() {
             && record.contains("observed during the session, not attributed"),
         "{record}"
     );
-    assert!(
-        !record.contains("FLAGGED"),
-        "not this session's to answer for: {record}"
+    // The broken main is the repository's state, whoever pushed it: said,
+    // never as this session's.
+    let warning = format!(
+        "origin/main at {pushed} in plain has no passing evidence (observed, not attributed) — \
+         check before building on it"
     );
+    assert!(record.contains(&warning), "{record}");
     let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&plain));
     assert!(
-        !stdout.contains("WARNING") && !stdout.contains("Last session here"),
-        "the root session is not plain's last session, and raises nothing there: {stdout}"
+        stdout.starts_with("WARNING from a session that observed this repository")
+            && stdout.contains(&warning)
+            && !stdout.contains("Last session here"),
+        "the root session is not plain's last session, but plain's main is broken: {stdout}"
     );
-    assert!(record.contains(&pushed), "{record}");
     fixture.cleanup();
 }
 

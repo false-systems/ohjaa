@@ -168,13 +168,15 @@ A receipt's `outcome` is its own claim, and the record says it as one
 (`receipt: passed`); a receipt is filed under the tree that ran (a run sykli's
 pre-commit hook makes before the commit is that tree's run), and a passing run
 outranks a newer failing or dirty one. Only sykli says a commit passed. It is
-asked about the pull request's head, and about the tip of every push that
-reached the default branch during the session (pushed from here to `origin/<default>`,
-or made here and now on the local one; a fetch is not a landing), which is
-what a pre-push Boundary gates. The commits before a tip are shown as their
-receipts' word. Leaving runs `sykli verify <receipt> --contract sykli.json
---commit <sha>` in a checkout at that commit with nothing beside it, when there
-is one, else where the receipt is:
+asked about the pull request's head; about the tip of every push of the
+session's that reached the default branch (pushed from here to
+`origin/<default>`, or made here and now on the local one; a fetch is not a
+landing), which is what a pre-push Boundary gates; and about the commit
+`origin/<default>` is left at when a push from this clone put it there,
+whoever pushed. The commits before a tip are shown as their receipts' word.
+Leaving runs `sykli verify <receipt> --contract sykli.json --commit <sha>` in a
+checkout at that commit with nothing beside it, when there is one, else where
+the receipt is:
 
 | sykli says | the record says | flag |
 |---|---|---|
@@ -186,24 +188,33 @@ is one, else where the receipt is:
 | any other end: a crash, a kill, no answer in time | `unverified: …` | no |
 | no `--commit` (`sykli verify --help` does not name it) | `unverified: sykli has no --commit` | no |
 | — the commit has no sykli contract | `unverified: no sykli contract …` | no |
-| — no receipt names the commit's tree | `unchecked` | no |
+| — no receipt names the commit's tree (the commit has a contract) | `unchecked` | **yes** where it is `origin/<default>`'s tip; otherwise no |
 
-Only a refusal **flags the record**: the record opens with it, leaving ends by
-saying it again (`ohjaa: flagged: …`), and the next briefing here, `ohjaa
-brief` included, opens with it before the knowledge and before the handover.
-"`origin/main` at `<sha>`" is said only of the commit the branch sits at, when
-the record is written and again when a briefing is made; once the branch has
-moved on, the flag says the commit reached it and that it has moved on since:
+A refusal of the session's own work **flags the record**, and so does the tip
+`origin/<default>` was left at when sykli refused it or it was never run where
+there is a contract: a broken main is the repository's state, whoever pushed it
+(another session sharing the clone, a person by hand), so it is said either way,
+as `observed, not attributed` when it is not shown to be this session's. Only
+the session's own refused work becomes an intake candidate. The record opens
+with its flags, leaving ends by saying them again (`ohjaa: flagged: …`), and
+the next briefing here, `ohjaa brief` included, opens with them before the
+knowledge and before the handover. "`origin/main` at `<sha>`" is said only of
+the commit the branch sits at, when the record is written and again when a
+briefing is made; once the branch has moved on, the session's own refused
+commit is said as having reached it, and a tip it only observed is no longer
+said:
 
 ```
 WARNING from the last session here (oh-1791…, claude, ended 2026-10-09 21:30 UTC):
 - origin/main at 3dbaafd in selko has no passing evidence — check before building on it (FAILED sykli verify: refused: outcome expected passed …)
 ```
 
-An earlier session's flag about a branch keeps opening the briefing for as long
-as that branch still sits at the commit it flagged (`WARNING from an earlier
-session here (…), still true`), so a quiet session in between cannot hide a
-broken main.
+An earlier session's flag about a branch here keeps opening the briefing for as
+long as that branch still sits at the commit it flagged (`WARNING from an
+earlier session here (…), still true`), so a quiet session in between cannot
+hide a broken main; so does one a root session saw in a repository it only
+found (`WARNING from a session that observed this repository`). Each tip is
+said once.
 
 The records live in a **session log**, redb at
 `~/.local/state/ohjaa/sessions.redb`, on this machine only. Knowledge never
