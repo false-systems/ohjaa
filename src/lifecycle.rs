@@ -1365,7 +1365,8 @@ impl Sykli {
 /// What a non-zero `sykli verify --commit` means. A sykli that reads
 /// everything from the commit (`from_the_commit`) refuses only the commit
 /// itself (exit 1, 3 or 4, the first failing check on stderr); exit 2 is that
-/// it could not verify (a bad revision, arguments, not a receipt). One that
+/// it could not verify (a bad revision, arguments, not a receipt), and any
+/// other end (a crash, a kill) says nothing about the commit either. One that
 /// still compares the checkout on disk refuses the commit on its own run
 /// (`commit`, `clean`, `submodules`, `outcome`, `records`), but on the tree,
 /// inputs or contract on disk only where the checkout is the commit
@@ -1377,7 +1378,14 @@ fn verdict(from_the_commit: bool, is_the_commit: bool, exit: Option<i32>, why: S
         };
     }
     if from_the_commit {
-        return Check::Failed { why };
+        return match exit {
+            Some(1 | 3 | 4) => Check::Failed { why },
+            // A crash, a kill or an exit sykli does not document says nothing
+            // about the commit.
+            _ => Check::Unverified {
+                why: format!("sykli verify could not say: {why}"),
+            },
+        };
     }
     // sykli names the first check that failed: `refused: <check> expected …`.
     let refused = why
@@ -2048,6 +2056,16 @@ mod tests {
             verdict(true, true, Some(2), "fatal: bad revision".to_owned()),
             Check::Unverified { .. }
         ));
+        // A sykli that crashed or was killed said nothing about the commit.
+        for exit in [None, Some(101), Some(127)] {
+            assert!(
+                matches!(
+                    verdict(true, true, exit, "thread 'main' panicked".to_owned()),
+                    Check::Unverified { .. }
+                ),
+                "{exit:?}"
+            );
+        }
         // One that still checks the checkout on disk.
         assert!(matches!(
             verdict(false, false, Some(3), why("clean")),
