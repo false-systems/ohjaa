@@ -1240,11 +1240,13 @@ pub fn still_at(repo: &Path, branch: &str, commit: &str) -> bool {
 /// a receipt to a commit (`sykli verify --commit`).
 #[derive(Debug, Default)]
 pub struct Sykli {
-    binds_commits: std::cell::OnceCell<Result<(), String>>,
+    /// `Ok(true)`: `--commit` reads everything from the commit (sykli#67 as
+    /// merged); `Ok(false)`: it also checks the checkout on disk.
+    binds_commits: std::cell::OnceCell<Result<bool, String>>,
 }
 
 impl Sykli {
-    fn binds_commits(&self) -> Result<(), String> {
+    fn binds_commits(&self) -> Result<bool, String> {
         self.binds_commits
             .get_or_init(|| {
                 let output = process::run(
@@ -1259,7 +1261,7 @@ impl Sykli {
                     String::from_utf8_lossy(&output.stderr)
                 );
                 if help.contains("--commit") {
-                    Ok(())
+                    Ok(help.contains("nothing is read from the"))
                 } else {
                     Err("sykli has no --commit".to_owned())
                 }
@@ -1299,9 +1301,10 @@ impl Sykli {
                 }
             };
         };
-        if let Err(why) = self.binds_commits() {
-            return Check::Unverified { why };
-        }
+        let from_the_commit = match self.binds_commits() {
+            Ok(from_the_commit) => from_the_commit,
+            Err(why) => return Check::Unverified { why },
+        };
         let at_commit = checkouts
             .iter()
             .filter(|w| w.head.as_deref() == Some(commit))
@@ -1340,19 +1343,43 @@ impl Sykli {
             Ok(output) if output.status.success() => return Check::Passed,
             Ok(output) => output,
         };
-        let why = output.failure_detail();
-        // sykli names the first check that failed: `refused: <check> expected …`.
-        let refused = why
-            .strip_prefix("refused: ")
-            .and_then(|rest| rest.split_whitespace().next());
-        match refused {
-            Some("commit" | "clean" | "outcome" | "records" | "schema") => Check::Failed { why },
-            Some("tree" | "inputs" | "contract") if is_the_commit => Check::Failed { why },
-            Some("tree" | "inputs" | "contract") => Check::Stale { why },
-            _ => Check::Unverified {
-                why: format!("sykli verify could not say: {why}"),
-            },
-        }
+        verdict(
+            from_the_commit,
+            is_the_commit,
+            output.status.code(),
+            output.failure_detail(),
+        )
+    }
+}
+
+/// What a non-zero `sykli verify --commit` means. A sykli that reads
+/// everything from the commit (`from_the_commit`) refuses only the commit
+/// itself (exit 1, 3 or 4, the first failing check on stderr); exit 2 is that
+/// it could not verify (a bad revision, arguments, not a receipt). One that
+/// still compares the checkout on disk refuses the commit on its own run
+/// (`commit`, `clean`, `submodules`, `outcome`, `records`), but on the tree,
+/// inputs or contract on disk only where the checkout is the commit
+/// (`is_the_commit`): elsewhere that is stale, not the commit's failure.
+fn verdict(from_the_commit: bool, is_the_commit: bool, exit: Option<i32>, why: String) -> Check {
+    if exit == Some(2) {
+        return Check::Unverified {
+            why: format!("sykli verify could not verify: {why}"),
+        };
+    }
+    if from_the_commit {
+        return Check::Failed { why };
+    }
+    // sykli names the first check that failed: `refused: <check> expected …`.
+    let refused = why
+        .strip_prefix("refused: ")
+        .and_then(|rest| rest.split_whitespace().next());
+    match refused {
+        Some("commit" | "clean" | "submodules" | "outcome" | "records") => Check::Failed { why },
+        Some("tree" | "inputs" | "contract") if is_the_commit => Check::Failed { why },
+        Some("tree" | "inputs" | "contract") => Check::Stale { why },
+        _ => Check::Unverified {
+            why: format!("sykli verify could not say: {why}"),
+        },
     }
 }
 
@@ -1960,6 +1987,47 @@ mod tests {
         assert_eq!(subjects(&work.phases.unwrap()), ["after entering"]);
         let _ = std::fs::remove_dir_all(wt);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_refusal_fails_the_commit_only_when_it_is_about_the_commit() {
+        let why = |check: &str| format!("refused: {check} expected a but got b");
+        // sykli#67 as merged reads everything from the commit.
+        for (exit, check) in [
+            (1, "outcome"),
+            (3, "commit"),
+            (3, "submodules"),
+            (4, "contract"),
+        ] {
+            assert!(
+                matches!(
+                    verdict(true, false, Some(exit), why(check)),
+                    Check::Failed { .. }
+                ),
+                "{check}"
+            );
+        }
+        assert!(matches!(
+            verdict(true, true, Some(2), "fatal: bad revision".to_owned()),
+            Check::Unverified { .. }
+        ));
+        // One that still checks the checkout on disk.
+        assert!(matches!(
+            verdict(false, false, Some(3), why("clean")),
+            Check::Failed { .. }
+        ));
+        assert!(matches!(
+            verdict(false, false, Some(3), why("tree")),
+            Check::Stale { .. }
+        ));
+        assert!(matches!(
+            verdict(false, true, Some(3), why("tree")),
+            Check::Failed { .. }
+        ));
+        assert!(matches!(
+            verdict(false, false, Some(4), why("contract")),
+            Check::Stale { .. }
+        ));
     }
 
     #[test]

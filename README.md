@@ -176,7 +176,9 @@ is one, else where the receipt is:
 |---|---|---|
 | exit 0 | `verified: passed` | no |
 | refused the commit's own run (another tree, a dirty run, a failed outcome, contradictory records) | `FAILED sykli verify: …` | **yes** |
-| refused the tree, inputs or contract on disk, in a checkout that is not the commit | `stale: sykli checked the checkout, not the commit` | no |
+| refused, by a sykli that reads everything from the commit (sykli#67 as merged; its help says "nothing is read from the checkout") | `FAILED sykli verify: …` | **yes** |
+| refused the tree, inputs or contract on disk, by an older sykli in a checkout that is not the commit | `stale: sykli checked the checkout, not the commit` | no |
+| exit 2: it could not verify (a bad revision, arguments, not a receipt) | `unverified: sykli verify could not verify: …` | no |
 | no `--commit` (`sykli verify --help` does not name it) | `unverified: sykli has no --commit` | no |
 | — the commit has no sykli contract | `unverified: no sykli contract …` | no |
 | — no receipt names the commit's tree | `unchecked` | no |

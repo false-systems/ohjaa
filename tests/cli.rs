@@ -97,6 +97,10 @@ if [ "$1" = verify ] && [ "$2" = --help ]; then
   if [ -n "${OHJAA_STUB_SYKLI_COMMIT:-}" ]; then
     echo "      --commit <REV>  Also require a clean run of this commit"
   fi
+  if [ "${OHJAA_STUB_SYKLI_COMMIT:-}" = new ]; then
+    echo "With --commit the subject is the commit, and nothing is read from the"
+    echo "checkout; REV is resolved in the repository around the current directory."
+  fi
   exit 0
 fi
 [ "$1" = verify ] || exit 2
