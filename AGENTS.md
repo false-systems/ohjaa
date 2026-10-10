@@ -30,14 +30,15 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   scope directories plus proposals waiting for a person, is the truth and lives
   in git. The **session log**, in redb at `$XDG_STATE_HOME/ohjaa/sessions.redb`,
   is machine-local history of what each session was briefed, read back,
-  committed, finished and handed over — deleting it loses no knowledge, it never
+  committed, finished and handed over, plus explicitly attributed usage receipts — deleting it loses no knowledge, it never
   blocks a launch, and a broken log is reported, never replaced. Everything
   else — fleet, perimeter, coverage — is derived now and stored never. No
   knowledge index, no cache, no daemon.
 - **`ohjaa run` stays the parent of the session until it ends**, so leaving
   always writes its record, whatever the exit. Session states are observed, not
-  declared: the agent writes only its read-back (`ohjaa oriented`) and its
-  handover (`ohjaa handover`).
+  declared: the agent's lifecycle testimony is its read-back (`ohjaa oriented`)
+  and handover (`ohjaa handover`). Imported usage is separately labelled source
+  testimony; it never becomes observed work or authoritative billing.
 - **Agents propose; only a person makes Knowledge current**, retires it or
   rejects it. Shared Knowledge (ours, repo) is reviewed in a pull request
   before any agent reads it. A proposal never lands in a shared repository by

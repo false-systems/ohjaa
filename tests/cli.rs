@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const STUB: &str = r#"#!/bin/sh
+printf '%s|%s\n' "$PWD" "$*" >> "$OHJAA_STUB_CALLS"
 if [ "$1" = run ]; then printf '%s\n' "$@" > "$OHJAA_STUB_ARGV"; fi
 case "$PWD" in
   *broken*) echo "boom: not a Git repository" >&2; exit 1;;
@@ -206,6 +207,7 @@ impl Fixture {
             .env("OHJAA_OURS", self.dir.join("ours"))
             .env("OHJAA_TODAY", "2026-09-24")
             .env("OHJAA_STUB_ARGV", self.dir.join("argv.txt"))
+            .env("OHJAA_STUB_CALLS", self.dir.join("calls.txt"))
             .env("OHJAA_STUB_SESSIONS", self.dir.join("sessions.json"))
             .env("OHJAA_STUB_OUTSIDE_SESSIONS", self.dir.join("outside.json"))
             .env("OHJAA_STUB_CONTEXT", self.dir.join("context.json"));
@@ -417,6 +419,7 @@ fn run_launches_toimija_with_the_full_forwarded_argv() {
     }
     let fixture = Fixture::new("exec");
     let repo = fixture.make_git_repo("only");
+    let usage_path = fixture.dir.join("receipt with \"quotes\".json");
 
     let (_, stderr, code) = output_of(
         fixture
@@ -431,6 +434,8 @@ fn run_launches_toimija_with_the_full_forwarded_argv() {
                 "--scope",
                 "src/parser/",
                 "--no-briefing",
+                "--usage-file",
+                usage_path.to_str().unwrap(),
                 "--",
                 "--model",
                 "o3",
@@ -439,6 +444,23 @@ fn run_launches_toimija_with_the_full_forwarded_argv() {
             .current_dir(&repo),
     );
     let argv = fixture.argv();
+    let (export, _, export_code) =
+        output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(export_code, Some(0));
+    let export: serde_json::Value = serde_json::from_str(&export).unwrap();
+    let session_id = export["sessions"][0]["id"].as_str().unwrap();
+    let session_config = format!(
+        "shell_environment_policy.set.OHJAA_SESSION={}",
+        serde_json::to_string(session_id).unwrap()
+    );
+    let state_config = format!(
+        "shell_environment_policy.set.XDG_STATE_HOME={}",
+        serde_json::to_string(&fixture.dir.join("state").display().to_string()).unwrap()
+    );
+    let usage_config = format!(
+        "shell_environment_policy.set.OHJAA_USAGE_FILE={}",
+        serde_json::to_string(&usage_path.display().to_string()).unwrap()
+    );
     fixture.cleanup();
 
     // The session's exit status becomes ohjaa's.
@@ -455,6 +477,12 @@ fn run_launches_toimija_with_the_full_forwarded_argv() {
             "src/parser/",
             "--",
             "codex",
+            "-c",
+            &session_config,
+            "-c",
+            &state_config,
+            "-c",
+            &usage_config,
             "--model",
             "o3",
         ],
@@ -567,28 +595,27 @@ fn run_prepends_the_system_perimeter_to_the_task() {
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
-            .args([
-                "run",
-                "codex",
-                "--intent",
-                "x",
-                "--task",
-                "fix the lexer",
-                "--dry-run",
-            ])
+            .args(["run", "codex", "--intent", "x", "--task", "fix the lexer"])
             .current_dir(&repo),
     );
+    let argv = fixture.argv();
     fixture.cleanup();
 
-    assert_eq!(code, Some(0));
-    // The task is user task + perimeter: the agent starts knowing the fleet.
-    assert!(stderr.contains("fix the lexer"), "{stderr}");
-    assert!(stderr.contains("System perimeter"), "{stderr}");
+    assert_eq!(code, Some(0), "{stderr}");
+    // The task is exactly what was assigned; the perimeter travels in the
+    // briefing, scoped to the selected repository, not the whole fleet.
+    let task = argv.iter().position(|a| a == "--task").expect("--task");
+    assert_eq!(argv[task + 1], "fix the lexer", "{argv:?}");
+    assert_eq!(argv[task + 2], "--briefing", "{argv:?}");
+    let end = argv.iter().rposition(|a| a == "--").expect("--");
+    let briefing = argv[task + 3..end].join("\n");
+    assert!(briefing.contains("System perimeter"), "{briefing}");
     assert!(
-        stderr.contains("toimija — compiles Git context for agents"),
-        "{stderr}"
+        briefing.contains("toimija — compiles Git context for agents"),
+        "{briefing}"
     );
-    assert!(stderr.contains("you are here"), "{stderr}");
+    assert!(briefing.contains("you are here"), "{briefing}");
+    assert!(!briefing.contains("fix the lexer"), "{briefing}");
 }
 
 #[test]
@@ -870,6 +897,182 @@ fn run_briefs_knowledge_before_the_perimeter() {
     let knowledge = stderr.find("Rust only.").expect("knowledge in the task");
     let perimeter = stderr.find("System perimeter").expect("perimeter");
     assert!(task < knowledge && knowledge < perimeter, "{stderr}");
+    fixture.cleanup();
+}
+
+#[test]
+fn startup_is_scoped_reuses_scans_and_delivers_repo_knowledge_from_the_root() {
+    let fixture = Fixture::new("scoped-startup");
+    let repo = fixture.make_git_repo("selected");
+    fixture.set_context(r#"{"repo":{"name":"selected","role":"selected role","not_roles":[]}}"#);
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        "personal",
+        "decision",
+        "Keep this personal decision.",
+    );
+    fixture.node(
+        &repo.join(".ohjaa/knowledge"),
+        "repo-rule",
+        "decision",
+        "Selected repository rule.",
+    );
+    let launch = || {
+        output_of(fixture.ohjaa_in(&fixture.dir).args([
+            "run",
+            "codex",
+            "--intent",
+            "fix selected",
+            "--dry-run",
+            "--scope",
+            repo.to_str().unwrap(),
+        ]))
+    };
+    let (_, before, code) = launch();
+    assert_eq!(code, Some(0), "{before}");
+    assert!(
+        before.contains("Keep this personal decision.")
+            && before.contains("Selected repository rule.")
+    );
+    let calls = fs::read_to_string(fixture.dir.join("calls.txt")).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.ends_with("|sessions --json --outside-repos"))
+            .count(),
+        1,
+        "{calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.ends_with("|sessions --json"))
+            .count(),
+        1,
+        "{calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.ends_with("|context --json"))
+            .count(),
+        1,
+        "{calls}"
+    );
+
+    // Growing the unrelated fleet must not grow the prompt or trigger its scans.
+    for i in 0..20 {
+        fixture.make_repo(&format!("broken-unrelated-{i}"));
+    }
+    fs::write(fixture.dir.join("calls.txt"), "").unwrap();
+    let (_, after, code) = launch();
+    assert_eq!(code, Some(0), "{after}");
+    assert_eq!(after.len(), before.len());
+    assert!(!after.contains("broken-unrelated"));
+    assert!(!fs::read_to_string(fixture.dir.join("calls.txt"))
+        .unwrap()
+        .contains("broken-unrelated"));
+    assert!(after.contains("Other repositories were not scanned"));
+
+    let (brief, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "brief",
+        "--scope",
+        repo.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(brief.contains("Selected repository rule.") && !brief.contains("broken-unrelated"));
+    assert_eq!(
+        brief
+            .matches("Knowledge (ohjaa, knowledge-node.v1)")
+            .count(),
+        1,
+        "the preamble is said once, not once per scoped repository: {brief}"
+    );
+    let (_, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "run",
+        "codex",
+        "--intent",
+        "fix selected",
+        "--scope",
+        repo.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    let (export, stderr, code) =
+        output_of(fixture.ohjaa_in(&fixture.dir).args(["usage", "export"]));
+    assert_eq!(code, Some(0), "{stderr}");
+    let export: serde_json::Value = serde_json::from_str(&export).unwrap();
+    let delivered = export["sessions"][0]["delivered"].as_array().unwrap();
+    let node = delivered.iter().find(|n| n["id"] == "repo-rule").unwrap();
+    assert_eq!(node["repo"], repo.canonicalize().unwrap().to_str().unwrap());
+    assert_eq!(node["scope"], "repo");
+    fixture.node(
+        &repo.join(".ohjaa/knowledge"),
+        "long-rule",
+        "decision",
+        &"Keep this rule. ".repeat(600),
+    );
+    let (brief, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "brief",
+        "--knowledge-only",
+        "--scope",
+        repo.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("combined scoped knowledge briefing"));
+    assert_eq!(
+        brief.matches("Keep this rule.").count(),
+        600,
+        "knowledge must not be truncated"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn unassigned_startup_does_not_derive_the_fleet_and_scope_failures_remain_visible() {
+    let fixture = Fixture::new("unassigned");
+    fixture.make_repo("broken-unrelated");
+    let (_, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "run",
+        "codex",
+        "--intent",
+        "unknown",
+        "--dry-run",
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("If no concrete task is assigned, acknowledge and wait"));
+    assert!(stderr.contains("--briefing"), "{stderr}");
+    assert!(
+        !stderr.contains("--task "),
+        "idle startup must not manufacture a task: {stderr}"
+    );
+    let calls = fs::read_to_string(fixture.dir.join("calls.txt")).unwrap();
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "only the outside-session preflight is needed: {calls}"
+    );
+    assert!(!stderr.contains("broken-unrelated"));
+
+    let selected = fixture.make_git_repo("selected");
+    // Role derivation failed: no context payload exists. It must be marked unknown.
+    let (brief, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "brief",
+        "--scope",
+        selected.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(4), "{brief}{stderr}");
+    assert!(brief.contains("role not derivable"));
+    fixture.set_context(r#"{"repo":{"name":"selected","role":"role"}}"#);
+    fixture.set_outside_sessions(
+        r#"{"sessions":[],"coverage":{"status":"degraded"},"warnings":["partial outside scan"]}"#,
+    );
+    let (brief, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "brief",
+        "--scope",
+        selected.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(4), "{brief}{stderr}");
+    assert!(brief.contains("incomplete") && brief.contains("partial outside scan"));
     fixture.cleanup();
 }
 
@@ -1170,6 +1373,142 @@ fn check_counts_an_unreadable_proposal_as_an_error() {
 
 fn ohjaa_bin() -> &'static str {
     env!("CARGO_BIN_EXE_ohjaa")
+}
+
+#[test]
+fn usage_import_is_attributed_idempotent_and_exportable() {
+    let fixture = Fixture::new("usage");
+    let repo = fixture.make_git_repo("work");
+    let receipt = fixture.dir.join("usage.json");
+    let data = serde_json::json!({
+        "schema":"agent-usage.v1", "agent":"sh", "session_id":"native-1",
+        "source":"synthetic fixture", "observed_at_ms":1790000000000_i64,
+        "complete":false,"limitations":["test source"],"entries":[{
+            "provider":"test", "model":"test", "input_tokens":100,"output_tokens":20,
+            "cache_read_tokens":null,"cache_write_tokens":null,
+            "estimated_usd_micros":25,"estimate_basis":"synthetic rate",
+            "credits":null,"billed":null
+        }]
+    });
+    fs::write(&receipt, serde_json::to_vec(&data).unwrap()).unwrap();
+    let script = format!(
+        "{} usage import '{}'; {} usage import '{}'",
+        ohjaa_bin(),
+        receipt.display(),
+        ohjaa_bin(),
+        receipt.display()
+    );
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+    let (out, err, code) = output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(code, Some(0), "{err}");
+    let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(export["schema"], "ohjaa-sessions.v1");
+    assert_eq!(export["sessions"][0]["usage"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        export["sessions"][0]["usage"][0]["entries"][0]["input_tokens"],
+        100
+    );
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_ne!(code, Some(0));
+    assert!(stderr.contains("already attributed"), "{stderr}");
+    let id = export["sessions"][0]["id"].as_str().unwrap();
+    let mut stale = data;
+    stale["entries"][0]["input_tokens"] = 200.into();
+    fs::write(&receipt, serde_json::to_vec(&stale).unwrap()).unwrap();
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["usage", "import"])
+            .arg(&receipt)
+            .args(["--session", id])
+            .current_dir(&repo),
+    );
+    assert_ne!(code, Some(0));
+    assert!(stderr.contains("stale or conflicting"), "{stderr}");
+    stale["observed_at_ms"] = 1790000000001_i64.into();
+    stale["entries"][0]["input_tokens"] = (-1).into();
+    fs::write(&receipt, serde_json::to_vec(&stale).unwrap()).unwrap();
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["usage", "import"])
+            .arg(&receipt)
+            .args(["--session", id])
+            .current_dir(&repo),
+    );
+    assert_ne!(code, Some(0));
+    assert!(stderr.contains("invalid usage receipt"), "{stderr}");
+    let (out, _, _) = output_of(
+        fixture
+            .ohjaa()
+            .args(["usage", "export", "--session", id])
+            .current_dir(&repo),
+    );
+    let unchanged: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        unchanged["sessions"][0]["usage"][0]["entries"][0]["input_tokens"],
+        100
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn leaving_picks_up_a_fresh_receipt_without_changing_the_agent_exit() {
+    let fixture = Fixture::new("usage-leaving");
+    let repo = fixture.make_git_repo("work");
+    let path = fixture.dir.join("receipt.json");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 1000;
+    let data = serde_json::json!({"schema":"agent-usage.v1","agent":"sh","session_id":"native-leaving","source":"fixture","observed_at_ms":now,"complete":false,"limitations":["fixture"],"entries":[]});
+    let script = format!("printf '%s' '{}' > \"$OHJAA_USAGE_FILE\"; exit 7", data);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "usage test",
+                "--no-briefing",
+                "--usage-file",
+            ])
+            .arg(&path)
+            .args(["--", "-c", &script])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(7), "{stderr}");
+    assert!(stderr.contains("native-leaving"), "{stderr}");
+    let (out, _, code) = output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(code, Some(0));
+    let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        export["sessions"][0]["usage"][0]["session_id"],
+        "native-leaving"
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "do not reuse",
+                "--no-briefing",
+                "--usage-file",
+            ])
+            .arg(&path)
+            .args(["--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("already exists"), "{stderr}");
+    fixture.cleanup();
 }
 
 /// `ohjaa run` whose stub toimija really runs `sh -c <script>` as the agent.
@@ -2200,6 +2539,254 @@ fn a_second_handover_changes_only_the_fields_it_names() {
     assert!(
         !stderr.contains("old surprise"),
         "cleared with '': {stderr}"
+    );
+    fixture.cleanup();
+}
+
+// ---- review of #38: each test failed before its fix ---------------------------
+
+#[test]
+fn a_stalled_export_reader_never_costs_a_running_session_its_record() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("export-stall");
+    let repo = fixture.make_git_repo("work");
+    // Enough history that the export outgrows a pipe buffer.
+    let long = "x".repeat(60_000);
+    for _ in 0..3 {
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "run",
+                    "sh",
+                    "--intent",
+                    &long,
+                    "--no-briefing",
+                    "--",
+                    "-c",
+                    "exit 0",
+                ])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+    }
+    // A reader that stops reading: the export blocks on its write.
+    let mut export = fixture
+        .ohjaa()
+        .args(["usage", "export"])
+        .current_dir(&repo)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let (_, stderr, code) = run_session(&fixture, &repo, "exit 0");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("recorded; queued") && !stderr.contains("could not be saved"),
+        "the session log was free while the export waited on its reader: {stderr}"
+    );
+    let mut out = String::new();
+    use std::io::Read as _;
+    export
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    assert!(export.wait().unwrap().success());
+    let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(export["sessions"].as_array().unwrap().len(), 3);
+    fixture.cleanup();
+}
+
+#[test]
+fn a_refused_usage_receipt_is_recorded_as_refused_with_its_reason() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("usage-refused");
+    let repo = fixture.make_git_repo("work");
+    let receipt = |agent: &str, observed: &str, extra: &str| {
+        format!(
+            "printf '%s' '{{\"schema\":\"agent-usage.v1\",\"agent\":\"{agent}\",\"session_id\":\"n\",\
+             \"source\":\"t\",\"observed_at_ms\":{observed},\"complete\":true,\"limitations\":[],\
+             \"entries\":[]{extra}}}' > \"$OHJAA_USAGE_FILE\""
+        )
+    };
+    // Closes the single quotes around the JSON, so the shell expands it.
+    let now = "'\"$(date +%s)000\"'";
+    let cases = [
+        (
+            "symlink",
+            "printf x > \"$OHJAA_USAGE_FILE.real\"; ln -s \"$OHJAA_USAGE_FILE.real\" \"$OHJAA_USAGE_FILE\""
+                .to_owned(),
+            "symbolic links",
+        ),
+        (
+            "fifo",
+            "mkfifo \"$OHJAA_USAGE_FILE\"".to_owned(),
+            "must be a regular file",
+        ),
+        (
+            "size",
+            "head -c 9000000 /dev/zero > \"$OHJAA_USAGE_FILE\"".to_owned(),
+            "exceeds 8 MiB",
+        ),
+        ("predates", receipt("sh", "1", ""), "predates this run"),
+        (
+            "agent",
+            receipt("codex", now, ""),
+            "receipt agent does not match session agent",
+        ),
+        (
+            "unknown-field",
+            receipt("sh", now, ",\"later\":1"),
+            "unknown field `later`",
+        ),
+    ];
+    for (case, write, reason) in cases {
+        let path = fixture.dir.join(format!("usage-{case}.json"));
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "run",
+                    "sh",
+                    "--intent",
+                    case,
+                    "--no-briefing",
+                    "--usage-file",
+                ])
+                .arg(&path)
+                .args(["--", "-c", &format!("{write}; exit 7")])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .current_dir(&repo),
+        );
+        assert_eq!(
+            code,
+            Some(7),
+            "{case}: the agent's exit is unchanged: {stderr}"
+        );
+        let usage = &stderr[stderr.find("─ usage").expect(&stderr)..];
+        assert!(
+            usage.contains("refused: ") && usage.contains(reason),
+            "{case}: the record says it was refused, and why: {usage}"
+        );
+        assert!(!usage.contains("not collected"), "{case}: {usage}");
+        let (out, _, _) = output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+        let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let refused = export["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["intent"] == case)
+            .unwrap()["usage_refused"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(refused.contains(reason), "{case}: exported: {refused}");
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn export_creates_no_log_and_one_bad_row_does_not_fail_an_export_of_another_session() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("export-quirks");
+    let repo = fixture.make_git_repo("work");
+    let log = fixture.dir.join("state/ohjaa/sessions.redb");
+    let (out, stderr, code) =
+        output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(code, Some(0), "{stderr}");
+    let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(export["schema"], "ohjaa-sessions.v1");
+    assert_eq!(export["sessions"], serde_json::json!([]));
+    assert_eq!(export["unreadable"], serde_json::json!([]));
+    assert!(!log.exists(), "an export never creates the log");
+
+    let (_, stderr, code) = run_session(&fixture, &repo, "echo \"id=$OHJAA_SESSION\"");
+    assert_eq!(code, Some(0), "{stderr}");
+    let (out, _, _) = output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    let id = serde_json::from_str::<serde_json::Value>(&out).unwrap()["sessions"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    {
+        let db = redb::Database::open(&log).unwrap();
+        let tx = db.begin_write().unwrap();
+        tx.open_table(redb::TableDefinition::<&str, &[u8]>::new("sessions"))
+            .unwrap()
+            .insert("oh-garbage", b"\"not a session\"".as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let (out, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["usage", "export", "--session", &id])
+            .current_dir(&repo),
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "an unrelated bad row does not fail this export: {out}"
+    );
+    let (out, _, code) = output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(
+        code,
+        Some(4),
+        "the whole log is incomplete, and says so: {out}"
+    );
+    let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(export["unreadable"], serde_json::json!(["oh-garbage"]));
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["usage", "export", "--session", "oh-garbage"])
+            .current_dir(&repo),
+    );
+    assert_ne!(code, Some(0));
+    assert!(
+        stderr.contains("session oh-garbage is unreadable"),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_briefing_too_big_for_one_command_line_argument_is_refused_clearly() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("briefing-cap");
+    let repo = fixture.make_git_repo("work");
+    let mine = fixture.dir.join("config/ohjaa/mine");
+    let launch = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["run", "codex", "--intent", "x", "--dry-run"])
+                .current_dir(&repo),
+        )
+    };
+    fixture.node(&mine, "big", "fact", &"long knowledge ".repeat(500));
+    let (_, stderr, code) = launch();
+    assert_eq!(code, Some(0), "{stderr}");
+    // Linux caps one argument at 128 KiB, and the briefing is one, twice.
+    fixture.node(&mine, "huge", "fact", &"long knowledge ".repeat(8_000));
+    let (_, stderr, code) = launch();
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        stderr.contains("KiB, over the 100 KiB a briefing may be")
+            && stderr.contains("refusing to launch")
+            && !stderr.contains("would run:"),
+        "{stderr}"
     );
     fixture.cleanup();
 }

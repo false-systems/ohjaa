@@ -8,11 +8,13 @@ the people an agent works for **know and have decided**. That covers the
 decisions, facts, taste and lessons that
 [`faija-ontology.v2`](https://github.com/false-systems/faija) calls
 **Knowledge**. Every agent launched through ohjaa starts with that Knowledge,
-followed by the live perimeter of the fleet.
+followed by context for its launch repository and declared scope. The full
+fleet remains available on demand.
 
 ```bash
 ohjaa run claude --intent "…"          # brief the agent, then hand off to toimija
 ohjaa brief                            # the briefing an agent gets here
+ohjaa brief --scope ../other-repo       # retrieve context after expanding scope
 ohjaa propose --scope ours --id rust-only --kind decision \
       --origin "2026-09-16: 'we dont do python'" "Code is Rust or Elixir/Erlang."
 ohjaa review                           # a person decides what becomes current
@@ -65,11 +67,16 @@ A node's scope, meaning whose it is, is the directory it lives in:
 | mine | `~/.config/ohjaa/mine/` | you |
 | machine | `~/.config/ohjaa/machine/` | you |
 
-The briefing is ordered **ours → repo → mine → machine**, then **decision →
+The launch repository's briefing is ordered **ours → repo → mine → machine**, then **decision →
 fact → taste → lesson**. A personal node can never supersede a shared one, and
 shared Knowledge never builds on personal Knowledge. Those rules come from
 faija's contract, and ohjaa carries its reference implementation in
 `vendor/faija-knowledge`.
+
+Every explicitly scoped repository also contributes its complete repo knowledge,
+labelled with its path. Global knowledge is delivered once, not repeated for each
+repo. No keyword matcher drops a decision. Session records preserve the repository
+identity of delivered repo nodes; older records without that identity still read.
 
 ## Agents propose, a person decides
 
@@ -126,7 +133,7 @@ until it ends so the last one always happens:
 
 | State | What happens | Written by |
 |---|---|---|
-| 1 entering | the briefing: knowledge, the last session here, how this session works, the perimeter | ohjaa |
+| 1 entering | knowledge, the last session here, lifecycle instructions, and scoped context | ohjaa |
 | 2 oriented | the agent reads back what it knows: `ohjaa oriented "<goal; rules; who else>"` | the agent |
 | 3 working | small phases, each a commit and, where the repo has a sykli contract, a `sykli run` on it | observed from git and `.sykli/receipts`: the commits HEAD's reflog shows made in this checkout since entering, never ones a pull or merge brought in |
 | 4 finished | the branch's pull request, and whether its head has evidence | observed through `gh` |
@@ -170,6 +177,62 @@ Signals, while a session runs (unix):
   then; the normal dispositions come back once it is saved.
 - **SIGKILL** cannot be caught: it loses the record.
 
+## Session usage
+
+Usage stays in the existing session log. It is **imported source testimony**,
+separate from ohjaa's observed work and from provider billing. No new service,
+database or sibling-repository dependency is required.
+
+```bash
+# A local collector such as Vessa creates a native-session snapshot.
+vessa receipt --input /path/to/session.jsonl > /tmp/session-usage.json
+ohjaa usage import /tmp/session-usage.json --session oh-EXISTING-ID
+ohjaa usage export > /tmp/ohjaa-sessions.json
+```
+
+Inside a run, `usage import` defaults to `OHJAA_SESSION`. To pick up a receipt
+automatically when the agent command ends, use `ohjaa run ... --usage-file
+/path/to/fresh-receipt.json`. Ohjaa passes that path as `OHJAA_USAGE_FILE`; the
+launched command or its wrapper must write an `agent-usage.v1` receipt there,
+and its `agent` must be the basename of the command ohjaa launched (a wrapper
+launched as the agent claims its own name, not `claude`). A refused receipt is
+recorded as `refused: <reason>`, never as not collected.
+Native agent transcripts are not that receipt format. Existing paths are
+refused so an old receipt cannot be accidentally reused. Missing/invalid
+receipts are reported and never change the agent's exit status. No automatic
+time-window or directory matching is performed between concurrent sessions.
+
+For Codex launches, ohjaa also passes the generated `OHJAA_SESSION`, the
+resolved `XDG_STATE_HOME`, and optional `OHJAA_USAGE_FILE` through per-session
+`shell_environment_policy.set` overrides. Codex tool commands can run in a
+persistent daemon that did not inherit the wrapper environment. Toimija passes
+its own handshake independently. Neither wrapper modifies global Codex config
+or relaxes environment filtering or sandbox permissions. Existing sessions need
+a fresh wrapped launch; no session is recovered by guessing from directory or
+time. See [Codex's configuration reference](https://developers.openai.com/codex/config-reference/).
+
+`agent-usage.v1` is a cumulative snapshot of one native session. It contains
+`agent`, `session_id`, `source`, `observed_at_ms`, `complete`, `limitations`,
+and `entries` grouped by `provider` and `model`. Each entry has nullable
+`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
+`estimated_usd_micros`, `estimate_basis`, `credits` and `billed`. Input excludes
+cache categories. An amount is `{unit, micros, source}`: credit units are
+provider-specific; billed units are currencies. `null` means unknown, never
+zero. Estimates require their rate basis; amounts require their source.
+
+Imports validate the shape and agent, not the truth of a provider claim.
+Repeating an identical snapshot changes nothing; a newer snapshot replaces
+the earlier one, rather than adding its cumulative totals. Stale/conflicting
+snapshots are refused. A native session can belong to only one wrapper
+session; after resuming it, update that original association rather than
+double-attribute its entire history to a second run. This first contract does
+not split a native session's consumption across several wrapper runs.
+
+`usage export` emits `ohjaa-sessions.v1`, with `sessions` and `unreadable`.
+Unreadable records produce exit 4. `--session ID` selects one record. Existing
+records without usage remain readable and explicitly show "not collected".
+Exports contain private session context; choose their destination accordingly.
+
 ## Keeping it true
 
 `ohjaa check` validates every node and the rules across them. It also flags
@@ -193,8 +256,24 @@ Knowledge as a generated block into an instruction file such as `CLAUDE.md` or
 sessions` in each repo and `toimija sessions --outside-repos` for the sessions
 running outside any repo (listed under "outside any repository", by folder).
 Both are **derived now, stored never**: a derived view cannot be staler than
-the moment it was computed. `ohjaa run` adds that perimeter to the agent's
-briefing, after the Knowledge.
+the moment it was computed. `ohjaa run` and `ohjaa brief` include only the launch
+repository and repositories named by `--scope`, after the Knowledge. Sessions
+outside repositories are included when they are in the launch folder or their
+declared scope reaches a selected repository. Other repositories are explicitly
+unobserved; `ohjaa system` and `ohjaa fleet` still derive the full fleet.
+
+`run` reuses its launch preflight scans when composing the briefing. It does not
+ask Toimija for every repository's context or repeat the session scans. Coverage
+failures remain visible and selected-repository launch checks still refuse to
+launch blind. `brief --scope PATH` can retrieve context when a task grows; it
+does not declare session scope, so declare it with `toimija intent` before work.
+Missing scope repositories produce exit 4 from `brief`, never an empty success.
+
+The briefing tells an agent to use delivered facts instead of repeating discovery.
+With no concrete task, it acknowledges and waits: the wrapper already recorded
+entry. Orientation precedes the first task change; handover belongs at work
+completion or session exit, not after every conversational reply. No knowledge
+is truncated to save tokens, and no new index, database or model call is needed.
 
 The root list is derived as the sibling directories of your git root (outside
 a repo, the folder you are in), unless `~/.config/ohjaa/roots` or `--root`
@@ -212,6 +291,12 @@ ohjaa run codex --intent "change the parser" -- --model o3
 ```
 
 - Each agent gets its own toimija session.
+- Knowledge and lifecycle context travel as `toimija run --briefing`, separately
+  from `--task`. With an updated Toimija, an idle Codex launch opens without a
+  model acknowledgement turn; the first user message still receives the briefing.
+  Explicit tasks and other agents retain prompt delivery. Update Toimija before
+  using this version of Ohjaa; older versions reject the new flag rather than
+  silently dropping context.
 - `--dry-run` prints the exact command it would exec, without launching.
 - If toimija cannot fully read the sessions, or does not report its coverage,
   ohjaa refuses to launch blind.
@@ -226,8 +311,9 @@ cd ~/projects
 ohjaa run claude --intent "rename the flag everywhere" --scope ~/projects/a --scope ~/projects/b
 ```
 
-ohjaa briefs it as usual (your Knowledge, the fleet, the last session in this
-folder) and hands it to toimija, which opens a session outside every repo: no
+ohjaa briefs it with your Knowledge, each scoped repo's Knowledge and context,
+and the last session in this folder. With no repository selected, it adds no
+repository roster. It hands the session to toimija, which opens it outside every repo: no
 packet, but visible — `ohjaa fleet` lists it under "outside any repository".
 Every repository named with `--scope` is treated like the one a session is
 launched in:

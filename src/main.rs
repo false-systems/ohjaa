@@ -14,6 +14,7 @@ mod roots;
 mod scan;
 mod sessions;
 mod system;
+mod usage;
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,9 @@ use scan::{ago, scan_fleet, scan_repo, Coverage, Scan};
 const REFUSED: i32 = 3;
 /// At least one repo could not be scanned, so absence proves nothing.
 const INCOMPLETE: i32 = 4;
+/// The most a briefing may be: it travels as one command-line argument, to
+/// toimija and on to the agent, and Linux caps one at 128 KiB.
+const MAX_BRIEFING: usize = 100 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -71,6 +75,10 @@ enum Cmd {
         /// Do not brief the agent with knowledge and the perimeter.
         #[arg(long = "no-briefing")]
         no_briefing: bool,
+        /// Import an agent-usage.v1 receipt written by the launched command at exit.
+        /// The path is passed to the child as OHJAA_USAGE_FILE. No file is required at launch.
+        #[arg(long)]
+        usage_file: Option<PathBuf>,
         /// Everything after `--` is passed through to the agent command.
         #[arg(last = true)]
         passthrough: Vec<String>,
@@ -81,6 +89,9 @@ enum Cmd {
         /// Only the knowledge, without the live perimeter.
         #[arg(long)]
         knowledge_only: bool,
+        /// Include knowledge and context for these repositories (repeatable).
+        #[arg(long, value_name = "PATH", conflicts_with = "write")]
+        scope: Vec<String>,
         /// Write the knowledge as a generated block into this file (repeatable),
         /// keeping everything else in it.
         #[arg(long, value_name = "FILE")]
@@ -207,9 +218,83 @@ enum Cmd {
     },
     /// Show a session record: the latest one here, or one by id.
     Session { id: Option<String> },
+    /// Import explicit usage attribution or export session history for analysis.
+    Usage {
+        #[command(subcommand)]
+        action: UsageCmd,
+    },
     /// A knowledge node and its neighbours: what it builds on, what builds on
     /// it, what it replaced, and which sessions were briefed with it.
     Graph { id: String },
+}
+
+#[derive(Subcommand)]
+enum UsageCmd {
+    /// Attach a native-session snapshot. Reimports replace, never add totals.
+    Import {
+        file: PathBuf,
+        /// Wrapper session ID; defaults to OHJAA_SESSION inside a run.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Versioned JSON export; no database access needed by consumers.
+    Export {
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+/// Rows of the session log that could not be read while checking a usage
+/// receipt was not attributed twice, named so they can be looked at.
+fn report_unreadable_rows(ids: &[String]) {
+    if !ids.is_empty() {
+        eprintln!(
+            "ohjaa: session log row(s) {} could not be read; skipped when checking this \
+             receipt is not attributed to another session",
+            ids.join(", ")
+        );
+    }
+}
+
+fn cmd_usage(action: &UsageCmd) -> Result<i32> {
+    let dirs = dirs()?;
+    let open = || sessions::Store::open(&sessions::store_path(&dirs.state));
+    match action {
+        UsageCmd::Import { file, session } => {
+            let id = session.clone().map(Ok).unwrap_or_else(current_session_id)?;
+            anyhow::ensure!(sessions::is_valid_id(&id), "invalid session id");
+            let skipped = open()?.attach_usage(&id, usage::Receipt::read(file)?)?;
+            report_unreadable_rows(&skipped);
+            println!("recorded usage snapshot for {id}");
+            Ok(0)
+        }
+        UsageCmd::Export { session } => {
+            // Read, then let the log go before writing: a reader that stops
+            // reading must never hold every other ohjaa off the log.
+            // With no log yet there is nothing to export, and none is created.
+            let (mut records, unreadable) = if sessions::store_path(&dirs.state).exists() {
+                open()?.all()?
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            if let Some(id) = session {
+                records.retain(|s| s.id == *id);
+                anyhow::ensure!(
+                    !unreadable.contains(id),
+                    "session {id} is unreadable in the log"
+                );
+                anyhow::ensure!(!records.is_empty(), "session {id} not found");
+            }
+            // One session asked for and found is complete, whatever other rows hold.
+            let complete = unreadable.is_empty() || session.is_some();
+            let mut out = serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "ohjaa-sessions.v1", "sessions": records, "unreadable": unreadable
+            }))?;
+            out.push(b'\n');
+            std::io::stdout().lock().write_all(&out)?;
+            Ok(if complete { 0 } else { INCOMPLETE })
+        }
+    }
 }
 
 fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
@@ -383,14 +468,9 @@ fn dirs() -> Result<Dirs> {
     Dirs::resolve(git_root().as_deref())
 }
 
-/// The knowledge section of the briefing, with its problems reported on stderr.
-/// Broken files and flags are said out loud; they never make the briefing
-/// silently smaller.
-fn knowledge_briefing(dirs: &Dirs) -> Result<String> {
-    Ok(knowledge_briefing_for(dirs, &Scope::ALL)?.0)
-}
-
-/// The knowledge section, and exactly which nodes it delivers.
+/// The knowledge section of the briefing for these scopes, and exactly which
+/// nodes it delivers. Broken files and flags are reported on stderr, out loud;
+/// they never make the briefing silently smaller.
 fn knowledge_briefing_for(
     dirs: &Dirs,
     scopes: &[Scope],
@@ -403,6 +483,9 @@ fn knowledge_briefing_for(
             id: located.node.id.clone(),
             scope: located.scope.name().to_owned(),
             as_of: located.node.as_of.to_string(),
+            repo: (located.scope == Scope::Repo)
+                .then(|| dirs.repo_root.as_ref().map(|p| repo_key(p)))
+                .flatten(),
         })
         .collect();
     for broken in &loaded.broken {
@@ -428,7 +511,68 @@ fn knowledge_briefing_for(
     Ok((text, delivered))
 }
 
-fn cmd_brief(roots: &[PathBuf], knowledge_only: bool, write: &[PathBuf]) -> Result<i32> {
+/// Shared/personal knowledge once, plus the complete knowledge of each named repo.
+/// No keyword filter is allowed to hide a binding decision.
+fn knowledge_for_work(
+    dirs: &Dirs,
+    scoped: &[PathBuf],
+) -> Result<(String, Vec<sessions::Delivered>)> {
+    let (mut text, mut delivered) = knowledge_briefing_for(dirs, &Scope::ALL)?;
+    for repo in scoped {
+        let mut scoped_dirs = dirs.clone();
+        scoped_dirs.repo_root = Some(repo.clone());
+        let (knowledge, nodes) = knowledge_briefing_for(&scoped_dirs, &[Scope::Repo])?;
+        // The preamble was said once, above; each repository adds its section.
+        let knowledge = knowledge
+            .strip_prefix(knowledge::PREAMBLE)
+            .unwrap_or(&knowledge)
+            .trim_start_matches('\n')
+            .to_owned();
+        if !knowledge.is_empty() {
+            text.push_str(&format!(
+                "\nScoped repository {}:\n{knowledge}",
+                repo.display()
+            ));
+        }
+        delivered.extend(nodes);
+    }
+    if !scoped.is_empty() && text.len() > knowledge::DEFAULT_BUDGET {
+        eprintln!("ohjaa: combined scoped knowledge briefing is {} characters, over {}; merge or retire nodes, never truncate", text.len(), knowledge::DEFAULT_BUDGET);
+    }
+    Ok((text, delivered))
+}
+
+fn selected_perimeter(
+    root: &Path,
+    in_repo: bool,
+    scoped: &[PathBuf],
+    mut scans: Vec<Scan>,
+    mut outside: Scan,
+) -> system::SystemView {
+    let selected: Vec<_> = in_repo
+        .then(|| root.to_path_buf())
+        .into_iter()
+        .chain(scoped.iter().cloned())
+        .collect();
+    let folder = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    outside.sessions.retain(|s| {
+        std::fs::canonicalize(&s.worktree).is_ok_and(|p| p == folder)
+            || selected.iter().any(|repo| scope_reaches(s, repo))
+    });
+    scans.push(outside);
+    system::scoped_view(&selected, scans)
+}
+
+fn scoped_perimeter_text(view: &system::SystemView, here: &Path) -> String {
+    format!("{}\n\nOnly the launch repository, declared scope and sessions reaching them are included.\nOther repositories were not scanned. Use `ohjaa system` or `ohjaa fleet` for a\nfleet-wide question; after expanding scope, use `ohjaa brief --scope <path>`.\nUse the delivered facts instead of repeating discovery. Refresh session observations\nbefore editing if work has moved on since this briefing.\n", system::briefing(view, here))
+}
+
+fn cmd_brief(
+    roots: &[PathBuf],
+    knowledge_only: bool,
+    write: &[PathBuf],
+    scope: &[String],
+) -> Result<i32> {
     let dirs = dirs()?;
     if !write.is_empty() {
         for file in write {
@@ -464,23 +608,45 @@ fn cmd_brief(roots: &[PathBuf], knowledge_only: bool, write: &[PathBuf]) -> Resu
         }
         return Ok(0);
     }
-    let knowledge = knowledge_briefing(&dirs)?;
+    let (scoped, unscoped) = scoped_repos(scope, dirs.repo_root.as_deref());
+    let (knowledge, _) = knowledge_for_work(&dirs, &scoped)?;
+    for path in &unscoped {
+        eprintln!("ohjaa: --scope {path} is not inside a Git repository; no repository knowledge or context was read there");
+    }
     if knowledge.is_empty() {
         println!("No knowledge recorded yet (`ohjaa propose`, then `ohjaa review`).");
     } else {
         print!("{knowledge}");
     }
     if knowledge_only {
-        return Ok(0);
+        return Ok(if unscoped.is_empty() { 0 } else { INCOMPLETE });
     }
-    let here = git_root().unwrap_or_else(|| PathBuf::from("."));
+    let here = dirs.repo_root.clone().unwrap_or(std::env::current_dir()?);
     if let Some(last) = last_session_here(&dirs, &here) {
         print!("\n{last}");
     }
-    let view = system::system_view(&repos(roots)?);
-    println!("\n{}", system::briefing(&view, &here));
+    // Validate configured discovery roots; do not derive unrelated repositories.
+    repos(roots)?;
+    let scans = dirs
+        .repo_root
+        .iter()
+        .chain(&scoped)
+        .map(|p| scan_repo(p))
+        .collect();
+    let view = selected_perimeter(
+        &here,
+        dirs.repo_root.is_some(),
+        &scoped,
+        scans,
+        scan::scan_outside(),
+    );
+    println!("\n{}", scoped_perimeter_text(&view, &here));
     // An incomplete perimeter is said with the exit code, as `system` does.
-    Ok(view.exit_code())
+    Ok(if unscoped.is_empty() {
+        view.exit_code()
+    } else {
+        INCOMPLETE
+    })
 }
 
 // ---- the session log ---------------------------------------------------------
@@ -1204,6 +1370,7 @@ struct RunOptions<'a> {
     scope: &'a [String],
     dry_run: bool,
     no_briefing: bool,
+    usage_file: Option<&'a Path>,
     passthrough: &'a [String],
     roots: &'a [PathBuf],
 }
@@ -1216,9 +1383,11 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         scope,
         dry_run,
         no_briefing,
+        usage_file,
         passthrough,
         roots,
     } = options;
+    let task = task.filter(|task| !task.trim().is_empty());
     // Outside any Git repository the session is the folder's: toimija keeps it
     // outside every repo, and there are no commits or pull request to observe.
     let (root, in_repo) = match git_root() {
@@ -1356,6 +1525,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         "--intent",
         "--task",
         "--scope",
+        "--usage-file",
     ] {
         if passthrough.iter().any(|arg| arg == misplaced) {
             eprintln!(
@@ -1367,21 +1537,26 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
 
     // State 1, entering. The briefing: knowledge first (what to know before
     // acting), then the last session here and how this one works, then the
-    // perimeter (who and what is around). Delivered inside the task so it
-    // travels in toimija's composed launch prompt.
+    // perimeter (who and what is around). Keep it separate from a task so an
+    // interactive Codex launch can wait for the person's first message.
     let dirs = Dirs::resolve(in_repo.then_some(root.as_path()))?;
     let started_ms = intake::now_seconds() * 1000;
     let session_id = sessions::new_id(started_ms);
     let mut delivered = Vec::new();
-    let task = if no_briefing {
-        task.map(String::from)
+    let briefing = if no_briefing {
+        None
     } else {
-        let (knowledge, nodes) = knowledge_briefing_for(&dirs, &Scope::ALL)?;
+        let (knowledge, nodes) = knowledge_for_work(&dirs, &scoped_repos)?;
         delivered = nodes;
         let last = last_session_here(&dirs, &root).unwrap_or_default();
-        let fleet = repos(roots)?;
-        let view = system::system_view(&fleet);
-        let perimeter = system::briefing(&view, &root);
+        repos(roots)?;
+        let scans = in_repo
+            .then(|| scan.clone())
+            .into_iter()
+            .chain(scoped_scans.iter().cloned())
+            .collect();
+        let view = selected_perimeter(&root, in_repo, &scoped_repos, scans, outside.clone());
+        let perimeter = scoped_perimeter_text(&view, &root);
         let how = lifecycle_briefing(&root, in_repo, &scoped_repos);
         let parts: Vec<&str> = [
             knowledge.as_str(),
@@ -1392,28 +1567,73 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect();
-        let briefing = parts.join("\n");
-        Some(match task {
-            Some(task) => format!("{task}\n\n{briefing}"),
-            None => briefing,
-        })
+        Some(parts.join("\n"))
     };
+    if let Some(briefing) = briefing.as_ref().filter(|b| b.len() > MAX_BRIEFING) {
+        eprintln!(
+            "ohjaa: the briefing is {} KiB, over the {} KiB a briefing may be: it is one \
+             command-line argument to toimija and again to the agent, and Linux caps one at \
+             128 KiB. Merge or retire knowledge (`ohjaa check`), name fewer repositories \
+             with --scope, or launch with --no-briefing",
+            briefing.len().div_ceil(1024),
+            MAX_BRIEFING / 1024
+        );
+        eprintln!("ohjaa: refusing to launch");
+        return Ok(REFUSED);
+    }
 
     let mut command = Command::new("toimija");
     command.arg("run").arg("--intent").arg(intent);
-    if let Some(task) = &task {
+    if let Some(task) = task {
         command.arg("--task").arg(task);
+    }
+    if let Some(briefing) = &briefing {
+        command.arg("--briefing").arg(briefing);
     }
     for scope_path in scope {
         command.arg("--scope").arg(scope_path);
     }
-    command.arg("--").arg(agent).args(passthrough);
+    let usage_path = usage_file.map(std::path::absolute).transpose()?;
+    if let Some(path) = &usage_path {
+        anyhow::ensure!(
+            !path.exists(),
+            "usage file already exists; use a fresh path for this run"
+        );
+    }
+    command.arg("--").arg(agent);
+    // A persistent Codex tool daemon is not a child of this wrapper. Deliver
+    // our identity and log location through its per-thread shell configuration.
+    if std::path::Path::new(agent)
+        .file_name()
+        .is_some_and(|name| name == "codex")
+    {
+        let mut handshake = vec![
+            (sessions::SESSION_ENV, std::ffi::OsString::from(&session_id)),
+            ("XDG_STATE_HOME", knowledge::state_home()?.into_os_string()),
+        ];
+        if let Some(path) = &usage_path {
+            handshake.push(("OHJAA_USAGE_FILE", path.as_os_str().to_owned()));
+        }
+        for (key, value) in handshake {
+            let value = value.to_str().with_context(|| {
+                format!("{key} is not UTF-8; cannot deliver the Codex session handshake")
+            })?;
+            command.arg("-c").arg(format!(
+                "shell_environment_policy.set.{key}={}",
+                serde_json::to_string(value)?
+            ));
+        }
+    }
+    command.args(passthrough);
     command.current_dir(&root);
     if dry_run {
         eprintln!("ohjaa: dry-run; would run: {}", render_command(&command));
         return Ok(0);
     }
     command.env(sessions::SESSION_ENV, &session_id);
+    if let Some(path) = &usage_path {
+        command.env("OHJAA_USAGE_FILE", path);
+    }
 
     let mut session = sessions::Session {
         id: session_id.clone(),
@@ -1437,6 +1657,8 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         handover: None,
         left: None,
         drafted: false,
+        usage: Vec::new(),
+        usage_refused: None,
     };
     // From here to the end of leaving, a signal is kept, not fatal.
     lifecycle::supervise();
@@ -1545,6 +1767,37 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         unrecorded.left = Some(left);
         unrecorded
     });
+    if let Some(path) = usage_file {
+        let imported = (|| -> Result<()> {
+            let receipt = usage::Receipt::read(path)?;
+            anyhow::ensure!(
+                receipt.observed_at_ms >= started_ms,
+                "usage receipt predates this run"
+            );
+            let store = sessions::Store::open(&sessions::store_path(&dirs.state))?;
+            report_unreadable_rows(&store.attach_usage(&session_id, receipt)?);
+            session = store
+                .get(&session_id)?
+                .context("session disappeared after usage import")?;
+            Ok(())
+        })();
+        if let Err(error) = imported {
+            eprintln!("ohjaa: usage was not imported: {error:#}; session exit is unchanged");
+            // Recorded as refused, with why: never shown as "not collected".
+            let why = format!("{error:#}");
+            let stored = session_store(&dirs).and_then(|store| {
+                store
+                    .update(&session_id, |s| s.usage_refused = Some(why.clone()))
+                    .ok()
+                    .flatten()
+            });
+            session = stored.unwrap_or_else(|| {
+                let mut unsaved = session;
+                unsaved.usage_refused = Some(why);
+                unsaved
+            });
+        }
+    }
     let _ = std::io::stdout().flush();
     // Written with `let _`: a closed terminal must not turn printing into a
     // panic after the record is already safe.
@@ -1679,10 +1932,15 @@ fn lifecycle_briefing(root: &Path, in_repo: bool, scoped: &[PathBuf]) -> String 
     format!(
         "\
 How this session works (ohjaa):
+If no concrete task is assigned, acknowledge and wait; the wrapper has already
+recorded entry. Do not run orientation, discovery or handover tools just to start.
+Once a task is assigned, use this briefing and the Toimija packet as your starting
+knowledge. Read the named files to resolve gaps; do not repeat repository discovery.
 1. Before your first change, read back what you know:
    ohjaa oriented \"<the goal in one line; the rules that apply; who else is working>\"
 {phases}
-3. Before you finish, write the handover for whoever comes next:
+3. When finishing the assigned work or leaving the session, write the handover
+   for whoever comes next (not after every conversational reply):
    ohjaa handover --unfinished \"…\" --next \"…\" --surprised \"…\"
 "
     )
@@ -1722,6 +1980,7 @@ fn main() {
             scope,
             dry_run,
             no_briefing,
+            usage_file,
             passthrough,
         } => cmd_run(RunOptions {
             agent,
@@ -1730,13 +1989,15 @@ fn main() {
             scope,
             dry_run: *dry_run,
             no_briefing: *no_briefing,
+            usage_file: usage_file.as_deref(),
             passthrough,
             roots: &cli.root,
         }),
         Cmd::Brief {
             knowledge_only,
             write,
-        } => cmd_brief(&cli.root, *knowledge_only, write),
+            scope,
+        } => cmd_brief(&cli.root, *knowledge_only, write, scope),
         Cmd::Fleet { json } => cmd_fleet(&cli.root, *json),
         Cmd::System { json } => cmd_system(&cli.root, *json),
         Cmd::List { all } => cmd_list(*all),
@@ -1774,6 +2035,7 @@ fn main() {
             surprised,
         } => cmd_handover(unfinished.as_deref(), next.as_deref(), surprised.as_deref()),
         Cmd::Session { id } => cmd_session(id.as_deref()),
+        Cmd::Usage { action } => cmd_usage(action),
         Cmd::Graph { id } => cmd_graph(id),
         Cmd::Intake {
             since,

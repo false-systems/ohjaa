@@ -38,6 +38,9 @@ pub struct Delivered {
     pub id: String,
     pub scope: String,
     pub as_of: String,
+    /// Repository identity for repo-scoped knowledge; older records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 /// The agent's read-back: "I know the state".
@@ -172,6 +175,13 @@ pub struct Session {
     /// Intake has drafted proposals from this session.
     #[serde(default)]
     pub drafted: bool,
+    /// Source-reported snapshots, separately labelled from observed work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage: Vec<crate::usage::Receipt>,
+    /// Why the receipt the launched command wrote at exit was refused: a
+    /// refusal is said, never shown as "not collected".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_refused: Option<String>,
 }
 
 /// Why the log could not be used. Never a reason to stop a launch.
@@ -219,6 +229,62 @@ pub struct Store {
 }
 
 impl Store {
+    /// One native session belongs to at most one wrapper session. Check and
+    /// attach in one transaction so concurrent imports cannot double
+    /// attribute it. A row that cannot be read is skipped in that check, never
+    /// fatal to every import: the ids skipped are returned, so the caller can
+    /// name them. The session attached to must itself be readable.
+    pub fn attach_usage(
+        &self,
+        id: &str,
+        receipt: crate::usage::Receipt,
+    ) -> anyhow::Result<Vec<String>> {
+        receipt.validate()?;
+        let tx = self.db.begin_write()?;
+        let mut skipped = Vec::new();
+        {
+            let mut table = tx.open_table(SESSIONS)?;
+            for row in table.iter()? {
+                let (key, bytes) = row?;
+                if key.value() == id {
+                    continue;
+                }
+                let Ok(other) = serde_json::from_slice::<Session>(bytes.value()) else {
+                    skipped.push(key.value().to_owned());
+                    continue;
+                };
+                let claimed = other
+                    .usage
+                    .iter()
+                    .any(|r| r.agent == receipt.agent && r.session_id == receipt.session_id);
+                anyhow::ensure!(
+                    !claimed,
+                    "native session already attributed to {}",
+                    key.value()
+                );
+            }
+            let mut session: Session = {
+                let bytes = table
+                    .get(id)?
+                    .ok_or_else(|| anyhow::anyhow!("session {id} is not in the log"))?;
+                serde_json::from_slice(bytes.value())
+                    .map_err(|error| anyhow::anyhow!("session {id} is unreadable: {error}"))?
+            };
+            let agent = Path::new(&session.agent)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&session.agent);
+            anyhow::ensure!(
+                agent == receipt.agent,
+                "receipt agent does not match session agent"
+            );
+            crate::usage::merge(&mut session.usage, receipt)?;
+            let bytes = serde_json::to_vec(&session)?;
+            table.insert(id, bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(skipped)
+    }
     /// Open the log, creating it only where no file exists. An empty or
     /// unreadable file is reported, never replaced: redb would treat an empty
     /// file as a fresh database and the history would silently vanish.
@@ -520,6 +586,41 @@ pub fn render_record(session: &Session) -> String {
             let _ = writeln!(out, "toimija       {toimija}");
         }
     }
+    out.push_str("─ usage (imported source assertions; estimates are not bills) ─\n");
+    if let Some(why) = &session.usage_refused {
+        let _ = writeln!(out, "refused: {why}");
+    } else if session.usage.is_empty() {
+        out.push_str("not collected; unknown, not zero\n");
+    }
+    for receipt in &session.usage {
+        let _ = writeln!(
+            out,
+            "{} {} · {} · {} model row(s) · source {}",
+            receipt.agent,
+            receipt.session_id,
+            if receipt.complete {
+                "complete source snapshot"
+            } else {
+                "partial source snapshot"
+            },
+            receipt.entries.len(),
+            receipt.source
+        );
+        for entry in &receipt.entries {
+            let number = |n: Option<u64>| n.map_or_else(|| "unknown".to_owned(), |n| n.to_string());
+            let _ = writeln!(
+                out,
+                "  {}/{} input={} output={} cache-read={} cache-write={} estimate-usd-micros={}",
+                entry.provider,
+                entry.model,
+                number(entry.input_tokens),
+                number(entry.output_tokens),
+                number(entry.cache_read_tokens),
+                number(entry.cache_write_tokens),
+                number(entry.estimated_usd_micros)
+            );
+        }
+    }
     out.push_str("─ handover (the agent's own words) ─\n");
     handover_lines(session.handover.as_ref(), &mut out);
     out
@@ -717,11 +818,14 @@ mod tests {
                 id: "rust-only".to_owned(),
                 scope: "ours".to_owned(),
                 as_of: "2026-09-24".to_owned(),
+                repo: None,
             }],
             readback: None,
             handover: None,
             left: None,
             drafted: false,
+            usage: Vec::new(),
+            usage_refused: None,
         }
     }
 
@@ -1032,6 +1136,114 @@ mod tests {
             last.contains("- it was surprised by: the fixture skips"),
             "{last}"
         );
+    }
+
+    fn usage_receipt(agent: &str, native: &str) -> crate::usage::Receipt {
+        crate::usage::Receipt {
+            schema: "agent-usage.v1".to_owned(),
+            agent: agent.to_owned(),
+            session_id: native.to_owned(),
+            source: "test".to_owned(),
+            observed_at_ms: 5_000,
+            complete: true,
+            limitations: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn one_unreadable_row_never_blocks_an_import_and_is_named() {
+        let dir = temp("unreadable-row");
+        let store = Store::open(&store_path(&dir)).unwrap();
+        store.put(&session("oh-1", "/r/a", 1_000)).unwrap();
+        {
+            let tx = store.db.begin_write().unwrap();
+            tx.open_table(SESSIONS)
+                .unwrap()
+                .insert("oh-broken", b"\"not a session\"".as_slice())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let skipped = store
+            .attach_usage("oh-1", usage_receipt("claude", "native-1"))
+            .expect("an unrelated unreadable row is skipped, not fatal");
+        assert_eq!(skipped, ["oh-broken"], "and it is named");
+        assert_eq!(store.get("oh-1").unwrap().unwrap().usage.len(), 1);
+        let error = store
+            .attach_usage("oh-broken", usage_receipt("claude", "native-2"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("session oh-broken is unreadable"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `ohjaa usage export` is `ohjaa-sessions.v1`: each session as stored.
+    /// vessa and seula read these fields; renaming one breaks them silently.
+    #[test]
+    fn the_v1_export_keeps_the_field_names_its_readers_use() {
+        let mut s = session("oh-7", "/r/projects", 1_000);
+        s.delivered[0].repo = Some("/r/projects/a".to_owned());
+        s.readback = Some(Readback {
+            at_ms: 1_100,
+            text: "goal".to_owned(),
+        });
+        s.handover = Some(Handover {
+            at_ms: 1_900,
+            next: Some("n".to_owned()),
+            ..Default::default()
+        });
+        s.usage = vec![usage_receipt("claude", "native-7")];
+        let phase = Phase {
+            commit: "c".to_owned(),
+            subject: "s".to_owned(),
+            evidence: Some(Evidence {
+                outcome: "passed".to_owned(),
+                dirty: false,
+            }),
+        };
+        let mut s = ended(s, 2_000);
+        let left = s.left.as_mut().unwrap();
+        left.phases = Some(vec![phase.clone()]);
+        left.scoped = vec![ScopedLeft {
+            repo: "/r/projects/a".to_owned(),
+            phases: Some(vec![phase]),
+            finished: Finished::NoPullRequest,
+        }];
+        let v1 = serde_json::to_value(&s).unwrap();
+        for pointer in [
+            "/id",
+            "/agent",
+            "/repo",
+            "/intent",
+            "/started_ms",
+            "/delivered/0/id",
+            "/delivered/0/scope",
+            "/delivered/0/as_of",
+            "/delivered/0/repo",
+            "/readback/text",
+            "/handover/next",
+            "/left/ended_ms",
+            "/left/exit/how",
+            "/left/finished/kind",
+            "/left/phases/0/commit",
+            "/left/phases/0/evidence/outcome",
+            "/left/scoped/0/repo",
+            "/left/scoped/0/phases/0/evidence/outcome",
+            "/left/scoped/0/phases/0/evidence/dirty",
+            "/usage/0/agent",
+            "/usage/0/session_id",
+            "/usage/0/entries",
+            "/drafted",
+        ] {
+            assert!(
+                v1.pointer(pointer).is_some(),
+                "{pointer} is gone from v1: {v1}"
+            );
+        }
     }
 
     #[test]
