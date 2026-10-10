@@ -401,8 +401,6 @@ pub fn render(loaded: &Loaded, flags: &[Flag]) -> String {
     render_scopes(loaded, flags, &Scope::ALL)
 }
 
-/// The briefing limited to some scopes: a file other people read gets only
-/// shared Knowledge, never one person's `mine` or `machine`.
 /// What opens the knowledge section of a briefing.
 pub const PREAMBLE: &str =
     "Knowledge (ohjaa, knowledge-node.v1): what the people you work for know and\n\
@@ -410,6 +408,8 @@ pub const PREAMBLE: &str =
      wrong or stale, say so instead of quietly working around it. Propose new\n\
      knowledge with `ohjaa propose`; only a person makes it current.\n";
 
+/// The briefing limited to some scopes: a file other people read gets only
+/// shared Knowledge, never one person's `mine` or `machine`.
 pub fn render_scopes(loaded: &Loaded, flags: &[Flag], scopes: &[Scope]) -> String {
     let current: Vec<&Located> = fk::briefing(&loaded.nodes)
         .into_iter()

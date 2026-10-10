@@ -135,34 +135,99 @@ until it ends so the last one always happens:
 |---|---|---|
 | 1 entering | knowledge, the last session here, lifecycle instructions, and scoped context | ohjaa |
 | 2 oriented | the agent reads back what it knows: `ohjaa oriented "<goal; rules; who else>"` | the agent |
-| 3 working | small phases, each a commit and, where the repo has a sykli contract, a `sykli run` on it | observed from git and `.sykli/receipts`: the commits HEAD's reflog shows made in this checkout since entering, never ones a pull or merge brought in |
-| 4 finished | the branch's pull request, and whether its head has evidence | observed through `gh` |
+| 3 working | small phases, each a commit and, where the repo has a sykli contract, a `sykli run` on it | observed from git, `.sykli/receipts` in every checkout `git worktree list` names, and `<git common dir>/sykli/receipts` (the receipt sykli keeps of each push it accepted, which outlives a removed worktree): the commits a reflog (a checkout's HEAD, or a branch) shows created since entering and still reachable, never ones a pull or merge brought in, nor one an amend or rebase replaced (a rebase's replayed commits are made anew, and count). A commit is the session's own only where that can be shown (see below); every other one made meanwhile is recorded as observed, not attributed |
+| 4 finished | the pull request of the branch this session's newest commit on a branch was made on (by name, then by commit once a squash merge deleted the branch; when the branch, its worktree and its remote-tracking branch are all gone, even after `git fetch --prune`, its commits made here are found in the object store and the pull request is searched for by the newest: when one holds it they are shown `on no branch now`, otherwise (a stash, say) they are left out; none asked when it made no commit on a branch), and what `sykli verify --commit` says about its head; every commit that reached the default branch during the session, checked the same way | observed through `gh`, git and sykli |
 | 5 leaving | the record: observed part, then the handover (`ohjaa handover`) | ohjaa, and the agent's testimony |
 
 States are **observed, not declared**: the agent writes only its read-back and
 its handover, and the record shows them as its words. Leaving always writes the
-record, crash or not; a missing handover is recorded as none. The next session
-here, and in every repository it named with `--scope`, is briefed with it:
+record, crash or not; a missing handover is recorded as none. Only losing ohjaa
+itself (a SIGKILL, a crash, a restart) skips leaving: the next launch finds that
+ohjaa gone, closes the session as `orphaned (observed at next launch)`, queues it
+for `ohjaa intake`, and opens its briefing with it when it ran here. Only the
+absence is observed, never a cause, and an orphan ranks by when it started: a
+session that really ended after that stays the last session here.
+
+The next session here, and in every repository it named with `--scope` (never
+one it was only found working in), is briefed with the last session's record:
 
 ```
 session oh-1790… · claude · selko · 2026-09-26 10:02 UTC → 2026-09-26 11:47 UTC · ended: clean (exit 0)
 ─ observed (written by ohjaa; the agent cannot change it) ─
 intent        retry uploads
 knew          14 knowledge node(s) delivered · read back at 10:04 UTC
-phases        a1b2c3d passed · d4e5f6a passed · 0718abc failed · 9c0d1e2 passed
-finished      https://github.com/…/pull/57 (open) · evidence on its head: passed
+phases        a1b2c3d receipt: passed · d4e5f6a receipt: passed · 0718abc receipt: failed · 9c0d1e2 receipt: passed
+finished      https://github.com/…/pull/57 (open) · head 9c0d1e2: verified: passed (sykli verify --commit)
 ─ handover (the agent's own words) ─
 unfinished    Windows paths in uploader/retry.rs
 next agent    Dima owns the queue; ask first
 surprised by  the fixture helper silently skips when git is missing
 ```
 
+A receipt's `outcome` is its own claim, and the record says it as one
+(`receipt: passed`); a receipt is filed under the tree that ran (a run sykli's
+pre-commit hook makes before the commit is that tree's run), and a passing run
+outranks a newer failing or dirty one. Only sykli says a commit passed. It is
+asked about the pull request's head; about the tip of every push of the
+session's that reached the default branch (pushed from here to
+`origin/<default>`, or made here and now on the local one; a fetch is not a
+landing), which is what a pre-push Boundary gates; and about the commit
+`origin/<default>` is left at when a push from this clone put it there,
+whoever pushed. The commits before a tip are shown as their receipts' word.
+Leaving runs `sykli verify <receipt> --contract sykli.json --commit <sha>` in a
+checkout at that commit with nothing beside it, when there is one, else where
+the receipt is:
+
+| sykli says | the record says | flag |
+|---|---|---|
+| exit 0 | `verified: passed` | no |
+| refused the commit's own run (another tree, a dirty run, a failed outcome, contradictory records) | `FAILED sykli verify: …` | **yes** |
+| exit 1, 3 or 4, by a sykli that reads everything from the commit (sykli#67 as merged; its help says "nothing is read from the checkout") | `FAILED sykli verify: …` | **yes** |
+| refused the tree, inputs or contract on disk, by an older sykli in a checkout that is not the commit | `stale: sykli checked the checkout, not the commit` | no |
+| exit 2: it could not verify (a bad revision, arguments, not a receipt) | `unverified: sykli verify could not verify: …` | no |
+| any other end: a crash, a kill, no answer in time | `unverified: …` | no |
+| no `--commit` (`sykli verify --help` does not name it) | `unverified: sykli has no --commit` | no |
+| — the commit has no sykli contract | `unverified: no sykli contract …` | no |
+| — no receipt names the commit's tree (the commit has a contract) | `unchecked` | **yes** where it is `origin/<default>`'s tip; otherwise no |
+| — no receipt, and the checkout it was made in is gone with its `.sykli/` | `unchecked: … the checkout it was made in is gone` | no: it cannot be observed |
+
+A refusal of the session's own work **flags the record**, and so does the tip
+`origin/<default>` was left at when sykli refused it or it was never run where
+there is a contract (and the checkout it was made in, where a receipt would be,
+still exists): a broken main is the repository's state, whoever pushed it
+(another session sharing the clone, a person by hand), so it is said either way,
+as `observed, not attributed` when it is not shown to be this session's. Only
+the session's own refused work becomes an intake candidate. The record opens
+with its flags, leaving ends by saying them again (`ohjaa: flagged: …`), and
+the next briefing here, `ohjaa brief` included, opens with them before the
+knowledge and before the handover. "`origin/main` at `<sha>`" is said only of
+the commit the branch sits at, when the record is written and again when a
+briefing is made; once the branch has moved on, the session's own refused
+commit is said as having reached it, and a tip it only observed is no longer
+said:
+
+```
+WARNING from the last session here (oh-1791…, claude, ended 2026-10-09 21:30 UTC):
+- origin/main at 3dbaafd in selko has no passing evidence — check before building on it (FAILED sykli verify: refused: outcome expected passed …)
+```
+
+An earlier session's flag about a branch here keeps opening the briefing for as
+long as that branch still sits at the commit it flagged (`WARNING from an
+earlier session here (…), still true`), so a quiet session in between cannot
+hide a broken main; so does one a root session saw in a repository it only
+found (`WARNING from a session that observed this repository`). Each tip is
+said once.
+
 The records live in a **session log**, redb at
 `~/.local/state/ohjaa/sessions.redb`, on this machine only. Knowledge never
 lives there, so deleting the log loses no knowledge. A busy or broken log never
 blocks a launch; a broken one is reported and left alone, never replaced.
-`ohjaa intake` drafts proposals from each ended session once: its handover and
-what was said in its window.
+`ohjaa intake` drafts proposals from each ended session once: its handover,
+what was said in its window, and what ohjaa observed going wrong in it (source
+`observed`): its own work that sykli refused at the default branch or a pull
+request head (never what could not be checked, nor what is not shown to be the
+session's); a non-zero exit; a missing handover; an orphaned session. Those are
+facts, not anyone's words, and the drafter is told so.
 
 Signals, while a session runs (unix):
 
@@ -329,10 +394,29 @@ launched in:
   one that ended last, launched in that repo or elsewhere with a `--scope`
   naming it, and one launched elsewhere says where it was launched.
 
-What ohjaa still cannot see, it says: a `--scope` path outside every repository
-is named as unobserved, and work in a repository nobody named is not recorded,
-so the handover has to say what changed there. Scope can be named from inside
-a repo too, for a second repository an agent will touch.
+**Observed, not asserted (law 3).** One rule: in a repository the session was
+launched in or named with `--scope`, a commit made during the session is its
+own unless another session was there at that second — in the checkout it was
+launched in, a session launched in that checkout; in any other checkout or
+branch of the clone, old or new, any session in the clone (sessions in the log,
+and live ones toimija saw at launch). Only its own commits are its phases, its
+pull request and its lessons. Everything else made during the session is
+recorded as `observed … not attributed`, with the session it shared the place
+with (`shared with oh-… in work, …`). Known limit: a person's own commit in a
+place the session holds alone looks exactly like the agent's, and is credited
+to the session.
+
+A repository nobody named is observed when a commit was made in it: at leaving,
+ohjaa looks at the repositories directly in the launch folder (and in any folder
+`--scope` named that is not itself a repository), and records each where a
+commit was made, or pushed from, during the session, in any of its worktrees,
+as **found, not named**. Nothing in a found repository is attributed to the
+session: it is not its phases or lessons, no pull request is looked up, and the
+session never becomes that repository's "last session here" (a broken main it
+saw there is still said, as the repository's state). Name repositories with
+`--scope` wherever you can. A `--scope` path that is neither in a repository
+nor a folder is named as unobserved. Scope can be named from inside a repo too, for
+a second repository an agent will touch.
 
 A toimija too old to list sessions outside repos makes ohjaa refuse to launch
 from the root, and makes `ohjaa fleet` incomplete — never quietly empty.

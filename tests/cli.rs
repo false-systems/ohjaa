@@ -47,6 +47,89 @@ fi
 exit "${OHJAA_STUB_EXIT:-0}"
 "#;
 
+/// Never the real gh: no network, and a controlled answer. With
+/// OHJAA_STUB_GH_PR_BRANCH set, the branch of that name has a pull request
+/// (state OHJAA_STUB_GH_PR_STATE, default OPEN) whose head is that branch's
+/// commit here; `pr view` with no branch asks about the one checked out.
+/// `pr list --search <sha>` finds a merged pull request for
+/// OHJAA_STUB_GH_PR_SEARCH only (or the sha in the file
+/// OHJAA_STUB_GH_PR_SEARCH_FILE names).
+const GH_STUB: &str = r#"#!/bin/sh
+if [ -n "${OHJAA_STUB_GH_SLEEP:-}" ]; then sleep "$OHJAA_STUB_GH_SLEEP"; fi
+printf '%s|%s\n' "$PWD" "$*" >> "${OHJAA_STUB_GH_CALLS:-/dev/null}"
+if [ "$1 $2" = "pr list" ]; then
+  sha=""
+  while [ $# -gt 0 ]; do case "$1" in --search) sha="$2"; shift;; esac; shift; done
+  if [ -n "${OHJAA_STUB_GH_PR_SEARCH_FILE:-}" ] && [ -f "$OHJAA_STUB_GH_PR_SEARCH_FILE" ]; then
+    OHJAA_STUB_GH_PR_SEARCH=$(cat "$OHJAA_STUB_GH_PR_SEARCH_FILE")
+  fi
+  if [ -n "$sha" ] && [ "$sha" = "${OHJAA_STUB_GH_PR_SEARCH:-}" ]; then
+    printf '[{"url":"https://github.com/o/r/pull/8","state":"MERGED","headRefOid":"%s"}]\n' "$sha"
+  else
+    echo '[]'
+  fi
+  exit 0
+fi
+if [ -n "${OHJAA_STUB_GH_PR_BRANCH:-}" ]; then
+  case "$3" in -*|"") branch="$(git branch --show-current)";; *) branch="$3";; esac
+  if [ "$branch" = "$OHJAA_STUB_GH_PR_BRANCH" ]; then
+    head=$(git rev-parse --verify -q "refs/heads/$branch" || git rev-parse --verify -q "refs/remotes/origin/$branch")
+    printf '{"url":"https://github.com/o/r/pull/7","state":"%s","headRefOid":"%s"}\n' \
+      "${OHJAA_STUB_GH_PR_STATE:-OPEN}" "$head"
+    exit 0
+  fi
+  echo "no pull requests found for branch \"$branch\"" >&2
+  exit 1
+fi
+echo "gh: To get started with GitHub CLI, please run:  gh auth login" >&2
+exit 4
+"#;
+
+/// Never the real sykli. `verify --help` names `--commit` only with
+/// OHJAA_STUB_SYKLI_COMMIT set. `verify <receipt> --contract <c> --commit
+/// <sha>` checks, in sykli's order and words: the contract the receipt was
+/// made under, that it ran exactly that commit's tree, cleanly, and then its
+/// outcome. With OHJAA_STUB_SYKLI_COMMIT=1 it is sykli#67 as it stands: after
+/// the commit checks it also compares the checkout on disk (its HEAD's tree,
+/// and nothing uncommitted beside it). With `new` it takes everything from the
+/// commit, as sykli#67 is being changed to.
+const SYKLI_STUB: &str = r#"#!/bin/sh
+printf '%s|%s\n' "$PWD" "$*" >> "${OHJAA_STUB_SYKLI_CALLS:-/dev/null}"
+if [ "$1" = verify ] && [ "$2" = --help ]; then
+  echo "Usage: sykli verify [OPTIONS] <RECEIPT>"
+  echo "      --contract <CONTRACT>  Path to sykli.rs or a sykli-contract.v1 JSON file"
+  if [ -n "${OHJAA_STUB_SYKLI_COMMIT:-}" ]; then
+    echo "      --commit <REV>  Also require a clean run of this commit"
+  fi
+  if [ "${OHJAA_STUB_SYKLI_COMMIT:-}" = new ]; then
+    echo "With --commit the subject is the commit, and nothing is read from the"
+    echo "checkout; REV is resolved in the repository around the current directory."
+  fi
+  exit 0
+fi
+[ "$1" = verify ] || exit 2
+receipt="$2"; shift 2
+sha=""
+while [ $# -gt 0 ]; do
+  case "$1" in --commit) sha="$2"; shift;; esac
+  shift
+done
+[ -n "$sha" ] || { echo "refused: commit expected a --commit" >&2; exit 2; }
+grep -q '"contract_hash":"forged"' "$receipt" && { echo "refused: contract expected c but got forged" >&2; exit 4; }
+tree=$(git rev-parse "$sha^{tree}") || exit 2
+ran=$(sed -n 's/.*"tree_oid":"\([0-9a-f]*\)".*/\1/p' "$receipt" | head -1)
+[ "$ran" = "$tree" ] || { echo "refused: commit expected $tree (the tree of commit $sha) but got $ran" >&2; exit 3; }
+grep -q '"dirty":false' "$receipt" || { echo "refused: clean expected a clean run but got dirty true" >&2; exit 3; }
+if [ "${OHJAA_STUB_SYKLI_COMMIT:-}" != new ]; then
+  live=$(git rev-parse 'HEAD^{tree}')
+  if [ "$live" != "$tree" ] || [ -n "$(git status --porcelain -- . ':(exclude).sykli')" ]; then
+    echo "refused: tree expected $live but got $tree" >&2; exit 3
+  fi
+fi
+grep -q '"outcome":"passed"' "$receipt" || { echo "refused: outcome expected passed or cached with complete task records but got failed with 0 task records" >&2; exit 1; }
+exit 0
+"#;
+
 /// A session payload exactly as `toimija sessions --json` emits it.
 fn sessions_json(sessions: &str, coverage: &str) -> String {
     format!(
@@ -126,12 +209,12 @@ impl Fixture {
         make_executable(&stub);
         // Never the real gh: no network, and a controlled answer.
         let gh = stub_dir.join("gh");
-        fs::write(
-            &gh,
-            "#!/bin/sh\nif [ -n \"${OHJAA_STUB_GH_SLEEP:-}\" ]; then sleep \"$OHJAA_STUB_GH_SLEEP\"; fi\necho \"gh: To get started with GitHub CLI, please run:  gh auth login\" >&2\nexit 4\n",
-        )
-        .unwrap();
+        fs::write(&gh, GH_STUB).unwrap();
         make_executable(&gh);
+        // Never the real sykli: `verify --help` names --commit only on demand.
+        let sykli = stub_dir.join("sykli");
+        fs::write(&sykli, SYKLI_STUB).unwrap();
+        make_executable(&sykli);
         let fixture = Fixture { dir, stub_dir };
         // Default: an empty, fully available scan, in repos and outside them.
         fixture.set_sessions(&sessions_json("", "available"));
@@ -185,6 +268,24 @@ impl Fixture {
         run_git(&repo, &["config", "user.email", "ohjaa@example.invalid"]);
         run_git(&repo, &["config", "user.name", "Ohjaa Test"]);
         run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        repo
+    }
+
+    /// A Git repository whose only commit, and its reflog entry, are long
+    /// past: reflog times are whole seconds, and one written in the second a
+    /// session starts counts as written during it.
+    fn make_settled_git_repo(&self, name: &str) -> PathBuf {
+        let repo = self.make_repo(name);
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "ohjaa@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Ohjaa Test"]);
+        let status = Command::new("git")
+            .args(["commit", "-q", "--allow-empty", "-m", "init"])
+            .env("GIT_COMMITTER_DATE", "@1000000000 +0000")
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
         repo
     }
 
@@ -901,6 +1002,41 @@ fn run_briefs_knowledge_before_the_perimeter() {
 }
 
 #[test]
+fn a_scoped_repositorys_knowledge_alone_still_opens_with_the_preamble() {
+    let fixture = Fixture::new("preamble-alone");
+    let repo = fixture.make_git_repo("selected");
+    fixture.set_context(r#"{"repo":{"name":"selected","role":"selected role","not_roles":[]}}"#);
+    // No ours, mine or machine knowledge at all: only the scoped repository's.
+    fixture.node(
+        &repo.join(".ohjaa/knowledge"),
+        "repo-rule",
+        "decision",
+        "Selected repository rule.",
+    );
+    let (brief, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "brief",
+        "--scope",
+        repo.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    let preamble = brief
+        .find("Knowledge (ohjaa, knowledge-node.v1)")
+        .expect(&brief);
+    assert_eq!(
+        brief
+            .matches("Knowledge (ohjaa, knowledge-node.v1)")
+            .count(),
+        1,
+        "{brief}"
+    );
+    assert!(
+        preamble < brief.find("Selected repository rule.").unwrap(),
+        "said once, before the first knowledge: {brief}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
 fn startup_is_scoped_reuses_scans_and_delivers_repo_knowledge_from_the_root() {
     let fixture = Fixture::new("scoped-startup");
     let repo = fixture.make_git_repo("selected");
@@ -967,7 +1103,10 @@ fn startup_is_scoped_reuses_scans_and_delivers_repo_knowledge_from_the_root() {
     fs::write(fixture.dir.join("calls.txt"), "").unwrap();
     let (_, after, code) = launch();
     assert_eq!(code, Some(0), "{after}");
-    assert_eq!(after.len(), before.len());
+    // Its size, but not its numbers: a session id carries a pid, whose digits
+    // can grow by one between two launches.
+    let size = |text: &str| text.chars().filter(|c| !c.is_ascii_digit()).count();
+    assert_eq!(size(&after), size(&before));
     assert!(!after.contains("broken-unrelated"));
     assert!(!fs::read_to_string(fixture.dir.join("calls.txt"))
         .unwrap()
@@ -1657,7 +1796,7 @@ fn phases_are_observed_from_commits_and_their_sykli_receipts() {
         .find(|l| l.starts_with("phases"))
         .expect(&stderr);
     assert!(
-        phases.contains(" passed · ") && phases.ends_with("no sykli run"),
+        phases.contains(" receipt: passed · ") && phases.ends_with("no sykli receipt"),
         "{phases}"
     );
     fixture.cleanup();
@@ -1754,7 +1893,7 @@ fn run_outside_a_repo_launches_from_the_folder_and_says_what_it_cannot_see() {
     for said in [
         "is not a Git repository; 0 sibling session(s) in this folder at launch",
         "--scope /r/a is not inside a Git repository; nothing there is observed",
-        "no --scope names a repository, so nothing this agent does in one is",
+        "no --scope names a repository; at leaving, the repositories directly",
         "This folder is not a Git repository, and no --scope named one",
         "which is not one of these repositories",
         "would run: toimija run --intent 'sweep the fleet'",
@@ -1816,7 +1955,7 @@ fn a_root_session_records_the_commits_it_made_in_a_scoped_repo() {
         .find(|l| l.starts_with("in work") && l.contains(" phases "))
         .expect(&stderr);
     assert!(
-        phases.ends_with("no sykli run"),
+        phases.ends_with("no sykli receipt"),
         "the commit made in the scoped repo is its phase: {phases}"
     );
     assert!(
@@ -2397,7 +2536,11 @@ fn a_signal_during_leaving_cuts_it_short_and_the_record_is_still_written() {
             "--",
             "-c",
         ])
-        .arg(format!("touch '{}'; exit 0", mark.display()))
+        // A commit on a branch of its own, so leaving asks gh about its PR.
+        .arg(format!(
+            "git switch -q -c side && git commit -q --allow-empty -m side; touch '{}'; exit 0",
+            mark.display()
+        ))
         .env("OHJAA_STUB_RUN_AGENT", "1")
         .env("OHJAA_STUB_GH_SLEEP", "30")
         .current_dir(&repo)
@@ -2787,6 +2930,1505 @@ fn a_briefing_too_big_for_one_command_line_argument_is_refused_clearly() {
             && stderr.contains("refusing to launch")
             && !stderr.contains("would run:"),
         "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+// ---- where work happens (audit 2026-10-09): each test failed before its fix ----
+
+/// A shell function for stub agents: `receipt <outcome> [<contract hash>]`
+/// writes a sykli-receipt.v1 for HEAD's tree into this checkout, as `sykli
+/// run` does.
+const RECEIPT_FN: &str = r#"
+receipt() {
+  tree=$(git rev-parse 'HEAD^{tree}')
+  mkdir -p .sykli/receipts
+  printf '{"schema":"sykli-receipt.v1","contract_hash":"'"${2:-c}"'","started_at_ms":%s000,"subject":{"repository":"r","tree_oid":"%s","inputs_digest":"d","head_tree_oid":"%s","dirty":false},"tasks":[],"outcome":"%s"}' \
+    "$(date +%s)" "$tree" "$tree" "$1" > ".sykli/receipts/rcpt_$tree.json"
+}
+"#;
+
+fn short_head(dir: &Path) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[test]
+fn a_commit_made_in_a_worktree_is_a_phase_with_the_receipt_made_there() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("worktree");
+    let repo = fixture.make_git_repo("work");
+    let worktree = fixture.dir.join("_worktrees").join("work-feat");
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        git worktree add -q -b feat '{wt}'
+        cd '{wt}'
+        echo one > a.txt && git add a.txt && git commit -q -m 'worktree phase'
+        receipt passed",
+        wt = worktree.display()
+    );
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+    let commit = short_head(&worktree);
+    let phases = stderr
+        .lines()
+        .find(|l| l.starts_with("phases"))
+        .expect(&stderr);
+    assert!(
+        phases.contains(&commit) && phases.contains("passed") && phases.contains("in work-feat"),
+        "the worktree's commit is a phase, with the receipt sykli wrote there: {phases}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_root_launch_without_scope_records_the_repos_it_worked_in() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("root-found");
+    let folder = fixture.make_folder("projects");
+    let repo = fixture.make_settled_git_repo("projects/work");
+    fixture.make_settled_git_repo("projects/idle");
+    let worktree = folder.join("_worktrees").join("work-feat");
+    // A repository only found at leaving counts moves after the second the
+    // session started (nothing was read of it at entering); a real agent reads
+    // its briefing first.
+    let script = format!(
+        "set -e
+        sleep 1
+        cd '{repo}'
+        git worktree add -q -b feat '{wt}'
+        cd '{wt}'
+        echo x > f.txt && git add f.txt && git commit -q -m 'found work'
+        {ohjaa} handover --unfinished 'half the rename'",
+        repo = repo.display(),
+        wt = worktree.display(),
+        ohjaa = ohjaa_bin()
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa_in(&folder)
+            .args(["run", "sh", "--intent", "root work", "--no-briefing", "--"])
+            .args(["-c", &script])
+            .env("OHJAA_STUB_RUN_AGENT", "1"),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let commit = short_head(&worktree);
+    let observed = stderr
+        .lines()
+        .find(|l| l.starts_with("in work") && l.contains(" observed "))
+        .expect(&stderr);
+    assert!(
+        observed.contains("observed during the session, not attributed:")
+            && observed.contains(&commit)
+            && observed.contains("in work-feat"),
+        "what moved in a repository nobody named is observed, never credited: {observed}"
+    );
+    assert!(
+        !stderr
+            .lines()
+            .any(|l| l.starts_with("in work") && l.contains(" phases ")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("not named with --scope"),
+        "and says it was found, not named: {stderr}"
+    );
+    assert!(
+        !stderr.contains("in idle"),
+        "a repository nothing was made in is not: {stderr}"
+    );
+    assert!(!stderr.contains("none to observe"), "{stderr}");
+
+    // It never becomes that repository's last session; the root's says it.
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(!stdout.contains("Last session here"), "{stdout}");
+    let (stdout, _, _) = output_of(fixture.ohjaa_in(&folder).arg("brief"));
+    for said in [
+        "Last session here (oh-",
+        "- in work: 1 commit(s) observed during the session, not attributed (found at leaving)",
+        "- unfinished: half the rename",
+    ] {
+        assert!(stdout.contains(said), "missing `{said}`: {stdout}");
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn a_scope_naming_the_folder_of_repos_records_the_ones_that_moved() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("scope-folder");
+    let launch = fixture.make_git_repo("launch");
+    let folder = fixture.make_folder("projects");
+    let repo = fixture.make_settled_git_repo("projects/work");
+    let script = format!(
+        "sleep 1; cd '{}' && echo x > f.txt && git add f.txt && git commit -q -m 'in a named folder'",
+        repo.display()
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent", "x", "--no-briefing", "--scope"])
+            .arg(&folder)
+            .args(["--", "-c", &script])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&launch),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(
+            "is not inside a Git repository; at leaving, the repositories directly in it"
+        ),
+        "{stderr}"
+    );
+    let observed = stderr
+        .lines()
+        .find(|l| l.starts_with("in work") && l.contains(" observed "))
+        .expect(&stderr);
+    assert!(observed.contains(&short_head(&repo)), "{observed}");
+    fixture.cleanup();
+}
+
+/// A session whose agent commits on branch `feat` in a new worktree `name`
+/// of `repo`, with a sykli contract, and writes a receipt with `receipt`'s
+/// arguments; gh reports a pull request for `feat`. Returns the record and
+/// the commit.
+fn pull_request_session(
+    fixture: &Fixture,
+    repo: &Path,
+    name: &str,
+    receipt: &str,
+    sykli_commit: bool,
+) -> (String, String) {
+    let worktree = fixture.dir.join("_worktrees").join(name);
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        git worktree add -q -b feat-{name} '{wt}'
+        cd '{wt}'
+        echo '{{}}' > sykli.json && echo '{name}' > name.txt
+        git add sykli.json name.txt && git commit -q -m 'ship {name}'
+        receipt {receipt}",
+        wt = worktree.display()
+    );
+    let mut command = fixture.ohjaa();
+    command
+        .args([
+            "run",
+            "sh",
+            "--intent",
+            "ship",
+            "--no-briefing",
+            "--",
+            "-c",
+            &script,
+        ])
+        .env("OHJAA_STUB_RUN_AGENT", "1")
+        .env("OHJAA_STUB_GH_PR_BRANCH", format!("feat-{name}"))
+        .env(
+            "OHJAA_STUB_SYKLI_CALLS",
+            fixture.dir.join("sykli-calls.txt"),
+        )
+        .current_dir(repo);
+    if sykli_commit {
+        command.env("OHJAA_STUB_SYKLI_COMMIT", "1");
+    }
+    let (_, stderr, code) = output_of(&mut command);
+    assert_eq!(code, Some(0), "{stderr}");
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&worktree)
+        .output()
+        .unwrap();
+    (
+        stderr,
+        String::from_utf8_lossy(&head.stdout).trim().to_owned(),
+    )
+}
+
+fn finished_line(record: &str) -> &str {
+    record
+        .lines()
+        .find(|l| l.starts_with("finished"))
+        .expect(record)
+}
+
+#[test]
+fn the_pull_request_head_is_verified_by_sykli_never_by_the_receipts_word() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("pr-head");
+    let repo = fixture.make_git_repo("work");
+
+    // The receipt says passed; sykli refuses it. The record says what sykli said.
+    let (record, head) = pull_request_session(&fixture, &repo, "forged", "passed forged", true);
+    let finished = finished_line(&record);
+    assert!(
+        finished.contains("https://github.com/o/r/pull/7 (open)")
+            && finished.contains(&format!("head {}", &head[..7]))
+            && finished
+                .contains("FAILED sykli verify: refused: contract expected c but got forged"),
+        "{finished}"
+    );
+    assert!(!finished.contains("passed"), "{finished}");
+    let calls = fs::read_to_string(fixture.dir.join("sykli-calls.txt")).unwrap();
+    assert!(
+        calls.contains(&format!("--contract sykli.json --commit {head}")),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("_worktrees/forged|verify "),
+        "sykli verifies in the checkout the receipt is in: {calls}"
+    );
+
+    // An honest receipt, verified by a sykli that can bind a commit.
+    let (record, head) = pull_request_session(&fixture, &repo, "honest", "passed", true);
+    assert!(
+        finished_line(&record).ends_with(&format!(
+            "head {}: verified: passed (sykli verify --commit)",
+            &head[..7]
+        )),
+        "{record}"
+    );
+
+    // The same receipt with a sykli that cannot: never a silent pass.
+    let (record, _) = pull_request_session(&fixture, &repo, "old-sykli", "passed", false);
+    assert!(
+        finished_line(&record).ends_with("unverified: sykli has no --commit"),
+        "{record}"
+    );
+    assert!(
+        !record.contains("FLAGGED"),
+        "a sykli that cannot say flags nothing: {record}"
+    );
+    fixture.cleanup();
+}
+
+/// A clone of a bare origin whose `main` has one commit, as `origin/main`.
+fn clone_with_origin(fixture: &Fixture, name: &str) -> PathBuf {
+    let origin = fixture.dir.join(format!("{name}-origin.git"));
+    let status = Command::new("git")
+        .args(["init", "-q", "--bare", "-b", "main"])
+        .arg(&origin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let repo = fixture.dir.join(name);
+    let status = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(&origin)
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    run_git(&repo, &["config", "user.email", "ohjaa@example.invalid"]);
+    run_git(&repo, &["config", "user.name", "Ohjaa Test"]);
+    // Long before the session, as far as reflog times say.
+    for args in [
+        &["commit", "-q", "--allow-empty", "-m", "init"][..],
+        &["push", "-q", "origin", "HEAD:main"],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .env("GIT_COMMITTER_DATE", "@1000000000 +0000")
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{status:?}");
+    }
+    run_git(&repo, &["remote", "set-head", "origin", "main"]);
+    repo
+}
+
+/// A session in a worktree of `repo` that runs `work` there, with the stub
+/// sykli in `mode` (`""`: no --commit). Returns the record and the worktree.
+fn worktree_push_session(
+    fixture: &Fixture,
+    repo: &Path,
+    name: &str,
+    work: &str,
+    mode: &str,
+) -> (String, PathBuf) {
+    let worktree = fixture.dir.join("_worktrees").join(name);
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        git worktree add -q -b {name} '{wt}'
+        cd '{wt}'
+        {work}",
+        wt = worktree.display()
+    );
+    let mut command = fixture.ohjaa();
+    command
+        .args([
+            "run",
+            "sh",
+            "--intent",
+            name,
+            "--no-briefing",
+            "--",
+            "-c",
+            &script,
+        ])
+        .env("OHJAA_STUB_RUN_AGENT", "1")
+        .current_dir(repo);
+    if !mode.is_empty() {
+        command.env("OHJAA_STUB_SYKLI_COMMIT", mode);
+    }
+    let (_, stderr, code) = output_of(&mut command);
+    assert_eq!(code, Some(0), "{stderr}");
+    (stderr, worktree)
+}
+
+fn short_of(dir: &Path, rev: &str) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", "--short=7", rev])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn landed_lines(record: &str) -> Vec<&str> {
+    record.lines().filter(|l| l.starts_with("landed")).collect()
+}
+
+#[test]
+fn a_commit_passes_when_any_receipt_of_its_tree_verifies() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("receipts-per-tree");
+    let repo = clone_with_origin(&fixture, "work");
+    // A passing run of the commit's contract, then a newer passing run of
+    // the same tree under another contract (a demo, say), which sykli
+    // refuses for that commit.
+    let (record, wt) = worktree_push_session(
+        &fixture,
+        &repo,
+        "two-runs",
+        "echo '{}' > sykli.json && git add sykli.json && git commit -q -m checked
+        receipt passed
+        mv .sykli/receipts/rcpt_*.json .sykli/receipts/rcpt_the_contract.json
+        sleep 1
+        receipt passed forged
+        git push -q origin HEAD:main",
+        "new",
+    );
+    assert!(
+        landed_lines(&record).concat().contains(&format!(
+            "{} reached origin/main: verified: passed (sykli verify --commit)",
+            short_of(&wt, "HEAD")
+        )),
+        "a newer receipt of the tree never shadows a pass: {record}"
+    );
+    assert!(!record.contains("FLAGGED"), "{record}");
+    // Refused only when every receipt of its tree is.
+    let (record, _) = worktree_push_session(
+        &fixture,
+        &repo,
+        "all-refused",
+        "git pull -q origin main && echo x > x.txt && git add x.txt && git commit -q -m x
+        receipt passed forged
+        mv .sykli/receipts/rcpt_*.json .sykli/receipts/rcpt_one.json
+        sleep 1
+        receipt failed
+        git push -q origin HEAD:main",
+        "new",
+    );
+    assert!(
+        landed_lines(&record)
+            .concat()
+            .contains("FAILED sykli verify: refused:"),
+        "{record}"
+    );
+    assert!(record.contains("─ FLAGGED"), "{record}");
+    fixture.cleanup();
+}
+
+#[test]
+fn the_documented_flow_pushed_to_main_is_verified_at_its_tip_and_raises_nothing() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("landed");
+    let repo = clone_with_origin(&fixture, "work");
+    // Each phase a commit and a sykli run; then one push.
+    let (record, worktree) = worktree_push_session(
+        &fixture,
+        &repo,
+        "flow",
+        "echo '{}' > sykli.json && git add sykli.json && git commit -q -m one
+        receipt passed
+        echo x > x.txt && git add x.txt && git commit -q -m two
+        receipt passed
+        git push -q origin HEAD:main",
+        "1",
+    );
+    let (one, two) = (short_of(&worktree, "HEAD~1"), short_of(&worktree, "HEAD"));
+    assert_eq!(
+        landed_lines(&record),
+        [
+            format!("landed        {one} reached origin/main: receipt: passed (not verified: only a push's tip is)"),
+            format!("landed        {two} reached origin/main: verified: passed (sykli verify --commit)"),
+        ],
+        "{record}"
+    );
+    assert!(
+        !record.contains("FLAGGED") && !record.contains("ohjaa: flagged"),
+        "{record}"
+    );
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(!stdout.contains("WARNING"), "{stdout}");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_push_to_main_with_no_sykli_run_where_there_is_a_contract_warns() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("unchecked-push");
+    let repo = clone_with_origin(&fixture, "work");
+    let (record, wt) = worktree_push_session(
+        &fixture,
+        &repo,
+        "unchecked",
+        "echo '{}' > sykli.json && git add sykli.json && git commit -q -m 'no run'
+        git push -q origin HEAD:main",
+        "new",
+    );
+    let warning = format!(
+        "origin/main at {} in work has no passing evidence — check before building on it",
+        short_of(&wt, "HEAD")
+    );
+    assert!(
+        record.contains("─ FLAGGED") && record.contains(&warning),
+        "{record}"
+    );
+    assert!(
+        record.contains("unchecked: no sykli receipt for its tree"),
+        "{record}"
+    );
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(
+        stdout.starts_with("WARNING from the last session here") && stdout.contains(&warning),
+        "{stdout}"
+    );
+    // A commit with no contract has nothing to run: recorded, never flagged,
+    // and main has moved on from the unchecked commit.
+    let (record, _) = worktree_push_session(
+        &fixture,
+        &repo,
+        "no-contract",
+        "git pull -q origin main && git rm -q sykli.json && git commit -q -m 'drop the contract'
+        git push -q origin HEAD:main",
+        "new",
+    );
+    assert!(
+        landed_lines(&record)
+            .concat()
+            .contains("unverified: no sykli contract"),
+        "{record}"
+    );
+    assert!(!record.contains("FLAGGED"), "{record}");
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(!stdout.contains("WARNING"), "{stdout}");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_broken_main_pushed_from_a_shared_clone_warns_whoever_pushed_it() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("shared-failing");
+    let repo = clone_with_origin(&fixture, "work");
+    let mark = |name: &str| fixture.dir.join(name);
+    // Y sits idle in the clone while X, in a worktree of its own, pushes a
+    // failing commit to main past every hook: neither is shown to have done it.
+    let idle = format!(
+        "touch '{}'; while [ ! -e '{}' ]; do sleep 0.1; done",
+        mark("y-started").display(),
+        mark("x-done").display()
+    );
+    let broken = format!(
+        "{RECEIPT_FN}
+        set -e
+        while [ ! -e '{y}' ]; do sleep 0.1; done
+        sleep 1
+        git worktree add -q -b x '{wt}' origin/main
+        cd '{wt}'
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q --no-verify -m broken
+        receipt failed
+        git push -q --no-verify origin HEAD:main
+        touch '{done}'",
+        y = mark("y-started").display(),
+        wt = fixture.dir.join("_worktrees").join("x").display(),
+        done = mark("x-done").display()
+    );
+    let launch = |intent: &str, script: &str| {
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                intent,
+                "--no-briefing",
+                "--",
+                "-c",
+                script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .current_dir(&repo)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let y = launch("y", &idle);
+    let x = launch("x", &broken);
+    let records: Vec<String> = [x, y]
+        .into_iter()
+        .map(|child| {
+            String::from_utf8_lossy(&child.wait_with_output().unwrap().stderr).into_owned()
+        })
+        .collect();
+    let warning = format!(
+        "origin/main at {} in work has no passing evidence (observed, not attributed) — check \
+         before building on it",
+        short_of(&repo, "origin/main")
+    );
+    for record in &records {
+        assert!(
+            record.contains("(not attributed)"),
+            "neither session is shown to have pushed it: {record}"
+        );
+        assert!(
+            record.contains("─ FLAGGED") && record.contains(&warning),
+            "a broken main is said whoever pushed it: {record}"
+        );
+        assert!(
+            record.contains("FAILED sykli verify: refused: outcome"),
+            "{record}"
+        );
+    }
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(
+        stdout.starts_with("WARNING from the last session here") && stdout.contains(&warning),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn what_sykli_could_not_check_is_recorded_and_never_flagged() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("not-flagged");
+    let repo = clone_with_origin(&fixture, "work");
+    let quiet = |record: &str| {
+        assert!(
+            !record.contains("FLAGGED") && !record.contains("ohjaa: flagged"),
+            "{record}"
+        );
+    };
+    // A stray file beside the commit: sykli#67 as it stands checks the
+    // checkout, not the commit.
+    let (record, wt) = worktree_push_session(
+        &fixture,
+        &repo,
+        "stray",
+        "echo '{}' > sykli.json && git add sykli.json && git commit -q -m checked
+        receipt passed
+        git push -q origin HEAD:main
+        echo scratch > notes.txt",
+        "1",
+    );
+    assert!(
+        landed_lines(&record).concat().contains(&format!(
+            "{} reached origin/main: stale: sykli checked the checkout, not the commit",
+            short_of(&wt, "HEAD")
+        )),
+        "{record}"
+    );
+    quiet(&record);
+    // A sykli without --commit cannot say.
+    let (record, _) = worktree_push_session(
+        &fixture,
+        &repo,
+        "old-sykli",
+        "git pull -q origin main && echo y > y.txt && git add y.txt && git commit -q -m y
+        receipt passed
+        git push -q origin HEAD:main",
+        "",
+    );
+    assert!(
+        landed_lines(&record)
+            .concat()
+            .contains("unverified: sykli has no --commit"),
+        "{record}"
+    );
+    quiet(&record);
+    // And nothing of it opens the next briefing.
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(!stdout.contains("WARNING"), "{stdout}");
+    // The commit-based sykli passes the stray-file case.
+    let (record, _) = worktree_push_session(
+        &fixture,
+        &repo,
+        "stray-new",
+        "git pull -q origin main && echo w > w.txt && git add w.txt && git commit -q -m w
+        receipt passed
+        git push -q origin HEAD:main
+        echo scratch > notes.txt",
+        "new",
+    );
+    assert!(
+        landed_lines(&record).concat().contains("verified: passed"),
+        "{record}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_failing_commit_pushed_to_main_flags_the_record_and_tops_the_next_briefing() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("loud");
+    let repo = clone_with_origin(&fixture, "work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'broken build'
+        receipt failed
+        git push -q origin HEAD:main
+        {ohjaa} handover --next 'ship it'",
+        ohjaa = ohjaa_bin()
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "push",
+                "--no-briefing",
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "the agent's exit is still ohjaa's: {stderr}");
+    let pushed = short_head(&repo);
+    let warning = format!(
+        "origin/main at {pushed} in work has no passing evidence — check before building on it"
+    );
+    let flagged = stderr.find("─ FLAGGED").expect(&stderr);
+    assert!(
+        flagged < stderr.find("─ observed").unwrap(),
+        "the flag comes first in the record: {stderr}"
+    );
+    assert!(stderr.contains(&warning), "{stderr}");
+    assert!(
+        stderr.contains("FAILED sykli verify: refused: outcome expected passed"),
+        "it says why: {stderr}"
+    );
+    assert!(
+        stderr
+            .trim_end()
+            .ends_with(&format!("ohjaa: flagged: {warning}")),
+        "and says it again last, where the person reads: {stderr}"
+    );
+
+    // The next agent hears it before anything else, the handover included.
+    let (_, stderr, _) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "codex", "--intent", "next", "--dry-run"])
+            .current_dir(&repo),
+    );
+    let briefing = &stderr[stderr.find("--briefing '").expect(&stderr) + 12..];
+    assert!(
+        briefing.starts_with("WARNING from the last session here (oh-"),
+        "{briefing}"
+    );
+    let top = briefing.lines().take(2).collect::<Vec<_>>().join("\n");
+    assert!(top.contains(&warning), "{top}");
+    assert!(
+        briefing.find(&warning).unwrap() < briefing.find("ship it").unwrap(),
+        "{briefing}"
+    );
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(
+        stdout.starts_with("WARNING from the last session here"),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_session_whose_ohjaa_was_killed_is_closed_as_orphaned_at_the_next_launch() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("orphan");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let agent_pid = fixture.dir.join("agent.pid");
+    let mut child = spawn_session(
+        &fixture,
+        &repo,
+        &format!("echo $$ > '{}'; exec sleep 30", agent_pid.display()),
+    );
+    signal(child.id(), "KILL");
+    let _ = child.wait();
+    // The agent outlives a SIGKILLed ohjaa; stop it, as a person would.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !agent_pid.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let pid = fs::read_to_string(&agent_pid).unwrap();
+    signal(pid.trim().parse().unwrap(), "KILL");
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("session").current_dir(&repo));
+    let orphan = stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("oh-"))
+        .and_then(|rest| rest.split(' ').next())
+        .map(|rest| format!("oh-{rest}"))
+        .expect(&stdout);
+
+    // The next launch closes it, says so, queues it and briefs with it.
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent", "next", "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!("ohjaa: session {orphan} (sh, started "))
+            && stderr.contains("was left open by an ohjaa that is gone; closed as orphaned"),
+        "{stderr}"
+    );
+    let briefing = fixture.argv().join("\n");
+    assert!(
+        briefing.contains(&format!("ORPHANED: session {orphan} (sh, long)")),
+        "{briefing}"
+    );
+    let (stdout, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["session", &orphan])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0));
+    assert!(
+        stdout.contains("ended: orphaned (observed at next launch)")
+            && stdout.contains("phases        not observed (its ohjaa was gone before leaving)"),
+        "{stdout}"
+    );
+    // Queued for intake, like any ended session.
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ncat > {}\necho '[]'\n",
+            fixture.dir.join("prompt.txt").display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--source", "transcripts", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("2 ended session(s) queued for drafting"),
+        "the orphan and the session that closed it: {stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn intake_drafts_from_what_ohjaa_observed_going_wrong_not_only_the_handover() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("anomalies");
+    let repo = clone_with_origin(&fixture, "work");
+    // A commit sykli refuses pushed to main, a failing exit, and no handover.
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m broken
+        receipt failed
+        git push -q origin HEAD:main
+        exit 3"
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "hurry",
+                "--no-briefing",
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(3), "{stderr}");
+    let pushed = short_head(&repo);
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ncat > {}\necho '[]'\n",
+            fixture.dir.join("prompt.txt").display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--source", "transcripts", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let prompt = fs::read_to_string(fixture.dir.join("prompt.txt")).unwrap();
+    for said in [
+        " · observed · ",
+        &format!(
+            "origin/main at {pushed} in work has no passing evidence — check before building on it \
+             (FAILED sykli verify: refused: outcome expected passed"
+        ),
+        "the agent exited with code 3",
+        "the agent left no handover",
+    ] {
+        assert!(prompt.contains(said), "missing `{said}`: {prompt}");
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn a_warning_about_main_stands_while_main_is_still_at_the_flagged_commit() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("standing");
+    let repo = clone_with_origin(&fixture, "work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let session = |script: &str| {
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "run",
+                    "sh",
+                    "--intent",
+                    "x",
+                    "--no-briefing",
+                    "--",
+                    "-c",
+                    script,
+                ])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+    };
+    let briefing = || {
+        let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+        stdout
+    };
+    session(&format!(
+        "{RECEIPT_FN}
+        set -e
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m broken
+        receipt failed
+        git push -q origin HEAD:main"
+    ));
+    let flagged = short_head(&repo);
+    // A later session that changes nothing is now the last session here.
+    session(&format!(
+        "sleep 1; {} handover --next 'all quiet'",
+        ohjaa_bin()
+    ));
+    let text = briefing();
+    assert!(
+        text.starts_with("WARNING from an earlier session here (oh-")
+            && text.contains(&format!(
+                "origin/main at {flagged} in work has no passing evidence"
+            )),
+        "main still sits at the flagged commit: {text}"
+    );
+    // Main moves on, with passing evidence: the warning has nothing left to say.
+    session(&format!(
+        "{RECEIPT_FN}
+        set -e
+        sleep 1
+        echo fixed > fix.txt && git add fix.txt && git commit -q -m fixed
+        receipt passed
+        git push -q origin HEAD:main"
+    ));
+    let text = briefing();
+    assert!(!text.contains("WARNING"), "{text}");
+    fixture.cleanup();
+}
+
+#[test]
+fn the_pull_request_is_the_one_for_the_sessions_own_branch_never_the_checkouts() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("own-pr");
+    let repo = clone_with_origin(&fixture, "work");
+    // The main checkout sits on another session's branch, which has a PR.
+    run_git(&repo, &["switch", "-q", "-c", "theirs"]);
+    let session = |script: &str, branch: &str| {
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "run",
+                    "sh",
+                    "--intent",
+                    "x",
+                    "--no-briefing",
+                    "--",
+                    "-c",
+                    script,
+                ])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+                .env("OHJAA_STUB_GH_PR_BRANCH", branch)
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        stderr
+    };
+    // A session that made nothing does not inherit the checkout's PR.
+    let record = session("exit 0", "theirs");
+    assert_eq!(
+        finished_line(&record),
+        "finished      unknown (not looked up: this session made no commit on a branch)",
+        "{record}"
+    );
+    assert!(!record.contains("pull/7"), "{record}");
+    // A commit on its own branch in a worktree removed since: that branch's PR.
+    let wt = fixture.dir.join("_worktrees").join("feat3");
+    let record = session(
+        &format!(
+            "set -e; sleep 1; git worktree add -q -b feat3 '{wt}' origin/main; cd '{wt}'
+            echo a > a.txt && git add a.txt && git commit -q -m a
+            cd '{repo}' && git worktree remove '{wt}'",
+            wt = wt.display(),
+            repo = repo.display()
+        ),
+        "feat3",
+    );
+    assert!(
+        finished_line(&record).starts_with("finished      https://github.com/o/r/pull/7 (open)"),
+        "{record}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_squash_merged_and_cleaned_up_pull_request_is_still_found() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("squashed");
+    let repo = clone_with_origin(&fixture, "work");
+    let wt = fixture.dir.join("_worktrees").join("feat4");
+    // The standard flow: push the branch, squash-merge, delete everything.
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        git worktree add -q -b feat4 '{wt}' origin/main
+        cd '{wt}'
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'the work'
+        receipt passed
+        git push -q origin HEAD:feat4
+        git rev-parse HEAD > '{mark}'
+        cd '{repo}' && git worktree remove --force '{wt}' && git branch -q -D feat4",
+        wt = wt.display(),
+        repo = repo.display(),
+        mark = fixture.dir.join("sha").display()
+    );
+    let mark = fixture.dir.join("sha");
+    // gh finds it by the commit only once the branch name is gone everywhere.
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "x",
+                "--no-briefing",
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+            .env("OHJAA_STUB_GH_PR_BRANCH", "feat4")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let sha = fs::read_to_string(&mark).unwrap().trim().to_owned();
+    let phases = stderr
+        .lines()
+        .find(|l| l.starts_with("phases"))
+        .expect(&stderr);
+    assert!(
+        phases.contains(&sha[..7]),
+        "the pushed commit is still the session's work: {phases}"
+    );
+    assert!(
+        finished_line(&stderr).starts_with("finished      https://github.com/o/r/pull/7"),
+        "found by the branch the push named: {stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_push_from_a_worktree_removed_since_is_never_shouted_for_its_lost_receipt() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("gone-worktree");
+    let repo = clone_with_origin(&fixture, "work");
+    // The house flow: a worktree off origin/main, a commit and its run, a push
+    // to main, then the worktree and its branch go, and its `.sykli/` with it.
+    // With `keep`, sykli's pre-push hook keeps the receipt that verified the
+    // push under the git common dir.
+    let session = |name: &str, keep: bool| {
+        let wt = fixture.dir.join("_worktrees").join(name);
+        let script = format!(
+            "{RECEIPT_FN}
+            set -e
+            git fetch -q origin
+            git worktree add -q -b {name} '{wt}' origin/main
+            cd '{wt}'
+            echo {name} > {name}.txt && echo '{{}}' > sykli.json
+            git add {name}.txt sykli.json && git commit -q -m {name}
+            receipt passed
+            if [ {keep} = true ]; then
+              common=$(cd \"$(git rev-parse --git-common-dir)\" && pwd)
+              mkdir -p \"$common/sykli/receipts\" && cp .sykli/receipts/*.json \"$common/sykli/receipts/\"
+            fi
+            git push -q origin HEAD:main
+            cd '{repo}' && git worktree remove --force '{wt}' && git branch -q -D {name}",
+            wt = wt.display(),
+            repo = repo.display(),
+        );
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "run",
+                    "sh",
+                    "--intent",
+                    name,
+                    "--no-briefing",
+                    "--",
+                    "-c",
+                    &script,
+                ])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        stderr
+    };
+    let brief = || output_of(fixture.ohjaa().arg("brief").current_dir(&repo)).0;
+    // No receipt anywhere any more: it cannot be observed, so it is not said.
+    let record = session("gone", false);
+    let tip = short_of(&repo, "origin/main");
+    assert!(
+        landed_lines(&record).concat().contains(&format!(
+            "{tip} reached origin/main: unchecked: no sykli receipt, and the checkout it was \
+             made in is gone"
+        )),
+        "{record}"
+    );
+    assert!(!record.contains("FLAGGED"), "{record}");
+    assert!(!brief().contains("WARNING"));
+    // The receipt sykli kept under the common dir verifies it.
+    let record = session("kept", true);
+    assert!(
+        landed_lines(&record)
+            .concat()
+            .contains("verified: passed (sykli verify --commit)"),
+        "{record}"
+    );
+    assert!(!record.contains("FLAGGED"), "{record}");
+    assert!(!brief().contains("WARNING"));
+    fixture.cleanup();
+}
+
+#[test]
+fn a_stash_is_never_taken_for_lost_work() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("stash");
+    let repo = clone_with_origin(&fixture, "work");
+    fs::write(repo.join("tracked.txt"), "one").unwrap();
+    run_git(&repo, &["add", "tracked.txt"]);
+    run_git(&repo, &["commit", "-q", "-m", "tracked"]);
+    let calls = fixture.dir.join("gh-calls.txt");
+    // A stash and its pop write commits no reference names afterwards.
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "x",
+                "--no-briefing",
+                "--",
+                "-c",
+                "set -e; sleep 1; echo two > tracked.txt; git stash -q; git stash pop -q",
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_GH_CALLS", &calls)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("phases        no commits") && !stderr.contains("on no branch now"),
+        "{stderr}"
+    );
+    assert_eq!(
+        finished_line(&stderr),
+        "finished      unknown (not looked up: this session made no commit on a branch)",
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_squash_merged_pull_request_is_found_by_its_commit_once_every_ref_is_pruned() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("pruned");
+    let repo = clone_with_origin(&fixture, "work");
+    let origin = fixture.dir.join("work-origin.git");
+    let wt = fixture.dir.join("_worktrees").join("feat5");
+    let mark = fixture.dir.join("sha");
+    // Squash-merged on the forge, which deletes the branch; then everything
+    // here goes too, the remote-tracking branch and its reflog by a prune.
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        git worktree add -q -b feat5 '{wt}' origin/main
+        cd '{wt}'
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'the work'
+        receipt passed
+        git push -q origin HEAD:feat5
+        git rev-parse HEAD > '{mark}'
+        cd '{repo}' && git worktree remove --force '{wt}' && git branch -q -D feat5
+        git -C '{origin}' branch -q -D feat5
+        git fetch -q --prune
+        ! git rev-parse -q --verify refs/remotes/origin/feat5",
+        wt = wt.display(),
+        repo = repo.display(),
+        origin = origin.display(),
+        mark = mark.display()
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "x",
+                "--no-briefing",
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_GH_PR_SEARCH_FILE", &mark)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let sha = fs::read_to_string(&mark).unwrap().trim().to_owned();
+    let phases = stderr
+        .lines()
+        .find(|l| l.starts_with("phases"))
+        .expect(&stderr);
+    assert!(
+        phases.contains(&format!("{} ", &sha[..7])) && phases.contains("(on no branch now)"),
+        "found in the object store, though no reference names it: {phases}"
+    );
+    assert!(
+        finished_line(&stderr).starts_with("finished      https://github.com/o/r/pull/8 (merged)"),
+        "found by its commit: {stderr}"
+    );
+    fixture.cleanup();
+}
+
+/// Wait until `path` exists (another process's mark), for at most 20 s.
+fn wait_for(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never came",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_hand_push_during_a_root_session_is_never_credited_to_it() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("hand-push");
+    let folder = fixture.make_folder("projects");
+    let plain = clone_with_origin(&fixture, "projects/plain");
+    // The root session only waits. Meanwhile someone commits, runs sykli
+    // (it fails) and pushes to main by hand.
+    let started = fixture.dir.join("started");
+    let done = fixture.dir.join("done");
+    let child = fixture
+        .ohjaa_in(&folder)
+        .args(["run", "sh", "--intent", "wait", "--no-briefing", "--", "-c"])
+        .arg(format!(
+            "touch '{}'; while [ ! -e '{}' ]; do sleep 0.1; done",
+            started.display(),
+            done.display()
+        ))
+        .env("OHJAA_STUB_RUN_AGENT", "1")
+        .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(&started);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let by_hand = format!(
+        "{RECEIPT_FN}
+        set -e
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'by hand'
+        receipt failed
+        git push -q origin HEAD:main"
+    );
+    let status = Command::new("sh")
+        .args(["-c", &by_hand])
+        .current_dir(&plain)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    fs::write(&done, "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    let record = String::from_utf8_lossy(&output.stderr);
+    let pushed = short_head(&plain);
+    assert!(
+        record.contains("in plain")
+            && record.contains("observed during the session, not attributed"),
+        "{record}"
+    );
+    // The broken main is the repository's state, whoever pushed it: said,
+    // never as this session's.
+    let warning = format!(
+        "origin/main at {pushed} in plain has no passing evidence (observed, not attributed) — \
+         check before building on it"
+    );
+    assert!(record.contains(&warning), "{record}");
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&plain));
+    assert!(
+        stdout.starts_with("WARNING from a session that observed this repository")
+            && stdout.contains(&warning)
+            && !stdout.contains("Last session here"),
+        "the root session is not plain's last session, but plain's main is broken: {stdout}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("shared-checkout");
+    let repo = fixture.make_git_repo("work");
+    let mark = |name: &str| fixture.dir.join(name);
+    let agent = |me: &str, other: &str| {
+        format!(
+            "set -e
+            touch '{started}'
+            while [ ! -e '{their_start}' ]; do sleep 0.1; done
+            sleep 1
+            git worktree add -q -b {me} '{wt}'
+            cd '{wt}' && echo {me} > {me}.txt && git add {me}.txt && git commit -q -m {me}
+            git rev-parse --short=7 HEAD > '{sha}'
+            touch '{done}'
+            while [ ! -e '{their_done}' ]; do sleep 0.1; done",
+            started = mark(&format!("{me}-started")).display(),
+            their_start = mark(&format!("{other}-started")).display(),
+            wt = fixture.dir.join("_worktrees").join(me).display(),
+            sha = mark(&format!("{me}-sha")).display(),
+            done = mark(&format!("{me}-done")).display(),
+            their_done = mark(&format!("{other}-done")).display(),
+        )
+    };
+    let launch = |me: &str, other: &str| {
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                me,
+                "--no-briefing",
+                "--",
+                "-c",
+                &agent(me, other),
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let x = launch("x", "y");
+    let y = launch("y", "x");
+    let records: Vec<String> = [x, y]
+        .into_iter()
+        .map(|child| {
+            String::from_utf8_lossy(&child.wait_with_output().unwrap().stderr).into_owned()
+        })
+        .collect();
+    let sha = |me: &str| {
+        fs::read_to_string(mark(&format!("{me}-sha")))
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    for (record, theirs) in records.iter().zip(["y", "x"]) {
+        let phases = record
+            .lines()
+            .find(|l| l.starts_with("phases"))
+            .expect(record);
+        assert!(
+            !phases.contains(&sha(theirs)),
+            "a session never claims the other's commit: {phases}\n{record}"
+        );
+        assert!(
+            record.contains("shared        with oh-"),
+            "and says why: {record}"
+        );
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn a_session_keeps_its_own_commits_in_a_checkout_another_session_has_left() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("takeover");
+    let repo = fixture.make_git_repo("work");
+    let mark = |name: &str| fixture.dir.join(name);
+    let spawn = |intent: &str, script: String| {
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                intent,
+                "--no-briefing",
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    // P is here first, and leaves while S is still working.
+    let p = spawn(
+        "p",
+        format!(
+            "touch '{}'; while [ ! -e '{}' ]; do sleep 0.1; done",
+            mark("p-started").display(),
+            mark("s-started").display()
+        ),
+    );
+    wait_for(&mark("p-started"));
+    let s = spawn(
+        "s",
+        format!(
+            "set -e; touch '{}'; while [ ! -e '{}' ]; do sleep 0.1; done; sleep 2
+            git commit -q --allow-empty -m 'after p left'; git rev-parse --short=7 HEAD > '{}'",
+            mark("s-started").display(),
+            mark("p-left").display(),
+            mark("s-sha").display()
+        ),
+    );
+    let _ = p.wait_with_output().unwrap();
+    fs::write(mark("p-left"), "").unwrap();
+    let record = String::from_utf8_lossy(&s.wait_with_output().unwrap().stderr).into_owned();
+    let sha = fs::read_to_string(mark("s-sha")).unwrap().trim().to_owned();
+    let phases = record
+        .lines()
+        .find(|l| l.starts_with("phases"))
+        .expect(&record);
+    assert!(
+        phases.contains(&sha),
+        "made after the other session left: its own: {phases}\n{record}"
     );
     fixture.cleanup();
 }

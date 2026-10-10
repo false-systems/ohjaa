@@ -17,6 +17,7 @@
 //! ending. The two things an agent writes — the read-back and the handover —
 //! are kept, and shown, as its testimony.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -71,12 +72,72 @@ pub struct Evidence {
 }
 
 /// One phase of work: a commit, and what sykli saw on it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Phase {
     pub commit: String,
     pub subject: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Evidence>,
+    /// The branch it was made on, or that a push from here named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The commit's tree, which a sykli receipt names; older records omit it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tree: String,
+    /// The checkout it was made in, when that is not the repository the
+    /// record is about (a worktree of it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// No reference or reflog names it any more (its branch, worktree and
+    /// remote-tracking branch were all deleted): found in the object store.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unreachable: bool,
+}
+
+/// What `sykli verify --commit` said about one commit. A receipt's own
+/// `outcome` is its claim; only this says passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum Check {
+    /// sykli verified a passing, clean receipt bound to exactly this commit.
+    Passed,
+    /// sykli refused it, in its own words.
+    Failed { why: String },
+    /// No sykli receipt names the commit's tree.
+    Unchecked,
+    /// No sykli receipt names the commit's tree, and the checkout it was
+    /// made in is gone, its receipts with it: what cannot be observed is
+    /// recorded, never asserted (law 3).
+    UncheckedGone,
+    /// sykli could not be asked: it has no `--commit`, is not installed, or
+    /// gave no answer in time; or the commit has no sykli contract.
+    Unverified { why: String },
+    /// sykli refused on the checkout it ran in, not on the commit: a sykli
+    /// that still compares the tree on disk, in a checkout that has moved on.
+    Stale { why: String },
+}
+
+/// A commit that reached the default branch during the session: one this
+/// session made that is on it now, or one it pushed to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Landed {
+    pub commit: String,
+    pub subject: String,
+    /// The branch it reached: `origin/main`, or the local `main`.
+    pub onto: String,
+    /// What sykli said: asked only of the tip of each push (what a pre-push
+    /// Boundary gates); the commits before it are their receipts' word.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<Check>,
+    /// Its receipt, as the receipt says it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Evidence>,
+    /// The branch still sat at it when the session left.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub at_tip: bool,
+    /// It cannot be shown to be this session's: observed, never flagged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unattributed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,8 +150,15 @@ pub enum Finished {
     PullRequest {
         url: String,
         state: String,
+        /// The receipt for its head's tree, as the receipt says it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_evidence: Option<Evidence>,
+        /// Its head commit; older records omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head: Option<String>,
+        /// What sykli said about its head; older records omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_check: Option<Check>,
     },
 }
 
@@ -121,6 +189,44 @@ pub struct Left {
     /// `--scope`, beyond the one it was launched in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scoped: Vec<ScopedLeft>,
+    /// The commits that reached the default branch of the launch repository
+    /// during the session, each with what sykli said about it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub landed: Vec<Landed>,
+    /// Commits made in the launch repository during the session that cannot
+    /// be shown to be its own (law 3): observed, never credited.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed: Vec<Phase>,
+    /// The other sessions that shared its places while it ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<String>,
+    /// Its ohjaa was gone before leaving could run (killed, crashed, or the
+    /// machine restarted: only its absence is observed): the session was
+    /// closed at a later launch that found it gone. `ended_ms` is when that
+    /// was observed, not when it ended, and nothing it did was observed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orphaned: bool,
+}
+
+impl Left {
+    /// The leaving of a session whose ohjaa is gone, observed at `now_ms`.
+    pub fn orphaned(now_ms: i64) -> Left {
+        Left {
+            ended_ms: now_ms,
+            exit: Exit::Unknown,
+            toimija_session: None,
+            phases: None,
+            finished: Finished::Unknown {
+                why: "its ohjaa was gone before leaving".to_owned(),
+            },
+            interrupted: false,
+            scoped: Vec::new(),
+            landed: Vec::new(),
+            observed: Vec::new(),
+            shared: Vec::new(),
+            orphaned: true,
+        }
+    }
 }
 
 /// A repository a session named with `--scope`, as it stood at entering. It
@@ -143,6 +249,20 @@ pub struct ScopedLeft {
     #[serde(default)]
     pub phases: Option<Vec<Phase>>,
     pub finished: Finished,
+    /// Not named with `--scope`: found at leaving, a repository directly in
+    /// the launch folder (or in a folder `--scope` named) whose branches or
+    /// checkouts moved while the session ran. Another agent may have moved
+    /// them, so it is said as found, never as named.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub found: bool,
+    /// As for the launch repository.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub landed: Vec<Landed>,
+    /// As for the launch repository; in a found one, every commit made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed: Vec<Phase>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<String>,
 }
 
 /// One session, entering to leaving.
@@ -182,6 +302,22 @@ pub struct Session {
     /// refusal is said, never shown as "not collected".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_refused: Option<String>,
+}
+
+impl Session {
+    /// When it ended, as far as that was observed, to rank the sessions in a
+    /// place: `None` while it runs. An orphan's end was never observed, only
+    /// that its ohjaa was gone at some later launch, so it ranks by its start:
+    /// a session that really ended after that comes after it.
+    pub fn ended_rank(&self) -> Option<i64> {
+        self.left.as_ref().map(|left| {
+            if left.orphaned {
+                self.started_ms
+            } else {
+                left.ended_ms
+            }
+        })
+    }
 }
 
 /// Why the log could not be used. Never a reason to stop a launch.
@@ -418,8 +554,10 @@ impl Store {
 /// Keep `LATEST` pointing at each repository's latest *ended* session. A
 /// session still running is never "the last session here": the perimeter
 /// already shows who is live, and an unfinished record must not read as a
-/// crash. "Here" is where a session was launched and every repository it
-/// named with `--scope`: the one that ended last wins, wherever it started.
+/// crash. "Here" is where a session was launched, every repository it
+/// named with `--scope`, and every one leaving found it worked in: the one
+/// that ended last wins, wherever it started (an orphan by its start: when it
+/// ended was never observed).
 fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), StoreError> {
     let Some(left) = &session.left else {
         return Ok(());
@@ -427,7 +565,15 @@ fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), Sto
     let sessions = tx.open_table(SESSIONS).map_err(other)?;
     let mut latest = tx.open_table(LATEST).map_err(other)?;
     let heres = std::iter::once(session.repo.as_str())
-        .chain(session.scoped.iter().map(|scoped| scoped.repo.as_str()));
+        .chain(session.scoped.iter().map(|scoped| scoped.repo.as_str()))
+        // A repository only found at leaving is never its last session's: nothing
+        // in it is attributed to this one.
+        .chain(
+            left.scoped
+                .iter()
+                .filter(|scoped| !scoped.found)
+                .map(|scoped| scoped.repo.as_str()),
+        );
     for here in heres {
         let newer = match latest.get(here).map_err(other)? {
             None => true,
@@ -437,9 +583,10 @@ fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), Sto
                     .get(id.value())
                     .map_err(other)?
                     .and_then(|value| serde_json::from_slice::<Session>(value.value()).ok());
+                let rank = session.ended_rank().unwrap_or(left.ended_ms);
                 current
-                    .and_then(|current| current.left.map(|l| l.ended_ms))
-                    .is_none_or(|ended| left.ended_ms >= ended)
+                    .and_then(|current| current.ended_rank())
+                    .is_none_or(|ended| rank >= ended)
             }
         };
         if newer {
@@ -452,6 +599,12 @@ fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), Sto
 /// A fresh session id: when it started, and which ohjaa started it.
 pub fn new_id(started_ms: i64) -> String {
     format!("oh-{started_ms}-{}", std::process::id())
+}
+
+/// The pid of the ohjaa that started a session, from its id.
+pub fn pid_of(id: &str) -> Option<u32> {
+    let (_, pid) = id.strip_prefix("oh-")?.rsplit_once('-')?;
+    pid.parse().ok().filter(|pid| *pid > 0)
 }
 
 /// Session ids are names, never paths.
@@ -467,7 +620,7 @@ pub fn is_valid_id(id: &str) -> bool {
 
 /// A time for people. Always UTC, and always says so: a bare 23:53 reads as
 /// local time to anyone east or west of Greenwich.
-fn clock(ms: i64) -> String {
+pub fn clock(ms: i64) -> String {
     let full = rfc3339(ms.div_euclid(1000));
     // "2026-09-26T10:02:03Z" → "2026-09-26 10:02 UTC"
     format!("{} {} UTC", &full[..10], &full[11..16])
@@ -482,11 +635,113 @@ fn describe_exit(exit: Exit) -> String {
     }
 }
 
+/// How a session ended, as its record says it.
+fn describe_end(left: &Left) -> String {
+    if left.orphaned {
+        "orphaned (observed at next launch)".to_owned()
+    } else {
+        describe_exit(left.exit)
+    }
+}
+
+/// A receipt's own word, said as its word: only `sykli verify --commit`
+/// ([`describe_check`]) says a commit passed.
 fn describe_evidence(evidence: Option<&Evidence>) -> String {
     match evidence {
-        Some(e) if e.dirty => format!("{} (dirty tree)", e.outcome),
-        Some(e) => e.outcome.clone(),
-        None => "no sykli run".to_owned(),
+        Some(e) if e.dirty => format!("receipt: {} (dirty tree)", e.outcome),
+        Some(e) => format!("receipt: {}", e.outcome),
+        None => "no sykli receipt".to_owned(),
+    }
+}
+
+fn describe_check(check: &Check) -> String {
+    match check {
+        Check::Passed => "verified: passed (sykli verify --commit)".to_owned(),
+        Check::Failed { why } => format!("FAILED sykli verify: {why}"),
+        Check::Unchecked => "unchecked: no sykli receipt for its tree".to_owned(),
+        Check::UncheckedGone => {
+            "unchecked: no sykli receipt, and the checkout it was made in is gone".to_owned()
+        }
+        Check::Unverified { why } => format!("unverified: {why}"),
+        Check::Stale { why } => {
+            format!("stale: sykli checked the checkout, not the commit ({why})")
+        }
+    }
+}
+
+/// What is known of a landed commit: sykli's word at a push's tip, its
+/// receipt's word before it.
+fn describe_landed(landed: &Landed) -> String {
+    match &landed.check {
+        Some(check) => describe_check(check),
+        None => format!(
+            "{} (not verified: {})",
+            describe_evidence(landed.evidence.as_ref()),
+            if landed.unattributed {
+                "not shown to be this session's"
+            } else {
+                "only a push's tip is"
+            }
+        ),
+    }
+}
+
+fn landed_lines(label: &str, landed: &[Landed], out: &mut String) {
+    for landed in landed {
+        let _ = writeln!(
+            out,
+            "{label}{} reached {}{}: {}",
+            short(&landed.commit),
+            landed.onto,
+            if landed.unattributed {
+                " (not attributed)"
+            } else {
+                ""
+            },
+            describe_landed(landed)
+        );
+    }
+}
+
+/// Where a commit was made, when that is not the repository itself.
+fn place_of(phase: &Phase) -> String {
+    if phase.unreachable {
+        " (on no branch now)".to_owned()
+    } else {
+        phase
+            .worktree
+            .as_deref()
+            .map(|path| format!(" (in {})", repo_name(path)))
+            .unwrap_or_default()
+    }
+}
+
+/// Commits made during the session that are not shown to be its own, and
+/// the sessions that shared its places: said, never credited.
+fn observed_lines(
+    label: &str,
+    shared_label: &str,
+    observed: &[Phase],
+    shared: &[String],
+    out: &mut String,
+) {
+    if !observed.is_empty() {
+        let list = observed
+            .iter()
+            .map(|p| format!("{}{}", short(&p.commit), place_of(p)))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if label.ends_with(": ") {
+            let _ = writeln!(out, "{label}{list}");
+        } else {
+            let _ = writeln!(
+                out,
+                "{label}made during the session, not attributed: {list}"
+            );
+        }
+    }
+    for with in shared {
+        let _ = writeln!(out, "{shared_label}{with}");
     }
 }
 
@@ -528,13 +783,7 @@ pub fn render_record(session: &Session) -> String {
     let mut out = String::new();
     let ended = session.left.as_ref().map_or_else(
         || "still open".to_owned(),
-        |left| {
-            format!(
-                "{} · ended: {}",
-                clock(left.ended_ms),
-                describe_exit(left.exit)
-            )
-        },
+        |left| format!("{} · ended: {}", clock(left.ended_ms), describe_end(left)),
     );
     let _ = writeln!(
         out,
@@ -545,6 +794,13 @@ pub fn render_record(session: &Session) -> String {
         clock(session.started_ms),
         ended
     );
+    let flagged = flags(session);
+    if !flagged.is_empty() {
+        out.push_str("─ FLAGGED (observed by ohjaa; the next briefing opens with it) ─\n");
+        for flag in flagged {
+            let _ = writeln!(out, "! {}\n  ({})", flag.headline, flag.why);
+        }
+    }
     out.push_str("─ observed (written by ohjaa; the agent cannot change it) ─\n");
     let _ = writeln!(out, "intent        {}", session.intent);
     let readback = match &session.readback {
@@ -561,9 +817,17 @@ pub fn render_record(session: &Session) -> String {
             let _ = writeln!(
                 out,
                 "phases        {}",
-                describe_phases(left.phases.as_ref(), left.interrupted)
+                describe_phases(left.phases.as_ref(), left)
+            );
+            observed_lines(
+                "observed      ",
+                "shared        ",
+                &left.observed,
+                &left.shared,
+                &mut out,
             );
             let _ = writeln!(out, "finished      {}", describe_finished(&left.finished));
+            landed_lines("landed        ", &left.landed, &mut out);
         } else if left.scoped.is_empty() {
             // The folder has nothing to observe, and no --scope named a repository.
             out.push_str("phases        none to observe (not a Git repository)\n");
@@ -571,16 +835,41 @@ pub fn render_record(session: &Session) -> String {
         }
         for scoped in &left.scoped {
             let label = format!("in {}", repo_name(&scoped.repo));
+            if scoped.found {
+                // Found, not named: nothing in it is this session's (law 3).
+                observed_lines(
+                    &format!("{label:<13} observed during the session, not attributed: "),
+                    &format!("{label:<13} shared "),
+                    &scoped.observed,
+                    &scoped.shared,
+                    &mut out,
+                );
+                landed_lines(&format!("{label:<13} landed "), &scoped.landed, &mut out);
+                let _ = writeln!(
+                    out,
+                    "{label:<13} not named with --scope: found at leaving because a commit was \
+                     made in it; nothing in it is attributed to this session"
+                );
+                continue;
+            }
             let _ = writeln!(
                 out,
                 "{label:<13} phases {}",
-                describe_phases(scoped.phases.as_ref(), left.interrupted)
+                describe_phases(scoped.phases.as_ref(), left)
+            );
+            observed_lines(
+                &format!("{label:<13} observed "),
+                &format!("{label:<13} shared "),
+                &scoped.observed,
+                &scoped.shared,
+                &mut out,
             );
             let _ = writeln!(
                 out,
                 "{label:<13} finished {}",
                 describe_finished(&scoped.finished)
             );
+            landed_lines(&format!("{label:<13} landed "), &scoped.landed, &mut out);
         }
         if let Some(toimija) = &left.toimija_session {
             let _ = writeln!(out, "toimija       {toimija}");
@@ -626,6 +915,245 @@ pub fn render_record(session: &Session) -> String {
     out
 }
 
+/// Something leaving observed that whoever comes next must hear first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flag {
+    pub headline: String,
+    /// What sykli said, or why it could not.
+    pub why: String,
+    /// The repository it is about.
+    pub repo: String,
+    /// For a commit that reached a branch: the branch and the commit, so a
+    /// later briefing can tell whether the branch still sits there.
+    pub tip: Option<(String, String)>,
+    /// The session's own work that sykli refused: only these are lessons for
+    /// intake. A broken tip of the default branch it is not shown to have put
+    /// there, or one never checked, is said but is no lesson.
+    pub own: bool,
+}
+
+/// The flags in a record, derived from what ohjaa observed, never from the
+/// agent's words:
+/// - the tip of the remote default branch as the session left it, when sykli
+///   refused it or it has a contract and no run of it at all in a checkout
+///   that still exists (gone with its receipts, it cannot be observed): a
+///   broken main is the repository's state, whoever pushed it (said as
+///   "observed, not attributed" when it is not shown to be the session's);
+/// - every commit of the session's own that sykli refused on the default
+///   branch, and the head of its open or merged pull request.
+///
+/// What sykli could not say (no --commit, no contract, a checkout that moved
+/// on) is recorded, never shouted.
+pub fn flags(session: &Session) -> Vec<Flag> {
+    let Some(left) = &session.left else {
+        return Vec::new();
+    };
+    let launch = (!session.outside_repo).then_some((
+        session.repo.as_str(),
+        &left.landed[..],
+        &left.finished,
+    ));
+    let mut out = Vec::new();
+    for (repo, landed, finished) in launch.into_iter().chain(
+        left.scoped
+            .iter()
+            .map(|s| (s.repo.as_str(), &s.landed[..], &s.finished)),
+    ) {
+        for landed in landed {
+            let Some(check) = &landed.check else {
+                continue;
+            };
+            let refused = matches!(check, Check::Failed { .. });
+            let mine = !landed.unattributed;
+            // What others build on: the remote default branch where it is now.
+            let broken_tip = landed.at_tip
+                && is_remote(&landed.onto)
+                && (refused || matches!(check, Check::Unchecked));
+            if !broken_tip && !(mine && refused) {
+                continue;
+            }
+            let (commit, repo_name) = (short(&landed.commit), repo_name(repo));
+            out.push(Flag {
+                headline: if landed.at_tip {
+                    format!(
+                        "{} at {commit} in {repo_name} has no passing evidence{} — check before \
+                         building on it",
+                        landed.onto,
+                        if mine {
+                            ""
+                        } else {
+                            " (observed, not attributed)"
+                        }
+                    )
+                } else {
+                    format!(
+                        "{commit} reached {} in {repo_name} without passing evidence — check \
+                         {} before building on it",
+                        landed.onto, landed.onto
+                    )
+                },
+                why: describe_check(check),
+                repo: repo.to_owned(),
+                tip: Some((landed.onto.clone(), landed.commit.clone())),
+                own: mine && refused,
+            });
+        }
+        if let Finished::PullRequest {
+            url,
+            state,
+            head: Some(head),
+            head_check: Some(check),
+            ..
+        } = finished
+        {
+            let live = matches!(state.to_uppercase().as_str(), "OPEN" | "MERGED");
+            if live && matches!(check, Check::Failed { .. }) {
+                out.push(Flag {
+                    headline: format!(
+                        "pull request {url} at {} has no passing evidence — check before \
+                         merging or building on it",
+                        short(head)
+                    ),
+                    why: describe_check(check),
+                    repo: repo.to_owned(),
+                    tip: None,
+                    own: true,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `origin/main`, not a local `main`.
+fn is_remote(onto: &str) -> bool {
+    onto.contains('/')
+}
+
+/// Whether an ended session was here: launched here, or named here with
+/// `--scope` (a repository only found at leaving is not its).
+pub fn touches(session: &Session, here: &str) -> bool {
+    session.left.as_ref().is_some_and(|left| {
+        session.repo == here
+            || session.scoped.iter().any(|s| s.repo == here)
+            || left.scoped.iter().any(|s| s.repo == here && !s.found)
+    })
+}
+
+/// Whether an ended session saw `here`: it was here ([`touches`]), or found
+/// it at leaving. What it saw of a branch here can still hold.
+pub fn observed_in(session: &Session, here: &str) -> bool {
+    touches(session, here)
+        || session
+            .left
+            .as_ref()
+            .is_some_and(|left| left.scoped.iter().any(|s| s.repo == here))
+}
+
+/// Sessions closed as orphaned at this launch, for the very top of its
+/// briefing: nothing they did was observed.
+pub fn render_orphaned(orphans: &[Session]) -> String {
+    let mut out = String::new();
+    for session in orphans {
+        let _ = writeln!(
+            out,
+            "ORPHANED: session {} ({}, {}), started {}, was never closed: its ohjaa was \
+             gone at this launch, so nothing it did was observed. Check `git log` and \
+             the worktrees here before building on its work.",
+            session.id,
+            session.agent,
+            session.intent,
+            clock(session.started_ms)
+        );
+    }
+    out
+}
+
+/// The flags of the last session here, and of earlier ones that still hold,
+/// for the very top of the next briefing: before the knowledge, and before a
+/// handover can say "ship it". Every flag of `last` about its own work is
+/// said ("<branch> at <sha>" only while the branch still sits there). Any
+/// other flag about a branch — an earlier session's, a broken tip it only
+/// observed, or one a session found working in `here` saw — is said while
+/// `still_at(repo, branch, commit)`: the branch still sits at the commit it
+/// flagged, so a quiet session in between cannot hide a broken main. Each tip
+/// is said once. `earlier` is newest first. Empty when nothing is flagged.
+pub fn render_warnings(
+    last: Option<&Session>,
+    earlier: &[Session],
+    here: &str,
+    still_at: impl Fn(&str, &str, &str) -> bool,
+) -> String {
+    let mut out = String::new();
+    let mut said = HashSet::new();
+    let mut block = |session: &Session, whose: &str, still: &str, flags: Vec<Flag>| {
+        let flags: Vec<Flag> = flags
+            .into_iter()
+            .filter(|flag| {
+                said.insert(flag.tip.as_ref().map_or_else(
+                    || flag.headline.clone(),
+                    |(branch, commit)| format!("{}\u{1f}{branch}\u{1f}{commit}", flag.repo),
+                ))
+            })
+            .collect();
+        if flags.is_empty() {
+            return;
+        }
+        let ended = session.left.as_ref().map_or_else(String::new, |left| {
+            format!(", ended {}", clock(left.ended_ms))
+        });
+        let _ = writeln!(
+            out,
+            "WARNING from {whose} ({}, {}{ended}){still}:",
+            session.id, session.agent
+        );
+        for flag in flags {
+            let _ = writeln!(out, "- {} ({})", flag.headline, flag.why);
+        }
+    };
+    let standing = |flag: &Flag| {
+        flag.tip
+            .as_ref()
+            .is_some_and(|(branch, commit)| still_at(&flag.repo, branch, commit))
+    };
+    if let Some(last) = last {
+        let last_flags = flags(last)
+            .into_iter()
+            .filter_map(|mut flag| {
+                if flag.tip.is_none() || standing(&flag) {
+                    return Some(flag);
+                }
+                // Its own refused work once the branch has moved on: said as
+                // reached, never as where the branch is.
+                let (branch, commit) = flag.tip.clone()?;
+                flag.own.then(|| {
+                    flag.headline = format!(
+                        "{} reached {branch} in {} without passing evidence; {branch} has moved \
+                         on since — check what is on it before building on it",
+                        short(&commit),
+                        repo_name(&flag.repo)
+                    );
+                    flag
+                })
+            })
+            .collect();
+        block(last, "the last session here", "", last_flags);
+    }
+    for session in earlier {
+        let whose = if touches(session, here) {
+            "an earlier session here"
+        } else {
+            "a session that observed this repository"
+        };
+        let standing = flags(session)
+            .into_iter()
+            .filter(|flag| flag.repo == here && standing(flag))
+            .collect();
+        block(session, whose, ", still true", standing);
+    }
+    out
+}
+
 /// What `ohjaa session` says when no session here has ended: never "none",
 /// while records exist that have not ended or could not be read.
 pub fn render_none_ended(unended: &[Session], unreadable: usize) -> String {
@@ -656,18 +1184,20 @@ pub fn render_none_ended(unended: &[Session], unreadable: usize) -> String {
     out
 }
 
-fn describe_phases(phases: Option<&Vec<Phase>>, interrupted: bool) -> String {
+fn describe_phases(phases: Option<&Vec<Phase>>, left: &Left) -> String {
     match phases {
-        None if interrupted => "not observed (leaving was interrupted)".to_owned(),
+        None if left.orphaned => "not observed (its ohjaa was gone before leaving)".to_owned(),
+        None if left.interrupted => "not observed (leaving was interrupted)".to_owned(),
         None => "not observed".to_owned(),
         Some(phases) if phases.is_empty() => "no commits".to_owned(),
         Some(phases) => phases
             .iter()
             .map(|p| {
                 format!(
-                    "{} {}",
+                    "{} {}{}",
                     short(&p.commit),
-                    describe_evidence(p.evidence.as_ref())
+                    describe_evidence(p.evidence.as_ref()),
+                    place_of(p)
                 )
             })
             .collect::<Vec<_>>()
@@ -682,9 +1212,23 @@ fn describe_finished(finished: &Finished) -> String {
         Finished::PullRequest {
             url,
             state,
-            head_evidence,
+            head: Some(head),
+            head_check: Some(check),
+            ..
         } => format!(
-            "{url} ({}) · evidence on its head: {}",
+            "{url} ({}) · head {}: {}",
+            state.to_lowercase(),
+            short(head),
+            describe_check(check)
+        ),
+        // Recorded before ohjaa asked sykli.
+        Finished::PullRequest {
+            url,
+            state,
+            head_evidence,
+            ..
+        } => format!(
+            "{url} ({}) · its head, unverified: {}",
             state.to_lowercase(),
             describe_evidence(head_evidence.as_ref())
         ),
@@ -694,12 +1238,12 @@ fn describe_finished(finished: &Finished) -> String {
 fn summarise_work(phases: Option<&Vec<Phase>>) -> String {
     match phases {
         Some(phases) => {
-            let with_evidence = phases
+            let claimed = phases
                 .iter()
                 .filter(|p| p.evidence.as_ref().is_some_and(|e| e.outcome == "passed"))
                 .count();
             format!(
-                "{} commit(s), {with_evidence} with a passing sykli run",
+                "{} commit(s), {claimed} whose sykli receipt says passed",
                 phases.len()
             )
         }
@@ -709,6 +1253,18 @@ fn summarise_work(phases: Option<&Vec<Phase>>) -> String {
 
 fn summarise_finished(finished: &Finished) -> String {
     match finished {
+        Finished::PullRequest {
+            url,
+            state,
+            head: Some(head),
+            head_check: Some(check),
+            ..
+        } => format!(
+            "{url} ({}), head {} {}",
+            state.to_lowercase(),
+            short(head),
+            describe_check(check)
+        ),
         Finished::PullRequest { url, state, .. } => format!("{url} ({})", state.to_lowercase()),
         Finished::NoPullRequest => "no pull request".to_owned(),
         Finished::Unknown { .. } => "unknown".to_owned(),
@@ -724,13 +1280,7 @@ pub fn render_last(session: &Session, here: &str) -> String {
     // a record without its leaving is said as exactly that, never as a crash.
     let ended = session.left.as_ref().map_or_else(
         || "leaving not recorded".to_owned(),
-        |left| {
-            format!(
-                "ended {}, {}",
-                clock(left.ended_ms),
-                describe_exit(left.exit)
-            )
-        },
+        |left| format!("ended {}, {}", clock(left.ended_ms), describe_end(left)),
     );
     let launched = if session.repo == here {
         String::new()
@@ -750,7 +1300,27 @@ pub fn render_last(session: &Session, here: &str) -> String {
         .left
         .as_ref()
         .map_or(&[][..], |left| &left.scoped[..]);
-    if session.outside_repo && scoped.is_empty() {
+    // What was made during it but is not shown to be its own: said as such.
+    let observed = |observed: &[Phase], shared: &[String], out: &mut String| {
+        if !observed.is_empty() {
+            let _ = writeln!(
+                out,
+                "  ({} more commit(s) made during it are not attributed to it{})",
+                observed.len(),
+                if shared.is_empty() {
+                    String::new()
+                } else {
+                    format!(": it shared its place, {}", shared.join("; "))
+                }
+            );
+        }
+    };
+    if session.left.as_ref().is_some_and(|left| left.orphaned) {
+        out.push_str(
+            "- work: not observed: its ohjaa was gone before leaving; check `git log` and \
+             the worktrees before building on it\n",
+        );
+    } else if session.outside_repo && scoped.is_empty() {
         out.push_str(
             "- work: not a Git repository, so no commits or pull request to observe; \
              its handover says what changed\n",
@@ -763,15 +1333,46 @@ pub fn render_last(session: &Session, here: &str) -> String {
                 summarise_work(left.phases.as_ref()),
                 summarise_finished(&left.finished)
             );
+            observed(&left.observed, &left.shared, &mut out);
+            for landed in left.landed.iter().filter(|l| !l.unattributed) {
+                let _ = writeln!(
+                    out,
+                    "- {} reached {}: {}",
+                    short(&landed.commit),
+                    landed.onto,
+                    describe_landed(landed)
+                );
+            }
         }
         for scoped in scoped {
+            if scoped.found {
+                let _ = writeln!(
+                    out,
+                    "- in {}: {} commit(s) observed during the session, not attributed (found \
+                     at leaving)",
+                    repo_name(&scoped.repo),
+                    scoped.observed.len()
+                );
+                continue;
+            }
             let _ = writeln!(
                 out,
                 "- work in {}: {}; finished: {}",
                 repo_name(&scoped.repo),
                 summarise_work(scoped.phases.as_ref()),
-                summarise_finished(&scoped.finished)
+                summarise_finished(&scoped.finished),
             );
+            observed(&scoped.observed, &scoped.shared, &mut out);
+            for landed in scoped.landed.iter().filter(|l| !l.unattributed) {
+                let _ = writeln!(
+                    out,
+                    "- in {}, {} reached {}: {}",
+                    repo_name(&scoped.repo),
+                    short(&landed.commit),
+                    landed.onto,
+                    describe_landed(landed)
+                );
+            }
         }
     }
     match &session.handover {
@@ -838,6 +1439,10 @@ mod tests {
             finished: Finished::NoPullRequest,
             interrupted: false,
             scoped: Vec::new(),
+            landed: Vec::new(),
+            observed: Vec::new(),
+            shared: Vec::new(),
+            orphaned: false,
         });
         session
     }
@@ -865,15 +1470,28 @@ mod tests {
                             outcome: "passed".to_owned(),
                             dirty: false,
                         }),
+                        ..Default::default()
                     }]),
                     finished: Finished::NoPullRequest,
+                    found: false,
+                    landed: Vec::new(),
+                    observed: Vec::new(),
+                    shared: Vec::new(),
                 },
                 ScopedLeft {
                     repo: "/r/projects/toimija".to_owned(),
                     phases: Some(Vec::new()),
                     finished: Finished::NoPullRequest,
+                    found: true,
+                    landed: Vec::new(),
+                    observed: Vec::new(),
+                    shared: Vec::new(),
                 },
             ],
+            landed: Vec::new(),
+            observed: Vec::new(),
+            shared: Vec::new(),
+            orphaned: false,
         });
         let record = render_record(&s);
         assert!(
@@ -881,20 +1499,16 @@ mod tests {
             "a root session with scoped repositories has work to show: {record}"
         );
         assert!(
-            record.contains("in ohjaa      phases a1b2c3d passed"),
+            record.contains("in ohjaa      phases a1b2c3d receipt: passed"),
             "{record}"
         );
         assert!(
-            record.contains("in toimija    phases no commits"),
-            "{record}"
-        );
-        assert!(
-            record.contains("in toimija    finished no pull request"),
-            "{record}"
+            !record.contains("in toimija    phases") && !record.contains("in toimija    finished"),
+            "a found repository has no phases or pull request of this session's: {record}"
         );
         let last = render_last(&s, &s.repo);
         assert!(
-            last.contains("- work in ohjaa: 1 commit(s), 1 with a passing sykli run"),
+            last.contains("- work in ohjaa: 1 commit(s), 1 whose sykli receipt says passed"),
             "{last}"
         );
         assert!(!last.contains("not a Git repository"), "{last}");
@@ -904,6 +1518,15 @@ mod tests {
         assert!(
             there.contains("; launched from /r/projects, it named this repository with --scope):"),
             "{there}"
+        );
+        // Found at leaving, it is never said as named, nor credited.
+        assert!(
+            record.contains("in toimija    not named with --scope: found at leaving because a commit was made in it; nothing in it is attributed to this session"),
+            "{record}"
+        );
+        assert!(
+            last.contains("- in toimija: 0 commit(s) observed during the session, not attributed (found at leaving)"),
+            "{last}"
         );
     }
 
@@ -947,6 +1570,31 @@ mod tests {
             "oh-2",
             "the one that ended last wins, wherever it was launched"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_orphan_never_outranks_a_session_that_really_ended_after_it_started() {
+        let dir = temp("orphan-rank");
+        let store = Store::open(&store_path(&dir)).unwrap();
+        // Started first, then its ohjaa was gone; found so only much later.
+        let mut orphan = session("oh-1", "/r/a", 1_000);
+        orphan.left = Some(Left::orphaned(9_000));
+        store
+            .put(&ended(session("oh-2", "/r/a", 2_000), 3_000))
+            .unwrap();
+        store.put(&orphan).unwrap();
+        assert_eq!(
+            store.latest_for("/r/a").unwrap().unwrap().id,
+            "oh-2",
+            "when it was found gone is not when it ended"
+        );
+        let record = render_record(&orphan);
+        assert!(
+            record.contains("phases        not observed (its ohjaa was gone before leaving)"),
+            "it says what was observed, never a cause: {record}"
+        );
+        assert!(!record.contains("killed"), "{record}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1082,16 +1730,22 @@ mod tests {
                         outcome: "passed".to_owned(),
                         dirty: false,
                     }),
+                    ..Default::default()
                 },
                 Phase {
                     commit: "0718abcdef".to_owned(),
                     subject: "two".to_owned(),
                     evidence: None,
+                    ..Default::default()
                 },
             ]),
             finished: Finished::NoPullRequest,
             interrupted: false,
             scoped: Vec::new(),
+            landed: Vec::new(),
+            observed: Vec::new(),
+            shared: Vec::new(),
+            orphaned: false,
         });
         let record = render_record(&s);
         let observed = record.find("─ observed").unwrap();
@@ -1099,7 +1753,7 @@ mod tests {
         assert!(observed < testimony, "{record}");
         assert!(record.contains("ended: clean (exit 0)"), "{record}");
         assert!(
-            record.contains("a1b2c3d passed · 0718abc no sykli run"),
+            record.contains("a1b2c3d receipt: passed · 0718abc no sykli receipt"),
             "{record}"
         );
         assert!(
@@ -1128,7 +1782,7 @@ mod tests {
             "said once, not twice: {last}"
         );
         assert!(
-            last.contains("2 commit(s), 1 with a passing sykli run"),
+            last.contains("2 commit(s), 1 whose sykli receipt says passed"),
             "{last}"
         );
         assert!(last.contains("- unfinished: windows paths"), "{last}");
@@ -1204,6 +1858,7 @@ mod tests {
                 outcome: "passed".to_owned(),
                 dirty: false,
             }),
+            ..Default::default()
         };
         let mut s = ended(s, 2_000);
         let left = s.left.as_mut().unwrap();
@@ -1212,6 +1867,10 @@ mod tests {
             repo: "/r/projects/a".to_owned(),
             phases: Some(vec![phase]),
             finished: Finished::NoPullRequest,
+            found: false,
+            landed: Vec::new(),
+            observed: Vec::new(),
+            shared: Vec::new(),
         }];
         let v1 = serde_json::to_value(&s).unwrap();
         for pointer in [
@@ -1244,6 +1903,271 @@ mod tests {
                 "{pointer} is gone from v1: {v1}"
             );
         }
+    }
+
+    #[test]
+    fn only_sykli_says_a_commit_passed_never_its_receipt() {
+        let mut s = session("oh-11", "/r/selko", 1_790_000_000_000);
+        let mut left = ended(s.clone(), 1_790_003_600_000).left.unwrap();
+        left.finished = Finished::PullRequest {
+            url: "https://github.com/o/r/pull/7".to_owned(),
+            state: "OPEN".to_owned(),
+            head_evidence: Some(Evidence {
+                outcome: "passed".to_owned(),
+                dirty: false,
+            }),
+            head: Some("feedface00".to_owned()),
+            head_check: Some(Check::Failed {
+                why: "error: tree mismatch".to_owned(),
+            }),
+        };
+        left.landed = vec![
+            Landed {
+                commit: "c0ffee1234".to_owned(),
+                subject: "pushed".to_owned(),
+                onto: "origin/main".to_owned(),
+                check: Some(Check::Unverified {
+                    why: "sykli has no --commit".to_owned(),
+                }),
+                evidence: None,
+                at_tip: false,
+                unattributed: false,
+            },
+            Landed {
+                commit: "abcdef1234".to_owned(),
+                subject: "checked".to_owned(),
+                onto: "origin/main".to_owned(),
+                check: Some(Check::Passed),
+                evidence: None,
+                at_tip: true,
+                unattributed: false,
+            },
+        ];
+        s.left = Some(left);
+        let record = render_record(&s);
+        for said in [
+            "finished      https://github.com/o/r/pull/7 (open) · head feedfac: FAILED sykli verify: error: tree mismatch",
+            "landed        c0ffee1 reached origin/main: unverified: sykli has no --commit",
+            "landed        abcdef1 reached origin/main: verified: passed (sykli verify --commit)",
+        ] {
+            assert!(record.contains(said), "missing `{said}`: {record}");
+        }
+        let last = render_last(&s, &s.repo);
+        assert!(
+            last.contains("finished: https://github.com/o/r/pull/7 (open), head feedfac FAILED"),
+            "{last}"
+        );
+        assert!(
+            last.contains("- c0ffee1 reached origin/main: unverified: sykli has no --commit"),
+            "{last}"
+        );
+        // A record written before ohjaa asked sykli says its receipt was not verified.
+        let old: Finished = serde_json::from_str(
+            r#"{"kind":"pull_request","url":"u","state":"MERGED","head_evidence":{"outcome":"passed","dirty":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            describe_finished(&old),
+            "u (merged) · its head, unverified: receipt: passed"
+        );
+    }
+
+    #[test]
+    fn a_record_is_flagged_only_where_sykli_refused_the_commit() {
+        let pr = |state: &str, check: Check| Finished::PullRequest {
+            url: "u".to_owned(),
+            state: state.to_owned(),
+            head_evidence: None,
+            head: Some("feedface00".to_owned()),
+            head_check: Some(check),
+        };
+        let landed = |check: Check, at_tip: bool| Landed {
+            commit: "c0ffee1234".to_owned(),
+            subject: "s".to_owned(),
+            onto: "origin/main".to_owned(),
+            check: Some(check),
+            evidence: None,
+            at_tip,
+            unattributed: false,
+        };
+        let with = |finished: Finished, landed: Vec<Landed>| {
+            let mut s = ended(session("oh-12", "/r/selko", 1_000), 2_000);
+            let left = s.left.as_mut().unwrap();
+            left.finished = finished;
+            left.landed = landed;
+            s
+        };
+        let failed = || Check::Failed {
+            why: "refused: outcome expected passed".to_owned(),
+        };
+        let headlines = |s: &Session| flags(s).into_iter().map(|f| f.headline).collect::<Vec<_>>();
+        // What could not be checked is recorded, never flagged (unchecked
+        // only where it is not the branch's tip: see below).
+        let superseded = with(
+            Finished::NoPullRequest,
+            vec![landed(Check::Unchecked, false)],
+        );
+        assert!(headlines(&superseded).is_empty());
+        for quiet in [
+            Check::Passed,
+            Check::Unverified {
+                why: "sykli has no --commit".to_owned(),
+            },
+            Check::Stale {
+                why: "refused: tree expected a but got b".to_owned(),
+            },
+        ] {
+            let s = with(pr("OPEN", quiet.clone()), vec![landed(quiet.clone(), true)]);
+            assert!(headlines(&s).is_empty(), "{quiet:?}");
+            assert!(
+                render_warnings(Some(&s), &[], "/r/selko", |_, _, _| false).is_empty(),
+                "{quiet:?}"
+            );
+        }
+        assert!(
+            flags(&with(pr("CLOSED", failed()), Vec::new())).is_empty(),
+            "a closed pull request reaches nothing"
+        );
+        assert_eq!(
+            headlines(&with(pr("OPEN", failed()), vec![landed(failed(), true)])),
+            [
+                "origin/main at c0ffee1 in selko has no passing evidence — check before building on it",
+                "pull request u at feedfac has no passing evidence — check before merging or building on it",
+            ]
+        );
+        assert_eq!(
+            headlines(&with(Finished::NoPullRequest, vec![landed(failed(), false)])),
+            ["c0ffee1 reached origin/main in selko without passing evidence — check origin/main before building on it"],
+            "\"at\" only of the commit the branch sits at"
+        );
+        let s = with(pr("MERGED", failed()), Vec::new());
+        assert!(render_warnings(Some(&s), &[], "/r/selko", |_, _, _| false)
+            .starts_with("WARNING from the last session here (oh-12, claude"));
+
+        // Once the branch has moved on, the briefing no longer says it is at
+        // the flagged commit; the last session's flag is still said.
+        let moved = with(Finished::NoPullRequest, vec![landed(failed(), true)]);
+        let said = render_warnings(Some(&moved), &[], "/r/selko", |_, _, _| false);
+        assert!(
+            said.contains(
+                "- c0ffee1 reached origin/main in selko without passing evidence; origin/main \
+                 has moved on since — check what is on it before building on it ("
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("origin/main at c0ffee1"), "{said}");
+        let still = render_warnings(Some(&moved), &[], "/r/selko", |_, _, _| true);
+        assert!(
+            still.contains("- origin/main at c0ffee1 in selko has no passing evidence"),
+            "{still}"
+        );
+
+        // A landing not shown to be the session's is never asked of sykli,
+        // and its record says why, not that only a push's tip is.
+        let mut theirs = landed(Check::Passed, true);
+        theirs.check = None;
+        theirs.unattributed = true;
+        let record = render_record(&with(Finished::NoPullRequest, vec![theirs]));
+        assert!(
+            record.contains(
+                "c0ffee1 reached origin/main (not attributed): no sykli receipt (not verified: \
+                 not shown to be this session's)"
+            ),
+            "{record}"
+        );
+    }
+
+    #[test]
+    fn a_broken_tip_of_main_is_flagged_whoever_put_it_there() {
+        let landed = |check: Check, onto: &str, at_tip: bool, unattributed: bool| Landed {
+            commit: "c0ffee1234".to_owned(),
+            subject: "s".to_owned(),
+            onto: onto.to_owned(),
+            check: Some(check),
+            evidence: None,
+            at_tip,
+            unattributed,
+        };
+        let with = |landed: Landed| {
+            let mut s = ended(session("oh-12", "/r/selko", 1_000), 2_000);
+            s.left.as_mut().unwrap().landed = vec![landed];
+            s
+        };
+        let failed = || Check::Failed {
+            why: "refused: outcome expected passed".to_owned(),
+        };
+        let said = |s: &Session| {
+            flags(s)
+                .into_iter()
+                .map(|f| (f.headline, f.own))
+                .collect::<Vec<_>>()
+        };
+        let state = "origin/main at c0ffee1 in selko has no passing evidence (observed, not \
+                     attributed) — check before building on it";
+        // Refused, or never run where there is a contract: the tip of main is
+        // broken whoever pushed it; only the session's own refusal is a lesson.
+        assert_eq!(
+            said(&with(landed(failed(), "origin/main", true, true))),
+            [(state.to_owned(), false)]
+        );
+        assert_eq!(
+            said(&with(landed(Check::Unchecked, "origin/main", true, true))),
+            [(state.to_owned(), false)]
+        );
+        assert_eq!(
+            said(&with(landed(Check::Unchecked, "origin/main", true, false))),
+            [(
+                "origin/main at c0ffee1 in selko has no passing evidence — check before \
+                 building on it"
+                    .to_owned(),
+                false
+            )]
+        );
+        assert!(said(&with(landed(failed(), "origin/main", true, false)))[0].1);
+        // What sykli could not say, a commit main has moved on from, and a
+        // local branch nobody else builds on raise nothing unless the session's
+        // own commit was refused.
+        for quiet in [
+            landed(
+                Check::Unverified {
+                    why: "sykli has no --commit".to_owned(),
+                },
+                "origin/main",
+                true,
+                true,
+            ),
+            landed(
+                Check::Unverified {
+                    why: "no sykli contract (sykli.json or sykli.rs) in this commit".to_owned(),
+                },
+                "origin/main",
+                true,
+                false,
+            ),
+            landed(
+                Check::Stale {
+                    why: "refused: tree expected a but got b".to_owned(),
+                },
+                "origin/main",
+                true,
+                true,
+            ),
+            landed(failed(), "origin/main", false, true),
+            landed(failed(), "main", true, true),
+            landed(Check::Unchecked, "main", true, false),
+        ] {
+            assert!(said(&with(quiet.clone())).is_empty(), "{quiet:?}");
+        }
+        // Two records of one broken tip say it once.
+        let mut theirs = with(landed(failed(), "origin/main", true, false));
+        theirs.id = "oh-13".to_owned();
+        let warnings = render_warnings(
+            Some(&with(landed(failed(), "origin/main", true, true))),
+            &[theirs],
+            "/r/selko",
+            |_, _, _| true,
+        );
+        assert_eq!(warnings.matches("c0ffee1").count(), 1, "{warnings}");
     }
 
     #[test]
