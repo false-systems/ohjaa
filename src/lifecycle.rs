@@ -1892,6 +1892,15 @@ mod tests {
             ..live(&own)
         };
         assert_eq!(watch(&[left]).0.len(), 2);
+        // One that left after this session started but before anything was
+        // made (the session it took the checkout over from, or an orphan
+        // closed at this launch): what was made after it left is this one's.
+        let handed_over = Window {
+            from_ms: started_ms - 10_000,
+            to_ms: started_ms,
+            ..live(&own)
+        };
+        assert_eq!(watch(&[handed_over]).0.len(), 2);
         // A repository only found at leaving: nothing in it is attributed.
         let found = observe(&dir, Some(&start), started_ms, &Start::default(), None, &[]);
         assert!(found.phases.unwrap().is_empty());

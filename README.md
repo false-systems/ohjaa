@@ -165,10 +165,11 @@ surprised by  the fixture helper silently skips when git is missing
 ```
 
 A receipt's `outcome` is its own claim, and the record says it as one
-(`receipt: passed`); a receipt is filed under the tree that ran, and a clean
-pass outranks a newer dirty run. Only sykli says a commit passed. It is asked
-about the pull request's head, and about the tip of every push that reached
-the default branch during the session (pushed from here to `origin/<default>`,
+(`receipt: passed`); a receipt is filed under the tree that ran (a run sykli's
+pre-commit hook makes before the commit is that tree's run), and a passing run
+outranks a newer failing or dirty one. Only sykli says a commit passed. It is
+asked about the pull request's head, and about the tip of every push that
+reached the default branch during the session (pushed from here to `origin/<default>`,
 or made here and now on the local one; a fetch is not a landing), which is
 what a pre-push Boundary gates. The commits before a tip are shown as their
 receipts' word. Leaving runs `sykli verify <receipt> --contract sykli.json
@@ -179,9 +180,10 @@ is one, else where the receipt is:
 |---|---|---|
 | exit 0 | `verified: passed` | no |
 | refused the commit's own run (another tree, a dirty run, a failed outcome, contradictory records) | `FAILED sykli verify: …` | **yes** |
-| refused, by a sykli that reads everything from the commit (sykli#67 as merged; its help says "nothing is read from the checkout") | `FAILED sykli verify: …` | **yes** |
+| exit 1, 3 or 4, by a sykli that reads everything from the commit (sykli#67 as merged; its help says "nothing is read from the checkout") | `FAILED sykli verify: …` | **yes** |
 | refused the tree, inputs or contract on disk, by an older sykli in a checkout that is not the commit | `stale: sykli checked the checkout, not the commit` | no |
 | exit 2: it could not verify (a bad revision, arguments, not a receipt) | `unverified: sykli verify could not verify: …` | no |
+| any other end: a crash, a kill, no answer in time | `unverified: …` | no |
 | no `--commit` (`sykli verify --help` does not name it) | `unverified: sykli has no --commit` | no |
 | — the commit has no sykli contract | `unverified: no sykli contract …` | no |
 | — no receipt names the commit's tree | `unchecked` | no |
@@ -207,9 +209,10 @@ lives there, so deleting the log loses no knowledge. A busy or broken log never
 blocks a launch; a broken one is reported and left alone, never replaced.
 `ohjaa intake` drafts proposals from each ended session once: its handover,
 what was said in its window, and what ohjaa observed going wrong in it (source
-`observed`): work that reached the default branch, or a pull request head,
-without passing evidence; a non-zero exit; a missing handover; an orphaned
-session. Those are facts, not anyone's words, and the drafter is told so.
+`observed`): its own work that sykli refused at the default branch or a pull
+request head (never what could not be checked, nor what is not shown to be the
+session's); a non-zero exit; a missing handover; an orphaned session. Those are
+facts, not anyone's words, and the drafter is told so.
 
 Signals, while a session runs (unix):
 

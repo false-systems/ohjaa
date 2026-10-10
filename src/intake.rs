@@ -486,10 +486,11 @@ pub fn handover_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candida
     out
 }
 
-/// What ohjaa observed going wrong in each ended session, as candidates: a
-/// commit that reached the default branch, or a pull request head, without
-/// passing evidence; an agent that exited non-zero; a missing handover; a
-/// session whose ohjaa was gone before leaving. Observed facts, not anyone's words: the
+/// What ohjaa observed going wrong in each ended session, as candidates: its
+/// own commit that sykli refused at the default branch or a pull request head
+/// (its flags: never what could not be checked, nor what is not shown to be
+/// its); an agent that exited non-zero; a missing handover; a session whose
+/// ohjaa was gone before leaving. Observed facts, not anyone's words: the
 /// drafter weighs them like any candidate, and a person decides.
 pub fn observed_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candidate> {
     use crate::sessions::Exit;
@@ -938,6 +939,49 @@ mod tests {
         assert!(found
             .iter()
             .all(|c| c.source == "observed" && c.who == "ohjaa"));
+
+        // Only a real failure of the session's own work is a candidate: what
+        // could not be checked, and what is not shown to be its, raise none.
+        use crate::sessions::{Check, Landed};
+        let landed = |check: Check, unattributed: bool| Landed {
+            commit: "c0ffee1".to_owned(),
+            subject: "s".to_owned(),
+            onto: "origin/main".to_owned(),
+            check: Some(check),
+            evidence: None,
+            at_tip: true,
+            unattributed,
+        };
+        let quiet = Left {
+            orphaned: false,
+            finished: Finished::NoPullRequest,
+            landed: vec![
+                landed(
+                    Check::Unverified {
+                        why: "sykli has no --commit".to_owned(),
+                    },
+                    false,
+                ),
+                landed(
+                    Check::Stale {
+                        why: "refused: tree expected a but got b".to_owned(),
+                    },
+                    false,
+                ),
+                landed(Check::Unchecked, false),
+                landed(
+                    Check::Failed {
+                        why: "refused: outcome expected passed".to_owned(),
+                    },
+                    true,
+                ),
+            ],
+            ..ended(Exit::Code { code: 0 })
+        };
+        assert!(
+            observed_candidates(&[session("oh-4", quiet, true)]).is_empty(),
+            "unverified, stale, unchecked and unattributed are recorded, never lessons"
+        );
     }
 
     #[test]
