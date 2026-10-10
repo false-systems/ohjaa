@@ -343,8 +343,47 @@ pub struct Receipt {
     pub checkout: PathBuf,
 }
 
-/// Sykli receipts keyed by the tree that ran.
-pub type Receipts = std::collections::HashMap<String, Receipt>;
+/// Sykli receipts keyed by the tree that ran: every one of each tree, best
+/// first (a passing run, then a clean one, then the newest). A newer run of
+/// the same tree, under another contract or failing, never hides a pass.
+#[derive(Debug, Clone, Default)]
+pub struct Receipts(std::collections::HashMap<String, Vec<Receipt>>);
+
+impl Receipts {
+    /// The best receipt of `tree`: the receipt's word a phase shows.
+    pub fn get(&self, tree: &str) -> Option<&Receipt> {
+        self.0.get(tree).and_then(|all| all.first())
+    }
+
+    /// Every receipt of `tree`, best first.
+    pub fn of(&self, tree: &str) -> &[Receipt] {
+        self.0.get(tree).map_or(&[], Vec::as_slice)
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn add(&mut self, tree: &str, receipt: Receipt) {
+        let rank = |r: &Receipt| (r.evidence.outcome == "passed", !r.evidence.dirty, r.at);
+        let all = self.0.entry(tree.to_owned()).or_default();
+        let at = all
+            .iter()
+            .position(|seen| rank(seen) < rank(&receipt))
+            .unwrap_or(all.len());
+        all.insert(at, receipt);
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<&str> for Receipts {
+    type Output = Receipt;
+
+    fn index(&self, tree: &str) -> &Receipt {
+        self.get(tree).expect("a receipt of that tree")
+    }
+}
 
 /// The sykli receipts in these checkouts' `.sykli/receipts` (see
 /// [`receipts_from`]).
@@ -376,11 +415,11 @@ pub fn receipts_of_clone(repo: &Path, checkouts: &[Worktree]) -> Receipts {
 /// from, keyed by the tree that ran. Reads `sykli-receipt.v1`:
 /// `subject.tree_oid`, `subject.head_tree_oid`, `subject.dirty`, `outcome`,
 /// `started_at_ms`. A tree is its content, so a receipt is about that tree in
-/// whichever checkout sykli ran. Of several for one tree, a passing run wins,
-/// then a clean one, then the newest. Read once per repository at leaving,
+/// whichever checkout sykli ran. Every receipt of a tree is kept, best first: a
+/// passing run, then a clean one, then the newest. Read once per repository at leaving,
 /// and shared by its phases and its pull request.
 fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Receipts {
-    let mut found = Receipts::new();
+    let mut found = Receipts::default();
     for (dir, checkout) in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
@@ -423,17 +462,8 @@ fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Rec
                 outcome: outcome.to_owned(),
                 dirty,
             };
-            // A passing run first (sykli needs one pass of the commit's tree,
-            // not the newest run), then a clean one, then the newest.
-            let rank = |e: &Evidence, at: i64| (e.outcome == "passed", !e.dirty, at);
-            if found
-                .get(tree)
-                .is_some_and(|seen| rank(&seen.evidence, seen.at) >= rank(&evidence, at))
-            {
-                continue;
-            }
-            found.insert(
-                tree.to_owned(),
+            found.add(
+                tree,
                 Receipt {
                     at,
                     evidence,
@@ -1435,6 +1465,9 @@ pub fn still_at(repo: &Path, branch: &str, commit: &str) -> bool {
     .any(|at| at == commit)
 }
 
+/// The most receipts of one tree sykli is asked about, best first.
+const MAX_ASKED: usize = 5;
+
 /// This machine's sykli, asked at most once per leaving whether it can bind
 /// a receipt to a commit (`sykli verify --commit`).
 #[derive(Debug, Default)]
@@ -1491,7 +1524,8 @@ impl Sykli {
         checkouts: &[Worktree],
         alive: bool,
     ) -> Check {
-        let Some(receipt) = receipts.get(tree) else {
+        let candidates = receipts.of(tree);
+        if candidates.is_empty() {
             let has_contract = ["sykli.json", "sykli.rs"]
                 .iter()
                 .any(|name| git(repo, &["cat-file", "-e", &format!("{commit}:{name}")]).is_some());
@@ -1504,7 +1538,7 @@ impl Sykli {
                     why: "no sykli contract (sykli.json or sykli.rs) in this commit".to_owned(),
                 }
             };
-        };
+        }
         let from_the_commit = match self.binds_commits() {
             Ok(from_the_commit) => from_the_commit,
             Err(why) => return Check::Unverified { why },
@@ -1514,50 +1548,60 @@ impl Sykli {
             .filter(|w| w.head.as_deref() == Some(commit))
             .map(|w| w.path.as_path())
             .find(|path| clean(path));
-        let (checkout, is_the_commit) = match at_commit {
-            Some(path) => (path, true),
-            None => (receipt.checkout.as_path(), false),
-        };
-        // A sykli that reads everything from the commit takes the contract
-        // from it too; an older one from the checkout on disk.
-        let Some(contract) = ["sykli.json", "sykli.rs"].into_iter().find(|name| {
-            if from_the_commit {
-                git(repo, &["cat-file", "-e", &format!("{commit}:{name}")]).is_some()
-            } else {
-                checkout.join(name).is_file()
-            }
-        }) else {
-            return Check::Unverified {
-                why: format!(
-                    "no sykli contract (sykli.json or sykli.rs) in {}",
-                    checkout.display()
-                ),
+        // Every receipt of the tree, best first, until one passes: a newer run
+        // of it under another contract, or a failing one, never hides a pass.
+        let mut verdicts = Vec::new();
+        for receipt in candidates.iter().take(MAX_ASKED) {
+            let (checkout, is_the_commit) = match at_commit {
+                Some(path) => (path, true),
+                None => (receipt.checkout.as_path(), false),
             };
-        };
-        let output = process::run(
-            Command::new("sykli")
-                .arg("verify")
-                .arg(&receipt.path)
-                .args(["--contract", contract, "--commit", commit])
-                .current_dir(checkout),
-            None,
-            process::LOCAL,
-        );
-        let output = match output {
-            Err(error) => {
-                return Check::Unverified {
-                    why: format!("sykli verify could not run: {error:#}"),
+            // A sykli that reads everything from the commit takes the contract
+            // from it too; an older one from the checkout on disk.
+            let Some(contract) = ["sykli.json", "sykli.rs"].into_iter().find(|name| {
+                if from_the_commit {
+                    git(repo, &["cat-file", "-e", &format!("{commit}:{name}")]).is_some()
+                } else {
+                    checkout.join(name).is_file()
                 }
-            }
-            Ok(output) if output.status.success() => return Check::Passed,
-            Ok(output) => output,
-        };
-        verdict(
-            from_the_commit,
-            is_the_commit,
-            output.status.code(),
-            output.failure_detail(),
-        )
+            }) else {
+                verdicts.push(Check::Unverified {
+                    why: format!(
+                        "no sykli contract (sykli.json or sykli.rs) in {}",
+                        checkout.display()
+                    ),
+                });
+                continue;
+            };
+            let output = process::run(
+                Command::new("sykli")
+                    .arg("verify")
+                    .arg(&receipt.path)
+                    .args(["--contract", contract, "--commit", commit])
+                    .current_dir(checkout),
+                None,
+                process::LOCAL,
+            );
+            verdicts.push(match output {
+                Err(error) => Check::Unverified {
+                    why: format!("sykli verify could not run: {error:#}"),
+                },
+                Ok(output) if output.status.success() => return Check::Passed,
+                Ok(output) => verdict(
+                    from_the_commit,
+                    is_the_commit,
+                    output.status.code(),
+                    output.failure_detail(),
+                ),
+            });
+        }
+        // Refused only when every receipt asked was; else what could not be
+        // said of the best one that was not refused.
+        let refused = |check: &Check| matches!(check, Check::Failed { .. });
+        match verdicts.iter().position(|check| !refused(check)) {
+            Some(at) => verdicts.swap_remove(at),
+            None => verdicts.swap_remove(0),
+        }
     }
 }
 

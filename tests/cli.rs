@@ -3305,6 +3305,59 @@ fn landed_lines(record: &str) -> Vec<&str> {
 }
 
 #[test]
+fn a_commit_passes_when_any_receipt_of_its_tree_verifies() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("receipts-per-tree");
+    let repo = clone_with_origin(&fixture, "work");
+    // A passing run of the commit's contract, then a newer passing run of
+    // the same tree under another contract (a demo, say), which sykli
+    // refuses for that commit.
+    let (record, wt) = worktree_push_session(
+        &fixture,
+        &repo,
+        "two-runs",
+        "echo '{}' > sykli.json && git add sykli.json && git commit -q -m checked
+        receipt passed
+        mv .sykli/receipts/rcpt_*.json .sykli/receipts/rcpt_the_contract.json
+        sleep 1
+        receipt passed forged
+        git push -q origin HEAD:main",
+        "new",
+    );
+    assert!(
+        landed_lines(&record).concat().contains(&format!(
+            "{} reached origin/main: verified: passed (sykli verify --commit)",
+            short_of(&wt, "HEAD")
+        )),
+        "a newer receipt of the tree never shadows a pass: {record}"
+    );
+    assert!(!record.contains("FLAGGED"), "{record}");
+    // Refused only when every receipt of its tree is.
+    let (record, _) = worktree_push_session(
+        &fixture,
+        &repo,
+        "all-refused",
+        "git pull -q origin main && echo x > x.txt && git add x.txt && git commit -q -m x
+        receipt passed forged
+        mv .sykli/receipts/rcpt_*.json .sykli/receipts/rcpt_one.json
+        sleep 1
+        receipt failed
+        git push -q origin HEAD:main",
+        "new",
+    );
+    assert!(
+        landed_lines(&record)
+            .concat()
+            .contains("FAILED sykli verify: refused:"),
+        "{record}"
+    );
+    assert!(record.contains("─ FLAGGED"), "{record}");
+    fixture.cleanup();
+}
+
+#[test]
 fn the_documented_flow_pushed_to_main_is_verified_at_its_tip_and_raises_nothing() {
     if !git_available() {
         return;
