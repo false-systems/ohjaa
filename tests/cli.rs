@@ -130,6 +130,16 @@ grep -q '"outcome":"passed"' "$receipt" || { echo "refused: outcome expected pas
 exit 0
 "#;
 
+/// Never the real vessa. `sessions --json` prints the file
+/// OHJAA_STUB_VESSA_JSON names, else no sessions.
+const VESSA_STUB: &str = r#"#!/bin/sh
+if [ "$1 $2" = "sessions --json" ] && [ -n "${OHJAA_STUB_VESSA_JSON:-}" ]; then
+  cat "$OHJAA_STUB_VESSA_JSON"
+else
+  echo '{"schema":"vessa-usage.v1","sessions":[],"warnings":[]}'
+fi
+"#;
+
 /// A session payload exactly as `toimija sessions --json` emits it.
 fn sessions_json(sessions: &str, coverage: &str) -> String {
     format!(
@@ -215,6 +225,10 @@ impl Fixture {
         let sykli = stub_dir.join("sykli");
         fs::write(&sykli, SYKLI_STUB).unwrap();
         make_executable(&sykli);
+        // Never the real vessa: no native sessions unless a test lists some.
+        let vessa = stub_dir.join("vessa");
+        fs::write(&vessa, VESSA_STUB).unwrap();
+        make_executable(&vessa);
         let fixture = Fixture { dir, stub_dir };
         // Default: an empty, fully available scan, in repos and outside them.
         fixture.set_sessions(&sessions_json("", "available"));
@@ -3305,6 +3319,34 @@ fn landed_lines(record: &str) -> Vec<&str> {
 }
 
 #[test]
+fn a_refusal_says_when_not_every_receipt_of_the_tree_was_asked() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("receipts-cap");
+    let repo = clone_with_origin(&fixture, "work");
+    // Six refused receipts of one tree: sykli is asked about five.
+    let (record, _) = worktree_push_session(
+        &fixture,
+        &repo,
+        "six-runs",
+        "echo '{}' > sykli.json && git add sykli.json && git commit -q -m checked
+        for n in 1 2 3 4 5 6; do
+          receipt passed forged && mv .sykli/receipts/rcpt_$(git rev-parse HEAD^{tree}).json .sykli/receipts/run_$n.json
+        done
+        git push -q origin HEAD:main",
+        "new",
+    );
+    assert!(
+        landed_lines(&record)
+            .concat()
+            .contains("(sykli was asked about the best 5 of 6 receipts of its tree)"),
+        "{record}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
 fn a_commit_passes_when_any_receipt_of_its_tree_verifies() {
     if !git_available() {
         return;
@@ -4429,6 +4471,442 @@ fn a_session_keeps_its_own_commits_in_a_checkout_another_session_has_left() {
     assert!(
         phases.contains(&sha),
         "made after the other session left: its own: {phases}\n{record}"
+    );
+    fixture.cleanup();
+}
+
+/// One launch through ohjaa of a stub `claude` that writes when it started,
+/// and a session of `sh` that pushes a failing commit to main: what the
+/// report is made of.
+fn report_fixture(fixture: &Fixture) -> (PathBuf, String) {
+    let repo = clone_with_origin(fixture, "work");
+    let started = fixture.dir.join("claude-started");
+    let claude = fixture.stub_dir.join("claude");
+    fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\ndate -u +%Y-%m-%dT%H:%M:%SZ > '{}'\nexit 0\n",
+            started.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&claude);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "claude",
+                "--intent",
+                "through ohjaa",
+                "--no-briefing",
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'broken build'
+        receipt failed
+        git push -q origin HEAD:main"
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "push broken",
+                "--no-briefing",
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    // vessa sees the launch above, and one claude session started by hand.
+    let launched = fs::read_to_string(&started).unwrap().trim().to_owned();
+    let repo_path = std::fs::canonicalize(&repo).unwrap();
+    fs::write(
+        fixture.dir.join("vessa.json"),
+        format!(
+            r#"{{"schema":"vessa-usage.v1","warnings":[],"sessions":[
+              {{"agent":"claude","id":"through","parent":null,"started_at":"{launched}","cwd":"{r}","entrypoint":"cli","originator":null}},
+              {{"agent":"claude","id":"by-hand","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere","entrypoint":"cli","originator":null}},
+              {{"agent":"claude","id":"by-hand","parent":"x","started_at":"{launched}","cwd":"{r}","entrypoint":"cli","originator":null}},
+              {{"agent":"claude","id":"drafter","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere","entrypoint":"sdk-cli","originator":null}}
+            ]}}"#,
+            r = repo_path.display()
+        )
+        .replace(&format!("{}/elsewhere", repo_path.display()), "/nonexistent/elsewhere"),
+    )
+    .unwrap();
+    let pushed = short_head(&repo);
+    (repo, pushed)
+}
+
+#[test]
+fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("report");
+    let (repo, pushed) = report_fixture(&fixture);
+    let report = |json: bool| {
+        let mut command = fixture.ohjaa();
+        command
+            .arg("--root")
+            .arg(&fixture.dir)
+            .arg("report")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+            .current_dir(&repo);
+        if json {
+            command.arg("--json");
+        }
+        output_of(&mut command)
+    };
+    let (stdout, stderr, code) = report(true);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["schema"], "ohjaa-report.v1");
+    let intents: Vec<&str> = json["sessions_without_testimony"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["intent"].as_str().unwrap())
+        .collect();
+    assert_eq!(intents, ["through ohjaa", "push broken"], "{stdout}");
+    let commits = json["unproven_commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 1, "{stdout}");
+    assert_eq!(commits[0]["check"], "failed");
+    assert!(commits[0]["commit"].as_str().unwrap().starts_with(&pushed));
+    assert_eq!(json["bypasses"]["judged"], true);
+    assert_eq!(
+        json["bypasses"]["headless"], 1,
+        "claude -p bypasses nothing"
+    );
+    assert_eq!(
+        json["default_branch_commits"]["repositories"], 1,
+        "{stdout}"
+    );
+    let bypassed: Vec<&str> = json["bypasses"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bypassed,
+        ["by-hand"],
+        "the launch through ohjaa and a subagent are not bypasses: {stdout}"
+    );
+    let (text, _, code) = report(false);
+    assert_eq!(code, Some(0));
+    assert!(
+        text.contains("Commits on a default branch without passing evidence (1), of ")
+            && text.contains("  The rest: ")
+            && text.contains(&format!("work origin/main {pushed} \"broken build\""))
+            && text.contains("Agent sessions a person started without ohjaa (1):")
+            && text.contains("Not counted: 1 headless run(s)")
+            && text.contains("- claude by-hand in /nonexistent/elsewhere"),
+        "{text}"
+    );
+    assert!(
+        !fixture.dir.join("state/ohjaa/report-at").exists(),
+        "only a complete report a person read at a terminal is the week's"
+    );
+
+    // Intake drafts from what the report found, never from what could not be
+    // checked.
+    let drafter = fixture.stub_dir.join("drafter");
+    let prompt = fixture.dir.join("prompt.txt");
+    fs::write(
+        &drafter,
+        format!("#!/bin/sh\ncat > '{}'\necho '[]'\n", prompt.display()),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .arg("--root")
+            .arg(&fixture.dir)
+            .args(["intake", "--source", "report", "--drafter"])
+            .arg(&drafter)
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let prompt = fs::read_to_string(&prompt).unwrap();
+    assert!(
+        prompt.contains("never read back its briefing")
+            && prompt
+                .contains("\"broken build\" is on origin/main in work without passing evidence")
+            && prompt.contains("a claude session (by-hand)"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("unverified"), "{prompt}");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_report_without_vessa_says_what_it_could_not_look_for() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("report-no-vessa");
+    let repo = fixture.make_git_repo("work");
+    fs::remove_file(fixture.stub_dir.join("vessa")).unwrap();
+    let path = std::env::join_paths([
+        fixture.stub_dir.clone(),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ])
+    .unwrap();
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .arg("--root")
+            .arg(&fixture.dir)
+            .arg("report")
+            .env("PATH", path)
+            .current_dir(&repo),
+    );
+    assert_eq!(
+        code,
+        Some(4),
+        "incomplete, never quietly empty: {stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "Agent sessions a person started without ohjaa: not judged: vessa is not on PATH"
+        ),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn what_vessa_could_not_read_or_date_leaves_the_report_incomplete() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("report-vessa-gaps");
+    let repo = fixture.make_git_repo("work");
+    let transcript = fixture.dir.join("undated.jsonl");
+    fs::write(&transcript, "{}\n").unwrap();
+    let report = |listed: &str| {
+        fs::write(fixture.dir.join("vessa.json"), listed).unwrap();
+        output_of(
+            fixture
+                .ohjaa()
+                .arg("--root")
+                .arg(&fixture.dir)
+                .arg("report")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+                .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+                .current_dir(&repo),
+        )
+    };
+    // vessa read nothing, and said so: never a clean week.
+    let (stdout, _, code) = report(
+        r#"{"schema":"vessa-usage.v1","sessions":[],"warnings":[
+            "/home/x/.claude/projects: symlink not followed",
+            "No supported native sessions found; usage is unknown"]}"#,
+    );
+    assert_eq!(code, Some(4), "{stdout}");
+    assert!(
+        stdout.contains("Agent sessions a person started without ohjaa (0):")
+            && stdout.contains("- vessa: /home/x/.claude/projects: symlink not followed")
+            && stdout.contains("- vessa: No supported native sessions found"),
+        "{stdout}"
+    );
+    // A session vessa could not date is said apart, never dropped.
+    let (stdout, _, code) = report(&format!(
+        r#"{{"schema":"vessa-usage.v1","warnings":[],"sessions":[
+            {{"agent":"claude","id":"no-date","parent":null,"started_at":null,"cwd":"",
+              "source":"{}","entrypoint":"cli","originator":null}}]}}"#,
+        transcript.display()
+    ));
+    assert_eq!(code, Some(4), "{stdout}");
+    assert!(
+        stdout.contains("Not judged, vessa could not date or place them (1):")
+            && stdout.contains("- claude no-date (transcript ")
+            && stdout.contains("1 native session(s) vessa could not date or place: not judged"),
+        "{stdout}"
+    );
+    // An older vessa cannot tell a headless run from a person's session.
+    let (stdout, _, code) = report(
+        r#"{"schema":"vessa-usage.v1","warnings":[],"sessions":[
+            {"agent":"claude","id":"old","parent":null,"started_at":"2026-10-09T10:00:00Z","cwd":"/r"}]}"#,
+    );
+    assert_eq!(code, Some(4), "{stdout}");
+    assert!(
+        stdout.contains("not judged: vessa does not say how a session was started"),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_window_with_more_commits_than_a_report_judges_says_so() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("report-cap");
+    let repo = fixture.make_git_repo("work");
+    let status = Command::new("sh")
+        .args([
+            "-c",
+            "i=0; while [ $i -lt 101 ]; do git commit -q --allow-empty -m c$i || exit 1; i=$((i+1)); done",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (stdout, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .arg("--root")
+            .arg(&fixture.dir)
+            .arg("report")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(4), "{stdout}");
+    assert!(
+        stdout.contains("of 100 first-parent commit(s) in 1 repository")
+            && stdout.contains(
+                "work: only the newest 100 default-branch commits in the window were judged"
+            )
+            && stdout.contains("The rest: 0 verified · 100 without a sykli contract"),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
+
+/// `command` run under a pseudo-terminal, as a person's shell would run it,
+/// with its output; `None` where `script` is not there to make one.
+fn under_a_terminal(command: &Command) -> Option<String> {
+    let mut line = vec![command.get_program().to_string_lossy().into_owned()];
+    line.extend(command.get_args().map(|a| a.to_string_lossy().into_owned()));
+    let quoted = line
+        .iter()
+        .map(|word| format!("'{}'", word.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut script = Command::new("script");
+    if cfg!(target_os = "macos") {
+        script.args(["-q", "/dev/null", "sh", "-c", &quoted]);
+    } else {
+        script.args(["-qec", &quoted, "/dev/null"]);
+    }
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => script.env(key, value),
+            None => script.env_remove(key),
+        };
+    }
+    if let Some(dir) = command.get_current_dir() {
+        script.current_dir(dir);
+    }
+    let output = script.stdin(std::process::Stdio::null()).output().ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).replace('\r', ""))
+}
+
+#[test]
+fn the_weekly_report_is_said_after_the_record_at_a_terminal_and_never_briefed() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("weekly");
+    let repo = fixture.make_git_repo("work");
+    let gappy = fixture.dir.join("gappy.json");
+    fs::write(
+        &gappy,
+        r#"{"schema":"vessa-usage.v1","sessions":[],"warnings":["a source could not be read"]}"#,
+    )
+    .unwrap();
+    let run = |intent: &str, complete: bool| {
+        let mut command = fixture.ohjaa();
+        command
+            .args(["run", "sh", "--intent", intent, "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo);
+        command.env("OHJAA_STUB_SYKLI_COMMIT", "new");
+        if !complete {
+            command.env("OHJAA_STUB_VESSA_JSON", &gappy);
+        }
+        under_a_terminal(&command)
+    };
+    let marker = fixture.dir.join("state/ohjaa/report-at");
+    // A report with a gap (vessa could not read a source) is said, and said
+    // again.
+    let Some(first) = run("one", false) else {
+        return; // no `script` here to make a terminal
+    };
+    let record = first.find("ohjaa: recorded; queued").expect(&first);
+    let weekly = first.find("ohjaa: weekly report, ").expect(&first);
+    assert!(weekly > record, "after the record: {first}");
+    assert!(
+        first.contains("incomplete: vessa: a source could not be read")
+            && first.contains("said again tomorrow"),
+        "it says what the gap is: {first}"
+    );
+    assert!(
+        !marker.exists(),
+        "an incomplete report does not mark the week"
+    );
+    assert!(
+        !fixture.argv().join("\n").contains("weekly report"),
+        "never into the agent's briefing"
+    );
+    // A gap that does not go away is said again at most once a day.
+    let again = run("one again", false).unwrap();
+    assert!(
+        !again.contains("weekly report"),
+        "not after every session: {again}"
+    );
+    let shown = fixture.dir.join("state/ohjaa/report-shown-at");
+    let two_days_ago = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        - 2 * 86_400_000)
+        .to_string();
+    fs::write(&shown, two_days_ago).unwrap();
+    let second = run("two", true).unwrap();
+    assert!(
+        second.contains("ohjaa: weekly report, ")
+            && second.contains("the next summary is in 7 days"),
+        "{second}"
+    );
+    assert!(marker.is_file(), "a complete one marks the week");
+    let third = run("three", true).unwrap();
+    assert!(!third.contains("weekly report"), "once a week: {third}");
+    // Not at a terminal, nothing is said: no person is reading.
+    fs::remove_file(&marker).unwrap();
+    fs::remove_file(&shown).unwrap();
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent", "four", "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        !stderr.contains("weekly report") && !marker.exists(),
+        "{stderr}"
     );
     fixture.cleanup();
 }

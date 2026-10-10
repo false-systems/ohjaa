@@ -964,6 +964,116 @@ fn intake_now_ms() -> i64 {
     crate::intake::now_seconds() * 1000
 }
 
+/// A commit on a repository's default branch, and what sykli says of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnDefault {
+    /// `origin/main`, else the local `main`.
+    pub onto: String,
+    pub commit: String,
+    pub subject: String,
+    /// Its commit time, in unix seconds.
+    pub committed: i64,
+    /// It has more than one parent: a merge (a forge's "Merge pull request").
+    pub merge: bool,
+    pub check: Check,
+}
+
+/// The most default-branch commits a report reads in one repository.
+pub const MAX_REPORTED: usize = 100;
+
+/// The commits on `repo`'s default branch (the remote one, else the local)
+/// committed after `since` (unix seconds), first parent only, newest first,
+/// at most [`MAX_REPORTED`] (`true` beside them when the window held more),
+/// each with what sykli says of it, against the receipts in every checkout
+/// and those kept under the git common dir. `None` when git cannot read it.
+pub fn default_branch_since(
+    repo: &Path,
+    since: i64,
+    sykli: &Sykli,
+) -> Option<(Vec<OnDefault>, bool)> {
+    let repo = canonical(repo);
+    let reference = default_branch(&repo).into_iter().next()?;
+    let onto = reference
+        .strip_prefix("refs/remotes/")
+        .or_else(|| reference.strip_prefix("refs/heads/"))
+        .unwrap_or(&reference)
+        .to_owned();
+    let log = git(
+        &repo,
+        &[
+            "log",
+            "--first-parent",
+            &format!("--since=@{since}"),
+            &format!("-{}", MAX_REPORTED + 1),
+            "--format=%H%x1f%T%x1f%ct%x1f%P%x1f%s",
+            &reference,
+        ],
+    )?;
+    let all = worktrees(&repo);
+    let receipts = receipts_of_clone(&repo, &all);
+    // What a checkout that still exists records making: its receipts would
+    // be there.
+    let mut alive = HashSet::new();
+    for checkout in &all {
+        let moves = reflog(
+            &checkout.path,
+            &[
+                "log",
+                "--walk-reflogs",
+                "--date=unix",
+                REFLOG_FORMAT,
+                "HEAD",
+            ],
+        );
+        for entry in moves.into_iter().flatten() {
+            if created_here(&entry.subject) {
+                alive.insert(entry.commit);
+            }
+        }
+    }
+    let mut listed: Vec<(&str, &str, i64, bool, &str)> = log
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(5, '\u{1f}');
+            let (commit, tree, committed, parents, subject) = (
+                fields.next()?,
+                fields.next()?,
+                fields.next()?.parse::<i64>().ok()?,
+                fields.next()?,
+                fields.next()?,
+            );
+            // `--since` keeps the second it names; the window does not.
+            (committed > since).then_some((
+                commit,
+                tree,
+                committed,
+                parents.split_whitespace().count() > 1,
+                subject,
+            ))
+        })
+        .collect();
+    let capped = listed.len() > MAX_REPORTED;
+    listed.truncate(MAX_REPORTED);
+    let judged = listed
+        .into_iter()
+        .map(|(commit, tree, committed, merge, subject)| OnDefault {
+            onto: onto.clone(),
+            commit: commit.to_owned(),
+            subject: subject.to_owned(),
+            committed,
+            merge,
+            check: sykli.check(&repo, commit, tree, &receipts, &all, alive.contains(commit)),
+        })
+        .collect();
+    Some((judged, capped))
+}
+
+/// Whether this sykli can bind a receipt to a commit, and why not when it
+/// cannot: for a report to say what it could not check.
+pub fn sykli_cannot_bind(sykli: &Sykli) -> Option<String> {
+    sykli.binds_commits().err()
+}
+
 /// The default branch's references: the remote one first, then the local
 /// one, each when it exists. The default branch is what `origin/HEAD` names,
 /// else `main`, else `master`.
@@ -1598,10 +1708,22 @@ impl Sykli {
         // Refused only when every receipt asked was; else what could not be
         // said of the best one that was not refused.
         let refused = |check: &Check| matches!(check, Check::Failed { .. });
-        match verdicts.iter().position(|check| !refused(check)) {
+        let mut check = match verdicts.iter().position(|check| !refused(check)) {
             Some(at) => verdicts.swap_remove(at),
             None => verdicts.swap_remove(0),
+        };
+        // Said when the cap left receipts unasked: one of them might pass.
+        if candidates.len() > MAX_ASKED {
+            if let Check::Failed { why } | Check::Unverified { why } | Check::Stale { why } =
+                &mut check
+            {
+                why.push_str(&format!(
+                    " (sykli was asked about the best {MAX_ASKED} of {} receipts of its tree)",
+                    candidates.len()
+                ));
+            }
         }
+        check
     }
 }
 
