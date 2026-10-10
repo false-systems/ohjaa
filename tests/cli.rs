@@ -3525,7 +3525,7 @@ fn a_session_whose_ohjaa_was_killed_is_closed_as_orphaned_at_the_next_launch() {
     assert_eq!(code, Some(0));
     assert!(
         stdout.contains("ended: orphaned (observed at next launch)")
-            && stdout.contains("phases        not observed (its ohjaa was killed before leaving)"),
+            && stdout.contains("phases        not observed (its ohjaa was gone before leaving)"),
         "{stdout}"
     );
     // Queued for intake, like any ended session.

@@ -141,12 +141,15 @@ until it ends so the last one always happens:
 
 States are **observed, not declared**: the agent writes only its read-back and
 its handover, and the record shows them as its words. Leaving always writes the
-record, crash or not; a missing handover is recorded as none. Only a SIGKILL of
-ohjaa itself skips leaving: the next launch finds that ohjaa gone, closes the
-session as `orphaned (observed at next launch)`, queues it for `ohjaa intake`,
-and opens its briefing with it when it ran here. The next session here, and in
-every repository it named with `--scope` or was found working in, is briefed
-with it:
+record, crash or not; a missing handover is recorded as none. Only losing ohjaa
+itself (a SIGKILL, a crash, a restart) skips leaving: the next launch finds that
+ohjaa gone, closes the session as `orphaned (observed at next launch)`, queues it
+for `ohjaa intake`, and opens its briefing with it when it ran here. Only the
+absence is observed, never a cause, and an orphan ranks by when it started: a
+session that really ended after that stays the last session here.
+
+The next session here, and in every repository it named with `--scope` (never
+one it was only found working in), is briefed with the last session's record:
 
 ```
 session oh-1790… · claude · selko · 2026-09-26 10:02 UTC → 2026-09-26 11:47 UTC · ended: clean (exit 0)

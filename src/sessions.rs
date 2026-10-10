@@ -192,9 +192,10 @@ pub struct Left {
     /// The other sessions that shared its places while it ran.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared: Vec<String>,
-    /// Its ohjaa was killed (SIGKILL) before leaving could run: the session
-    /// was closed at a later launch that found that ohjaa gone. `ended_ms` is
-    /// when that was observed, and nothing it did was observed.
+    /// Its ohjaa was gone before leaving could run (killed, crashed, or the
+    /// machine restarted: only its absence is observed): the session was
+    /// closed at a later launch that found it gone. `ended_ms` is when that
+    /// was observed, not when it ended, and nothing it did was observed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub orphaned: bool,
 }
@@ -208,7 +209,7 @@ impl Left {
             toimija_session: None,
             phases: None,
             finished: Finished::Unknown {
-                why: "its ohjaa was killed before leaving".to_owned(),
+                why: "its ohjaa was gone before leaving".to_owned(),
             },
             interrupted: false,
             scoped: Vec::new(),
@@ -293,6 +294,22 @@ pub struct Session {
     /// refusal is said, never shown as "not collected".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_refused: Option<String>,
+}
+
+impl Session {
+    /// When it ended, as far as that was observed, to rank the sessions in a
+    /// place: `None` while it runs. An orphan's end was never observed, only
+    /// that its ohjaa was gone at some later launch, so it ranks by its start:
+    /// a session that really ended after that comes after it.
+    pub fn ended_rank(&self) -> Option<i64> {
+        self.left.as_ref().map(|left| {
+            if left.orphaned {
+                self.started_ms
+            } else {
+                left.ended_ms
+            }
+        })
+    }
 }
 
 /// Why the log could not be used. Never a reason to stop a launch.
@@ -531,7 +548,8 @@ impl Store {
 /// already shows who is live, and an unfinished record must not read as a
 /// crash. "Here" is where a session was launched, every repository it
 /// named with `--scope`, and every one leaving found it worked in: the one
-/// that ended last wins, wherever it started.
+/// that ended last wins, wherever it started (an orphan by its start: when it
+/// ended was never observed).
 fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), StoreError> {
     let Some(left) = &session.left else {
         return Ok(());
@@ -557,9 +575,10 @@ fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), Sto
                     .get(id.value())
                     .map_err(other)?
                     .and_then(|value| serde_json::from_slice::<Session>(value.value()).ok());
+                let rank = session.ended_rank().unwrap_or(left.ended_ms);
                 current
-                    .and_then(|current| current.left.map(|l| l.ended_ms))
-                    .is_none_or(|ended| left.ended_ms >= ended)
+                    .and_then(|current| current.ended_rank())
+                    .is_none_or(|ended| rank >= ended)
             }
         };
         if newer {
@@ -975,8 +994,8 @@ pub fn render_orphaned(orphans: &[Session]) -> String {
         let _ = writeln!(
             out,
             "ORPHANED: session {} ({}, {}), started {}, was never closed: its ohjaa was \
-             killed, so nothing it did was observed. Check `git log` and the worktrees here \
-             before building on its work.",
+             gone at this launch, so nothing it did was observed. Check `git log` and \
+             the worktrees here before building on its work.",
             session.id,
             session.agent,
             session.intent,
@@ -1067,7 +1086,7 @@ pub fn render_none_ended(unended: &[Session], unreadable: usize) -> String {
 
 fn describe_phases(phases: Option<&Vec<Phase>>, left: &Left) -> String {
     match phases {
-        None if left.orphaned => "not observed (its ohjaa was killed before leaving)".to_owned(),
+        None if left.orphaned => "not observed (its ohjaa was gone before leaving)".to_owned(),
         None if left.interrupted => "not observed (leaving was interrupted)".to_owned(),
         None => "not observed".to_owned(),
         Some(phases) if phases.is_empty() => "no commits".to_owned(),
@@ -1455,6 +1474,31 @@ mod tests {
             "oh-2",
             "the one that ended last wins, wherever it was launched"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_orphan_never_outranks_a_session_that_really_ended_after_it_started() {
+        let dir = temp("orphan-rank");
+        let store = Store::open(&store_path(&dir)).unwrap();
+        // Started first, then its ohjaa was gone; found so only much later.
+        let mut orphan = session("oh-1", "/r/a", 1_000);
+        orphan.left = Some(Left::orphaned(9_000));
+        store
+            .put(&ended(session("oh-2", "/r/a", 2_000), 3_000))
+            .unwrap();
+        store.put(&orphan).unwrap();
+        assert_eq!(
+            store.latest_for("/r/a").unwrap().unwrap().id,
+            "oh-2",
+            "when it was found gone is not when it ended"
+        );
+        let record = render_record(&orphan);
+        assert!(
+            record.contains("phases        not observed (its ohjaa was gone before leaving)"),
+            "it says what was observed, never a cause: {record}"
+        );
+        assert!(!record.contains("killed"), "{record}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

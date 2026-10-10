@@ -489,7 +489,7 @@ pub fn handover_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candida
 /// What ohjaa observed going wrong in each ended session, as candidates: a
 /// commit that reached the default branch, or a pull request head, without
 /// passing evidence; an agent that exited non-zero; a missing handover; a
-/// session whose ohjaa was killed. Observed facts, not anyone's words: the
+/// session whose ohjaa was gone before leaving. Observed facts, not anyone's words: the
 /// drafter weighs them like any candidate, and a person decides.
 pub fn observed_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candidate> {
     use crate::sessions::Exit;
@@ -504,7 +504,7 @@ pub fn observed_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candida
             .collect();
         if left.orphaned {
             seen.push(
-                "its ohjaa was killed before leaving; the session was closed as orphaned at \
+                "its ohjaa was gone before leaving; the session was closed as orphaned at \
                  a later launch, and nothing it did was observed"
                     .to_owned(),
             );
@@ -929,7 +929,7 @@ mod tests {
             texts,
             [
                 "in session oh-2: the agent was killed by signal 9",
-                "in session oh-3: its ohjaa was killed before leaving; the session was closed as \
+                "in session oh-3: its ohjaa was gone before leaving; the session was closed as \
                  orphaned at a later launch, and nothing it did was observed",
             ],
             "a clean session with a handover raises nothing; an orphan is not also blamed \

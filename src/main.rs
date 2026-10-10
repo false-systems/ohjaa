@@ -694,7 +694,7 @@ fn last_session_here(dirs: &Dirs, repo: &Path) -> Option<(String, String)> {
                 .into_iter()
                 .filter(|s| s.id != session.id && sessions::touches(s, &here))
                 .collect();
-            earlier.sort_by_key(|s| std::cmp::Reverse(s.left.as_ref().map(|l| l.ended_ms)));
+            earlier.sort_by_key(|s| std::cmp::Reverse(s.ended_rank()));
             earlier.truncate(STANDING_LOOKBACK);
             let warnings = sessions::render_warnings(&session, &earlier, |repo, branch, commit| {
                 lifecycle::still_at(Path::new(repo), branch, commit)
@@ -1589,8 +1589,9 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // perimeter (who and what is around). Keep it separate from a task so an
     // interactive Codex launch can wait for the person's first message.
     let dirs = Dirs::resolve(in_repo.then_some(root.as_path()))?;
-    // Sessions an ohjaa killed with SIGKILL left open are closed first, so they
-    // are queued, and the one here is the last session here.
+    // Sessions left open by an ohjaa that is gone (a SIGKILL, a crash, a
+    // restart) are closed first, so they are queued and can be the last session
+    // here.
     let orphans = close_orphans(&dirs, !dry_run);
     let here_key = repo_key(&root);
     for orphan in &orphans {
@@ -2009,11 +2010,12 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     Ok(lifecycle::exit_code(exit))
 }
 
-/// Sessions left open by an ohjaa that is gone: killed with SIGKILL, so its
-/// leaving never ran. Each is closed now as orphaned (observed at this
-/// launch), which queues it for `ohjaa intake` and makes it the last session
-/// where it ran; with `write` false (a dry run) it is only said. A session
-/// whose ohjaa may still run, or cannot be told, is left alone.
+/// Sessions left open by an ohjaa that is gone (killed, crashed or restarted:
+/// only its absence is observed), so its leaving never ran. Each is closed now
+/// as orphaned (observed at this launch), which queues it for `ohjaa intake`
+/// and ranks it by its start among the sessions where it ran; with `write`
+/// false (a dry run) it is only said. A session whose ohjaa may still run, or
+/// cannot be told, is left alone.
 fn close_orphans(dirs: &Dirs, write: bool) -> Vec<sessions::Session> {
     let Some(store) = session_store(dirs) else {
         return Vec::new();
