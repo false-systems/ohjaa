@@ -4910,3 +4910,150 @@ fn the_weekly_report_is_said_after_the_record_at_a_terminal_and_never_briefed() 
     );
     fixture.cleanup();
 }
+
+/// What a command could change in the log: its digest, its size and when it
+/// was last written.
+fn log_stamp(log: &Path) -> (String, u64, std::time::SystemTime) {
+    use sha2::{Digest, Sha256};
+    let meta = fs::metadata(log).unwrap();
+    (
+        format!("{:x}", Sha256::digest(fs::read(log).unwrap())),
+        meta.len(),
+        meta.modified().unwrap(),
+    )
+}
+
+#[test]
+fn commands_that_only_read_the_session_log_never_write_it() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("read-only-log");
+    let (repo, _) = report_fixture(&fixture);
+    fixture.node(
+        &fixture.dir.join("ours/knowledge"),
+        "lean",
+        "taste",
+        "Lean first.",
+    );
+    let log = fixture.dir.join("state/ohjaa/sessions.redb");
+    // Written an hour ago: any write now moves it, however coarse the file
+    // system's clock.
+    fs::File::options()
+        .write(true)
+        .open(&log)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+    let before = log_stamp(&log);
+    let (out, stderr, code) =
+        output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(log_stamp(&log), before, "usage export wrote the log");
+    let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(export["sessions"].as_array().unwrap().len(), 2, "{out}");
+    let id = export["sessions"][0]["id"].as_str().unwrap().to_owned();
+    let root = fixture.dir.to_string_lossy().into_owned();
+    let reads: [&[&str]; 10] = [
+        &["--root", &root, "report", "--json"],
+        &["--root", &root, "report", "--since", "14d"],
+        &["usage", "export", "--session", &id],
+        &["session"],
+        &["session", &id],
+        &["brief"],
+        &["graph", "lean"],
+        &["run", "sh", "--intent", "look", "--dry-run"],
+        &["intake", "--dry-run", "--source", "report"],
+        &[
+            "--root",
+            &root,
+            "intake",
+            "--dry-run",
+            "--source",
+            "transcripts",
+        ],
+    ];
+    for args in reads {
+        let (stdout, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args(args)
+                .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+                .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+                .current_dir(&repo),
+        );
+        // 4: a perimeter with a repository whose role it cannot derive.
+        assert!(
+            matches!(code, Some(0 | 4)),
+            "ohjaa {args:?}: {stdout}{stderr}"
+        );
+        assert!(
+            !stderr.contains("without the session log") && !stderr.contains("could not be opened"),
+            "ohjaa {args:?} read the log: {stdout}{stderr}"
+        );
+        assert_eq!(log_stamp(&log), before, "ohjaa {args:?} wrote the log");
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn a_command_that_only_reads_says_a_held_log_is_busy_and_never_waits_on_it() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("read-held-log");
+    let repo = fixture.make_git_repo("work");
+    let (_, stderr, code) = run_session(&fixture, &repo, "exit 0");
+    assert_eq!(code, Some(0), "{stderr}");
+    let log = fixture.dir.join("state/ohjaa/sessions.redb");
+    // A writer holds it, as a running `ohjaa run` does while it records.
+    let holder = redb::Database::open(&log).unwrap();
+    let ohjaa = |args: &[&str]| {
+        let started = std::time::Instant::now();
+        let out = output_of(
+            fixture
+                .ohjaa()
+                .arg("--root")
+                .arg(&fixture.dir)
+                .args(args)
+                .current_dir(&repo),
+        );
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "ohjaa {args:?} waited {took:?} on a held log"
+        );
+        out
+    };
+    let (stdout, stderr, code) = ohjaa(&["report", "--json"]);
+    assert_eq!(
+        code,
+        Some(4),
+        "a gap, never an empty week: {stdout}{stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        report["gaps"].as_array().unwrap().iter().any(|gap| gap
+            .as_str()
+            .unwrap()
+            .contains("busy (another ohjaa holds it)")),
+        "{stdout}"
+    );
+    let (stdout, stderr, code) = ohjaa(&["usage", "export"]);
+    assert_eq!(code, Some(1), "never an empty export: {stdout}{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("busy (another ohjaa holds it)"), "{stderr}");
+    let (stdout, stderr, code) = ohjaa(&["brief"]);
+    assert!(code.is_some(), "{stdout}{stderr}");
+    assert!(stdout.contains("No knowledge recorded yet"), "{stdout}");
+    assert!(
+        stderr.contains("busy (another ohjaa holds it); carrying on without the session log"),
+        "{stderr}"
+    );
+    drop(holder);
+    let (stdout, stderr, code) = ohjaa(&["usage", "export"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let export: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(export["sessions"].as_array().unwrap().len(), 1, "{stdout}");
+    fixture.cleanup();
+}
