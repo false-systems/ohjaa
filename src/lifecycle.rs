@@ -1708,10 +1708,22 @@ impl Sykli {
         // Refused only when every receipt asked was; else what could not be
         // said of the best one that was not refused.
         let refused = |check: &Check| matches!(check, Check::Failed { .. });
-        match verdicts.iter().position(|check| !refused(check)) {
+        let mut check = match verdicts.iter().position(|check| !refused(check)) {
             Some(at) => verdicts.swap_remove(at),
             None => verdicts.swap_remove(0),
+        };
+        // Said when the cap left receipts unasked: one of them might pass.
+        if candidates.len() > MAX_ASKED {
+            if let Check::Failed { why } | Check::Unverified { why } | Check::Stale { why } =
+                &mut check
+            {
+                why.push_str(&format!(
+                    " (sykli was asked about the best {MAX_ASKED} of {} receipts of its tree)",
+                    candidates.len()
+                ));
+            }
         }
+        check
     }
 }
 

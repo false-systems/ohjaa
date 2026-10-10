@@ -3319,6 +3319,34 @@ fn landed_lines(record: &str) -> Vec<&str> {
 }
 
 #[test]
+fn a_refusal_says_when_not_every_receipt_of_the_tree_was_asked() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("receipts-cap");
+    let repo = clone_with_origin(&fixture, "work");
+    // Six refused receipts of one tree: sykli is asked about five.
+    let (record, _) = worktree_push_session(
+        &fixture,
+        &repo,
+        "six-runs",
+        "echo '{}' > sykli.json && git add sykli.json && git commit -q -m checked
+        for n in 1 2 3 4 5 6; do
+          receipt passed forged && mv .sykli/receipts/rcpt_$(git rev-parse HEAD^{tree}).json .sykli/receipts/run_$n.json
+        done
+        git push -q origin HEAD:main",
+        "new",
+    );
+    assert!(
+        landed_lines(&record)
+            .concat()
+            .contains("(sykli was asked about the best 5 of 6 receipts of its tree)"),
+        "{record}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
 fn a_commit_passes_when_any_receipt_of_its_tree_verifies() {
     if !git_available() {
         return;
