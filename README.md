@@ -392,25 +392,28 @@ launched in:
   one that ended last, launched in that repo or elsewhere with a `--scope`
   naming it, and one launched elsewhere says where it was launched.
 
-**Observed, not asserted (law 3).** A commit is the session's own only where
-that can be shown: it was made in the checkout the session was launched in or
-named with `--scope`, or in a worktree or on a branch created during the
-session, or pushed from here; and no other session sharing that place was there
-at that second (other sessions in the log, and live ones toimija saw at launch;
-for a place created during the session, any session in the same clone). Only
-its own commits are its phases, its pull request and its flags. Everything else
-made during the session is recorded as `observed … not attributed`, with the
-session it shared the place with (`shared with oh-… in work, …`).
+**Observed, not asserted (law 3).** One rule: in a repository the session was
+launched in or named with `--scope`, a commit made during the session is its
+own unless another session was there at that second — in the checkout it was
+launched in, a session launched in that checkout; in any other checkout or
+branch of the clone, old or new, any session in the clone (sessions in the log,
+and live ones toimija saw at launch). Only its own commits are its phases, its
+pull request and its lessons. Everything else made during the session is
+recorded as `observed … not attributed`, with the session it shared the place
+with (`shared with oh-… in work, …`). Known limit: a person's own commit in a
+place the session holds alone looks exactly like the agent's, and is credited
+to the session.
 
 A repository nobody named is observed when a commit was made in it: at leaving,
 ohjaa looks at the repositories directly in the launch folder (and in any folder
 `--scope` named that is not itself a repository), and records each where a
 commit was made, or pushed from, during the session, in any of its worktrees,
 as **found, not named**. Nothing in a found repository is attributed to the
-session: it is not its phases or flags, no pull request is looked up, and the
-session never becomes that repository's "last session here". Name repositories
-with `--scope` wherever you can. A `--scope` path that is neither in a repository nor
-a folder is named as unobserved. Scope can be named from inside a repo too, for
+session: it is not its phases or lessons, no pull request is looked up, and the
+session never becomes that repository's "last session here" (a broken main it
+saw there is still said, as the repository's state). Name repositories with
+`--scope` wherever you can. A `--scope` path that is neither in a repository
+nor a folder is named as unobserved. Scope can be named from inside a repo too, for
 a second repository an agent will touch.
 
 A toimija too old to list sessions outside repos makes ohjaa refuse to launch
