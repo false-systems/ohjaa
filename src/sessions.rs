@@ -664,8 +664,13 @@ fn describe_landed(landed: &Landed) -> String {
     match &landed.check {
         Some(check) => describe_check(check),
         None => format!(
-            "{} (not verified: only a push's tip is)",
-            describe_evidence(landed.evidence.as_ref())
+            "{} (not verified: {})",
+            describe_evidence(landed.evidence.as_ref()),
+            if landed.unattributed {
+                "not shown to be this session's"
+            } else {
+                "only a push's tip is"
+            }
         ),
     }
 }
@@ -1039,7 +1044,25 @@ pub fn render_warnings(
             let _ = writeln!(out, "- {} ({})", flag.headline, flag.why);
         }
     };
-    block(last, "the last session here", "", flags(last));
+    // Every flag of the last session is said, but "<branch> at <sha>" only
+    // while the branch still sits there.
+    let last_flags = flags(last)
+        .into_iter()
+        .map(|mut flag| {
+            if let Some((branch, commit)) = &flag.tip {
+                if !still_at(&flag.repo, branch, commit) {
+                    flag.headline = format!(
+                        "{} reached {branch} in {} without passing evidence; {branch} has moved \
+                         on since — check what is on it before building on it",
+                        short(commit),
+                        repo_name(&flag.repo)
+                    );
+                }
+            }
+            flag
+        })
+        .collect();
+    block(last, "the last session here", "", last_flags);
     for session in earlier {
         let standing = flags(session)
             .into_iter()
@@ -1942,6 +1965,38 @@ mod tests {
         let s = with(pr("MERGED", failed()), Vec::new());
         assert!(render_warnings(&s, &[], |_, _, _| false)
             .starts_with("WARNING from the last session here (oh-12, claude"));
+
+        // Once the branch has moved on, the briefing no longer says it is at
+        // the flagged commit; the last session's flag is still said.
+        let moved = with(Finished::NoPullRequest, vec![landed(failed(), true)]);
+        let said = render_warnings(&moved, &[], |_, _, _| false);
+        assert!(
+            said.contains(
+                "- c0ffee1 reached origin/main in selko without passing evidence; origin/main \
+                 has moved on since — check what is on it before building on it ("
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("origin/main at c0ffee1"), "{said}");
+        let still = render_warnings(&moved, &[], |_, _, _| true);
+        assert!(
+            still.contains("- origin/main at c0ffee1 in selko has no passing evidence"),
+            "{still}"
+        );
+
+        // A landing not shown to be the session's is never asked of sykli,
+        // and its record says why, not that only a push's tip is.
+        let mut theirs = landed(Check::Passed, true);
+        theirs.check = None;
+        theirs.unattributed = true;
+        let record = render_record(&with(Finished::NoPullRequest, vec![theirs]));
+        assert!(
+            record.contains(
+                "c0ffee1 reached origin/main (not attributed): no sykli receipt (not verified: \
+                 not shown to be this session's)"
+            ),
+            "{record}"
+        );
     }
 
     #[test]

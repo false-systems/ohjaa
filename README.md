@@ -191,7 +191,9 @@ is one, else where the receipt is:
 Only a refusal **flags the record**: the record opens with it, leaving ends by
 saying it again (`ohjaa: flagged: …`), and the next briefing here, `ohjaa
 brief` included, opens with it before the knowledge and before the handover.
-"`origin/main` at `<sha>`" is said only of the commit the branch sits at:
+"`origin/main` at `<sha>`" is said only of the commit the branch sits at, when
+the record is written and again when a briefing is made; once the branch has
+moved on, the flag says the commit reached it and that it has moved on since:
 
 ```
 WARNING from the last session here (oh-1791…, claude, ended 2026-10-09 21:30 UTC):
