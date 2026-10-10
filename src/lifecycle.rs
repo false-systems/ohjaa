@@ -494,6 +494,10 @@ pub struct Work {
     pub observed: Vec<Phase>,
     /// The other sessions that shared this session's places while it ran.
     pub shared: Vec<Window>,
+    /// Commits made here during the session that no reference or reflog
+    /// names any more, each with the session that shared the clone then:
+    /// work only once a pull request is found holding the newest of them.
+    pub lost: Vec<(Phase, Option<Window>)>,
     /// The branch this session's newest commit on a branch was made on, and
     /// that commit: where its pull request is looked up. With no branch, the
     /// newest of its commits no reference names any more, to search by.
@@ -839,11 +843,12 @@ pub fn observe(
         } else if named.is_some() {
             // No branch names its work. A squash-merged pull request whose
             // branch, worktree and remote-tracking branch (`git fetch --prune`)
-            // were all deleted leaves its commits only in the object store:
-            // those made here during the session are its own by the same rule,
-            // for the clone, and its pull request is searched for by the newest.
+            // were all deleted leaves its commits only in the object store.
+            // Those made here during the session are candidates, its own by
+            // the same rule, for the clone; its pull request is searched for by
+            // the newest of its own, and they count only if one holds it (a
+            // stash's commits are lost too, and are no one's work).
             for lost in lost_commits(&repo, since) {
-                work.made = true;
                 let phase = Phase {
                     evidence: work.receipts.get(&lost.tree).map(|r| r.evidence.clone()),
                     commit: lost.commit,
@@ -852,18 +857,11 @@ pub fn observe(
                     unreachable: true,
                     ..Phase::default()
                 };
-                match in_clone(lost.committed) {
-                    None => {
-                        work.pr_commit = Some(phase.commit.clone());
-                        phases.push(phase);
-                    }
-                    Some(by) => {
-                        if !shared.contains(by) {
-                            shared.push(by.clone());
-                        }
-                        work.observed.push(phase);
-                    }
+                let by = in_clone(lost.committed).cloned();
+                if by.is_none() {
+                    work.pr_commit = Some(phase.commit.clone());
                 }
+                work.lost.push((phase, by));
             }
         }
         work.phases = Some(phases);

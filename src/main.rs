@@ -2167,30 +2167,18 @@ fn observe_repo(
             lifecycle::Start::default(),
         ),
     };
-    let work = unless_interrupted(|| {
+    let mut work = unless_interrupted(|| {
         lifecycle::observe(repo, head_at_start, started_ms, &start, named, windows)
     })
     .unwrap_or_default();
-    let shared = work
-        .shared
-        .iter()
-        .map(|w| {
-            format!(
-                "with {} in {}, {} to {}: what was made then where it was is not attributed",
-                w.id,
-                w.checkout.file_name().unwrap_or_default().to_string_lossy(),
-                sessions::clock(w.from_ms),
-                &sessions::clock(w.to_ms)[11..]
-            )
-        })
-        .collect();
+    let not_looked_up = || sessions::Finished::Unknown {
+        why: "not looked up: this session made no commit on a branch".to_owned(),
+    };
     // The pull request of this session's own branch, never whatever branch a
     // checkout holds now, else the one holding its commit no branch names any
     // more; with no commit of its own on a branch, none is asked.
-    let finished = match &work.pr_commit {
-        None => sessions::Finished::Unknown {
-            why: "not looked up: this session made no commit on a branch".to_owned(),
-        },
+    let mut finished = match &work.pr_commit {
+        None => not_looked_up(),
         Some(commit) => match unless_interrupted(|| {
             lifecycle::finished(
                 repo,
@@ -2208,6 +2196,39 @@ fn observe_repo(
             why: "interrupted".to_owned(),
         }),
     };
+    // Commits no reference names any more are work only when a pull request
+    // holds them; otherwise (a stash, say) they are left out entirely.
+    let lost = std::mem::take(&mut work.lost);
+    if work.pr_branch.is_none() && !lost.is_empty() {
+        if matches!(finished, sessions::Finished::PullRequest { .. }) {
+            for (phase, by) in lost {
+                match by {
+                    None => work.phases.get_or_insert_with(Vec::new).push(phase),
+                    Some(by) => {
+                        if !work.shared.contains(&by) {
+                            work.shared.push(by);
+                        }
+                        work.observed.push(phase);
+                    }
+                }
+            }
+        } else {
+            finished = not_looked_up();
+        }
+    }
+    let shared = work
+        .shared
+        .iter()
+        .map(|w| {
+            format!(
+                "with {} in {}, {} to {}: what was made then where it was is not attributed",
+                w.id,
+                w.checkout.file_name().unwrap_or_default().to_string_lossy(),
+                sessions::clock(w.from_ms),
+                &sessions::clock(w.to_ms)[11..]
+            )
+        })
+        .collect();
     let landed = work
         .landed
         .iter()

@@ -4050,6 +4050,48 @@ fn a_push_from_a_worktree_removed_since_is_never_shouted_for_its_lost_receipt() 
 }
 
 #[test]
+fn a_stash_is_never_taken_for_lost_work() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("stash");
+    let repo = clone_with_origin(&fixture, "work");
+    fs::write(repo.join("tracked.txt"), "one").unwrap();
+    run_git(&repo, &["add", "tracked.txt"]);
+    run_git(&repo, &["commit", "-q", "-m", "tracked"]);
+    let calls = fixture.dir.join("gh-calls.txt");
+    // A stash and its pop write commits no reference names afterwards.
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "x",
+                "--no-briefing",
+                "--",
+                "-c",
+                "set -e; sleep 1; echo two > tracked.txt; git stash -q; git stash pop -q",
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_GH_CALLS", &calls)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("phases        no commits") && !stderr.contains("on no branch now"),
+        "{stderr}"
+    );
+    assert_eq!(
+        finished_line(&stderr),
+        "finished      unknown (not looked up: this session made no commit on a branch)",
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
 fn a_squash_merged_pull_request_is_found_by_its_commit_once_every_ref_is_pruned() {
     if !git_available() {
         return;
