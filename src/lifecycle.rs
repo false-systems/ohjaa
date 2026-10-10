@@ -343,16 +343,15 @@ pub struct Receipt {
     pub checkout: PathBuf,
 }
 
-/// Sykli receipts keyed by the HEAD tree they ran on.
+/// Sykli receipts keyed by the tree that ran.
 pub type Receipts = std::collections::HashMap<String, Receipt>;
 
 /// The sykli receipts in these checkouts, keyed by the tree that ran.
 /// Reads `sykli-receipt.v1`: `subject.tree_oid`, `subject.head_tree_oid`,
 /// `subject.dirty`, `outcome`, `started_at_ms`. A tree is its content, so a
 /// receipt is about that tree in whichever checkout sykli ran. Of several for
-/// one tree, a clean run (not dirty, and HEAD's own tree) wins, then a
-/// passing one, then the newest. Read once per repository at leaving, and shared by its phases and
-/// its pull request.
+/// one tree, a passing run wins, then a clean one, then the newest. Read once
+/// per repository at leaving, and shared by its phases and its pull request.
 pub fn receipts_in<'a>(checkouts: impl IntoIterator<Item = &'a Path>) -> Receipts {
     let mut found = Receipts::new();
     for checkout in checkouts {
@@ -383,12 +382,23 @@ pub fn receipts_in<'a>(checkouts: impl IntoIterator<Item = &'a Path>) -> Receipt
             };
             let at = receipt["started_at_ms"].as_i64().unwrap_or(0);
             let head = receipt["subject"]["head_tree_oid"].as_str();
+            // sykli calls a run dirty when the tree that ran is not HEAD's, or
+            // something beside it (a modified submodule) is. A receipt is filed
+            // under the tree that ran, so a run made before the commit (sykli's
+            // pre-commit hook, HEAD still at the parent) is that tree's run all
+            // the same: only something beside the tree is dirty here.
+            let dirty = match receipt["subject"]["dirty"].as_bool() {
+                Some(false) => false,
+                Some(true) => head.is_none_or(|head| head == tree),
+                None => true,
+            };
             let evidence = Evidence {
                 outcome: outcome.to_owned(),
-                dirty: receipt["subject"]["dirty"].as_bool().unwrap_or(true) || head != Some(tree),
+                dirty,
             };
-            // A clean run first, then a passing one, then the newest.
-            let rank = |e: &Evidence, at: i64| (!e.dirty, e.outcome == "passed", at);
+            // A passing run first (sykli needs one pass of the commit's tree,
+            // not the newest run), then a clean one, then the newest.
+            let rank = |e: &Evidence, at: i64| (e.outcome == "passed", !e.dirty, at);
             if found
                 .get(tree)
                 .is_some_and(|seen| rank(&seen.evidence, seen.at) >= rank(&evidence, at))
@@ -1523,6 +1533,33 @@ mod tests {
         assert_eq!(
             receipts["e0e0"].evidence.outcome, "failed",
             "filed under what ran"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_pass_made_before_the_commit_outranks_a_newer_failing_run_of_its_tree() {
+        let dir = repo("receipt-precommit");
+        let parent = commit(&dir, "a.txt", "parent");
+        let tree = commit(&dir, "a.txt", "the phase");
+        // sykli's pre-commit hook runs the tree being committed while HEAD is
+        // still the parent: sykli calls that dirty, yet it ran exactly this tree.
+        receipt_ran(&dir, "pre-commit", &tree, &parent, "passed", 1, true);
+        // A newer run of the same tree failed (a flaky task).
+        receipt_ran(&dir, "flake", &tree, &tree, "failed", 2, false);
+        // A newer pass with something beside the tree (a modified submodule).
+        receipt_ran(&dir, "beside", &tree, &tree, "passed", 3, true);
+        let receipts = receipts_in([dir.as_path()]);
+        let chosen = &receipts[&tree];
+        assert!(
+            chosen.path.ends_with("pre-commit.json"),
+            "{:?}",
+            chosen.path
+        );
+        assert_eq!(chosen.evidence.outcome, "passed");
+        assert!(
+            !chosen.evidence.dirty,
+            "a run of exactly the commit's tree, made before the commit, is not dirty"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
