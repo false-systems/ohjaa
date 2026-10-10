@@ -767,6 +767,20 @@ pub fn to_json(report: &Report) -> Value {
     })
 }
 
+/// What left a report incomplete, said so a person can act on it.
+fn first_gap(report: &Report) -> Option<String> {
+    match &report.natives {
+        Err(why) if why.starts_with("vessa does not say how") => {
+            Some("vessa lacks session origins — update vessa (vessa#2)".to_owned())
+        }
+        Err(why) if why.starts_with("vessa is not on PATH") => Some(
+            "vessa is not on PATH — install vessa to see sessions started without ohjaa".to_owned(),
+        ),
+        Err(why) => Some(why.clone()),
+        Ok(_) => report.gaps.first().cloned(),
+    }
+}
+
 /// Three lines for the person, after a session's record.
 pub fn summary(report: &Report) -> String {
     let bypassed = match &report.natives {
@@ -774,7 +788,8 @@ pub fn summary(report: &Report) -> String {
             "{} agent session(s) started without ohjaa",
             natives.bypasses.len()
         ),
-        Err(why) => format!("sessions started without ohjaa not judged ({why})"),
+        // Why is said on the last line, once.
+        Err(_) => "sessions started without ohjaa not judged".to_owned(),
     };
     // A refusal first, then a commit never checked, then a session.
     let first = report
@@ -804,14 +819,20 @@ pub fn summary(report: &Report) -> String {
             })
         })
         .unwrap_or_else(|| "nothing went around the workflow that ohjaa could see".to_owned());
-    let last = if report.complete() {
-        "`ohjaa report` lists them all; the next summary is in 7 days.".to_owned()
-    } else {
-        format!(
-            "`ohjaa report` lists them all; {} gap(s) left it incomplete, so it is said again \
-             at the next launch.",
-            report.gaps.len() + usize::from(report.natives.is_err())
-        )
+    let last = match first_gap(report) {
+        None => "`ohjaa report` lists them all; the next summary is in 7 days.".to_owned(),
+        Some(gap) => {
+            let more = report.gaps.len() + usize::from(report.natives.is_err()) - 1;
+            format!(
+                "incomplete: {gap}{}; `ohjaa report` lists it all, and it is said again \
+                 tomorrow.",
+                if more > 0 {
+                    format!(" (and {more} more)")
+                } else {
+                    String::new()
+                }
+            )
+        }
     };
     format!(
         "ohjaa: weekly report, {} to {}: {} session(s) without read-back or handover · {} \
@@ -905,29 +926,54 @@ pub fn candidates(report: &Report) -> Vec<Candidate> {
 
 // ---- once a week -------------------------------------------------------------
 
+/// How often a report with a gap is said again: a gap that does not go away
+/// (vessa too old, say) must not follow every session.
+pub const DAY_MS: i64 = 86_400_000;
+
+/// When a complete report was last shown to a person: the week's.
 fn marker(dirs: &Dirs) -> PathBuf {
     dirs.state.join("report-at")
 }
 
-/// When a complete report was last shown to a person, if one was.
-pub fn last_made(dirs: &Dirs) -> Option<i64> {
-    std::fs::read_to_string(marker(dirs))
+/// When any report was last shown to a person, complete or not.
+fn shown_marker(dirs: &Dirs) -> PathBuf {
+    dirs.state.join("report-shown-at")
+}
+
+fn read_time(path: &Path) -> Option<i64> {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|text| text.trim().parse().ok())
 }
 
-/// Record that a complete report was shown to a person at `now_ms`.
-pub fn made(dirs: &Dirs, now_ms: i64) -> Result<()> {
+fn write_time(dirs: &Dirs, path: &Path, now_ms: i64) -> Result<()> {
     std::fs::create_dir_all(&dirs.state)
         .with_context(|| format!("cannot create {}", dirs.state.display()))?;
-    std::fs::write(marker(dirs), format!("{now_ms}\n"))
-        .with_context(|| format!("cannot write {}", marker(dirs).display()))
+    std::fs::write(path, format!("{now_ms}\n"))
+        .with_context(|| format!("cannot write {}", path.display()))
 }
 
-/// Whether a week has passed since a complete report was last shown (or
-/// none was).
+/// When a complete report was last shown to a person, if one was.
+pub fn last_made(dirs: &Dirs) -> Option<i64> {
+    read_time(&marker(dirs))
+}
+
+/// Record that a report was shown to a person at `now_ms`; a complete one
+/// is also the week's.
+pub fn shown(dirs: &Dirs, now_ms: i64, complete: bool) -> Result<()> {
+    write_time(dirs, &shown_marker(dirs), now_ms)?;
+    if complete {
+        write_time(dirs, &marker(dirs), now_ms)?;
+    }
+    Ok(())
+}
+
+/// Whether a report is due: a week since a complete one was shown (or none
+/// was), and a day since any was, so one with a gap is said again at most
+/// once a day.
 pub fn due(dirs: &Dirs, now_ms: i64) -> bool {
     last_made(dirs).is_none_or(|at| now_ms - at >= WEEK_MS)
+        && read_time(&shown_marker(dirs)).is_none_or(|at| now_ms - at >= DAY_MS)
 }
 
 #[cfg(test)]
@@ -1068,11 +1114,18 @@ mod tests {
             state: root.join("state"),
         };
         let now = 100 * 86_400_000;
-        assert!(due(&dirs, now), "never made: due");
-        made(&dirs, now).unwrap();
-        assert_eq!(last_made(&dirs), Some(now));
-        assert!(!due(&dirs, now + WEEK_MS - 1));
-        assert!(due(&dirs, now + WEEK_MS));
+        assert!(due(&dirs, now), "never shown: due");
+        // One with a gap is said again, but at most once a day.
+        shown(&dirs, now, false).unwrap();
+        assert_eq!(last_made(&dirs), None, "an incomplete one marks no week");
+        assert!(!due(&dirs, now + DAY_MS - 1));
+        assert!(due(&dirs, now + DAY_MS));
+        // A complete one is the week's.
+        let later = now + DAY_MS;
+        shown(&dirs, later, true).unwrap();
+        assert_eq!(last_made(&dirs), Some(later));
+        assert!(!due(&dirs, later + WEEK_MS - 1));
+        assert!(due(&dirs, later + WEEK_MS));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1148,11 +1201,24 @@ mod tests {
         // Not judged: no bypass is a candidate, none is counted.
         let report = sample(Err("vessa is not on PATH".to_owned()));
         assert_eq!(candidates(&report).len(), 2);
-        let summary = summary(&report);
+        let said = summary(&report);
         assert!(
-            summary.contains("not judged (vessa is not on PATH)")
-                && summary.contains("said again at the next launch"),
-            "{summary}"
+            said.contains("not judged")
+                && said.contains("incomplete: vessa is not on PATH — install vessa")
+                && said.contains("said again tomorrow"),
+            "{said}"
         );
+        // What the gap is, said so a person can fix it.
+        let report = sample(Err(
+            "vessa does not say how a session was started (no `entrypoint` or `originator`; \
+             vessa#2), so headless runs cannot be told apart"
+                .to_owned(),
+        ));
+        let said = summary(&report);
+        assert!(
+            said.contains("incomplete: vessa lacks session origins — update vessa"),
+            "{said}"
+        );
+        assert_eq!(said.lines().count(), 3, "{said}");
     }
 }

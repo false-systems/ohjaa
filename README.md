@@ -167,10 +167,13 @@ a gap. A report with gaps says them, and exits 4: it is never a clean week.
 Once a week, at an `ohjaa run` a person starts at a terminal, the report is
 read while the agent works, and three lines of it are said after the
 session's record, never in the agent's briefing. The week is marked only
-when that report was complete, so one with gaps is said again at the next
-launch. Only that time is kept (`$XDG_STATE_HOME/ohjaa/report-at`), like
-intake's cursor. `ohjaa report` marks it too, but only when its complete
-report was printed to a terminal: never for `--json`, a script or an agent.
+when that report was complete. One with a gap is said again at most once a
+day, and its last line says what the gap is, so it can be fixed (for
+example `incomplete: vessa lacks session origins — update vessa`). Only
+those two times are kept (`$XDG_STATE_HOME/ohjaa/report-at` and
+`report-shown-at`), like intake's cursor. `ohjaa report` records them too,
+but only when it printed to a terminal: never for `--json`, a script or an
+agent.
 
 ```
 ohjaa: weekly report, 2026-10-03 to 2026-10-10: 2 session(s) without read-back or handover · 1 commit(s) on a default branch without passing evidence · 1 agent session(s) started without ohjaa

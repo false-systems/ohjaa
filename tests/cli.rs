@@ -4828,7 +4828,11 @@ fn the_weekly_report_is_said_after_the_record_at_a_terminal_and_never_briefed() 
     let record = first.find("ohjaa: recorded; queued").expect(&first);
     let weekly = first.find("ohjaa: weekly report, ").expect(&first);
     assert!(weekly > record, "after the record: {first}");
-    assert!(first.contains("said again at the next launch"), "{first}");
+    assert!(
+        first.contains("incomplete: vessa: a source could not be read")
+            && first.contains("said again tomorrow"),
+        "it says what the gap is: {first}"
+    );
     assert!(
         !marker.exists(),
         "an incomplete report does not mark the week"
@@ -4837,6 +4841,20 @@ fn the_weekly_report_is_said_after_the_record_at_a_terminal_and_never_briefed() 
         !fixture.argv().join("\n").contains("weekly report"),
         "never into the agent's briefing"
     );
+    // A gap that does not go away is said again at most once a day.
+    let again = run("one again", false).unwrap();
+    assert!(
+        !again.contains("weekly report"),
+        "not after every session: {again}"
+    );
+    let shown = fixture.dir.join("state/ohjaa/report-shown-at");
+    let two_days_ago = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        - 2 * 86_400_000)
+        .to_string();
+    fs::write(&shown, two_days_ago).unwrap();
     let second = run("two", true).unwrap();
     assert!(
         second.contains("ohjaa: weekly report, ")
@@ -4848,6 +4866,7 @@ fn the_weekly_report_is_said_after_the_record_at_a_terminal_and_never_briefed() 
     assert!(!third.contains("weekly report"), "once a week: {third}");
     // Not at a terminal, nothing is said: no person is reading.
     fs::remove_file(&marker).unwrap();
+    fs::remove_file(&shown).unwrap();
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()

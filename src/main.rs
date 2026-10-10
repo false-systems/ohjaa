@@ -1230,10 +1230,10 @@ fn cmd_report(roots: &[PathBuf], since: &str, json: bool) -> Result<i32> {
     } else {
         print!("{}", report::render(&report));
     }
-    // A complete report a person read at a terminal is the week's: not one
-    // for a script or an agent, nor one with gaps.
-    if !json && report.complete() && std::io::stdout().is_terminal() {
-        if let Err(error) = report::made(&dirs, now_ms) {
+    // A report a person read at a terminal was said; a complete one is the
+    // week's. Never one for a script or an agent.
+    if !json && std::io::stdout().is_terminal() {
+        if let Err(error) = report::shown(&dirs, now_ms, report.complete()) {
             eprintln!("ohjaa: {error:#}");
         }
     }
@@ -1270,8 +1270,8 @@ fn weekly_report(dirs: &Dirs, roots: &[PathBuf]) -> Option<Weekly> {
     })
 }
 
-/// Say the weekly report after the record; the week is marked only when it
-/// was complete, so a report with gaps is said again at the next launch.
+/// Say the weekly report after the record. The week is marked only when it
+/// was complete; one with a gap is said again, at most once a day.
 fn say_weekly(weekly: Option<Weekly>) {
     let Some(weekly) = weekly else {
         return;
@@ -1283,10 +1283,8 @@ fn say_weekly(weekly: Option<Weekly>) {
         return;
     };
     eprint!("{}", report::summary(&report));
-    if report.complete() {
-        if let Err(error) = report::made(&weekly.dirs, weekly.now_ms) {
-            eprintln!("ohjaa: {error:#}");
-        }
+    if let Err(error) = report::shown(&weekly.dirs, weekly.now_ms, report.complete()) {
+        eprintln!("ohjaa: {error:#}");
     }
 }
 
