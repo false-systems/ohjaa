@@ -52,13 +52,17 @@ exit "${OHJAA_STUB_EXIT:-0}"
 /// (state OHJAA_STUB_GH_PR_STATE, default OPEN) whose head is that branch's
 /// commit here; `pr view` with no branch asks about the one checked out.
 /// `pr list --search <sha>` finds a merged pull request for
-/// OHJAA_STUB_GH_PR_SEARCH only.
+/// OHJAA_STUB_GH_PR_SEARCH only (or the sha in the file
+/// OHJAA_STUB_GH_PR_SEARCH_FILE names).
 const GH_STUB: &str = r#"#!/bin/sh
 if [ -n "${OHJAA_STUB_GH_SLEEP:-}" ]; then sleep "$OHJAA_STUB_GH_SLEEP"; fi
 printf '%s|%s\n' "$PWD" "$*" >> "${OHJAA_STUB_GH_CALLS:-/dev/null}"
 if [ "$1 $2" = "pr list" ]; then
   sha=""
   while [ $# -gt 0 ]; do case "$1" in --search) sha="$2"; shift;; esac; shift; done
+  if [ -n "${OHJAA_STUB_GH_PR_SEARCH_FILE:-}" ] && [ -f "$OHJAA_STUB_GH_PR_SEARCH_FILE" ]; then
+    OHJAA_STUB_GH_PR_SEARCH=$(cat "$OHJAA_STUB_GH_PR_SEARCH_FILE")
+  fi
   if [ -n "$sha" ] && [ "$sha" = "${OHJAA_STUB_GH_PR_SEARCH:-}" ]; then
     printf '[{"url":"https://github.com/o/r/pull/8","state":"MERGED","headRefOid":"%s"}]\n' "$sha"
   else
@@ -3929,6 +3933,71 @@ fn a_squash_merged_and_cleaned_up_pull_request_is_still_found() {
     assert!(
         finished_line(&stderr).starts_with("finished      https://github.com/o/r/pull/7"),
         "found by the branch the push named: {stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_squash_merged_pull_request_is_found_by_its_commit_once_every_ref_is_pruned() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("pruned");
+    let repo = clone_with_origin(&fixture, "work");
+    let origin = fixture.dir.join("work-origin.git");
+    let wt = fixture.dir.join("_worktrees").join("feat5");
+    let mark = fixture.dir.join("sha");
+    // Squash-merged on the forge, which deletes the branch; then everything
+    // here goes too, the remote-tracking branch and its reflog by a prune.
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        git worktree add -q -b feat5 '{wt}' origin/main
+        cd '{wt}'
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'the work'
+        receipt passed
+        git push -q origin HEAD:feat5
+        git rev-parse HEAD > '{mark}'
+        cd '{repo}' && git worktree remove --force '{wt}' && git branch -q -D feat5
+        git -C '{origin}' branch -q -D feat5
+        git fetch -q --prune
+        ! git rev-parse -q --verify refs/remotes/origin/feat5",
+        wt = wt.display(),
+        repo = repo.display(),
+        origin = origin.display(),
+        mark = mark.display()
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "x",
+                "--no-briefing",
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_GH_PR_SEARCH_FILE", &mark)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let sha = fs::read_to_string(&mark).unwrap().trim().to_owned();
+    let phases = stderr
+        .lines()
+        .find(|l| l.starts_with("phases"))
+        .expect(&stderr);
+    assert!(
+        phases.contains(&format!("{} ", &sha[..7])) && phases.contains("(on no branch now)"),
+        "found in the object store, though no reference names it: {phases}"
+    );
+    assert!(
+        finished_line(&stderr).starts_with("finished      https://github.com/o/r/pull/8 (merged)"),
+        "found by its commit: {stderr}"
     );
     fixture.cleanup();
 }

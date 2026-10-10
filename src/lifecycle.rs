@@ -468,7 +468,8 @@ pub struct Work {
     /// The other sessions that shared this session's places while it ran.
     pub shared: Vec<Window>,
     /// The branch this session's newest commit on a branch was made on, and
-    /// that commit: where its pull request is looked up.
+    /// that commit: where its pull request is looked up. With no branch, the
+    /// newest of its commits no reference names any more, to search by.
     pub pr_branch: Option<String>,
     pub pr_commit: Option<String>,
     /// Whether any commit was made, or pushed from here, during the session.
@@ -799,6 +800,35 @@ pub fn observe(
         if let Some(newest) = phases.iter().rev().find(|p| p.branch.is_some()) {
             work.pr_branch = newest.branch.clone();
             work.pr_commit = Some(newest.commit.clone());
+        } else if named.is_some() {
+            // No branch names its work. A squash-merged pull request whose
+            // branch, worktree and remote-tracking branch (`git fetch --prune`)
+            // were all deleted leaves its commits only in the object store:
+            // those made here during the session are its own by the same rule,
+            // for the clone, and its pull request is searched for by the newest.
+            for lost in lost_commits(&repo, since) {
+                work.made = true;
+                let phase = Phase {
+                    evidence: work.receipts.get(&lost.tree).map(|r| r.evidence.clone()),
+                    commit: lost.commit,
+                    subject: lost.subject,
+                    tree: lost.tree,
+                    unreachable: true,
+                    ..Phase::default()
+                };
+                match in_clone(lost.committed) {
+                    None => {
+                        work.pr_commit = Some(phase.commit.clone());
+                        phases.push(phase);
+                    }
+                    Some(by) => {
+                        if !shared.contains(by) {
+                            shared.push(by.clone());
+                        }
+                        work.observed.push(phase);
+                    }
+                }
+            }
         }
         work.phases = Some(phases);
     }
@@ -1010,6 +1040,142 @@ fn surviving(
     Some(phases)
 }
 
+/// A commit no reference and no reflog names any more.
+struct Lost {
+    commit: String,
+    tree: String,
+    /// Its commit time, in unix seconds.
+    committed: i64,
+    subject: String,
+}
+
+/// The most loose objects written during a session read for lost commits:
+/// more were written by a fetch or an unpack, not by commits, and none is.
+const MAX_LOOSE: usize = 5_000;
+
+/// Commits written in `repo`'s clone since `since` (unix seconds) that no
+/// reference and no reflog names any more, oldest first: the newest one and
+/// those of its ancestors that are lost too (a sibling an amend or a rebase
+/// replaced is not). Git writes a new commit as a loose object, so only loose
+/// objects written since then are read, and only commits this clone's
+/// committer (`user.email`) committed since then count; one fetched and
+/// pruned again was someone else's.
+fn lost_commits(repo: &Path, since: i64) -> Vec<Lost> {
+    let run = |args: &[&str], input: String| {
+        process::run(
+            Command::new("git").arg("-C").arg(repo).args(args),
+            Some(input.as_bytes()),
+            process::LOCAL,
+        )
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| output.stdout_text())
+    };
+    let read = || -> Option<Vec<Lost>> {
+        let common = repo.join(git(repo, &["rev-parse", "--git-common-dir"])?);
+        let mut loose = Vec::new();
+        for dir in std::fs::read_dir(common.join("objects")).ok()?.flatten() {
+            let prefix = dir.file_name().to_string_lossy().into_owned();
+            if prefix.len() != 2 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            for file in std::fs::read_dir(dir.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let written = file
+                    .metadata()
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|at| at.as_secs() as i64);
+                if written.is_some_and(|at| at >= since) {
+                    loose.push(format!("{prefix}{}", file.file_name().to_string_lossy()));
+                }
+            }
+            if loose.len() > MAX_LOOSE {
+                return None;
+            }
+        }
+        if loose.is_empty() {
+            return Some(Vec::new());
+        }
+        let kinds = run(
+            &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            loose.join("\n") + "\n",
+        )?;
+        let commits: Vec<&str> = kinds
+            .lines()
+            .filter_map(|line| line.strip_suffix(" commit"))
+            .collect();
+        if commits.is_empty() {
+            return Some(Vec::new());
+        }
+        let me = git(repo, &["config", "user.email"]);
+        let log = run(
+            &[
+                "log",
+                "--no-walk=unsorted",
+                "--stdin",
+                "--format=%H%x1f%T%x1f%ct%x1f%ce%x1f%s",
+            ],
+            commits.join("\n") + "\n",
+        )?;
+        let mut lost: Vec<Lost> = log
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(5, '\u{1f}');
+                let (commit, tree, committed, email, subject) = (
+                    fields.next()?,
+                    fields.next()?,
+                    fields.next()?.parse::<i64>().ok()?,
+                    fields.next()?,
+                    fields.next()?,
+                );
+                (committed >= since && me.as_deref().is_none_or(|me| me == email)).then(|| Lost {
+                    commit: commit.to_owned(),
+                    tree: tree.to_owned(),
+                    committed,
+                    subject: subject.to_owned(),
+                })
+            })
+            .collect();
+        if lost.is_empty() {
+            return Some(Vec::new());
+        }
+        // Named by no reference and no reflog, in any checkout; parents first.
+        let unnamed = |tips: String| {
+            run(
+                &[
+                    "rev-list",
+                    "--reverse",
+                    "--topo-order",
+                    "--not",
+                    "--all",
+                    "--reflog",
+                    "--stdin",
+                ],
+                tips,
+            )
+        };
+        let gone = unnamed(lost.iter().map(|l| format!("{}\n", l.commit)).collect())?;
+        let gone: HashSet<&str> = gone.lines().collect();
+        lost.retain(|l| gone.contains(l.commit.as_str()));
+        let newest = lost.iter().max_by_key(|l| l.committed)?.commit.clone();
+        let line = unnamed(format!("{newest}\n"))?;
+        let mut by_commit: HashMap<String, Lost> =
+            lost.into_iter().map(|l| (l.commit.clone(), l)).collect();
+        let mut lost: Vec<Lost> = line
+            .lines()
+            .filter_map(|commit| by_commit.remove(commit))
+            .collect();
+        lost.drain(..lost.len().saturating_sub(MAX_PHASES));
+        Some(lost)
+    };
+    read().unwrap_or_default()
+}
+
 /// The commits among `commits` the repository still has.
 fn existing(repo: &Path, commits: &[String]) -> Option<Vec<String>> {
     if commits.is_empty() {
@@ -1114,11 +1280,12 @@ fn reflogs_touched_since(checkout: &Path, since: i64) -> bool {
 
 /// State 4, observed: the pull request for `branch` (the one this session's
 /// newest commit on a branch was made on), else, when gh knows no pull
-/// request by that name any more, the one that holds `commit`; and what sykli
-/// says about its head. Asked of `gh` in `repo`.
+/// request by that name any more, or no branch names the session's work any
+/// more (`branch` is `None`), the one that holds `commit`; and what sykli says
+/// about its head. Asked of `gh` in `repo`.
 pub fn finished(
     repo: &Path,
-    branch: &str,
+    branch: Option<&str>,
     commit: Option<&str>,
     receipts: &Receipts,
     checkouts: &[Worktree],
@@ -1131,29 +1298,33 @@ pub fn finished(
             std::time::Duration::from_secs(20),
         )
     };
-    let output = match gh(&["pr", "view", branch, "--json", "url,state,headRefOid"]) {
-        Ok(output) => output,
-        Err(error) => {
-            return Finished::Unknown {
-                why: format!("{error:#}"),
+    let viewed =
+        match branch.map(|branch| gh(&["pr", "view", branch, "--json", "url,state,headRefOid"])) {
+            None => None,
+            Some(Ok(output)) => Some(output),
+            Some(Err(error)) => {
+                return Finished::Unknown {
+                    why: format!("{error:#}"),
+                }
             }
-        }
-    };
-    let pr = if output.status.success() {
+        };
+    let pr = if let Some(output) = viewed.as_ref().filter(|o| o.status.success()) {
         serde_json::from_slice::<Value>(&output.stdout).ok()
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("no pull requests found") {
-            return Finished::Unknown {
-                why: if stderr.contains("gh auth login") || stderr.contains("GH_TOKEN") {
-                    "gh is not signed in".to_owned()
-                } else {
-                    output.failure_detail()
-                },
-            };
+        if let Some(output) = &viewed {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("no pull requests found") {
+                return Finished::Unknown {
+                    why: if stderr.contains("gh auth login") || stderr.contains("GH_TOKEN") {
+                        "gh is not signed in".to_owned()
+                    } else {
+                        output.failure_detail()
+                    },
+                };
+            }
         }
-        // A branch deleted after a squash merge: the pull request still holds
-        // the commit.
+        // A branch deleted after a squash merge, or no branch left at all: the
+        // pull request still holds the commit.
         let Some(commit) = commit else {
             return Finished::NoPullRequest;
         };
@@ -1933,6 +2104,60 @@ mod tests {
         assert!(work.phases.unwrap().is_empty());
         assert_eq!(subjects(&work.observed), ["resumed"]);
         assert_eq!(work.pr_branch, None);
+        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_commit_no_reference_names_any_more_is_found_and_what_replaced_it_wins() {
+        let dir = repo("lost");
+        let since = now_ms() / 1000 - 1;
+        let wt = worktree_path("lost");
+        git_ok(
+            &dir,
+            &["worktree", "add", "-q", "-b", "gone", wt.to_str().unwrap()],
+        );
+        // Commit times a second apart and more, as an amend's would be.
+        let at = |seconds: i64, args: &[&str]| {
+            let done = Command::new("git")
+                .args(args)
+                .env("GIT_COMMITTER_DATE", format!("@{} +0000", since + seconds))
+                .current_dir(&wt)
+                .output()
+                .unwrap();
+            assert!(done.status.success(), "{done:?}");
+        };
+        at(10, &["commit", "-q", "--allow-empty", "-m", "first try"]);
+        at(
+            20,
+            &["commit", "-q", "--amend", "--allow-empty", "-m", "the work"],
+        );
+        at(30, &["commit", "-q", "--allow-empty", "-m", "more work"]);
+        // Someone else's commit, fetched and pruned: not this clone's.
+        at(
+            40,
+            &[
+                "-c",
+                "user.email=someone@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "theirs",
+            ],
+        );
+        git_ok(
+            &dir,
+            &["worktree", "remove", "--force", wt.to_str().unwrap()],
+        );
+        git_ok(&dir, &["branch", "-q", "-D", "gone"]);
+        let found: Vec<String> = lost_commits(&dir, since)
+            .into_iter()
+            .map(|l| l.subject)
+            .collect();
+        assert_eq!(found, ["the work", "more work"]);
+        // While a reference still names them, nothing is lost.
+        assert!(lost_commits(&dir, now_ms() / 1000 + 5).is_empty());
         let _ = std::fs::remove_dir_all(wt);
         let _ = std::fs::remove_dir_all(dir);
     }

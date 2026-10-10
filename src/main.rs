@@ -2181,16 +2181,17 @@ fn observe_repo(
         })
         .collect();
     // The pull request of this session's own branch, never whatever branch a
-    // checkout holds now; with no commit of its own on a branch, none is asked.
-    let finished = match &work.pr_branch {
+    // checkout holds now, else the one holding its commit no branch names any
+    // more; with no commit of its own on a branch, none is asked.
+    let finished = match &work.pr_commit {
         None => sessions::Finished::Unknown {
             why: "not looked up: this session made no commit on a branch".to_owned(),
         },
-        Some(branch) => match unless_interrupted(|| {
+        Some(commit) => match unless_interrupted(|| {
             lifecycle::finished(
                 repo,
-                branch,
-                work.pr_commit.as_deref(),
+                work.pr_branch.as_deref(),
+                Some(commit),
                 &work.receipts,
                 &work.checkouts,
                 sykli,

@@ -88,6 +88,10 @@ pub struct Phase {
     /// record is about (a worktree of it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// No reference or reflog names it any more (its branch, worktree and
+    /// remote-tracking branch were all deleted): found in the object store.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unreachable: bool,
 }
 
 /// What `sykli verify --commit` said about one commit. A receipt's own
@@ -692,6 +696,19 @@ fn landed_lines(label: &str, landed: &[Landed], out: &mut String) {
     }
 }
 
+/// Where a commit was made, when that is not the repository itself.
+fn place_of(phase: &Phase) -> String {
+    if phase.unreachable {
+        " (on no branch now)".to_owned()
+    } else {
+        phase
+            .worktree
+            .as_deref()
+            .map(|path| format!(" (in {})", repo_name(path)))
+            .unwrap_or_default()
+    }
+}
+
 /// Commits made during the session that are not shown to be its own, and
 /// the sessions that shared its places: said, never credited.
 fn observed_lines(
@@ -704,14 +721,7 @@ fn observed_lines(
     if !observed.is_empty() {
         let list = observed
             .iter()
-            .map(|p| {
-                let place = p
-                    .worktree
-                    .as_deref()
-                    .map(|path| format!(" (in {})", repo_name(path)))
-                    .unwrap_or_default();
-                format!("{}{place}", short(&p.commit))
-            })
+            .map(|p| format!("{}{}", short(&p.commit), place_of(p)))
             .collect::<Vec<_>>()
             .join(" · ");
         if label.ends_with(": ") {
@@ -1175,15 +1185,11 @@ fn describe_phases(phases: Option<&Vec<Phase>>, left: &Left) -> String {
         Some(phases) => phases
             .iter()
             .map(|p| {
-                let place = p
-                    .worktree
-                    .as_deref()
-                    .map(|path| format!(" (in {})", repo_name(path)))
-                    .unwrap_or_default();
                 format!(
-                    "{} {}{place}",
+                    "{} {}{}",
                     short(&p.commit),
-                    describe_evidence(p.evidence.as_ref())
+                    describe_evidence(p.evidence.as_ref()),
+                    place_of(p)
                 )
             })
             .collect::<Vec<_>>()
