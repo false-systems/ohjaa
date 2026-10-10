@@ -105,6 +105,10 @@ pub enum Check {
     Failed { why: String },
     /// No sykli receipt names the commit's tree.
     Unchecked,
+    /// No sykli receipt names the commit's tree, and the checkout it was
+    /// made in is gone, its receipts with it: what cannot be observed is
+    /// recorded, never asserted (law 3).
+    UncheckedGone,
     /// sykli could not be asked: it has no `--commit`, is not installed, or
     /// gave no answer in time; or the commit has no sykli contract.
     Unverified { why: String },
@@ -655,6 +659,9 @@ fn describe_check(check: &Check) -> String {
         Check::Passed => "verified: passed (sykli verify --commit)".to_owned(),
         Check::Failed { why } => format!("FAILED sykli verify: {why}"),
         Check::Unchecked => "unchecked: no sykli receipt for its tree".to_owned(),
+        Check::UncheckedGone => {
+            "unchecked: no sykli receipt, and the checkout it was made in is gone".to_owned()
+        }
         Check::Unverified { why } => format!("unverified: {why}"),
         Check::Stale { why } => {
             format!("stale: sykli checked the checkout, not the commit ({why})")
@@ -928,9 +935,10 @@ pub struct Flag {
 /// The flags in a record, derived from what ohjaa observed, never from the
 /// agent's words:
 /// - the tip of the remote default branch as the session left it, when sykli
-///   refused it or it has a contract and no run of it at all: a broken main
-///   is the repository's state, whoever pushed it (said as "observed, not
-///   attributed" when it is not shown to be the session's);
+///   refused it or it has a contract and no run of it at all in a checkout
+///   that still exists (gone with its receipts, it cannot be observed): a
+///   broken main is the repository's state, whoever pushed it (said as
+///   "observed, not attributed" when it is not shown to be the session's);
 /// - every commit of the session's own that sykli refused on the default
 ///   branch, and the head of its open or merged pull request.
 ///

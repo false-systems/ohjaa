@@ -3973,6 +3973,83 @@ fn a_squash_merged_and_cleaned_up_pull_request_is_still_found() {
 }
 
 #[test]
+fn a_push_from_a_worktree_removed_since_is_never_shouted_for_its_lost_receipt() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("gone-worktree");
+    let repo = clone_with_origin(&fixture, "work");
+    // The house flow: a worktree off origin/main, a commit and its run, a push
+    // to main, then the worktree and its branch go, and its `.sykli/` with it.
+    // With `keep`, sykli's pre-push hook keeps the receipt that verified the
+    // push under the git common dir.
+    let session = |name: &str, keep: bool| {
+        let wt = fixture.dir.join("_worktrees").join(name);
+        let script = format!(
+            "{RECEIPT_FN}
+            set -e
+            git fetch -q origin
+            git worktree add -q -b {name} '{wt}' origin/main
+            cd '{wt}'
+            echo {name} > {name}.txt && echo '{{}}' > sykli.json
+            git add {name}.txt sykli.json && git commit -q -m {name}
+            receipt passed
+            if [ {keep} = true ]; then
+              common=$(cd \"$(git rev-parse --git-common-dir)\" && pwd)
+              mkdir -p \"$common/sykli/receipts\" && cp .sykli/receipts/*.json \"$common/sykli/receipts/\"
+            fi
+            git push -q origin HEAD:main
+            cd '{repo}' && git worktree remove --force '{wt}' && git branch -q -D {name}",
+            wt = wt.display(),
+            repo = repo.display(),
+        );
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "run",
+                    "sh",
+                    "--intent",
+                    name,
+                    "--no-briefing",
+                    "--",
+                    "-c",
+                    &script,
+                ])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        stderr
+    };
+    let brief = || output_of(fixture.ohjaa().arg("brief").current_dir(&repo)).0;
+    // No receipt anywhere any more: it cannot be observed, so it is not said.
+    let record = session("gone", false);
+    let tip = short_of(&repo, "origin/main");
+    assert!(
+        landed_lines(&record).concat().contains(&format!(
+            "{tip} reached origin/main: unchecked: no sykli receipt, and the checkout it was \
+             made in is gone"
+        )),
+        "{record}"
+    );
+    assert!(!record.contains("FLAGGED"), "{record}");
+    assert!(!brief().contains("WARNING"));
+    // The receipt sykli kept under the common dir verifies it.
+    let record = session("kept", true);
+    assert!(
+        landed_lines(&record)
+            .concat()
+            .contains("verified: passed (sykli verify --commit)"),
+        "{record}"
+    );
+    assert!(!record.contains("FLAGGED"), "{record}");
+    assert!(!brief().contains("WARNING"));
+    fixture.cleanup();
+}
+
+#[test]
 fn a_squash_merged_pull_request_is_found_by_its_commit_once_every_ref_is_pruned() {
     if !git_available() {
         return;

@@ -2230,6 +2230,7 @@ fn observe_repo(
                         &arrived.tree,
                         &work.receipts,
                         &work.checkouts,
+                        arrived.alive,
                     )
                 })
                 .unwrap_or_else(|| sessions::Check::Unverified {

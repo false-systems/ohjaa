@@ -346,16 +346,43 @@ pub struct Receipt {
 /// Sykli receipts keyed by the tree that ran.
 pub type Receipts = std::collections::HashMap<String, Receipt>;
 
-/// The sykli receipts in these checkouts, keyed by the tree that ran.
-/// Reads `sykli-receipt.v1`: `subject.tree_oid`, `subject.head_tree_oid`,
-/// `subject.dirty`, `outcome`, `started_at_ms`. A tree is its content, so a
-/// receipt is about that tree in whichever checkout sykli ran. Of several for
-/// one tree, a passing run wins, then a clean one, then the newest. Read once
-/// per repository at leaving, and shared by its phases and its pull request.
+/// The sykli receipts in these checkouts' `.sykli/receipts` (see
+/// [`receipts_from`]).
+#[cfg(test)]
 pub fn receipts_in<'a>(checkouts: impl IntoIterator<Item = &'a Path>) -> Receipts {
+    receipts_from(
+        checkouts
+            .into_iter()
+            .map(|checkout| (checkout.join(".sykli").join("receipts"), checkout)),
+    )
+}
+
+/// The receipts in every checkout of `repo`'s clone, and those sykli keeps
+/// under the git common dir (`<common>/sykli/receipts`: a copy of the receipt
+/// that verified each push it accepted), which outlive a worktree removed
+/// with its `.sykli/`. Those are run from `repo`.
+pub fn receipts_of_clone(repo: &Path, checkouts: &[Worktree]) -> Receipts {
+    let kept = git(repo, &["rev-parse", "--git-common-dir"])
+        .map(|common| repo.join(common).join("sykli").join("receipts"));
+    receipts_from(
+        checkouts
+            .iter()
+            .map(|w| (w.path.join(".sykli").join("receipts"), w.path.as_path()))
+            .chain(kept.map(|dir| (dir, repo))),
+    )
+}
+
+/// The sykli receipts in these folders, each with the checkout it is run
+/// from, keyed by the tree that ran. Reads `sykli-receipt.v1`:
+/// `subject.tree_oid`, `subject.head_tree_oid`, `subject.dirty`, `outcome`,
+/// `started_at_ms`. A tree is its content, so a receipt is about that tree in
+/// whichever checkout sykli ran. Of several for one tree, a passing run wins,
+/// then a clean one, then the newest. Read once per repository at leaving,
+/// and shared by its phases and its pull request.
+fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Receipts {
     let mut found = Receipts::new();
-    for checkout in checkouts {
-        let Ok(entries) = std::fs::read_dir(checkout.join(".sykli").join("receipts")) else {
+    for (dir, checkout) in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -515,6 +542,9 @@ pub struct Arrived {
     pub at_tip: bool,
     /// It can be shown to be this session's landing.
     pub attributed: bool,
+    /// A checkout that still exists records making it (its HEAD's reflog):
+    /// where sykli's receipt of it would be.
+    pub alive: bool,
 }
 
 /// The most landed commits a record keeps: the newest ones.
@@ -587,7 +617,7 @@ pub fn observe(
         .filter(|w| all.iter().any(|c| c.path == w.checkout))
         .collect();
     let mut work = Work {
-        receipts: receipts_in(all.iter().map(|w| w.path.as_path())),
+        receipts: receipts_of_clone(&repo, &all),
         ..Work::default()
     };
     let mut made: HashMap<String, Made> = HashMap::new();
@@ -605,6 +635,9 @@ pub fn observe(
         .chain(start.remote.iter().cloned())
         .collect();
     let mut repo_moves = None;
+    // Every commit a checkout that still exists records making, at any time:
+    // its sykli receipts would be there.
+    let mut made_alive: HashSet<String> = HashSet::new();
     for checkout in &all {
         let Some(moves) = reflog(
             &checkout.path,
@@ -621,6 +654,9 @@ pub fn observe(
         let mut in_window = 0;
         let mut boundary = None;
         for entry in moves {
+            if created_here(&entry.subject) {
+                made_alive.insert(entry.commit.clone());
+            }
             if entry.at < since {
                 boundary.get_or_insert(entry.commit);
                 continue;
@@ -883,6 +919,7 @@ pub fn observe(
                         tip: commit.commit == entry.commit,
                         at_tip: now_at.as_deref() == Some(commit.commit.as_str()),
                         attributed,
+                        alive: made_alive.contains(&commit.commit),
                         ..commit
                     });
                 }
@@ -969,6 +1006,7 @@ fn range(repo: &Path, new: &str, old: Option<&str>, already: &[String]) -> Vec<A
                 tip: false,
                 at_tip: false,
                 attributed: false,
+                alive: false,
             })
         })
         .collect();
@@ -1373,7 +1411,7 @@ pub fn finished(
         .as_ref()
         .and_then(|tree| receipts.get(tree).map(|r| r.evidence.clone()));
     let head_check = head.as_deref().map(|head| match &tree {
-        Some(tree) => sykli.check(repo, head, tree, receipts, checkouts),
+        Some(tree) => sykli.check(repo, head, tree, receipts, checkouts, true),
         None => Check::Unverified {
             why: "its head commit is not in this repository".to_owned(),
         },
@@ -1444,6 +1482,8 @@ impl Sykli {
     /// sykli that checks the checkout, not the commit. A receipt's own
     /// `outcome` is never read as a pass, a sykli that cannot bind a commit
     /// never passes anything, and a commit with no contract cannot be checked.
+    /// With no receipt, `alive` says whether the checkout it was made in, and
+    /// so its receipts, still exists: when not, it cannot be observed.
     pub fn check(
         &self,
         repo: &Path,
@@ -1451,13 +1491,16 @@ impl Sykli {
         tree: &str,
         receipts: &Receipts,
         checkouts: &[Worktree],
+        alive: bool,
     ) -> Check {
         let Some(receipt) = receipts.get(tree) else {
             let has_contract = ["sykli.json", "sykli.rs"]
                 .iter()
                 .any(|name| git(repo, &["cat-file", "-e", &format!("{commit}:{name}")]).is_some());
-            return if has_contract {
+            return if has_contract && alive {
                 Check::Unchecked
+            } else if has_contract {
+                Check::UncheckedGone
             } else {
                 Check::Unverified {
                     why: "no sykli contract (sykli.json or sykli.rs) in this commit".to_owned(),
@@ -1477,10 +1520,15 @@ impl Sykli {
             Some(path) => (path, true),
             None => (receipt.checkout.as_path(), false),
         };
-        let Some(contract) = ["sykli.json", "sykli.rs"]
-            .into_iter()
-            .find(|name| checkout.join(name).is_file())
-        else {
+        // A sykli that reads everything from the commit takes the contract
+        // from it too; an older one from the checkout on disk.
+        let Some(contract) = ["sykli.json", "sykli.rs"].into_iter().find(|name| {
+            if from_the_commit {
+                git(repo, &["cat-file", "-e", &format!("{commit}:{name}")]).is_some()
+            } else {
+                checkout.join(name).is_file()
+            }
+        }) else {
             return Check::Unverified {
                 why: format!(
                     "no sykli contract (sykli.json or sykli.rs) in {}",
@@ -2264,7 +2312,8 @@ mod tests {
                 &landed.commit,
                 &landed.tree,
                 &work.receipts,
-                &work.checkouts
+                &work.checkouts,
+                landed.alive
             ),
             Check::Unverified {
                 why: "no sykli contract (sykli.json or sykli.rs) in this commit".to_owned()
