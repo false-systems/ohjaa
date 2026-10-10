@@ -1002,6 +1002,41 @@ fn run_briefs_knowledge_before_the_perimeter() {
 }
 
 #[test]
+fn a_scoped_repositorys_knowledge_alone_still_opens_with_the_preamble() {
+    let fixture = Fixture::new("preamble-alone");
+    let repo = fixture.make_git_repo("selected");
+    fixture.set_context(r#"{"repo":{"name":"selected","role":"selected role","not_roles":[]}}"#);
+    // No ours, mine or machine knowledge at all: only the scoped repository's.
+    fixture.node(
+        &repo.join(".ohjaa/knowledge"),
+        "repo-rule",
+        "decision",
+        "Selected repository rule.",
+    );
+    let (brief, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "brief",
+        "--scope",
+        repo.to_str().unwrap(),
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    let preamble = brief
+        .find("Knowledge (ohjaa, knowledge-node.v1)")
+        .expect(&brief);
+    assert_eq!(
+        brief
+            .matches("Knowledge (ohjaa, knowledge-node.v1)")
+            .count(),
+        1,
+        "{brief}"
+    );
+    assert!(
+        preamble < brief.find("Selected repository rule.").unwrap(),
+        "said once, before the first knowledge: {brief}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
 fn startup_is_scoped_reuses_scans_and_delivers_repo_knowledge_from_the_root() {
     let fixture = Fixture::new("scoped-startup");
     let repo = fixture.make_git_repo("selected");

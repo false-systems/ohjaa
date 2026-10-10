@@ -522,13 +522,17 @@ fn knowledge_for_work(
         let mut scoped_dirs = dirs.clone();
         scoped_dirs.repo_root = Some(repo.clone());
         let (knowledge, nodes) = knowledge_briefing_for(&scoped_dirs, &[Scope::Repo])?;
-        // The preamble was said once, above; each repository adds its section.
+        // The preamble is said once, before the first knowledge of all; each
+        // repository adds its section.
         let knowledge = knowledge
             .strip_prefix(knowledge::PREAMBLE)
             .unwrap_or(&knowledge)
             .trim_start_matches('\n')
             .to_owned();
         if !knowledge.is_empty() {
+            if text.is_empty() {
+                text.push_str(knowledge::PREAMBLE);
+            }
             text.push_str(&format!(
                 "\nScoped repository {}:\n{knowledge}",
                 repo.display()
