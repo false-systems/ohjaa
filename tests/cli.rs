@@ -1103,7 +1103,10 @@ fn startup_is_scoped_reuses_scans_and_delivers_repo_knowledge_from_the_root() {
     fs::write(fixture.dir.join("calls.txt"), "").unwrap();
     let (_, after, code) = launch();
     assert_eq!(code, Some(0), "{after}");
-    assert_eq!(after.len(), before.len());
+    // Its size, but not its numbers: a session id carries a pid, whose digits
+    // can grow by one between two launches.
+    let size = |text: &str| text.chars().filter(|c| !c.is_ascii_digit()).count();
+    assert_eq!(size(&after), size(&before));
     assert!(!after.contains("broken-unrelated"));
     assert!(!fs::read_to_string(fixture.dir.join("calls.txt"))
         .unwrap()
