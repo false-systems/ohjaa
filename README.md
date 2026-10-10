@@ -135,7 +135,7 @@ until it ends so the last one always happens:
 |---|---|---|
 | 1 entering | knowledge, the last session here, lifecycle instructions, and scoped context | ohjaa |
 | 2 oriented | the agent reads back what it knows: `ohjaa oriented "<goal; rules; who else>"` | the agent |
-| 3 working | small phases, each a commit and, where the repo has a sykli contract, a `sykli run` on it | observed from git and `.sykli/receipts` in every checkout `git worktree list` names: the commits a reflog (a checkout's HEAD, or a branch) shows created since entering and still reachable, never ones a pull or merge brought in, nor one an amend or rebase replaced; a checkout where another session was launched is that session's |
+| 3 working | small phases, each a commit and, where the repo has a sykli contract, a `sykli run` on it | observed from git and `.sykli/receipts` in every checkout `git worktree list` names: the commits a reflog (a checkout's HEAD, or a branch) shows created since entering and still reachable, never ones a pull or merge brought in, nor one an amend or rebase replaced (a rebase's replayed commits are made anew, and count). A commit is the session's own only where that can be shown (see below); every other one made meanwhile is recorded as observed, not attributed |
 | 4 finished | the pull request of the branch this session's newest commit on a branch was made on (by name, then by commit once a squash merge deleted the branch; none asked when it made no commit on a branch), and what `sykli verify --commit` says about its head; every commit that reached the default branch during the session, checked the same way | observed through `gh`, git and sykli |
 | 5 leaving | the record: observed part, then the handover (`ohjaa handover`) | ohjaa, and the agent's testimony |
 
@@ -371,13 +371,24 @@ launched in:
   one that ended last, launched in that repo or elsewhere with a `--scope`
   naming it, and one launched elsewhere says where it was launched.
 
-A repository nobody named is still observed when it moved: at leaving, ohjaa
-looks at the repositories directly in the launch folder (and in any folder
-`--scope` named that is not itself a repository), and records each whose
-checkouts or branches moved while the session ran, in any of its worktrees,
-as **found, not named**. Another agent working there at the same time cannot be
-told apart from this one, and the record says so; name repositories with
-`--scope` wherever you can. A `--scope` path that is neither in a repository nor
+**Observed, not asserted (law 3).** A commit is the session's own only where
+that can be shown: it was made in the checkout the session was launched in or
+named with `--scope`, or in a worktree or on a branch created during the
+session, or pushed from here; and no other session sharing that place was there
+at that second (other sessions in the log, and live ones toimija saw at launch;
+for a place created during the session, any session in the same clone). Only
+its own commits are its phases, its pull request and its flags. Everything else
+made during the session is recorded as `observed … not attributed`, with the
+session it shared the place with (`shared with oh-… in work, …`).
+
+A repository nobody named is observed when a commit was made in it: at leaving,
+ohjaa looks at the repositories directly in the launch folder (and in any folder
+`--scope` named that is not itself a repository), and records each where a
+commit was made, or pushed from, during the session, in any of its worktrees,
+as **found, not named**. Nothing in a found repository is attributed to the
+session: it is not its phases or flags, no pull request is looked up, and the
+session never becomes that repository's "last session here". Name repositories
+with `--scope` wherever you can. A `--scope` path that is neither in a repository nor
 a folder is named as unobserved. Scope can be named from inside a repo too, for
 a second repository an agent will touch.
 

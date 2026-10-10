@@ -448,21 +448,45 @@ fn reflog(dir: &Path, args: &[&str]) -> Option<Vec<Move>> {
 /// What leaving observed of one repository's commits, in all its checkouts.
 #[derive(Debug, Clone, Default)]
 pub struct Work {
-    /// `None` when they could not be observed (see [`observe`]).
+    /// This session's own commits. `None` when they could not be observed
+    /// (see [`observe`]).
     pub phases: Option<Vec<Phase>>,
+    /// Commits made during the session that cannot be shown to be its own:
+    /// in a repository it only was found working in, in a checkout it was
+    /// not launched in and did not create, or while another session shared
+    /// the place. Observed, never credited.
+    pub observed: Vec<Phase>,
+    /// The other sessions that shared this session's places while it ran.
+    pub shared: Vec<Window>,
     /// The branch this session's newest commit on a branch was made on, and
     /// that commit: where its pull request is looked up.
     pub pr_branch: Option<String>,
     pub pr_commit: Option<String>,
-    /// Whether any of its checkouts or branches moved during the session.
-    pub moved: bool,
+    /// Whether any commit was made, or pushed from here, during the session.
+    pub made: bool,
     /// The receipts in every checkout read.
     pub receipts: Receipts,
     /// The commits that reached the default branch during the session, oldest
-    /// first (see [`observe`]); sykli is asked about each by the caller.
+    /// first (see [`observe`]); sykli is asked about each tip by the caller.
     pub landed: Vec<Arrived>,
     /// Every checkout of the repository.
     pub checkouts: Vec<Worktree>,
+}
+
+/// Another session's time in a checkout of this clone (`from_ms` to `to_ms`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Window {
+    pub id: String,
+    pub checkout: PathBuf,
+    pub from_ms: i64,
+    pub to_ms: i64,
+}
+
+impl Window {
+    /// Whether the session was there during the second `at` (unix seconds).
+    fn live_at(&self, at: i64) -> bool {
+        self.from_ms <= at * 1000 + 999 && self.to_ms >= at * 1000
+    }
 }
 
 /// A commit that reached the default branch, before sykli is asked about it.
@@ -479,29 +503,55 @@ pub struct Arrived {
     pub tip: bool,
     /// The branch still sits at it.
     pub at_tip: bool,
+    /// It can be shown to be this session's landing.
+    pub attributed: bool,
 }
 
 /// The most landed commits a record keeps: the newest ones.
 const MAX_LANDED: usize = 20;
 
-/// State 3, observed: every commit this session made in `repo`, in any of its
-/// checkouts (`git worktree list`), each with whatever sykli saw on its tree.
+/// Where a commit was made, as its reflog says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Place {
+    /// In this checkout (its HEAD's reflog).
+    Checkout(PathBuf),
+    /// On this branch, in a checkout since removed (only the branch's reflog).
+    Branch(String),
+    /// Known only from a push from here (local branch and checkout gone).
+    Push,
+}
+
+#[derive(Debug, Clone)]
+struct Made {
+    place: Place,
+    /// When, in unix seconds.
+    at: i64,
+}
+
+/// State 3, observed: every commit made in `repo` during the session, in any
+/// of its checkouts (`git worktree list`), each with whatever sykli saw on
+/// its tree; and which of them are this session's own.
 ///
-/// A commit is this session's when a reflog — a checkout's HEAD, or a branch
-/// — shows it created since the session started, and it is still reachable
-/// from a branch, a remote branch or a checkout. Commits a pull, merge or
-/// reset brought in were made elsewhere, and are not phases; nor is one that
-/// an amend or a rebase replaced. Checkouts in `skip` (where another session
-/// was launched) are someone else's: neither their HEAD nor the branch checked
-/// out there is read as this session's. That may include `repo` itself, when
-/// it was only found at leaving; a caller that was launched in or named
-/// `repo` leaves it out.
+/// A commit was made during the session when a reflog — a checkout's HEAD, a
+/// branch, or a push from here — shows it created since the session started,
+/// and it is still reachable from a branch, a remote branch or a checkout.
+/// Commits a pull, merge or reset brought in were made elsewhere; one an
+/// amend or a rebase replaced is gone. A rebase's replayed commits are made
+/// anew, so they count, whenever their originals were written.
+///
+/// Law 3, observed not asserted: a commit is this session's own only where it
+/// can be shown to be. It was made in `named` (the checkout the session was
+/// launched in or named with `--scope`), or in a worktree or on a branch
+/// created during the session, or pushed from here; and no other session
+/// sharing that place (`others`: in `named` itself, or anywhere in this clone
+/// for a place created during the session) was there at that second. In a
+/// repository only found at leaving (`named` is `None`) nothing is its own.
+/// Every other commit made during the session is observed, not attributed.
 ///
 /// Also observed: the commits that reached the default branch (`origin/HEAD`,
-/// else `main` or `master`) during the session — every commit a push from
-/// here took to the remote one, and every commit this session made that
-/// arrived on the local one. A push is not told apart by checkout, so the
-/// commits made in a skipped checkout are left out of it.
+/// else `main` or `master`) — every commit a push from here took to the
+/// remote one, and every commit made here that arrived on the local one. A
+/// push is this session's when no other session was in the clone then.
 ///
 /// Reflog times are whole seconds, so a move in the second the session started
 /// may be from just before it: what `start` says the repository held at
@@ -513,32 +563,34 @@ pub fn observe(
     repo: &Path,
     head_at_start: Option<&str>,
     started_ms: i64,
-    skip: &[PathBuf],
     start: &Start,
+    named: Option<&Path>,
+    others: &[Window],
 ) -> Work {
     let repo = canonical(repo);
+    let named = named.map(canonical);
     let since = started_ms.div_euclid(1000);
     let all = worktrees(&repo);
-    let skipped = |path: &Path| skip.iter().any(|s| s == path);
+    // Only sessions in a checkout of this clone can share its places.
+    let others: Vec<&Window> = others
+        .iter()
+        .filter(|w| all.iter().any(|c| c.path == w.checkout))
+        .collect();
     let mut work = Work {
-        receipts: receipts_in(
-            all.iter()
-                .filter(|w| !skipped(&w.path))
-                .map(|w| w.path.as_path()),
-        ),
+        receipts: receipts_in(all.iter().map(|w| w.path.as_path())),
         ..Work::default()
     };
-    // Each commit created since the start, with the checkout it was made in
-    // when known; and those another session made in a skipped checkout.
-    let mut created: HashMap<String, Option<PathBuf>> = HashMap::new();
+    let mut made: HashMap<String, Made> = HashMap::new();
     // The branch each was made on, or the remote branch a push from here named.
     let mut branch_of: HashMap<String, String> = HashMap::new();
     // Each remote branch's pushes since the start, newest first, and where it
     // pointed at the start.
     let mut pushes: HashMap<String, (Vec<Move>, Option<String>)> = HashMap::new();
-    let mut theirs: HashSet<String> = HashSet::new();
+    // Linked worktrees, and branches, that came into being during the session.
+    let mut new_checkouts: HashSet<PathBuf> = HashSet::new();
+    let mut oldest: HashMap<String, i64> = HashMap::new();
     // What each reference pointed at when the session started: nothing
-    // reachable from those was made by this session.
+    // reachable from those was made during it.
     let mut boundaries: Vec<String> = head_at_start
         .into_iter()
         .map(str::to_owned)
@@ -546,8 +598,7 @@ pub fn observe(
         .chain(start.remote.iter().cloned())
         .collect();
     let mut repo_moves = None;
-    for checkout in &all {
-        let ours = !skipped(&checkout.path);
+    for (index, checkout) in all.iter().enumerate() {
         let Some(moves) = reflog(
             &checkout.path,
             &[
@@ -560,6 +611,9 @@ pub fn observe(
         ) else {
             continue;
         };
+        if index > 0 && moves.last().is_some_and(|first| first.at >= since) {
+            new_checkouts.insert(checkout.path.clone());
+        }
         let mut in_window = 0;
         let mut boundary = None;
         for entry in moves {
@@ -568,23 +622,16 @@ pub fn observe(
                 continue;
             }
             in_window += 1;
-            if !created_here(&entry.subject) {
-                continue;
-            }
-            if ours {
-                created
-                    .entry(entry.commit)
-                    .or_insert_with(|| Some(checkout.path.clone()));
-            } else {
-                theirs.insert(entry.commit);
+            if created_here(&entry.subject) {
+                made.entry(entry.commit).or_insert_with(|| Made {
+                    place: Place::Checkout(checkout.path.clone()),
+                    at: entry.at,
+                });
             }
         }
         boundaries.extend(boundary);
-        if ours {
-            work.moved |= in_window > 0;
-            if checkout.path == repo {
-                repo_moves = Some(in_window);
-            }
+        if checkout.path == repo {
+            repo_moves = Some(in_window);
         }
     }
     let default = default_branch(&repo);
@@ -608,6 +655,10 @@ pub fn observe(
             if !entry.reference.starts_with("refs/") {
                 continue; // checkouts' HEADs, read above
             }
+            oldest
+                .entry(entry.reference.clone())
+                .and_modify(|at| *at = (*at).min(entry.at))
+                .or_insert(entry.at);
             let arrival = arrivals.iter_mut().find(|(r, _, _)| *r == entry.reference);
             if entry.at < since {
                 if bounded.insert(entry.reference.clone()) {
@@ -624,28 +675,23 @@ pub fn observe(
                 }
                 continue;
             }
-            if entry.reference.starts_with("refs/heads/") {
-                let there = all
-                    .iter()
-                    .find(|w| w.branch.as_deref() == Some(entry.reference.as_str()));
-                if there.is_some_and(|w| skipped(&w.path)) {
-                    if created_here(&entry.subject) {
-                        theirs.insert(entry.commit);
-                    }
-                    continue;
-                }
-                work.moved = true;
+            if let Some(name) = entry.reference.strip_prefix("refs/heads/") {
                 if created_here(&entry.subject) {
-                    created
-                        .entry(entry.commit.clone())
-                        .or_insert_with(|| there.map(|w| w.path.clone()));
-                    let name = entry.reference.trim_start_matches("refs/heads/");
+                    let there = all
+                        .iter()
+                        .find(|w| w.branch.as_deref() == Some(entry.reference.as_str()));
+                    made.entry(entry.commit.clone()).or_insert_with(|| Made {
+                        place: there.map_or_else(
+                            || Place::Branch(name.to_owned()),
+                            |w| Place::Checkout(w.path.clone()),
+                        ),
+                        at: entry.at,
+                    });
                     branch_of
                         .entry(entry.commit.clone())
                         .or_insert_with(|| name.to_owned());
                 }
             } else if entry.subject == "update by push" {
-                work.moved = true;
                 pushes
                     .entry(entry.reference.clone())
                     .or_default()
@@ -662,8 +708,8 @@ pub fn observe(
             }
         }
     }
-    // A commit a push from here took to a remote branch during the session is
-    // this session's work even once its local branch and checkout are gone (a
+    // A commit a push from here took to a remote branch during the session was
+    // made during it even once its local branch and checkout are gone (a
     // squash-merged, cleaned-up pull request): its commit time says when.
     for (reference, (moves, held)) in &pushes {
         let name = reference
@@ -677,36 +723,84 @@ pub fn observe(
             .chain(std::iter::once(held.clone()));
         for (entry, old) in moves.iter().zip(olds) {
             for pushed in range(&repo, &entry.commit, old.as_deref(), &on_remotes) {
-                if pushed.committed < since || theirs.contains(&pushed.commit) {
+                if pushed.committed < since {
                     continue;
                 }
                 branch_of
                     .entry(pushed.commit.clone())
                     .or_insert_with(|| name.to_owned());
-                created.entry(pushed.commit).or_insert(None);
+                made.entry(pushed.commit).or_insert(Made {
+                    place: Place::Push,
+                    at: entry.at,
+                });
             }
         }
     }
+    work.made = !made.is_empty() || !pushes.is_empty();
+
+    // Whose each commit is: `Ok` this session's own; `Err(Some(w))` made in
+    // its place while `w` shared it; `Err(None)` not in a place of its own.
+    let in_clone = |at: i64| others.iter().copied().find(|w| w.live_at(at));
+    let attribute = |made: &Made| -> Result<(), Option<&Window>> {
+        let Some(named) = &named else {
+            return Err(None);
+        };
+        let contested = match &made.place {
+            Place::Checkout(path) if path == named => others
+                .iter()
+                .copied()
+                .find(|w| w.checkout == *named && w.live_at(made.at)),
+            Place::Checkout(path) if new_checkouts.contains(path) => in_clone(made.at),
+            Place::Checkout(_) => return Err(None),
+            Place::Branch(branch) => {
+                let created = oldest
+                    .get(&format!("refs/heads/{branch}"))
+                    .is_some_and(|at| *at >= since);
+                if !created {
+                    return Err(None);
+                }
+                in_clone(made.at)
+            }
+            Place::Push => in_clone(made.at),
+        };
+        contested.map_or(Ok(()), |w| Err(Some(w)))
+    };
+
     let head_now = all
         .iter()
         .find(|w| w.path == repo)
         .and_then(|w| w.head.clone());
     let unkept = head_at_start.is_some() && head_now.as_deref() != head_at_start;
-    work.phases = match repo_moves {
-        None if skipped(&repo) => surviving(&repo, &all, &created, &boundaries),
+    let made_since = match repo_moves {
         None => None,
-        Some(0) if unkept && created.is_empty() => None,
-        Some(_) => surviving(&repo, &all, &created, &boundaries),
+        Some(0) if unkept && made.is_empty() => None,
+        Some(_) => surviving(&repo, &all, &made, &boundaries),
     };
-    if let Some(phases) = &mut work.phases {
-        for phase in phases.iter_mut() {
+    let mut shared: Vec<Window> = Vec::new();
+    if let Some(made_since) = made_since {
+        let mut phases = Vec::new();
+        for mut phase in made_since {
             phase.evidence = work
                 .receipts
                 .get(&phase.tree)
                 .map(|receipt| receipt.evidence.clone());
-        }
-        for phase in phases.iter_mut() {
             phase.branch = branch_of.get(&phase.commit).cloned();
+            let how = &made[&phase.commit];
+            phase.worktree = match &how.place {
+                Place::Checkout(path) if *path != repo => Some(path.to_string_lossy().into_owned()),
+                _ => None,
+            };
+            match attribute(how) {
+                Ok(()) => phases.push(phase),
+                Err(by) => {
+                    if let Some(by) = by {
+                        if !shared.contains(by) {
+                            shared.push(by.clone());
+                        }
+                    }
+                    work.observed.push(phase);
+                }
+            }
         }
         // Its pull request is the one for the branch its newest commit on a
         // branch was made on: never whatever a checkout holds now.
@@ -714,17 +808,20 @@ pub fn observe(
             work.pr_branch = newest.branch.clone();
             work.pr_commit = Some(newest.commit.clone());
         }
-        {
-            for phase in phases.iter_mut() {
-                phase.worktree = created
-                    .get(&phase.commit)
-                    .cloned()
-                    .flatten()
-                    .filter(|path| *path != repo)
-                    .map(|path| path.to_string_lossy().into_owned());
+        work.phases = Some(phases);
+    }
+    // A session launched in the same checkout while this one ran shares it,
+    // whether or not either made a commit.
+    if let Some(named) = &named {
+        for w in &others {
+            let overlaps = w.from_ms <= intake_now_ms() && w.to_ms >= started_ms;
+            if w.checkout == *named && overlaps && !shared.contains(w) {
+                shared.push((*w).clone());
             }
         }
     }
+    work.shared = shared;
+
     let mut seen = HashSet::new();
     for (reference, moves, held) in arrivals {
         let remote = reference.starts_with("refs/remotes/");
@@ -745,18 +842,25 @@ pub fn observe(
             if remote && entry.subject != "update by push" {
                 continue; // a fetch brings in other people's commits
             }
+            // A push is this session's when it was in a place of its own and
+            // no other session was in the clone then.
+            let pushed_by_us = named.is_some() && in_clone(entry.at).is_none();
             let already = if remote { &on_remotes } else { &start.local };
             for commit in range(&repo, &entry.commit, old.as_deref(), already) {
-                let ours = if remote {
-                    !theirs.contains(&commit.commit)
+                let attributed = if remote {
+                    pushed_by_us
                 } else {
-                    created.contains_key(&commit.commit)
+                    match made.get(&commit.commit) {
+                        None => continue, // brought in, not made here
+                        Some(how) => attribute(how).is_ok(),
+                    }
                 };
-                if ours && seen.insert(commit.commit.clone()) {
+                if seen.insert(commit.commit.clone()) {
                     work.landed.push(Arrived {
                         onto: onto.clone(),
                         tip: commit.commit == entry.commit,
                         at_tip: now_at.as_deref() == Some(commit.commit.as_str()),
+                        attributed,
                         ..commit
                     });
                 }
@@ -767,6 +871,10 @@ pub fn observe(
         .drain(..work.landed.len().saturating_sub(MAX_LANDED));
     work.checkouts = all;
     work
+}
+
+fn intake_now_ms() -> i64 {
+    crate::intake::now_seconds() * 1000
 }
 
 /// The default branch's references: the remote one first, then the local
@@ -838,6 +946,7 @@ fn range(repo: &Path, new: &str, old: Option<&str>, already: &[String]) -> Vec<A
                 onto: String::new(),
                 tip: false,
                 at_tip: false,
+                attributed: false,
             })
         })
         .collect();
@@ -851,7 +960,7 @@ fn range(repo: &Path, new: &str, old: Option<&str>, already: &[String]) -> Vec<A
 fn surviving(
     repo: &Path,
     checkouts: &[Worktree],
-    created: &HashMap<String, Option<PathBuf>>,
+    created: &HashMap<String, Made>,
     boundaries: &[String],
 ) -> Option<Vec<Phase>> {
     if created.is_empty() {
@@ -1410,7 +1519,7 @@ mod tests {
 
     /// The phases leaving observes in `dir`, skipping no checkout.
     fn phases(dir: &Path, start: Option<&str>, started_ms: i64) -> Option<Vec<Phase>> {
-        observe(dir, start, started_ms, &[], &Start::default()).phases
+        observe(dir, start, started_ms, &Start::default(), Some(dir), &[]).phases
     }
 
     #[test]
@@ -1578,7 +1687,14 @@ mod tests {
         );
         let tree = commit(&wt, "w.txt", "made in the worktree");
         receipt(&wt, "w", &tree, "passed", 5, false);
-        let work = observe(&dir, Some(&start), started_ms, &[], &Start::default());
+        let work = observe(
+            &dir,
+            Some(&start),
+            started_ms,
+            &Start::default(),
+            Some(&dir),
+            &[],
+        );
         let found = work.phases.unwrap();
         assert_eq!(subjects(&found), ["made in the worktree"]);
         assert_eq!(found[0].evidence.as_ref().unwrap().outcome, "passed");
@@ -1590,7 +1706,7 @@ mod tests {
             Some("feat2"),
             "its pull request is looked up for the branch it was made on"
         );
-        assert!(work.moved);
+        assert!(work.made);
         let _ = std::fs::remove_dir_all(wt);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1639,10 +1755,10 @@ mod tests {
     }
 
     #[test]
-    fn a_checkout_another_session_was_launched_in_is_not_this_sessions() {
-        let dir = repo("wt-skip");
+    fn what_was_made_where_another_session_was_is_observed_not_attributed() {
+        let dir = repo("shared");
         let start = head(&dir).unwrap();
-        let started_ms = now_ms();
+        let started_ms = now_ms() - 1000;
         let theirs = worktree_path("theirs");
         git_ok(
             &dir,
@@ -1655,48 +1771,60 @@ mod tests {
                 theirs.to_str().unwrap(),
             ],
         );
-        commit(&theirs, "t.txt", "another session's work");
+        commit(&theirs, "t.txt", "in a worktree made during the session");
+        commit(&dir, "o.txt", "in the launch checkout");
         let theirs = std::fs::canonicalize(&theirs).unwrap();
-        assert_eq!(phases(&dir, Some(&start), started_ms).unwrap().len(), 1);
-        let skipped = observe(
-            &dir,
-            Some(&start),
-            started_ms,
-            std::slice::from_ref(&theirs),
-            &Start::default(),
-        );
-        assert_eq!(skipped.phases, Some(Vec::new()));
         let own = std::fs::canonicalize(&dir).unwrap();
-        commit(&dir, "o.txt", "made where another session was launched");
-        let mine = worktree_path("mine");
-        git_ok(
-            &dir,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "mine",
-                mine.to_str().unwrap(),
-            ],
-        );
-        commit(&mine, "m.txt", "mine");
+        let watch = |others: &[Window]| {
+            let work = observe(
+                &dir,
+                Some(&start),
+                started_ms,
+                &Start::default(),
+                Some(&dir),
+                others,
+            );
+            let mut mine = subjects(&work.phases.unwrap())
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            mine.sort();
+            (mine, work.observed.len(), work.shared.len())
+        };
+        // Alone in the clone: both are this session's.
         assert_eq!(
-            subjects(
-                &observe(
-                    &dir,
-                    None,
-                    started_ms,
-                    &[own, theirs.clone()],
-                    &Start::default(),
-                )
-                .phases
-                .unwrap()
-            ),
-            ["mine"],
-            "a repository only found at leaving can be another session's launch checkout too"
+            watch(&[]),
+            (
+                vec![
+                    "in a worktree made during the session".to_owned(),
+                    "in the launch checkout".to_owned()
+                ],
+                0,
+                0
+            )
         );
-        let _ = std::fs::remove_dir_all(mine);
+        let live = |checkout: &Path| Window {
+            id: "oh-other".to_owned(),
+            checkout: checkout.to_path_buf(),
+            from_ms: started_ms,
+            to_ms: now_ms() + 60_000,
+        };
+        // Another session in the clone while the worktree was made: it could
+        // have made it; and one in the launch checkout shares that too.
+        assert_eq!(watch(&[live(&theirs)]).0, ["in the launch checkout"]);
+        assert_eq!(watch(&[live(&own)]), (Vec::new(), 2, 1));
+        // One that had left before anything was made shares nothing.
+        let left = Window {
+            to_ms: started_ms - 5_000,
+            from_ms: started_ms - 10_000,
+            ..live(&own)
+        };
+        assert_eq!(watch(&[left]).0.len(), 2);
+        // A repository only found at leaving: nothing in it is attributed.
+        let found = observe(&dir, Some(&start), started_ms, &Start::default(), None, &[]);
+        assert!(found.phases.unwrap().is_empty());
+        assert_eq!(found.observed.len(), 2);
+        assert!(found.made);
         let _ = std::fs::remove_dir_all(theirs);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1769,10 +1897,24 @@ mod tests {
         let started_ms = now_ms();
         commit(&upstream, "u.txt", "theirs");
         git_ok(&dir, &["fetch", "-q"]);
-        let work = observe(&dir, Some(&start), started_ms, &[], &Start::default());
+        let work = observe(
+            &dir,
+            Some(&start),
+            started_ms,
+            &Start::default(),
+            Some(&dir),
+            &[],
+        );
         assert!(work.landed.is_empty(), "a fetch is not a landing");
         commit(&dir, "m.txt", "mine, on the default branch");
-        let work = observe(&dir, Some(&start), started_ms, &[], &Start::default());
+        let work = observe(
+            &dir,
+            Some(&start),
+            started_ms,
+            &Start::default(),
+            Some(&dir),
+            &[],
+        );
         let default = git(&dir, &["branch", "--show-current"]).unwrap();
         assert_eq!(
             work.landed
@@ -1814,7 +1956,7 @@ mod tests {
         let started_ms = now_ms() - 1000;
         let start = start_of(&dir);
         commit(&wt, "a.txt", "after entering");
-        let work = observe(&dir, None, started_ms, &[], &start);
+        let work = observe(&dir, None, started_ms, &start, Some(&dir), &[]);
         assert_eq!(subjects(&work.phases.unwrap()), ["after entering"]);
         let _ = std::fs::remove_dir_all(wt);
         let _ = std::fs::remove_dir_all(dir);

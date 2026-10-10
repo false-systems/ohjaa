@@ -1708,6 +1708,17 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
 
     // What every checkout and branch of the launch and scoped repositories
     // held at entering, kept until leaving: none of it is this session's.
+    // The sessions that had already ended when this one entered: none of them
+    // can have shared its places, whatever whole-second times suggest.
+    let ended_at_entering: std::collections::HashSet<String> = session_store(&dirs)
+        .and_then(|store| store.all().ok())
+        .map(|(all, _)| {
+            all.into_iter()
+                .filter(|s| s.left.is_some())
+                .map(|s| s.id)
+                .collect()
+        })
+        .unwrap_or_default();
     let starts: Vec<(PathBuf, lifecycle::Start)> = in_repo
         .then(|| folder.clone())
         .into_iter()
@@ -1775,6 +1786,8 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 interrupted: false,
                 scoped: Vec::new(),
                 landed: Vec::new(),
+                observed: Vec::new(),
+                shared: Vec::new(),
                 orphaned: false,
             };
             if let Some(store) = session_store(&dirs) {
@@ -1800,29 +1813,54 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let toimija_session =
         unless_interrupted(|| lifecycle::toimija_session(&root, !in_repo, child.id(), started_ms))
             .flatten();
-    // Checkouts where another session was launched while this one ran hold
-    // that session's work, not this one's.
-    let skip = unless_interrupted(|| other_sessions_checkouts(&dirs, &session_id, started_ms))
-        .unwrap_or_default();
+    // Other sessions in these repositories while this one ran: what was made
+    // in a place they shared at that time is not this session's (law 3). From
+    // the log, and the live sessions toimija saw at launch.
+    let siblings: Vec<(String, PathBuf)> = in_repo
+        .then_some(&scan)
+        .into_iter()
+        .chain(scoped_scans.iter())
+        .flat_map(|scan| scan.occupying().filter(|s| !s.is_quiet()))
+        .map(|s| {
+            let worktree =
+                std::fs::canonicalize(&s.worktree).unwrap_or_else(|_| s.worktree.clone());
+            (format!("toimija session {}", s.id), worktree)
+        })
+        .collect();
+    let windows = unless_interrupted(|| {
+        other_windows(
+            &dirs,
+            &session_id,
+            started_ms,
+            &siblings,
+            &ended_at_entering,
+        )
+    })
+    .unwrap_or_default();
     // Asked at most once, and only when a commit needs it.
     let sykli = lifecycle::Sykli::default();
     // Outside a repository the folder itself has no commits or pull request
     // to observe; the record says why, and asks neither git nor gh there.
-    let (phases, finished, landed) = if in_repo {
-        let seen = observe_repo(
+    let launch = if in_repo {
+        observe_repo(
             &root,
             session.head_at_start.as_deref(),
             started_ms,
-            &skip,
             Some(&start_of(&root)),
+            &windows,
             &sykli,
-        );
-        (seen.phases, seen.finished, seen.landed)
+        )
     } else {
-        let finished = sessions::Finished::Unknown {
-            why: "not a Git repository".to_owned(),
-        };
-        (None, finished, Vec::new())
+        Observed {
+            phases: None,
+            observed: Vec::new(),
+            shared: Vec::new(),
+            finished: sessions::Finished::Unknown {
+                why: "not a Git repository".to_owned(),
+            },
+            landed: Vec::new(),
+            made: false,
+        }
     };
     // Every scoped repository is observed the same way as the launch one.
     let mut scoped: Vec<sessions::ScopedLeft> = session
@@ -1833,8 +1871,8 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 Path::new(&scoped.repo),
                 scoped.head_at_start.as_deref(),
                 started_ms,
-                &skip,
                 Some(&start_of(Path::new(&scoped.repo))),
+                &windows,
                 &sykli,
             );
             sessions::ScopedLeft {
@@ -1843,11 +1881,14 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 finished: seen.finished,
                 found: false,
                 landed: seen.landed,
+                observed: seen.observed,
+                shared: seen.shared,
             }
         })
         .collect();
     // And every repository nobody named, directly in the launch folder (or a
-    // folder --scope named), that moved while the session ran.
+    // folder --scope named), where a commit was made while the session ran:
+    // observed, never attributed to it.
     let known: Vec<PathBuf> = in_repo
         .then(|| folder.clone())
         .into_iter()
@@ -1861,14 +1902,16 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         if known.contains(&repo) || scoped.iter().any(|s| Path::new(&s.repo) == repo) {
             continue;
         }
-        let seen = observe_repo(&repo, None, started_ms, &skip, None, &sykli);
-        if seen.moved {
+        let seen = observe_repo(&repo, None, started_ms, None, &windows, &sykli);
+        if seen.made {
             scoped.push(sessions::ScopedLeft {
                 repo: repo_key(&repo),
                 phases: seen.phases,
                 finished: seen.finished,
                 found: true,
                 landed: seen.landed,
+                observed: seen.observed,
+                shared: seen.shared,
             });
         }
     }
@@ -1876,11 +1919,13 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         ended_ms: intake::now_seconds() * 1000,
         exit,
         toimija_session,
-        phases,
-        finished,
+        phases: launch.phases,
+        finished: launch.finished,
         interrupted: process::cancelled(),
         scoped,
-        landed,
+        landed: launch.landed,
+        observed: launch.observed,
+        shared: launch.shared,
         orphaned: false,
     };
     // The store is opened only now, after every slow call, and held only for
@@ -2009,21 +2054,57 @@ fn close_orphans(dirs: &Dirs, write: bool) -> Vec<sessions::Session> {
     closed
 }
 
-/// The checkouts other sessions in the log were launched in while this one
-/// ran (`started_ms` to now). Read in one short open of the log.
-fn other_sessions_checkouts(dirs: &Dirs, id: &str, started_ms: i64) -> Vec<PathBuf> {
-    let Some((all, _)) = session_store(dirs).and_then(|store| store.all().ok()) else {
-        return Vec::new();
-    };
-    all.into_iter()
-        .filter(|s| s.id != id && !s.outside_repo)
-        .filter(|s| {
-            s.left
-                .as_ref()
-                .is_none_or(|left| left.ended_ms >= started_ms)
+/// Every other session's time in a checkout while this one ran (`started_ms`
+/// to now): from the log, each session's launch checkout and the
+/// repositories it named; and the live sessions toimija saw at launch
+/// (`siblings`), for all of this session. A session that had ended before this
+/// one entered (`ended_before`) shared nothing with it. Read in one short open
+/// of the log.
+fn other_windows(
+    dirs: &Dirs,
+    id: &str,
+    started_ms: i64,
+    siblings: &[(String, PathBuf)],
+    ended_before: &std::collections::HashSet<String>,
+) -> Vec<lifecycle::Window> {
+    let now_ms = intake::now_seconds() * 1000 + 999;
+    let mut windows: Vec<lifecycle::Window> = siblings
+        .iter()
+        .map(|(id, checkout)| lifecycle::Window {
+            id: id.clone(),
+            checkout: checkout.clone(),
+            from_ms: started_ms,
+            to_ms: now_ms,
         })
-        .map(|s| PathBuf::from(s.repo))
-        .collect()
+        .collect();
+    let Some((all, _)) = session_store(dirs).and_then(|store| store.all().ok()) else {
+        return windows;
+    };
+    for other in all
+        .into_iter()
+        .filter(|s| s.id != id && !ended_before.contains(&s.id))
+    {
+        let to_ms = other
+            .left
+            .as_ref()
+            .map_or(now_ms, |left| left.ended_ms + 999);
+        if to_ms < started_ms {
+            continue;
+        }
+        let checkouts = (!other.outside_repo)
+            .then(|| other.repo.clone())
+            .into_iter()
+            .chain(other.scoped.iter().map(|s| s.repo.clone()));
+        for checkout in checkouts {
+            windows.push(lifecycle::Window {
+                id: other.id.clone(),
+                checkout: PathBuf::from(checkout),
+                from_ms: other.started_ms,
+                to_ms,
+            });
+        }
+    }
+    windows
 }
 
 /// Run one step of leaving's observing, unless a signal has cut leaving short.
@@ -2033,32 +2114,38 @@ fn unless_interrupted<T>(step: impl FnOnce() -> T) -> Option<T> {
 
 /// What leaving observed in one repository.
 struct Observed {
+    /// This session's own commits.
     phases: Option<Vec<sessions::Phase>>,
+    /// Commits made during the session that are not shown to be its own.
+    observed: Vec<sessions::Phase>,
+    /// The other sessions that shared its places, said for people.
+    shared: Vec<String>,
     finished: sessions::Finished,
-    /// The commits that reached the default branch, each with what sykli said.
+    /// The commits that reached the default branch, each tip with what sykli
+    /// said.
     landed: Vec<sessions::Landed>,
-    /// Whether any of its checkouts or branches moved during the session.
-    moved: bool,
+    /// Whether any commit was made, or pushed from here, during the session.
+    made: bool,
 }
 
-/// Leaving's observation of one repository: the commits this session made
-/// there, in any of its checkouts, with what sykli saw on each, and the pull
-/// request of the branch the newest one was made on. Checkouts in `skip` are
-/// other sessions', except `repo` itself when the session was launched in it
-/// or named it, which is when what it held at entering is known (`start`). A
-/// repository only found at leaving, and that did not move, is not asked
-/// about its pull request. sykli is asked about the pull request's head
-/// and about every commit that reached the default branch.
+/// Leaving's observation of one repository: the commits made there during
+/// the session, in any of its checkouts, and which are this session's own
+/// (see `lifecycle::observe`); with what sykli saw on each, and the pull
+/// request of its own branch. `start` is what the repository held at
+/// entering, read for a repository the session was launched in or named;
+/// a repository only found at leaving has none, and nothing in it is the
+/// session's. sykli is asked about the pull request's head and about the tip
+/// of every push of the session's to the default branch.
 fn observe_repo(
     repo: &Path,
     head_at_start: Option<&str>,
     started_ms: i64,
-    skip: &[PathBuf],
     start: Option<&lifecycle::Start>,
+    windows: &[lifecycle::Window],
     sykli: &lifecycle::Sykli,
 ) -> Observed {
-    let named = start.is_some();
     let own = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let named = start.is_some().then_some(own.as_path());
     // Reflog times are whole seconds. With nothing read at entering, a move in
     // the second the session started may be from before it: only later ones
     // count.
@@ -2069,24 +2156,23 @@ fn observe_repo(
             lifecycle::Start::default(),
         ),
     };
-    let skip: Vec<PathBuf> = skip
+    let work = unless_interrupted(|| {
+        lifecycle::observe(repo, head_at_start, started_ms, &start, named, windows)
+    })
+    .unwrap_or_default();
+    let shared = work
+        .shared
         .iter()
-        .filter(|path| !named || **path != own)
-        .cloned()
+        .map(|w| {
+            format!(
+                "with {} in {}, {} to {}: what was made then where it was is not attributed",
+                w.id,
+                w.checkout.file_name().unwrap_or_default().to_string_lossy(),
+                sessions::clock(w.from_ms),
+                &sessions::clock(w.to_ms)[11..]
+            )
+        })
         .collect();
-    let work =
-        unless_interrupted(|| lifecycle::observe(repo, head_at_start, started_ms, &skip, &start))
-            .unwrap_or_default();
-    if !named && !work.moved {
-        return Observed {
-            phases: work.phases,
-            finished: sessions::Finished::Unknown {
-                why: "not looked up: nothing moved".to_owned(),
-            },
-            landed: Vec::new(),
-            moved: false,
-        };
-    }
     // The pull request of this session's own branch, never whatever branch a
     // checkout holds now; with no commit of its own on a branch, none is asked.
     let finished = match &work.pr_branch {
@@ -2117,9 +2203,10 @@ fn observe_repo(
             commit: arrived.commit.clone(),
             subject: arrived.subject.clone(),
             onto: arrived.onto.clone(),
-            // sykli is asked about the tip of each push, as a pre-push Boundary
-            // would be; the commits before it are their receipts' word.
-            check: arrived.tip.then(|| {
+            // sykli is asked about the tip of each of this session's pushes, as a
+            // pre-push Boundary would be; the commits before it, and what is not
+            // shown to be this session's, are their receipts' word.
+            check: (arrived.tip && arrived.attributed).then(|| {
                 unless_interrupted(|| {
                     sykli.check(
                         repo,
@@ -2138,13 +2225,16 @@ fn observe_repo(
                 .get(&arrived.tree)
                 .map(|receipt| receipt.evidence.clone()),
             at_tip: arrived.at_tip,
+            unattributed: !arrived.attributed,
         })
         .collect();
     Observed {
         phases: work.phases,
+        observed: work.observed,
+        shared,
         finished,
         landed,
-        moved: work.moved,
+        made: work.made,
     }
 }
 

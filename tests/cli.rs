@@ -2976,13 +2976,21 @@ fn a_root_launch_without_scope_records_the_repos_it_worked_in() {
     );
     assert_eq!(code, Some(0), "{stderr}");
     let commit = short_head(&worktree);
-    let phases = stderr
+    let observed = stderr
         .lines()
-        .find(|l| l.starts_with("in work") && l.contains(" phases "))
+        .find(|l| l.starts_with("in work") && l.contains(" observed "))
         .expect(&stderr);
     assert!(
-        phases.contains(&commit) && phases.contains("in work-feat"),
-        "the repository the agent committed in is observed, unnamed: {phases}"
+        observed.contains("observed during the session, not attributed:")
+            && observed.contains(&commit)
+            && observed.contains("in work-feat"),
+        "what moved in a repository nobody named is observed, never credited: {observed}"
+    );
+    assert!(
+        !stderr
+            .lines()
+            .any(|l| l.starts_with("in work") && l.contains(" phases ")),
+        "{stderr}"
     );
     assert!(
         stderr.contains("not named with --scope"),
@@ -2990,15 +2998,17 @@ fn a_root_launch_without_scope_records_the_repos_it_worked_in() {
     );
     assert!(
         !stderr.contains("in idle"),
-        "a repository nothing moved in is not: {stderr}"
+        "a repository nothing was made in is not: {stderr}"
     );
     assert!(!stderr.contains("none to observe"), "{stderr}");
 
-    // The next agent launched in that repository is told what this one left.
+    // It never becomes that repository's last session; the root's says it.
     let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(!stdout.contains("Last session here"), "{stdout}");
+    let (stdout, _, _) = output_of(fixture.ohjaa_in(&folder).arg("brief"));
     for said in [
         "Last session here (oh-",
-        "- work in work: 1 commit(s)",
+        "- in work: 1 commit(s) observed during the session, not attributed (found at leaving)",
         "- unfinished: half the rename",
     ] {
         assert!(stdout.contains(said), "missing `{said}`: {stdout}");
@@ -3035,11 +3045,11 @@ fn a_scope_naming_the_folder_of_repos_records_the_ones_that_moved() {
         ),
         "{stderr}"
     );
-    let phases = stderr
+    let observed = stderr
         .lines()
-        .find(|l| l.starts_with("in work") && l.contains(" phases "))
+        .find(|l| l.starts_with("in work") && l.contains(" observed "))
         .expect(&stderr);
-    assert!(phases.contains(&short_head(&repo)), "{phases}");
+    assert!(observed.contains(&short_head(&repo)), "{observed}");
     fixture.cleanup();
 }
 
@@ -3789,6 +3799,223 @@ fn a_squash_merged_and_cleaned_up_pull_request_is_still_found() {
     assert!(
         finished_line(&stderr).starts_with("finished      https://github.com/o/r/pull/7"),
         "found by the branch the push named: {stderr}"
+    );
+    fixture.cleanup();
+}
+
+/// Wait until `path` exists (another process's mark), for at most 20 s.
+fn wait_for(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never came",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_hand_push_during_a_root_session_is_never_credited_to_it() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("hand-push");
+    let folder = fixture.make_folder("projects");
+    let plain = clone_with_origin(&fixture, "projects/plain");
+    // The root session only waits. Meanwhile someone commits, runs sykli
+    // (it fails) and pushes to main by hand.
+    let started = fixture.dir.join("started");
+    let done = fixture.dir.join("done");
+    let child = fixture
+        .ohjaa_in(&folder)
+        .args(["run", "sh", "--intent", "wait", "--no-briefing", "--", "-c"])
+        .arg(format!(
+            "touch '{}'; while [ ! -e '{}' ]; do sleep 0.1; done",
+            started.display(),
+            done.display()
+        ))
+        .env("OHJAA_STUB_RUN_AGENT", "1")
+        .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(&started);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let by_hand = format!(
+        "{RECEIPT_FN}
+        set -e
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'by hand'
+        receipt failed
+        git push -q origin HEAD:main"
+    );
+    let status = Command::new("sh")
+        .args(["-c", &by_hand])
+        .current_dir(&plain)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    fs::write(&done, "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    let record = String::from_utf8_lossy(&output.stderr);
+    let pushed = short_head(&plain);
+    assert!(
+        record.contains("in plain")
+            && record.contains("observed during the session, not attributed"),
+        "{record}"
+    );
+    assert!(
+        !record.contains("FLAGGED"),
+        "not this session's to answer for: {record}"
+    );
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&plain));
+    assert!(
+        !stdout.contains("WARNING") && !stdout.contains("Last session here"),
+        "the root session is not plain's last session, and raises nothing there: {stdout}"
+    );
+    assert!(record.contains(&pushed), "{record}");
+    fixture.cleanup();
+}
+
+#[test]
+fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("shared-checkout");
+    let repo = fixture.make_git_repo("work");
+    let mark = |name: &str| fixture.dir.join(name);
+    let agent = |me: &str, other: &str| {
+        format!(
+            "set -e
+            touch '{started}'
+            while [ ! -e '{their_start}' ]; do sleep 0.1; done
+            sleep 1
+            git worktree add -q -b {me} '{wt}'
+            cd '{wt}' && echo {me} > {me}.txt && git add {me}.txt && git commit -q -m {me}
+            git rev-parse --short=7 HEAD > '{sha}'
+            touch '{done}'
+            while [ ! -e '{their_done}' ]; do sleep 0.1; done",
+            started = mark(&format!("{me}-started")).display(),
+            their_start = mark(&format!("{other}-started")).display(),
+            wt = fixture.dir.join("_worktrees").join(me).display(),
+            sha = mark(&format!("{me}-sha")).display(),
+            done = mark(&format!("{me}-done")).display(),
+            their_done = mark(&format!("{other}-done")).display(),
+        )
+    };
+    let launch = |me: &str, other: &str| {
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                me,
+                "--no-briefing",
+                "--",
+                "-c",
+                &agent(me, other),
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let x = launch("x", "y");
+    let y = launch("y", "x");
+    let records: Vec<String> = [x, y]
+        .into_iter()
+        .map(|child| {
+            String::from_utf8_lossy(&child.wait_with_output().unwrap().stderr).into_owned()
+        })
+        .collect();
+    let sha = |me: &str| {
+        fs::read_to_string(mark(&format!("{me}-sha")))
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    for (record, theirs) in records.iter().zip(["y", "x"]) {
+        let phases = record
+            .lines()
+            .find(|l| l.starts_with("phases"))
+            .expect(record);
+        assert!(
+            !phases.contains(&sha(theirs)),
+            "a session never claims the other's commit: {phases}\n{record}"
+        );
+        assert!(
+            record.contains("shared        with oh-"),
+            "and says why: {record}"
+        );
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn a_session_keeps_its_own_commits_in_a_checkout_another_session_has_left() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("takeover");
+    let repo = fixture.make_git_repo("work");
+    let mark = |name: &str| fixture.dir.join(name);
+    let spawn = |intent: &str, script: String| {
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                intent,
+                "--no-briefing",
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    // P is here first, and leaves while S is still working.
+    let p = spawn(
+        "p",
+        format!(
+            "touch '{}'; while [ ! -e '{}' ]; do sleep 0.1; done",
+            mark("p-started").display(),
+            mark("s-started").display()
+        ),
+    );
+    wait_for(&mark("p-started"));
+    let s = spawn(
+        "s",
+        format!(
+            "set -e; touch '{}'; while [ ! -e '{}' ]; do sleep 0.1; done; sleep 2
+            git commit -q --allow-empty -m 'after p left'; git rev-parse --short=7 HEAD > '{}'",
+            mark("s-started").display(),
+            mark("p-left").display(),
+            mark("s-sha").display()
+        ),
+    );
+    let _ = p.wait_with_output().unwrap();
+    fs::write(mark("p-left"), "").unwrap();
+    let record = String::from_utf8_lossy(&s.wait_with_output().unwrap().stderr).into_owned();
+    let sha = fs::read_to_string(mark("s-sha")).unwrap().trim().to_owned();
+    let phases = record
+        .lines()
+        .find(|l| l.starts_with("phases"))
+        .expect(&record);
+    assert!(
+        phases.contains(&sha),
+        "made after the other session left: its own: {phases}\n{record}"
     );
     fixture.cleanup();
 }

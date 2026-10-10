@@ -127,6 +127,9 @@ pub struct Landed {
     /// The branch still sat at it when the session left.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub at_tip: bool,
+    /// It cannot be shown to be this session's: observed, never flagged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unattributed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +185,13 @@ pub struct Left {
     /// during the session, each with what sykli said about it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub landed: Vec<Landed>,
+    /// Commits made in the launch repository during the session that cannot
+    /// be shown to be its own (law 3): observed, never credited.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed: Vec<Phase>,
+    /// The other sessions that shared its places while it ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<String>,
     /// Its ohjaa was killed (SIGKILL) before leaving could run: the session
     /// was closed at a later launch that found that ohjaa gone. `ended_ms` is
     /// when that was observed, and nothing it did was observed.
@@ -203,6 +213,8 @@ impl Left {
             interrupted: false,
             scoped: Vec::new(),
             landed: Vec::new(),
+            observed: Vec::new(),
+            shared: Vec::new(),
             orphaned: true,
         }
     }
@@ -237,6 +249,11 @@ pub struct ScopedLeft {
     /// As for the launch repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub landed: Vec<Landed>,
+    /// As for the launch repository; in a found one, every commit made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed: Vec<Phase>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<String>,
 }
 
 /// One session, entering to leaving.
@@ -523,7 +540,14 @@ fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), Sto
     let mut latest = tx.open_table(LATEST).map_err(other)?;
     let heres = std::iter::once(session.repo.as_str())
         .chain(session.scoped.iter().map(|scoped| scoped.repo.as_str()))
-        .chain(left.scoped.iter().map(|scoped| scoped.repo.as_str()));
+        // A repository only found at leaving is never its last session's: nothing
+        // in it is attributed to this one.
+        .chain(
+            left.scoped
+                .iter()
+                .filter(|scoped| !scoped.found)
+                .map(|scoped| scoped.repo.as_str()),
+        );
     for here in heres {
         let newer = match latest.get(here).map_err(other)? {
             None => true,
@@ -631,11 +655,52 @@ fn landed_lines(label: &str, landed: &[Landed], out: &mut String) {
     for landed in landed {
         let _ = writeln!(
             out,
-            "{label}{} reached {}: {}",
+            "{label}{} reached {}{}: {}",
             short(&landed.commit),
             landed.onto,
+            if landed.unattributed {
+                " (not attributed)"
+            } else {
+                ""
+            },
             describe_landed(landed)
         );
+    }
+}
+
+/// Commits made during the session that are not shown to be its own, and
+/// the sessions that shared its places: said, never credited.
+fn observed_lines(
+    label: &str,
+    shared_label: &str,
+    observed: &[Phase],
+    shared: &[String],
+    out: &mut String,
+) {
+    if !observed.is_empty() {
+        let list = observed
+            .iter()
+            .map(|p| {
+                let place = p
+                    .worktree
+                    .as_deref()
+                    .map(|path| format!(" (in {})", repo_name(path)))
+                    .unwrap_or_default();
+                format!("{}{place}", short(&p.commit))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if label.ends_with(": ") {
+            let _ = writeln!(out, "{label}{list}");
+        } else {
+            let _ = writeln!(
+                out,
+                "{label}made during the session, not attributed: {list}"
+            );
+        }
+    }
+    for with in shared {
+        let _ = writeln!(out, "{shared_label}{with}");
     }
 }
 
@@ -713,6 +778,13 @@ pub fn render_record(session: &Session) -> String {
                 "phases        {}",
                 describe_phases(left.phases.as_ref(), left)
             );
+            observed_lines(
+                "observed      ",
+                "shared        ",
+                &left.observed,
+                &left.shared,
+                &mut out,
+            );
             let _ = writeln!(out, "finished      {}", describe_finished(&left.finished));
             landed_lines("landed        ", &left.landed, &mut out);
         } else if left.scoped.is_empty() {
@@ -722,10 +794,34 @@ pub fn render_record(session: &Session) -> String {
         }
         for scoped in &left.scoped {
             let label = format!("in {}", repo_name(&scoped.repo));
+            if scoped.found {
+                // Found, not named: nothing in it is this session's (law 3).
+                observed_lines(
+                    &format!("{label:<13} observed during the session, not attributed: "),
+                    &format!("{label:<13} shared "),
+                    &scoped.observed,
+                    &scoped.shared,
+                    &mut out,
+                );
+                landed_lines(&format!("{label:<13} landed "), &scoped.landed, &mut out);
+                let _ = writeln!(
+                    out,
+                    "{label:<13} not named with --scope: found at leaving because a commit was \
+                     made in it; nothing in it is attributed to this session"
+                );
+                continue;
+            }
             let _ = writeln!(
                 out,
                 "{label:<13} phases {}",
                 describe_phases(scoped.phases.as_ref(), left)
+            );
+            observed_lines(
+                &format!("{label:<13} observed "),
+                &format!("{label:<13} shared "),
+                &scoped.observed,
+                &scoped.shared,
+                &mut out,
             );
             let _ = writeln!(
                 out,
@@ -733,13 +829,6 @@ pub fn render_record(session: &Session) -> String {
                 describe_finished(&scoped.finished)
             );
             landed_lines(&format!("{label:<13} landed "), &scoped.landed, &mut out);
-            if scoped.found {
-                let _ = writeln!(
-                    out,
-                    "{label:<13} not named with --scope: found at leaving because it moved \
-                     (another agent may have moved it)"
-                );
-            }
         }
         if let Some(toimija) = &left.toimija_session {
             let _ = writeln!(out, "toimija       {toimija}");
@@ -818,7 +907,7 @@ pub fn flags(session: &Session) -> Vec<Flag> {
         // Only sykli refusing the commit's own run raises a flag: what could
         // not be checked (no --commit, no contract, no receipt, a checkout
         // that moved on) is recorded, never shouted.
-        for landed in landed.iter() {
+        for landed in landed.iter().filter(|landed| !landed.unattributed) {
             let Some(check @ Check::Failed { .. }) = &landed.check else {
                 continue;
             };
@@ -868,13 +957,13 @@ pub fn flags(session: &Session) -> Vec<Flag> {
     out
 }
 
-/// Whether an ended session was here: launched here, named here with
-/// `--scope`, or found working here at leaving.
+/// Whether an ended session was here: launched here, or named here with
+/// `--scope` (a repository only found at leaving is not its).
 pub fn touches(session: &Session, here: &str) -> bool {
     session.left.as_ref().is_some_and(|left| {
         session.repo == here
             || session.scoped.iter().any(|s| s.repo == here)
-            || left.scoped.iter().any(|s| s.repo == here)
+            || left.scoped.iter().any(|s| s.repo == here && !s.found)
     })
 }
 
@@ -1078,18 +1167,8 @@ pub fn render_last(session: &Session, here: &str) -> String {
         || "leaving not recorded".to_owned(),
         |left| format!("ended {}, {}", clock(left.ended_ms), describe_end(left)),
     );
-    let found_here = session
-        .left
-        .as_ref()
-        .is_some_and(|left| left.scoped.iter().any(|s| s.repo == here && s.found));
     let launched = if session.repo == here {
         String::new()
-    } else if found_here {
-        format!(
-            "; launched from {} without naming this repository, it was found working here \
-             at leaving",
-            session.repo
-        )
     } else {
         format!(
             "; launched from {}, it named this repository with --scope",
@@ -1106,9 +1185,24 @@ pub fn render_last(session: &Session, here: &str) -> String {
         .left
         .as_ref()
         .map_or(&[][..], |left| &left.scoped[..]);
+    // What was made during it but is not shown to be its own: said as such.
+    let observed = |observed: &[Phase], shared: &[String], out: &mut String| {
+        if !observed.is_empty() {
+            let _ = writeln!(
+                out,
+                "  ({} more commit(s) made during it are not attributed to it{})",
+                observed.len(),
+                if shared.is_empty() {
+                    String::new()
+                } else {
+                    format!(": it shared its place, {}", shared.join("; "))
+                }
+            );
+        }
+    };
     if session.left.as_ref().is_some_and(|left| left.orphaned) {
         out.push_str(
-            "- work: not observed: its ohjaa was killed before leaving; check `git log` and \
+            "- work: not observed: its ohjaa was gone before leaving; check `git log` and \
              the worktrees before building on it\n",
         );
     } else if session.outside_repo && scoped.is_empty() {
@@ -1124,7 +1218,8 @@ pub fn render_last(session: &Session, here: &str) -> String {
                 summarise_work(left.phases.as_ref()),
                 summarise_finished(&left.finished)
             );
-            for landed in &left.landed {
+            observed(&left.observed, &left.shared, &mut out);
+            for landed in left.landed.iter().filter(|l| !l.unattributed) {
                 let _ = writeln!(
                     out,
                     "- {} reached {}: {}",
@@ -1135,19 +1230,25 @@ pub fn render_last(session: &Session, here: &str) -> String {
             }
         }
         for scoped in scoped {
+            if scoped.found {
+                let _ = writeln!(
+                    out,
+                    "- in {}: {} commit(s) observed during the session, not attributed (found \
+                     at leaving)",
+                    repo_name(&scoped.repo),
+                    scoped.observed.len()
+                );
+                continue;
+            }
             let _ = writeln!(
                 out,
-                "- work in {}: {}; finished: {}{}",
+                "- work in {}: {}; finished: {}",
                 repo_name(&scoped.repo),
                 summarise_work(scoped.phases.as_ref()),
                 summarise_finished(&scoped.finished),
-                if scoped.found {
-                    "; found at leaving, not named with --scope"
-                } else {
-                    ""
-                }
             );
-            for landed in &scoped.landed {
+            observed(&scoped.observed, &scoped.shared, &mut out);
+            for landed in scoped.landed.iter().filter(|l| !l.unattributed) {
                 let _ = writeln!(
                     out,
                     "- in {}, {} reached {}: {}",
@@ -1224,6 +1325,8 @@ mod tests {
             interrupted: false,
             scoped: Vec::new(),
             landed: Vec::new(),
+            observed: Vec::new(),
+            shared: Vec::new(),
             orphaned: false,
         });
         session
@@ -1257,6 +1360,8 @@ mod tests {
                     finished: Finished::NoPullRequest,
                     found: false,
                     landed: Vec::new(),
+                    observed: Vec::new(),
+                    shared: Vec::new(),
                 },
                 ScopedLeft {
                     repo: "/r/projects/toimija".to_owned(),
@@ -1264,9 +1369,13 @@ mod tests {
                     finished: Finished::NoPullRequest,
                     found: true,
                     landed: Vec::new(),
+                    observed: Vec::new(),
+                    shared: Vec::new(),
                 },
             ],
             landed: Vec::new(),
+            observed: Vec::new(),
+            shared: Vec::new(),
             orphaned: false,
         });
         let record = render_record(&s);
@@ -1279,12 +1388,8 @@ mod tests {
             "{record}"
         );
         assert!(
-            record.contains("in toimija    phases no commits"),
-            "{record}"
-        );
-        assert!(
-            record.contains("in toimija    finished no pull request"),
-            "{record}"
+            !record.contains("in toimija    phases") && !record.contains("in toimija    finished"),
+            "a found repository has no phases or pull request of this session's: {record}"
         );
         let last = render_last(&s, &s.repo);
         assert!(
@@ -1299,19 +1404,14 @@ mod tests {
             there.contains("; launched from /r/projects, it named this repository with --scope):"),
             "{there}"
         );
-        // Found at leaving, it is never said as named.
+        // Found at leaving, it is never said as named, nor credited.
         assert!(
-            record.contains("in toimija    not named with --scope: found at leaving"),
+            record.contains("in toimija    not named with --scope: found at leaving because a commit was made in it; nothing in it is attributed to this session"),
             "{record}"
         );
         assert!(
-            last.contains("- work in toimija: 0 commit(s), 0 whose sykli receipt says passed; finished: no pull request; found at leaving, not named with --scope"),
+            last.contains("- in toimija: 0 commit(s) observed during the session, not attributed (found at leaving)"),
             "{last}"
-        );
-        let found = render_last(&s, "/r/projects/toimija");
-        assert!(
-            found.contains("; launched from /r/projects without naming this repository, it was found working here at leaving):"),
-            "{found}"
         );
     }
 
@@ -1503,6 +1603,8 @@ mod tests {
             interrupted: false,
             scoped: Vec::new(),
             landed: Vec::new(),
+            observed: Vec::new(),
+            shared: Vec::new(),
             orphaned: false,
         });
         let record = render_record(&s);
@@ -1627,6 +1729,8 @@ mod tests {
             finished: Finished::NoPullRequest,
             found: false,
             landed: Vec::new(),
+            observed: Vec::new(),
+            shared: Vec::new(),
         }];
         let v1 = serde_json::to_value(&s).unwrap();
         for pointer in [
@@ -1687,6 +1791,7 @@ mod tests {
                 }),
                 evidence: None,
                 at_tip: false,
+                unattributed: false,
             },
             Landed {
                 commit: "abcdef1234".to_owned(),
@@ -1695,6 +1800,7 @@ mod tests {
                 check: Some(Check::Passed),
                 evidence: None,
                 at_tip: true,
+                unattributed: false,
             },
         ];
         s.left = Some(left);
@@ -1742,6 +1848,7 @@ mod tests {
             check: Some(check),
             evidence: None,
             at_tip,
+            unattributed: false,
         };
         let with = |finished: Finished, landed: Vec<Landed>| {
             let mut s = ended(session("oh-12", "/r/selko", 1_000), 2_000);
