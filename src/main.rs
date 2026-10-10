@@ -10,13 +10,14 @@ mod intake;
 mod knowledge;
 mod lifecycle;
 mod process;
+mod report;
 mod roots;
 mod scan;
 mod sessions;
 mod system;
 mod usage;
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -177,7 +178,7 @@ enum Cmd {
         /// stopped, else fourteen days ago.
         #[arg(long)]
         since: Option<String>,
-        /// transcripts, reviews or reverts (repeatable). Default: all three.
+        /// transcripts, reviews, reverts or report (repeatable). Default: all four.
         #[arg(long = "source", value_name = "SOURCE")]
         sources: Vec<String>,
         /// The command that drafts: it reads the prompt on stdin and prints a
@@ -193,6 +194,17 @@ enum Cmd {
         /// Show what would be sent, and send nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// What went around the workflow: sessions without read-back or handover,
+    /// default-branch commits without passing evidence, and agent sessions run
+    /// without ohjaa (through vessa). Derived now; exits 4 when it could not
+    /// read everything.
+    Report {
+        /// The window: `7d`, `24h`, a date or an RFC 3339 time.
+        #[arg(long, default_value = "7d")]
+        since: String,
+        #[arg(long)]
+        json: bool,
     },
     /// State 2, from inside a session: read back what you know before the
     /// first change. The goal in one line, the rules that apply, who else is
@@ -1201,6 +1213,49 @@ fn default_drafter() -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The git repositories a report reads: those under the roots.
+fn report_repos(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    roots::git_repos(&roots::load(roots, git_root().as_deref()))
+}
+
+fn cmd_report(roots: &[PathBuf], since: &str, json: bool) -> Result<i32> {
+    let dirs = dirs()?;
+    let now_ms = intake::now_seconds() * 1000;
+    let since_ms = report::parse_since(since, now_ms)?;
+    let report = report::build(&dirs, &report_repos(roots)?, since_ms, now_ms);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report::to_json(&report))?
+        );
+    } else {
+        print!("{}", report::render(&report));
+    }
+    if let Err(error) = report::made(&dirs, now_ms) {
+        eprintln!("ohjaa: {error:#}");
+    }
+    Ok(if report.complete() { 0 } else { INCOMPLETE })
+}
+
+/// Once a week, at a launch a person watches: three lines of the report on
+/// stderr, before the agent starts and never into its briefing.
+fn weekly_report(dirs: &Dirs, roots: &[PathBuf]) {
+    let now_ms = intake::now_seconds() * 1000;
+    if !std::io::stderr().is_terminal() || !report::due(dirs, now_ms) {
+        return;
+    }
+    eprintln!("ohjaa: a week since the last report; reading it before the launch");
+    let repos = report_repos(roots).unwrap_or_else(|error| {
+        eprintln!("ohjaa: {error:#}");
+        Vec::new()
+    });
+    let report = report::build(dirs, &repos, now_ms - report::WEEK_MS, now_ms);
+    eprint!("{}", report::summary(&report));
+    if let Err(error) = report::made(dirs, now_ms) {
+        eprintln!("ohjaa: {error:#}");
+    }
+}
+
 fn cmd_intake(
     roots: &[PathBuf],
     since: Option<&str>,
@@ -1220,7 +1275,7 @@ fn cmd_intake(
         },
     };
     let sources: Vec<&str> = if sources.is_empty() {
-        vec!["transcripts", "reviews", "reverts"]
+        vec!["transcripts", "reviews", "reverts", "report"]
     } else {
         sources.iter().map(String::as_str).collect()
     };
@@ -1281,7 +1336,20 @@ fn cmd_intake(
             }
             "reviews" => candidates.extend(intake::reviews(&git_repos()?, since, &mut warnings)),
             "reverts" => candidates.extend(intake::reverts(&git_repos()?, since, &mut warnings)),
-            other => bail!("`{other}` is not a source: transcripts, reviews or reverts"),
+            "report" => {
+                // What the report finds going around the workflow: real
+                // failures and bypasses only. What it could not read is said,
+                // and does not hold the cursor back.
+                let report = report::build(&dirs, &git_repos()?, since, started);
+                for gap in &report.gaps {
+                    eprintln!("ohjaa: intake: report: not read: {gap}");
+                }
+                if let Err(why) = &report.bypasses {
+                    eprintln!("ohjaa: intake: report: {why}");
+                }
+                candidates.extend(report::candidates(&report));
+            }
+            other => bail!("`{other}` is not a source: transcripts, reviews, reverts or report"),
         }
     }
     if !queued.is_empty() {
@@ -1602,6 +1670,9 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // restart) are closed first, so they are queued and can be the last session
     // here.
     let orphans = close_orphans(&dirs, !dry_run);
+    if !dry_run {
+        weekly_report(&dirs, roots);
+    }
     let here_key = repo_key(&root);
     for orphan in &orphans {
         eprintln!(
@@ -2471,6 +2542,7 @@ fn main() {
         } => cmd_handover(unfinished.as_deref(), next.as_deref(), surprised.as_deref()),
         Cmd::Session { id } => cmd_session(id.as_deref()),
         Cmd::Usage { action } => cmd_usage(action),
+        Cmd::Report { since, json } => cmd_report(&cli.root, since, *json),
         Cmd::Graph { id } => cmd_graph(id),
         Cmd::Intake {
             since,

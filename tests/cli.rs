@@ -130,6 +130,16 @@ grep -q '"outcome":"passed"' "$receipt" || { echo "refused: outcome expected pas
 exit 0
 "#;
 
+/// Never the real vessa. `sessions --json` prints the file
+/// OHJAA_STUB_VESSA_JSON names, else no sessions.
+const VESSA_STUB: &str = r#"#!/bin/sh
+if [ "$1 $2" = "sessions --json" ] && [ -n "${OHJAA_STUB_VESSA_JSON:-}" ]; then
+  cat "$OHJAA_STUB_VESSA_JSON"
+else
+  echo '{"schema":"vessa-usage.v1","sessions":[],"warnings":[]}'
+fi
+"#;
+
 /// A session payload exactly as `toimija sessions --json` emits it.
 fn sessions_json(sessions: &str, coverage: &str) -> String {
     format!(
@@ -215,6 +225,10 @@ impl Fixture {
         let sykli = stub_dir.join("sykli");
         fs::write(&sykli, SYKLI_STUB).unwrap();
         make_executable(&sykli);
+        // Never the real vessa: no native sessions unless a test lists some.
+        let vessa = stub_dir.join("vessa");
+        fs::write(&vessa, VESSA_STUB).unwrap();
+        make_executable(&vessa);
         let fixture = Fixture { dir, stub_dir };
         // Default: an empty, fully available scan, in repos and outside them.
         fixture.set_sessions(&sessions_json("", "available"));
@@ -4429,6 +4443,212 @@ fn a_session_keeps_its_own_commits_in_a_checkout_another_session_has_left() {
     assert!(
         phases.contains(&sha),
         "made after the other session left: its own: {phases}\n{record}"
+    );
+    fixture.cleanup();
+}
+
+/// One launch through ohjaa of a stub `claude` that writes when it started,
+/// and a session of `sh` that pushes a failing commit to main: what the
+/// report is made of.
+fn report_fixture(fixture: &Fixture) -> (PathBuf, String) {
+    let repo = clone_with_origin(fixture, "work");
+    let started = fixture.dir.join("claude-started");
+    let claude = fixture.stub_dir.join("claude");
+    fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\ndate -u +%Y-%m-%dT%H:%M:%SZ > '{}'\nexit 0\n",
+            started.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&claude);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "claude",
+                "--intent",
+                "through ohjaa",
+                "--no-briefing",
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'broken build'
+        receipt failed
+        git push -q origin HEAD:main"
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "push broken",
+                "--no-briefing",
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    // vessa sees the launch above, and one claude session started by hand.
+    let launched = fs::read_to_string(&started).unwrap().trim().to_owned();
+    let repo_path = std::fs::canonicalize(&repo).unwrap();
+    fs::write(
+        fixture.dir.join("vessa.json"),
+        format!(
+            r#"{{"schema":"vessa-usage.v1","warnings":[],"sessions":[
+              {{"agent":"claude","id":"through","parent":null,"started_at":"{launched}","cwd":"{r}"}},
+              {{"agent":"claude","id":"by-hand","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere"}},
+              {{"agent":"claude","id":"by-hand","parent":"x","started_at":"{launched}","cwd":"{r}"}}
+            ]}}"#,
+            r = repo_path.display()
+        )
+        .replace(&format!("{}/elsewhere", repo_path.display()), "/nonexistent/elsewhere"),
+    )
+    .unwrap();
+    let pushed = short_head(&repo);
+    (repo, pushed)
+}
+
+#[test]
+fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("report");
+    let (repo, pushed) = report_fixture(&fixture);
+    let report = |json: bool| {
+        let mut command = fixture.ohjaa();
+        command
+            .arg("--root")
+            .arg(&fixture.dir)
+            .arg("report")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+            .current_dir(&repo);
+        if json {
+            command.arg("--json");
+        }
+        output_of(&mut command)
+    };
+    let (stdout, stderr, code) = report(true);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["schema"], "ohjaa-report.v1");
+    let intents: Vec<&str> = json["sessions_without_testimony"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["intent"].as_str().unwrap())
+        .collect();
+    assert_eq!(intents, ["through ohjaa", "push broken"], "{stdout}");
+    let commits = json["unproven_commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 1, "{stdout}");
+    assert_eq!(commits[0]["check"], "failed");
+    assert!(commits[0]["commit"].as_str().unwrap().starts_with(&pushed));
+    assert_eq!(json["bypasses"]["checked"], true);
+    let bypassed: Vec<&str> = json["bypasses"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bypassed,
+        ["by-hand"],
+        "the launch through ohjaa and a subagent are not bypasses: {stdout}"
+    );
+    let (text, _, code) = report(false);
+    assert_eq!(code, Some(0));
+    assert!(
+        text.contains("Commits on a default branch without passing evidence (1):")
+            && text.contains(&format!("work origin/main {pushed} \"broken build\""))
+            && text.contains("Agent sessions not run through ohjaa (1):")
+            && text.contains("- claude by-hand in /nonexistent/elsewhere"),
+        "{text}"
+    );
+    assert!(
+        fixture.dir.join("state/ohjaa/report-at").is_file(),
+        "a report records when it was made, for the weekly summary"
+    );
+
+    // Intake drafts from what the report found, never from what could not be
+    // checked.
+    let drafter = fixture.stub_dir.join("drafter");
+    let prompt = fixture.dir.join("prompt.txt");
+    fs::write(
+        &drafter,
+        format!("#!/bin/sh\ncat > '{}'\necho '[]'\n", prompt.display()),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .arg("--root")
+            .arg(&fixture.dir)
+            .args(["intake", "--source", "report", "--drafter"])
+            .arg(&drafter)
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let prompt = fs::read_to_string(&prompt).unwrap();
+    assert!(
+        prompt.contains("never read back its briefing")
+            && prompt
+                .contains("\"broken build\" is on origin/main in work without passing evidence")
+            && prompt.contains("a claude session (by-hand)"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("unverified"), "{prompt}");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_report_without_vessa_says_what_it_could_not_look_for() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("report-no-vessa");
+    let repo = fixture.make_git_repo("work");
+    fs::remove_file(fixture.stub_dir.join("vessa")).unwrap();
+    let path = std::env::join_paths([
+        fixture.stub_dir.clone(),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ])
+    .unwrap();
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .arg("--root")
+            .arg(&fixture.dir)
+            .arg("report")
+            .env("PATH", path)
+            .current_dir(&repo),
+    );
+    assert_eq!(
+        code,
+        Some(4),
+        "incomplete, never quietly empty: {stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains("Agent sessions not run through ohjaa: not checked: vessa is not on PATH"),
+        "{stdout}"
     );
     fixture.cleanup();
 }

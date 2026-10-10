@@ -964,6 +964,96 @@ fn intake_now_ms() -> i64 {
     crate::intake::now_seconds() * 1000
 }
 
+/// A commit on a repository's default branch, and what sykli says of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnDefault {
+    /// `origin/main`, else the local `main`.
+    pub onto: String,
+    pub commit: String,
+    pub subject: String,
+    /// Its commit time, in unix seconds.
+    pub committed: i64,
+    pub check: Check,
+}
+
+/// The most default-branch commits a report reads in one repository.
+const MAX_REPORTED: usize = 100;
+
+/// The commits on `repo`'s default branch (the remote one, else the local)
+/// committed since `since` (unix seconds), first parent only, newest first,
+/// each with what sykli says of it, against the receipts in every checkout
+/// and those kept under the git common dir. `None` when git cannot read it.
+pub fn default_branch_since(repo: &Path, since: i64, sykli: &Sykli) -> Option<Vec<OnDefault>> {
+    let repo = canonical(repo);
+    let reference = default_branch(&repo).into_iter().next()?;
+    let onto = reference
+        .strip_prefix("refs/remotes/")
+        .or_else(|| reference.strip_prefix("refs/heads/"))
+        .unwrap_or(&reference)
+        .to_owned();
+    let log = git(
+        &repo,
+        &[
+            "log",
+            "--first-parent",
+            &format!("--since=@{since}"),
+            &format!("-{MAX_REPORTED}"),
+            "--format=%H%x1f%T%x1f%ct%x1f%s",
+            &reference,
+        ],
+    )?;
+    let all = worktrees(&repo);
+    let receipts = receipts_of_clone(&repo, &all);
+    // What a checkout that still exists records making: its receipts would
+    // be there.
+    let mut alive = HashSet::new();
+    for checkout in &all {
+        let moves = reflog(
+            &checkout.path,
+            &[
+                "log",
+                "--walk-reflogs",
+                "--date=unix",
+                REFLOG_FORMAT,
+                "HEAD",
+            ],
+        );
+        for entry in moves.into_iter().flatten() {
+            if created_here(&entry.subject) {
+                alive.insert(entry.commit);
+            }
+        }
+    }
+    Some(
+        log.lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(4, '\u{1f}');
+                let (commit, tree, committed, subject) = (
+                    fields.next()?,
+                    fields.next()?,
+                    fields.next()?.parse::<i64>().ok()?,
+                    fields.next()?,
+                );
+                let check =
+                    sykli.check(&repo, commit, tree, &receipts, &all, alive.contains(commit));
+                Some(OnDefault {
+                    onto: onto.clone(),
+                    commit: commit.to_owned(),
+                    subject: subject.to_owned(),
+                    committed,
+                    check,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Whether this sykli can bind a receipt to a commit, and why not when it
+/// cannot: for a report to say what it could not check.
+pub fn sykli_cannot_bind(sykli: &Sykli) -> Option<String> {
+    sykli.binds_commits().err()
+}
+
 /// The default branch's references: the remote one first, then the local
 /// one, each when it exists. The default branch is what `origin/HEAD` names,
 /// else `main`, else `master`.

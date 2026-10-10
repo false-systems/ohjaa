@@ -19,6 +19,7 @@ ohjaa propose --scope ours --id rust-only --kind decision \
       --origin "2026-09-16: 'we dont do python'" "Code is Rust or Elixir/Erlang."
 ohjaa review                           # a person decides what becomes current
 ohjaa intake                           # draft proposals from what people said
+ohjaa report                           # what went around the workflow this week
 ohjaa check                            # validate, and flag what may no longer hold
 ohjaa session                          # the record of the last ended session here, or of one by id
 ohjaa graph rust-only                  # a node, its neighbours, who was briefed with it
@@ -105,12 +106,13 @@ ohjaa intake --since 2026-04-01 --max-batches 50
 ohjaa intake --source transcripts --dry-run   # show the prompt, send nothing
 ```
 
-`ohjaa intake` reads three sources:
+`ohjaa intake` reads four sources:
 
 - **Transcripts:** Claude Code and Codex sessions, keeping only what the person
   typed.
 - **Reviews:** human comments on pull requests and issues, through `gh`.
 - **Reverts:** reverted commits.
+- **Report:** what the bypass report finds (see below).
 
 It sends them in batches to a **drafter**, an agent CLI that reads a prompt on
 stdin and prints a JSON array. The default is `claude -p`; override it with
@@ -121,6 +123,51 @@ node that is not reaching agents gets noticed.
 
 Every draft is validated like any proposal, and an invalid one is refused out
 loud. The cursor moves only past what was actually drafted from.
+
+## The bypass report: what went around the workflow
+
+```bash
+ohjaa report                    # the last 7 days
+ohjaa report --since 30d --json # ohjaa-report.v1
+```
+
+`ohjaa report` derives, now, three lists for the window:
+
+- **Sessions without read-back or handover:** ended sessions in the log that
+  never ran `ohjaa oriented`, or left no `ohjaa handover`.
+- **Commits on a default branch without passing evidence:** for every git
+  repository under the roots, the first-parent commits its default branch
+  (`origin/<default>`, else the local one) gained in the window, by commit
+  time. Each is asked of `sykli verify --commit` against the receipts in every
+  checkout and those sykli keeps under the git common dir. Listed: what sykli
+  refused, and what was never run in a checkout that still exists. Not listed:
+  what sykli could not say (no `--commit`, no contract) or a commit made in a
+  checkout that is gone; the report says when sykli could not verify at all.
+- **Agent sessions not run through ohjaa:** with `vessa` on PATH, the
+  top-level Claude and Codex sessions `vessa sessions --json` lists in the
+  window that no `ohjaa run` launched. A session is a launch's when its usage
+  receipt names it, or when it is the same agent, in the launch's repository
+  or below, started within a minute after the launch; each launch claims one.
+  Without vessa the report says so and exits 4.
+
+What could not be read is said, and the exit is 4: a report with a gap is not
+a clean week. Only the time the last report was made is kept
+(`$XDG_STATE_HOME/ohjaa/report-at`), like intake's cursor.
+
+Once a week, when `ohjaa run` starts at a terminal and the last report is
+older than seven days, three lines of it are printed to the person on stderr
+before the agent starts, never into its briefing:
+
+```
+ohjaa: weekly report, 2026-10-03 to 2026-10-10: 2 session(s) without read-back or handover · 1 commit(s) on a default branch without passing evidence · 1 agent session(s) not run through ohjaa
+ohjaa:   first: 3dbaafd on origin/main in selko: FAILED sykli verify: refused: outcome …
+ohjaa:   `ohjaa report` lists them all; the next summary is in 7 days.
+```
+
+`ohjaa intake` takes the report as its fourth source (`--source report`): a
+session that never read back, a refused or unchecked commit on a default
+branch, and a session run without ohjaa become `observed` candidates. What
+could not be checked never does.
 
 ## Sessions: entering to leaving
 
