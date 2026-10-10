@@ -450,9 +450,10 @@ fn reflog(dir: &Path, args: &[&str]) -> Option<Vec<Move>> {
 pub struct Work {
     /// `None` when they could not be observed (see [`observe`]).
     pub phases: Option<Vec<Phase>>,
-    /// The checkout this session's newest commit was made in, where its
-    /// branch's pull request is looked up; the repository itself otherwise.
-    pub checkout: PathBuf,
+    /// The branch this session's newest commit on a branch was made on, and
+    /// that commit: where its pull request is looked up.
+    pub pr_branch: Option<String>,
+    pub pr_commit: Option<String>,
     /// Whether any of its checkouts or branches moved during the session.
     pub moved: bool,
     /// The receipts in every checkout read.
@@ -470,6 +471,8 @@ pub struct Arrived {
     pub commit: String,
     pub tree: String,
     pub subject: String,
+    /// Its commit time, in unix seconds.
+    pub committed: i64,
     /// `origin/main`, or the local `main`.
     pub onto: String,
     /// The tip of the push (or move) that brought it: what sykli is asked about.
@@ -518,7 +521,6 @@ pub fn observe(
     let all = worktrees(&repo);
     let skipped = |path: &Path| skip.iter().any(|s| s == path);
     let mut work = Work {
-        checkout: repo.clone(),
         receipts: receipts_in(
             all.iter()
                 .filter(|w| !skipped(&w.path))
@@ -529,6 +531,11 @@ pub fn observe(
     // Each commit created since the start, with the checkout it was made in
     // when known; and those another session made in a skipped checkout.
     let mut created: HashMap<String, Option<PathBuf>> = HashMap::new();
+    // The branch each was made on, or the remote branch a push from here named.
+    let mut branch_of: HashMap<String, String> = HashMap::new();
+    // Each remote branch's pushes since the start, newest first, and where it
+    // pointed at the start.
+    let mut pushes: HashMap<String, (Vec<Move>, Option<String>)> = HashMap::new();
     let mut theirs: HashSet<String> = HashSet::new();
     // What each reference pointed at when the session started: nothing
     // reachable from those was made by this session.
@@ -607,6 +614,9 @@ pub fn observe(
                     if let Some((_, _, start)) = arrival {
                         *start = Some(entry.commit.clone());
                     }
+                    if let Some((_, start)) = pushes.get_mut(&entry.reference) {
+                        start.get_or_insert(entry.commit.clone());
+                    }
                     if entry.reference.starts_with("refs/remotes/") {
                         on_remotes.push(entry.commit.clone());
                     }
@@ -629,12 +639,51 @@ pub fn observe(
                     created
                         .entry(entry.commit.clone())
                         .or_insert_with(|| there.map(|w| w.path.clone()));
+                    let name = entry.reference.trim_start_matches("refs/heads/");
+                    branch_of
+                        .entry(entry.commit.clone())
+                        .or_insert_with(|| name.to_owned());
                 }
             } else if entry.subject == "update by push" {
                 work.moved = true;
+                pushes
+                    .entry(entry.reference.clone())
+                    .or_default()
+                    .0
+                    .push(Move {
+                        reference: entry.reference.clone(),
+                        at: entry.at,
+                        commit: entry.commit.clone(),
+                        subject: entry.subject.clone(),
+                    });
             }
             if let Some((_, moves, _)) = arrival {
                 moves.push(entry);
+            }
+        }
+    }
+    // A commit a push from here took to a remote branch during the session is
+    // this session's work even once its local branch and checkout are gone (a
+    // squash-merged, cleaned-up pull request): its commit time says when.
+    for (reference, (moves, held)) in &pushes {
+        let name = reference
+            .trim_start_matches("refs/remotes/")
+            .split_once('/')
+            .map_or(reference.as_str(), |(_, branch)| branch);
+        let olds = moves
+            .iter()
+            .skip(1)
+            .map(|older| Some(older.commit.clone()))
+            .chain(std::iter::once(held.clone()));
+        for (entry, old) in moves.iter().zip(olds) {
+            for pushed in range(&repo, &entry.commit, old.as_deref(), &on_remotes) {
+                if pushed.committed < since || theirs.contains(&pushed.commit) {
+                    continue;
+                }
+                branch_of
+                    .entry(pushed.commit.clone())
+                    .or_insert_with(|| name.to_owned());
+                created.entry(pushed.commit).or_insert(None);
             }
         }
     }
@@ -656,10 +705,16 @@ pub fn observe(
                 .get(&phase.tree)
                 .map(|receipt| receipt.evidence.clone());
         }
-        if let Some(newest) = phases.last() {
-            if let Some(Some(checkout)) = created.get(&newest.commit) {
-                work.checkout = checkout.clone();
-            }
+        for phase in phases.iter_mut() {
+            phase.branch = branch_of.get(&phase.commit).cloned();
+        }
+        // Its pull request is the one for the branch its newest commit on a
+        // branch was made on: never whatever a checkout holds now.
+        if let Some(newest) = phases.iter().rev().find(|p| p.branch.is_some()) {
+            work.pr_branch = newest.branch.clone();
+            work.pr_commit = Some(newest.commit.clone());
+        }
+        {
             for phase in phases.iter_mut() {
                 phase.worktree = created
                     .get(&phase.commit)
@@ -749,22 +804,36 @@ fn default_branch(repo: &Path) -> Vec<String> {
 /// The commits reachable from `new` but from neither `old` nor what was
 /// `already` on a remote, oldest first; at most the newest [`MAX_LANDED`].
 fn range(repo: &Path, new: &str, old: Option<&str>, already: &[String]) -> Vec<Arrived> {
-    let excluded: Vec<String> = old
-        .into_iter()
-        .chain(already.iter().map(String::as_str))
-        .map(|commit| format!("^{commit}"))
-        .collect();
+    // Fed on stdin: a repository with many branches has many starting points.
+    let mut input = format!("{new}\n");
+    for excluded in old.into_iter().chain(already.iter().map(String::as_str)) {
+        input.push_str(&format!("^{excluded}\n"));
+    }
     let limit = format!("-{MAX_LANDED}");
-    let mut args = vec!["log", "--format=%H%x1f%T%x1f%s", &limit, new];
-    args.extend(excluded.iter().map(String::as_str));
-    let mut found: Vec<Arrived> = git(repo, &args)
-        .unwrap_or_default()
+    let output = process::run(
+        Command::new("git").arg("-C").arg(repo).args([
+            "log",
+            "--stdin",
+            "--format=%H%x1f%T%x1f%ct%x1f%s",
+            &limit,
+        ]),
+        Some(input.as_bytes()),
+        process::LOCAL,
+    );
+    let Ok(output) = output.map(|output| (output.status.success(), output.stdout_text())) else {
+        return Vec::new();
+    };
+    let (true, log) = output else {
+        return Vec::new();
+    };
+    let mut found: Vec<Arrived> = log
         .lines()
         .filter_map(|line| {
-            let mut fields = line.splitn(3, '\u{1f}');
+            let mut fields = line.splitn(4, '\u{1f}');
             Some(Arrived {
                 commit: fields.next()?.to_owned(),
                 tree: fields.next()?.to_owned(),
+                committed: fields.next()?.parse().ok()?,
                 subject: fields.next()?.to_owned(),
                 onto: String::new(),
                 tip: false,
@@ -830,9 +899,8 @@ fn surviving(
             created.contains_key(commit).then(|| Phase {
                 commit: commit.to_owned(),
                 subject: subject.to_owned(),
-                evidence: None,
                 tree: tree.to_owned(),
-                worktree: None,
+                ..Phase::default()
             })
         })
         .collect();
@@ -943,22 +1011,26 @@ fn reflogs_touched_since(checkout: &Path, since: i64) -> bool {
     false
 }
 
-/// State 4, observed: the pull request of the branch checked out in
-/// `checkout`, if `gh` can say, and what sykli says about its head.
+/// State 4, observed: the pull request for `branch` (the one this session's
+/// newest commit on a branch was made on), else, when gh knows no pull
+/// request by that name any more, the one that holds `commit`; and what sykli
+/// says about its head. Asked of `gh` in `repo`.
 pub fn finished(
-    checkout: &Path,
+    repo: &Path,
+    branch: &str,
+    commit: Option<&str>,
     receipts: &Receipts,
     checkouts: &[Worktree],
     sykli: &Sykli,
 ) -> Finished {
-    let output = process::run(
-        Command::new("gh")
-            .args(["pr", "view", "--json", "url,state,headRefOid"])
-            .current_dir(checkout),
-        None,
-        std::time::Duration::from_secs(20),
-    );
-    let output = match output {
+    let gh = |args: &[&str]| {
+        process::run(
+            Command::new("gh").args(args).current_dir(repo),
+            None,
+            std::time::Duration::from_secs(20),
+        )
+    };
+    let output = match gh(&["pr", "view", branch, "--json", "url,state,headRefOid"]) {
         Ok(output) => output,
         Err(error) => {
             return Finished::Unknown {
@@ -966,21 +1038,57 @@ pub fn finished(
             }
         }
     };
-    if !output.status.success() {
+    let pr = if output.status.success() {
+        serde_json::from_slice::<Value>(&output.stdout).ok()
+    } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return if stderr.contains("no pull requests found") {
-            Finished::NoPullRequest
-        } else if stderr.contains("gh auth login") || stderr.contains("GH_TOKEN") {
-            Finished::Unknown {
-                why: "gh is not signed in".to_owned(),
-            }
-        } else {
-            Finished::Unknown {
-                why: output.failure_detail(),
-            }
+        if !stderr.contains("no pull requests found") {
+            return Finished::Unknown {
+                why: if stderr.contains("gh auth login") || stderr.contains("GH_TOKEN") {
+                    "gh is not signed in".to_owned()
+                } else {
+                    output.failure_detail()
+                },
+            };
+        }
+        // A branch deleted after a squash merge: the pull request still holds
+        // the commit.
+        let Some(commit) = commit else {
+            return Finished::NoPullRequest;
         };
-    }
-    let Ok(pr) = serde_json::from_slice::<Value>(&output.stdout) else {
+        let search = [
+            "pr",
+            "list",
+            "--state",
+            "all",
+            "--search",
+            commit,
+            "--json",
+            "url,state,headRefOid",
+            "--limit",
+            "1",
+        ];
+        match gh(&search) {
+            Ok(found) if found.status.success() => {
+                match serde_json::from_slice::<Value>(&found.stdout) {
+                    Ok(Value::Array(list)) if list.is_empty() => return Finished::NoPullRequest,
+                    Ok(Value::Array(mut list)) => Some(list.swap_remove(0)),
+                    _ => None,
+                }
+            }
+            Ok(found) => {
+                return Finished::Unknown {
+                    why: found.failure_detail(),
+                }
+            }
+            Err(error) => {
+                return Finished::Unknown {
+                    why: format!("{error:#}"),
+                }
+            }
+        }
+    };
+    let Some(pr) = pr else {
         return Finished::Unknown {
             why: "unreadable gh output".to_owned(),
         };
@@ -988,12 +1096,12 @@ pub fn finished(
     let head = pr["headRefOid"].as_str().map(str::to_owned);
     let tree = head
         .as_deref()
-        .and_then(|head| git(checkout, &["rev-parse", &format!("{head}^{{tree}}")]));
+        .and_then(|head| git(repo, &["rev-parse", &format!("{head}^{{tree}}")]));
     let head_evidence = tree
         .as_ref()
         .and_then(|tree| receipts.get(tree).map(|r| r.evidence.clone()));
     let head_check = head.as_deref().map(|head| match &tree {
-        Some(tree) => sykli.check(checkout, head, tree, receipts, checkouts),
+        Some(tree) => sykli.check(repo, head, tree, receipts, checkouts),
         None => Check::Unverified {
             why: "its head commit is not in this repository".to_owned(),
         },
@@ -1477,7 +1585,11 @@ mod tests {
         assert_eq!(found[0].tree, tree);
         let wt = std::fs::canonicalize(&wt).unwrap();
         assert_eq!(found[0].worktree.as_deref(), Some(wt.to_str().unwrap()));
-        assert_eq!(work.checkout, wt, "its pull request is looked up there");
+        assert_eq!(
+            work.pr_branch.as_deref(),
+            Some("feat2"),
+            "its pull request is looked up for the branch it was made on"
+        );
         assert!(work.moved);
         let _ = std::fs::remove_dir_all(wt);
         let _ = std::fs::remove_dir_all(dir);

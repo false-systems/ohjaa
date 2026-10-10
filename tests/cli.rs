@@ -48,17 +48,33 @@ exit "${OHJAA_STUB_EXIT:-0}"
 "#;
 
 /// Never the real gh: no network, and a controlled answer. With
-/// OHJAA_STUB_GH_PR_BRANCH set, the branch of that name has an open pull
-/// request whose head is the commit checked out where gh runs.
+/// OHJAA_STUB_GH_PR_BRANCH set, the branch of that name has a pull request
+/// (state OHJAA_STUB_GH_PR_STATE, default OPEN) whose head is that branch's
+/// commit here; `pr view` with no branch asks about the one checked out.
+/// `pr list --search <sha>` finds a merged pull request for
+/// OHJAA_STUB_GH_PR_SEARCH only.
 const GH_STUB: &str = r#"#!/bin/sh
 if [ -n "${OHJAA_STUB_GH_SLEEP:-}" ]; then sleep "$OHJAA_STUB_GH_SLEEP"; fi
+printf '%s|%s\n' "$PWD" "$*" >> "${OHJAA_STUB_GH_CALLS:-/dev/null}"
+if [ "$1 $2" = "pr list" ]; then
+  sha=""
+  while [ $# -gt 0 ]; do case "$1" in --search) sha="$2"; shift;; esac; shift; done
+  if [ -n "$sha" ] && [ "$sha" = "${OHJAA_STUB_GH_PR_SEARCH:-}" ]; then
+    printf '[{"url":"https://github.com/o/r/pull/8","state":"MERGED","headRefOid":"%s"}]\n' "$sha"
+  else
+    echo '[]'
+  fi
+  exit 0
+fi
 if [ -n "${OHJAA_STUB_GH_PR_BRANCH:-}" ]; then
-  if [ "$(git branch --show-current)" = "$OHJAA_STUB_GH_PR_BRANCH" ]; then
+  case "$3" in -*|"") branch="$(git branch --show-current)";; *) branch="$3";; esac
+  if [ "$branch" = "$OHJAA_STUB_GH_PR_BRANCH" ]; then
+    head=$(git rev-parse --verify -q "refs/heads/$branch" || git rev-parse --verify -q "refs/remotes/origin/$branch")
     printf '{"url":"https://github.com/o/r/pull/7","state":"%s","headRefOid":"%s"}\n' \
-      "${OHJAA_STUB_GH_PR_STATE:-OPEN}" "$(git rev-parse HEAD)"
+      "${OHJAA_STUB_GH_PR_STATE:-OPEN}" "$head"
     exit 0
   fi
-  echo "no pull requests found for branch \"$(git branch --show-current)\"" >&2
+  echo "no pull requests found for branch \"$branch\"" >&2
   exit 1
 fi
 echo "gh: To get started with GitHub CLI, please run:  gh auth login" >&2
@@ -2474,7 +2490,11 @@ fn a_signal_during_leaving_cuts_it_short_and_the_record_is_still_written() {
             "--",
             "-c",
         ])
-        .arg(format!("touch '{}'; exit 0", mark.display()))
+        // A commit on a branch of its own, so leaving asks gh about its PR.
+        .arg(format!(
+            "git switch -q -c side && git commit -q --allow-empty -m side; touch '{}'; exit 0",
+            mark.display()
+        ))
         .env("OHJAA_STUB_RUN_AGENT", "1")
         .env("OHJAA_STUB_GH_SLEEP", "30")
         .current_dir(&repo)
@@ -3652,5 +3672,123 @@ fn a_warning_about_main_stands_while_main_is_still_at_the_flagged_commit() {
     ));
     let text = briefing();
     assert!(!text.contains("WARNING"), "{text}");
+    fixture.cleanup();
+}
+
+#[test]
+fn the_pull_request_is_the_one_for_the_sessions_own_branch_never_the_checkouts() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("own-pr");
+    let repo = clone_with_origin(&fixture, "work");
+    // The main checkout sits on another session's branch, which has a PR.
+    run_git(&repo, &["switch", "-q", "-c", "theirs"]);
+    let session = |script: &str, branch: &str| {
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "run",
+                    "sh",
+                    "--intent",
+                    "x",
+                    "--no-briefing",
+                    "--",
+                    "-c",
+                    script,
+                ])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+                .env("OHJAA_STUB_GH_PR_BRANCH", branch)
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        stderr
+    };
+    // A session that made nothing does not inherit the checkout's PR.
+    let record = session("exit 0", "theirs");
+    assert_eq!(
+        finished_line(&record),
+        "finished      unknown (not looked up: this session made no commit on a branch)",
+        "{record}"
+    );
+    assert!(!record.contains("pull/7"), "{record}");
+    // A commit on its own branch in a worktree removed since: that branch's PR.
+    let wt = fixture.dir.join("_worktrees").join("feat3");
+    let record = session(
+        &format!(
+            "set -e; sleep 1; git worktree add -q -b feat3 '{wt}' origin/main; cd '{wt}'
+            echo a > a.txt && git add a.txt && git commit -q -m a
+            cd '{repo}' && git worktree remove '{wt}'",
+            wt = wt.display(),
+            repo = repo.display()
+        ),
+        "feat3",
+    );
+    assert!(
+        finished_line(&record).starts_with("finished      https://github.com/o/r/pull/7 (open)"),
+        "{record}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_squash_merged_and_cleaned_up_pull_request_is_still_found() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("squashed");
+    let repo = clone_with_origin(&fixture, "work");
+    let wt = fixture.dir.join("_worktrees").join("feat4");
+    // The standard flow: push the branch, squash-merge, delete everything.
+    let script = format!(
+        "{RECEIPT_FN}
+        set -e
+        git worktree add -q -b feat4 '{wt}' origin/main
+        cd '{wt}'
+        echo '{{}}' > sykli.json && git add sykli.json && git commit -q -m 'the work'
+        receipt passed
+        git push -q origin HEAD:feat4
+        git rev-parse HEAD > '{mark}'
+        cd '{repo}' && git worktree remove --force '{wt}' && git branch -q -D feat4",
+        wt = wt.display(),
+        repo = repo.display(),
+        mark = fixture.dir.join("sha").display()
+    );
+    let mark = fixture.dir.join("sha");
+    // gh finds it by the commit only once the branch name is gone everywhere.
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "x",
+                "--no-briefing",
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+            .env("OHJAA_STUB_GH_PR_BRANCH", "feat4")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let sha = fs::read_to_string(&mark).unwrap().trim().to_owned();
+    let phases = stderr
+        .lines()
+        .find(|l| l.starts_with("phases"))
+        .expect(&stderr);
+    assert!(
+        phases.contains(&sha[..7]),
+        "the pushed commit is still the session's work: {phases}"
+    );
+    assert!(
+        finished_line(&stderr).starts_with("finished      https://github.com/o/r/pull/7"),
+        "found by the branch the push named: {stderr}"
+    );
     fixture.cleanup();
 }

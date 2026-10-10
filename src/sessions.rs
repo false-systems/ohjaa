@@ -78,6 +78,9 @@ pub struct Phase {
     pub subject: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Evidence>,
+    /// The branch it was made on, or that a push from here named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// The commit's tree, which a sykli receipt names; older records omit it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tree: String,

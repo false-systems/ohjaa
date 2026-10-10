@@ -2087,15 +2087,29 @@ fn observe_repo(
             moved: false,
         };
     }
-    let finished = match unless_interrupted(|| {
-        lifecycle::finished(&work.checkout, &work.receipts, &work.checkouts, sykli)
-    }) {
-        Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
-        other => other,
-    }
-    .unwrap_or_else(|| sessions::Finished::Unknown {
-        why: "interrupted".to_owned(),
-    });
+    // The pull request of this session's own branch, never whatever branch a
+    // checkout holds now; with no commit of its own on a branch, none is asked.
+    let finished = match &work.pr_branch {
+        None => sessions::Finished::Unknown {
+            why: "not looked up: this session made no commit on a branch".to_owned(),
+        },
+        Some(branch) => match unless_interrupted(|| {
+            lifecycle::finished(
+                repo,
+                branch,
+                work.pr_commit.as_deref(),
+                &work.receipts,
+                &work.checkouts,
+                sykli,
+            )
+        }) {
+            Some(sessions::Finished::Unknown { .. }) if process::cancelled() => None,
+            other => other,
+        }
+        .unwrap_or_else(|| sessions::Finished::Unknown {
+            why: "interrupted".to_owned(),
+        }),
+    };
     let landed = work
         .landed
         .iter()
