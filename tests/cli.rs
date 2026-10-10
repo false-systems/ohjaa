@@ -4509,9 +4509,10 @@ fn report_fixture(fixture: &Fixture) -> (PathBuf, String) {
         fixture.dir.join("vessa.json"),
         format!(
             r#"{{"schema":"vessa-usage.v1","warnings":[],"sessions":[
-              {{"agent":"claude","id":"through","parent":null,"started_at":"{launched}","cwd":"{r}"}},
-              {{"agent":"claude","id":"by-hand","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere"}},
-              {{"agent":"claude","id":"by-hand","parent":"x","started_at":"{launched}","cwd":"{r}"}}
+              {{"agent":"claude","id":"through","parent":null,"started_at":"{launched}","cwd":"{r}","entrypoint":"cli","originator":null}},
+              {{"agent":"claude","id":"by-hand","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere","entrypoint":"cli","originator":null}},
+              {{"agent":"claude","id":"by-hand","parent":"x","started_at":"{launched}","cwd":"{r}","entrypoint":"cli","originator":null}},
+              {{"agent":"claude","id":"drafter","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere","entrypoint":"sdk-cli","originator":null}}
             ]}}"#,
             r = repo_path.display()
         )
@@ -4558,7 +4559,15 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
     assert_eq!(commits.len(), 1, "{stdout}");
     assert_eq!(commits[0]["check"], "failed");
     assert!(commits[0]["commit"].as_str().unwrap().starts_with(&pushed));
-    assert_eq!(json["bypasses"]["checked"], true);
+    assert_eq!(json["bypasses"]["judged"], true);
+    assert_eq!(
+        json["bypasses"]["headless"], 1,
+        "claude -p bypasses nothing"
+    );
+    assert_eq!(
+        json["default_branch_commits"]["repositories"], 1,
+        "{stdout}"
+    );
     let bypassed: Vec<&str> = json["bypasses"]["sessions"]
         .as_array()
         .unwrap()
@@ -4573,15 +4582,17 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
     let (text, _, code) = report(false);
     assert_eq!(code, Some(0));
     assert!(
-        text.contains("Commits on a default branch without passing evidence (1):")
+        text.contains("Commits on a default branch without passing evidence (1), of ")
+            && text.contains("  The rest: ")
             && text.contains(&format!("work origin/main {pushed} \"broken build\""))
-            && text.contains("Agent sessions not run through ohjaa (1):")
+            && text.contains("Agent sessions a person started without ohjaa (1):")
+            && text.contains("Not counted: 1 headless run(s)")
             && text.contains("- claude by-hand in /nonexistent/elsewhere"),
         "{text}"
     );
     assert!(
-        fixture.dir.join("state/ohjaa/report-at").is_file(),
-        "a report records when it was made, for the weekly summary"
+        !fixture.dir.join("state/ohjaa/report-at").exists(),
+        "only a complete report a person read at a terminal is the week's"
     );
 
     // Intake drafts from what the report found, never from what could not be
@@ -4647,8 +4658,208 @@ fn a_report_without_vessa_says_what_it_could_not_look_for() {
         "incomplete, never quietly empty: {stdout}{stderr}"
     );
     assert!(
-        stdout.contains("Agent sessions not run through ohjaa: not checked: vessa is not on PATH"),
+        stdout.contains(
+            "Agent sessions a person started without ohjaa: not judged: vessa is not on PATH"
+        ),
         "{stdout}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn what_vessa_could_not_read_or_date_leaves_the_report_incomplete() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("report-vessa-gaps");
+    let repo = fixture.make_git_repo("work");
+    let transcript = fixture.dir.join("undated.jsonl");
+    fs::write(&transcript, "{}\n").unwrap();
+    let report = |listed: &str| {
+        fs::write(fixture.dir.join("vessa.json"), listed).unwrap();
+        output_of(
+            fixture
+                .ohjaa()
+                .arg("--root")
+                .arg(&fixture.dir)
+                .arg("report")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+                .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+                .current_dir(&repo),
+        )
+    };
+    // vessa read nothing, and said so: never a clean week.
+    let (stdout, _, code) = report(
+        r#"{"schema":"vessa-usage.v1","sessions":[],"warnings":[
+            "/home/x/.claude/projects: symlink not followed",
+            "No supported native sessions found; usage is unknown"]}"#,
+    );
+    assert_eq!(code, Some(4), "{stdout}");
+    assert!(
+        stdout.contains("Agent sessions a person started without ohjaa (0):")
+            && stdout.contains("- vessa: /home/x/.claude/projects: symlink not followed")
+            && stdout.contains("- vessa: No supported native sessions found"),
+        "{stdout}"
+    );
+    // A session vessa could not date is said apart, never dropped.
+    let (stdout, _, code) = report(&format!(
+        r#"{{"schema":"vessa-usage.v1","warnings":[],"sessions":[
+            {{"agent":"claude","id":"no-date","parent":null,"started_at":null,"cwd":"",
+              "source":"{}","entrypoint":"cli","originator":null}}]}}"#,
+        transcript.display()
+    ));
+    assert_eq!(code, Some(4), "{stdout}");
+    assert!(
+        stdout.contains("Not judged, vessa could not date or place them (1):")
+            && stdout.contains("- claude no-date (transcript ")
+            && stdout.contains("1 native session(s) vessa could not date or place: not judged"),
+        "{stdout}"
+    );
+    // An older vessa cannot tell a headless run from a person's session.
+    let (stdout, _, code) = report(
+        r#"{"schema":"vessa-usage.v1","warnings":[],"sessions":[
+            {"agent":"claude","id":"old","parent":null,"started_at":"2026-10-09T10:00:00Z","cwd":"/r"}]}"#,
+    );
+    assert_eq!(code, Some(4), "{stdout}");
+    assert!(
+        stdout.contains("not judged: vessa does not say how a session was started"),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_window_with_more_commits_than_a_report_judges_says_so() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("report-cap");
+    let repo = fixture.make_git_repo("work");
+    let status = Command::new("sh")
+        .args([
+            "-c",
+            "i=0; while [ $i -lt 101 ]; do git commit -q --allow-empty -m c$i || exit 1; i=$((i+1)); done",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (stdout, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .arg("--root")
+            .arg(&fixture.dir)
+            .arg("report")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(4), "{stdout}");
+    assert!(
+        stdout.contains("of 100 first-parent commit(s) in 1 repository")
+            && stdout.contains(
+                "work: only the newest 100 default-branch commits in the window were judged"
+            )
+            && stdout.contains("The rest: 0 verified · 100 without a sykli contract"),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
+
+/// `command` run under a pseudo-terminal, as a person's shell would run it,
+/// with its output; `None` where `script` is not there to make one.
+fn under_a_terminal(command: &Command) -> Option<String> {
+    let mut line = vec![command.get_program().to_string_lossy().into_owned()];
+    line.extend(command.get_args().map(|a| a.to_string_lossy().into_owned()));
+    let quoted = line
+        .iter()
+        .map(|word| format!("'{}'", word.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut script = Command::new("script");
+    if cfg!(target_os = "macos") {
+        script.args(["-q", "/dev/null", "sh", "-c", &quoted]);
+    } else {
+        script.args(["-qec", &quoted, "/dev/null"]);
+    }
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => script.env(key, value),
+            None => script.env_remove(key),
+        };
+    }
+    if let Some(dir) = command.get_current_dir() {
+        script.current_dir(dir);
+    }
+    let output = script.stdin(std::process::Stdio::null()).output().ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).replace('\r', ""))
+}
+
+#[test]
+fn the_weekly_report_is_said_after_the_record_at_a_terminal_and_never_briefed() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("weekly");
+    let repo = fixture.make_git_repo("work");
+    let gappy = fixture.dir.join("gappy.json");
+    fs::write(
+        &gappy,
+        r#"{"schema":"vessa-usage.v1","sessions":[],"warnings":["a source could not be read"]}"#,
+    )
+    .unwrap();
+    let run = |intent: &str, complete: bool| {
+        let mut command = fixture.ohjaa();
+        command
+            .args(["run", "sh", "--intent", intent, "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo);
+        command.env("OHJAA_STUB_SYKLI_COMMIT", "new");
+        if !complete {
+            command.env("OHJAA_STUB_VESSA_JSON", &gappy);
+        }
+        under_a_terminal(&command)
+    };
+    let marker = fixture.dir.join("state/ohjaa/report-at");
+    // A report with a gap (vessa could not read a source) is said, and said
+    // again.
+    let Some(first) = run("one", false) else {
+        return; // no `script` here to make a terminal
+    };
+    let record = first.find("ohjaa: recorded; queued").expect(&first);
+    let weekly = first.find("ohjaa: weekly report, ").expect(&first);
+    assert!(weekly > record, "after the record: {first}");
+    assert!(first.contains("said again at the next launch"), "{first}");
+    assert!(
+        !marker.exists(),
+        "an incomplete report does not mark the week"
+    );
+    assert!(
+        !fixture.argv().join("\n").contains("weekly report"),
+        "never into the agent's briefing"
+    );
+    let second = run("two", true).unwrap();
+    assert!(
+        second.contains("ohjaa: weekly report, ")
+            && second.contains("the next summary is in 7 days"),
+        "{second}"
+    );
+    assert!(marker.is_file(), "a complete one marks the week");
+    let third = run("three", true).unwrap();
+    assert!(!third.contains("weekly report"), "once a week: {third}");
+    // Not at a terminal, nothing is said: no person is reading.
+    fs::remove_file(&marker).unwrap();
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent", "four", "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        !stderr.contains("weekly report") && !marker.exists(),
+        "{stderr}"
     );
     fixture.cleanup();
 }

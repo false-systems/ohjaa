@@ -1212,7 +1212,6 @@ fn default_drafter() -> String {
         .unwrap_or_else(|| "claude -p".to_owned())
 }
 
-#[allow(clippy::too_many_arguments)]
 /// The git repositories a report reads: those under the roots.
 fn report_repos(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     roots::git_repos(&roots::load(roots, git_root().as_deref()))
@@ -1231,31 +1230,67 @@ fn cmd_report(roots: &[PathBuf], since: &str, json: bool) -> Result<i32> {
     } else {
         print!("{}", report::render(&report));
     }
-    if let Err(error) = report::made(&dirs, now_ms) {
-        eprintln!("ohjaa: {error:#}");
+    // A complete report a person read at a terminal is the week's: not one
+    // for a script or an agent, nor one with gaps.
+    if !json && report.complete() && std::io::stdout().is_terminal() {
+        if let Err(error) = report::made(&dirs, now_ms) {
+            eprintln!("ohjaa: {error:#}");
+        }
     }
     Ok(if report.complete() { 0 } else { INCOMPLETE })
 }
 
-/// Once a week, at a launch a person watches: three lines of the report on
-/// stderr, before the agent starts and never into its briefing.
-fn weekly_report(dirs: &Dirs, roots: &[PathBuf]) {
+/// Once a week, at a launch a person watches: the report is read while the
+/// agent works, never delaying its start, and three lines of it are said
+/// after the session's record, when the person is back at the shell. Never
+/// into the agent's briefing.
+struct Weekly {
+    dirs: Dirs,
+    now_ms: i64,
+    reading: std::thread::JoinHandle<report::Report>,
+}
+
+fn weekly_report(dirs: &Dirs, roots: &[PathBuf]) -> Option<Weekly> {
     let now_ms = intake::now_seconds() * 1000;
     if !std::io::stderr().is_terminal() || !report::due(dirs, now_ms) {
-        return;
+        return None;
     }
-    eprintln!("ohjaa: a week since the last report; reading it before the launch");
-    let repos = report_repos(roots).unwrap_or_else(|error| {
-        eprintln!("ohjaa: {error:#}");
-        Vec::new()
-    });
-    let report = report::build(dirs, &repos, now_ms - report::WEEK_MS, now_ms);
+    let (dirs, roots) = (dirs.clone(), roots.to_vec());
+    let reading = {
+        let dirs = dirs.clone();
+        std::thread::spawn(move || {
+            let repos = report_repos(&roots).unwrap_or_default();
+            report::build(&dirs, &repos, now_ms - report::WEEK_MS, now_ms)
+        })
+    };
+    Some(Weekly {
+        dirs,
+        now_ms,
+        reading,
+    })
+}
+
+/// Say the weekly report after the record; the week is marked only when it
+/// was complete, so a report with gaps is said again at the next launch.
+fn say_weekly(weekly: Option<Weekly>) {
+    let Some(weekly) = weekly else {
+        return;
+    };
+    if !weekly.reading.is_finished() {
+        eprintln!("ohjaa: reading the weekly report…");
+    }
+    let Ok(report) = weekly.reading.join() else {
+        return;
+    };
     eprint!("{}", report::summary(&report));
-    if let Err(error) = report::made(dirs, now_ms) {
-        eprintln!("ohjaa: {error:#}");
+    if report.complete() {
+        if let Err(error) = report::made(&weekly.dirs, weekly.now_ms) {
+            eprintln!("ohjaa: {error:#}");
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_intake(
     roots: &[PathBuf],
     since: Option<&str>,
@@ -1344,7 +1379,7 @@ fn cmd_intake(
                 for gap in &report.gaps {
                     eprintln!("ohjaa: intake: report: not read: {gap}");
                 }
-                if let Err(why) = &report.bypasses {
+                if let Err(why) = &report.natives {
                     eprintln!("ohjaa: intake: report: {why}");
                 }
                 candidates.extend(report::candidates(&report));
@@ -1670,9 +1705,8 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // restart) are closed first, so they are queued and can be the last session
     // here.
     let orphans = close_orphans(&dirs, !dry_run);
-    if !dry_run {
-        weekly_report(&dirs, roots);
-    }
+    // Read while the agent works; said after the record.
+    let weekly = (!dry_run).then(|| weekly_report(&dirs, roots)).flatten();
     let here_key = repo_key(&root);
     for orphan in &orphans {
         eprintln!(
@@ -2082,6 +2116,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             "ohjaa: this record could not be saved; it is shown above only"
         )
     };
+    say_weekly(weekly);
     // Said again last, where the person looks when the session ends.
     for flag in sessions::flags(&session) {
         let _ = writeln!(stderr, "ohjaa: flagged: {}", flag.headline);

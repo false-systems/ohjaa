@@ -6,11 +6,13 @@
 //!   handover;
 //! - commits on a known repository's default branch that sykli refused, or
 //!   that were never checked where a receipt would be;
-//! - native agent sessions (vessa's list) that did not go through `ohjaa run`.
+//! - native agent sessions (vessa's list) a person started without
+//!   `ohjaa run`.
 //!
-//! What could not be looked at is said, never shown as nothing. Only the time
-//! the last report was made is stored, like intake's cursor; the report
-//! itself is derived each time.
+//! What could not be looked at, or not judged, is said and counted, never
+//! shown as nothing. Only the time a complete report was last shown to a
+//! person is stored, like intake's cursor; the report itself is derived each
+//! time.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -58,6 +60,22 @@ pub struct Unproven {
     pub on: lifecycle::OnDefault,
 }
 
+/// What became of every default-branch commit in the window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Judged {
+    pub repos: usize,
+    pub commits: usize,
+    pub verified: usize,
+    pub no_contract: usize,
+    /// Made in a checkout that is gone, with its receipts, and none kept.
+    pub gone: usize,
+    /// Of those, merge commits (a forge's "Merge pull request").
+    pub gone_merges: usize,
+    /// sykli could not say: exit 2, a crash, or no `--commit`.
+    pub could_not_say: usize,
+    pub stale: usize,
+}
+
 /// A native agent session that did not go through `ohjaa run`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bypass {
@@ -67,22 +85,44 @@ pub struct Bypass {
     pub started_ms: i64,
 }
 
+/// A native session vessa could not date or place: not judged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Undated {
+    pub agent: String,
+    pub id: String,
+    /// Its transcript, and when that was last written.
+    pub source: String,
+    pub written_ms: Option<i64>,
+}
+
+/// What vessa's list says about sessions run without ohjaa.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Natives {
+    pub bypasses: Vec<Bypass>,
+    /// Headless runs (`claude -p`, `codex exec`, intake's drafter among
+    /// them): no person started them, so they bypass nothing.
+    pub headless: usize,
+    pub undated: Vec<Undated>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     pub since_ms: i64,
     pub until_ms: i64,
     pub untold: Vec<Untold>,
     pub unproven: Vec<Unproven>,
+    pub judged: Judged,
     /// The native sessions not run through ohjaa, or why they could not be
-    /// looked for.
-    pub bypasses: Result<Vec<Bypass>, String>,
-    /// What could not be read, each with why: a report with gaps says so.
+    /// judged.
+    pub natives: Result<Natives, String>,
+    /// What could not be read or judged, each with why: a report with gaps
+    /// says so, and exits 4.
     pub gaps: Vec<String>,
 }
 
 impl Report {
     pub fn complete(&self) -> bool {
-        self.gaps.is_empty() && self.bypasses.is_ok()
+        self.gaps.is_empty() && self.natives.is_ok()
     }
 }
 
@@ -102,8 +142,9 @@ pub fn parse_since(text: &str, now_ms: i64) -> Result<i64> {
         .unwrap_or_else(|| intake::normalize_since(text))
 }
 
-/// The report for `since_ms` to `now_ms`: the log in `dirs`, the git
-/// repositories under `roots`, and vessa's sessions when vessa is on PATH.
+/// The report for after `since_ms` until `now_ms`: the log in `dirs`, the git
+/// repositories `repos` (those under the roots), and vessa's sessions when
+/// vessa is on PATH.
 pub fn build(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Report {
     let mut gaps = Vec::new();
     let logged: Vec<Session> = match sessions::Store::open(&sessions::store_path(&dirs.state)) {
@@ -128,9 +169,45 @@ pub fn build(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Repo
         }
     };
     let untold = untold(&logged, since_ms, now_ms);
+    let (unproven, judged) = default_branches(repos, since_ms, &mut gaps);
+    let natives = native_sessions(since_ms, now_ms, &mut gaps).map(|listed| {
+        let (judgeable, mut natives) = listed;
+        natives.bypasses = bypasses(judgeable, &logged);
+        natives
+    });
+    if let Ok(natives) = &natives {
+        if !natives.undated.is_empty() {
+            gaps.push(format!(
+                "{} native session(s) vessa could not date or place: not judged",
+                natives.undated.len()
+            ));
+        }
+    }
+    Report {
+        since_ms,
+        until_ms: now_ms,
+        untold,
+        unproven,
+        judged,
+        natives,
+        gaps,
+    }
+}
 
-    let sykli = lifecycle::Sykli::default();
+/// Every first-parent commit each repository's default branch gained in the
+/// window, judged by sykli: the unproven ones, and a count of the rest.
+fn default_branches(
+    repos: &[PathBuf],
+    since_ms: i64,
+    gaps: &mut Vec<String>,
+) -> (Vec<Unproven>, Judged) {
     let mut unproven = Vec::new();
+    let mut judged = Judged::default();
+    if repos.is_empty() {
+        gaps.push("there are no git repositories under the roots".to_owned());
+        return (unproven, judged);
+    }
+    let sykli = lifecycle::Sykli::default();
     let mut clones = std::collections::HashSet::new();
     for repo in repos {
         // A worktree of a clone already read is the same clone.
@@ -146,45 +223,57 @@ pub fn build(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Repo
         if common.is_some_and(|common| !clones.insert(common)) {
             continue;
         }
-        match lifecycle::default_branch_since(repo, since_ms.div_euclid(1000), &sykli) {
-            Some(commits) => unproven.extend(
-                commits
-                    .into_iter()
-                    .filter(|on| matches!(on.check, Check::Failed { .. } | Check::Unchecked))
-                    .map(|on| Unproven {
-                        repo: repo.to_string_lossy().into_owned(),
-                        on,
-                    }),
-            ),
-            None => {
-                // A repository with no default branch has nothing to report.
-                if has_commits(repo) && has_default_branch(repo) {
-                    gaps.push(format!(
-                        "{}: its default branch could not be read",
-                        repo.display()
-                    ));
+        let Some((commits, capped)) =
+            lifecycle::default_branch_since(repo, since_ms.div_euclid(1000), &sykli)
+        else {
+            // A repository with no default branch has nothing to report.
+            if has_commits(repo) && has_default_branch(repo) {
+                gaps.push(format!(
+                    "{}: its default branch could not be read",
+                    repo.display()
+                ));
+            }
+            continue;
+        };
+        judged.repos += 1;
+        if capped {
+            gaps.push(format!(
+                "{}: only the newest {} default-branch commits in the window were judged",
+                repo.display(),
+                lifecycle::MAX_REPORTED
+            ));
+        }
+        for on in commits {
+            judged.commits += 1;
+            match &on.check {
+                Check::Passed => judged.verified += 1,
+                Check::Failed { .. } | Check::Unchecked => unproven.push(Unproven {
+                    repo: repo.to_string_lossy().into_owned(),
+                    on,
+                }),
+                Check::UncheckedGone => {
+                    judged.gone += 1;
+                    if on.merge {
+                        judged.gone_merges += 1;
+                    }
                 }
+                Check::Unverified { why } if why.starts_with("no sykli contract") => {
+                    judged.no_contract += 1
+                }
+                Check::Unverified { .. } => judged.could_not_say += 1,
+                Check::Stale { .. } => judged.stale += 1,
             }
         }
     }
     if let Some(why) = lifecycle::sykli_cannot_bind(&sykli) {
-        if !unproven.is_empty() || !repos.is_empty() {
+        if judged.could_not_say > 0 {
             gaps.push(format!(
-                "sykli could not verify commits ({why}): only commits sykli was never run on are listed"
+                "sykli could not verify commits ({why}): only commits never run are listed"
             ));
         }
     }
     unproven.sort_by_key(|u| std::cmp::Reverse(u.on.committed));
-
-    let bypasses = native_sessions(since_ms, now_ms).map(|native| bypasses(native, &logged));
-    Report {
-        since_ms,
-        until_ms: now_ms,
-        untold,
-        unproven,
-        bypasses,
-        gaps,
-    }
+    (unproven, judged)
 }
 
 fn has_commits(repo: &Path) -> bool {
@@ -215,7 +304,7 @@ fn git_ok(repo: &Path, args: &[&str]) -> bool {
 pub fn untold(logged: &[Session], since_ms: i64, now_ms: i64) -> Vec<Untold> {
     logged
         .iter()
-        .filter(|s| s.left.is_some() && s.started_ms >= since_ms && s.started_ms <= now_ms)
+        .filter(|s| s.left.is_some() && s.started_ms > since_ms && s.started_ms <= now_ms)
         .filter(|s| s.readback.is_none() || s.handover.is_none())
         .map(|s| Untold {
             id: s.id.clone(),
@@ -230,7 +319,7 @@ pub fn untold(logged: &[Session], since_ms: i64, now_ms: i64) -> Vec<Untold> {
         .collect()
 }
 
-/// A native session, as vessa lists it.
+/// A native session, as vessa lists it, dated and placed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Native {
     pub agent: String,
@@ -239,9 +328,14 @@ pub struct Native {
     pub started_ms: i64,
 }
 
-/// The top-level Claude and Codex sessions vessa lists that started in the
-/// window; `Err` says why they could not be listed.
-fn native_sessions(since_ms: i64, now_ms: i64) -> Result<Vec<Native>, String> {
+/// vessa's list for the window: the sessions a person started, dated and
+/// placed, to judge against the launches; and what else it held. `Err` says
+/// why they cannot be judged at all. What vessa could not read is a gap.
+fn native_sessions(
+    since_ms: i64,
+    now_ms: i64,
+    gaps: &mut Vec<String>,
+) -> Result<(Vec<Native>, Natives), String> {
     let output = match process::run(
         Command::new("vessa").args(["sessions", "--json"]),
         None,
@@ -252,47 +346,136 @@ fn native_sessions(since_ms: i64, now_ms: i64) -> Result<Vec<Native>, String> {
             let text = format!("{error:#}");
             return Err(
                 if text.contains("No such file") || text.contains("not found") {
-                    "vessa is not on PATH: agent sessions run without ohjaa were not looked for"
-                        .to_owned()
+                    "vessa is not on PATH".to_owned()
                 } else {
                     format!("vessa could not list sessions: {text}")
                 },
             );
         }
     };
-    if !output.status.success() && output.stdout.is_empty() {
-        return Err(format!(
-            "vessa could not list sessions: {}",
+    let listed: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "vessa's sessions are not JSON ({error}; exit {:?}: {})",
+            output.status.code(),
+            output.failure_detail()
+        )
+    })?;
+    // vessa exits 4 when usage evidence is partial, which says nothing about
+    // which sessions it listed; any other failure, and every warning about
+    // what it read, is a gap here.
+    if !matches!(output.status.code(), Some(0 | 4)) {
+        gaps.push(format!(
+            "vessa exited {:?}: {}",
+            output.status.code(),
             output.failure_detail()
         ));
     }
-    let listed: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("vessa's sessions are not JSON: {error}"))?;
+    for warning in listed["warnings"].as_array().into_iter().flatten() {
+        if let Some(warning) = warning.as_str() {
+            gaps.push(format!("vessa: {warning}"));
+        }
+    }
     parse_native(&listed, since_ms, now_ms)
 }
 
+/// Whether a session was started by no person: `claude -p` (Claude's
+/// `entrypoint` is `sdk-…`), or `codex exec` (Codex's `originator` names
+/// exec). Intake's own drafter runs one of these.
+fn headless(session: &Value) -> bool {
+    session["entrypoint"]
+        .as_str()
+        .is_some_and(|entry| entry.starts_with("sdk"))
+        || session["originator"]
+            .as_str()
+            .is_some_and(|origin| origin.contains("exec"))
+}
+
 /// Read `vessa sessions --json` (`vessa-usage.v1`): `sessions[]` with `agent`,
-/// `id`, `parent`, `started_at` (RFC 3339) and `cwd`. vessa exits non-zero when
-/// a source is missing or usage is partial, and still lists what it read. Subagent sessions (with a parent) were
-/// started by a session, not by a person, and are left out.
-pub fn parse_native(listed: &Value, since_ms: i64, now_ms: i64) -> Result<Vec<Native>, String> {
+/// `id`, `parent`, `started_at` (RFC 3339), `cwd`, `source`, and how each was
+/// started (`entrypoint`, `originator`). Subagent sessions (with a parent)
+/// and headless runs were started by no person and are left out. A session
+/// with no date or no folder cannot be judged against a launch: it is kept
+/// apart as undated when its transcript was written in the window. Without
+/// `entrypoint` and `originator` (an older vessa), headless runs cannot be
+/// told apart, and nothing is judged.
+pub fn parse_native(
+    listed: &Value,
+    since_ms: i64,
+    now_ms: i64,
+) -> Result<(Vec<Native>, Natives), String> {
     let sessions = listed["sessions"]
         .as_array()
         .ok_or("vessa's output has no sessions list")?;
-    Ok(sessions
+    let says_how = |s: &Value| {
+        s.as_object()
+            .is_some_and(|o| o.contains_key("entrypoint") && o.contains_key("originator"))
+    };
+    if !sessions.is_empty() && !sessions.iter().any(says_how) {
+        return Err(
+            "vessa does not say how a session was started (no `entrypoint` or `originator`; \
+             vessa#2), so headless runs cannot be told apart"
+                .to_owned(),
+        );
+    }
+    let in_window = |ms: i64| ms > since_ms && ms <= now_ms;
+    let mut judgeable = Vec::new();
+    let mut natives = Natives::default();
+    for s in sessions
         .iter()
         .filter(|s| matches!(s["agent"].as_str(), Some("claude" | "codex")))
         .filter(|s| s["parent"].is_null())
-        .filter_map(|s| {
-            let started_ms = intake::parse_time(s["started_at"].as_str()?)?;
-            (started_ms >= since_ms && started_ms <= now_ms).then(|| Native {
-                agent: s["agent"].as_str().unwrap_or_default().to_owned(),
-                id: s["id"].as_str().unwrap_or_default().to_owned(),
-                cwd: s["cwd"].as_str().unwrap_or_default().to_owned(),
-                started_ms,
-            })
-        })
-        .collect())
+    {
+        let text = |key: &str| s[key].as_str().unwrap_or_default().to_owned();
+        let started_ms = s["started_at"].as_str().and_then(intake::parse_time);
+        let cwd = text("cwd");
+        match started_ms {
+            Some(started_ms) if !cwd.is_empty() => {
+                if !in_window(started_ms) {
+                    continue;
+                }
+                if headless(s) {
+                    natives.headless += 1;
+                    continue;
+                }
+                judgeable.push(Native {
+                    agent: text("agent"),
+                    id: text("id"),
+                    cwd,
+                    started_ms,
+                });
+            }
+            _ => {
+                let source = text("source");
+                let written_ms = std::fs::metadata(&source)
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                    // Whole seconds, as the window's ends are.
+                    .map(|at| at.as_secs() as i64 * 1000);
+                // Undated: in the window when its transcript was written then,
+                // or when that cannot be told.
+                let relevant = match (started_ms, written_ms) {
+                    (Some(started_ms), _) => in_window(started_ms),
+                    (None, Some(written_ms)) => in_window(written_ms),
+                    (None, None) => true,
+                };
+                if !relevant {
+                    continue;
+                }
+                if headless(s) {
+                    natives.headless += 1;
+                    continue;
+                }
+                natives.undated.push(Undated {
+                    agent: text("agent"),
+                    id: text("id"),
+                    source,
+                    written_ms,
+                });
+            }
+        }
+    }
+    Ok((judgeable, natives))
 }
 
 /// The native sessions no `ohjaa run` launched, oldest first. One matches a
@@ -357,6 +540,14 @@ fn name(path: &str) -> String {
         .map_or_else(|| path.to_owned(), |n| n.to_string_lossy().into_owned())
 }
 
+fn folder(cwd: &str) -> &str {
+    if cwd.is_empty() {
+        "(no folder)"
+    } else {
+        cwd
+    }
+}
+
 fn describe_check(check: &Check) -> String {
     match check {
         Check::Failed { why } => format!("FAILED sykli verify: {why}"),
@@ -377,6 +568,27 @@ fn missing(u: &Untold) -> String {
         } else {
             ""
         }
+}
+
+/// What was read of the default branches and not listed, by why.
+fn not_judged(j: &Judged) -> String {
+    let mut parts = vec![format!("{} verified", j.verified)];
+    if j.no_contract > 0 {
+        parts.push(format!("{} without a sykli contract", j.no_contract));
+    }
+    if j.gone > 0 {
+        parts.push(format!(
+            "{} made in a checkout that is gone, with no receipt kept ({} of them merges)",
+            j.gone, j.gone_merges
+        ));
+    }
+    if j.could_not_say > 0 {
+        parts.push(format!("{} sykli could not say", j.could_not_say));
+    }
+    if j.stale > 0 {
+        parts.push(format!("{} judged on a checkout, not the commit", j.stale));
+    }
+    parts.join(" · ")
 }
 
 /// The report for people.
@@ -405,10 +617,15 @@ pub fn render(report: &Report) -> String {
             missing(u)
         );
     }
+    let j = &report.judged;
     let _ = writeln!(
         out,
-        "\nCommits on a default branch without passing evidence ({}):",
-        report.unproven.len()
+        "\nCommits on a default branch without passing evidence ({}), of {} first-parent \
+         commit(s) in {} repositor{}:",
+        report.unproven.len(),
+        j.commits,
+        j.repos,
+        if j.repos == 1 { "y" } else { "ies" }
     );
     for u in &report.unproven {
         let _ = writeln!(
@@ -422,33 +639,63 @@ pub fn render(report: &Report) -> String {
             describe_check(&u.on.check)
         );
     }
-    match &report.bypasses {
-        Ok(bypasses) => {
+    if j.commits > 0 {
+        let _ = writeln!(out, "  The rest: {}", not_judged(j));
+    }
+    match &report.natives {
+        Ok(natives) => {
             let _ = writeln!(
                 out,
-                "\nAgent sessions not run through ohjaa ({}):",
-                bypasses.len()
+                "\nAgent sessions a person started without ohjaa ({}):",
+                natives.bypasses.len()
             );
-            for b in bypasses {
+            for b in &natives.bypasses {
                 let _ = writeln!(
                     out,
                     "- {} {} in {}, started {}",
                     b.agent,
                     b.id,
-                    b.cwd,
+                    folder(&b.cwd),
                     sessions::clock(b.started_ms)
                 );
+            }
+            if natives.headless > 0 {
+                let _ = writeln!(
+                    out,
+                    "  Not counted: {} headless run(s) (claude -p, codex exec, intake's drafter)",
+                    natives.headless
+                );
+            }
+            if !natives.undated.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  Not judged, vessa could not date or place them ({}):",
+                    natives.undated.len()
+                );
+                for u in &natives.undated {
+                    let written = u
+                        .written_ms
+                        .map_or_else(|| "unknown".to_owned(), sessions::clock);
+                    let _ = writeln!(
+                        out,
+                        "  - {} {} (transcript {}, written {written})",
+                        u.agent, u.id, u.source
+                    );
+                }
             }
         }
         Err(why) => {
             let _ = writeln!(
                 out,
-                "\nAgent sessions not run through ohjaa: not checked: {why}"
+                "\nAgent sessions a person started without ohjaa: not judged: {why}"
             );
         }
     }
     if !report.gaps.is_empty() {
-        let _ = writeln!(out, "\nNot read, so absence above proves nothing there:");
+        let _ = writeln!(
+            out,
+            "\nNot read or not judged, so absence above proves nothing there:"
+        );
         for gap in &report.gaps {
             let _ = writeln!(out, "- {gap}");
         }
@@ -459,10 +706,12 @@ pub fn render(report: &Report) -> String {
 /// The report as `ohjaa-report.v1` JSON.
 pub fn to_json(report: &Report) -> Value {
     let rfc = |ms: i64| intake::rfc3339(ms.div_euclid(1000));
+    let j = &report.judged;
     json!({
         "schema": "ohjaa-report.v1",
         "since": rfc(report.since_ms),
         "until": rfc(report.until_ms),
+        "complete": report.complete(),
         "sessions_without_testimony": report.untold.iter().map(|u| json!({
             "id": u.id,
             "agent": u.agent,
@@ -485,27 +734,47 @@ pub fn to_json(report: &Report) -> Value {
             },
             "why": describe_check(&u.on.check),
         })).collect::<Vec<_>>(),
-        "bypasses": match &report.bypasses {
-            Ok(list) => json!({
-                "checked": true,
-                "sessions": list.iter().map(|b| json!({
+        "default_branch_commits": {
+            "repositories": j.repos,
+            "commits": j.commits,
+            "verified": j.verified,
+            "no_contract": j.no_contract,
+            "checkout_gone": j.gone,
+            "checkout_gone_merges": j.gone_merges,
+            "sykli_could_not_say": j.could_not_say,
+            "stale": j.stale,
+        },
+        "bypasses": match &report.natives {
+            Ok(natives) => json!({
+                "judged": true,
+                "sessions": natives.bypasses.iter().map(|b| json!({
                     "agent": b.agent,
                     "id": b.id,
                     "cwd": b.cwd,
                     "started": rfc(b.started_ms),
                 })).collect::<Vec<_>>(),
+                "headless": natives.headless,
+                "undated": natives.undated.iter().map(|u| json!({
+                    "agent": u.agent,
+                    "id": u.id,
+                    "source": u.source,
+                    "written": u.written_ms.map(rfc),
+                })).collect::<Vec<_>>(),
             }),
-            Err(why) => json!({"checked": false, "why": why}),
+            Err(why) => json!({"judged": false, "why": why}),
         },
         "gaps": report.gaps,
     })
 }
 
-/// Three lines for the person at `ohjaa run`, before the agent starts.
+/// Three lines for the person, after a session's record.
 pub fn summary(report: &Report) -> String {
-    let bypassed = match &report.bypasses {
-        Ok(list) => format!("{} agent session(s) not run through ohjaa", list.len()),
-        Err(_) => "agent sessions run without ohjaa not checked (no vessa)".to_owned(),
+    let bypassed = match &report.natives {
+        Ok(natives) => format!(
+            "{} agent session(s) started without ohjaa",
+            natives.bypasses.len()
+        ),
+        Err(why) => format!("sessions started without ohjaa not judged ({why})"),
     };
     // A refusal first, then a commit never checked, then a session.
     let first = report
@@ -535,28 +804,32 @@ pub fn summary(report: &Report) -> String {
             })
         })
         .unwrap_or_else(|| "nothing went around the workflow that ohjaa could see".to_owned());
+    let last = if report.complete() {
+        "`ohjaa report` lists them all; the next summary is in 7 days.".to_owned()
+    } else {
+        format!(
+            "`ohjaa report` lists them all; {} gap(s) left it incomplete, so it is said again \
+             at the next launch.",
+            report.gaps.len() + usize::from(report.natives.is_err())
+        )
+    };
     format!(
         "ohjaa: weekly report, {} to {}: {} session(s) without read-back or handover · {} \
          commit(s) on a default branch without passing evidence · {bypassed}\n\
          ohjaa:   first: {first}\n\
-         ohjaa:   `ohjaa report` lists them all{}; the next summary is in 7 days.\n",
+         ohjaa:   {last}\n",
         &sessions::clock(report.since_ms)[..10],
         &sessions::clock(report.until_ms)[..10],
         report.untold.len(),
         report.unproven.len(),
-        if report.complete() {
-            ""
-        } else {
-            ", and what it could not read"
-        }
     )
 }
 
 // ---- intake ------------------------------------------------------------------
 
 /// The report's real failures and bypasses as intake candidates: never what
-/// could not be checked. A missing handover is intake's already, from the
-/// session itself; a missing read-back is not.
+/// could not be checked or judged. A missing handover is intake's already,
+/// from the session itself; a missing read-back is not.
 pub fn candidates(report: &Report) -> Vec<Candidate> {
     let mut out = Vec::new();
     let mut push = |at_ms: i64, place: &str, context: String, text: String| {
@@ -608,15 +881,21 @@ pub fn candidates(report: &Report) -> Vec<Candidate> {
             ),
         );
     }
-    if let Ok(bypasses) = &report.bypasses {
-        for b in bypasses {
+    if let Ok(natives) = &report.natives {
+        for b in &natives.bypasses {
             push(
                 b.started_ms,
                 &b.cwd,
-                format!("{} session {}, observed by ohjaa through vessa, not said by anyone", b.agent, b.id),
                 format!(
-                    "a {} session ({}) in {} started without `ohjaa run`: it was briefed with no knowledge and left no record",
-                    b.agent, b.id, b.cwd
+                    "{} session {}, observed by ohjaa through vessa, not said by anyone",
+                    b.agent, b.id
+                ),
+                format!(
+                    "a {} session ({}) in {} was started without `ohjaa run`: it was briefed \
+                     with no knowledge and left no record",
+                    b.agent,
+                    b.id,
+                    folder(&b.cwd)
                 ),
             );
         }
@@ -630,14 +909,14 @@ fn marker(dirs: &Dirs) -> PathBuf {
     dirs.state.join("report-at")
 }
 
-/// When the last report was made, if one was.
+/// When a complete report was last shown to a person, if one was.
 pub fn last_made(dirs: &Dirs) -> Option<i64> {
     std::fs::read_to_string(marker(dirs))
         .ok()
         .and_then(|text| text.trim().parse().ok())
 }
 
-/// Record that a report was made at `now_ms`.
+/// Record that a complete report was shown to a person at `now_ms`.
 pub fn made(dirs: &Dirs, now_ms: i64) -> Result<()> {
     std::fs::create_dir_all(&dirs.state)
         .with_context(|| format!("cannot create {}", dirs.state.display()))?;
@@ -645,7 +924,8 @@ pub fn made(dirs: &Dirs, now_ms: i64) -> Result<()> {
         .with_context(|| format!("cannot write {}", marker(dirs).display()))
 }
 
-/// Whether a week has passed since the last report (or none was made).
+/// Whether a week has passed since a complete report was last shown (or
+/// none was).
 pub fn due(dirs: &Dirs, now_ms: i64) -> bool {
     last_made(dirs).is_none_or(|at| now_ms - at >= WEEK_MS)
 }
@@ -723,26 +1003,55 @@ mod tests {
     }
 
     #[test]
-    fn vessas_list_is_read_for_top_level_claude_and_codex_sessions_in_the_window() {
-        let listed = json!({"schema": "vessa-usage.v1", "warnings": [], "sessions": [
-            {"agent": "claude", "id": "in", "parent": null, "started_at": "2026-10-09T10:00:00.500Z", "cwd": "/r/app"},
-            {"agent": "claude", "id": "sub", "parent": "in", "started_at": "2026-10-09T10:01:00Z", "cwd": "/r/app"},
-            {"agent": "pi", "id": "pi", "parent": null, "started_at": "2026-10-09T10:00:00Z", "cwd": "/r/app"},
-            {"agent": "codex", "id": "old", "parent": null, "started_at": "2026-09-01T10:00:00Z", "cwd": "/r/app"},
-            {"agent": "codex", "id": "undated", "parent": null, "started_at": null, "cwd": "/r/app"}
-        ]});
+    fn vessas_list_keeps_what_a_person_started_and_says_what_it_could_not_date() {
         let since = intake::parse_time("2026-10-03T00:00:00Z").unwrap();
         let now = intake::parse_time("2026-10-10T00:00:00Z").unwrap();
-        let found = parse_native(&listed, since, now).unwrap();
+        let s = |id: &str, agent: &str, extra: Value| {
+            let mut s = json!({"agent": agent, "id": id, "parent": null,
+                "started_at": "2026-10-09T10:00:00.500Z", "cwd": "/r/app",
+                "source": "/nonexistent/transcript.jsonl",
+                "entrypoint": null, "originator": null});
+            for (key, value) in extra.as_object().unwrap() {
+                s[key] = value.clone();
+            }
+            s
+        };
+        let listed = json!({"schema": "vessa-usage.v1", "warnings": [], "sessions": [
+            s("tui", "claude", json!({"entrypoint": "cli"})),
+            s("sub", "claude", json!({"parent": "tui"})),
+            s("pi", "pi", json!({})),
+            s("old", "codex", json!({"started_at": "2026-09-01T10:00:00Z"})),
+            s("headless", "claude", json!({"entrypoint": "sdk-cli"})),
+            s("exec", "codex", json!({"originator": "codex_exec"})),
+            s("undated", "claude", json!({"started_at": null, "cwd": ""})),
+            s("nowhere", "codex", json!({"cwd": ""})),
+        ]});
+        let (judgeable, natives) = parse_native(&listed, since, now).unwrap();
         assert_eq!(
-            found,
+            judgeable,
             [native(
                 "claude",
-                "in",
+                "tui",
                 "/r/app",
                 since + 6 * 86_400_000 + 36_000_500
             )]
         );
+        assert_eq!(
+            natives.headless, 2,
+            "claude -p and codex exec bypass nothing"
+        );
+        let undated: Vec<&str> = natives.undated.iter().map(|u| u.id.as_str()).collect();
+        assert_eq!(
+            undated,
+            ["undated", "nowhere"],
+            "never dropped: said apart, not judged"
+        );
+        // An older vessa cannot tell a headless run from a person's session.
+        let older = json!({"sessions": [{"agent": "claude", "id": "x", "parent": null,
+            "started_at": "2026-10-09T10:00:00Z", "cwd": "/r/app"}]});
+        assert!(parse_native(&older, since, now)
+            .unwrap_err()
+            .contains("headless runs cannot be told apart"));
         assert!(parse_native(&json!({"nothing": []}), since, now).is_err());
     }
 
@@ -777,62 +1086,73 @@ mod tests {
         assert!(parse_since("soon", now).is_err());
     }
 
-    #[test]
-    fn only_real_failures_and_bypasses_become_candidates() {
+    fn sample(natives: Result<Natives, String>) -> Report {
         let on = |check: Check| lifecycle::OnDefault {
             onto: "origin/main".to_owned(),
             commit: "c0ffee1234".to_owned(),
             subject: "s".to_owned(),
             committed: 100,
+            merge: false,
             check,
         };
-        let report = Report {
+        let untold = |id: &str, no_readback: bool| Untold {
+            id: id.to_owned(),
+            agent: "claude".to_owned(),
+            repo: "/r/app".to_owned(),
+            intent: "x".to_owned(),
+            started_ms: 5,
+            no_readback,
+            no_handover: true,
+            orphaned: false,
+        };
+        Report {
             since_ms: 0,
             until_ms: 1,
-            untold: vec![
-                Untold {
-                    id: "oh-1".to_owned(),
-                    agent: "claude".to_owned(),
-                    repo: "/r/app".to_owned(),
-                    intent: "x".to_owned(),
-                    started_ms: 5,
-                    no_readback: true,
-                    no_handover: true,
-                    orphaned: false,
-                },
-                Untold {
-                    id: "oh-2".to_owned(),
-                    agent: "claude".to_owned(),
-                    repo: "/r/app".to_owned(),
-                    intent: "x".to_owned(),
-                    started_ms: 6,
-                    no_readback: false,
-                    no_handover: true,
-                    orphaned: false,
-                },
-            ],
+            untold: vec![untold("oh-1", true), untold("oh-2", false)],
             unproven: vec![Unproven {
                 repo: "/r/app".to_owned(),
                 on: on(Check::Failed {
                     why: "refused: outcome".to_owned(),
                 }),
             }],
-            bypasses: Ok(vec![Bypass {
+            judged: Judged::default(),
+            natives,
+            gaps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_real_failures_and_judged_bypasses_become_candidates() {
+        let natives = Natives {
+            bypasses: vec![Bypass {
                 agent: "codex".to_owned(),
                 id: "n1".to_owned(),
-                cwd: "/r/app".to_owned(),
+                cwd: String::new(),
                 started_ms: 7,
-            }]),
-            gaps: Vec::new(),
+            }],
+            headless: 3,
+            undated: Vec::new(),
         };
+        let report = sample(Ok(natives));
         let texts: Vec<String> = candidates(&report).into_iter().map(|c| c.text).collect();
         assert_eq!(texts.len(), 3, "{texts:?}");
         assert!(texts[0].contains("never read back"));
         assert!(texts[1].contains("FAILED sykli verify"));
-        assert!(texts[2].contains("without `ohjaa run`"));
+        assert!(texts[2].contains("in (no folder) was started without `ohjaa run`"));
+        let said = summary(&report);
+        assert_eq!(said.lines().count(), 3, "{said}");
+        assert!(said.contains("2 session(s) without read-back or handover"));
+        assert!(said.contains("1 agent session(s) started without ohjaa"));
+        assert!(said.contains("first: c0ffee1 on origin/main in app: FAILED"));
+        assert!(said.contains("the next summary is in 7 days"));
+        // Not judged: no bypass is a candidate, none is counted.
+        let report = sample(Err("vessa is not on PATH".to_owned()));
+        assert_eq!(candidates(&report).len(), 2);
         let summary = summary(&report);
-        assert_eq!(summary.lines().count(), 3, "{summary}");
-        assert!(summary.contains("2 session(s) without read-back or handover"));
-        assert!(summary.contains("first: c0ffee1 on origin/main in app: FAILED"));
+        assert!(
+            summary.contains("not judged (vessa is not on PATH)")
+                && summary.contains("said again at the next launch"),
+            "{summary}"
+        );
     }
 }

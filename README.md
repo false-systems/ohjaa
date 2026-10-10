@@ -135,39 +135,57 @@ ohjaa report --since 30d --json # ohjaa-report.v1
 
 - **Sessions without read-back or handover:** ended sessions in the log that
   never ran `ohjaa oriented`, or left no `ohjaa handover`.
-- **Commits on a default branch without passing evidence:** for every git
-  repository under the roots, the first-parent commits its default branch
-  (`origin/<default>`, else the local one) gained in the window, by commit
-  time. Each is asked of `sykli verify --commit` against the receipts in every
-  checkout and those sykli keeps under the git common dir. Listed: what sykli
-  refused, and what was never run in a checkout that still exists. Not listed:
-  what sykli could not say (no `--commit`, no contract) or a commit made in a
-  checkout that is gone; the report says when sykli could not verify at all.
-- **Agent sessions not run through ohjaa:** with `vessa` on PATH, the
-  top-level Claude and Codex sessions `vessa sessions --json` lists in the
-  window that no `ohjaa run` launched. A session is a launch's when its usage
-  receipt names it, or when it is the same agent, in the launch's repository
-  or below, started within a minute after the launch; each launch claims one.
-  Without vessa the report says so and exits 4.
+- **Commits on a default branch without passing evidence.**
+  - For every git repository under the roots, these are the first-parent
+    commits its default branch (`origin/<default>`, else the local one)
+    gained in the window, by commit time, at most 100 per repository.
+  - Each is checked with `sykli verify --commit` against every receipt of its
+    tree, in every checkout and under the git common dir. It passes when any
+    one of them verifies.
+  - Listed: what sykli refused, and what was never run in a checkout that
+    still exists.
+  - The rest are counted by why: verified; no sykli contract; made in a
+    checkout that is gone, with no receipt kept (merge commits among them);
+    sykli could not say. A window over the cap is said.
+- **Agent sessions a person started without ohjaa:** with `vessa` on PATH,
+  the top-level Claude and Codex sessions `vessa sessions --json` lists in
+  the window that no `ohjaa run` launched.
+  - A session belongs to a launch when the launch's usage receipt names it,
+    or when it is the same agent, in the launch's repository or below,
+    started within a minute after the launch. Each launch claims one.
+  - Headless runs bypass nothing and are only counted: `claude -p`
+    (`entrypoint` `sdk-…`), `codex exec` (`originator` naming exec), and
+    intake's own drafter with them.
+  - A session vessa could not date or place is listed apart, not judged.
+  - A vessa that does not say how sessions were started (no `entrypoint` or
+    `originator`, before vessa#2) leaves the list not judged.
 
-What could not be read is said, and the exit is 4: a report with a gap is not
-a clean week. Only the time the last report was made is kept
-(`$XDG_STATE_HOME/ohjaa/report-at`), like intake's cursor.
+Every warning vessa gives about what it read, a vessa exit other than 0 or
+4, an undated session, a capped window, and a root with no repositories is
+a gap. A report with gaps says them, and exits 4: it is never a clean week.
 
-Once a week, when `ohjaa run` starts at a terminal and the last report is
-older than seven days, three lines of it are printed to the person on stderr
-before the agent starts, never into its briefing:
+Once a week, at an `ohjaa run` a person starts at a terminal, the report is
+read while the agent works, and three lines of it are said after the
+session's record, never in the agent's briefing. The week is marked only
+when that report was complete, so one with gaps is said again at the next
+launch. Only that time is kept (`$XDG_STATE_HOME/ohjaa/report-at`), like
+intake's cursor. `ohjaa report` marks it too, but only when its complete
+report was printed to a terminal: never for `--json`, a script or an agent.
 
 ```
-ohjaa: weekly report, 2026-10-03 to 2026-10-10: 2 session(s) without read-back or handover · 1 commit(s) on a default branch without passing evidence · 1 agent session(s) not run through ohjaa
+ohjaa: weekly report, 2026-10-03 to 2026-10-10: 2 session(s) without read-back or handover · 1 commit(s) on a default branch without passing evidence · 1 agent session(s) started without ohjaa
 ohjaa:   first: 3dbaafd on origin/main in selko: FAILED sykli verify: refused: outcome …
 ohjaa:   `ohjaa report` lists them all; the next summary is in 7 days.
 ```
 
-`ohjaa intake` takes the report as its fourth source (`--source report`): a
-session that never read back, a refused or unchecked commit on a default
-branch, and a session run without ohjaa become `observed` candidates. What
-could not be checked never does.
+`ohjaa intake` takes the report as its fourth source (`--source report`).
+These become `observed` candidates:
+
+- a session that never read back;
+- a refused or unchecked commit on a default branch;
+- a session a person started without ohjaa.
+
+What could not be checked or judged never does.
 
 ## Sessions: entering to leaving
 
