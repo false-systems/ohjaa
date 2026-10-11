@@ -147,8 +147,9 @@ pub fn parse_since(text: &str, now_ms: i64) -> Result<i64> {
 /// vessa is on PATH.
 pub fn build(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Report {
     let mut gaps = Vec::new();
-    let logged: Vec<Session> = match sessions::Store::open(&sessions::store_path(&dirs.state)) {
-        Ok(store) => match store.all() {
+    // Opened only to read: a report never writes the log (#41).
+    let logged: Vec<Session> = match sessions::Reader::open(&sessions::store_path(&dirs.state)) {
+        Ok(log) => match log.all() {
             Ok((all, unreadable)) => {
                 if !unreadable.is_empty() {
                     gaps.push(format!(

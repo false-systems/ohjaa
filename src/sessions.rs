@@ -22,7 +22,10 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use redb::{Database, DatabaseError, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, DatabaseError, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable,
+    TableDefinition, TableError,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::intake::rfc3339;
@@ -425,18 +428,7 @@ impl Store {
     /// unreadable file is reported, never replaced: redb would treat an empty
     /// file as a fresh database and the history would silently vanish.
     pub fn open(path: &Path) -> Result<Store, StoreError> {
-        let mut delay = Duration::from_millis(20);
-        let mut waited = Duration::ZERO;
-        loop {
-            match Self::open_once(path) {
-                Err(StoreError::Locked) if waited < Duration::from_millis(1500) => {
-                    std::thread::sleep(delay);
-                    waited += delay;
-                    delay = (delay * 2).min(Duration::from_millis(200));
-                }
-                result => return result,
-            }
-        }
+        retrying(|| Self::open_once(path))
     }
 
     fn open_once(path: &Path) -> Result<Store, StoreError> {
@@ -485,14 +477,7 @@ impl Store {
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Session>, StoreError> {
-        let tx = self.db.begin_read().map_err(other)?;
-        let sessions = tx.open_table(SESSIONS).map_err(other)?;
-        let Some(value) = sessions.get(id).map_err(other)? else {
-            return Ok(None);
-        };
-        serde_json::from_slice(value.value())
-            .map(Some)
-            .map_err(|error| other(format!("session {id} is unreadable: {error}")))
+        get_in(&self.db, id)
     }
 
     /// Read, change and write back one session in a single transaction.
@@ -520,35 +505,211 @@ impl Store {
         Ok(Some(updated))
     }
 
+    /// Only the tests ask a writer: whatever reads "the last session here"
+    /// only reads, through a [`Reader`].
+    #[cfg(test)]
     pub fn latest_for(&self, repo: &str) -> Result<Option<Session>, StoreError> {
-        let id = {
-            let tx = self.db.begin_read().map_err(other)?;
-            let latest = tx.open_table(LATEST).map_err(other)?;
-            match latest.get(repo).map_err(other)? {
-                Some(id) => id.value().to_owned(),
-                None => return Ok(None),
-            }
-        };
-        self.get(&id)
+        latest_in(&self.db, repo)
     }
 
     /// Every session, oldest first. Unreadable entries are skipped with their
     /// id reported, so one bad record cannot hide the rest.
     pub fn all(&self) -> Result<(Vec<Session>, Vec<String>), StoreError> {
-        let tx = self.db.begin_read().map_err(other)?;
-        let sessions = tx.open_table(SESSIONS).map_err(other)?;
-        let mut out = Vec::new();
-        let mut unreadable = Vec::new();
-        for entry in sessions.iter().map_err(other)? {
-            let (id, value) = entry.map_err(other)?;
-            match serde_json::from_slice::<Session>(value.value()) {
-                Ok(session) => out.push(session),
-                Err(_) => unreadable.push(id.value().to_owned()),
-            }
-        }
-        out.sort_by_key(|session| session.started_ms);
-        Ok((out, unreadable))
+        all_in(&self.db)
     }
+}
+
+/// The log opened only to read it, for the commands that only read it. A
+/// writable open changes the file even when no session is written (redb's
+/// own bookkeeping as it opens and closes: its time and size move), so a
+/// reader never makes one on the log: it opens it read-only, and never
+/// creates it — where none exists, no session was recorded. Writers use
+/// [`Store`].
+pub struct Reader {
+    db: Option<Box<dyn ReadableDatabase>>,
+    /// The private copy read instead of a log that needs a repair, kept only
+    /// to be removed with the reader. After `db`, so the copy is closed
+    /// before it is removed.
+    _copy: Option<PrivateCopy>,
+}
+
+impl Reader {
+    /// Retried briefly while a writer holds the log, then said to be busy: a
+    /// reader never waits on a writer for long.
+    pub fn open(path: &Path) -> Result<Reader, StoreError> {
+        retrying(|| Self::open_once(path))
+    }
+
+    fn open_once(path: &Path) -> Result<Reader, StoreError> {
+        let broken = |why: String| StoreError::Broken {
+            path: path.to_path_buf(),
+            why,
+        };
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.len() == 0 => return Err(broken("the file is empty".to_owned())),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Reader {
+                    db: None,
+                    _copy: None,
+                })
+            }
+            Err(error) => return Err(other(error)),
+        }
+        match ReadOnlyDatabase::open(path) {
+            Ok(db) => Ok(Reader {
+                db: Some(Box::new(db)),
+                _copy: None,
+            }),
+            Err(DatabaseError::DatabaseAlreadyOpen) => Err(StoreError::Locked),
+            // A writer that stopped while it held the log (killed, crashed)
+            // leaves it needing a repair, and only a writable open repairs.
+            // The repair is made on a private copy, which is read instead;
+            // the log itself is repaired by the next writer.
+            Err(DatabaseError::RepairAborted) => {
+                let unread = |error: &dyn std::fmt::Display| {
+                    other(format!(
+                        "it was left open by a writer that stopped, and a private copy of it \
+                         could not be made and repaired to read ({error})"
+                    ))
+                };
+                let copy = PrivateCopy::of(path).map_err(|error| unread(&error))?;
+                let db = Database::open(&copy.0).map_err(|error| unread(&error))?;
+                Ok(Reader {
+                    db: Some(Box::new(db)),
+                    _copy: Some(copy),
+                })
+            }
+            Err(error) => Err(broken(error.to_string())),
+        }
+    }
+
+    pub fn get(&self, id: &str) -> Result<Option<Session>, StoreError> {
+        self.db.as_deref().map_or(Ok(None), |db| get_in(db, id))
+    }
+
+    pub fn latest_for(&self, repo: &str) -> Result<Option<Session>, StoreError> {
+        self.db
+            .as_deref()
+            .map_or(Ok(None), |db| latest_in(db, repo))
+    }
+
+    /// As [`Store::all`].
+    pub fn all(&self) -> Result<(Vec<Session>, Vec<String>), StoreError> {
+        self.db
+            .as_deref()
+            .map_or_else(|| Ok((Vec::new(), Vec::new())), all_in)
+    }
+}
+
+/// A copy of the log that only this process reads, in the temporary
+/// directory (never beside the log), removed when dropped.
+struct PrivateCopy(PathBuf);
+
+impl PrivateCopy {
+    fn of(log: &Path) -> std::io::Result<PrivateCopy> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "ohjaa-log-copy-{}-{nanos}-{}.redb",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        // Never an existing file, nor one another user can read.
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&path)?;
+        let copy = PrivateCopy(path);
+        std::io::copy(&mut std::fs::File::open(log)?, &mut file)?;
+        Ok(copy)
+    }
+}
+
+impl Drop for PrivateCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Run `open` until it is not [`StoreError::Locked`], for at most about a
+/// second and a half: whoever holds the log holds it for one short write.
+fn retrying<T>(open: impl Fn() -> Result<T, StoreError>) -> Result<T, StoreError> {
+    let mut delay = Duration::from_millis(20);
+    let mut waited = Duration::ZERO;
+    loop {
+        match open() {
+            Err(StoreError::Locked) if waited < Duration::from_millis(1500) => {
+                std::thread::sleep(delay);
+                waited += delay;
+                delay = (delay * 2).min(Duration::from_millis(200));
+            }
+            result => return result,
+        }
+    }
+}
+
+// ---- reading, for a writer and a reader alike --------------------------------
+
+/// A table of the log, or `None` where it was never made: a reader creates
+/// nothing, and a missing table holds nothing.
+fn read_table<K: redb::Key + 'static, V: redb::Value + 'static>(
+    tx: &ReadTransaction,
+    table: TableDefinition<'_, K, V>,
+) -> Result<Option<redb::ReadOnlyTable<K, V>>, StoreError> {
+    match tx.open_table(table) {
+        Ok(table) => Ok(Some(table)),
+        Err(TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(error) => Err(other(error)),
+    }
+}
+
+fn get_in(db: &dyn ReadableDatabase, id: &str) -> Result<Option<Session>, StoreError> {
+    let tx = db.begin_read().map_err(other)?;
+    let Some(sessions) = read_table(&tx, SESSIONS)? else {
+        return Ok(None);
+    };
+    let Some(value) = sessions.get(id).map_err(other)? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(value.value())
+        .map(Some)
+        .map_err(|error| other(format!("session {id} is unreadable: {error}")))
+}
+
+fn latest_in(db: &dyn ReadableDatabase, repo: &str) -> Result<Option<Session>, StoreError> {
+    let id = {
+        let tx = db.begin_read().map_err(other)?;
+        let Some(latest) = read_table(&tx, LATEST)? else {
+            return Ok(None);
+        };
+        match latest.get(repo).map_err(other)? {
+            Some(id) => id.value().to_owned(),
+            None => return Ok(None),
+        }
+    };
+    get_in(db, &id)
+}
+
+fn all_in(db: &dyn ReadableDatabase) -> Result<(Vec<Session>, Vec<String>), StoreError> {
+    let tx = db.begin_read().map_err(other)?;
+    let Some(sessions) = read_table(&tx, SESSIONS)? else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut out = Vec::new();
+    let mut unreadable = Vec::new();
+    for entry in sessions.iter().map_err(other)? {
+        let (id, value) = entry.map_err(other)?;
+        match serde_json::from_slice::<Session>(value.value()) {
+            Ok(session) => out.push(session),
+            Err(_) => unreadable.push(id.value().to_owned()),
+        }
+    }
+    out.sort_by_key(|session| session.started_ms);
+    Ok((out, unreadable))
 }
 
 /// Keep `LATEST` pointing at each repository's latest *ended* session. A
@@ -1708,6 +1869,138 @@ mod tests {
         );
         drop(holder);
         assert!(Store::open(&path).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The bytes and modification time of `path`, after setting that time an
+    /// hour back: any write from here on moves it, however coarse the clock.
+    fn settled(path: &Path) -> (Vec<u8>, std::time::SystemTime) {
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+        stamp(path)
+    }
+
+    fn stamp(path: &Path) -> (Vec<u8>, std::time::SystemTime) {
+        let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+        (std::fs::read(path).unwrap(), modified)
+    }
+
+    #[test]
+    fn a_reader_never_writes_the_log_and_never_creates_one() {
+        let dir = temp("reader");
+        let path = store_path(&dir);
+        let none = Reader::open(&path).unwrap();
+        assert_eq!(none.all().unwrap(), (Vec::new(), Vec::new()));
+        assert!(none.latest_for("/r/a").unwrap().is_none());
+        assert!(!path.exists(), "reading never creates the log");
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .put(&ended(session("oh-1", "/r/a", 1_000), 1_500))
+                .unwrap();
+            store.put(&session("oh-2", "/r/a", 2_000)).unwrap();
+        }
+        let before = settled(&path);
+        let reader = Reader::open(&path).unwrap();
+        let (all, unreadable) = reader.all().unwrap();
+        assert_eq!(
+            all.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["oh-1", "oh-2"]
+        );
+        assert!(unreadable.is_empty());
+        assert_eq!(reader.latest_for("/r/a").unwrap().unwrap().id, "oh-1");
+        assert_eq!(reader.get("oh-2").unwrap().unwrap().id, "oh-2");
+        drop(reader);
+        assert!(stamp(&path) == before, "a reader wrote the log");
+        // A writer opens it as before, after a reader let it go.
+        Store::open(&path).unwrap();
+        // A log with no tables yet holds no sessions.
+        let bare = dir.join("bare.redb");
+        drop(Database::create(&bare).unwrap());
+        let reader = Reader::open(&bare).unwrap();
+        assert_eq!(reader.all().unwrap(), (Vec::new(), Vec::new()));
+        assert!(reader.get("oh-1").unwrap().is_none());
+        assert!(reader.latest_for("/r/a").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_reader_reports_an_empty_or_corrupt_log_and_leaves_it_alone() {
+        let dir = temp("reader-broken");
+        let path = store_path(&dir);
+        std::fs::write(&path, b"").unwrap();
+        let error = Reader::open(&path).err().expect("an empty log is refused");
+        assert!(matches!(error, StoreError::Broken { .. }), "{error}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        std::fs::write(&path, b"this is not a redb database at all, not even close").unwrap();
+        let before = settled(&path);
+        let error = Reader::open(&path).err().expect("a corrupt log is refused");
+        assert!(matches!(error, StoreError::Broken { .. }), "{error}");
+        assert!(stamp(&path) == before, "left untouched");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_reader_beside_a_writer_is_told_locked_promptly() {
+        let dir = temp("reader-locked");
+        let path = store_path(&dir);
+        let holder = Store::open(&path).unwrap();
+        let started = std::time::Instant::now();
+        let error = Reader::open(&path)
+            .err()
+            .expect("a held log is not read beside its writer");
+        assert!(matches!(error, StoreError::Locked), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "retries are bounded"
+        );
+        drop(holder);
+        assert!(Reader::open(&path).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_log_a_writer_left_unclean_is_read_from_a_private_copy_never_repaired_in_place() {
+        let dir = temp("reader-unclean");
+        let path = store_path(&dir);
+        let unclean = dir.join("unclean.redb");
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .put(&ended(session("oh-1", "/r/a", 1_000), 1_500))
+                .unwrap();
+            // Its bytes while a writer still holds it: what a writer killed
+            // there leaves behind.
+            std::fs::copy(&path, &unclean).unwrap();
+        }
+        assert!(
+            matches!(
+                redb::ReadOnlyDatabase::open(&unclean),
+                Err(DatabaseError::RepairAborted)
+            ),
+            "the fixture needs a repair"
+        );
+        let before = settled(&unclean);
+        let reader = Reader::open(&unclean).unwrap();
+        let copy = reader._copy.as_ref().expect("read from a copy").0.clone();
+        assert!(
+            copy.is_file() && !copy.starts_with(&dir),
+            "{}",
+            copy.display()
+        );
+        assert_eq!(reader.all().unwrap().0[0].id, "oh-1");
+        assert_eq!(reader.latest_for("/r/a").unwrap().unwrap().id, "oh-1");
+        drop(reader);
+        assert!(!copy.exists(), "the private copy is removed");
+        assert!(
+            stamp(&unclean) == before,
+            "the log itself is never repaired"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

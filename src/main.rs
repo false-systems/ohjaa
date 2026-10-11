@@ -283,12 +283,10 @@ fn cmd_usage(action: &UsageCmd) -> Result<i32> {
         UsageCmd::Export { session } => {
             // Read, then let the log go before writing: a reader that stops
             // reading must never hold every other ohjaa off the log.
-            // With no log yet there is nothing to export, and none is created.
-            let (mut records, unreadable) = if sessions::store_path(&dirs.state).exists() {
-                open()?.all()?
-            } else {
-                (Vec::new(), Vec::new())
-            };
+            // Opened only to read: with no log yet there is nothing to
+            // export, and none is created.
+            let (mut records, unreadable) =
+                sessions::Reader::open(&sessions::store_path(&dirs.state))?.all()?;
             if let Some(id) = session {
                 records.retain(|s| s.id == *id);
                 anyhow::ensure!(
@@ -684,6 +682,18 @@ fn session_store(dirs: &Dirs) -> Option<sessions::Store> {
     }
 }
 
+/// Open the session log only to read it, or say why not: what only reads
+/// the log never writes it (#41).
+fn session_reader(dirs: &Dirs) -> Option<sessions::Reader> {
+    match sessions::Reader::open(&sessions::store_path(&dirs.state)) {
+        Ok(log) => Some(log),
+        Err(error) => {
+            eprintln!("ohjaa: {error}; carrying on without the session log");
+            None
+        }
+    }
+}
+
 fn repo_key(repo: &Path) -> String {
     std::fs::canonicalize(repo)
         .unwrap_or_else(|_| repo.to_path_buf())
@@ -700,20 +710,21 @@ const STANDING_LOOKBACK: usize = 50;
 /// branch that still sits at the flagged commit, including one a session only
 /// found here saw), and "Last session here". `None` when it knows neither.
 fn last_session_here(dirs: &Dirs, repo: &Path) -> Option<(String, String)> {
-    let store = session_store(dirs)?;
     let here = repo_key(repo);
-    let latest = match store.latest_for(&here) {
-        Ok(latest) => latest,
-        Err(error) => {
-            eprintln!("ohjaa: {error}");
-            return None;
-        }
+    // Read in one short open, let go before any git is asked.
+    let (latest, all) = {
+        let log = session_reader(dirs)?;
+        let latest = match log.latest_for(&here) {
+            Ok(latest) => latest,
+            Err(error) => {
+                eprintln!("ohjaa: {error}");
+                return None;
+            }
+        };
+        (latest, log.all().map(|(all, _)| all).unwrap_or_default())
     };
     let latest_id = latest.as_ref().map(|s| s.id.clone());
-    let mut earlier: Vec<sessions::Session> = store
-        .all()
-        .map(|(all, _)| all)
-        .unwrap_or_default()
+    let mut earlier: Vec<sessions::Session> = all
         .into_iter()
         .filter(|s| Some(&s.id) != latest_id.as_ref() && sessions::observed_in(s, &here))
         .collect();
@@ -806,7 +817,7 @@ fn cmd_handover(
 
 fn cmd_session(id: Option<&str>) -> Result<i32> {
     let dirs = dirs()?;
-    let store = sessions::Store::open(&sessions::store_path(&dirs.state))
+    let store = sessions::Reader::open(&sessions::store_path(&dirs.state))
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let session = match id {
         Some(id) => store.get(id).map_err(|e| anyhow::anyhow!("{e}"))?,
@@ -930,8 +941,8 @@ fn cmd_graph(id: &str) -> Result<i32> {
             replaced_by.join(", ")
         }
     );
-    if let Some(store) = session_store(&dirs) {
-        if let Ok((all, _)) = store.all() {
+    if let Some(log) = session_reader(&dirs) {
+        if let Ok((all, _)) = log.all() {
             let briefed: Vec<&sessions::Session> = all
                 .iter()
                 .rev()
@@ -1314,10 +1325,10 @@ fn cmd_intake(
     };
     // Sessions that ended and were never drafted from: the agent's own
     // handover, and what was said in that session's window, even when the
-    // window lies before the cursor. Read in one short open of the log; no
-    // store is held across the slow calls below.
-    let queued: Vec<sessions::Session> = session_store(&dirs)
-        .and_then(|store| store.all().ok())
+    // window lies before the cursor. Read in one short, read-only open of the
+    // log; no store is held across the slow calls below.
+    let queued: Vec<sessions::Session> = session_reader(&dirs)
+        .and_then(|log| log.all().ok())
         .map(|(all, _)| {
             all.into_iter()
                 .filter(|s| s.left.is_some() && !s.drafted)
@@ -2130,10 +2141,23 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
 /// false (a dry run) it is only said. A session whose ohjaa may still run, or
 /// cannot be told, is left alone.
 fn close_orphans(dirs: &Dirs, write: bool) -> Vec<sessions::Session> {
-    let Some(store) = session_store(dirs) else {
-        return Vec::new();
+    // A dry run only says what it would close: it opens the log to read.
+    let store = if write {
+        let Some(store) = session_store(dirs) else {
+            return Vec::new();
+        };
+        Some(store)
+    } else {
+        None
     };
-    let Ok((all, _)) = store.all() else {
+    let all = match &store {
+        Some(store) => store.all(),
+        None => match session_reader(dirs) {
+            Some(log) => log.all(),
+            None => return Vec::new(),
+        },
+    };
+    let Ok((all, _)) = all else {
         return Vec::new();
     };
     let now_ms = intake::now_seconds() * 1000;
@@ -2147,12 +2171,12 @@ fn close_orphans(dirs: &Dirs, write: bool) -> Vec<sessions::Session> {
             continue;
         }
         let left = sessions::Left::orphaned(now_ms);
-        if !write {
+        let Some(store) = &store else {
             let mut session = session;
             session.left = Some(left);
             closed.push(session);
             continue;
-        }
+        };
         let updated = store.update(&session.id, |s| {
             if s.left.is_none() {
                 s.left = Some(left);
