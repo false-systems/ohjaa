@@ -363,6 +363,17 @@ impl Sandbox {
     /// own trace2 event stream, with its output. A missing or empty stream
     /// fails the test: a count of nothing must never pass for zero.
     fn git_starts(&self, command: &mut Command) -> (Vec<String>, Output) {
+        let (events, output) = self.git_events(command);
+        let starts = events
+            .into_iter()
+            .filter(|line| line.contains("\"event\":\"start\""))
+            .collect();
+        (starts, output)
+    }
+
+    /// Every trace2 event of the git processes `command` starts; a missing
+    /// or empty stream fails the test.
+    fn git_events(&self, command: &mut Command) -> (Vec<String>, Output) {
         static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let trace = self.dir.join(format!("trace2-{n}.json"));
@@ -375,12 +386,7 @@ impl Sandbox {
             trace.display(),
             text(&output).1
         );
-        let starts = events
-            .lines()
-            .filter(|line| line.contains("\"event\":\"start\""))
-            .map(str::to_owned)
-            .collect();
-        (starts, output)
+        (events.lines().map(str::to_owned).collect(), output)
     }
 }
 
@@ -1763,8 +1769,9 @@ fn every_command_stays_within_its_git_budget() {
         command
     };
 
-    // apply: git's version and global config, then one per clone, and one
-    // check per file it writes.
+    // apply before any entry: git's version and global config, no clone read
+    // (nothing can be gated yet), the include added and git/config checked
+    // before it is written.
     let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&["apply", "--root", &root]));
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
     assert!(
@@ -1776,7 +1783,11 @@ fn every_command_stays_within_its_git_budget() {
         started(&starts, "--version") && started(&starts, "--global"),
         "{starts:#?}"
     );
-    budget("ohjaa apply (4 clones, first run)", starts.len(), 2 + 4 + 1);
+    budget(
+        "ohjaa apply (no entries yet, first run)",
+        starts.len(),
+        2 + 2,
+    );
     let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&["apply"]));
     assert!(
         text(&output).0.contains("nothing to change"),
@@ -1784,11 +1795,7 @@ fn every_command_stays_within_its_git_budget() {
         text(&output).0
     );
     assert!(started(&starts, "--global"), "{starts:#?}");
-    budget(
-        "ohjaa apply (4 clones, nothing to change)",
-        starts.len(),
-        2 + 4,
-    );
+    budget("ohjaa apply (no entries yet, no change)", starts.len(), 2);
 
     // adopt: the repository's config and objects, git's global config, its
     // config again once gated, and a check per file it writes (2).
@@ -1807,6 +1814,41 @@ fn every_command_stays_within_its_git_budget() {
     assert!(started(&starts, "cat-file"), "{starts:#?}");
     budget("ohjaa adopt", starts.len(), 4 + 2);
     sandbox.adopt(&own);
+
+    // apply with two entries, nothing to change: now it reads the clones.
+    // Exactly git's version and global config, then one process per clone
+    // under the roots (4, gated or not): each clone is read exactly once.
+    let (events, output) = sandbox.git_events(&mut ohjaa_here(&["apply"]));
+    assert!(
+        text(&output).0.contains("nothing to change"),
+        "{}",
+        text(&output).0
+    );
+    for clone in ["gated", "own", "free", "local-hooks"] {
+        let worktree = format!(
+            "\"worktree\":\"{}\"",
+            sandbox.dir.join("projects").join(clone).display()
+        );
+        let reads = events
+            .iter()
+            .filter(|line| line.contains("\"event\":\"def_repo\"") && line.contains(&worktree))
+            .count();
+        assert_eq!(reads, 1, "apply read {clone} {reads} times, not once");
+    }
+    let starts = events
+        .iter()
+        .filter(|line| line.contains("\"event\":\"start\""))
+        .count();
+    assert_eq!(
+        starts,
+        2 + 4,
+        "apply with entries: 2 + 1 per clone, exactly"
+    );
+    budget(
+        "ohjaa apply (2 entries, 4 clones, no change)",
+        starts,
+        2 + 4,
+    );
 
     // pre-commit, a hook that only chains: `git commit` through the
     // dispatcher, against the same commit with git running the own hook.
