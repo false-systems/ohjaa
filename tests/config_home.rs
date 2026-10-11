@@ -359,39 +359,41 @@ impl Sandbox {
             .count()
     }
 
-    /// The git processes `command` starts, as git's own trace2 event stream
-    /// counts them (one `"event":"start"` per process), with its output.
-    fn git_starts(&self, command: &mut Command, stdin: Option<&str>) -> (usize, Output) {
+    /// The `start` events of the git processes `command` starts, from git's
+    /// own trace2 event stream, with its output. A missing or empty stream
+    /// fails the test: a count of nothing must never pass for zero.
+    fn git_starts(&self, command: &mut Command) -> (Vec<String>, Output) {
         static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let trace = self.dir.join(format!("trace2-{n}.json"));
         command.env("GIT_TRACE2_EVENT", &trace);
-        let output = match stdin {
-            Some(input) => {
-                use std::io::Write;
-                let mut child = command
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child
-                    .stdin
-                    .take()
-                    .unwrap()
-                    .write_all(input.as_bytes())
-                    .unwrap();
-                child.wait_with_output().unwrap()
-            }
-            None => command.output().unwrap(),
-        };
+        let output = command.output().unwrap();
         let events = fs::read_to_string(&trace).unwrap_or_default();
+        assert!(
+            !events.trim().is_empty(),
+            "no trace2 events in {}: git never ran under {command:?}\n{}",
+            trace.display(),
+            text(&output).1
+        );
         let starts = events
             .lines()
             .filter(|line| line.contains("\"event\":\"start\""))
-            .count();
+            .map(str::to_owned)
+            .collect();
         (starts, output)
     }
+}
+
+/// Whether one of the `start` events is git's own `git … <word> …` (trace2
+/// names git by the path it ran from).
+fn started(starts: &[String], word: &str) -> bool {
+    let word = format!("\"{word}\"");
+    starts.iter().any(|line| {
+        line.split_once("\"argv\":[")
+            .and_then(|(_, argv)| argv.split(',').next())
+            .is_some_and(|program| program.ends_with("git\""))
+            && line.contains(&word)
+    })
 }
 
 impl Drop for Sandbox {
@@ -1729,8 +1731,12 @@ claude
 }
 
 /// "We don't want to run git git git": each command's own git processes, as
-/// git's trace2 counts them, within its budget. The stub sykli runs no git,
-/// so what is counted is ohjaa's.
+/// git's trace2 counts them, within its budget. Every case first proves it
+/// measured something real (a positive control): the trace holds the git
+/// command that ran the hook, and what the command does visibly happened.
+/// A hook is measured as the same git command run through ohjaa's
+/// dispatcher, minus the same command with ohjaa out of the way. The stub
+/// sykli runs no git, so the rest is ohjaa's own.
 #[test]
 fn every_command_stays_within_its_git_budget() {
     let mut sandbox = Sandbox::new("budget");
@@ -1738,76 +1744,127 @@ fn every_command_stays_within_its_git_budget() {
     sandbox.stub_contract = "fast";
     let (gated, bare) = sandbox.repo("acme", "gated", &[("sykli.json", "{}\n")]);
     let (own, _) = sandbox.repo("acme", "own", &[("sykli.json", "{}\n")]);
-    write_executable(&own.join(".git/hooks/pre-commit"), "#!/bin/sh\nexit 0\n");
+    write_executable(
+        &own.join(".git/hooks/pre-commit"),
+        "#!/bin/sh\necho ran >> \"$SANDBOX/own-pre-commit\"\n",
+    );
     sandbox.repo("acme", "free", &[]);
     let (local, _) = sandbox.repo("acme", "local-hooks", &[("sykli.json", "{}\n")]);
     sandbox.git(&local, &["config", "core.hooksPath", ".githooks"]);
-    let budget = |what: &str, starts: usize, at_most: usize| {
+    let mut report = Vec::new();
+    let mut budget = |what: &str, starts: usize, at_most: usize| {
         eprintln!("{what:<44} {starts} git processes (budget {at_most})");
-        starts <= at_most
+        report.push((what.to_owned(), starts, at_most));
     };
-    let mut over = Vec::new();
     let root = sandbox.projects();
+    let ohjaa_here = |args: &[&str]| {
+        let mut command = sandbox.command("ohjaa", &sandbox.dir);
+        command.args(args);
+        command
+    };
 
-    // apply: git's version and global config, then one per clone (4), and
-    // one check per file it writes (git/config).
-    let (starts, output) = sandbox.git_starts(
-        sandbox
-            .command("ohjaa", &sandbox.dir)
-            .args(["apply", "--root", &root]),
-        None,
-    );
+    // apply: git's version and global config, then one per clone, and one
+    // check per file it writes.
+    let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&["apply", "--root", &root]));
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
-    if !budget("ohjaa apply (4 clones, first run)", starts, 2 + 4 + 1) {
-        over.push("apply");
-    }
-    let (starts, _) = sandbox.git_starts(sandbox.command("ohjaa", &sandbox.dir).arg("apply"), None);
-    if !budget("ohjaa apply (4 clones, nothing to change)", starts, 2 + 4) {
-        over.push("apply again");
-    }
+    assert!(
+        text(&output).0.contains("ohjaa apply: wrote"),
+        "{}",
+        text(&output).0
+    );
+    assert!(
+        started(&starts, "--version") && started(&starts, "--global"),
+        "{starts:#?}"
+    );
+    budget("ohjaa apply (4 clones, first run)", starts.len(), 2 + 4 + 1);
+    let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&["apply"]));
+    assert!(
+        text(&output).0.contains("nothing to change"),
+        "{}",
+        text(&output).0
+    );
+    assert!(started(&starts, "--global"), "{starts:#?}");
+    budget(
+        "ohjaa apply (4 clones, nothing to change)",
+        starts.len(),
+        2 + 4,
+    );
+
     // adopt: the repository's config and objects, git's global config, its
     // config again once gated, and a check per file it writes (2).
-    let (starts, output) = sandbox.git_starts(
-        sandbox
-            .command("ohjaa", &sandbox.dir)
-            .args(["adopt", &gated.to_string_lossy()]),
-        None,
-    );
+    let (starts, output) =
+        sandbox.git_starts(&mut ohjaa_here(&["adopt", &gated.to_string_lossy()]));
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
-    if !budget("ohjaa adopt", starts, 4 + 2) {
-        over.push("adopt");
-    }
+    assert!(
+        text(&output).0.contains("  gated: git runs"),
+        "{}",
+        text(&output).0
+    );
+    assert!(sandbox
+        .config()
+        .join("repos/acme/gated/repo.toml")
+        .is_file());
+    assert!(started(&starts, "cat-file"), "{starts:#?}");
+    budget("ohjaa adopt", starts.len(), 4 + 2);
     sandbox.adopt(&own);
 
-    // A hook that only chains starts no git at all.
-    let (starts, output) = sandbox.git_starts(
-        sandbox.command("ohjaa", &own).args(["hook", "pre-commit"]),
-        None,
+    // pre-commit, a hook that only chains: `git commit` through the
+    // dispatcher, against the same commit with git running the own hook.
+    let own_ran = || sandbox.read("own-pre-commit").lines().count();
+    let commit = |direct: bool| {
+        let mut command = sandbox.command("git", &own);
+        if direct {
+            command.args([
+                "-c",
+                &format!("core.hooksPath={}", own.join(".git/hooks").display()),
+            ]);
+        }
+        command.args(["commit", "-q", "--allow-empty", "-m", "measure"]);
+        let before = own_ran();
+        let (starts, output) = sandbox.git_starts(&mut command);
+        assert!(output.status.success(), "{}", text(&output).1);
+        assert!(
+            started(&starts, "commit"),
+            "no git commit in the trace: {starts:#?}"
+        );
+        assert_eq!(own_ran(), before + 1, "the own pre-commit did not run");
+        starts.len()
+    };
+    let through = commit(false);
+    let direct = commit(true);
+    budget(
+        "ohjaa hook pre-commit (chains only)",
+        through.saturating_sub(direct),
+        0,
     );
-    assert!(output.status.success(), "{}", text(&output).1);
-    if !budget("ohjaa hook pre-commit (chains only)", starts, 0) {
-        over.push("hook pre-commit");
-    }
 
-    // pre-push: at most one of its own, sykli's aside; sykli gets the facts.
-    let head = sandbox.git(&gated, &["rev-parse", "HEAD"]);
-    let line = format!(
-        "refs/heads/side {head} refs/heads/side {}\n",
-        "0".repeat(40)
-    );
-    let (starts, output) = sandbox.git_starts(
-        sandbox.command("ohjaa", &gated).args([
-            "hook",
-            "pre-push",
-            "origin",
-            &bare.to_string_lossy(),
-        ]),
-        Some(&line),
-    );
-    assert!(output.status.success(), "{}", text(&output).1);
-    if !budget("ohjaa hook pre-push (gated)", starts, 1) {
-        over.push("hook pre-push");
-    }
+    // pre-push: `git push` through the dispatcher, against the same push
+    // with no hooks at all. Each pushes one new commit to a new branch.
+    let calls = || sandbox.read("sykli-calls").lines().count();
+    let push = |branch: &str, hooks: bool| {
+        sandbox.commit(&gated, branch);
+        let mut command = sandbox.command("git", &gated);
+        if !hooks {
+            command.args(["-c", "core.hooksPath=/dev/null"]);
+        }
+        command.args(["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")]);
+        let before = calls();
+        let (starts, output) = sandbox.git_starts(&mut command);
+        assert!(output.status.success(), "{}", text(&output).1);
+        assert!(
+            started(&starts, "push"),
+            "no git push in the trace: {starts:#?}"
+        );
+        sandbox.git(
+            &bare,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        );
+        (starts.len(), calls() - before)
+    };
+    let (through, gate_calls) = push("measured", true);
+    let (direct, no_calls) = push("plain", false);
+    assert_eq!(no_calls, 0, "sykli ran without the dispatcher");
+    assert!(gate_calls >= 1, "the gate never asked sykli");
     let facts = format!(
         "--repo-root {} --git-common-dir {}",
         gated.display(),
@@ -1820,13 +1877,23 @@ fn every_command_stays_within_its_git_budget() {
         "{}",
         sandbox.read("sykli-calls")
     );
+    budget(
+        "ohjaa hook pre-push (gated)",
+        through.saturating_sub(direct),
+        1,
+    );
 
     // ohjaa gate: one git process, then sykli's own, with the facts.
-    let (starts, output) = sandbox.git_starts(sandbox.command("ohjaa", &gated).arg("gate"), None);
+    let (starts, output) = sandbox.git_starts(sandbox.command("ohjaa", &gated).arg("gate"));
     assert!(output.status.success(), "{}", text(&output).1);
-    if !budget("ohjaa gate", starts, 1) {
-        over.push("gate");
-    }
+    assert!(
+        text(&output).0.contains("ohjaa gate: passed"),
+        "{}",
+        text(&output).0
+    );
+    assert!(sandbox
+        .read("projects/gated/.sykli/receipt.json")
+        .contains("passed"));
     let contract = sandbox.config().join("repos/acme/gated/sykli.json");
     let calls = sandbox.read("sykli-calls");
     assert!(
@@ -1834,42 +1901,64 @@ fn every_command_stays_within_its_git_budget() {
         "{calls}"
     );
     assert!(calls.contains(&format!("{facts} --commit HEAD")), "{calls}");
+    budget("ohjaa gate", starts.len(), 1);
 
     // doctor: two for the machine, at most two per clone.
-    let (starts, _) = sandbox.git_starts(
-        sandbox
-            .command("ohjaa", &sandbox.dir)
-            .args(["doctor", "--root", &root]),
-        None,
-    );
-    if !budget("ohjaa doctor (4 clones)", starts, 2 + 2 * 4) {
-        over.push("doctor");
+    let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&["doctor", "--root", &root]));
+    let (stdout, _) = text(&output);
+    assert!(stdout.contains("ohjaa doctor: "), "{stdout}");
+    for clone in [
+        "gated (acme/gated)",
+        "own (acme/own)",
+        "local-hooks: ",
+        "free",
+    ] {
+        assert!(
+            stdout.contains(clone),
+            "doctor did not look at {clone}: {stdout}"
+        );
     }
+    assert!(
+        started(&starts, "--version") && started(&starts, "--global"),
+        "{starts:#?}"
+    );
+    budget("ohjaa doctor (4 clones)", starts.len(), 2 + 2 * 4);
 
-    // ohjaa run's warning: what a launch costs with entries, beyond the same
-    // launch with no entries at all (which reads no clone).
+    // ohjaa run's warning, for a clone that has drifted (a hook of its own
+    // with no dispatcher): a launch with entries, beyond the same launch with
+    // no entries at all, which reads no clone.
+    write_executable(&gated.join(".git/hooks/pre-commit"), "#!/bin/sh\nexit 0\n");
     let launch = |sandbox: &Sandbox| {
-        sandbox
-            .git_starts(
-                sandbox.command("ohjaa", &gated).args([
-                    "run",
-                    "claude",
-                    "--intent",
-                    "x",
-                    "--dry-run",
-                ]),
-                None,
-            )
-            .0
+        let (starts, output) = sandbox.git_starts(sandbox.command("ohjaa", &gated).args([
+            "run",
+            "claude",
+            "--intent",
+            "x",
+            "--dry-run",
+        ]));
+        let (_, stderr) = text(&output);
+        assert!(
+            stderr.contains("ohjaa: dry-run; would run:"),
+            "the launch stopped short: {stderr}"
+        );
+        (starts.len(), stderr)
     };
-    let with = launch(&sandbox);
+    let (with, said) = launch(&sandbox);
+    assert!(
+        said.contains("its own pre-commit hook has no dispatcher"),
+        "no warning for the drifted clone: {said}"
+    );
     let repos = sandbox.config().join("repos");
     fs::rename(&repos, sandbox.config().join("repos.aside")).unwrap();
-    let without = launch(&sandbox);
+    let (without, said) = launch(&sandbox);
     fs::rename(sandbox.config().join("repos.aside"), &repos).unwrap();
-    if !budget("ohjaa run's gate warning", with.saturating_sub(without), 2) {
-        over.push("run warning");
-    }
+    assert!(!said.contains("has no dispatcher"), "{said}");
+    budget("ohjaa run's gate warning", with.saturating_sub(without), 2);
+
+    let over: Vec<_> = report
+        .iter()
+        .filter(|(_, starts, at_most)| starts > at_most)
+        .collect();
     assert!(over.is_empty(), "over budget: {over:?}");
 }
 
