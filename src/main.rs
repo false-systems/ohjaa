@@ -252,21 +252,27 @@ enum Cmd {
     #[command(after_help = "Exit codes:\n  \
         0  applied, undone, or nothing to change\n  \
         1  a tool was not installed, git is older than 2.36, or a change could not be made\n  \
-        3  refused: git's global core.hooksPath is set (see --force)\n\n\
+        3  refused: a global core.hooksPath (see --force), an ohjaa that is not the\n     \
+           one on PATH (see --bin), or --prune without a roots file\n\n\
         Writes in the home:\n  \
-        hooks/<name>        #!/bin/sh + exec <this ohjaa> hook <name> \"$@\", for pre-push\n                      \
-        and each hook a gated clone under the roots has of its own\n  \
-        git/config          includeIf \"hasconfig:remote.*.url:<pattern>\" per entry\n  \
-        git/gated.config    core.hooksPath = <home>/hooks\n  \
-        applied.toml        what apply changed outside the home, for --undo\n\
+        repos/<o>/<r>/hooks/<name>    exec <ohjaa> hook <name> \"$@\": pre-push, and each\n                                \
+        hook that entry's clones under the roots have of their own\n  \
+        repos/<o>/<r>/gated.config    core.hooksPath = that entry's hooks/\n  \
+        git/config                    includeIf \"hasconfig:remote.*.url:<pattern>\" per entry\n  \
+        roots                         on the first run that finds repositories: the roots\n  \
+        applied.toml                  what apply changes outside the home, kept before each change\n\
         Changes outside it, and nothing else:\n  \
-        git's global config  [include] path = <home>/git/config (once)\n  \
+        git's global config    [include] path = <home>/git/config (once)\n  \
         git's global excludes  a block marked \"ohjaa apply\" holding .sykli/\n  \
-        ~/.zshrc             eval \"$(ohjaa shell-init zsh)\", in place of a line\n                       \
-        that sources ~/projects/ohjaa-launch.zsh\n\
-        --undo puts those three back as they were, and removes hooks/, git/ and\n\
-        applied.toml; repos/ and tools.lock stay. With --tools, tools.lock's\n\
-        revisions are installed with\n  \
+        ~/.zshrc               [[ -x <ohjaa> ]] && eval \"$(<ohjaa> shell-init zsh)\", in place\n                         \
+        of a line that sources ~/projects/ohjaa-launch.zsh\n\
+        <ohjaa> is the ohjaa on PATH (or --bin), and the pre-push dispatchers name\n\
+        the sykli on PATH, both by absolute path. Dispatchers are only added;\n\
+        --prune removes the ones no clone needs. --undo puts the three changes back\n\
+        as they were (a hooksPath --force removed comes back at the end of [core],\n\
+        a global config apply created is removed), and removes what apply wrote\n\
+        in the home except the entries, roots and tools.lock. With --tools,\n\
+        tools.lock's revisions are installed with\n  \
         cargo +<toolchain> install --git <url> --rev <rev> --locked --force <name>\n\
         from an empty temporary directory, for each tool not already at its pin.")]
     Apply {
@@ -279,6 +285,12 @@ enum Cmd {
         /// Also install the tool revisions tools.lock pins.
         #[arg(long, conflicts_with = "undo")]
         tools: bool,
+        /// Also remove dispatchers no clone under the roots needs (needs a roots file).
+        #[arg(long, conflicts_with = "undo")]
+        prune: bool,
+        /// The ohjaa the hooks and the launcher run, instead of the one on PATH.
+        #[arg(long, value_name = "PATH", conflicts_with = "undo")]
+        bin: Option<PathBuf>,
         /// Take back what apply changed outside the home, and what it generated.
         #[arg(long)]
         undo: bool,
@@ -526,6 +538,15 @@ fn git_root() -> Option<PathBuf> {
     git(&["rev-parse", "--show-toplevel"], None)
         .ok()
         .map(PathBuf::from)
+}
+
+/// The repository around the current directory, asked of git only when the
+/// roots must be derived from it: none given, and no roots file.
+fn git_root_for_roots(explicit: &[PathBuf]) -> Option<PathBuf> {
+    let configured = roots::config_path().is_some_and(|path| path.is_file());
+    (explicit.is_empty() && !configured)
+        .then(git_root)
+        .flatten()
 }
 
 fn repos(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -2809,6 +2830,8 @@ fn main() {
             dry_run,
             force,
             tools,
+            prune,
+            bin,
             undo,
         } => {
             if *undo {
@@ -2819,12 +2842,15 @@ fn main() {
                         dry_run: *dry_run,
                         force: *force,
                         tools: *tools,
+                        prune: *prune,
+                        bin: bin.as_deref(),
                     },
-                    &roots::load(&cli.root, git_root().as_deref()),
+                    &cli.root,
+                    git_root_for_roots(&cli.root).as_deref(),
                 )
             }
         }
-        Cmd::Doctor => workflow::doctor(&cli.root, git_root().as_deref()),
+        Cmd::Doctor => workflow::doctor(&cli.root, git_root_for_roots(&cli.root).as_deref()),
         Cmd::Adopt {
             path,
             branch,

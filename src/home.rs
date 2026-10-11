@@ -6,20 +6,21 @@
 //!
 //! ```text
 //! ~/.config/ohjaa/
-//!   repos/<owner>/<repo>/
+//!   repos/<owner>/<repo>/            lower case
 //!     repo.toml    branch = "main"   the only per-repo workflow fact
 //!     sykli.json   the gate (a sykli contract), inputs repo-relative
 //!     sykli.lock
-//!   git/config                       includeIf per entry remote -> gated.config
-//!   git/gated.config                 core.hooksPath = <home>/hooks
-//!   hooks/<name>                     exec <ohjaa> hook <name> "$@", for
-//!                                    pre-push and each hook a gated clone has
+//!     hooks/<name>                   exec <ohjaa> hook <name> "$@", for pre-push
+//!                                    and each hook the entry's clones have
+//!     gated.config                   core.hooksPath = that hooks/ folder
+//!   git/config                       includeIf per entry remote -> its gated.config
+//!   roots                            where apply and doctor look
 //!   applied.toml                     what apply changed, for `apply --undo`
 //!   tools.lock                       the tool revisions `apply --tools` installs
 //! ```
 //!
-//! The knowledge scopes (`mine/`, `machine/`) and the `roots`, `ours` and
-//! `drafter` files live in the same directory and are not touched here.
+//! The knowledge scopes (`mine/`, `machine/`) and the `ours` and `drafter`
+//! files live in the same directory and are not touched here.
 //!
 //! A repository is found by its remote: `git@github.com:o/r.git`,
 //! `https://github.com/o/r` and `ssh://git@github.com/o/r.git` are all
@@ -32,7 +33,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 use crate::flat_toml;
-use crate::knowledge::{config_home, expand_home};
+use crate::knowledge::config_home;
 use crate::process;
 
 /// `$XDG_CONFIG_HOME/ohjaa`, else `~/.config/ohjaa`.
@@ -295,36 +296,10 @@ fn global_command<'a>(args: &[&'a str]) -> (Command, Vec<&'a str>) {
     (command, full)
 }
 
-/// A global git setting that names a path, `~` expanded, wherever git's
-/// global config sets it: in the file itself or in a file it includes.
-pub fn global_path_setting(key: &str) -> Result<Option<String>> {
-    global_git(&["--includes", "--type=path", "--get", key])
-}
-
-/// Whether git's global config file itself (not a file it includes) sets
-/// `key`: only that is ohjaa's to change.
-pub fn global_sets_directly(key: &str) -> Result<bool> {
-    Ok(global_git(&["--no-includes", "--get", key])?.is_some())
-}
-
-/// The file a global setting comes from, as `git config --show-origin` says.
-pub fn global_origin(key: &str) -> Result<Option<String>> {
-    Ok(global_git(&["--includes", "--show-origin", "--get", key])?
-        .and_then(|line| line.split('\t').next().map(str::to_owned)))
-}
-
 pub fn set_global(key: &str, value: &str) -> Result<()> {
     global_git(&[key, value])?
         .map(|_| ())
         .with_context(|| format!("git config --global {key} did not take"))
-}
-
-/// Every value of a global setting that names a path, `~` expanded, in the
-/// global file itself.
-pub fn global_paths(key: &str) -> Result<Vec<String>> {
-    Ok(global_git(&["--type=path", "--get-all", key])?
-        .map(|text| text.lines().map(str::to_owned).collect())
-        .unwrap_or_default())
 }
 
 /// Add one more value to a global setting.
@@ -348,26 +323,6 @@ pub fn unset_global(key: &str, value: Option<&str>) -> Result<()> {
         Some(0 | 5) => Ok(()),
         _ => bail!("git {} failed: {}", full.join(" "), output.failure_detail()),
     }
-}
-
-/// The `insteadOf` rules in git's global config, includes followed, as
-/// `git config -z --get-regexp` prints them.
-pub fn global_rewrites_text() -> Result<String> {
-    Ok(
-        global_git(&["--includes", "-z", "--get-regexp", r"^url\..*\.insteadof$"])?
-            .unwrap_or_default(),
-    )
-}
-
-/// Git's global excludes file: `core.excludesFile` when set (includes
-/// followed), else `$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`.
-pub fn global_ignore_file() -> Result<PathBuf> {
-    if let Some(value) = global_path_setting("core.excludesFile")? {
-        if !value.is_empty() {
-            return Ok(expand_home(&value));
-        }
-    }
-    Ok(config_home()?.join("git").join("ignore"))
 }
 
 /// zsh's startup file: `$ZDOTDIR/.zshrc`, else `~/.zshrc`.

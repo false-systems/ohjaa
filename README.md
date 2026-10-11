@@ -513,8 +513,10 @@ The agent workflow (the gate, the hooks, the launcher) is a workflow thing,
 not something to merge into product repositories. Ohjaa keeps it in its home
 and applies it to repositories from outside; nothing is installed on a
 repository or written into one. Only repositories whose remote names an entry
-run ohjaa's hooks: `git status` in a Homebrew tap, Cargo's git cache or a
-personal project never starts ohjaa.
+run ohjaa's hooks, and only the hooks they need: `git status`, `commit` and
+`fetch` start no ohjaa at all unless the repository has a hook of its own
+there, and a Homebrew tap, Cargo's git cache or a personal project never
+starts it.
 
 ```
 ~/.config/ohjaa/                    ($XDG_CONFIG_HOME/ohjaa)
@@ -522,13 +524,14 @@ personal project never starts ohjaa.
     repo.toml     branch = "main"   the only per-repo workflow fact
     sykli.json    the gate (a sykli contract), inputs repo-relative
     sykli.lock
+    hooks/pre-push, hooks/<name>    exec '<ohjaa>' hook <name> "$@": pre-push, and each
+                                    hook this entry's clones have of their own
+    gated.config                    core.hooksPath = that hooks/ folder
   git/config                        includeIf "hasconfig:remote.*.url:<pattern>" per entry
-  git/gated.config                  core.hooksPath = ~/.config/ohjaa/hooks
-  hooks/pre-push, hooks/<name>      exec <ohjaa> hook <name> "$@": pre-push, and each
-                                    hook a gated clone has of its own
+  roots                             where apply and doctor look (written on the first run)
   applied.toml                      what apply changed outside the home, for --undo
   tools.lock                        the tool revisions apply --tools installs
-  mine/ machine/ roots ours drafter (knowledge and settings, as before)
+  mine/ machine/ ours drafter       (knowledge and settings, as before)
 ~/.gitconfig                        [include] path = ~/.config/ohjaa/git/config (once)
 ~/.config/git/ignore                git's global excludes (or core.excludesFile):
                                     a block marked "ohjaa apply" holds .sykli/
@@ -536,8 +539,9 @@ personal project never starts ohjaa.
 
 ```bash
 ohjaa apply --dry-run                  # every change apply would make; makes none
-ohjaa apply                            # git/, hooks/, the include, the ignore block, ~/.zshrc
-ohjaa apply --undo                     # put back what apply changed; repos/ and tools.lock stay
+ohjaa apply                            # the home's files, the include, the ignore block, ~/.zshrc
+ohjaa apply --undo                     # put back what apply changed; entries, roots, tools.lock stay
+ohjaa apply --prune                    # also remove dispatchers no clone needs any more
 ohjaa adopt ~/projects/taso            # entry: origin's default branch, and the gate
 ohjaa gate                             # run this repo's gate, as a push will judge it
 ohjaa gate --print                     # the contract and the commands, run nothing
@@ -548,18 +552,19 @@ ohjaa apply --tools                    # install tools.lock's revisions
 
 **Scoped by remote.** Git's global config gets one line, an `include` of
 `git/config`. That file has, for each entry, `includeIf
-"hasconfig:remote.*.url:…"` sections (git 2.36+) that include
-`gated.config`, which sets `core.hooksPath`. The patterns are host-agnostic
-and case-insensitive (`**/o/r`, `**/o/r.git`, `**/o/r/`, `*:o/r`, `*:o/r.git`,
-plus a short form for each global `insteadOf` rule), because a pattern that
-misses lets a push past the gate, while one that matches too much only costs a
+"hasconfig:remote.*.url:…"` sections (git 2.36+) that include the entry's own
+`gated.config`, which sets `core.hooksPath` to the entry's own `hooks/`. The
+patterns are host-agnostic and case-insensitive (`**/o/r`, `**/o/r.git`,
+`**/o/r/`, `**/o/r.git/`, and the same after `*:` for scp-like URLs, plus a
+short form for each global `insteadOf` rule), because a pattern that misses
+lets a push past the gate, while one that matches too much only costs a
 process that finds no entry. Any remote of a clone counts. A `pushurl`, a
 repository-local `insteadOf`, or the repository's own `core.hooksPath`
 (perusta, selko and vartio set one) is not seen by the patterns: `ohjaa doctor`
 checks, clone by clone, that git really resolves `core.hooksPath` to the
-home's hooks, and `ohjaa run` warns at launch in such a repository. The two
-generated files are written atomically and checked with `git config --file …
---list` first, since an unreadable one would break every git command.
+entry's hooks, and `ohjaa run` warns at launch in such a repository. The
+generated files are written atomically and checked with `git config --file
+… --list` first, since an unreadable one would break every git command.
 
 **The dispatcher** (`ohjaa hook <name>`) finds the repository by the URL git
 pushes to. On pre-push, with an entry, the push is judged by
@@ -567,14 +572,21 @@ pushes to. On pre-push, with an entry, the push is judged by
 <remote> <url>`, and a refusal stops it. A sykli without both flags, or an
 entry without a gate, refuses every push to the entry's branch. Then, for
 every hook, the dispatcher runs the repository's own hook,
-`$(git rev-parse --git-common-dir)/hooks/<name>`, with the same arguments and
-the same stdin, and exits with its status. The hooks folder is shared by the
-gated repositories, so it holds pre-push plus the union of their own hooks;
-`push-to-checkout`, `proc-receive` and `fsmonitor-watchman` never get a
-dispatcher, because a file of that name changes what git does. A hook of their
-own added later runs only once `apply` writes its dispatcher; doctor says so.
-The dispatchers exec ohjaa by the path `apply` ran it from, so a git client
-started without your PATH still finds it.
+`<common dir>/hooks/<name>`, with the same arguments and the same stdin, and
+exits with its status. `push-to-checkout`, `proc-receive` and
+`fsmonitor-watchman` never get a dispatcher, because a file of that name
+changes what git does. The dispatchers exec ohjaa, and the pre-push one hands
+the gate to sykli, by the paths `apply` found on PATH, so a git client started
+without your PATH (a GUI) runs them too.
+
+**Few git processes.** Facts are worked out once and passed down. A hook that
+only chains starts no git: git runs it from the work tree's root, and the
+common directory comes from the repository's layout. pre-push starts none of
+its own either, and hands sykli `--repo-root` and `--git-common-dir` when
+sykli takes them. `ohjaa gate` starts one (the repository's config);
+`doctor` two for the machine (`git --version`, the global config with
+includes) and one per clone (its config, with `insteadOf` applied in Rust).
+`tests/config_home.rs` holds these budgets.
 
 **`ohjaa gate`** runs the gate a push will judge, from the repository root:
 `mkdir -p .sykli && sykli run <contract> --json > .sykli/receipt.json &&
@@ -583,18 +595,25 @@ the contract is the entry's, or the repository's own `sykli.json` when origin
 names no entry. It prints the contract and every command, and exits with
 sykli's status. Agents are taught this one command.
 
-**`apply`** refuses, before changing anything, when git's global
-`core.hooksPath` is set (in the global file or a file it includes): it would
-run in every repository and override the scoped one. `--force` removes it from
-the global file, and `--undo` puts it back. The launcher line it puts in
-`~/.zshrc`, in place of the old `source ~/projects/ohjaa-launch.zsh`, is
-guarded like that one was: `[[ -x <ohjaa> ]] && eval "$(<ohjaa> shell-init
-zsh)"`.
+**`apply`** runs as the `ohjaa` on PATH (anything else is refused unless
+`--bin` names it, so a `cargo run` cannot re-point every hook). It refuses,
+before changing anything, when git's global `core.hooksPath` is set (in the
+global file or a file it includes): it would run in every repository and
+override the scoped one; `--force` removes it from the global file. Its first
+run that finds repositories writes them down in `roots`, so what it finds
+never depends on where it runs, and it only ever adds dispatchers (a spare
+costs a process, a missing one silently skips a check); `--prune` removes
+spares. Each change is recorded before it is made, so `--undo` can put back
+exactly what was there even after an apply that failed. The launcher line it
+puts in `~/.zshrc`, in place of the old `source ~/projects/ohjaa-launch.zsh`,
+is guarded like that one was: `[[ -x <ohjaa> ]] && eval "$(<ohjaa>
+shell-init zsh)"`.
 
 **`adopt`** copies the repository's `sykli.json` and `sykli.lock` as origin's
 default branch holds them (not the working tree, which another session may be
 editing), or asks `sykli init --contract <entry>/sykli.json` for a new one,
-then regenerates `git/`. It never touches git's global config.
+then regenerates `git/` and writes the entry's dispatchers. It never touches
+git's global config, and takes no lock in the repository.
 
 **`tools.lock`** pins each tool to a full commit and to the toolchain its
 repository's `rust-toolchain.toml` names, because `cargo install --git` builds

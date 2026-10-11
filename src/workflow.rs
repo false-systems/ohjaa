@@ -1,10 +1,15 @@
-//! The workflow from outside the repositories: `ohjaa doctor`, `ohjaa adopt`
-//! and `ohjaa shell-init` (`ohjaa apply` is in `apply`).
+//! The workflow from outside the repositories: `ohjaa doctor`, `ohjaa adopt`,
+//! `ohjaa gate` and `ohjaa shell-init` (`ohjaa apply` is in `apply`).
 //!
 //! `doctor` reads what `apply` writes and, clone by clone, whether git really
 //! runs ohjaa's hooks where an entry says it should. `adopt` writes a
 //! repository's entry into the home and regenerates the home's git config;
-//! it never touches git's global config, and never writes into a repository.
+//! it never touches git's global config, and never writes into a repository
+//! (it takes no lock there either: no `git status`). `gate` runs the gate a
+//! push will judge.
+//!
+//! Each reads its facts once: git's global config in one process, a clone's
+//! config in one, its common directory from the layout.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,9 +19,9 @@ use anyhow::{bail, Context, Result};
 use crate::apply::{
     ignore_with_block, launch_target, read_or_empty, sources_old_launcher, IGNORED,
 };
-use crate::gate;
+use crate::gate::{self, Listing};
 use crate::home::{self, RepoId};
-use crate::hook::{dispatcher_target, HOOK_NAMES};
+use crate::hook::{common_dir_in, dispatcher_target, facts_for_sykli, quote_path, HOOK_NAMES};
 use crate::process;
 use crate::tools;
 
@@ -46,6 +51,85 @@ fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
 }
 
+/// The work tree's root and the common git directory of the repository at
+/// or above `start`: the nearest directory holding `.git`, read from its
+/// layout, not above a `GIT_CEILING_DIRECTORIES` entry. Git is asked (one
+/// process) only when the layout does not say, or `GIT_DIR` /
+/// `GIT_WORK_TREE` point elsewhere.
+fn repo_at(start: &Path) -> Result<(PathBuf, PathBuf)> {
+    let start = absolute(start.to_path_buf());
+    let set = |var: &str| std::env::var_os(var).is_some_and(|value| !value.is_empty());
+    if !set("GIT_DIR") && !set("GIT_WORK_TREE") {
+        let ceilings: Vec<PathBuf> = std::env::var_os("GIT_CEILING_DIRECTORIES")
+            .map(|value| std::env::split_paths(&value).collect())
+            .unwrap_or_default();
+        for dir in start.ancestors() {
+            if dir != start && ceilings.iter().any(|ceiling| home::same_path(ceiling, dir)) {
+                break;
+            }
+            if dir.join(".git").exists() {
+                if let Some(common) = common_dir_in(dir, None, None) {
+                    return Ok((dir.to_path_buf(), common));
+                }
+                break;
+            }
+        }
+    }
+    let text = home::git_value(
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        ],
+        Some(&start),
+    )
+    .with_context(|| format!("{} is not inside a git repository", start.display()))?
+    .with_context(|| format!("{} is not inside a git repository", start.display()))?;
+    let mut lines = text.lines();
+    match (lines.next(), lines.next()) {
+        (Some(top), Some(common)) => Ok((PathBuf::from(top), PathBuf::from(common))),
+        _ => bail!("git named no work tree for {}", start.display()),
+    }
+}
+
+/// The URL `git push <remote>` pushes to, as git works it out: the
+/// `pushurl` with `insteadOf`, else the `url` with `pushInsteadOf`, else with
+/// `insteadOf`.
+fn push_url(listing: &Listing, remote: &str) -> Option<String> {
+    let rewrites = listing.rewrites();
+    if let Some(push) = listing.last(&format!("remote.{remote}.pushurl")) {
+        return Some(gate::rewrite(&push.value, &rewrites));
+    }
+    let url = &listing.last(&format!("remote.{remote}.url"))?.value;
+    let push_rules: Vec<gate::Rewrite> = listing
+        .0
+        .iter()
+        .filter_map(|setting| {
+            let base = setting
+                .key
+                .strip_prefix("url.")?
+                .strip_suffix(".pushinsteadof")?;
+            Some(gate::Rewrite {
+                base: base.to_owned(),
+                prefix: setting.value.clone(),
+            })
+        })
+        .collect();
+    let pushed = gate::rewrite(url, &push_rules);
+    Some(if &pushed != url {
+        pushed
+    } else {
+        gate::rewrite(url, &rewrites)
+    })
+}
+
+/// The URL `git fetch <remote>` uses: its `url` with `insteadOf`.
+fn fetch_url(listing: &Listing, remote: &str) -> Option<String> {
+    let url = &listing.last(&format!("remote.{remote}.url"))?.value;
+    Some(gate::rewrite(url, &listing.rewrites()))
+}
+
 /// What `doctor` says, line by line, and how much of it is drift.
 struct Findings {
     drift: usize,
@@ -64,31 +148,41 @@ impl Findings {
     }
 }
 
-/// The hooks folder: which dispatchers there are, which are edited, and
-/// which ohjaa they exec, by name.
-fn check_dispatchers(found: &mut Findings, hooks: &Path, needed: &[&'static str]) {
+/// An entry's hooks folder: which dispatchers there are, which are edited,
+/// which are missing or spare, and whether what they run is still there.
+fn check_dispatchers(
+    found: &mut Findings,
+    slug: &str,
+    hooks: &Path,
+    needed: &std::collections::BTreeSet<&'static str>,
+) {
     let mut present = Vec::new();
-    let mut targets: Vec<PathBuf> = Vec::new();
+    let mut ohjaas: Vec<PathBuf> = Vec::new();
+    let mut syklis: Vec<Option<PathBuf>> = Vec::new();
     for name in HOOK_NAMES {
-        let Ok(text) = std::fs::read_to_string(hooks.join(name)) else {
+        let path = hooks.join(name);
+        let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
         match dispatcher_target(name, &text) {
-            Some(target) => {
+            Some(dispatch) => {
                 present.push(name);
-                if !targets.contains(&target) {
-                    targets.push(target);
+                if !ohjaas.contains(&dispatch.ohjaa) {
+                    ohjaas.push(dispatch.ohjaa);
+                }
+                if name == "pre-push" {
+                    syklis.push(dispatch.sykli);
                 }
             }
             None => found.drift(format!(
                 "{} is not one of apply's dispatchers (edited?) (ohjaa apply)",
-                hooks.join(name).display()
+                path.display()
             )),
         }
-        if !gate::executable(&hooks.join(name)) {
+        if !gate::executable(&path) {
             found.drift(format!(
                 "{} is not executable (ohjaa apply)",
-                hooks.join(name).display()
+                path.display()
             ));
         }
     }
@@ -97,45 +191,73 @@ fn check_dispatchers(found: &mut Findings, hooks: &Path, needed: &[&'static str]
         .copied()
         .filter(|name| !present.contains(name))
         .collect();
-    let extra: Vec<&str> = present
+    let spare: Vec<&str> = present
         .iter()
         .copied()
         .filter(|name| !needed.contains(name))
         .collect();
     if !missing.is_empty() {
         found.drift(format!(
-            "dispatchers missing in {}: {} (ohjaa apply)",
+            "{slug}: dispatchers missing in {}: {} (ohjaa apply)",
             hooks.display(),
             missing.join(", ")
         ));
     }
-    if !extra.is_empty() {
-        found.drift(format!(
-            "dispatchers no gated clone needs in {}: {} (ohjaa apply removes them)",
+    if !spare.is_empty() {
+        found.note(format!(
+            "{slug}: spare dispatchers in {}: {} (each costs a process; ohjaa apply --prune \
+             removes them)",
             hooks.display(),
-            extra.join(", ")
+            spare.join(", ")
         ));
     }
-    for target in &targets {
-        if gate::executable(target) {
+    for ohjaa in &ohjaas {
+        if gate::executable(ohjaa) {
             found.ok(format!(
-                "dispatchers in {} ({}) exec {}",
-                hooks.display(),
+                "{slug}: dispatchers ({}) exec {}",
                 present.join(", "),
-                target.display()
+                ohjaa.display()
             ));
         } else {
             found.drift(format!(
-                "the dispatchers exec {}, which is gone: every gated push fails (ohjaa apply)",
-                target.display()
+                "{slug}: the dispatchers exec {}, which is gone: pushes to the entry's branch \
+                 fail, and so do commits in clones that chain a hook of their own (ohjaa apply)",
+                ohjaa.display()
             ));
+        }
+    }
+    for sykli in syklis {
+        match sykli {
+            Some(sykli) if gate::executable(&sykli) => {}
+            Some(sykli) => found.drift(format!(
+                "{slug}: the pre-push dispatcher hands the gate to {}, which is gone: pushes \
+                 to the entry's branch are refused (ohjaa apply)",
+                sykli.display()
+            )),
+            None => found.drift(format!(
+                "{slug}: the pre-push dispatcher names no sykli (it was not on PATH when apply \
+                 ran), so a git client without your PATH refuses pushes to the entry's \
+                 branch (ohjaa apply)"
+            )),
         }
     }
 }
 
-pub fn doctor(roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32> {
+/// Where the roots come from, for doctor to say.
+fn roots_source(explicit: &[PathBuf]) -> String {
+    if !explicit.is_empty() {
+        return "given with --root".to_owned();
+    }
+    match crate::roots::config_path().filter(|path| path.is_file()) {
+        Some(path) => format!("from {}", path.display()),
+        None => "derived from the current directory: no roots file yet (ohjaa apply writes \
+                 one)"
+            .to_owned(),
+    }
+}
+
+pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32> {
     let home = absolute(home::ohjaa_home()?);
-    let hooks = home::hooks_dir(&home);
     let mut found = Findings { drift: 0 };
     println!("ohjaa doctor: the workflow home is {}", home.display());
 
@@ -156,86 +278,95 @@ pub fn doctor(roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32> {
         )),
         Err(error) => found.drift(format!("{error:#}")),
     }
+    let entries = gate::entry_names(&home)?;
+    let global = match gate::GlobalFacts::read() {
+        Ok(global) => Some(global),
+        Err(error) => {
+            found.drift(format!("cannot read git's global config: {error:#}"));
+            None
+        }
+    };
     let include = gate::include_file(&home);
-    match home::global_paths("include.path") {
-        Ok(paths)
-            if paths
-                .iter()
-                .any(|p| home::same_path(Path::new(p), &include)) =>
-        {
+    if let Some(global) = &global {
+        if global.includes(&include) {
             found.ok(format!(
                 "git's global config includes {}",
                 include.display()
-            ))
+            ));
+        } else {
+            found.drift(format!(
+                "git's global config does not include {}: no repository runs ohjaa's hooks \
+                 (ohjaa apply)",
+                include.display()
+            ));
         }
-        Ok(_) => found.drift(format!(
-            "git's global config does not include {}: no repository runs ohjaa's hooks \
-             (ohjaa apply)",
-            include.display()
-        )),
-        Err(error) => found.drift(format!("cannot read git's global include.path: {error:#}")),
+        match global.hooks_path() {
+            None => found.ok("git's global core.hooksPath is unset"),
+            Some((path, _, _)) => found.drift(format!(
+                "git's global core.hooksPath is {path}: it runs in every repository and \
+                 overrides ohjaa's per-repository one (ohjaa apply --force removes it)"
+            )),
+        }
     }
-    match home::global_path_setting("core.hooksPath") {
-        Ok(None) => found.ok("git's global core.hooksPath is unset"),
-        Ok(Some(path)) => found.drift(format!(
-            "git's global core.hooksPath is {path}: it runs in every repository and \
-             overrides ohjaa's per-repository one (ohjaa apply --force removes it)"
-        )),
-        Err(error) => found.drift(format!(
-            "cannot read git's global core.hooksPath: {error:#}"
-        )),
-    }
-    // Each generated file on its own first: an invalid one breaks every git
-    // command, generating the expected text among them.
-    let mut readable = true;
-    for path in [gate::include_file(&home), gate::gated_file(&home)] {
+    // The generated files: as they should be, else (rarely) why not. An
+    // unreadable one breaks every git command, the global read among them.
+    let expected = match &global {
+        Some(global) => gate::generated(&home, &global.rewrites())?,
+        None => {
+            let mut files = vec![(include.clone(), String::new())];
+            files.extend(
+                entries
+                    .iter()
+                    .map(|entry| (gate::entry_gated(&entry.dir), String::new())),
+            );
+            files
+        }
+    };
+    for (path, text) in &expected {
         if !path.is_file() {
             found.drift(format!(
                 "{} is missing: the gate is off (ohjaa apply)",
                 path.display()
             ));
-        } else if let Err(error) = gate::check_git_config(&path) {
-            readable = false;
+        } else if global.is_some() && read_or_empty(path).is_ok_and(|now| &now == text) {
+            found.ok(format!("{} is current", path.display()));
+        } else if let Err(error) = gate::check_git_config(path) {
             found.drift(format!(
                 "{} cannot be read by git, which then fails in every repository (ohjaa \
                  apply): {}",
                 path.display(),
                 error.root_cause()
             ));
-        }
-    }
-    if readable {
-        match gate::generated(&home) {
-            Ok(files) => {
-                for (path, text) in files.iter().filter(|(path, _)| path.is_file()) {
-                    if read_or_empty(path).is_ok_and(|now| &now == text) {
-                        found.ok(format!("{} is current", path.display()));
-                    } else {
-                        found.drift(format!(
-                            "{} is stale: it does not match repos/ (ohjaa apply)",
-                            path.display()
-                        ));
-                    }
-                }
-            }
-            Err(error) => found.drift(format!("cannot generate the git config: {error:#}")),
+        } else if global.is_some() {
+            found.drift(format!(
+                "{} is stale: it does not match repos/ (ohjaa apply)",
+                path.display()
+            ));
         }
     }
 
-    let roots = crate::roots::load(roots, git_root);
+    let roots = crate::roots::load(explicit_roots, git_root);
     let repos = crate::roots::git_repos(&roots)?;
-    let gated = match gate::gated_clones(&home, &roots) {
+    println!(
+        "roots: {} ({})",
+        roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        roots_source(explicit_roots)
+    );
+    let gated = match gate::gated_clones(&home, &repos) {
         Ok(gated) => gated,
         Err(error) => {
             found.drift(format!("cannot read the clones under the roots: {error:#}"));
             Vec::new()
         }
     };
-    let needed: Vec<&'static str> = gate::needed_hooks(&gated).into_iter().collect();
-    check_dispatchers(&mut found, &hooks, &needed);
+    let needed = gate::needed_hooks(&home, &gated)?;
 
-    match home::global_ignore_file() {
-        Ok(path) => match read_or_empty(&path).map(|text| (ignore_with_block(&text), text)) {
+    match global.as_ref().map(gate::GlobalFacts::excludes_file) {
+        Some(Ok(path)) => match read_or_empty(&path).map(|text| (ignore_with_block(&text), text)) {
             Ok((Ok((with, _)), text)) if with == text => found.ok(format!(
                 "{} ignores {} for every repository",
                 path.display(),
@@ -249,7 +380,10 @@ pub fn doctor(roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32> {
             Ok((Err(why), _)) => found.drift(format!("{}: {why}", path.display())),
             Err(error) => found.drift(format!("{error:#}")),
         },
-        Err(error) => found.drift(format!("cannot find git's global excludes file: {error:#}")),
+        Some(Err(error)) => {
+            found.drift(format!("cannot find git's global excludes file: {error:#}"))
+        }
+        None => {}
     }
     match home::zshrc().and_then(|path| read_or_empty(&path).map(|text| (path, text))) {
         Ok((path, text)) => {
@@ -319,33 +453,30 @@ pub fn doctor(roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32> {
     }
 
     println!("entries ({}):", home.join("repos").display());
-    let mut entries = 0;
-    for (slug, dir) in home::entry_dirs(&home)? {
-        match home::read_entry(&dir) {
-            Ok(Some(entry)) if entry.has_contract() => {
-                entries += 1;
-                found.ok(format!("{slug}: gates {}", entry.branch));
+    let mut readable = 0;
+    for entry in &entries {
+        let slug = format!("{}/{}", entry.owner, entry.name);
+        match home::read_entry(&entry.dir) {
+            Ok(Some(read)) if read.has_contract() => {
+                readable += 1;
+                found.ok(format!("{slug}: gates {}", read.branch));
             }
-            Ok(Some(entry)) => found.drift(format!(
+            Ok(Some(read)) => found.drift(format!(
                 "{slug}: no gate ({} is missing)",
-                entry.contract().display()
+                read.contract().display()
             )),
             Ok(None) => {}
             Err(error) => found.drift(format!("{slug}: {error:#}")),
         }
+        if let Some(needed) = needed.get(&entry.dir) {
+            check_dispatchers(&mut found, &slug, &gate::entry_hooks(&entry.dir), needed);
+        }
     }
-    if entries == 0 {
+    if readable == 0 && entries.is_empty() {
         found.note("no repository has an entry yet (ohjaa adopt <repo>)");
     }
 
-    println!(
-        "repositories under {}:",
-        roots
-            .iter()
-            .map(|root| root.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    println!("repositories:");
     let mut plain = Vec::new();
     for repo in &repos {
         let label = repo
@@ -358,7 +489,7 @@ pub fn doctor(roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32> {
             if drift.is_empty() {
                 found.ok(format!(
                     "{named}: gated; git runs {} here{}",
-                    hooks.display(),
+                    clone.hooks_path.as_deref().unwrap_or_default(),
                     if clone.own.is_empty() {
                         String::new()
                     } else {
@@ -397,14 +528,14 @@ pub fn doctor(roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32> {
     }
 }
 
-/// The gate of the repository at `root`: the contract of the entry origin's
+/// The gate of the repository at `top`: the contract of the entry origin's
 /// push URL names, else the repository's own `sykli.json`; with whose it is.
-fn gate_of(root: &Path) -> Result<Option<(PathBuf, String)>> {
+fn gate_of(top: &Path, listing: &Listing) -> Result<Option<(PathBuf, String)>> {
     let home = absolute(home::ohjaa_home()?);
-    let url = home::git_value(&["remote", "get-url", "--push", "origin"], Some(root))
-        .ok()
-        .flatten();
-    if let Some(id) = url.as_deref().and_then(RepoId::parse) {
+    if let Some(id) = push_url(listing, "origin")
+        .as_deref()
+        .and_then(RepoId::parse)
+    {
         match home::find_entry(&home, &id)? {
             Some(entry) if entry.has_contract() => {
                 return Ok(Some((
@@ -416,46 +547,93 @@ fn gate_of(root: &Path) -> Result<Option<(PathBuf, String)>> {
                 "{} has an entry but no gate: {} is missing (ohjaa adopt --force {})",
                 id.slug(),
                 entry.contract().display(),
-                root.display()
+                top.display()
             ),
             None => {}
         }
     }
-    let own = root.join("sykli.json");
+    let own = top.join("sykli.json");
     Ok(own
         .is_file()
         .then(|| (own, "the repository's own sykli.json (no entry)".to_owned())))
 }
 
+/// `sykli <command> --help` names both facts flags: then sykli is handed the
+/// repository's facts instead of asking git for them again.
+fn sykli_takes_facts(command: &str, top: &Path, common: &Path) -> Vec<std::ffi::OsString> {
+    let help = Command::new("sykli")
+        .args([command, "--help"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    facts_for_sykli(&help, Some(top), common)
+}
+
+fn shown(words: &[std::ffi::OsString]) -> String {
+    words
+        .iter()
+        .map(|word| {
+            let word = word.to_string_lossy();
+            if word.starts_with('-') {
+                word.into_owned()
+            } else {
+                quote_path(Path::new(word.as_ref()))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// `ohjaa gate`: run the gate for the repository here, the way a push will
-/// judge it, and leave the receipt the push looks for.
+/// judge it, and leave the receipt the push looks for. One git process (the
+/// repository's config); the rest is sykli's.
 pub fn gate_here(print_only: bool) -> Result<i32> {
-    let root = PathBuf::from(
-        home::git_value(&["rev-parse", "--show-toplevel"], None)
-            .context("not inside a git repository")?
-            .context("not inside a git repository")?,
-    );
-    let Some((contract, whose)) = gate_of(&root)? else {
+    let cwd = std::env::current_dir().context("cannot read the current directory")?;
+    let (top, common) = repo_at(&cwd)?;
+    let listing = gate::clone_listing(&top)?;
+    let Some((contract, whose)) = gate_of(&top, &listing)? else {
         eprintln!(
             "ohjaa gate: {} has no gate: origin names no entry (ohjaa adopt), and there is \
              no sykli.json in the repository",
-            root.display()
+            top.display()
         );
         return Ok(2);
     };
-    let quoted = crate::hook::quote_path(&contract);
-    let run = format!("sykli run {quoted} --json > .sykli/receipt.json");
-    let verify = format!("sykli verify .sykli/receipt.json --contract {quoted} --commit HEAD");
+    let quoted = quote_path(&contract);
+    let (run_facts, verify_facts) = if print_only {
+        (Vec::new(), Vec::new())
+    } else {
+        (
+            sykli_takes_facts("run", &top, &common),
+            sykli_takes_facts("verify", &top, &common),
+        )
+    };
+    let extra = |facts: &[std::ffi::OsString]| {
+        if facts.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", shown(facts))
+        }
+    };
+    let run = format!(
+        "sykli run {quoted}{} --json > .sykli/receipt.json",
+        extra(&run_facts)
+    );
+    let verify = format!(
+        "sykli verify .sykli/receipt.json --contract {quoted}{} --commit HEAD",
+        extra(&verify_facts)
+    );
     println!("ohjaa gate: the gate is {} ({whose})", contract.display());
     if print_only {
         println!(
             "cd {} && mkdir -p .sykli && {run} && {verify}",
-            crate::hook::quote_path(&root)
+            quote_path(&top)
         );
         return Ok(0);
     }
-    println!("ohjaa gate: in {}", root.display());
-    let sykli_dir = root.join(".sykli");
+    println!("ohjaa gate: in {}", top.display());
+    let sykli_dir = top.join(".sykli");
     std::fs::create_dir_all(&sykli_dir)
         .with_context(|| format!("cannot create {}", sykli_dir.display()))?;
     println!("$ {run}");
@@ -465,8 +643,9 @@ pub fn gate_here(print_only: bool) -> Result<i32> {
     let status = Command::new("sykli")
         .arg("run")
         .arg(&contract)
+        .args(&run_facts)
         .arg("--json")
-        .current_dir(&root)
+        .current_dir(&top)
         .stdout(receipt)
         .status()
         .context("cannot run sykli")?;
@@ -479,8 +658,9 @@ pub fn gate_here(print_only: bool) -> Result<i32> {
     let status = Command::new("sykli")
         .args(["verify", ".sykli/receipt.json", "--contract"])
         .arg(&contract)
+        .args(&verify_facts)
         .args(["--commit", "HEAD"])
-        .current_dir(&root)
+        .current_dir(&top)
         .status()
         .context("cannot run sykli")?;
     let code = status.code().unwrap_or(1);
@@ -492,40 +672,60 @@ pub fn gate_here(print_only: bool) -> Result<i32> {
     Ok(code)
 }
 
-/// Run git in `cwd` and return its stdout as it is (a file's bytes).
-fn git_bytes(args: &[&str], cwd: &Path) -> Result<Vec<u8>> {
+/// An object `git cat-file --batch` found: its id and content.
+type Object = (String, Vec<u8>);
+
+/// What one `git cat-file --batch` says of each object asked for: its id
+/// and content, or `None` when missing.
+fn objects(top: &Path, names: &[String]) -> Result<Vec<Option<Object>>> {
     let mut command = Command::new("git");
-    command.args(args).current_dir(cwd);
-    let output = process::run(&mut command, None, process::LOCAL).context("cannot run git")?;
+    command.args(["cat-file", "--batch"]).current_dir(top);
+    let input = names.join("\n") + "\n";
+    let output = process::run(&mut command, Some(input.as_bytes()), process::LOCAL)
+        .context("cannot run git cat-file")?;
     if !output.status.success() {
-        bail!("git {} failed: {}", args.join(" "), output.failure_detail());
+        bail!("git cat-file --batch failed: {}", output.failure_detail());
     }
-    Ok(output.stdout)
+    let mut out = output.stdout.as_slice();
+    let mut found = Vec::new();
+    for _ in names {
+        let end = out
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .context("git cat-file --batch said less than asked")?;
+        let header = String::from_utf8_lossy(&out[..end]).into_owned();
+        out = &out[end + 1..];
+        let fields: Vec<&str> = header.split(' ').collect();
+        match fields[..] {
+            [oid, _, size] if size.parse::<usize>().is_ok() => {
+                let size: usize = size.parse().unwrap_or(0);
+                if out.len() < size + 1 {
+                    bail!("git cat-file --batch cut an object short");
+                }
+                found.push(Some((oid.to_owned(), out[..size].to_vec())));
+                out = &out[size + 1..];
+            }
+            _ => found.push(None),
+        }
+    }
+    Ok(found)
 }
 
-/// A file as commit `rev` holds it, `None` when it holds none.
-fn committed(root: &Path, rev: &str, file: &str) -> Result<Option<Vec<u8>>> {
-    let spec = format!("{rev}:{file}");
-    match home::git_value(&["rev-parse", "--verify", "--quiet", &spec], Some(root))? {
-        Some(blob) => Ok(Some(git_bytes(&["cat-file", "blob", &blob], root)?)),
-        None => Ok(None),
+/// The branch `refs/remotes/origin/HEAD` names: the loose symbolic ref, else
+/// (a reftable repository) asked of git.
+fn origin_head(top: &Path, common: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(common.join("refs/remotes/origin/HEAD")) {
+        Ok(text) => Ok(text
+            .trim()
+            .strip_prefix("ref: refs/remotes/origin/")
+            .map(str::to_owned)),
+        Err(_) if common.join("reftable").exists() => Ok(home::git_value(
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            Some(top),
+        )?
+        .and_then(|head| head.strip_prefix("refs/remotes/origin/").map(str::to_owned))),
+        Err(_) => Ok(None),
     }
-}
-
-/// What `git status` says, ignored paths too: adopt must leave it as it was.
-/// Untracked and ignored directories are named, not listed file by file, so
-/// a large ignored tree (`node_modules`) costs nothing.
-fn status_of(root: &Path) -> Result<String> {
-    Ok(home::git_value(
-        &[
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=normal",
-            "--ignored",
-        ],
-        Some(root),
-    )?
-    .unwrap_or_default())
 }
 
 fn sykli_init_takes_a_contract() -> bool {
@@ -537,15 +737,10 @@ fn sykli_init_takes_a_contract() -> bool {
 }
 
 pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
-    let root = PathBuf::from(
-        home::git_value(&["rev-parse", "--show-toplevel"], Some(path))
-            .with_context(|| format!("{} is not inside a git repository", path.display()))?
-            .with_context(|| format!("{} is not inside a git repository", path.display()))?,
-    );
-    let url = home::git_value(&["remote", "get-url", "origin"], Some(&root))
-        .ok()
-        .flatten()
-        .with_context(|| format!("{} has no origin remote to name it by", root.display()))?;
+    let (top, common) = repo_at(path)?;
+    let listing = gate::clone_listing(&top)?;
+    let url = fetch_url(&listing, "origin")
+        .with_context(|| format!("{} has no origin remote to name it by", top.display()))?;
     let id = RepoId::parse(&url)
         .with_context(|| format!("origin's URL {url:?} names no owner and repository"))?;
     let branch = match branch {
@@ -553,16 +748,11 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
             .strip_prefix("refs/heads/")
             .unwrap_or(branch)
             .to_owned(),
-        None => home::git_value(
-            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
-            Some(&root),
-        )?
-        .and_then(|head| head.strip_prefix("refs/remotes/origin/").map(str::to_owned))
-        .with_context(|| {
+        None => origin_head(&top, &common)?.with_context(|| {
             format!(
                 "origin/HEAD is not set in {}, so its default branch is unknown here; \
                  name it with --branch, or set it with: git remote set-head origin --auto",
-                root.display()
+                top.display()
             )
         })?,
     };
@@ -576,9 +766,8 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
         );
         return Ok(REFUSED);
     }
-    let before = status_of(&root)?;
     let created = !dir.exists();
-    let result = write_entry(&root, &id, &dir, &branch, force);
+    let result = write_entry(&top, &id, &dir, &branch, force);
     if result.is_err() && created {
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -588,55 +777,67 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
     println!("  {source}");
     // The home's git config now names this repository too; git's global
     // config is not touched (it includes the home's file once, from apply).
-    for said in crate::apply::regenerate(&home, &gate::own_hooks(&root)?)? {
+    let global = gate::GlobalFacts::read()?;
+    let own = gate::own_hooks_in(&common);
+    for said in crate::apply::regenerate(&home, &dir, &own, &global.rewrites())? {
         println!("  {said}");
     }
-    match gate::gated_clone(&home, &root)? {
+    match gate::gated_clone(&home, &top)? {
         Some(clone) => {
             let drift = gate::clone_drift(&home, &clone);
             if drift.is_empty() {
                 println!(
                     "  gated: git runs {} here",
-                    home::hooks_dir(&home).display()
+                    clone.hooks_path.as_deref().unwrap_or_default()
                 );
             }
             for line in drift {
-                eprintln!("ohjaa adopt: warning: {}: {line}", root.display());
+                eprintln!("ohjaa adopt: warning: {}: {line}", top.display());
             }
         }
         None => eprintln!(
             "ohjaa adopt: warning: no remote of {} names {} after all",
-            root.display(),
+            top.display(),
             id.slug()
         ),
-    }
-    let after = status_of(&root)?;
-    if after != before {
-        eprintln!(
-            "ohjaa adopt: warning: git status in {} changed while adopting (another session, \
-             or sykli); before:\n{before}\nafter:\n{after}",
-            root.display()
-        );
     }
     Ok(0)
 }
 
 /// Write the gate and `repo.toml` into `dir`; say where the gate came from.
-fn write_entry(root: &Path, id: &RepoId, dir: &Path, branch: &str, force: bool) -> Result<String> {
+/// The gate is read as `origin/<branch>` holds it (else `HEAD`), in one `git
+/// cat-file --batch`.
+fn write_entry(top: &Path, id: &RepoId, dir: &Path, branch: &str, force: bool) -> Result<String> {
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let tracking = format!("refs/remotes/origin/{branch}");
-    let rev = match home::git_value(&["rev-parse", "--verify", "--quiet", &tracking], Some(root))? {
-        Some(_) => format!("origin/{branch}"),
-        None => "HEAD".to_owned(),
+    let revs = [format!("refs/remotes/origin/{branch}"), "HEAD".to_owned()];
+    let files = ["sykli.json", "sykli.lock", "sykli.rs"];
+    let mut names = Vec::new();
+    for rev in &revs {
+        names.push(rev.clone());
+        names.extend(files.iter().map(|file| format!("{rev}:{file}")));
+    }
+    let found = objects(top, &names)?;
+    let at = if found[0].is_some() {
+        0
+    } else {
+        files.len() + 1
     };
+    let rev = if at == 0 {
+        format!("origin/{branch}")
+    } else {
+        "HEAD".to_owned()
+    };
+    let commit = found[at]
+        .as_ref()
+        .map(|(oid, _)| short(oid).to_owned())
+        .unwrap_or_default();
+    let blob = |n: usize| found[at + 1 + n].as_ref().map(|(_, bytes)| bytes.clone());
     let contract = dir.join("sykli.json");
     let lock = dir.join("sykli.lock");
-    let source = if let Some(json) = committed(root, &rev, "sykli.json")? {
+    let source = if let Some(json) = blob(0) {
         std::fs::write(&contract, json)
             .with_context(|| format!("cannot write {}", contract.display()))?;
-        let commit =
-            home::git_value(&["rev-parse", "--short=12", &rev], Some(root))?.unwrap_or_default();
-        match committed(root, &rev, "sykli.lock")? {
+        match blob(1) {
             Some(bytes) => {
                 std::fs::write(&lock, bytes)
                     .with_context(|| format!("cannot write {}", lock.display()))?;
@@ -651,7 +852,7 @@ fn write_entry(root: &Path, id: &RepoId, dir: &Path, branch: &str, force: bool) 
                 )
             }
         }
-    } else if committed(root, &rev, "sykli.rs")?.is_some() {
+    } else if blob(2).is_some() {
         bail!(
             "{} gates with sykli.rs at {rev}; an entry holds a sykli.json contract, so write \
              one (sykli init --contract {}) and adopt again",
@@ -670,7 +871,7 @@ fn write_entry(root: &Path, id: &RepoId, dir: &Path, branch: &str, force: bool) 
         let mut init = Command::new("sykli");
         init.args(["init", "--contract"])
             .arg(&contract)
-            .current_dir(root);
+            .current_dir(top);
         if force && contract.exists() {
             init.arg("--force");
         }
@@ -713,5 +914,36 @@ mod tests {
         }
         assert!(LAUNCH_ZSH.contains("shell-init zsh"));
         assert!(!LAUNCH_ZSH.contains("source ~/projects/ohjaa-launch.zsh"));
+    }
+
+    #[test]
+    fn push_and_fetch_urls_are_worked_out_the_way_git_does() {
+        let listing = Listing::parse(
+            "url.git@github.com:.insteadof\ngh:\0\
+             url.ssh://push.example/.pushinsteadof\nhttps://h/\0\
+             remote.origin.url\ngh:acme/w\0\
+             remote.up.url\nhttps://h/o/r\0\
+             remote.fork.url\nhttps://h/me/r\0\
+             remote.fork.pushurl\ngh:o/p\0",
+            false,
+        );
+        assert_eq!(
+            fetch_url(&listing, "origin").as_deref(),
+            Some("git@github.com:acme/w")
+        );
+        assert_eq!(
+            push_url(&listing, "origin").as_deref(),
+            Some("git@github.com:acme/w")
+        );
+        assert_eq!(
+            push_url(&listing, "up").as_deref(),
+            Some("ssh://push.example/o/r")
+        );
+        assert_eq!(fetch_url(&listing, "up").as_deref(), Some("https://h/o/r"));
+        assert_eq!(
+            push_url(&listing, "fork").as_deref(),
+            Some("git@github.com:o/p")
+        );
+        assert_eq!(push_url(&listing, "none"), None);
     }
 }

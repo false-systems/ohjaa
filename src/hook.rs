@@ -64,16 +64,28 @@ pub const HOOK_NAMES: [&str; 28] = [
 /// a hooks folder at all (`core.fsmonitor` names it).
 pub const NOT_DISPATCHED: [&str; 3] = ["push-to-checkout", "proc-receive", "fsmonitor-watchman"];
 
-/// The dispatcher `ohjaa apply` writes as `hooks/<name>`.
-///
-/// It execs `ohjaa` by the absolute path `apply` ran from, so a git that runs
-/// with another PATH (a GUI client) still finds it.
-pub fn dispatcher(name: &str, ohjaa: &Path) -> String {
+/// What a dispatcher runs: the ohjaa it execs and, for pre-push, the sykli
+/// the gate is handed to. Both by the absolute paths `apply` found on PATH,
+/// so a git that runs with another PATH (a GUI client) finds them too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dispatch {
+    pub ohjaa: PathBuf,
+    pub sykli: Option<PathBuf>,
+}
+
+/// The dispatcher `ohjaa apply` writes as `<entry>/hooks/<name>`.
+pub fn dispatcher(name: &str, dispatch: &Dispatch) -> String {
+    let sykli = match (&dispatch.sykli, name) {
+        (Some(sykli), "pre-push") => {
+            format!("OHJAA_SYKLI={}; export OHJAA_SYKLI\n", quote_path(sykli))
+        }
+        _ => String::new(),
+    };
     format!(
         "#!/bin/sh\n\
          # Written by `ohjaa apply`, checked by `ohjaa doctor`; edits are replaced.\n\
-         exec {} hook {name} \"$@\"\n",
-        quote_path(ohjaa)
+         {sykli}exec {} hook {name} \"$@\"\n",
+        quote_path(&dispatch.ohjaa)
     )
 }
 
@@ -81,35 +93,34 @@ pub fn quote_path(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
-/// The ohjaa a dispatcher execs, when the file is one of `apply`'s
-/// dispatchers (unedited) for `name`.
-pub fn dispatcher_target(name: &str, text: &str) -> Option<PathBuf> {
-    let line = text.lines().find_map(|line| line.strip_prefix("exec "))?;
-    let quoted = line.strip_suffix(&format!(" hook {name} \"$@\""))?;
+fn unquote(quoted: &str) -> Option<PathBuf> {
     let inner = quoted.strip_prefix('\'')?.strip_suffix('\'')?;
-    let path = PathBuf::from(inner.replace("'\\''", "'"));
-    (dispatcher(name, &path) == text).then_some(path)
+    Some(PathBuf::from(inner.replace("'\\''", "'")))
 }
 
-/// The ohjaa running now, by the path it was started as: `argv[0]` made
-/// absolute, or found on PATH the way the shell found it. Symbolic links are
-/// kept (`~/.cargo/bin/ohjaa` stays that, never a versioned directory behind
-/// it), so a reinstall keeps the dispatchers working.
-pub fn invoked_ohjaa() -> Result<PathBuf> {
-    let argv0 = PathBuf::from(std::env::args_os().next().context("no argv[0]")?);
-    let absolute = |path: PathBuf| std::path::absolute(&path).unwrap_or(path);
-    if argv0.components().count() > 1 {
-        return Ok(absolute(argv0));
-    }
-    let found = std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(&argv0))
-            .find(|candidate| crate::gate::executable(candidate))
+/// What a dispatcher runs, when the file is one of `apply`'s dispatchers
+/// (unedited) for `name`.
+pub fn dispatcher_target(name: &str, text: &str) -> Option<Dispatch> {
+    let exec = text.lines().find_map(|line| line.strip_prefix("exec "))?;
+    let ohjaa = unquote(exec.strip_suffix(&format!(" hook {name} \"$@\""))?)?;
+    let sykli = text.lines().find_map(|line| {
+        unquote(
+            line.strip_prefix("OHJAA_SYKLI=")?
+                .strip_suffix("; export OHJAA_SYKLI")?,
+        )
     });
-    match found {
-        Some(path) => Ok(absolute(path)),
-        None => std::env::current_exe().context("cannot tell where this ohjaa is"),
-    }
+    let dispatch = Dispatch { ohjaa, sykli };
+    (dispatcher(name, &dispatch) == text).then_some(dispatch)
+}
+
+/// The first `name` on PATH, as the shell finds it: made absolute, never
+/// resolved, so `~/.cargo/bin/ohjaa` stays that and a reinstall keeps every
+/// dispatcher working.
+pub fn on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|path| crate::gate::executable(path))
+        .map(|path| std::path::absolute(&path).unwrap_or(path))
 }
 
 /// Refused, as sykli's hooks say it.
@@ -122,14 +133,64 @@ pub fn run(name: &str, args: &[OsString]) -> Result<i32> {
         eprintln!("ohjaa hook: {name:?} is not a git hook");
         return Ok(CANNOT);
     }
+    let here = match here() {
+        Ok(here) => here,
+        Err(error) => {
+            // Skipping the repository's own hook would pass a check it may
+            // hold, so this refuses instead.
+            eprintln!("ohjaa hook {name}: cannot find the repository's own hooks: {error:#}");
+            return Ok(CANNOT);
+        }
+    };
     let mut input = None;
     if name == "pre-push" {
-        match gate(args)? {
+        match gate(args, &here)? {
             Gate::Refused(code) => return Ok(code),
             Gate::Passed(read) => input = read,
         }
     }
-    chain(name, args, input.as_deref())
+    chain(name, args, input.as_deref(), &here.common)
+}
+
+/// Where git runs a hook, worked out once: the work tree's root (git's
+/// current directory for a hook in a non-bare repository) and the common
+/// git directory, from the layout. One git process only when the layout
+/// does not say.
+struct Here {
+    top: Option<PathBuf>,
+    common: PathBuf,
+}
+
+fn here() -> Result<Here> {
+    let env = |var: &str| std::env::var_os(var).filter(|value| !value.is_empty());
+    let cwd = std::env::current_dir().context("cannot read the current directory")?;
+    if let Some(common) = common_dir_in(&cwd, env("GIT_DIR"), env("GIT_COMMON_DIR")) {
+        let top = env("GIT_WORK_TREE")
+            .map(|top| cwd.join(top))
+            .or_else(|| cwd.join(".git").exists().then(|| cwd.clone()));
+        return Ok(Here { top, common });
+    }
+    let ask = |args: &[&str]| -> Result<Vec<String>> {
+        Ok(home::git_value(args, None)?
+            .context("git names no repository here")?
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    };
+    let lines = ask(&[
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+        "--show-toplevel",
+    ])
+    // A bare repository has no top level to show.
+    .or_else(|_| ask(&["rev-parse", "--path-format=absolute", "--git-common-dir"]))?;
+    let mut lines = lines.into_iter();
+    let common = PathBuf::from(lines.next().context("git named no common directory")?);
+    Ok(Here {
+        top: lines.next().map(PathBuf::from),
+        common,
+    })
 }
 
 enum Gate {
@@ -160,35 +221,67 @@ fn updates(input: &str) -> std::result::Result<Vec<Update>, String> {
         .collect()
 }
 
-/// Whether the sykli on PATH can judge a push against a contract outside the
-/// repository, for exactly the branch the entry names; the reason when it
-/// cannot. Both flags are required: without `--branch`, sykli would gate the
-/// branch `refs/remotes/<remote>/HEAD` names, which need not be the entry's.
-fn sykli_can_gate() -> std::result::Result<(), String> {
-    let output = Command::new("sykli")
+/// The sykli the gate is handed to: the one `apply` recorded in the
+/// dispatcher (`OHJAA_SYKLI`), else the one on PATH.
+fn sykli_program() -> PathBuf {
+    std::env::var_os("OHJAA_SYKLI")
+        .filter(|path| !path.is_empty())
+        .map_or_else(|| PathBuf::from("sykli"), PathBuf::from)
+}
+
+/// `sykli hook pre-push --help`, or why sykli cannot be run.
+fn sykli_help(sykli: &Path) -> std::result::Result<String, String> {
+    let output = Command::new(sykli)
         .args(["hook", "pre-push", "--help"])
         .stdin(Stdio::null())
         .output();
-    let help = match output {
+    match output {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err("sykli is not on PATH".to_owned())
+            Err(if sykli == Path::new("sykli") {
+                "sykli is not on PATH".to_owned()
+            } else {
+                format!(
+                    "the sykli `ohjaa apply` recorded ({}) is gone",
+                    sykli.display()
+                )
+            })
         }
-        Err(error) => return Err(format!("sykli cannot be run ({error})")),
-        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
-    };
+        Err(error) => Err(format!("sykli cannot be run ({error})")),
+        Ok(output) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
+    }
+}
+
+/// Why this sykli cannot judge a push against a contract outside the
+/// repository for exactly the entry's branch, if it cannot. Both flags are
+/// required: without `--branch`, sykli would gate the branch
+/// `refs/remotes/<remote>/HEAD` names, which need not be the entry's.
+fn cannot_gate(help: &str) -> Option<String> {
     let lacking: Vec<&str> = ["--contract", "--branch"]
         .into_iter()
         .filter(|flag| !help.contains(flag))
         .collect();
-    if lacking.is_empty() {
-        return Ok(());
+    (!lacking.is_empty()).then(|| {
+        format!(
+            "the sykli on PATH cannot gate a branch against a contract kept outside the \
+             repository (`sykli hook pre-push --help` names no {}); update it with \
+             `ohjaa apply --tools`",
+            lacking.join(" and no ")
+        )
+    })
+}
+
+/// sykli's flags that take the repository's facts instead of asking git
+/// for them again, when this sykli has them.
+pub fn facts_for_sykli(help: &str, top: Option<&Path>, common: &Path) -> Vec<OsString> {
+    match top {
+        Some(top) if help.contains("--repo-root") && help.contains("--git-common-dir") => vec![
+            "--repo-root".into(),
+            top.as_os_str().to_owned(),
+            "--git-common-dir".into(),
+            common.as_os_str().to_owned(),
+        ],
+        _ => Vec::new(),
     }
-    Err(format!(
-        "the sykli on PATH cannot gate a branch against a contract kept outside the \
-         repository (`sykli hook pre-push --help` names no {}); update it with \
-         `ohjaa apply --tools`",
-        lacking.join(" and no ")
-    ))
 }
 
 fn read_stdin() -> Result<Vec<u8>> {
@@ -229,17 +322,11 @@ fn refuse_the_gated_branch(input: Vec<u8>, slug: &str, branch: &str, why: &str) 
     }
 }
 
-fn gate(args: &[OsString]) -> Result<Gate> {
+/// The gate: the URL is git's `$2`, the entry is a file, and the repository's
+/// facts come from [`here`], so no git process is started here.
+fn gate(args: &[OsString], here: &Here) -> Result<Gate> {
     const HOOK: &str = "ohjaa hook pre-push";
-    let remote = args.first().map(|arg| arg.to_string_lossy().into_owned());
-    let url = match args.get(1) {
-        Some(url) => Some(url.to_string_lossy().into_owned()),
-        None => remote.as_deref().and_then(|remote| {
-            home::git_value(&["remote", "get-url", remote], None)
-                .ok()
-                .flatten()
-        }),
-    };
+    let url = args.get(1).map(|url| url.to_string_lossy().into_owned());
     let Some(id) = url.as_deref().and_then(RepoId::parse) else {
         return Ok(Gate::Passed(None));
     };
@@ -265,15 +352,24 @@ fn gate(args: &[OsString]) -> Result<Gate> {
         );
         return Ok(refuse_the_gated_branch(input, &slug, &entry.branch, &why));
     }
-    if let Err(why) = sykli_can_gate() {
+    let sykli = sykli_program();
+    let help = match sykli_help(&sykli) {
+        Ok(help) => help,
+        Err(why) => {
+            let why = format!("its gate is {}, but {why}", entry.contract().display());
+            return Ok(refuse_the_gated_branch(input, &slug, &entry.branch, &why));
+        }
+    };
+    if let Some(why) = cannot_gate(&help) {
         let why = format!("its gate is {}, but {why}", entry.contract().display());
         return Ok(refuse_the_gated_branch(input, &slug, &entry.branch, &why));
     }
-    let mut command = Command::new("sykli");
+    let mut command = Command::new(&sykli);
     command
         .args(["hook", "pre-push", "--contract"])
         .arg(entry.contract())
         .args(["--branch", &entry.branch])
+        .args(facts_for_sykli(&help, here.top.as_deref(), &here.common))
         .args(args.iter().take(2));
     let status =
         run_with_input(&mut command, Some(&input)).context("cannot run sykli hook pre-push")?;
@@ -288,28 +384,6 @@ fn gate(args: &[OsString]) -> Result<Gate> {
     Ok(Gate::Refused(exit_code(status).max(REFUSED)))
 }
 
-/// `$(git rev-parse --git-common-dir)/hooks/<name>`, where git would look
-/// without a `core.hooksPath`. Every worktree shares it.
-///
-/// Read from the repository's layout when it says ([`common_dir_in`]), so the
-/// hooks git runs on every commit and ref update (twelve for one commit) do
-/// not each start a `git rev-parse`; asked of git otherwise.
-fn own_hook(name: &str) -> Result<PathBuf> {
-    let env = |var: &str| std::env::var_os(var).filter(|dir| !dir.is_empty());
-    let cwd = std::env::current_dir().context("cannot read the current directory")?;
-    let common = match common_dir_in(&cwd, env("GIT_DIR"), env("GIT_COMMON_DIR")) {
-        Some(common) => common,
-        None => PathBuf::from(
-            home::git_value(
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                None,
-            )?
-            .context("git names no repository here")?,
-        ),
-    };
-    Ok(common.join("hooks").join(name))
-}
-
 /// The common git directory as git's on-disk layout names it
 /// (gitrepository-layout(5)), for a hook git started in `cwd`.
 ///
@@ -319,7 +393,7 @@ fn own_hook(name: &str) -> Result<PathBuf> {
 /// it yet); otherwise `cwd/.git` is the directory, or a `gitdir: <path>` file.
 /// A git directory with a `commondir` file shares that one's hooks. `None`
 /// when the layout does not say, and git must be asked.
-fn common_dir_in(
+pub fn common_dir_in(
     cwd: &Path,
     git_dir: Option<OsString>,
     common_dir: Option<OsString>,
@@ -347,17 +421,11 @@ fn common_dir_in(
     }
 }
 
-/// Run the repository's own hook, if it has one git would have run.
-fn chain(name: &str, args: &[OsString], input: Option<&[u8]>) -> Result<i32> {
-    let own = match own_hook(name) {
-        Ok(own) => own,
-        Err(error) => {
-            // Skipping the repository's own hook would pass a check it may
-            // hold, so this refuses instead.
-            eprintln!("ohjaa hook {name}: cannot find the repository's own hooks: {error:#}");
-            return Ok(CANNOT);
-        }
-    };
+/// Run the repository's own hook, `<common dir>/hooks/<name>` (where git
+/// would look without a `core.hooksPath`; every worktree shares it), if it
+/// has one git would have run.
+fn chain(name: &str, args: &[OsString], input: Option<&[u8]>, common: &Path) -> Result<i32> {
+    let own = common.join("hooks").join(name);
     let meta = match std::fs::metadata(&own) {
         Ok(meta) if meta.is_file() => meta,
         _ => return Ok(0),
@@ -376,12 +444,10 @@ fn chain(name: &str, args: &[OsString], input: Option<&[u8]>) -> Result<i32> {
     }
     #[cfg(not(unix))]
     let _ = meta;
-    // A repository hook that is (a link to) this dispatcher would run itself
-    // forever.
-    if let Ok(home) = home::ohjaa_home() {
-        if home::same_path(&own, &home::hooks_dir(&home).join(name)) {
-            return Ok(0);
-        }
+    // A repository hook that is (a copy of, or a link to) one of ohjaa's
+    // dispatchers would run itself forever.
+    if std::fs::read_to_string(&own).is_ok_and(|text| dispatcher_target(name, &text).is_some()) {
+        return Ok(0);
     }
     let status = match run_with_input(Command::new(&own).args(args), input) {
         Err(error) if is_exec_format_error(&error) => {
@@ -453,10 +519,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_dispatcher_execs_ohjaa_by_its_path_with_its_own_name() {
-        let ohjaa = Path::new("/Users/x/.cargo/bin/ohjaa");
+    fn every_dispatcher_execs_ohjaa_by_its_path_and_pre_push_names_sykli() {
+        let dispatch = Dispatch {
+            ohjaa: PathBuf::from("/Users/x/.cargo/bin/ohjaa"),
+            sykli: Some(PathBuf::from("/Users/x/.local/bin/sykli")),
+        };
         for name in HOOK_NAMES {
-            let text = dispatcher(name, ohjaa);
+            let text = dispatcher(name, &dispatch);
             assert!(text.starts_with("#!/bin/sh\n"), "{name}");
             assert!(
                 text.ends_with(&format!(
@@ -464,11 +533,21 @@ mod tests {
                 )),
                 "{name}"
             );
-            assert_eq!(dispatcher_target(name, &text).as_deref(), Some(ohjaa));
+            assert_eq!(
+                text.contains("OHJAA_SYKLI='/Users/x/.local/bin/sykli'; export OHJAA_SYKLI\n"),
+                name == "pre-push",
+                "{name}"
+            );
+            let read = dispatcher_target(name, &text).unwrap();
+            assert_eq!(read.ohjaa, dispatch.ohjaa);
+            assert_eq!(read.sykli.is_some(), name == "pre-push", "{name}");
         }
-        let odd = Path::new("/tmp/it's here/ohjaa");
-        let text = dispatcher("pre-push", odd);
-        assert_eq!(dispatcher_target("pre-push", &text).as_deref(), Some(odd));
+        let odd = Dispatch {
+            ohjaa: PathBuf::from("/tmp/it's here/ohjaa"),
+            sykli: None,
+        };
+        let text = dispatcher("pre-push", &odd);
+        assert_eq!(dispatcher_target("pre-push", &text), Some(odd));
         assert_eq!(
             dispatcher_target("pre-commit", &text),
             None,
@@ -480,6 +559,25 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), HOOK_NAMES.len(), "no hook twice");
+    }
+
+    #[test]
+    fn sykli_gets_the_facts_only_when_it_takes_them() {
+        let common = Path::new("/r/.git");
+        let both = "  --repo-root <DIR>\n  --git-common-dir <DIR>\n";
+        assert_eq!(
+            facts_for_sykli(both, Some(Path::new("/r")), common),
+            ["--repo-root", "/r", "--git-common-dir", "/r/.git"].map(OsString::from)
+        );
+        assert!(facts_for_sykli("  --repo-root <DIR>\n", Some(Path::new("/r")), common).is_empty());
+        assert!(
+            facts_for_sykli(both, None, common).is_empty(),
+            "a bare repository"
+        );
+        assert_eq!(cannot_gate("--contract --branch"), None);
+        assert!(cannot_gate("--contract")
+            .unwrap()
+            .contains("names no --branch"));
     }
 
     #[test]
