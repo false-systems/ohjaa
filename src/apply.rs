@@ -29,10 +29,6 @@ use crate::hook::{
 /// The change was refused.
 const REFUSED: i32 = 3;
 
-/// The unguarded line an earlier `apply` wrote; still recognised, and
-/// replaced.
-const BARE_LAUNCH_LINE: &str = r#"eval "$(ohjaa shell-init zsh)""#;
-
 /// The launcher line: the ohjaa that ran `apply`, by its path, guarded like
 /// the line it replaces, so a shell where that ohjaa is gone starts quietly.
 pub fn launch_line(ohjaa: &Path) -> String {
@@ -40,13 +36,9 @@ pub fn launch_line(ohjaa: &Path) -> String {
     format!("[[ -x {quoted} ]] && eval \"$({quoted} shell-init zsh)\"")
 }
 
-/// The ohjaa a launcher line `apply` wrote runs (`ohjaa` for the unguarded
-/// form); `None` for any other line.
+/// The ohjaa a launcher line `apply` wrote runs; `None` for any other line.
 pub fn launch_target(line: &str) -> Option<PathBuf> {
     let line = line.trim();
-    if line == BARE_LAUNCH_LINE {
-        return Some(PathBuf::from("ohjaa"));
-    }
     let (path, _) = line.strip_prefix("[[ -x '")?.split_once("' ]] && eval ")?;
     let path = PathBuf::from(path.replace("'\\''", "'"));
     (launch_line(&path) == line).then_some(path)
@@ -497,8 +489,7 @@ pub fn apply(
     // A global core.hooksPath runs in every repository and overrides the one
     // ohjaa scopes to gated ones: refused unless --force says to remove it.
     if let Some((path, direct, origin)) = global.hooks_path() {
-        let ours = home::same_path(Path::new(&path), &home::hooks_dir(&home));
-        if !ours && !options.force {
+        if !options.force {
             eprintln!(
                 "ohjaa apply: refusing: git's global core.hooksPath is {path}. It runs in every \
                  repository and overrides the core.hooksPath ohjaa gives the gated ones, so \
@@ -515,11 +506,7 @@ pub fn apply(
             );
             return Ok(REFUSED);
         }
-        let record = if ours {
-            Vec::new()
-        } else {
-            vec![("hooks_path_removed".to_owned(), path.clone())]
-        };
+        let record = vec![("hooks_path_removed".to_owned(), path.clone())];
         steps.push(step(
             ("remove", "removed"),
             format!("git's global core.hooksPath ({path})"),
@@ -1011,11 +998,7 @@ mod tests {
             launch_target(&line()).as_deref(),
             Some(Path::new("/Users/x/.cargo/bin/ohjaa"))
         );
-        assert_eq!(
-            launch_target(BARE_LAUNCH_LINE).as_deref(),
-            Some(Path::new("ohjaa"))
-        );
-        assert_eq!(launch_target("eval \"$(other shell-init zsh)\""), None);
+        assert_eq!(launch_target("eval \"$(ohjaa shell-init zsh)\""), None);
     }
 
     #[test]
@@ -1054,13 +1037,13 @@ mod tests {
     }
 
     #[test]
-    fn a_launcher_line_for_another_ohjaa_or_the_bare_form_is_rewritten() {
-        let earlier = format!("{LAUNCH_COMMENT}\n{BARE_LAUNCH_LINE}\n");
-        let plan = zshrc_with_launcher(&earlier, &line()).unwrap();
-        assert_eq!(plan.contents, format!("{LAUNCH_COMMENT}\n{}\n", line()));
+    fn a_launcher_line_for_another_ohjaa_is_rewritten() {
+        let earlier = format!("{LAUNCH_COMMENT}\n{}\n", line());
         let moved = launch_line(Path::new("/opt/ohjaa"));
-        let plan = zshrc_with_launcher(&plan.contents, &moved).unwrap();
+        let plan = zshrc_with_launcher(&earlier, &moved).unwrap();
         assert_eq!(plan.contents, format!("{LAUNCH_COMMENT}\n{moved}\n"));
+        assert_eq!(plan.removed, [LAUNCH_COMMENT.to_owned(), line()]);
+        assert_eq!(zshrc_with_launcher(&plan.contents, &moved), None);
     }
 
     #[test]

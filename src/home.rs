@@ -40,10 +40,6 @@ pub fn ohjaa_home() -> Result<PathBuf> {
     Ok(config_home()?.join("ohjaa"))
 }
 
-pub fn hooks_dir(home: &Path) -> PathBuf {
-    home.join("hooks")
-}
-
 /// A repository as its remote names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoId {

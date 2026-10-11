@@ -289,12 +289,7 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
                 ));
             }
             for target in targets {
-                if target == Path::new("ohjaa") {
-                    found.drift(format!(
-                        "{} loads the launcher unguarded, through PATH (ohjaa apply)",
-                        path.display()
-                    ));
-                } else if gitconfig::executable(&target) {
+                if gitconfig::executable(&target) {
                     found.ok(format!(
                         "{} loads the launcher from {}",
                         path.display(),
