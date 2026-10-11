@@ -34,6 +34,14 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   blocks a launch, and a broken log is reported, never replaced. Everything
   else — fleet, perimeter, coverage — is derived now and stored never. No
   knowledge index, no cache, no daemon.
+- **The workflow lives in the home, outside every repository.**
+  `~/.config/ohjaa` holds each repository's entry (`repos/<owner>/<repo>/`:
+  the branch and the gate, nothing else), the hook dispatchers and
+  `tools.lock`. `ohjaa apply` changes only the home's `hooks/`, git's global
+  `core.hooksPath`, a marked block in git's global excludes file and one line
+  of `~/.zshrc`; `ohjaa adopt` writes only the entry. Nothing is installed on
+  or written into a repository, and the dispatcher always runs a repository's
+  own hooks after the gate.
 - **`ohjaa run` stays the parent of the session until it ends**, so leaving
   always writes its record, whatever the exit. Session states are observed, not
   declared: the agent's lifecycle testimony is its read-back (`ohjaa oriented`)
@@ -48,10 +56,11 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   Knowledge is not a message — it carries its time, its why and whose it is. A
   session's handover is a record for whoever comes next, shown in the next
   briefing, never a message to a particular agent.
-- **Network only through `gh` and the drafter** — in `ohjaa intake` (review
-  comments, drafting) and when a session leaves (its branch's pull request,
-  bounded, recorded as unknown when gh cannot say). Every other command works
-  from the filesystem and local CLIs.
+- **Network only through `gh`, the drafter and cargo** — in `ohjaa intake`
+  (review comments, drafting), when a session leaves (its branch's pull
+  request, bounded, recorded as unknown when gh cannot say), and in
+  `ohjaa apply --tools` (`cargo install` of the pinned revisions). Every other
+  command works from the filesystem and local CLIs.
 - Failed coverage is never rendered as an empty result. If a scan could not
   look, it says so and exits non-zero.
 
@@ -66,7 +75,10 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 - Never edit `vendor/faija-knowledge/`; refresh it with
   `scripts/vendor-faija-knowledge.sh`. The format belongs to faija.
 - Tests must never read or write the person's real knowledge: the CLI tests
-  sandbox `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `OHJAA_OURS`.
+  sandbox `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `OHJAA_OURS`. The
+  workflow-home tests (`tests/config_home.rs`) empty the environment and also
+  sandbox `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`, `CARGO_HOME`, `TMPDIR`
+  and `PATH`: `apply` writes git's global config and `~/.zshrc`.
 
 ## Validation
 

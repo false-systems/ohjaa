@@ -6,6 +6,9 @@
 //! agent *before* it acts, together with the live perimeter of the fleet.
 //! Agents may propose Knowledge; only a person makes it current.
 
+mod flat_toml;
+mod home;
+mod hook;
 mod intake;
 mod knowledge;
 mod lifecycle;
@@ -15,7 +18,9 @@ mod roots;
 mod scan;
 mod sessions;
 mod system;
+mod tools;
 mod usage;
+mod workflow;
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -238,6 +243,153 @@ enum Cmd {
     /// A knowledge node and its neighbours: what it builds on, what builds on
     /// it, what it replaced, and which sessions were briefed with it.
     Graph { id: String },
+    /// Apply the workflow from the home (~/.config/ohjaa), outside every
+    /// repository: hook dispatchers, git's global core.hooksPath, the global
+    /// ignore block and the shell launcher. Idempotent.
+    #[command(after_help = "Exit codes:\n  \
+        0  applied, or nothing to change\n  \
+        1  a tool was not installed, or a change could not be made\n  \
+        3  refused: git's global core.hooksPath points elsewhere (see --force)\n\n\
+        Changes, and nothing else:\n  \
+        <home>/hooks/<every git hook>  #!/bin/sh + exec ohjaa hook <name> \"$@\"\n  \
+        git config --global core.hooksPath <home>/hooks\n  \
+        git's global excludes file     a block marked \"ohjaa apply\" holding .sykli/\n  \
+        ~/.zshrc                       eval \"$(ohjaa shell-init zsh)\", in place of a line\n                                 \
+        that sources ~/projects/ohjaa-launch.zsh\n\
+        With --tools, tools.lock's revisions are installed with\n  \
+        cargo +<toolchain> install --git <url> --rev <rev> --locked --force <name>\n\
+        from an empty temporary directory, for each tool not already at its pin.")]
+    Apply {
+        /// Print every change, and make none.
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace a global core.hooksPath that points elsewhere.
+        #[arg(long)]
+        force: bool,
+        /// Also install the tool revisions tools.lock pins.
+        #[arg(long)]
+        tools: bool,
+    },
+    /// Report what differs from what `apply` would make it, the pinned tools,
+    /// and how each repository under the roots stands. Read-only.
+    #[command(after_help = "Exit codes:\n  \
+        0  healthy\n  \
+        4  drift: a line marked DRIFT says what, and what fixes it\n\n\
+        A repository with its own core.hooksPath (set in its .git/config) never\n\
+        runs the global dispatchers: the workflow gate is not applied there.")]
+    Doctor,
+    /// Write a repository's entry into the home: the branch its gate protects
+    /// (origin's default branch) and the gate itself, copied from the
+    /// repository's sykli.json on that branch, else written by
+    /// `sykli init --contract`. Nothing is written into the repository.
+    Adopt {
+        /// The repository (any directory inside it).
+        path: PathBuf,
+        /// The branch to gate, when origin/HEAD does not name it.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Rewrite an existing entry.
+        #[arg(long)]
+        force: bool,
+    },
+    /// The git hook dispatcher every hook in <home>/hooks execs. pre-push
+    /// runs the repository's gate, when the home has an entry for it; every
+    /// hook then runs the repository's own hook, with the same arguments and
+    /// stdin.
+    #[command(after_help = "Exit codes:\n  \
+        0  passed (and the repository's own hook, if any, passed)\n  \
+        1  the gate refused the push\n  \
+        2  could not evaluate: an unreadable entry or pre-push input, or no repository\n  \
+        N  otherwise, the repository's own hook's status\n\n\
+        The repository is found by the URL git pushes to; its entry is\n\
+        <home>/repos/<owner>/<repo>/. The gate is\n  \
+        sykli hook pre-push --contract <entry>/sykli.json <remote> <url>\n\
+        When the sykli on PATH cannot take --contract, a push to the entry's\n\
+        branch is refused; other branches pass. The repository's own hook is\n\
+        $(git rev-parse --git-common-dir)/hooks/<name>, run when executable.")]
+    Hook {
+        /// The git hook's name, e.g. pre-push.
+        name: String,
+        /// The arguments git passed to the hook.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+    /// Print the shell functions that route `claude` and `codex` through
+    /// `ohjaa run`. Load them with: eval "$(ohjaa shell-init zsh)"
+    ShellInit {
+        /// zsh is the only one.
+        shell: String,
+    },
+    /// The tool revisions tools.lock pins, which `apply --tools` installs.
+    Tools {
+        #[command(subcommand)]
+        action: ToolsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ToolsCmd {
+    /// Pin a tool (a Cargo package) at a commit. With --from, a local clone
+    /// supplies what is not given: origin's URL, the commit (--rev, else
+    /// origin's default branch) and that commit's rust-toolchain.toml.
+    Pin {
+        /// The Cargo package, e.g. sykli.
+        name: String,
+        /// A local clone of the tool's repository.
+        #[arg(long, value_name = "CLONE")]
+        from: Option<PathBuf>,
+        /// The repository URL cargo installs from.
+        #[arg(long)]
+        git: Option<String>,
+        /// A full commit id; with --from, any revision the clone knows.
+        #[arg(long)]
+        rev: Option<String>,
+        /// The toolchain channel the tool's repository pins, e.g. 1.98.
+        #[arg(long)]
+        toolchain: Option<String>,
+    },
+    /// Remove a tool from tools.lock.
+    Unpin { name: String },
+}
+
+fn cmd_tools(action: &ToolsCmd) -> Result<i32> {
+    let lock = home::tools_lock(&home::ohjaa_home()?);
+    match action {
+        ToolsCmd::Pin {
+            name,
+            from,
+            git,
+            rev,
+            toolchain,
+        } => {
+            let pin = tools::pin(
+                &lock,
+                name,
+                from.as_deref(),
+                git.as_deref(),
+                rev.as_deref(),
+                toolchain.as_deref(),
+            )?;
+            println!(
+                "ohjaa tools: pinned {} at {} from {} (toolchain {}) in {}",
+                pin.name,
+                pin.rev,
+                pin.git,
+                pin.toolchain,
+                lock.display()
+            );
+            Ok(0)
+        }
+        ToolsCmd::Unpin { name } => {
+            if tools::unpin(&lock, name)? {
+                println!("ohjaa tools: unpinned {name} in {}", lock.display());
+                Ok(0)
+            } else {
+                eprintln!("ohjaa tools: {name} is not pinned in {}", lock.display());
+                Ok(1)
+            }
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -2534,6 +2686,18 @@ fn shell_word(word: &str) -> String {
 }
 
 fn main() {
+    // `ohjaa hook <name> ARGS…` hands git's arguments on exactly as git gave
+    // them. Through clap, one that looks like an ohjaa flag (`--root`) would be
+    // taken as one, so the dispatcher's path goes around it; `--help` still
+    // goes through clap.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv.len() >= 3 && argv[1] == "hook" && !argv[2].to_string_lossy().starts_with('-') {
+        let code = hook::run(&argv[2].to_string_lossy(), &argv[3..]).unwrap_or_else(|error| {
+            eprintln!("ohjaa hook: {error:#}");
+            2
+        });
+        std::process::exit(code);
+    }
     let cli = Cli::parse();
     let result = match &cli.command {
         Cmd::Run {
@@ -2601,6 +2765,20 @@ fn main() {
         Cmd::Usage { action } => cmd_usage(action),
         Cmd::Report { since, json } => cmd_report(&cli.root, since, *json),
         Cmd::Graph { id } => cmd_graph(id),
+        Cmd::Apply {
+            dry_run,
+            force,
+            tools,
+        } => workflow::apply(*dry_run, *force, *tools),
+        Cmd::Doctor => workflow::doctor(&cli.root, git_root().as_deref()),
+        Cmd::Adopt {
+            path,
+            branch,
+            force,
+        } => workflow::adopt(path, branch.as_deref(), *force),
+        Cmd::Hook { name, args } => hook::run(name, args),
+        Cmd::ShellInit { shell } => workflow::shell_init(shell),
+        Cmd::Tools { action } => cmd_tools(action),
         Cmd::Intake {
             since,
             sources,

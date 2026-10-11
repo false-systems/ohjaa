@@ -25,6 +25,9 @@ ohjaa session                          # the record of the last ended session he
 ohjaa graph rust-only                  # a node, its neighbours, who was briefed with it
 ohjaa fleet                            # who is live, across every repo
 ohjaa system                           # what every tool in the fleet is, derived now
+ohjaa apply                            # apply the workflow from ~/.config/ohjaa, outside every repo
+ohjaa adopt ~/projects/sykli           # give a repo an entry: its branch and its gate
+ohjaa doctor                           # what differs from what apply would make it
 ```
 
 ## Why
@@ -502,6 +505,74 @@ coverage: scanned 17/18 repo(s)
 - `ohjaa fleet` exits `4` when coverage is incomplete.
 - A session toimija reports as `stale` stays visible, with its age, because
   "quiet for ninety minutes" and "gone" look the same from outside.
+
+## The workflow home: applied from outside the repos
+
+The agent workflow (the gate, the hooks, the launcher) is a workflow thing,
+not something to merge into product repositories. Ohjaa keeps it in its home
+and applies it to repositories from outside; nothing is installed on a
+repository or written into one.
+
+```
+~/.config/ohjaa/                    ($XDG_CONFIG_HOME/ohjaa)
+  repos/<owner>/<repo>/
+    repo.toml     branch = "main"   the only per-repo workflow fact
+    sykli.json    the gate (a sykli contract), inputs repo-relative
+    sykli.lock
+  hooks/<every git hook>            exec ohjaa hook <name> "$@"
+  tools.lock                        the tool revisions apply --tools installs
+  mine/ machine/ roots ours drafter (knowledge and settings, as before)
+~/.config/git/ignore                git's global excludes (or core.excludesFile):
+                                    a block marked "ohjaa apply" holds .sykli/
+```
+
+```bash
+ohjaa apply --dry-run                  # every change apply would make; makes none
+ohjaa apply                            # dispatchers, core.hooksPath, ignore block, ~/.zshrc line
+ohjaa apply --tools                    # also install tools.lock's revisions
+ohjaa adopt ~/projects/taso            # entry: origin's default branch, and the gate
+ohjaa doctor                           # read-only; exits 4 on drift
+ohjaa tools pin sykli --from ~/projects/sykli   # pin origin/HEAD's commit and toolchain
+eval "$(ohjaa shell-init zsh)"         # the claude/codex launcher (apply puts this in ~/.zshrc)
+```
+
+**`apply`** changes four things outside every repository, and refuses before
+changing any when git's global `core.hooksPath` already points somewhere else
+(`--force` replaces it). It writes a dispatcher for every git hook into
+`hooks/`, points the global `core.hooksPath` there, keeps `.sykli/` in git's
+global excludes, and puts `eval "$(ohjaa shell-init zsh)"` in `~/.zshrc` in
+place of the old `source ~/projects/ohjaa-launch.zsh` line. Running it again
+changes nothing.
+
+**The dispatcher** (`ohjaa hook <name>`) finds the repository by the URL git
+pushes to (`git@github.com:o/r.git`, `https://github.com/o/r` and
+`ssh://git@github.com/o/r` are all `o/r`). On pre-push, when the home has an
+entry for it, the push is judged by
+`sykli hook pre-push --contract <entry>/sykli.json <remote> <url>`; a refusal
+stops the push. A sykli that cannot take `--contract` refuses every push to
+the entry's branch instead of letting it through. Then, for every hook, the
+dispatcher runs the repository's own hook,
+`$(git rev-parse --git-common-dir)/hooks/<name>`, with the same arguments and
+the same stdin, and exits with its status. A global `core.hooksPath` would
+otherwise switch off every clone's own `.git/hooks`; the dispatcher keeps
+them running, and a repository with no entry only runs its own.
+
+A repository that sets its own `core.hooksPath` (in its `.git/config`) never
+runs the global dispatchers. `ohjaa doctor` says so: *workflow gate not
+applied here: the repo's own hooks run*.
+
+**`adopt`** copies the repository's `sykli.json` and `sykli.lock` as origin's
+default branch holds them (not the working tree, which another session may be
+editing), or asks `sykli init --contract <entry>/sykli.json` for a new one.
+It refuses an existing entry without `--force`.
+
+**`tools.lock`** pins each tool to a full commit and to the toolchain its
+repository's `rust-toolchain.toml` names, because `cargo install --git` builds
+with whatever toolchain runs it. `apply --tools` runs
+`cargo +<toolchain> install --git <url> --rev <rev> --locked --force <name>`
+from an empty temporary directory, only for a tool Cargo's own record
+(`~/.cargo/.crates.toml`) does not show at its pin; a tool installed from a
+path is *unpinned*.
 
 ## What it will never do
 
