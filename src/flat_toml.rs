@@ -1,12 +1,14 @@
 //! The small, strict piece of TOML that ohjaa's config home is written in:
 //! `[table]` and `[dotted.table]` headers, `key = "text"` pairs, comments and
-//! blank lines. Every file ohjaa writes in it (`repo.toml`, `tools.lock`) is
-//! valid TOML that any TOML reader reads the same way.
+//! blank lines. Every file ohjaa writes in it (`repo.toml`, `tools.lock`,
+//! `applied.toml`) is valid TOML that any TOML reader reads the same way.
 //!
 //! Anything outside that subset is an error naming its line, never skipped:
 //! a config file read differently from what its author meant would apply the
-//! wrong gate or install the wrong tool. It is not a TOML parser, and adding
-//! one would be a dependency this crate does not need for two short files.
+//! wrong gate or install the wrong tool. It is not a TOML parser. The `toml`
+//! crate is already built here, for the vendored faija-knowledge, but
+//! depending on it directly would change the crate's dependency list, which
+//! only a person moves (AGENTS.md); until then, this subset.
 
 use std::collections::BTreeMap;
 

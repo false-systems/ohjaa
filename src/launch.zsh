@@ -1,7 +1,8 @@
 # Route everyday `claude` and `codex` through `ohjaa run` (workflow step 1 · Start).
 #
-# Printed by `ohjaa shell-init zsh`; `ohjaa apply` loads it from ~/.zshrc with:
-#   eval "$(ohjaa shell-init zsh)"
+# Printed by `ohjaa shell-init zsh`; `ohjaa apply` loads it from ~/.zshrc with
+#   [[ -x <ohjaa> ]] && eval "$(<ohjaa> shell-init zsh)"
+# where <ohjaa> is the path of the ohjaa that ran apply.
 #
 # ohjaa runs the agent as a child through `toimija run`. A child process never
 # sees these shell functions, so the real binary runs there and there is no

@@ -28,6 +28,7 @@ ohjaa system                           # what every tool in the fleet is, derive
 ohjaa apply                            # apply the workflow from ~/.config/ohjaa, outside every repo
 ohjaa adopt ~/projects/sykli           # give a repo an entry: its branch and its gate
 ohjaa doctor                           # what differs from what apply would make it
+ohjaa gate                             # run this repo's gate, as a push will judge it
 ```
 
 ## Why
@@ -511,60 +512,89 @@ coverage: scanned 17/18 repo(s)
 The agent workflow (the gate, the hooks, the launcher) is a workflow thing,
 not something to merge into product repositories. Ohjaa keeps it in its home
 and applies it to repositories from outside; nothing is installed on a
-repository or written into one.
+repository or written into one. Only repositories whose remote names an entry
+run ohjaa's hooks: `git status` in a Homebrew tap, Cargo's git cache or a
+personal project never starts ohjaa.
 
 ```
 ~/.config/ohjaa/                    ($XDG_CONFIG_HOME/ohjaa)
-  repos/<owner>/<repo>/
+  repos/<owner>/<repo>/             lower case
     repo.toml     branch = "main"   the only per-repo workflow fact
     sykli.json    the gate (a sykli contract), inputs repo-relative
     sykli.lock
-  hooks/<every git hook>            exec ohjaa hook <name> "$@"
+  git/config                        includeIf "hasconfig:remote.*.url:<pattern>" per entry
+  git/gated.config                  core.hooksPath = ~/.config/ohjaa/hooks
+  hooks/pre-push, hooks/<name>      exec <ohjaa> hook <name> "$@": pre-push, and each
+                                    hook a gated clone has of its own
+  applied.toml                      what apply changed outside the home, for --undo
   tools.lock                        the tool revisions apply --tools installs
   mine/ machine/ roots ours drafter (knowledge and settings, as before)
+~/.gitconfig                        [include] path = ~/.config/ohjaa/git/config (once)
 ~/.config/git/ignore                git's global excludes (or core.excludesFile):
                                     a block marked "ohjaa apply" holds .sykli/
 ```
 
 ```bash
 ohjaa apply --dry-run                  # every change apply would make; makes none
-ohjaa apply                            # dispatchers, core.hooksPath, ignore block, ~/.zshrc line
-ohjaa apply --tools                    # also install tools.lock's revisions
+ohjaa apply                            # git/, hooks/, the include, the ignore block, ~/.zshrc
+ohjaa apply --undo                     # put back what apply changed; repos/ and tools.lock stay
 ohjaa adopt ~/projects/taso            # entry: origin's default branch, and the gate
+ohjaa gate                             # run this repo's gate, as a push will judge it
+ohjaa gate --print                     # the contract and the commands, run nothing
 ohjaa doctor                           # read-only; exits 4 on drift
 ohjaa tools pin sykli --from ~/projects/sykli   # pin origin/HEAD's commit and toolchain
-eval "$(ohjaa shell-init zsh)"         # the claude/codex launcher (apply puts this in ~/.zshrc)
+ohjaa apply --tools                    # install tools.lock's revisions
 ```
 
-**`apply`** changes four things outside every repository, and refuses before
-changing any when git's global `core.hooksPath` already points somewhere else
-(`--force` replaces it). It writes a dispatcher for every git hook into
-`hooks/`, points the global `core.hooksPath` there, keeps `.sykli/` in git's
-global excludes, and puts `eval "$(ohjaa shell-init zsh)"` in `~/.zshrc` in
-place of the old `source ~/projects/ohjaa-launch.zsh` line. Running it again
-changes nothing.
+**Scoped by remote.** Git's global config gets one line, an `include` of
+`git/config`. That file has, for each entry, `includeIf
+"hasconfig:remote.*.url:…"` sections (git 2.36+) that include
+`gated.config`, which sets `core.hooksPath`. The patterns are host-agnostic
+and case-insensitive (`**/o/r`, `**/o/r.git`, `**/o/r/`, `*:o/r`, `*:o/r.git`,
+plus a short form for each global `insteadOf` rule), because a pattern that
+misses lets a push past the gate, while one that matches too much only costs a
+process that finds no entry. Any remote of a clone counts. A `pushurl`, a
+repository-local `insteadOf`, or the repository's own `core.hooksPath`
+(perusta, selko and vartio set one) is not seen by the patterns: `ohjaa doctor`
+checks, clone by clone, that git really resolves `core.hooksPath` to the
+home's hooks, and `ohjaa run` warns at launch in such a repository. The two
+generated files are written atomically and checked with `git config --file …
+--list` first, since an unreadable one would break every git command.
 
 **The dispatcher** (`ohjaa hook <name>`) finds the repository by the URL git
-pushes to (`git@github.com:o/r.git`, `https://github.com/o/r` and
-`ssh://git@github.com/o/r` are all `o/r`). On pre-push, when the home has an
-entry for it, the push is judged by
-`sykli hook pre-push --contract <entry>/sykli.json <remote> <url>`; a refusal
-stops the push. A sykli that cannot take `--contract` refuses every push to
-the entry's branch instead of letting it through. Then, for every hook, the
-dispatcher runs the repository's own hook,
+pushes to. On pre-push, with an entry, the push is judged by
+`sykli hook pre-push --contract <entry>/sykli.json --branch <entry's branch>
+<remote> <url>`, and a refusal stops it. A sykli without both flags, or an
+entry without a gate, refuses every push to the entry's branch. Then, for
+every hook, the dispatcher runs the repository's own hook,
 `$(git rev-parse --git-common-dir)/hooks/<name>`, with the same arguments and
-the same stdin, and exits with its status. A global `core.hooksPath` would
-otherwise switch off every clone's own `.git/hooks`; the dispatcher keeps
-them running, and a repository with no entry only runs its own.
+the same stdin, and exits with its status. The hooks folder is shared by the
+gated repositories, so it holds pre-push plus the union of their own hooks;
+`push-to-checkout`, `proc-receive` and `fsmonitor-watchman` never get a
+dispatcher, because a file of that name changes what git does. A hook of their
+own added later runs only once `apply` writes its dispatcher; doctor says so.
+The dispatchers exec ohjaa by the path `apply` ran it from, so a git client
+started without your PATH still finds it.
 
-A repository that sets its own `core.hooksPath` (in its `.git/config`) never
-runs the global dispatchers. `ohjaa doctor` says so: *workflow gate not
-applied here: the repo's own hooks run*.
+**`ohjaa gate`** runs the gate a push will judge, from the repository root:
+`mkdir -p .sykli && sykli run <contract> --json > .sykli/receipt.json &&
+sykli verify .sykli/receipt.json --contract <contract> --commit HEAD`, where
+the contract is the entry's, or the repository's own `sykli.json` when origin
+names no entry. It prints the contract and every command, and exits with
+sykli's status. Agents are taught this one command.
+
+**`apply`** refuses, before changing anything, when git's global
+`core.hooksPath` is set (in the global file or a file it includes): it would
+run in every repository and override the scoped one. `--force` removes it from
+the global file, and `--undo` puts it back. The launcher line it puts in
+`~/.zshrc`, in place of the old `source ~/projects/ohjaa-launch.zsh`, is
+guarded like that one was: `[[ -x <ohjaa> ]] && eval "$(<ohjaa> shell-init
+zsh)"`.
 
 **`adopt`** copies the repository's `sykli.json` and `sykli.lock` as origin's
 default branch holds them (not the working tree, which another session may be
-editing), or asks `sykli init --contract <entry>/sykli.json` for a new one.
-It refuses an existing entry without `--force`.
+editing), or asks `sykli init --contract <entry>/sykli.json` for a new one,
+then regenerates `git/`. It never touches git's global config.
 
 **`tools.lock`** pins each tool to a full commit and to the toolchain its
 repository's `rust-toolchain.toml` names, because `cargo install --git` builds

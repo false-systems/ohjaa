@@ -10,7 +10,11 @@
 //!     repo.toml    branch = "main"   the only per-repo workflow fact
 //!     sykli.json   the gate (a sykli contract), inputs repo-relative
 //!     sykli.lock
-//!   hooks/<every git hook name>      exec ohjaa hook <name> "$@"
+//!   git/config                       includeIf per entry remote -> gated.config
+//!   git/gated.config                 core.hooksPath = <home>/hooks
+//!   hooks/<name>                     exec <ohjaa> hook <name> "$@", for
+//!                                    pre-push and each hook a gated clone has
+//!   applied.toml                     what apply changed, for `apply --undo`
 //!   tools.lock                       the tool revisions `apply --tools` installs
 //! ```
 //!
@@ -133,8 +137,12 @@ impl Entry {
     }
 }
 
+/// `repos/<owner>/<name>`, lower case: owners and repositories are
+/// case-insensitive on GitHub, and some file systems are not.
 pub fn entry_dir(home: &Path, id: &RepoId) -> PathBuf {
-    home.join("repos").join(&id.owner).join(&id.name)
+    home.join("repos")
+        .join(id.owner.to_ascii_lowercase())
+        .join(id.name.to_ascii_lowercase())
 }
 
 /// What `repo.toml` holds: the branch, and nothing else.
@@ -196,8 +204,22 @@ pub fn read_entry(dir: &Path) -> Result<Option<Entry>> {
     }
 }
 
+/// The entry for `id`. Owners and repositories are case-insensitive on
+/// GitHub, so `False-Systems/Ohjaa` finds `repos/false-systems/ohjaa/` on
+/// any file system.
 pub fn find_entry(home: &Path, id: &RepoId) -> Result<Option<Entry>> {
-    read_entry(&entry_dir(home, id))
+    let exact = entry_dir(home, id);
+    if exact.is_dir() {
+        return read_entry(&exact);
+    }
+    let wanted = id.slug();
+    match entry_dirs(home)?
+        .into_iter()
+        .find(|(slug, _)| slug.eq_ignore_ascii_case(&wanted))
+    {
+        Some((_, dir)) => read_entry(&dir),
+        None => Ok(None),
+    }
 }
 
 /// Every entry directory under `repos/`, as `(owner/name, dir)`.
@@ -237,7 +259,11 @@ pub fn git_value(args: &[&str], cwd: Option<&Path>) -> Result<Option<String>> {
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = process::run(&mut command, None, process::LOCAL).context("cannot run git")?;
+    value_of(&mut command, args)
+}
+
+pub fn value_of(command: &mut Command, args: &[&str]) -> Result<Option<String>> {
+    let output = process::run(command, None, process::LOCAL).context("cannot run git")?;
     match output.status.code() {
         Some(0) => Ok(Some(output.stdout_text().trim().to_owned())),
         Some(1) if output.stderr.is_empty() => Ok(None),
@@ -245,19 +271,96 @@ pub fn git_value(args: &[&str], cwd: Option<&Path>) -> Result<Option<String>> {
     }
 }
 
-/// A global git setting that names a path, `~` expanded.
+/// `git config --global …`, run outside every repository: with `--includes`,
+/// a repository's `includeIf` (ohjaa's own among them) would otherwise count
+/// as global wherever the command happens to run.
+fn global_git(args: &[&str]) -> Result<Option<String>> {
+    let (mut command, full) = global_command(args);
+    value_of(&mut command, &full)
+}
+
+fn global_command<'a>(args: &[&'a str]) -> (Command, Vec<&'a str>) {
+    let mut full = vec!["config", "--global"];
+    full.extend_from_slice(args);
+    let mut command = Command::new("git");
+    command.args(&full).current_dir("/");
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+    ] {
+        command.env_remove(var);
+    }
+    (command, full)
+}
+
+/// A global git setting that names a path, `~` expanded, wherever git's
+/// global config sets it: in the file itself or in a file it includes.
 pub fn global_path_setting(key: &str) -> Result<Option<String>> {
-    git_value(&["config", "--global", "--type=path", "--get", key], None)
+    global_git(&["--includes", "--type=path", "--get", key])
+}
+
+/// Whether git's global config file itself (not a file it includes) sets
+/// `key`: only that is ohjaa's to change.
+pub fn global_sets_directly(key: &str) -> Result<bool> {
+    Ok(global_git(&["--no-includes", "--get", key])?.is_some())
+}
+
+/// The file a global setting comes from, as `git config --show-origin` says.
+pub fn global_origin(key: &str) -> Result<Option<String>> {
+    Ok(global_git(&["--includes", "--show-origin", "--get", key])?
+        .and_then(|line| line.split('\t').next().map(str::to_owned)))
 }
 
 pub fn set_global(key: &str, value: &str) -> Result<()> {
-    git_value(&["config", "--global", key, value], None)?
+    global_git(&[key, value])?
         .map(|_| ())
         .with_context(|| format!("git config --global {key} did not take"))
 }
 
-/// Git's global excludes file: `core.excludesFile` when set, else
-/// `$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`.
+/// Every value of a global setting that names a path, `~` expanded, in the
+/// global file itself.
+pub fn global_paths(key: &str) -> Result<Vec<String>> {
+    Ok(global_git(&["--type=path", "--get-all", key])?
+        .map(|text| text.lines().map(str::to_owned).collect())
+        .unwrap_or_default())
+}
+
+/// Add one more value to a global setting.
+pub fn add_global(key: &str, value: &str) -> Result<()> {
+    global_git(&["--add", key, value])?
+        .map(|_| ())
+        .with_context(|| format!("git config --global --add {key} did not take"))
+}
+
+/// Remove the global setting's values equal to `value` (all of them when
+/// `None`). Git drops a section left empty.
+pub fn unset_global(key: &str, value: Option<&str>) -> Result<()> {
+    let mut args = vec!["--unset-all", key];
+    if let Some(value) = value {
+        args = vec!["--fixed-value", "--unset-all", key, value];
+    }
+    let (mut command, full) = global_command(&args);
+    let output = process::run(&mut command, None, process::LOCAL).context("cannot run git")?;
+    match output.status.code() {
+        // Exit 5: nothing to unset, which is what was wanted.
+        Some(0 | 5) => Ok(()),
+        _ => bail!("git {} failed: {}", full.join(" "), output.failure_detail()),
+    }
+}
+
+/// The `insteadOf` rules in git's global config, includes followed, as
+/// `git config -z --get-regexp` prints them.
+pub fn global_rewrites_text() -> Result<String> {
+    Ok(
+        global_git(&["--includes", "-z", "--get-regexp", r"^url\..*\.insteadof$"])?
+            .unwrap_or_default(),
+    )
+}
+
+/// Git's global excludes file: `core.excludesFile` when set (includes
+/// followed), else `$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`.
 pub fn global_ignore_file() -> Result<PathBuf> {
     if let Some(value) = global_path_setting("core.excludesFile")? {
         if !value.is_empty() {
@@ -295,6 +398,17 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
 /// symbolic link (a dotfiles checkout) is written through, never replaced,
 /// and the file keeps its permissions.
 pub fn write_file(path: &Path, contents: &str, mode: Option<u32>) -> Result<()> {
+    write_checked(path, contents, mode, |_| Ok(()))
+}
+
+/// [`write_file`], with `check` run on the written temporary file before it
+/// replaces `path`; a failed check leaves `path` as it was.
+pub fn write_checked(
+    path: &Path,
+    contents: &str,
+    mode: Option<u32>,
+    check: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let dir = target
         .parent()
@@ -321,6 +435,10 @@ pub fn write_file(path: &Path, contents: &str, mode: Option<u32>) -> Result<()> 
     }
     #[cfg(not(unix))]
     let _ = mode;
+    if let Err(error) = check(&temp) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
     std::fs::rename(&temp, &target).with_context(|| {
         let _ = std::fs::remove_file(&temp);
         format!("cannot replace {}", target.display())

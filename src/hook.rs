@@ -1,15 +1,17 @@
-//! `ohjaa hook <name> [args]`: the global git hook dispatcher.
+//! `ohjaa hook <name> [args]`: the git hook dispatcher.
 //!
-//! `ohjaa apply` points the global `core.hooksPath` at the home's `hooks/`,
-//! where every git hook is a two-line dispatcher into this command. Two jobs:
+//! A repository whose remote names an entry includes `core.hooksPath =
+//! <home>/hooks` (see `gate`), where each needed hook is a dispatcher into
+//! this command: pre-push, and every hook a gated clone has of its own. No
+//! other repository runs it. Two jobs:
 //!
 //! 1. **The gate (pre-push only).** The repository is found by the URL git
 //!    pushes to. When the home has an entry for it with a contract, sykli
 //!    judges the push against that contract. A refusal stops the push.
-//! 2. **Chaining (every hook).** A global `core.hooksPath` switches off every
-//!    clone's own `.git/hooks`, so the dispatcher runs the repository's own
-//!    hook, `$(git rev-parse --git-common-dir)/hooks/<name>` when executable,
-//!    with the same arguments and the same stdin, and exits with its status.
+//! 2. **Chaining (every hook).** A `core.hooksPath` switches off the clone's
+//!    own `.git/hooks`, so the dispatcher runs the repository's own hook,
+//!    `$(git rev-parse --git-common-dir)/hooks/<name>` when executable, with
+//!    the same arguments and the same stdin, and exits with its status.
 //!
 //! Nothing is ever written into the repository.
 
@@ -54,13 +56,60 @@ pub const HOOK_NAMES: [&str; 28] = [
     "post-index-change",
 ];
 
+/// Hooks that never get a dispatcher: a file of that name changes what git
+/// does in every repository that shares the hooks folder, whatever the
+/// dispatcher then chains to. `push-to-checkout` takes over the worktree
+/// update of `receive.denyCurrentBranch=updateInstead`, `proc-receive` takes
+/// over `receive.procReceiveRefs`, and `fsmonitor-watchman` is never run from
+/// a hooks folder at all (`core.fsmonitor` names it).
+pub const NOT_DISPATCHED: [&str; 3] = ["push-to-checkout", "proc-receive", "fsmonitor-watchman"];
+
 /// The dispatcher `ohjaa apply` writes as `hooks/<name>`.
-pub fn dispatcher(name: &str) -> String {
+///
+/// It execs `ohjaa` by the absolute path `apply` ran from, so a git that runs
+/// with another PATH (a GUI client) still finds it.
+pub fn dispatcher(name: &str, ohjaa: &Path) -> String {
     format!(
         "#!/bin/sh\n\
          # Written by `ohjaa apply`, checked by `ohjaa doctor`; edits are replaced.\n\
-         exec ohjaa hook {name} \"$@\"\n"
+         exec {} hook {name} \"$@\"\n",
+        quote_path(ohjaa)
     )
+}
+
+pub fn quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// The ohjaa a dispatcher execs, when the file is one of `apply`'s
+/// dispatchers (unedited) for `name`.
+pub fn dispatcher_target(name: &str, text: &str) -> Option<PathBuf> {
+    let line = text.lines().find_map(|line| line.strip_prefix("exec "))?;
+    let quoted = line.strip_suffix(&format!(" hook {name} \"$@\""))?;
+    let inner = quoted.strip_prefix('\'')?.strip_suffix('\'')?;
+    let path = PathBuf::from(inner.replace("'\\''", "'"));
+    (dispatcher(name, &path) == text).then_some(path)
+}
+
+/// The ohjaa running now, by the path it was started as: `argv[0]` made
+/// absolute, or found on PATH the way the shell found it. Symbolic links are
+/// kept (`~/.cargo/bin/ohjaa` stays that, never a versioned directory behind
+/// it), so a reinstall keeps the dispatchers working.
+pub fn invoked_ohjaa() -> Result<PathBuf> {
+    let argv0 = PathBuf::from(std::env::args_os().next().context("no argv[0]")?);
+    let absolute = |path: PathBuf| std::path::absolute(&path).unwrap_or(path);
+    if argv0.components().count() > 1 {
+        return Ok(absolute(argv0));
+    }
+    let found = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(&argv0))
+            .find(|candidate| crate::gate::executable(candidate))
+    });
+    match found {
+        Some(path) => Ok(absolute(path)),
+        None => std::env::current_exe().context("cannot tell where this ohjaa is"),
+    }
 }
 
 /// Refused, as sykli's hooks say it.
@@ -112,25 +161,34 @@ fn updates(input: &str) -> std::result::Result<Vec<Update>, String> {
 }
 
 /// Whether the sykli on PATH can judge a push against a contract outside the
-/// repository; the reason when it cannot.
-fn sykli_takes_a_contract() -> std::result::Result<(), String> {
+/// repository, for exactly the branch the entry names; the reason when it
+/// cannot. Both flags are required: without `--branch`, sykli would gate the
+/// branch `refs/remotes/<remote>/HEAD` names, which need not be the entry's.
+fn sykli_can_gate() -> std::result::Result<(), String> {
     let output = Command::new("sykli")
         .args(["hook", "pre-push", "--help"])
         .stdin(Stdio::null())
         .output();
-    match output {
+    let help = match output {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err("sykli is not on PATH".to_owned())
+            return Err("sykli is not on PATH".to_owned())
         }
-        Err(error) => Err(format!("sykli cannot be run ({error})")),
-        Ok(output) if String::from_utf8_lossy(&output.stdout).contains("--contract") => Ok(()),
-        Ok(_) => Err(
-            "the sykli on PATH cannot check a contract kept outside the repository \
-             (`sykli hook pre-push --help` names no --contract); update it with \
-             `ohjaa apply --tools`"
-                .to_owned(),
-        ),
+        Err(error) => return Err(format!("sykli cannot be run ({error})")),
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+    };
+    let lacking: Vec<&str> = ["--contract", "--branch"]
+        .into_iter()
+        .filter(|flag| !help.contains(flag))
+        .collect();
+    if lacking.is_empty() {
+        return Ok(());
     }
+    Err(format!(
+        "the sykli on PATH cannot gate a branch against a contract kept outside the \
+         repository (`sykli hook pre-push --help` names no {}); update it with \
+         `ohjaa apply --tools`",
+        lacking.join(" and no ")
+    ))
 }
 
 fn read_stdin() -> Result<Vec<u8>> {
@@ -139,6 +197,36 @@ fn read_stdin() -> Result<Vec<u8>> {
         .read_to_end(&mut input)
         .context("cannot read what git pushes")?;
     Ok(input)
+}
+
+/// Refuse when the push moves the entry's branch, saying `why` it cannot be
+/// judged; let every other push through. A push to the gated branch never
+/// passes unjudged.
+fn refuse_the_gated_branch(input: Vec<u8>, slug: &str, branch: &str, why: &str) -> Gate {
+    const HOOK: &str = "ohjaa hook pre-push";
+    let text = String::from_utf8_lossy(&input);
+    let updates = match updates(&text) {
+        Ok(updates) => updates,
+        Err(error) => {
+            eprintln!("{HOOK}: cannot read what is pushed: {error}");
+            return Gate::Refused(CANNOT);
+        }
+    };
+    let gated = format!("refs/heads/{branch}");
+    let pushed = updates
+        .iter()
+        .find(|update| update.remote_ref == gated && !update.local_sha.bytes().all(|b| b == b'0'));
+    match pushed {
+        Some(update) => {
+            let sha = &update.local_sha;
+            eprintln!(
+                "{HOOK}: refusing to push {} to {gated} of {slug}: {why}",
+                &sha[..sha.len().min(12)]
+            );
+            Gate::Refused(REFUSED)
+        }
+        None => Gate::Passed(Some(input)),
+    }
 }
 
 fn gate(args: &[OsString]) -> Result<Gate> {
@@ -165,60 +253,39 @@ fn gate(args: &[OsString]) -> Result<Gate> {
             return Ok(Gate::Refused(CANNOT));
         }
     };
+    let slug = id.slug();
+    let input = read_stdin()?;
+    // An entry means the repository is meant to be gated: without its gate,
+    // its branch is refused, never let through.
     if !entry.has_contract() {
-        eprintln!(
-            "{HOOK}: {} has an entry but no gate ({} is missing); not gated",
-            id.slug(),
+        let why = format!(
+            "it has an entry but no gate ({} is missing); write one with \
+             `ohjaa adopt --force`, or remove the entry",
             entry.contract().display()
         );
-        return Ok(Gate::Passed(None));
+        return Ok(refuse_the_gated_branch(input, &slug, &entry.branch, &why));
     }
-    let input = read_stdin()?;
-    match sykli_takes_a_contract() {
-        Ok(()) => {
-            let mut command = Command::new("sykli");
-            command
-                .args(["hook", "pre-push", "--contract"])
-                .arg(entry.contract())
-                .args(args.iter().take(2));
-            let status = run_with_input(&mut command, Some(&input))
-                .context("cannot run sykli hook pre-push")?;
-            if status.success() {
-                return Ok(Gate::Passed(Some(input)));
-            }
-            eprintln!(
-                "{HOOK}: the gate for {} ({}) refused this push",
-                id.slug(),
-                entry.contract().display()
-            );
-            Ok(Gate::Refused(exit_code(status).max(REFUSED)))
-        }
-        Err(why) => {
-            let text = String::from_utf8_lossy(&input);
-            let updates = match updates(&text) {
-                Ok(updates) => updates,
-                Err(error) => {
-                    eprintln!("{HOOK}: cannot read what is pushed: {error}");
-                    return Ok(Gate::Refused(CANNOT));
-                }
-            };
-            let gated = format!("refs/heads/{}", entry.branch);
-            let pushed = updates.iter().find(|update| {
-                update.remote_ref == gated && !update.local_sha.bytes().all(|b| b == b'0')
-            });
-            if let Some(update) = pushed {
-                let sha = &update.local_sha;
-                eprintln!(
-                    "{HOOK}: refusing to push {} to {gated} of {}: its gate is {}, but {why}",
-                    &sha[..sha.len().min(12)],
-                    id.slug(),
-                    entry.contract().display()
-                );
-                return Ok(Gate::Refused(REFUSED));
-            }
-            Ok(Gate::Passed(Some(input)))
-        }
+    if let Err(why) = sykli_can_gate() {
+        let why = format!("its gate is {}, but {why}", entry.contract().display());
+        return Ok(refuse_the_gated_branch(input, &slug, &entry.branch, &why));
     }
+    let mut command = Command::new("sykli");
+    command
+        .args(["hook", "pre-push", "--contract"])
+        .arg(entry.contract())
+        .args(["--branch", &entry.branch])
+        .args(args.iter().take(2));
+    let status =
+        run_with_input(&mut command, Some(&input)).context("cannot run sykli hook pre-push")?;
+    if status.success() {
+        return Ok(Gate::Passed(Some(input)));
+    }
+    eprintln!(
+        "{HOOK}: the gate for {slug} ({}, branch {}) refused this push; run it with: ohjaa gate",
+        entry.contract().display(),
+        entry.branch
+    );
+    Ok(Gate::Refused(exit_code(status).max(REFUSED)))
 }
 
 /// `$(git rev-parse --git-common-dir)/hooks/<name>`, where git would look
@@ -386,15 +453,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_dispatcher_execs_ohjaa_with_its_own_name() {
+    fn every_dispatcher_execs_ohjaa_by_its_path_with_its_own_name() {
+        let ohjaa = Path::new("/Users/x/.cargo/bin/ohjaa");
         for name in HOOK_NAMES {
-            let text = dispatcher(name);
+            let text = dispatcher(name, ohjaa);
             assert!(text.starts_with("#!/bin/sh\n"), "{name}");
             assert!(
-                text.ends_with(&format!("exec ohjaa hook {name} \"$@\"\n")),
+                text.ends_with(&format!(
+                    "exec '/Users/x/.cargo/bin/ohjaa' hook {name} \"$@\"\n"
+                )),
                 "{name}"
             );
+            assert_eq!(dispatcher_target(name, &text).as_deref(), Some(ohjaa));
         }
+        let odd = Path::new("/tmp/it's here/ohjaa");
+        let text = dispatcher("pre-push", odd);
+        assert_eq!(dispatcher_target("pre-push", &text).as_deref(), Some(odd));
+        assert_eq!(
+            dispatcher_target("pre-commit", &text),
+            None,
+            "another hook's"
+        );
+        let edited = text.replace("exec", "echo hi\nexec");
+        assert_eq!(dispatcher_target("pre-push", &edited), None, "edited");
         let mut names = HOOK_NAMES.to_vec();
         names.sort_unstable();
         names.dedup();

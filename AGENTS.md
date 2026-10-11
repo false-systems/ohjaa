@@ -36,12 +36,15 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   knowledge index, no cache, no daemon.
 - **The workflow lives in the home, outside every repository.**
   `~/.config/ohjaa` holds each repository's entry (`repos/<owner>/<repo>/`:
-  the branch and the gate, nothing else), the hook dispatchers and
-  `tools.lock`. `ohjaa apply` changes only the home's `hooks/`, git's global
-  `core.hooksPath`, a marked block in git's global excludes file and one line
-  of `~/.zshrc`; `ohjaa adopt` writes only the entry. Nothing is installed on
-  or written into a repository, and the dispatcher always runs a repository's
-  own hooks after the gate.
+  the branch and the gate, nothing else), the generated `git/` config, the
+  hook dispatchers and `tools.lock`. Only repositories whose remote names an
+  entry run ohjaa's hooks; no other git command anywhere starts ohjaa.
+  Outside the home, `ohjaa apply` changes only one `include.path` in git's
+  global config, a marked block in git's global excludes file and one line of
+  `~/.zshrc`, records each, and `apply --undo` puts them back; `ohjaa adopt`
+  writes only the entry and the home's `git/`. Nothing is installed on or
+  written into a repository, and the dispatcher always runs a repository's own
+  hooks after the gate.
 - **`ohjaa run` stays the parent of the session until it ends**, so leaving
   always writes its record, whatever the exit. Session states are observed, not
   declared: the agent's lifecycle testimony is its read-back (`ohjaa oriented`)

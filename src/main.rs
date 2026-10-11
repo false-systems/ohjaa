@@ -6,7 +6,9 @@
 //! agent *before* it acts, together with the live perimeter of the fleet.
 //! Agents may propose Knowledge; only a person makes it current.
 
+mod apply;
 mod flat_toml;
+mod gate;
 mod home;
 mod hook;
 mod intake;
@@ -244,44 +246,59 @@ enum Cmd {
     /// it, what it replaced, and which sessions were briefed with it.
     Graph { id: String },
     /// Apply the workflow from the home (~/.config/ohjaa), outside every
-    /// repository: hook dispatchers, git's global core.hooksPath, the global
-    /// ignore block and the shell launcher. Idempotent.
+    /// repository: git runs ohjaa's hooks only in repositories whose remote
+    /// names an entry. Also the global ignore block and the shell launcher.
+    /// Idempotent; --undo takes it all back.
     #[command(after_help = "Exit codes:\n  \
-        0  applied, or nothing to change\n  \
-        1  a tool was not installed, or a change could not be made\n  \
-        3  refused: git's global core.hooksPath points elsewhere (see --force)\n\n\
-        Changes, and nothing else:\n  \
-        <home>/hooks/<every git hook>  #!/bin/sh + exec ohjaa hook <name> \"$@\"\n  \
-        git config --global core.hooksPath <home>/hooks\n  \
-        git's global excludes file     a block marked \"ohjaa apply\" holding .sykli/\n  \
-        ~/.zshrc                       eval \"$(ohjaa shell-init zsh)\", in place of a line\n                                 \
+        0  applied, undone, or nothing to change\n  \
+        1  a tool was not installed, git is older than 2.36, or a change could not be made\n  \
+        3  refused: git's global core.hooksPath is set (see --force)\n\n\
+        Writes in the home:\n  \
+        hooks/<name>        #!/bin/sh + exec <this ohjaa> hook <name> \"$@\", for pre-push\n                      \
+        and each hook a gated clone under the roots has of its own\n  \
+        git/config          includeIf \"hasconfig:remote.*.url:<pattern>\" per entry\n  \
+        git/gated.config    core.hooksPath = <home>/hooks\n  \
+        applied.toml        what apply changed outside the home, for --undo\n\
+        Changes outside it, and nothing else:\n  \
+        git's global config  [include] path = <home>/git/config (once)\n  \
+        git's global excludes  a block marked \"ohjaa apply\" holding .sykli/\n  \
+        ~/.zshrc             eval \"$(ohjaa shell-init zsh)\", in place of a line\n                       \
         that sources ~/projects/ohjaa-launch.zsh\n\
-        With --tools, tools.lock's revisions are installed with\n  \
+        --undo puts those three back as they were, and removes hooks/, git/ and\n\
+        applied.toml; repos/ and tools.lock stay. With --tools, tools.lock's\n\
+        revisions are installed with\n  \
         cargo +<toolchain> install --git <url> --rev <rev> --locked --force <name>\n\
         from an empty temporary directory, for each tool not already at its pin.")]
     Apply {
         /// Print every change, and make none.
         #[arg(long)]
         dry_run: bool,
-        /// Replace a global core.hooksPath that points elsewhere.
+        /// Remove a global core.hooksPath (it would run in every repository).
         #[arg(long)]
         force: bool,
         /// Also install the tool revisions tools.lock pins.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "undo")]
         tools: bool,
+        /// Take back what apply changed outside the home, and what it generated.
+        #[arg(long)]
+        undo: bool,
     },
     /// Report what differs from what `apply` would make it, the pinned tools,
-    /// and how each repository under the roots stands. Read-only.
+    /// and, clone by clone, whether git runs ohjaa's hooks where an entry says
+    /// it should. Read-only.
     #[command(after_help = "Exit codes:\n  \
         0  healthy\n  \
         4  drift: a line marked DRIFT says what, and what fixes it\n\n\
-        A repository with its own core.hooksPath (set in its .git/config) never\n\
-        runs the global dispatchers: the workflow gate is not applied there.")]
+        For each clone under the roots whose remote names an entry: git must\n\
+        resolve its core.hooksPath to <home>/hooks (a pattern that missed, or the\n\
+        repository's own core.hooksPath, means the gate does not run there), and\n\
+        each hook of its own must have a dispatcher (else git skips it).")]
     Doctor,
     /// Write a repository's entry into the home: the branch its gate protects
     /// (origin's default branch) and the gate itself, copied from the
     /// repository's sykli.json on that branch, else written by
-    /// `sykli init --contract`. Nothing is written into the repository.
+    /// `sykli init --contract`; then regenerate the home's git config. Neither
+    /// git's global config nor the repository is written.
     Adopt {
         /// The repository (any directory inside it).
         path: PathBuf,
@@ -313,6 +330,22 @@ enum Cmd {
         /// The arguments git passed to the hook.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
+    },
+    /// Run the gate for the repository here, as a push to its gated branch
+    /// will judge it: the contract of the entry origin names (else the
+    /// repository's own sykli.json), run into .sykli/receipt.json and verified
+    /// for HEAD. Prints the contract and every command it runs.
+    #[command(after_help = "Exit codes:\n  \
+        0  passed: .sykli/receipt.json verifies for HEAD\n  \
+        N  sykli's status: the run or the verify failed\n  \
+        2  no gate here: origin names no entry, and there is no sykli.json\n\n\
+        Runs, from the repository root:\n  \
+        mkdir -p .sykli && sykli run <contract> --json > .sykli/receipt.json &&\n  \
+        sykli verify .sykli/receipt.json --contract <contract> --commit HEAD")]
+    Gate {
+        /// Print the contract and the commands, and run nothing.
+        #[arg(long)]
+        print: bool,
     },
     /// Print the shell functions that route `claude` and `codex` through
     /// `ohjaa run`. Load them with: eval "$(ohjaa shell-init zsh)"
@@ -1839,6 +1872,13 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     for warning in &scan.warnings {
         eprintln!("ohjaa: warning: {warning}");
     }
+    // The workflow gate, where an entry says it applies: what doctor checks
+    // for this one repository (a few git calls, none outside a gated one).
+    if in_repo {
+        for warning in gate::launch_warnings(&root) {
+            eprintln!("ohjaa: warning: {warning}");
+        }
+    }
 
     // A footgun guard: ohjaa flags after `--` belong to the agent.
     for misplaced in [
@@ -2769,7 +2809,21 @@ fn main() {
             dry_run,
             force,
             tools,
-        } => workflow::apply(*dry_run, *force, *tools),
+            undo,
+        } => {
+            if *undo {
+                apply::undo(*dry_run)
+            } else {
+                apply::apply(
+                    apply::Options {
+                        dry_run: *dry_run,
+                        force: *force,
+                        tools: *tools,
+                    },
+                    &roots::load(&cli.root, git_root().as_deref()),
+                )
+            }
+        }
         Cmd::Doctor => workflow::doctor(&cli.root, git_root().as_deref()),
         Cmd::Adopt {
             path,
@@ -2778,6 +2832,7 @@ fn main() {
         } => workflow::adopt(path, branch.as_deref(), *force),
         Cmd::Hook { name, args } => hook::run(name, args),
         Cmd::ShellInit { shell } => workflow::shell_init(shell),
+        Cmd::Gate { print } => workflow::gate_here(*print),
         Cmd::Tools { action } => cmd_tools(action),
         Cmd::Intake {
             since,

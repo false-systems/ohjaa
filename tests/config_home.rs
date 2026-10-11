@@ -16,31 +16,52 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// Never the real sykli. `--help` names `--contract` only with
-/// STUB_SYKLI_CONTRACT set. The pre-push gate keeps its stdin and refuses a
-/// push to main unless the repository has `.sykli/receipt.json`.
+/// Never the real sykli. `hook pre-push --help` names `--contract` and
+/// `--branch` with STUB_SYKLI_CONTRACT=1, only `--contract` with `nobranch`,
+/// neither without it. The pre-push gate keeps its stdin and, like the real
+/// one, gates exactly the branch it is given: a push to it is refused unless
+/// the repository has `.sykli/receipt.json`. `run` passes unless
+/// `$SANDBOX/fail-gate` exists; `verify` passes a receipt that says passed.
 const SYKLI_STUB: &str = r#"#!/bin/sh
 printf '%s|%s\n' "$PWD" "$*" >> "$SANDBOX/sykli-calls"
-case "$1 $2" in
-  "hook pre-push")
+case "$1" in
+  hook)
     if [ "$3" = --help ]; then
       echo "Usage: sykli hook pre-push [OPTIONS] [REMOTE] [URL]"
-      [ -n "${STUB_SYKLI_CONTRACT:-}" ] && echo "      --contract <CONTRACT>  a contract outside the repository"
+      case "${STUB_SYKLI_CONTRACT:-}" in
+        1) echo "      --contract <CONTRACT>  a contract outside the repository"
+           echo "      --branch <BRANCH>      gate exactly this branch";;
+        nobranch) echo "      --contract <CONTRACT>  a contract outside the repository";;
+      esac
       exit 0
     fi
+    shift 2; branch=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --contract) shift;; --branch) branch=$2; shift;; *) break;; esac
+      shift
+    done
     cat > "$SANDBOX/sykli-stdin"
-    [ -n "${STUB_SYKLI_CONTRACT:-}" ] || { echo "error: unexpected argument '--contract'" >&2; exit 2; }
-    if grep -q " refs/heads/main " "$SANDBOX/sykli-stdin" && [ ! -f .sykli/receipt.json ]; then
-      echo "sykli hook pre-push: refusing to push to refs/heads/main: no receipt of its tree" >&2
+    [ -n "$branch" ] || { echo "error: no --branch" >&2; exit 2; }
+    if grep -q " refs/heads/$branch " "$SANDBOX/sykli-stdin" && [ ! -f .sykli/receipt.json ]; then
+      echo "sykli hook pre-push: refusing to push to refs/heads/$branch: no receipt of its tree" >&2
       exit 1
     fi
     exit 0;;
-  "init --help")
-    echo "Usage: sykli init [OPTIONS] [PATH]"
-    [ -n "${STUB_SYKLI_CONTRACT:-}" ] && echo "      --contract <CONTRACT>  write the contract there"
-    exit 0;;
-  "init --contract")
-    printf '{"version":"1","tasks":{}}\n' > "$3"
+  init)
+    if [ "$2" = --help ]; then
+      echo "Usage: sykli init [OPTIONS] [PATH]"
+      [ -n "${STUB_SYKLI_CONTRACT:-}" ] && echo "      --contract <CONTRACT>  write the contract there"
+      exit 0
+    fi
+    [ "$2" = --contract ] && { printf '{"version":"1","tasks":{}}\n' > "$3"; exit 0; }
+    exit 2;;
+  run)
+    if [ -f "$SANDBOX/fail-gate" ]; then
+      echo '{"outcome":"failed"}'; echo "failed: says-one" >&2; exit 1
+    fi
+    echo '{"outcome":"passed"}'; echo "passed: says-one" >&2; exit 0;;
+  verify)
+    grep -q passed "$2" || { echo "refused: outcome expected passed" >&2; exit 1; }
     exit 0;;
 esac
 exit 2
@@ -50,6 +71,15 @@ const CARGO_STUB: &str = r#"#!/bin/sh
 printf '%s|%s\n' "$PWD" "$*" >> "$SANDBOX/cargo-calls"
 "#;
 
+/// Never the real toimija: no live sessions, so `ohjaa run --dry-run` gets
+/// as far as its warnings.
+const TOIMIJA_STUB: &str = r#"#!/bin/sh
+case "$1" in
+  sessions) echo '{"sessions":[],"warnings":[],"coverage":{"status":"available"}}';;
+  context) echo '{}';;
+esac
+"#;
+
 const CLAUDE_STUB: &str = "#!/bin/sh\necho \"direct $*\"\n";
 const CODEX_STUB: &str = "#!/bin/sh\necho \"direct-codex $*\"\n";
 
@@ -57,10 +87,6 @@ const OLD_ZSHRC: &str = "export PATH=\"$HOME/.local/bin:$PATH\"\n\
     # Route claude/codex through ohjaa (agent delivery workflow, step 1). Bypass: command claude, or OHJAA_WRAP=0.\n\
     [[ -r ~/projects/ohjaa-launch.zsh ]] && source ~/projects/ohjaa-launch.zsh\n\
     alias ll='ls -l'\n";
-
-const LAUNCH_LINE: &str = r#"eval "$(ohjaa shell-init zsh)""#;
-
-const HOOKS: usize = 28;
 
 fn executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
@@ -78,10 +104,25 @@ fn text(output: &Output) -> (String, String) {
     )
 }
 
+/// The names of the files in a directory, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 struct Sandbox {
     dir: PathBuf,
     path: String,
-    stub_contract: bool,
+    /// STUB_SYKLI_CONTRACT: "" (an old sykli), "nobranch" or "1".
+    stub_contract: &'static str,
 }
 
 impl Sandbox {
@@ -105,6 +146,7 @@ impl Sandbox {
         write_executable(&bin.join("sykli"), SYKLI_STUB);
         write_executable(&bin.join("cargo"), CARGO_STUB);
         write_executable(&bin.join("claude"), CLAUDE_STUB);
+        write_executable(&bin.join("toimija"), TOIMIJA_STUB);
         write_executable(&bin.join("codex"), CODEX_STUB);
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ohjaa"), bin.join("ohjaa")).unwrap();
         // Only the stubs and the system: no real sykli, cargo, agent or ohjaa.
@@ -119,7 +161,7 @@ impl Sandbox {
         Sandbox {
             dir,
             path,
-            stub_contract: false,
+            stub_contract: "",
         }
     }
 
@@ -129,6 +171,23 @@ impl Sandbox {
 
     fn config(&self) -> PathBuf {
         self.dir.join("config").join("ohjaa")
+    }
+
+    fn hooks(&self) -> PathBuf {
+        self.config().join("hooks")
+    }
+
+    /// The launcher line apply writes: the sandbox's ohjaa, by its path.
+    fn launch_line(&self) -> String {
+        let ohjaa = self.dir.join("bin/ohjaa");
+        format!(
+            "[[ -x '{0}' ]] && eval \"$('{0}' shell-init zsh)\"",
+            ohjaa.display()
+        )
+    }
+
+    fn projects(&self) -> String {
+        self.dir.join("projects").to_string_lossy().into_owned()
     }
 
     fn command(&self, program: &str, cwd: &Path) -> Command {
@@ -150,8 +209,8 @@ impl Sandbox {
             .env("GIT_COMMITTER_NAME", "Ohjaa Test")
             .env("GIT_COMMITTER_EMAIL", "ohjaa@example.invalid")
             .env("SANDBOX", &self.dir);
-        if self.stub_contract {
-            command.env("STUB_SYKLI_CONTRACT", "1");
+        if !self.stub_contract.is_empty() {
+            command.env("STUB_SYKLI_CONTRACT", self.stub_contract);
         }
         command
     }
@@ -179,6 +238,20 @@ impl Sandbox {
         stdout.trim().to_owned()
     }
 
+    /// `core.hooksPath` as git resolves it in `repo`, `None` when unset.
+    fn hooks_path(&self, repo: &Path) -> Option<String> {
+        let output = self.git_out(repo, &["config", "--get", "core.hooksPath"]);
+        output
+            .status
+            .success()
+            .then(|| text(&output).0.trim().to_owned())
+    }
+
+    /// Whether git runs ohjaa's hooks in `repo`.
+    fn gated(&self, repo: &Path) -> bool {
+        self.hooks_path(repo).as_deref() == Some(self.hooks().to_str().unwrap())
+    }
+
     /// `projects/<name>`, with one commit holding `files`, pushed to a bare
     /// `remotes/<owner>/<name>.git` as origin's main, and origin/HEAD set.
     fn repo(&self, owner: &str, name: &str, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
@@ -202,6 +275,16 @@ impl Sandbox {
         self.git(&repo, &["push", "-q", "-u", "origin", "main"]);
         self.git(&repo, &["remote", "set-head", "origin", "main"]);
         (repo, bare)
+    }
+
+    /// An entry written by hand: `repo.toml`, and a gate unless `None`.
+    fn entry(&self, owner: &str, name: &str, gate: Option<&str>) {
+        let dir = self.config().join("repos").join(owner).join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("repo.toml"), "branch = \"main\"\n").unwrap();
+        if let Some(gate) = gate {
+            fs::write(dir.join("sykli.json"), gate).unwrap();
+        }
     }
 
     fn commit(&self, repo: &Path, file: &str) -> String {
@@ -228,9 +311,33 @@ impl Sandbox {
     }
 
     fn apply(&self) {
-        let output = self.ohjaa(&["apply"]);
+        let output = self.ohjaa(&["apply", "--root", &self.projects()]);
         let (stdout, stderr) = text(&output);
         assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    }
+
+    fn adopt(&self, repo: &Path) {
+        let output = self.ohjaa(&["adopt", &repo.to_string_lossy()]);
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    }
+
+    /// The ohjaa processes git starts for `args` in `repo`: its hook runs from
+    /// the home's hooks folder, as GIT_TRACE reports them.
+    fn ohjaa_runs(&self, repo: &Path, args: &[&str]) -> usize {
+        let output = self
+            .command("git", repo)
+            .env("GIT_TRACE", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        let (_, stderr) = text(&output);
+        // `trace: run_command: [VAR=value …] <hooks>/<name> args`
+        let hooks = format!(" {}/", self.hooks().display());
+        stderr
+            .lines()
+            .filter(|line| line.contains("run_command:") && line.contains(&hooks))
+            .count()
     }
 }
 
@@ -246,19 +353,27 @@ impl Drop for Sandbox {
 fn apply_dry_run_says_every_change_and_makes_none() {
     let sandbox = Sandbox::new("dry");
     fs::write(sandbox.home().join(".zshrc"), OLD_ZSHRC).unwrap();
-    let output = sandbox.ohjaa(&["apply", "--dry-run"]);
+    let output = sandbox.ohjaa(&["apply", "--dry-run", "--root", &sandbox.projects()]);
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
-    let hooks = sandbox.config().join("hooks");
+    let hooks = sandbox.hooks();
     for said in [
         format!(
-            "would write {HOOKS} hook dispatchers into {}",
-            hooks.display()
+            "would write 1 hook dispatcher into {} (exec {}): pre-push",
+            hooks.display(),
+            sandbox.dir.join("bin/ohjaa").display()
         ),
-        "pre-push".to_owned(),
         format!(
-            "would set core.hooksPath = {} in git's global config (unset now)",
-            hooks.display()
+            "would write {}",
+            sandbox.config().join("git/config").display()
+        ),
+        format!(
+            "would write {}",
+            sandbox.config().join("git/gated.config").display()
+        ),
+        format!(
+            "would add include.path = {} to git's global config",
+            sandbox.config().join("git/config").display()
         ),
         format!(
             "would add .sykli/ to {}",
@@ -266,12 +381,12 @@ fn apply_dry_run_says_every_change_and_makes_none() {
         ),
         format!("would change {}", sandbox.home().join(".zshrc").display()),
         "  - [[ -r ~/projects/ohjaa-launch.zsh ]] && source ~/projects/ohjaa-launch.zsh".to_owned(),
-        format!("  + {LAUNCH_LINE}"),
+        format!("  + {}", sandbox.launch_line()),
         "dry run; nothing was changed".to_owned(),
     ] {
         assert!(stdout.contains(&said), "missing {said:?} in:\n{stdout}");
     }
-    assert!(!hooks.exists(), "no dispatcher written");
+    assert!(!sandbox.config().exists(), "nothing written in the home");
     assert!(
         !sandbox.dir.join("gitconfig").exists(),
         "global config untouched"
@@ -284,54 +399,65 @@ fn apply_dry_run_says_every_change_and_makes_none() {
 }
 
 #[test]
-fn apply_applies_once_and_then_has_nothing_to_change() {
+fn apply_includes_one_file_and_no_repository_without_an_entry_runs_ohjaa() {
     let sandbox = Sandbox::new("apply");
     fs::write(sandbox.home().join(".zshrc"), OLD_ZSHRC).unwrap();
     fs::create_dir_all(sandbox.dir.join("config/git")).unwrap();
     fs::write(sandbox.dir.join("config/git/ignore"), "*.swp\n").unwrap();
+    let (other, bare) = sandbox.repo("acme", "other", &[]);
     sandbox.apply();
 
-    let hooks = sandbox.config().join("hooks");
-    let written: Vec<_> = fs::read_dir(&hooks).unwrap().flatten().collect();
-    assert_eq!(written.len(), HOOKS);
-    for entry in written {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let body = fs::read_to_string(entry.path()).unwrap();
-        assert!(body.starts_with("#!/bin/sh\n"), "{name}");
-        assert!(
-            body.ends_with(&format!("exec ohjaa hook {name} \"$@\"\n")),
-            "{name}: {body}"
-        );
-        assert!(executable(&entry.path()), "{name}");
-    }
+    // One include, no global core.hooksPath.
     assert_eq!(
         sandbox.git(
             &sandbox.dir,
-            &["config", "--global", "--get", "core.hooksPath"]
+            &["config", "--global", "--get-all", "include.path"]
         ),
-        hooks.to_string_lossy()
+        sandbox.config().join("git/config").to_string_lossy()
     );
-    let ignore = sandbox.read("config/git/ignore");
-    assert!(ignore.starts_with("*.swp\n"), "{ignore}");
-    assert!(ignore.contains("\n.sykli/\n"), "{ignore}");
-    // git init and git clone still work: while they create a repository,
-    // git runs reference-transaction before rev-parse can see it.
-    let (repo, bare) = sandbox.repo("acme", "any", &[]);
+    let global = sandbox.git_out(
+        &sandbox.dir,
+        &["config", "--global", "--get", "core.hooksPath"],
+    );
+    assert!(!global.status.success(), "no global core.hooksPath");
+    // Only pre-push: no gated clone has hooks of its own.
+    assert_eq!(names_in(&sandbox.hooks()), ["pre-push"]);
+    let dispatcher = fs::read_to_string(sandbox.hooks().join("pre-push")).unwrap();
+    assert!(dispatcher.ends_with(&format!(
+        "exec '{}' hook pre-push \"$@\"\n",
+        sandbox.dir.join("bin/ohjaa").display()
+    )));
+    assert!(executable(&sandbox.hooks().join("pre-push")));
+    assert_eq!(
+        names_in(&sandbox.config().join("git")),
+        ["config", "gated.config"]
+    );
+    // A repository whose remote names no entry never runs ohjaa.
+    assert!(!sandbox.gated(&other));
+    assert_eq!(
+        sandbox.ohjaa_runs(&other, &["commit", "-q", "--allow-empty", "-m", "x"]),
+        0
+    );
+    assert_eq!(
+        sandbox.ohjaa_runs(&other, &["push", "-q", "origin", "main"]),
+        0
+    );
+    // git init and git clone still work.
     sandbox.git(
         &sandbox.dir,
         &["clone", "-q", &bare.to_string_lossy(), "cloned"],
     );
-    // Git reads the file apply wrote: .sykli/ is ignored in every repository.
-    sandbox.git(&repo, &["check-ignore", "-q", ".sykli/receipt.json"]);
+    // Git reads the ignore file apply wrote: .sykli/ is ignored everywhere.
+    let ignore = sandbox.read("config/git/ignore");
+    assert!(
+        ignore.starts_with("*.swp\n") && ignore.contains("\n.sykli/\n"),
+        "{ignore}"
+    );
+    sandbox.git(&other, &["check-ignore", "-q", ".sykli/receipt.json"]);
     let zshrc = fs::read_to_string(sandbox.home().join(".zshrc")).unwrap();
     assert!(!zshrc.contains("ohjaa-launch.zsh"), "{zshrc}");
-    assert_eq!(zshrc.matches(LAUNCH_LINE).count(), 1, "{zshrc}");
     assert!(
-        zshrc.starts_with("export PATH=\"$HOME/.local/bin:$PATH\"\n"),
-        "{zshrc}"
-    );
-    assert!(
-        zshrc.ends_with(&format!("{LAUNCH_LINE}\nalias ll='ls -l'\n")),
+        zshrc.ends_with(&format!("{}\nalias ll='ls -l'\n", sandbox.launch_line())),
         "{zshrc}"
     );
 
@@ -340,10 +466,12 @@ fn apply_applies_once_and_then_has_nothing_to_change() {
         sandbox.read("config/git/ignore"),
         zshrc,
     );
-    let output = sandbox.ohjaa(&["apply"]);
-    let (stdout, _) = text(&output);
-    assert_eq!(output.status.code(), Some(0));
-    assert!(stdout.contains("nothing to change"), "{stdout}");
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    assert!(
+        text(&output).0.contains("nothing to change"),
+        "{}",
+        text(&output).0
+    );
     assert_eq!(
         before,
         (
@@ -354,31 +482,167 @@ fn apply_applies_once_and_then_has_nothing_to_change() {
     );
 
     // An edited dispatcher is drift, and apply puts it back.
-    fs::write(hooks.join("pre-push"), "#!/bin/sh\nexit 0\n").unwrap();
-    let output = sandbox.ohjaa(&[
-        "doctor",
-        "--root",
-        &sandbox.dir.join("projects").to_string_lossy(),
-    ]);
+    fs::write(sandbox.hooks().join("pre-push"), "#!/bin/sh\nexit 0\n").unwrap();
+    let output = sandbox.ohjaa(&["doctor", "--root", &sandbox.projects()]);
     let (stdout, _) = text(&output);
     assert_eq!(output.status.code(), Some(4), "{stdout}");
     assert!(
-        stdout.contains("DRIFT  hook dispatchers edited or not executable: pre-push"),
+        stdout.contains("pre-push is not one of apply's dispatchers"),
         "{stdout}"
     );
-    let output = sandbox.ohjaa(&["apply"]);
-    let (stdout, _) = text(&output);
-    assert!(stdout.contains("wrote 1 hook dispatcher into"), "{stdout}");
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    assert!(text(&output).0.contains("wrote 1 hook dispatcher into"));
+}
+
+/// Every form a remote URL takes, against the patterns apply generates for
+/// the entry false-systems/ohjaa (and git's insteadOf rules).
+#[test]
+fn the_remote_patterns_gate_every_url_form_and_nothing_else() {
+    let sandbox = Sandbox::new("patterns");
+    sandbox.git(
+        &sandbox.dir,
+        &["config", "--global", "url.git@github.com:.insteadOf", "gh:"],
+    );
+    sandbox.git(
+        &sandbox.dir,
+        &[
+            "config",
+            "--global",
+            "url.git@github.com:false-systems/.insteadOf",
+            "fs:",
+        ],
+    );
+    sandbox.entry("false-systems", "ohjaa", Some("{}\n"));
+    sandbox.apply();
+    let matrix: &[(&[&str], bool)] = &[
+        (&["git@github.com:false-systems/ohjaa.git"], true),
+        (&["git@github.com:false-systems/ohjaa"], true),
+        (&["https://github.com/false-systems/ohjaa"], true),
+        (&["https://github.com/false-systems/ohjaa.git"], true),
+        (&["https://github.com/false-systems/ohjaa/"], true),
+        (&["ssh://git@github.com/false-systems/ohjaa.git"], true),
+        (&["ssh://git@github.com:22/false-systems/ohjaa.git"], true),
+        (&["github.com:false-systems/ohjaa.git"], true),
+        (&["https://x@github.com/false-systems/ohjaa.git"], true),
+        (&["https://github.com/False-Systems/ohjaa.git"], true),
+        (&["https://GITHUB.com/FALSE-SYSTEMS/OHJAA"], true),
+        (&["gh:false-systems/ohjaa"], true),
+        (&["fs:ohjaa.git"], true),
+        (
+            &[
+                "git@github.com:yairfalse/fork.git",
+                "git@github.com:false-systems/ohjaa.git",
+            ],
+            true,
+        ),
+        (
+            &["https://evil.example/github.com/false-systems/ohjaa"],
+            true,
+        ),
+        (&["https://github.com/false-systems/ohjaa-other.git"], false),
+        (&["git@github.com:false-systems/ohjaa-other"], false),
+        (&["git@github.com:yairfalse/ohjaa.git"], false),
+        (&["https://github.com/other/ohjaa"], false),
+        (&["git@github.com:false-systems/xohjaa"], false),
+        (&["fs:ohjaa-other"], false),
+        (&[], false),
+    ];
+    let mut wrong = Vec::new();
+    for (at, (urls, gated)) in matrix.iter().enumerate() {
+        let repo = sandbox.dir.join(format!("r{at}"));
+        sandbox.git(&sandbox.dir, &["init", "-q", &repo.to_string_lossy()]);
+        for (n, url) in urls.iter().enumerate() {
+            sandbox.git(&repo, &["remote", "add", &format!("r{n}"), url]);
+        }
+        let label = if urls.is_empty() {
+            "(no remote)".to_owned()
+        } else {
+            urls.join(" + ")
+        };
+        eprintln!(
+            "{label:<72} gated: {}",
+            if sandbox.gated(&repo) { "yes" } else { "no" }
+        );
+        if sandbox.gated(&repo) != *gated {
+            wrong.push(label);
+        }
+    }
+    assert!(wrong.is_empty(), "wrongly gated or not: {wrong:?}");
+
+    // A linked worktree of a gated clone is gated too.
+    let gated = sandbox.dir.join("r0");
+    sandbox.git(&gated, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    let linked = sandbox.dir.join("r0-linked");
+    sandbox.git(
+        &gated,
+        &["worktree", "add", "-q", &linked.to_string_lossy()],
+    );
+    assert!(sandbox.gated(&linked));
 }
 
 #[test]
-fn apply_refuses_another_global_hooks_path_unless_forced() {
+fn a_gated_repository_starts_ohjaa_only_for_push_and_for_hooks_it_has() {
+    let sandbox = Sandbox::new("count");
+    let (gated, _) = sandbox.repo("acme", "gated", &[("sykli.json", "{}\n")]);
+    let (own, _) = sandbox.repo("acme", "own", &[("sykli.json", "{}\n")]);
+    let (free, _) = sandbox.repo("acme", "free", &[]);
+    write_executable(
+        &own.join(".git/hooks/pre-commit"),
+        "#!/bin/sh\necho own >> \"$SANDBOX/own-calls\"\n",
+    );
+    fs::create_dir_all(gated.join(".sykli")).unwrap();
+    fs::write(gated.join(".sykli/receipt.json"), "{}").unwrap();
+    // (status, commit, fetch, push): the ohjaa processes git starts.
+    let counts = |label: &str, repo: &Path| {
+        let status = sandbox.ohjaa_runs(repo, &["status"]);
+        let commit = sandbox.ohjaa_runs(repo, &["commit", "-q", "--allow-empty", "-m", "n"]);
+        let fetch = sandbox.ohjaa_runs(repo, &["fetch", "-q", "origin"]);
+        let push = sandbox.ohjaa_runs(repo, &["push", "-q", "origin", "HEAD:refs/heads/side"]);
+        eprintln!("{label:<44} status {status}  commit {commit}  fetch {fetch}  push {push}");
+        (status, commit, fetch, push)
+    };
+
+    sandbox.apply();
+    sandbox.adopt(&gated);
+    assert_eq!(names_in(&sandbox.hooks()), ["pre-push"]);
+    assert_eq!(
+        counts("gated (hooks folder: pre-push)", &gated),
+        (0, 0, 0, 1)
+    );
+    assert_eq!(counts("no entry", &free), (0, 0, 0, 0));
+
+    // A gated clone with a pre-commit of its own: adopt adds that dispatcher,
+    // and only it. The folder is shared, so every gated clone now runs it.
+    sandbox.adopt(&own);
+    assert_eq!(names_in(&sandbox.hooks()), ["pre-commit", "pre-push"]);
+    fs::remove_file(sandbox.hooks().join("pre-commit")).unwrap();
+    sandbox.apply();
+    assert_eq!(
+        names_in(&sandbox.hooks()),
+        ["pre-commit", "pre-push"],
+        "apply arrives at it too"
+    );
+    assert_eq!(counts("own, its own pre-commit", &own), (0, 1, 0, 1));
+    assert_eq!(
+        counts("gated (folder: pre-commit, pre-push)", &gated),
+        (0, 1, 0, 1)
+    );
+    assert_eq!(counts("no entry", &free), (0, 0, 0, 0));
+    assert_eq!(
+        sandbox.read("own-calls"),
+        "own\n",
+        "the own pre-commit ran once"
+    );
+}
+
+#[test]
+fn apply_refuses_a_global_hooks_path_unless_forced_and_undo_puts_it_back() {
     let sandbox = Sandbox::new("refuse");
     sandbox.git(
         &sandbox.dir,
         &["config", "--global", "core.hooksPath", "/elsewhere/hooks"],
     );
-    let output = sandbox.ohjaa(&["apply"]);
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(3), "{stdout}{stderr}");
     assert!(
@@ -386,25 +650,112 @@ fn apply_refuses_another_global_hooks_path_unless_forced() {
         "{stderr}"
     );
     assert!(stderr.contains("ohjaa apply --force"), "{stderr}");
-    assert!(
-        !sandbox.config().join("hooks").exists(),
-        "nothing half applied"
-    );
+    assert!(!sandbox.config().exists(), "nothing half applied");
     assert!(
         !sandbox.home().join(".zshrc").exists(),
         "nothing half applied"
     );
 
-    let output = sandbox.ohjaa(&["apply", "--force"]);
+    let output = sandbox.ohjaa(&["apply", "--force", "--root", &sandbox.projects()]);
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
-    assert!(stdout.contains("replacing /elsewhere/hooks"), "{stdout}");
+    assert!(
+        stdout.contains("removed git's global core.hooksPath (/elsewhere/hooks)"),
+        "{stdout}"
+    );
+    let global = sandbox.git_out(
+        &sandbox.dir,
+        &["config", "--global", "--get", "core.hooksPath"],
+    );
+    assert!(!global.status.success());
+
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
     assert_eq!(
         sandbox.git(
             &sandbox.dir,
             &["config", "--global", "--get", "core.hooksPath"]
         ),
-        sandbox.config().join("hooks").to_string_lossy()
+        "/elsewhere/hooks"
+    );
+}
+
+#[test]
+fn undo_puts_back_exactly_what_apply_changed() {
+    let sandbox = Sandbox::new("undo");
+    let gitconfig = "[user]\n\tname = Someone\n[alias]\n\tst = status\n";
+    fs::write(sandbox.dir.join("gitconfig"), gitconfig).unwrap();
+    fs::write(sandbox.home().join(".zshrc"), OLD_ZSHRC).unwrap();
+    fs::create_dir_all(sandbox.dir.join("config/git")).unwrap();
+    fs::write(sandbox.dir.join("config/git/ignore"), "*.swp\n").unwrap();
+    let (repo, _) = sandbox.repo("acme", "widget", &[("sykli.json", "{}\n")]);
+    sandbox.apply();
+    sandbox.adopt(&repo);
+    let output = sandbox.ohjaa(&[
+        "tools",
+        "pin",
+        "sykli",
+        "--git",
+        "ssh://h/o/sykli",
+        "--rev",
+        "95bc5921a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "--toolchain",
+        "1.98",
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(sandbox.gated(&repo));
+
+    let output = sandbox.ohjaa(&["apply", "--undo", "--dry-run"]);
+    let (stdout, _) = text(&output);
+    for said in [
+        "would remove include.path = ",
+        "would remove the \"ohjaa apply\" block from ",
+        "would change ",
+        "  + [[ -r ~/projects/ohjaa-launch.zsh ]] && source ~/projects/ohjaa-launch.zsh",
+        "would remove what apply generated in ",
+        "dry run; nothing was changed",
+    ] {
+        assert!(stdout.contains(said), "missing {said:?} in:\n{stdout}");
+    }
+    assert!(
+        sandbox.hooks().exists() && sandbox.gated(&repo),
+        "a dry run undoes nothing"
+    );
+
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(sandbox.read("gitconfig"), gitconfig);
+    assert_eq!(
+        fs::read_to_string(sandbox.home().join(".zshrc")).unwrap(),
+        OLD_ZSHRC
+    );
+    assert_eq!(sandbox.read("config/git/ignore"), "*.swp\n");
+    assert_eq!(
+        names_in(&sandbox.config()),
+        ["repos", "tools.lock"],
+        "entries and lock kept"
+    );
+    assert!(!sandbox.gated(&repo));
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    assert!(text(&output).0.contains("nothing to undo"));
+}
+
+#[test]
+fn undo_removes_the_files_apply_created() {
+    let sandbox = Sandbox::new("undo-created");
+    sandbox.apply();
+    assert!(sandbox.home().join(".zshrc").exists());
+    assert!(sandbox.dir.join("config/git/ignore").exists());
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    assert!(!sandbox.home().join(".zshrc").exists());
+    assert!(!sandbox.dir.join("config/git/ignore").exists());
+    assert_eq!(sandbox.read("gitconfig"), "");
+    assert!(
+        names_in(&sandbox.config()).is_empty(),
+        "{:?}",
+        names_in(&sandbox.config())
     );
 }
 
@@ -436,12 +787,15 @@ fn adopt_copies_the_gate_from_the_default_branch_and_never_writes_into_the_repo(
             (".gitignore", "target/\n"),
         ],
     );
+    sandbox.apply();
+    let global_before = sandbox.read("gitconfig");
     // Someone's uncommitted work: the gate comes from origin/main, not from it.
     fs::write(repo.join("sykli.json"), "{\"edited\":true}\n").unwrap();
     fs::write(repo.join("notes.txt"), "untracked\n").unwrap();
     fs::create_dir_all(repo.join("target")).unwrap();
     fs::write(repo.join("target/x"), "ignored\n").unwrap();
     let before = sandbox.status(&repo);
+    assert!(!sandbox.gated(&repo));
 
     let output = sandbox.ohjaa(&["adopt", &repo.to_string_lossy()]);
     let (stdout, stderr) = text(&output);
@@ -449,6 +803,11 @@ fn adopt_copies_the_gate_from_the_default_branch_and_never_writes_into_the_repo(
     let entry = sandbox.config().join("repos/acme/widget");
     assert!(stdout.contains(&entry.display().to_string()), "{stdout}");
     assert!(stdout.contains("copied from origin/main"), "{stdout}");
+    assert!(stdout.contains(&format!(
+        "wrote {}",
+        sandbox.config().join("git/config").display()
+    )));
+    assert!(stdout.contains("gated: git runs"), "{stdout}");
     assert!(fs::read_to_string(entry.join("repo.toml"))
         .unwrap()
         .contains("\nbranch = \"main\"\n"));
@@ -462,6 +821,12 @@ fn adopt_copies_the_gate_from_the_default_branch_and_never_writes_into_the_repo(
         before,
         "adopt wrote into the repository"
     );
+    assert_eq!(
+        sandbox.read("gitconfig"),
+        global_before,
+        "adopt left git's global config alone"
+    );
+    assert!(sandbox.gated(&repo), "git runs ohjaa's hooks there now");
     assert!(!stderr.contains("changed while adopting"), "{stderr}");
 
     let output = sandbox.ohjaa(&["adopt", &repo.to_string_lossy()]);
@@ -485,7 +850,7 @@ fn adopt_asks_sykli_for_a_gate_kept_outside_the_repo_and_refuses_when_it_cannot(
         "a refused adopt leaves no entry"
     );
 
-    sandbox.stub_contract = true;
+    sandbox.stub_contract = "1";
     let output = sandbox.ohjaa(&["adopt", &plain.to_string_lossy()]);
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
@@ -502,21 +867,21 @@ fn adopt_asks_sykli_for_a_gate_kept_outside_the_repo_and_refuses_when_it_cannot(
         sandbox.read("sykli-calls")
     );
     assert_eq!(sandbox.status(&plain), before);
+    // Before apply, adopt cannot gate: git's global config does not include
+    // the home's file, and adopt never writes git's global config.
+    assert!(
+        stderr.contains("the gate is not applied (ohjaa apply)"),
+        "{stderr}"
+    );
 }
 
 #[test]
-fn a_push_to_main_without_a_receipt_is_refused_through_the_global_dispatcher() {
+fn a_push_to_main_without_a_receipt_is_refused_through_the_dispatcher() {
     let mut sandbox = Sandbox::new("gate");
-    sandbox.stub_contract = true;
+    sandbox.stub_contract = "1";
     let (repo, bare) = sandbox.repo("acme", "widget", &[("sykli.json", "{}\n")]);
     sandbox.apply();
-    assert_eq!(
-        sandbox
-            .ohjaa(&["adopt", &repo.to_string_lossy()])
-            .status
-            .code(),
-        Some(0)
-    );
+    sandbox.adopt(&repo);
     let landed = sandbox.git(&bare, &["rev-parse", "main"]);
 
     let head = sandbox.commit(&repo, "change");
@@ -539,7 +904,7 @@ fn a_push_to_main_without_a_receipt_is_refused_through_the_global_dispatcher() {
     let contract = sandbox.config().join("repos/acme/widget/sykli.json");
     assert!(
         sandbox.read("sykli-calls").contains(&format!(
-            "{}|hook pre-push --contract {} origin {}",
+            "{}|hook pre-push --contract {} --branch main origin {}",
             repo.display(),
             contract.display(),
             bare.display()
@@ -571,18 +936,8 @@ fn a_push_to_main_without_a_receipt_is_refused_through_the_global_dispatcher() {
 fn without_a_sykli_that_takes_a_contract_the_gated_branch_is_refused_and_others_pass() {
     let sandbox = Sandbox::new("no-contract");
     let (repo, bare) = sandbox.repo("acme", "widget", &[("sykli.json", "{}\n")]);
+    sandbox.entry("acme", "widget", Some("{}\n"));
     sandbox.apply();
-    fs::create_dir_all(sandbox.config().join("repos/acme/widget")).unwrap();
-    fs::write(
-        sandbox.config().join("repos/acme/widget/sykli.json"),
-        "{}\n",
-    )
-    .unwrap();
-    fs::write(
-        sandbox.config().join("repos/acme/widget/repo.toml"),
-        "branch = \"main\"\n",
-    )
-    .unwrap();
     let landed = sandbox.git(&bare, &["rev-parse", "main"]);
     sandbox.commit(&repo, "change");
 
@@ -607,16 +962,20 @@ fn without_a_sykli_that_takes_a_contract_the_gated_branch_is_refused_and_others_
 }
 
 #[test]
-fn an_entry_that_cannot_be_read_refuses_the_push() {
+fn an_entry_that_cannot_be_read_still_gates_and_refuses_the_push() {
     let sandbox = Sandbox::new("broken-entry");
     let (repo, bare) = sandbox.repo("acme", "widget", &[]);
-    sandbox.apply();
     fs::create_dir_all(sandbox.config().join("repos/acme/widget")).unwrap();
     fs::write(
         sandbox.config().join("repos/acme/widget/sykli.json"),
         "{}\n",
     )
     .unwrap();
+    sandbox.apply();
+    assert!(
+        sandbox.gated(&repo),
+        "a broken entry still gates its repository"
+    );
     let landed = sandbox.git(&bare, &["rev-parse", "main"]);
     sandbox.commit(&repo, "change");
     let output = sandbox.git_out(&repo, &["push", "origin", "HEAD:refs/heads/feature"]);
@@ -631,6 +990,7 @@ fn an_entry_that_cannot_be_read_refuses_the_push() {
 fn a_repo_without_an_entry_pushes_freely() {
     let sandbox = Sandbox::new("free");
     let (repo, bare) = sandbox.repo("acme", "free", &[("sykli.json", "{}\n")]);
+    sandbox.entry("acme", "other", Some("{}\n"));
     sandbox.apply();
     let head = sandbox.commit(&repo, "change");
     let output = sandbox.git_out(&repo, &["push", "origin", "main"]);
@@ -642,7 +1002,7 @@ fn a_repo_without_an_entry_pushes_freely() {
 #[test]
 fn the_repositorys_own_hooks_still_run_through_the_dispatcher() {
     let mut sandbox = Sandbox::new("chain");
-    sandbox.stub_contract = true;
+    sandbox.stub_contract = "1";
     let (repo, bare) = sandbox.repo("acme", "own", &[("sykli.json", "{}\n")]);
     let hooks = repo.join(".git/hooks");
     write_executable(
@@ -663,12 +1023,10 @@ fn the_repositorys_own_hooks_still_run_through_the_dispatcher() {
         "#!/bin/sh\necho \"pre-push $*\" >> \"$SANDBOX/own-calls\"\ncat > \"$SANDBOX/own-stdin\"\n",
     );
     sandbox.apply();
+    sandbox.adopt(&repo);
     assert_eq!(
-        sandbox
-            .ohjaa(&["adopt", &repo.to_string_lossy()])
-            .status
-            .code(),
-        Some(0)
+        names_in(&sandbox.hooks()),
+        ["commit-msg", "post-commit", "pre-commit", "pre-push"]
     );
 
     let first = sandbox.commit(&repo, "one");
@@ -762,10 +1120,9 @@ fn hook_arguments_reach_the_own_hook_unchanged() {
 }
 
 #[test]
-fn doctor_reports_drift_before_and_health_after() {
+fn doctor_checks_every_gated_clone_and_ohjaa_run_warns_in_one() {
     let sandbox = Sandbox::new("doctor");
-    let projects = sandbox.dir.join("projects");
-    let root = projects.to_string_lossy().into_owned();
+    let root = sandbox.projects();
     let (gated, _) = sandbox.repo("acme", "gated", &[("sykli.json", "{}\n")]);
     let (own, _) = sandbox.repo("acme", "own-hooks", &[]);
     sandbox.git(&own, &["config", "core.hooksPath", ".githooks"]);
@@ -776,28 +1133,23 @@ fn doctor_reports_drift_before_and_health_after() {
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(4), "{stdout}{stderr}");
     for said in [
-        "DRIFT  git's global core.hooksPath is unset",
-        &format!("DRIFT  {HOOKS} of {HOOKS} hook dispatchers are missing"),
+        "ok     git 2.",
+        "DRIFT  git's global config does not include",
+        "ok     git's global core.hooksPath is unset",
+        "/git/config is missing: the gate is off (ohjaa apply)",
+        "DRIFT  dispatchers missing in",
         "lacks the ohjaa block (.sykli/)",
         "does not load the launcher",
         "DRIFT  no tools.lock",
-        "note   own-hooks (acme/own-hooks): core.hooksPath is .githooks in the repo: \
-         workflow gate not applied here: the repo's own hooks run",
-        "note   older (acme/older): an older in-repo sykli.json and no entry",
-        "note   gated (acme/gated): an older in-repo sykli.json and no entry",
-        "no entry: plain",
+        "note   older: an older in-repo sykli.json and no entry",
+        "note   gated: an older in-repo sykli.json and no entry",
+        "not gated (no entry; git never runs ohjaa there): own-hooks, plain",
     ] {
         assert!(stdout.contains(said), "missing {said:?} in:\n{stdout}");
     }
 
     sandbox.apply();
-    assert_eq!(
-        sandbox
-            .ohjaa(&["adopt", &gated.to_string_lossy()])
-            .status
-            .code(),
-        Some(0)
-    );
+    sandbox.adopt(&gated);
     let sha = "95bc5921a1b2c3d4e5f60718293a4b5c6d7e8f90";
     let output = sandbox.ohjaa(&[
         "tools",
@@ -822,21 +1174,26 @@ fn doctor_reports_drift_before_and_health_after() {
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
     for said in [
-        "ok     git's global core.hooksPath is",
-        &format!("ok     all {HOOKS} hook dispatchers are current"),
+        "ok     git's global config includes",
+        "/git/config is current",
+        "/git/gated.config is current",
+        &format!(
+            "ok     dispatchers in {} (pre-push) exec",
+            sandbox.hooks().display()
+        ),
         "ok     sykli at 95bc5921a1b2",
         "ok     acme/gated: gates main",
-        "ok     gated (acme/gated): gated on main",
+        "ok     gated (acme/gated): gated; git runs",
         "ohjaa doctor: healthy",
     ] {
         assert!(stdout.contains(said), "missing {said:?} in:\n{stdout}");
     }
 
-    // An entry for a repository whose own core.hooksPath wins is drift.
-    let entry = sandbox.config().join("repos/acme/own-hooks");
-    fs::create_dir_all(&entry).unwrap();
-    fs::write(entry.join("repo.toml"), "branch = \"main\"\n").unwrap();
-    fs::write(entry.join("sykli.json"), "{}\n").unwrap();
+    // (a) An entry for a clone whose own core.hooksPath wins.
+    sandbox.entry("acme", "own-hooks", Some("{}\n"));
+    sandbox.apply();
+    // (b) A hook of its own that has no dispatcher: git would skip it.
+    write_executable(&gated.join(".git/hooks/pre-commit"), "#!/bin/sh\nexit 0\n");
     // A path install is not the pinned commit.
     fs::write(
         sandbox.dir.join("cargo/.crates.toml"),
@@ -846,14 +1203,374 @@ fn doctor_reports_drift_before_and_health_after() {
     let output = sandbox.ohjaa(&["doctor", "--root", &root]);
     let (stdout, _) = text(&output);
     assert_eq!(output.status.code(), Some(4), "{stdout}");
-    assert!(stdout.contains(
-        "DRIFT  own-hooks (acme/own-hooks): has an entry, but its own core.hooksPath (.githooks) \
-         overrides the global one: workflow gate not applied here: the repo's own hooks run"
-    ), "{stdout}");
+    for said in [
+        "DRIFT  own-hooks (acme/own-hooks): its own core.hooksPath (.githooks) overrides \
+         ohjaa's: workflow gate not applied here: the repo's own hooks run",
+        &format!(
+            "DRIFT  gated (acme/gated): its own pre-commit hook has no dispatcher in {}, so git \
+             skips it (ohjaa apply)",
+            sandbox.hooks().display()
+        ),
+        "DRIFT  dispatchers missing in",
+        "DRIFT  sykli is unpinned: installed from the path /src/sykli",
+    ] {
+        assert!(stdout.contains(said), "missing {said:?} in:\n{stdout}");
+    }
+
+    // ohjaa run says the same at launch, in the repository it starts in.
+    let output = sandbox.ohjaa_in(&gated, &["run", "claude", "--intent", "x", "--dry-run"]);
+    let (_, stderr) = text(&output);
     assert!(
-        stdout.contains("DRIFT  sykli is unpinned: installed from the path /src/sykli"),
+        stderr.contains("ohjaa: warning: ")
+            && stderr.contains("its own pre-commit hook has no dispatcher"),
+        "{stderr}"
+    );
+
+    // The dispatchers exec an ohjaa that is gone.
+    sandbox.apply();
+    fs::remove_file(sandbox.dir.join("bin/ohjaa")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ohjaa"))
+        .env_clear()
+        .envs(
+            sandbox
+                .command("x", &sandbox.dir)
+                .get_envs()
+                .filter_map(|(k, v)| Some((k, v?))),
+        )
+        .current_dir(&sandbox.dir)
+        .args(["doctor", "--root", &root])
+        .output()
+        .unwrap();
+    let (stdout, _) = text(&output);
+    assert!(
+        stdout.contains("which is gone: every gated push fails"),
         "{stdout}"
     );
+}
+
+/// B2: a hook whose mere presence changes what git does is never dispatched,
+/// so a gated checkout that takes pushes with updateInstead still updates.
+#[test]
+fn a_gated_checkout_with_update_instead_still_updates_its_worktree() {
+    let sandbox = Sandbox::new("update-instead");
+    let (target, _) = sandbox.repo("acme", "target", &[("f", "v1\n")]);
+    let (deploy, _) = sandbox.repo("acme", "deploy", &[]);
+    sandbox.git(
+        &target,
+        &["config", "receive.denyCurrentBranch", "updateInstead"],
+    );
+    // Another gated clone has its own push-to-checkout: it gets no dispatcher.
+    write_executable(
+        &deploy.join(".git/hooks/push-to-checkout"),
+        "#!/bin/sh\nexit 0\n",
+    );
+    sandbox.entry("acme", "target", Some("{}\n"));
+    sandbox.entry("acme", "deploy", Some("{}\n"));
+    sandbox.apply();
+    assert!(sandbox.gated(&target));
+    assert_eq!(names_in(&sandbox.hooks()), ["pre-push"]);
+
+    let work = sandbox.dir.join("work");
+    sandbox.git(
+        &sandbox.dir,
+        &["clone", "-q", &target.to_string_lossy(), "work"],
+    );
+    fs::write(work.join("f"), "v2\n").unwrap();
+    sandbox.git(&work, &["commit", "-q", "-am", "v2"]);
+    sandbox.git(&work, &["push", "-q", "origin", "main"]);
+    assert_eq!(
+        fs::read_to_string(target.join("f")).unwrap(),
+        "v2\n",
+        "worktree updated"
+    );
+    assert_eq!(sandbox.git(&target, &["status", "--porcelain"]), "");
+
+    let output = sandbox.ohjaa(&["doctor", "--root", &sandbox.projects()]);
+    let (stdout, _) = text(&output);
+    assert!(
+        stdout.contains(
+            "deploy (acme/deploy): its own push-to-checkout cannot run under ohjaa's hooks folder"
+        ),
+        "{stdout}"
+    );
+}
+
+/// B3: the entry's branch is the gated one, whatever origin/HEAD says.
+#[test]
+fn the_entry_branch_is_gated_whatever_origin_head_says() {
+    let mut sandbox = Sandbox::new("branch");
+    sandbox.stub_contract = "1";
+    let (repo, bare) = sandbox.repo("acme", "widget", &[]);
+    sandbox.entry("acme", "widget", Some("{}\n"));
+    sandbox.apply();
+    // origin/HEAD at develop, entry main.
+    sandbox.git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/develop"]);
+    sandbox.git(&repo, &["fetch", "-q", "origin"]);
+    sandbox.git(&repo, &["remote", "set-head", "origin", "develop"]);
+    let landed = sandbox.git(&bare, &["rev-parse", "main"]);
+    sandbox.commit(&repo, "a");
+    let output = sandbox.git_out(&repo, &["push", "origin", "main"]);
+    let (_, stderr) = text(&output);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("refusing to push to refs/heads/main"),
+        "{stderr}"
+    );
+    assert!(sandbox.read("sykli-calls").contains("--branch main origin"));
+    assert_eq!(sandbox.git(&bare, &["rev-parse", "main"]), landed);
+    sandbox.git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/develop"]);
+
+    // Entry trunk2: trunk2 is refused, and main is no longer gated.
+    sandbox.entry("acme", "widget", Some("{}\n"));
+    fs::write(
+        sandbox.config().join("repos/acme/widget/repo.toml"),
+        "branch = \"trunk2\"\n",
+    )
+    .unwrap();
+    let output = sandbox.git_out(&repo, &["push", "origin", "HEAD:refs/heads/trunk2"]);
+    let (_, stderr) = text(&output);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("refusing to push to refs/heads/trunk2"),
+        "{stderr}"
+    );
+    assert!(sandbox
+        .read("sykli-calls")
+        .contains("--branch trunk2 origin"));
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+}
+
+/// B3: a sykli that takes --contract but not --branch cannot gate the
+/// entry's branch, so a push to it is refused, never let through.
+#[test]
+fn a_sykli_without_branch_refuses_the_entry_branch_and_passes_others() {
+    let mut sandbox = Sandbox::new("nobranch");
+    sandbox.stub_contract = "nobranch";
+    let (repo, bare) = sandbox.repo("acme", "widget", &[]);
+    sandbox.entry("acme", "widget", Some("{}\n"));
+    sandbox.apply();
+    let landed = sandbox.git(&bare, &["rev-parse", "main"]);
+    sandbox.commit(&repo, "a");
+    sandbox.git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/feature"]);
+    let output = sandbox.git_out(&repo, &["push", "origin", "main"]);
+    let (_, stderr) = text(&output);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("names no --branch"), "{stderr}");
+    assert!(!stderr.contains("no --contract"), "{stderr}");
+    assert_eq!(sandbox.git(&bare, &["rev-parse", "main"]), landed);
+}
+
+/// Should-fix 4: an entry means the repository is meant to be gated.
+#[test]
+fn an_entry_without_a_gate_refuses_its_branch() {
+    let mut sandbox = Sandbox::new("no-gate");
+    sandbox.stub_contract = "1";
+    let (repo, bare) = sandbox.repo("acme", "widget", &[]);
+    sandbox.entry("acme", "widget", None);
+    sandbox.apply();
+    let landed = sandbox.git(&bare, &["rev-parse", "main"]);
+    sandbox.commit(&repo, "a");
+    sandbox.git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/feature"]);
+    let output = sandbox.git_out(&repo, &["push", "origin", "main"]);
+    let (_, stderr) = text(&output);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("it has an entry but no gate"), "{stderr}");
+    assert_eq!(sandbox.git(&bare, &["rev-parse", "main"]), landed);
+}
+
+/// Should-fix 1: `ohjaa gate` runs the gate a push will judge, and says so.
+#[test]
+fn ohjaa_gate_runs_the_entry_gate_and_prints_it() {
+    let mut sandbox = Sandbox::new("gate-command");
+    sandbox.stub_contract = "1";
+    let (repo, bare) = sandbox.repo("acme", "widget", &[]);
+    sandbox.entry("acme", "widget", Some("{}\n"));
+    sandbox.apply();
+    let contract = sandbox.config().join("repos/acme/widget/sykli.json");
+    fs::create_dir_all(repo.join("src")).unwrap();
+
+    let output = sandbox.ohjaa_in(&repo.join("src"), &["gate", "--print"]);
+    let (stdout, _) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "ohjaa gate: the gate is {} (the entry for acme/widget (branch main))",
+            contract.display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "cd '{}' && mkdir -p .sykli && sykli run '{c}' --json > .sykli/receipt.json && \
+         sykli verify .sykli/receipt.json --contract '{c}' --commit HEAD",
+            repo.display(),
+            c = contract.display()
+        )),
+        "{stdout}"
+    );
+    assert!(!repo.join(".sykli").exists(), "--print runs nothing");
+
+    let head = sandbox.commit(&repo, "a");
+    let output = sandbox.ohjaa_in(&repo.join("src"), &["gate"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains(&format!(
+        "$ sykli run '{}' --json > .sykli/receipt.json",
+        contract.display()
+    )));
+    assert!(stdout.contains("ohjaa gate: passed"), "{stdout}");
+    assert!(sandbox
+        .read("projects/widget/.sykli/receipt.json")
+        .contains("passed"));
+    assert!(sandbox.read("sykli-calls").contains(&format!(
+        "{}|run {} --json",
+        repo.display(),
+        contract.display()
+    )));
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+    assert_eq!(sandbox.git(&bare, &["rev-parse", "main"]), head);
+
+    fs::write(sandbox.dir.join("fail-gate"), "").unwrap();
+    let output = sandbox.ohjaa_in(&repo, &["gate"]);
+    let (stdout, _) = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("ohjaa gate: failed: sykli run exited 1"),
+        "{stdout}"
+    );
+
+    // No entry: the repository's own sykli.json; neither: no gate.
+    let (own, _) = sandbox.repo("acme", "own", &[("sykli.json", "{}\n")]);
+    let output = sandbox.ohjaa_in(&own, &["gate", "--print"]);
+    assert!(text(&output).0.contains(&format!(
+        "the gate is {} (the repository's own sykli.json (no entry))",
+        own.join("sykli.json").display()
+    )));
+    let (none, _) = sandbox.repo("acme", "none", &[]);
+    let output = sandbox.ohjaa_in(&none, &["gate"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output).1.contains("has no gate"));
+}
+
+/// Should-fix 3: settings in a file git's global config includes count.
+#[test]
+fn settings_in_an_included_global_file_count() {
+    let sandbox = Sandbox::new("includes");
+    let extra = sandbox.dir.join("team.gitconfig");
+    fs::write(
+        sandbox.dir.join("gitconfig"),
+        format!("[include]\n\tpath = {}\n", extra.display()),
+    )
+    .unwrap();
+    fs::write(&extra, "[core]\n\thooksPath = /team/hooks\n").unwrap();
+    for args in [&["apply"][..], &["apply", "--force"][..]] {
+        let output = sandbox.ohjaa(&[args, &["--root", &sandbox.projects()]].concat());
+        let (_, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(3), "{args:?}: {stderr}");
+        assert!(stderr.contains("/team/hooks"), "{stderr}");
+    }
+    assert!(
+        text(&sandbox.ohjaa(&["apply", "--force", "--root", &sandbox.projects()]))
+            .1
+            .contains("a file git's global config includes")
+    );
+
+    fs::write(&extra, "[core]\n\texcludesFile = ~/team-ignore\n").unwrap();
+    sandbox.apply();
+    assert!(sandbox.read("home/team-ignore").contains(".sykli/"));
+    assert!(!sandbox.dir.join("config/git/ignore").exists());
+    let (repo, _) = sandbox.repo("acme", "any", &[]);
+    sandbox.git(&repo, &["check-ignore", "-q", ".sykli/receipt.json"]);
+}
+
+/// The nit: entries are found whatever the case of the remote.
+#[test]
+fn an_entry_is_found_whatever_the_case_of_the_remote() {
+    let mut sandbox = Sandbox::new("case");
+    sandbox.stub_contract = "1";
+    let (repo, bare) = sandbox.repo("Acme", "Widget", &[("sykli.json", "{}\n")]);
+    sandbox.apply();
+    sandbox.adopt(&repo);
+    assert!(sandbox
+        .config()
+        .join("repos/acme/widget/repo.toml")
+        .is_file());
+    assert!(sandbox.gated(&repo));
+    let landed = sandbox.git(&bare, &["rev-parse", "main"]);
+    sandbox.commit(&repo, "a");
+    let output = sandbox.git_out(&repo, &["push", "origin", "main"]);
+    assert!(
+        !output.status.success(),
+        "the gate was found: {}",
+        text(&output).1
+    );
+    assert_eq!(sandbox.git(&bare, &["rev-parse", "main"]), landed);
+}
+
+/// A clone that names an entry only through its push URL is not gated by
+/// git's patterns (they see remote.*.url); doctor and `ohjaa run` say so.
+#[test]
+fn doctor_flags_a_clone_named_only_by_its_push_url() {
+    let sandbox = Sandbox::new("pushurl");
+    let (repo, bare) = sandbox.repo("acme", "pushy", &[]);
+    sandbox.git(
+        &repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.invalid/other/thing",
+        ],
+    );
+    sandbox.git(
+        &repo,
+        &[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            &bare.to_string_lossy(),
+        ],
+    );
+    sandbox.entry("acme", "pushy", Some("{}\n"));
+    sandbox.apply();
+    assert!(!sandbox.gated(&repo));
+    let output = sandbox.ohjaa(&["doctor", "--root", &sandbox.projects()]);
+    let (stdout, _) = text(&output);
+    assert_eq!(output.status.code(), Some(4), "{stdout}");
+    assert!(
+        stdout.contains("DRIFT  pushy (acme/pushy): git does not include"),
+        "{stdout}"
+    );
+}
+
+/// A generated file git cannot read breaks every git command: doctor names
+/// it, and apply puts it right.
+#[test]
+fn an_unreadable_generated_file_is_named_and_apply_repairs_it() {
+    let sandbox = Sandbox::new("corrupt");
+    let (repo, _) = sandbox.repo("acme", "widget", &[]);
+    sandbox.entry("acme", "widget", Some("{}\n"));
+    sandbox.apply();
+    fs::write(
+        sandbox.config().join("git/config"),
+        "[includeIf \"hasconfig:remote.*.url:x\n",
+    )
+    .unwrap();
+    assert!(
+        !sandbox.git_out(&repo, &["status"]).status.success(),
+        "git is broken"
+    );
+    let output = sandbox.ohjaa(&["doctor", "--root", &sandbox.projects()]);
+    let (stdout, _) = text(&output);
+    assert_eq!(output.status.code(), Some(4), "{stdout}");
+    assert!(
+        stdout.contains("cannot be read by git, which then fails in every repository"),
+        "{stdout}"
+    );
+    sandbox.apply();
+    assert!(sandbox.git_out(&repo, &["status"]).status.success());
+    assert!(sandbox.gated(&repo));
 }
 
 #[test]
