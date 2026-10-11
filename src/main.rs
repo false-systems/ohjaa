@@ -262,7 +262,7 @@ enum Cmd {
         applied.toml                  what apply changes outside the home, kept before each change\n\
         Changes outside it, and nothing else:\n  \
         git's global config    [include] path = <home>/git/config (once)\n  \
-        git's global excludes  a block marked \"ohjaa apply\" holding .sykli/\n  \
+        git's global excludes  a block marked \"ohjaa apply\" holding .sykli/ .teko/\n  \
         ~/.zshrc               [[ -x <ohjaa> ]] && eval \"$(<ohjaa> shell-init zsh)\", in place\n                         \
         of a line that sources ~/projects/ohjaa-launch.zsh\n\
         <ohjaa> is the ohjaa on PATH (or --bin), and the pre-push dispatchers name\n\

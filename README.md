@@ -533,7 +533,7 @@ starts it.
   mine/ machine/ ours drafter       (knowledge and settings, as before)
 ~/.gitconfig                        [include] path = ~/.config/ohjaa/git/config (once)
 ~/.config/git/ignore                git's global excludes (or core.excludesFile):
-                                    a block marked "ohjaa apply" holds .sykli/
+                                    a block marked "ohjaa apply" holds .sykli/ and .teko/
 ```
 
 ```bash

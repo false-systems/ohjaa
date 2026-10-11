@@ -426,7 +426,7 @@ fn apply_dry_run_says_every_change_and_makes_none() {
             sandbox.dir.join("gitconfig").display()
         ),
         format!(
-            "would add .sykli/ to {}",
+            "would add .sykli/ .teko/ to {}",
             sandbox.dir.join("config/git/ignore").display()
         ),
         format!("would change {}", sandbox.home().join(".zshrc").display()),
@@ -1236,7 +1236,7 @@ fn doctor_checks_every_gated_clone_and_ohjaa_run_warns_in_one() {
         "DRIFT  git's global config does not include",
         "ok     git's global core.hooksPath is unset",
         "/git/config is missing: the gate is off (ohjaa apply)",
-        "lacks the ohjaa block (.sykli/)",
+        "lacks the ohjaa block (.sykli/ .teko/)",
         "does not load the launcher",
         &format!("roots: {root} (given with --root)"),
         "note   older: an older in-repo sykli.json and no entry",
@@ -2007,4 +2007,42 @@ fn a_push_from_a_client_without_the_path_still_runs_the_gate() {
     fs::write(repo.join(".sykli/receipt.json"), "{}").unwrap();
     let output = push(&sandbox);
     assert!(output.status.success(), "{}", text(&output).1);
+}
+
+/// The ignore block holds `.sykli/` and `.teko/`. A block an earlier apply
+/// wrote with `.sykli/` only is brought up to date in place, and undo still
+/// puts back exactly what was there before the first apply.
+#[test]
+fn an_older_ignore_block_is_upgraded_in_place_and_undo_is_exact() {
+    let sandbox = Sandbox::new("teko");
+    let (repo, _) = sandbox.repo("acme", "any", &[]);
+    fs::create_dir_all(sandbox.dir.join("config/git")).unwrap();
+    fs::write(sandbox.dir.join("config/git/ignore"), "*.swp\n").unwrap();
+    sandbox.apply();
+    let ignore = sandbox.read("config/git/ignore");
+    assert!(ignore.contains("\n.sykli/\n.teko/\n"), "{ignore}");
+    sandbox.git(&repo, &["check-ignore", "-q", ".teko/state.json"]);
+    sandbox.git(&repo, &["check-ignore", "-q", ".sykli/receipt.json"]);
+
+    // As an earlier apply left it: .sykli/ only.
+    let older = ignore.replace(".sykli/\n.teko/\n", ".sykli/\n");
+    fs::write(sandbox.dir.join("config/git/ignore"), &older).unwrap();
+    let output = sandbox.ohjaa(&["doctor"]);
+    let (stdout, _) = text(&output);
+    assert!(
+        stdout.contains("holds an older ohjaa block; it should ignore .sykli/ .teko/"),
+        "{stdout}"
+    );
+    let output = sandbox.ohjaa(&["apply"]);
+    let (stdout, _) = text(&output);
+    assert!(stdout.contains("added .sykli/ .teko/ to"), "{stdout}");
+    assert_eq!(
+        sandbox.read("config/git/ignore"),
+        ignore,
+        "upgraded in place"
+    );
+
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    assert_eq!(sandbox.read("config/git/ignore"), "*.swp\n");
 }

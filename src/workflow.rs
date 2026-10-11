@@ -17,7 +17,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 use crate::apply::{
-    ignore_with_block, launch_target, read_or_empty, sources_old_launcher, IGNORED,
+    ignore_with_block, launch_target, read_or_empty, sources_old_launcher, IGNORED, IGNORE_BEGIN,
 };
 use crate::gate::{self, Listing};
 use crate::home::{self, RepoId};
@@ -368,6 +368,11 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
         Some(Ok(path)) => match read_or_empty(&path).map(|text| (ignore_with_block(&text), text)) {
             Ok((Ok((with, _)), text)) if with == text => found.ok(format!(
                 "{} ignores {} for every repository",
+                path.display(),
+                IGNORED.join(" ")
+            )),
+            Ok((Ok(_), text)) if text.contains(IGNORE_BEGIN) => found.drift(format!(
+                "{} holds an older ohjaa block; it should ignore {} (ohjaa apply)",
                 path.display(),
                 IGNORED.join(" ")
             )),
