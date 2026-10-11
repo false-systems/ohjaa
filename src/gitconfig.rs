@@ -762,6 +762,85 @@ pub fn launch_warnings(repo: &Path) -> Vec<String> {
     }
 }
 
+/// The work tree's root and the common git directory of the repository at
+/// or above `start`: the nearest directory holding `.git`, read from its
+/// layout, not above a `GIT_CEILING_DIRECTORIES` entry. Git is asked (one
+/// process) only when the layout does not say, or `GIT_DIR` /
+/// `GIT_WORK_TREE` point elsewhere.
+pub fn repo_at(start: &Path) -> Result<(PathBuf, PathBuf)> {
+    let start = home::absolute(start.to_path_buf());
+    let set = |var: &str| std::env::var_os(var).is_some_and(|value| !value.is_empty());
+    if !set("GIT_DIR") && !set("GIT_WORK_TREE") {
+        let ceilings: Vec<PathBuf> = std::env::var_os("GIT_CEILING_DIRECTORIES")
+            .map(|value| std::env::split_paths(&value).collect())
+            .unwrap_or_default();
+        for dir in start.ancestors() {
+            if dir != start && ceilings.iter().any(|ceiling| home::same_path(ceiling, dir)) {
+                break;
+            }
+            if dir.join(".git").exists() {
+                if let Some(common) = common_dir_in(dir, None, None) {
+                    return Ok((dir.to_path_buf(), common));
+                }
+                break;
+            }
+        }
+    }
+    let text = home::git_value(
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        ],
+        Some(&start),
+    )
+    .with_context(|| format!("{} is not inside a git repository", start.display()))?
+    .with_context(|| format!("{} is not inside a git repository", start.display()))?;
+    let mut lines = text.lines();
+    match (lines.next(), lines.next()) {
+        (Some(top), Some(common)) => Ok((PathBuf::from(top), PathBuf::from(common))),
+        _ => bail!("git named no work tree for {}", start.display()),
+    }
+}
+
+/// The URL `git push <remote>` pushes to, as git works it out: the
+/// `pushurl` with `insteadOf`, else the `url` with `pushInsteadOf`, else with
+/// `insteadOf`.
+pub fn push_url(listing: &Listing, remote: &str) -> Option<String> {
+    let rewrites = listing.rewrites();
+    if let Some(push) = listing.last(&format!("remote.{remote}.pushurl")) {
+        return Some(rewrite(&push.value, &rewrites));
+    }
+    let url = &listing.last(&format!("remote.{remote}.url"))?.value;
+    let push_rules: Vec<Rewrite> = listing
+        .0
+        .iter()
+        .filter_map(|setting| {
+            let base = setting
+                .key
+                .strip_prefix("url.")?
+                .strip_suffix(".pushinsteadof")?;
+            Some(Rewrite {
+                base: base.to_owned(),
+                prefix: setting.value.clone(),
+            })
+        })
+        .collect();
+    let pushed = rewrite(url, &push_rules);
+    Some(if &pushed != url {
+        pushed
+    } else {
+        rewrite(url, &rewrites)
+    })
+}
+
+/// The URL `git fetch <remote>` uses: its `url` with `insteadOf`.
+pub fn fetch_url(listing: &Listing, remote: &str) -> Option<String> {
+    let url = &listing.last(&format!("remote.{remote}.url"))?.value;
+    Some(rewrite(url, &listing.rewrites()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,5 +971,36 @@ mod tests {
         assert_eq!(config_quote("a\"b\\c"), "\"a\\\"b\\\\c\"");
         assert!(gated_text(Path::new("/h/ohjaa/repos/acme/w"))
             .contains("hooksPath = \"/h/ohjaa/repos/acme/w/hooks\""));
+    }
+
+    #[test]
+    fn push_and_fetch_urls_are_worked_out_the_way_git_does() {
+        let listing = Listing::parse(
+            "url.git@github.com:.insteadof\ngh:\0\
+             url.ssh://push.example/.pushinsteadof\nhttps://h/\0\
+             remote.origin.url\ngh:acme/w\0\
+             remote.up.url\nhttps://h/o/r\0\
+             remote.fork.url\nhttps://h/me/r\0\
+             remote.fork.pushurl\ngh:o/p\0",
+            false,
+        );
+        assert_eq!(
+            fetch_url(&listing, "origin").as_deref(),
+            Some("git@github.com:acme/w")
+        );
+        assert_eq!(
+            push_url(&listing, "origin").as_deref(),
+            Some("git@github.com:acme/w")
+        );
+        assert_eq!(
+            push_url(&listing, "up").as_deref(),
+            Some("ssh://push.example/o/r")
+        );
+        assert_eq!(fetch_url(&listing, "up").as_deref(), Some("https://h/o/r"));
+        assert_eq!(
+            push_url(&listing, "fork").as_deref(),
+            Some("git@github.com:o/p")
+        );
+        assert_eq!(push_url(&listing, "none"), None);
     }
 }

@@ -334,6 +334,11 @@ pub fn zshrc() -> Result<PathBuf> {
     Ok(dir.join(".zshrc"))
 }
 
+/// `path` made absolute against the current directory, never resolved.
+pub fn absolute(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
+}
+
 /// Two paths name the same place, whether or not either exists.
 pub fn same_path(a: &Path, b: &Path) -> bool {
     let clean = |path: &Path| {

@@ -6,8 +6,11 @@
 //! agent *before* it acts, together with the live perimeter of the fleet.
 //! Agents may propose Knowledge; only a person makes it current.
 
+mod adopt;
 mod apply;
+mod doctor;
 mod flat_toml;
+mod gate;
 mod gitconfig;
 mod home;
 mod hook;
@@ -19,9 +22,9 @@ mod report;
 mod roots;
 mod scan;
 mod sessions;
+mod shell_init;
 mod system;
 mod usage;
-mod workflow;
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -2771,15 +2774,15 @@ fn main() {
                 )
             }
         }
-        Cmd::Doctor => workflow::doctor(&cli.root, git_root_for_roots(&cli.root).as_deref()),
+        Cmd::Doctor => doctor::doctor(&cli.root, git_root_for_roots(&cli.root).as_deref()),
         Cmd::Adopt {
             path,
             branch,
             force,
-        } => workflow::adopt(path, branch.as_deref(), *force),
+        } => adopt::adopt(path, branch.as_deref(), *force),
         Cmd::Hook { name, args } => hook::run(name, args),
-        Cmd::ShellInit { shell } => workflow::shell_init(shell),
-        Cmd::Gate { print } => workflow::gate_here(*print),
+        Cmd::ShellInit { shell } => shell_init::shell_init(shell),
+        Cmd::Gate { print } => gate::gate_here(*print),
         Cmd::Intake {
             since,
             sources,
