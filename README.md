@@ -530,7 +530,6 @@ starts it.
   git/config                        includeIf "hasconfig:remote.*.url:<pattern>" per entry
   roots                             where apply and doctor look (written on the first run)
   applied.toml                      what apply changed outside the home, for --undo
-  tools.lock                        the tool revisions apply --tools installs
   mine/ machine/ ours drafter       (knowledge and settings, as before)
 ~/.gitconfig                        [include] path = ~/.config/ohjaa/git/config (once)
 ~/.config/git/ignore                git's global excludes (or core.excludesFile):
@@ -540,14 +539,12 @@ starts it.
 ```bash
 ohjaa apply --dry-run                  # every change apply would make; makes none
 ohjaa apply                            # the home's files, the include, the ignore block, ~/.zshrc
-ohjaa apply --undo                     # put back what apply changed; entries, roots, tools.lock stay
+ohjaa apply --undo                     # put back what apply changed; entries and roots stay
 ohjaa apply --prune                    # also remove dispatchers no clone needs any more
 ohjaa adopt ~/projects/taso            # entry: origin's default branch, and the gate
 ohjaa gate                             # run this repo's gate, as a push will judge it
 ohjaa gate --print                     # the contract and the commands, run nothing
 ohjaa doctor                           # read-only; exits 4 on drift
-ohjaa tools pin sykli --from ~/projects/sykli   # pin origin/HEAD's commit and toolchain
-ohjaa apply --tools                    # install tools.lock's revisions
 ```
 
 **Scoped by remote.** Git's global config gets one line, an `include` of
@@ -614,14 +611,6 @@ default branch holds them (not the working tree, which another session may be
 editing), or asks `sykli init --contract <entry>/sykli.json` for a new one,
 then regenerates `git/` and writes the entry's dispatchers. It never touches
 git's global config, and takes no lock in the repository.
-
-**`tools.lock`** pins each tool to a full commit and to the toolchain its
-repository's `rust-toolchain.toml` names, because `cargo install --git` builds
-with whatever toolchain runs it. `apply --tools` runs
-`cargo +<toolchain> install --git <url> --rev <rev> --locked --force <name>`
-from an empty temporary directory, only for a tool Cargo's own record
-(`~/.cargo/.crates.toml`) does not show at its pin; a tool installed from a
-path is *unpinned*.
 
 ## What it will never do
 

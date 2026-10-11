@@ -1,11 +1,11 @@
 //! The small, strict piece of TOML that ohjaa's config home is written in:
 //! `[table]` and `[dotted.table]` headers, `key = "text"` pairs, comments and
-//! blank lines. Every file ohjaa writes in it (`repo.toml`, `tools.lock`,
-//! `applied.toml`) is valid TOML that any TOML reader reads the same way.
+//! blank lines. Every file ohjaa writes in it (`repo.toml`, `applied.toml`) is
+//! valid TOML that any TOML reader reads the same way.
 //!
 //! Anything outside that subset is an error naming its line, never skipped:
 //! a config file read differently from what its author meant would apply the
-//! wrong gate or install the wrong tool. It is not a TOML parser. The `toml`
+//! wrong gate or undo the wrong change. It is not a TOML parser. The `toml`
 //! crate is already built here, for the vendored faija-knowledge, but
 //! depending on it directly would change the crate's dependency list, which
 //! only a person moves (AGENTS.md); until then, this subset.
@@ -165,12 +165,12 @@ mod tests {
     #[test]
     fn top_level_and_tables_are_read() {
         let tables = parse(
-            "# a comment\nschema = \"x.v1\"  # trailing\n\n[tools.sykli]\ngit = \"ssh://h/o/r.git\"\nrev = \"abc\"\n",
+            "# a comment\nschema = \"x.v1\"  # trailing\n\n[entry.w]\ngit = \"ssh://h/o/r.git\"\nrev = \"abc\"\n",
         )
         .unwrap();
         assert_eq!(tables[""]["schema"], "x.v1");
-        assert_eq!(tables["tools.sykli"]["git"], "ssh://h/o/r.git");
-        assert_eq!(tables["tools.sykli"]["rev"], "abc");
+        assert_eq!(tables["entry.w"]["git"], "ssh://h/o/r.git");
+        assert_eq!(tables["entry.w"]["rev"], "abc");
     }
 
     #[test]

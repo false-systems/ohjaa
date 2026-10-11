@@ -20,7 +20,6 @@ mod roots;
 mod scan;
 mod sessions;
 mod system;
-mod tools;
 mod usage;
 mod workflow;
 
@@ -271,10 +270,7 @@ enum Cmd {
         --prune removes the ones no clone needs. --undo puts the three changes back\n\
         as they were (a hooksPath --force removed comes back at the end of [core],\n\
         a global config apply created is removed), and removes what apply wrote\n\
-        in the home except the entries, roots and tools.lock. With --tools,\n\
-        tools.lock's revisions are installed with\n  \
-        cargo +<toolchain> install --git <url> --rev <rev> --locked --force <name>\n\
-        from an empty temporary directory, for each tool not already at its pin.")]
+        in the home except the entries and the roots.")]
     Apply {
         /// Print every change, and make none.
         #[arg(long)]
@@ -282,9 +278,6 @@ enum Cmd {
         /// Remove a global core.hooksPath (it would run in every repository).
         #[arg(long)]
         force: bool,
-        /// Also install the tool revisions tools.lock pins.
-        #[arg(long, conflicts_with = "undo")]
-        tools: bool,
         /// Also remove dispatchers no clone under the roots needs (needs a roots file).
         #[arg(long, conflicts_with = "undo")]
         prune: bool,
@@ -295,9 +288,9 @@ enum Cmd {
         #[arg(long)]
         undo: bool,
     },
-    /// Report what differs from what `apply` would make it, the pinned tools,
-    /// and, clone by clone, whether git runs ohjaa's hooks where an entry says
-    /// it should. Read-only.
+    /// Report what differs from what `apply` would make it and, clone by
+    /// clone, whether git runs ohjaa's hooks where an entry says it should.
+    /// Read-only.
     #[command(after_help = "Exit codes:\n  \
         0  healthy\n  \
         4  drift: a line marked DRIFT says what, and what fixes it\n\n\
@@ -365,76 +358,6 @@ enum Cmd {
         /// zsh is the only one.
         shell: String,
     },
-    /// The tool revisions tools.lock pins, which `apply --tools` installs.
-    Tools {
-        #[command(subcommand)]
-        action: ToolsCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum ToolsCmd {
-    /// Pin a tool (a Cargo package) at a commit. With --from, a local clone
-    /// supplies what is not given: origin's URL, the commit (--rev, else
-    /// origin's default branch) and that commit's rust-toolchain.toml.
-    Pin {
-        /// The Cargo package, e.g. sykli.
-        name: String,
-        /// A local clone of the tool's repository.
-        #[arg(long, value_name = "CLONE")]
-        from: Option<PathBuf>,
-        /// The repository URL cargo installs from.
-        #[arg(long)]
-        git: Option<String>,
-        /// A full commit id; with --from, any revision the clone knows.
-        #[arg(long)]
-        rev: Option<String>,
-        /// The toolchain channel the tool's repository pins, e.g. 1.98.
-        #[arg(long)]
-        toolchain: Option<String>,
-    },
-    /// Remove a tool from tools.lock.
-    Unpin { name: String },
-}
-
-fn cmd_tools(action: &ToolsCmd) -> Result<i32> {
-    let lock = home::tools_lock(&home::ohjaa_home()?);
-    match action {
-        ToolsCmd::Pin {
-            name,
-            from,
-            git,
-            rev,
-            toolchain,
-        } => {
-            let pin = tools::pin(
-                &lock,
-                name,
-                from.as_deref(),
-                git.as_deref(),
-                rev.as_deref(),
-                toolchain.as_deref(),
-            )?;
-            println!(
-                "ohjaa tools: pinned {} at {} from {} (toolchain {}) in {}",
-                pin.name,
-                pin.rev,
-                pin.git,
-                pin.toolchain,
-                lock.display()
-            );
-            Ok(0)
-        }
-        ToolsCmd::Unpin { name } => {
-            if tools::unpin(&lock, name)? {
-                println!("ohjaa tools: unpinned {name} in {}", lock.display());
-                Ok(0)
-            } else {
-                eprintln!("ohjaa tools: {name} is not pinned in {}", lock.display());
-                Ok(1)
-            }
-        }
-    }
 }
 
 #[derive(Subcommand)]
@@ -2829,7 +2752,6 @@ fn main() {
         Cmd::Apply {
             dry_run,
             force,
-            tools,
             prune,
             bin,
             undo,
@@ -2841,7 +2763,6 @@ fn main() {
                     apply::Options {
                         dry_run: *dry_run,
                         force: *force,
-                        tools: *tools,
                         prune: *prune,
                         bin: bin.as_deref(),
                     },
@@ -2859,7 +2780,6 @@ fn main() {
         Cmd::Hook { name, args } => hook::run(name, args),
         Cmd::ShellInit { shell } => workflow::shell_init(shell),
         Cmd::Gate { print } => workflow::gate_here(*print),
-        Cmd::Tools { action } => cmd_tools(action),
         Cmd::Intake {
             since,
             sources,

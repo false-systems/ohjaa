@@ -263,8 +263,7 @@ fn cannot_gate(help: &str) -> Option<String> {
     (!lacking.is_empty()).then(|| {
         format!(
             "the sykli on PATH cannot gate a branch against a contract kept outside the \
-             repository (`sykli hook pre-push --help` names no {}); update it with \
-             `ohjaa apply --tools`",
+             repository (`sykli hook pre-push --help` names no {}); update sykli",
             lacking.join(" and no ")
         )
     })

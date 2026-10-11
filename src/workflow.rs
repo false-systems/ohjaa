@@ -23,7 +23,6 @@ use crate::gate::{self, Listing};
 use crate::home::{self, RepoId};
 use crate::hook::{common_dir_in, dispatcher_target, facts_for_sykli, quote_path, HOOK_NAMES};
 use crate::process;
-use crate::tools;
 
 /// The change was refused.
 const REFUSED: i32 = 3;
@@ -426,30 +425,6 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
             }
         }
         Err(error) => found.drift(format!("cannot read ~/.zshrc: {error:#}")),
-    }
-
-    let lock = home::tools_lock(&home);
-    println!("tools ({}):", lock.display());
-    match tools::read_lock(&lock) {
-        Ok(None) => found.drift("no tools.lock: no tool revision is pinned (ohjaa tools pin)"),
-        Ok(Some(pins)) if pins.is_empty() => found.drift("tools.lock pins no tool"),
-        Ok(Some(pins)) => match tools::installed() {
-            Ok((record, installed)) => {
-                for pin in pins {
-                    match tools::standing(&pin, installed.get(&pin.name)) {
-                        Ok(()) => found.ok(format!("{} at {}", pin.name, short(&pin.rev))),
-                        Err(why) => found.drift(format!(
-                            "{} is {why}; tools.lock pins {} (ohjaa apply --tools; read from {})",
-                            pin.name,
-                            short(&pin.rev),
-                            record.display()
-                        )),
-                    }
-                }
-            }
-            Err(error) => found.drift(format!("cannot read what Cargo installed: {error:#}")),
-        },
-        Err(error) => found.drift(format!("{error:#}")),
     }
 
     println!("entries ({}):", home.join("repos").display());

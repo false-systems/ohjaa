@@ -37,7 +37,7 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 - **The workflow lives in the home, outside every repository.**
   `~/.config/ohjaa` holds each repository's entry (`repos/<owner>/<repo>/`:
   the branch and the gate, plus its generated hooks folder and
-  `gated.config`), the generated `git/` config, `roots` and `tools.lock`. Only
+  `gated.config`), the generated `git/` config and `roots`. Only
   repositories whose remote names an entry run ohjaa's hooks, and only the
   hooks that entry needs; no other git command anywhere starts ohjaa, and
   ohjaa works its git facts out once instead of asking git again. Outside the
@@ -61,11 +61,10 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   Knowledge is not a message — it carries its time, its why and whose it is. A
   session's handover is a record for whoever comes next, shown in the next
   briefing, never a message to a particular agent.
-- **Network only through `gh`, the drafter and cargo** — in `ohjaa intake`
-  (review comments, drafting), when a session leaves (its branch's pull
-  request, bounded, recorded as unknown when gh cannot say), and in
-  `ohjaa apply --tools` (`cargo install` of the pinned revisions). Every other
-  command works from the filesystem and local CLIs.
+- **Network only through `gh` and the drafter** — in `ohjaa intake` (review
+  comments, drafting) and when a session leaves (its branch's pull request,
+  bounded, recorded as unknown when gh cannot say). Every other command works
+  from the filesystem and local CLIs.
 - Failed coverage is never rendered as an empty result. If a scan could not
   look, it says so and exits non-zero.
 

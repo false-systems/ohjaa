@@ -16,7 +16,6 @@
 //!   git/config                       includeIf per entry remote -> its gated.config
 //!   roots                            where apply and doctor look
 //!   applied.toml                     what apply changed, for `apply --undo`
-//!   tools.lock                       the tool revisions `apply --tools` installs
 //! ```
 //!
 //! The knowledge scopes (`mine/`, `machine/`) and the `ours` and `drafter`
@@ -43,10 +42,6 @@ pub fn ohjaa_home() -> Result<PathBuf> {
 
 pub fn hooks_dir(home: &Path) -> PathBuf {
     home.join("hooks")
-}
-
-pub fn tools_lock(home: &Path) -> PathBuf {
-    home.join("tools.lock")
 }
 
 /// A repository as its remote names it.

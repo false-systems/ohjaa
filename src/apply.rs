@@ -7,7 +7,7 @@
 //! in `~/.zshrc`. Each is recorded in `applied.toml` before it is made (what
 //! the zshrc line replaced, whether a file, a blank line or a final newline
 //! was there), so `--undo` puts back exactly what was there, even after an
-//! apply that failed midway. `--tools` also installs `tools.lock`'s revisions.
+//! apply that failed midway.
 //!
 //! Every change is planned before any is made: a refusal leaves nothing half
 //! applied, and `--dry-run` prints the same plan. Dispatchers are only ever
@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::flat_toml;
 use crate::gate;
@@ -25,7 +25,6 @@ use crate::home;
 use crate::hook::{
     dispatcher, dispatcher_target, on_path, quote_path, Dispatch, HOOK_NAMES, NOT_DISPATCHED,
 };
-use crate::tools::{self, Pin};
 
 /// The change was refused.
 const REFUSED: i32 = 3;
@@ -340,10 +339,6 @@ fn step(
     }
 }
 
-fn short(sha: &str) -> &str {
-    &sha[..sha.len().min(12)]
-}
-
 fn zshrc_lines(plan: &ZshrcPlan) -> String {
     let mut text = String::new();
     for line in &plan.removed {
@@ -358,7 +353,6 @@ fn zshrc_lines(plan: &ZshrcPlan) -> String {
 pub struct Options<'a> {
     pub dry_run: bool,
     pub force: bool,
-    pub tools: bool,
     /// Also remove dispatchers no clone under the roots needs.
     pub prune: bool,
     /// The ohjaa the hooks and the launcher run, instead of the one on PATH.
@@ -729,23 +723,6 @@ pub fn apply(
         ));
     }
 
-    let mut installs: Vec<(Pin, String)> = Vec::new();
-    if options.tools {
-        let lock = home::tools_lock(&home);
-        let pins = tools::read_lock(&lock)?.with_context(|| {
-            format!(
-                "no {}: pin the tools first, e.g. ohjaa tools pin sykli --from ~/projects/sykli",
-                lock.display()
-            )
-        })?;
-        let (_, installed) = tools::installed()?;
-        for pin in pins {
-            if let Err(why) = tools::standing(&pin, installed.get(&pin.name)) {
-                installs.push((pin, why));
-            }
-        }
-    }
-
     // Which ohjaa and sykli the dispatchers run: adopt writes an entry's
     // dispatchers with them, whatever else this run changes.
     if !options.dry_run {
@@ -757,27 +734,16 @@ pub fn apply(
             keep_record(&home, &dispatch_record)?;
         }
     }
-    if steps.is_empty() && installs.is_empty() {
+    if steps.is_empty() {
         println!(
             "ohjaa apply: nothing to change; the workflow is applied from {}",
             home.display()
         );
         return Ok(0);
     }
-    let install_line = |pin: &Pin, why: &str| {
-        format!(
-            "{} at {} ({why}): {}",
-            pin.name,
-            short(&pin.rev),
-            crate::render_command(&tools::install_command(pin))
-        )
-    };
     if options.dry_run {
         for step in &steps {
             println!("ohjaa apply: {}", step.will);
-        }
-        for (pin, why) in &installs {
-            println!("ohjaa apply: would install {}", install_line(pin, why));
         }
         println!("ohjaa apply: dry run; nothing was changed");
         return Ok(0);
@@ -788,36 +754,7 @@ pub fn apply(
         (step.run)()?;
         println!("ohjaa apply: {}", step.did);
     }
-    let mut failed = Vec::new();
-    for (pin, why) in &installs {
-        println!("ohjaa apply: installing {}", install_line(pin, why));
-        if let Err(error) = install(pin) {
-            eprintln!("ohjaa apply: {} was not installed: {error:#}", pin.name);
-            failed.push(pin.name.clone());
-        }
-    }
-    if !failed.is_empty() {
-        eprintln!("ohjaa apply: not installed: {}", failed.join(", "));
-        return Ok(1);
-    }
     Ok(0)
-}
-
-/// `cargo install` from an empty directory of its own, so no repository's
-/// `rust-toolchain.toml` or `.cargo/config.toml` decides how it builds.
-fn install(pin: &Pin) -> Result<()> {
-    let dir = std::env::temp_dir().join(format!("ohjaa-tools-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let status = tools::install_command(pin)
-        .current_dir(&dir)
-        .status()
-        .context("cannot run cargo");
-    let _ = std::fs::remove_dir(&dir);
-    let status = status?;
-    if !status.success() {
-        bail!("cargo exited {status}");
-    }
-    Ok(())
 }
 
 /// Text as it was before apply: without a final newline when it had none.
@@ -830,7 +767,7 @@ fn as_it_was(text: String, newline: bool) -> String {
 }
 
 /// `ohjaa apply --undo`: take back exactly what apply changed, and remove
-/// what it generated. `repos/` entries, `roots` and `tools.lock` stay.
+/// what it generated. `repos/` entries and `roots` stay.
 pub fn undo(dry_run: bool) -> Result<i32> {
     let home = std::path::absolute(home::ohjaa_home()?)?;
     let record = read_record(&home)?;
@@ -994,7 +931,7 @@ pub fn undo(dry_run: bool) -> Result<i32> {
         println!("ohjaa apply --undo: dry run; nothing was changed");
     } else {
         println!(
-            "ohjaa apply --undo: kept the entries in {}, the roots and tools.lock",
+            "ohjaa apply --undo: kept the entries in {} and the roots",
             home.join("repos").display()
         );
     }

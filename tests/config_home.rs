@@ -1,11 +1,11 @@
 //! The workflow home from outside the repositories: `apply`, `doctor`,
-//! `adopt`, `hook`, `shell-init` and `tools`, run as the real binary against
+//! `adopt`, `hook`, `gate` and `shell-init`, run as the real binary against
 //! real git.
 //!
 //! Every command runs with an emptied environment: HOME, XDG_CONFIG_HOME,
 //! XDG_STATE_HOME, CARGO_HOME and TMPDIR inside the sandbox,
 //! GIT_CONFIG_GLOBAL at a sandbox file, GIT_CONFIG_NOSYSTEM=1, no ZDOTDIR, and
-//! a PATH of stubs (sykli, cargo, claude, codex) plus the system directories.
+//! a PATH of stubs (sykli, toimija, claude, codex) plus the system directories.
 //! `apply` writes git's global config and ~/.zshrc, so nothing here may reach
 //! the person's real ones, nor run a real agent or tool.
 
@@ -82,10 +82,6 @@ esac
 exit 2
 "#;
 
-const CARGO_STUB: &str = r#"#!/bin/sh
-printf '%s|%s\n' "$PWD" "$*" >> "$SANDBOX/cargo-calls"
-"#;
-
 /// Never the real toimija: no live sessions, so `ohjaa run --dry-run` gets
 /// as far as its warnings.
 const TOIMIJA_STUB: &str = r#"#!/bin/sh
@@ -159,7 +155,6 @@ impl Sandbox {
         }
         let bin = dir.join("bin");
         write_executable(&bin.join("sykli"), SYKLI_STUB);
-        write_executable(&bin.join("cargo"), CARGO_STUB);
         write_executable(&bin.join("claude"), CLAUDE_STUB);
         write_executable(&bin.join("toimija"), TOIMIJA_STUB);
         write_executable(&bin.join("codex"), CODEX_STUB);
@@ -763,18 +758,6 @@ fn undo_puts_back_exactly_what_apply_changed() {
     let (repo, _) = sandbox.repo("acme", "widget", &[("sykli.json", "{}\n")]);
     sandbox.apply();
     sandbox.adopt(&repo);
-    let output = sandbox.ohjaa(&[
-        "tools",
-        "pin",
-        "sykli",
-        "--git",
-        "ssh://h/o/sykli",
-        "--rev",
-        "95bc5921a1b2c3d4e5f60718293a4b5c6d7e8f90",
-        "--toolchain",
-        "1.98",
-    ]);
-    assert_eq!(output.status.code(), Some(0));
     assert!(sandbox.gated(&repo));
 
     let output = sandbox.ohjaa(&["apply", "--undo", "--dry-run"]);
@@ -807,8 +790,8 @@ fn undo_puts_back_exactly_what_apply_changed() {
     assert_eq!(sandbox.read("config/git/ignore"), "*.swp");
     assert_eq!(
         names_in(&sandbox.config()),
-        ["repos", "roots", "tools.lock"],
-        "entries, roots and lock kept"
+        ["repos", "roots"],
+        "entries and roots kept"
     );
     assert_eq!(
         names_in(&sandbox.config().join("repos/acme/widget")),
@@ -1255,7 +1238,6 @@ fn doctor_checks_every_gated_clone_and_ohjaa_run_warns_in_one() {
         "/git/config is missing: the gate is off (ohjaa apply)",
         "lacks the ohjaa block (.sykli/)",
         "does not load the launcher",
-        "DRIFT  no tools.lock",
         &format!("roots: {root} (given with --root)"),
         "note   older: an older in-repo sykli.json and no entry",
         "note   gated: an older in-repo sykli.json and no entry",
@@ -1266,26 +1248,6 @@ fn doctor_checks_every_gated_clone_and_ohjaa_run_warns_in_one() {
 
     sandbox.apply();
     sandbox.adopt(&gated);
-    let sha = "95bc5921a1b2c3d4e5f60718293a4b5c6d7e8f90";
-    let output = sandbox.ohjaa(&[
-        "tools",
-        "pin",
-        "sykli",
-        "--git",
-        "ssh://git@example.invalid/acme/sykli.git",
-        "--rev",
-        sha,
-        "--toolchain",
-        "1.98",
-    ]);
-    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
-    fs::write(
-        sandbox.dir.join("cargo/.crates.toml"),
-        format!(
-            "[v1]\n\"sykli 0.6.0 (git+ssh://git@example.invalid/acme/sykli.git?rev={sha}#{sha})\" = [\"sykli\"]\n"
-        ),
-    )
-    .unwrap();
     // No --root: the roots file apply wrote.
     let output = sandbox.ohjaa(&["doctor"]);
     let (stdout, stderr) = text(&output);
@@ -1303,8 +1265,6 @@ fn doctor_checks_every_gated_clone_and_ohjaa_run_warns_in_one() {
             "roots: {root} (from {})",
             sandbox.config().join("roots").display()
         ),
-        "ok     sykli at 95bc5921a1b2",
-        "ok     acme/gated: gates main",
         &format!(
             "ok     gated (acme/gated): gated; git runs {} here",
             hooks.display()
@@ -1319,12 +1279,6 @@ fn doctor_checks_every_gated_clone_and_ohjaa_run_warns_in_one() {
     sandbox.apply();
     // (b) A hook of its own that has no dispatcher: git would skip it.
     write_executable(&gated.join(".git/hooks/pre-commit"), "#!/bin/sh\nexit 0\n");
-    // A path install is not the pinned commit.
-    fs::write(
-        sandbox.dir.join("cargo/.crates.toml"),
-        "[v1]\n\"sykli 0.6.0 (path+file:///src/sykli)\" = [\"sykli\"]\n",
-    )
-    .unwrap();
     let output = sandbox.ohjaa(&["doctor", "--root", &root]);
     let (stdout, _) = text(&output);
     assert_eq!(output.status.code(), Some(4), "{stdout}");
@@ -1340,7 +1294,6 @@ fn doctor_checks_every_gated_clone_and_ohjaa_run_warns_in_one() {
             "DRIFT  acme/gated: dispatchers missing in {}: pre-commit (ohjaa apply)",
             hooks.display()
         ),
-        "DRIFT  sykli is unpinned: installed from the path /src/sykli",
     ] {
         assert!(stdout.contains(said), "missing {said:?} in:\n{stdout}");
     }
@@ -1711,109 +1664,6 @@ fn an_unreadable_generated_file_is_named_and_apply_repairs_it() {
     sandbox.apply();
     assert!(sandbox.git_out(&repo, &["status"]).status.success());
     assert!(sandbox.gated(&repo));
-}
-
-#[test]
-fn tools_are_pinned_from_a_clone_and_installed_with_their_toolchain() {
-    let sandbox = Sandbox::new("tools");
-    let clone = sandbox.dir.join("projects/sykli");
-    fs::create_dir_all(&clone).unwrap();
-    sandbox.git(&clone, &["init", "-q", "-b", "main"]);
-    fs::write(
-        clone.join("rust-toolchain.toml"),
-        "[toolchain]\nchannel = \"1.98\"\ncomponents = [\"rustfmt\"]\n",
-    )
-    .unwrap();
-    sandbox.git(&clone, &["add", "-A"]);
-    sandbox.git(&clone, &["commit", "-q", "-m", "init"]);
-    sandbox.git(
-        &clone,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "git@example.invalid:acme/sykli.git",
-        ],
-    );
-    sandbox.git(&clone, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-    sandbox.git(
-        &clone,
-        &[
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/main",
-        ],
-    );
-    let sha = sandbox.git(&clone, &["rev-parse", "HEAD"]);
-
-    let output = sandbox.ohjaa(&["tools", "pin", "sykli", "--from", &clone.to_string_lossy()]);
-    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
-    let lock = fs::read_to_string(sandbox.config().join("tools.lock")).unwrap();
-    for line in [
-        "schema = \"ohjaa-tools-lock.v1\"",
-        "[tools.sykli]",
-        "git = \"ssh://git@example.invalid/acme/sykli.git\"",
-        &format!("rev = \"{sha}\""),
-        "toolchain = \"1.98\"",
-    ] {
-        assert!(lock.contains(line), "missing {line:?} in:\n{lock}");
-    }
-    let output = sandbox.ohjaa(&[
-        "tools",
-        "pin",
-        "toimija",
-        "--git",
-        "ssh://h/o/toimija",
-        "--rev",
-        "main",
-        "--toolchain",
-        "1.98",
-    ]);
-    assert_ne!(output.status.code(), Some(0));
-    assert!(text(&output).1.contains("not a full commit id"));
-
-    sandbox.apply();
-    let install = format!(
-        "+1.98 install --git ssh://git@example.invalid/acme/sykli.git --rev {sha} --locked --force sykli"
-    );
-    let output = sandbox.ohjaa(&["apply", "--tools", "--dry-run"]);
-    let (stdout, _) = text(&output);
-    assert!(stdout.contains("would install sykli at"), "{stdout}");
-    assert!(
-        stdout.contains(&format!("(not installed): cargo {install}")),
-        "{stdout}"
-    );
-    assert_eq!(
-        sandbox.read("cargo-calls"),
-        "",
-        "a dry run installs nothing"
-    );
-
-    let output = sandbox.ohjaa(&["apply", "--tools"]);
-    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
-    let calls = sandbox.read("cargo-calls");
-    let (cwd, args) = calls.trim().split_once('|').unwrap();
-    assert_eq!(args, install);
-    assert!(
-        cwd.starts_with(&sandbox.dir.join("tmp").to_string_lossy().into_owned()),
-        "cargo runs from an empty directory of its own, not a repository: {cwd}"
-    );
-
-    // Installed at the pin: nothing to do.
-    fs::write(
-        sandbox.dir.join("cargo/.crates.toml"),
-        format!("[v1]\n\"sykli 0.6.0 (git+ssh://git@example.invalid/acme/sykli.git?rev={sha}#{sha})\" = [\"sykli\"]\n"),
-    )
-    .unwrap();
-    let output = sandbox.ohjaa(&["apply", "--tools"]);
-    assert!(text(&output).0.contains("nothing to change"));
-    assert_eq!(sandbox.read("cargo-calls").lines().count(), 1);
-
-    let output = sandbox.ohjaa(&["tools", "unpin", "sykli"]);
-    assert_eq!(output.status.code(), Some(0));
-    assert!(!fs::read_to_string(sandbox.config().join("tools.lock"))
-        .unwrap()
-        .contains("[tools.sykli]"));
 }
 
 #[test]
