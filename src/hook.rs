@@ -1,7 +1,7 @@
 //! `ohjaa hook <name> [args]`: the git hook dispatcher.
 //!
 //! A repository whose remote names an entry includes `core.hooksPath =
-//! <home>/hooks` (see `gate`), where each needed hook is a dispatcher into
+//! <home>/hooks` (see `gitconfig`), where each needed hook is a dispatcher into
 //! this command: pre-push, and every hook a gated clone has of its own. No
 //! other repository runs it. Two jobs:
 //!
@@ -119,7 +119,7 @@ pub fn dispatcher_target(name: &str, text: &str) -> Option<Dispatch> {
 pub fn on_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|dir| dir.join(name))
-        .find(|path| crate::gate::executable(path))
+        .find(|path| crate::gitconfig::executable(path))
         .map(|path| std::path::absolute(&path).unwrap_or(path))
 }
 

@@ -8,7 +8,7 @@
 
 mod apply;
 mod flat_toml;
-mod gate;
+mod gitconfig;
 mod home;
 mod hook;
 mod intake;
@@ -1819,7 +1819,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // The workflow gate, where an entry says it applies: what doctor checks
     // for this one repository (a few git calls, none outside a gated one).
     if in_repo {
-        for warning in gate::launch_warnings(&root) {
+        for warning in gitconfig::launch_warnings(&root) {
             eprintln!("ohjaa: warning: {warning}");
         }
     }

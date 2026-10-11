@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use crate::apply::{
     ignore_with_block, launch_target, read_or_empty, sources_old_launcher, IGNORED, IGNORE_BEGIN,
 };
-use crate::gate::{self, Listing};
+use crate::gitconfig::{self, Listing};
 use crate::home::{self, RepoId};
 use crate::hook::{common_dir_in, dispatcher_target, facts_for_sykli, quote_path, HOOK_NAMES};
 use crate::process;
@@ -98,10 +98,10 @@ fn repo_at(start: &Path) -> Result<(PathBuf, PathBuf)> {
 fn push_url(listing: &Listing, remote: &str) -> Option<String> {
     let rewrites = listing.rewrites();
     if let Some(push) = listing.last(&format!("remote.{remote}.pushurl")) {
-        return Some(gate::rewrite(&push.value, &rewrites));
+        return Some(gitconfig::rewrite(&push.value, &rewrites));
     }
     let url = &listing.last(&format!("remote.{remote}.url"))?.value;
-    let push_rules: Vec<gate::Rewrite> = listing
+    let push_rules: Vec<gitconfig::Rewrite> = listing
         .0
         .iter()
         .filter_map(|setting| {
@@ -109,24 +109,24 @@ fn push_url(listing: &Listing, remote: &str) -> Option<String> {
                 .key
                 .strip_prefix("url.")?
                 .strip_suffix(".pushinsteadof")?;
-            Some(gate::Rewrite {
+            Some(gitconfig::Rewrite {
                 base: base.to_owned(),
                 prefix: setting.value.clone(),
             })
         })
         .collect();
-    let pushed = gate::rewrite(url, &push_rules);
+    let pushed = gitconfig::rewrite(url, &push_rules);
     Some(if &pushed != url {
         pushed
     } else {
-        gate::rewrite(url, &rewrites)
+        gitconfig::rewrite(url, &rewrites)
     })
 }
 
 /// The URL `git fetch <remote>` uses: its `url` with `insteadOf`.
 fn fetch_url(listing: &Listing, remote: &str) -> Option<String> {
     let url = &listing.last(&format!("remote.{remote}.url"))?.value;
-    Some(gate::rewrite(url, &listing.rewrites()))
+    Some(gitconfig::rewrite(url, &listing.rewrites()))
 }
 
 /// What `doctor` says, line by line, and how much of it is drift.
@@ -178,7 +178,7 @@ fn check_dispatchers(
                 path.display()
             )),
         }
-        if !gate::executable(&path) {
+        if !gitconfig::executable(&path) {
             found.drift(format!(
                 "{} is not executable (ohjaa apply)",
                 path.display()
@@ -211,7 +211,7 @@ fn check_dispatchers(
         ));
     }
     for ohjaa in &ohjaas {
-        if gate::executable(ohjaa) {
+        if gitconfig::executable(ohjaa) {
             found.ok(format!(
                 "{slug}: dispatchers ({}) exec {}",
                 present.join(", "),
@@ -227,7 +227,7 @@ fn check_dispatchers(
     }
     for sykli in syklis {
         match sykli {
-            Some(sykli) if gate::executable(&sykli) => {}
+            Some(sykli) if gitconfig::executable(&sykli) => {}
             Some(sykli) => found.drift(format!(
                 "{slug}: the pre-push dispatcher hands the gate to {}, which is gone: pushes \
                  to the entry's branch are refused (ohjaa apply)",
@@ -260,32 +260,32 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
     let mut found = Findings { drift: 0 };
     println!("ohjaa doctor: the workflow home is {}", home.display());
 
-    match gate::git_version() {
-        Ok(version) if version >= gate::MIN_GIT => found.ok(format!(
+    match gitconfig::git_version() {
+        Ok(version) if version >= gitconfig::MIN_GIT => found.ok(format!(
             "git {}.{} scopes hooks by remote (includeIf hasconfig needs {}.{})",
             version.0,
             version.1,
-            gate::MIN_GIT.0,
-            gate::MIN_GIT.1
+            gitconfig::MIN_GIT.0,
+            gitconfig::MIN_GIT.1
         )),
         Ok(version) => found.drift(format!(
             "git {}.{} cannot scope hooks by remote (includeIf hasconfig needs {}.{})",
             version.0,
             version.1,
-            gate::MIN_GIT.0,
-            gate::MIN_GIT.1
+            gitconfig::MIN_GIT.0,
+            gitconfig::MIN_GIT.1
         )),
         Err(error) => found.drift(format!("{error:#}")),
     }
-    let entries = gate::entry_names(&home)?;
-    let global = match gate::GlobalFacts::read() {
+    let entries = gitconfig::entry_names(&home)?;
+    let global = match gitconfig::GlobalFacts::read() {
         Ok(global) => Some(global),
         Err(error) => {
             found.drift(format!("cannot read git's global config: {error:#}"));
             None
         }
     };
-    let include = gate::include_file(&home);
+    let include = gitconfig::include_file(&home);
     if let Some(global) = &global {
         if global.includes(&include) {
             found.ok(format!(
@@ -310,13 +310,13 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
     // The generated files: as they should be, else (rarely) why not. An
     // unreadable one breaks every git command, the global read among them.
     let expected = match &global {
-        Some(global) => gate::generated(&home, &global.rewrites())?,
+        Some(global) => gitconfig::generated(&home, &global.rewrites())?,
         None => {
             let mut files = vec![(include.clone(), String::new())];
             files.extend(
                 entries
                     .iter()
-                    .map(|entry| (gate::entry_gated(&entry.dir), String::new())),
+                    .map(|entry| (gitconfig::entry_gated(&entry.dir), String::new())),
             );
             files
         }
@@ -329,7 +329,7 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
             ));
         } else if global.is_some() && read_or_empty(path).is_ok_and(|now| &now == text) {
             found.ok(format!("{} is current", path.display()));
-        } else if let Err(error) = gate::check_git_config(path) {
+        } else if let Err(error) = gitconfig::check_git_config(path) {
             found.drift(format!(
                 "{} cannot be read by git, which then fails in every repository (ohjaa \
                  apply): {}",
@@ -355,16 +355,16 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
             .join(", "),
         roots_source(explicit_roots)
     );
-    let gated = match gate::gated_clones(&home, &repos) {
+    let gated = match gitconfig::gated_clones(&home, &repos) {
         Ok(gated) => gated,
         Err(error) => {
             found.drift(format!("cannot read the clones under the roots: {error:#}"));
             Vec::new()
         }
     };
-    let needed = gate::needed_hooks(&home, &gated)?;
+    let needed = gitconfig::needed_hooks(&home, &gated)?;
 
-    match global.as_ref().map(gate::GlobalFacts::excludes_file) {
+    match global.as_ref().map(gitconfig::GlobalFacts::excludes_file) {
         Some(Ok(path)) => match read_or_empty(&path).map(|text| (ignore_with_block(&text), text)) {
             Ok((Ok((with, _)), text)) if with == text => found.ok(format!(
                 "{} ignores {} for every repository",
@@ -404,7 +404,7 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
                         "{} loads the launcher unguarded, through PATH (ohjaa apply)",
                         path.display()
                     ));
-                } else if gate::executable(&target) {
+                } else if gitconfig::executable(&target) {
                     found.ok(format!(
                         "{} loads the launcher from {}",
                         path.display(),
@@ -449,7 +449,12 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
             Err(error) => found.drift(format!("{slug}: {error:#}")),
         }
         if let Some(needed) = needed.get(&entry.dir) {
-            check_dispatchers(&mut found, &slug, &gate::entry_hooks(&entry.dir), needed);
+            check_dispatchers(
+                &mut found,
+                &slug,
+                &gitconfig::entry_hooks(&entry.dir),
+                needed,
+            );
         }
     }
     if readable == 0 && entries.is_empty() {
@@ -465,7 +470,7 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
             .unwrap_or_else(|| repo.display().to_string());
         if let Some(clone) = gated.iter().find(|clone| &clone.path == repo) {
             let named = format!("{label} ({})", clone.slugs.join(", "));
-            let drift = gate::clone_drift(&home, clone);
+            let drift = gitconfig::clone_drift(&home, clone);
             if drift.is_empty() {
                 found.ok(format!(
                     "{named}: gated; git runs {} here{}",
@@ -571,7 +576,7 @@ fn shown(words: &[std::ffi::OsString]) -> String {
 pub fn gate_here(print_only: bool) -> Result<i32> {
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let (top, common) = repo_at(&cwd)?;
-    let listing = gate::clone_listing(&top)?;
+    let listing = gitconfig::clone_listing(&top)?;
     let Some((contract, whose)) = gate_of(&top, &listing)? else {
         eprintln!(
             "ohjaa gate: {} has no gate: origin names no entry (ohjaa adopt), and there is \
@@ -718,7 +723,7 @@ fn sykli_init_takes_a_contract() -> bool {
 
 pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
     let (top, common) = repo_at(path)?;
-    let listing = gate::clone_listing(&top)?;
+    let listing = gitconfig::clone_listing(&top)?;
     let url = fetch_url(&listing, "origin")
         .with_context(|| format!("{} has no origin remote to name it by", top.display()))?;
     let id = RepoId::parse(&url)
@@ -757,14 +762,14 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
     println!("  {source}");
     // The home's git config now names this repository too; git's global
     // config is not touched (it includes the home's file once, from apply).
-    let global = gate::GlobalFacts::read()?;
-    let own = gate::own_hooks_in(&common);
+    let global = gitconfig::GlobalFacts::read()?;
+    let own = gitconfig::own_hooks_in(&common);
     for said in crate::apply::regenerate(&home, &dir, &own, &global.rewrites())? {
         println!("  {said}");
     }
-    match gate::gated_clone(&home, &top)? {
+    match gitconfig::gated_clone(&home, &top)? {
         Some(clone) => {
-            let drift = gate::clone_drift(&home, &clone);
+            let drift = gitconfig::clone_drift(&home, &clone);
             if drift.is_empty() {
                 println!(
                     "  gated: git runs {} here",

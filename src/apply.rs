@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::flat_toml;
-use crate::gate;
+use crate::gitconfig;
 use crate::home;
 use crate::hook::{
     dispatcher, dispatcher_target, on_path, quote_path, Dispatch, HOOK_NAMES, NOT_DISPATCHED,
@@ -366,7 +366,7 @@ pub struct Options<'a> {
 fn chosen_ohjaa(bin: Option<&Path>) -> std::result::Result<PathBuf, String> {
     if let Some(bin) = bin {
         let bin = std::path::absolute(bin).unwrap_or_else(|_| bin.to_path_buf());
-        return if gate::executable(&bin) {
+        return if gitconfig::executable(&bin) {
             Ok(bin)
         } else {
             Err(format!("--bin {} is not an executable file", bin.display()))
@@ -430,19 +430,19 @@ fn roots_text(roots: &[PathBuf]) -> String {
 /// Read git's global config once; when an unreadable generated file breaks
 /// that (every git command fails then, apply's own among them), remove what
 /// git cannot read and read again: apply writes it anew below.
-fn global_facts(home: &Path, repair: bool) -> Result<gate::GlobalFacts> {
-    match gate::GlobalFacts::read() {
+fn global_facts(home: &Path, repair: bool) -> Result<gitconfig::GlobalFacts> {
+    match gitconfig::GlobalFacts::read() {
         Ok(facts) => Ok(facts),
         Err(error) if repair => {
-            let mut generated = vec![gate::include_file(home)];
+            let mut generated = vec![gitconfig::include_file(home)];
             generated.extend(
-                gate::entry_names(home)?
+                gitconfig::entry_names(home)?
                     .into_iter()
-                    .map(|entry| gate::entry_gated(&entry.dir)),
+                    .map(|entry| gitconfig::entry_gated(&entry.dir)),
             );
             let mut removed = false;
             for path in generated {
-                if path.is_file() && gate::check_git_config(&path).is_err() {
+                if path.is_file() && gitconfig::check_git_config(&path).is_err() {
                     std::fs::remove_file(&path)
                         .with_context(|| format!("cannot remove {}", path.display()))?;
                     println!(
@@ -455,7 +455,7 @@ fn global_facts(home: &Path, repair: bool) -> Result<gate::GlobalFacts> {
             if !removed {
                 return Err(error);
             }
-            gate::GlobalFacts::read()
+            gitconfig::GlobalFacts::read()
         }
         Err(error) => Err(error),
     }
@@ -467,7 +467,7 @@ pub fn apply(
     git_root: Option<&Path>,
 ) -> Result<i32> {
     let home = std::path::absolute(home::ohjaa_home()?)?;
-    let version = gate::require_git()?;
+    let version = gitconfig::require_git()?;
     let global = global_facts(&home, !options.dry_run)?;
     let mut steps: Vec<Step> = Vec::new();
 
@@ -575,9 +575,9 @@ pub fn apply(
 
     // Each entry's dispatchers: pre-push, and each hook its clones have of
     // their own. Only ever added here; --prune (or --undo) removes.
-    let gated = gate::gated_clones(&home, &repos)?;
-    for (entry, needed) in gate::needed_hooks(&home, &gated)? {
-        let hooks = gate::entry_hooks(&entry);
+    let gated = gitconfig::gated_clones(&home, &repos)?;
+    for (entry, needed) in gitconfig::needed_hooks(&home, &gated)? {
+        let hooks = gitconfig::entry_hooks(&entry);
         let mut write = Vec::new();
         let mut spare = Vec::new();
         for name in HOOK_NAMES {
@@ -585,7 +585,7 @@ pub fn apply(
             let current = std::fs::read_to_string(&path).ok();
             if needed.contains(name) {
                 if current.as_deref() != Some(dispatcher(name, &dispatch).as_str())
-                    || !gate::executable(&path)
+                    || !gitconfig::executable(&path)
                 {
                     write.push(name);
                 }
@@ -635,20 +635,20 @@ pub fn apply(
 
     // The generated git config: one includeIf per entry remote pattern, each
     // including that entry's gated.config.
-    for (path, text) in gate::generated(&home, &global.rewrites())? {
+    for (path, text) in gitconfig::generated(&home, &global.rewrites())? {
         if read_or_empty(&path)? != text {
             let (target, contents) = (path.clone(), text);
             steps.push(step(
                 ("write", "wrote"),
                 path.display().to_string(),
                 Vec::new(),
-                move || gate::write_generated(&target, &contents),
+                move || gitconfig::write_generated(&target, &contents),
             ));
         }
     }
-    let include = gate::include_file(&home);
+    let include = gitconfig::include_file(&home);
     if !global.includes(&include) {
-        let target = gate::global_write_target()?;
+        let target = gitconfig::global_write_target()?;
         let value = include.to_string_lossy().into_owned();
         steps.push(step(
             ("add", "added"),
@@ -776,11 +776,11 @@ pub fn undo(dry_run: bool) -> Result<i32> {
     // A key absent from the record says nothing was changed: keep as it is.
     let newline = |key: &str| record.get(key).is_none_or(|value| value == "true");
     let mut steps: Vec<Step> = Vec::new();
-    let global = gate::GlobalFacts::read()?;
+    let global = gitconfig::GlobalFacts::read()?;
 
     let include = recorded("include")
         .map(PathBuf::from)
-        .unwrap_or_else(|| gate::include_file(&home));
+        .unwrap_or_else(|| gitconfig::include_file(&home));
     if global.includes(&include) {
         let value = include.to_string_lossy().into_owned();
         let created = yes("gitconfig_created");
@@ -867,8 +867,8 @@ pub fn undo(dry_run: bool) -> Result<i32> {
     // folders, if nothing else is in them.
     let mut generated: Vec<PathBuf> = Vec::new();
     let mut folders: Vec<PathBuf> = Vec::new();
-    for entry in gate::entry_names(&home)? {
-        let hooks = gate::entry_hooks(&entry.dir);
+    for entry in gitconfig::entry_names(&home)? {
+        let hooks = gitconfig::entry_hooks(&entry.dir);
         generated.extend(
             HOOK_NAMES
                 .into_iter()
@@ -878,11 +878,11 @@ pub fn undo(dry_run: bool) -> Result<i32> {
                 })
                 .map(|name| hooks.join(name)),
         );
-        generated.push(gate::entry_gated(&entry.dir));
+        generated.push(gitconfig::entry_gated(&entry.dir));
         folders.push(hooks);
     }
-    generated.extend([gate::include_file(&home), record_path(&home)]);
-    folders.push(gate::git_dir(&home));
+    generated.extend([gitconfig::include_file(&home), record_path(&home)]);
+    folders.push(gitconfig::git_dir(&home));
     generated.retain(|path| path.exists());
     if !generated.is_empty() {
         steps.push(step(
@@ -946,12 +946,12 @@ pub fn regenerate(
     home: &Path,
     entry: &Path,
     own: &[&'static str],
-    rewrites: &[gate::Rewrite],
+    rewrites: &[gitconfig::Rewrite],
 ) -> Result<Vec<String>> {
     let mut said = Vec::new();
-    for (path, text) in gate::generated(home, rewrites)? {
+    for (path, text) in gitconfig::generated(home, rewrites)? {
         if read_or_empty(&path)? != text {
-            gate::write_generated(&path, &text)?;
+            gitconfig::write_generated(&path, &text)?;
             said.push(format!("wrote {}", path.display()));
         }
     }
@@ -964,7 +964,7 @@ pub fn regenerate(
         ohjaa,
         sykli: record.get("sykli").map(PathBuf::from),
     };
-    let hooks = gate::entry_hooks(entry);
+    let hooks = gitconfig::entry_hooks(entry);
     let mut wanted: BTreeSet<&str> = own
         .iter()
         .copied()
