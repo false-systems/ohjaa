@@ -528,7 +528,7 @@ starts it.
                                     hook this entry's clones have of their own
     gated.config                    core.hooksPath = that hooks/ folder
   git/config                        includeIf "hasconfig:remote.*.url:<pattern>" per entry
-  roots                             where apply and doctor look (written on the first run)
+  roots                             where apply and doctor look (from the first apply's --root)
   applied.toml                      what apply changed outside the home, for --undo
   mine/ machine/ ours drafter       (knowledge and settings, as before)
 ~/.gitconfig                        [include] path = ~/.config/ohjaa/git/config (once)
@@ -537,8 +537,9 @@ starts it.
 ```
 
 ```bash
-ohjaa apply --dry-run                  # every change apply would make; makes none
-ohjaa apply                            # the home's files, the include, the ignore block, ~/.zshrc
+ohjaa apply --root ~/projects --dry-run # the first time: name where the repositories are
+ohjaa apply --root ~/projects          # the home's files, the include, the ignore block, ~/.zshrc
+ohjaa apply                            # later runs read the roots it wrote down
 ohjaa apply --undo                     # put back what apply changed; entries and roots stay
 ohjaa apply --prune                    # also remove dispatchers no clone needs any more
 ohjaa adopt ~/projects/taso            # entry: origin's default branch, and the gate
@@ -596,9 +597,11 @@ sykli's status. Agents are taught this one command.
 `--bin` names it, so a `cargo run` cannot re-point every hook). It refuses,
 before changing anything, when git's global `core.hooksPath` is set (in the
 global file or a file it includes): it would run in every repository and
-override the scoped one; `--force` removes it from the global file. Its first
-run that finds repositories writes them down in `roots`, so what it finds
-never depends on where it runs, and it only ever adds dispatchers (a spare
+override the scoped one; `--force` removes it from the global file. It does
+not guess where the repositories are: with no `roots` file it refuses until
+`--root <dir>` names the folder that holds them, writes that down in `roots`,
+so what it finds never depends on where it runs, and it only ever adds
+dispatchers (a spare
 costs a process, a missing one silently skips a check); `--prune` removes
 spares. Each change is recorded before it is made, so `--undo` can put back
 exactly what was there even after an apply that failed. The launcher line it

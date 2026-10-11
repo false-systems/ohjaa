@@ -459,6 +459,25 @@ pub fn apply(
     git_root: Option<&Path>,
 ) -> Result<i32> {
     let home = std::path::absolute(home::ohjaa_home()?)?;
+    // Where the repositories are is written down once, by the person: a
+    // guess from the current directory (a home folder whose `.oh-my-zsh` is
+    // a repository) would leave every clone unscanned, and a later --prune
+    // would strip their dispatchers.
+    let roots_file = crate::roots::config_path().context("no config home")?;
+    if explicit_roots.is_empty() && !roots_file.is_file() {
+        let guess = crate::roots::load(&[], git_root)
+            .into_iter()
+            .map(|root| home::absolute(root).display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "ohjaa apply: refusing: {} does not exist, so where your repositories are is not \
+             written down, and apply does not guess (from here it would have used {guess}). \
+             Name the folder that holds them once: ohjaa apply --root <dir>",
+            roots_file.display()
+        );
+        return Ok(2);
+    }
     let version = gitconfig::require_git()?;
     let global = global_facts(&home, !options.dry_run)?;
     let mut steps: Vec<Step> = Vec::new();
@@ -517,7 +536,6 @@ pub fn apply(
 
     // The roots: written down on the first run, so the hooks apply finds
     // never depend on where it is run from.
-    let roots_file = crate::roots::config_path().context("no config home")?;
     let configured = roots_file.is_file();
     let roots: Vec<PathBuf> = crate::roots::load(explicit_roots, git_root)
         .into_iter()
@@ -541,9 +559,8 @@ pub fn apply(
     if !configured {
         if repos.is_empty() {
             eprintln!(
-                "ohjaa apply: warning: {roots_said} holds no repositories, and there is no {}: \
-                 the hooks clones have of their own are not known; run apply from your \
-                 projects folder, or pass --root <dir>",
+                "ohjaa apply: warning: {roots_said} holds no repositories, so {} is not \
+                 written; pass the folder that holds them with --root <dir>",
                 roots_file.display()
             );
         } else {

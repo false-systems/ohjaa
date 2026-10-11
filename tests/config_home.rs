@@ -1873,22 +1873,54 @@ fn every_command_stays_within_its_git_budget() {
     assert!(over.is_empty(), "over budget: {over:?}");
 }
 
-/// N1: what apply finds does not depend on where it runs. It writes the roots
-/// it scanned on its first run, never removes a dispatcher, and --prune needs
-/// the roots written down.
+/// N1: what apply finds does not depend on where it runs. With no roots file
+/// it does not guess (a home folder whose `.oh-my-zsh` is a repository would
+/// pass for the projects folder): it refuses until --root names the folder,
+/// writes that down, never removes a dispatcher, and --prune needs the roots
+/// written down.
 #[test]
 fn apply_only_adds_dispatchers_and_writes_the_roots_it_scanned() {
     let sandbox = Sandbox::new("roots");
     let (own, _) = sandbox.repo("acme", "own", &[("sykli.json", "{}\n")]);
     write_executable(&own.join(".git/hooks/pre-commit"), "#!/bin/sh\nexit 0\n");
-    // From the projects folder, with no roots file: it is written.
-    let output = sandbox.ohjaa_in(&sandbox.dir.join("projects"), &["apply"]);
+    // A home folder with a repository in it, as ~/.oh-my-zsh is.
+    let zsh = sandbox.home().join(".oh-my-zsh");
+    fs::create_dir_all(&zsh).unwrap();
+    sandbox.git(&zsh, &["init", "-q"]);
+
+    // No roots file and no --root: refused, from anywhere, dry run or not,
+    // naming the fix and what it would have used.
+    for (cwd, args) in [
+        (sandbox.home(), &["apply"][..]),
+        (sandbox.home(), &["apply", "--dry-run"][..]),
+        (sandbox.dir.join("projects"), &["apply"][..]),
+    ] {
+        let output = sandbox.ohjaa_in(&cwd, args);
+        let (stdout, stderr) = text(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} in {}: {stdout}{stderr}",
+            cwd.display()
+        );
+        assert!(stderr.contains("ohjaa apply --root <dir>"), "{stderr}");
+        assert!(
+            stderr.contains(&format!("would have used {}", cwd.display())),
+            "{stderr}"
+        );
+    }
+    assert!(!sandbox.config().exists(), "nothing written");
+    assert!(!sandbox.dir.join("gitconfig").exists(), "nothing written");
+
+    // With --root: the roots are written down.
+    let output = sandbox.ohjaa_in(&sandbox.home(), &["apply", "--root", &sandbox.projects()]);
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
     assert!(
         stdout.contains(&format!(
-            "wrote {}",
-            sandbox.config().join("roots").display()
+            "wrote {} with {}",
+            sandbox.config().join("roots").display(),
+            sandbox.projects()
         )),
         "{stdout}"
     );
@@ -1900,24 +1932,33 @@ fn apply_only_adds_dispatchers_and_writes_the_roots_it_scanned() {
     let output = sandbox.ohjaa_in(&sandbox.home(), &["apply"]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
     assert_eq!(names_in(&hooks), ["pre-commit", "pre-push"]);
-    // Even with no roots file and nothing found where it runs.
-    fs::remove_file(sandbox.config().join("roots")).unwrap();
-    let output = sandbox.ohjaa_in(&sandbox.home(), &["apply"]);
-    let (_, stderr) = text(&output);
-    assert_eq!(output.status.code(), Some(0), "{stderr}");
-    assert!(stderr.contains("holds no repositories"), "{stderr}");
-    assert_eq!(
-        names_in(&hooks),
-        ["pre-commit", "pre-push"],
-        "never removed by apply"
+    let output = sandbox.ohjaa_in(&sandbox.home(), &["doctor"]);
+    assert!(
+        text(&output).0.contains(&format!(
+            "roots: {} (from {})",
+            sandbox.projects(),
+            sandbox.config().join("roots").display()
+        )),
+        "{}",
+        text(&output).0
     );
 
     // --prune refuses without a roots file; with one, it removes spares.
-    let output = sandbox.ohjaa_in(&sandbox.home(), &["apply", "--prune"]);
+    fs::rename(
+        sandbox.config().join("roots"),
+        sandbox.dir.join("roots.aside"),
+    )
+    .unwrap();
+    let output = sandbox.ohjaa(&["apply", "--prune", "--root", &sandbox.projects()]);
     assert_eq!(output.status.code(), Some(3), "{}", text(&output).1);
     assert!(text(&output).1.contains("refusing --prune"));
+    fs::rename(
+        sandbox.dir.join("roots.aside"),
+        sandbox.config().join("roots"),
+    )
+    .unwrap();
     fs::remove_file(own.join(".git/hooks/pre-commit")).unwrap();
-    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    let output = sandbox.ohjaa(&["apply"]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
     assert_eq!(
         names_in(&hooks),

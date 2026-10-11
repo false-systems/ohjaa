@@ -253,7 +253,9 @@ enum Cmd {
     /// Idempotent; --undo takes it all back.
     #[command(after_help = "Exit codes:\n  \
         0  applied, undone, or nothing to change\n  \
-        1  a tool was not installed, git is older than 2.36, or a change could not be made\n  \
+        1  git is older than 2.36, or a change could not be made\n  \
+        2  refused: no roots file and no --root (apply does not guess where the\n     \
+           repositories are: run it once with --root <dir>)\n  \
         3  refused: a global core.hooksPath (see --force), an ohjaa that is not the\n     \
            one on PATH (see --bin), or --prune without a roots file\n\n\
         Writes in the home:\n  \
@@ -261,7 +263,7 @@ enum Cmd {
         hook that entry's clones under the roots have of their own\n  \
         repos/<o>/<r>/gated.config    core.hooksPath = that entry's hooks/\n  \
         git/config                    includeIf \"hasconfig:remote.*.url:<pattern>\" per entry\n  \
-        roots                         on the first run that finds repositories: the roots\n  \
+        roots                         from --root on the first run: where the repositories are\n  \
         applied.toml                  what apply changes outside the home, kept before each change\n\
         Changes outside it, and nothing else:\n  \
         git's global config    [include] path = <home>/git/config (once)\n  \
