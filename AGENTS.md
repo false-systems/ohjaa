@@ -30,7 +30,7 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   scope directories plus proposals waiting for a person, is the truth and lives
   in git. The **session log**, in redb at `$XDG_STATE_HOME/ohjaa/sessions.redb`,
   is machine-local history of what each session was briefed, read back,
-  committed, finished and handed over, plus explicitly attributed usage receipts — deleting it loses no knowledge, it never
+  committed, finished and handed over, plus explicitly attributed usage receipts and references to the validations `ohjaa gate` requested (sykli's run ids and receipts, never outcomes) — deleting it loses no knowledge, it never
   blocks a launch, and a broken log is reported, never replaced. Everything
   else — fleet, perimeter, coverage, marks — is derived now and stored never. No
   knowledge index, no cache, no daemon.
