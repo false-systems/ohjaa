@@ -511,8 +511,8 @@ pub fn apply(
         if !options.force {
             eprintln!(
                 "ohjaa apply: refusing: git's global core.hooksPath is {path}. It runs in every \
-                 repository and overrides the core.hooksPath ohjaa gives the gated ones, so \
-                 the gate would not run. Move what it does into the repositories' own hooks \
+                 repository and overrides the core.hooksPath ohjaa gives the observed ones, so \
+                 their pushes would not be observed. Move what it does into the repositories' own hooks \
                  (ohjaa's dispatchers chain to them), or remove it with: ohjaa apply --force"
             );
             return Ok(REFUSED);

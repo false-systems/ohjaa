@@ -134,7 +134,7 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
             let drift = gitconfig::clone_drift(&home, &clone);
             if drift.is_empty() {
                 println!(
-                    "  gated: git runs {} here",
+                    "  observed: git runs {} here",
                     clone.hooks_path.as_deref().unwrap_or_default()
                 );
             }

@@ -4574,7 +4574,10 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
     };
     let (stdout, stderr, code) = report(true);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let marks: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(marks["schema"], "ohjaa-marks.v1");
+    // The window's report, as it was, under `report`.
+    let json = &marks["report"];
     assert_eq!(json["schema"], "ohjaa-report.v1");
     let intents: Vec<&str> = json["sessions_without_testimony"]
         .as_array()
@@ -4996,6 +4999,116 @@ fn commands_that_only_read_the_session_log_never_write_it() {
     fixture.cleanup();
 }
 
+/// `ohjaa report --json` is `ohjaa-marks.v1`, for other tools to read, and
+/// it moves nothing: not the session log, not the report's bookmarks, even
+/// at a terminal, where the report for people does mark the week.
+#[test]
+fn report_json_is_ohjaa_marks_v1_and_writes_nothing() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("marks-json");
+    let (repo, _) = report_fixture(&fixture);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "propose",
+                "--scope",
+                "ours",
+                "--id",
+                "rust-only",
+                "--kind",
+                "decision",
+                "--origin",
+                "2026-09-16: 'we dont do python'",
+                "Code is Rust.",
+            ])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let state = fixture.dir.join("state/ohjaa");
+    let log = state.join("sessions.redb");
+    let at = state.join("report-at");
+    fs::write(&at, "1000\n").unwrap();
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for file in [&log, &at] {
+        fs::File::options()
+            .write(true)
+            .open(file)
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+    }
+    let stamps = || (log_stamp(&log), log_stamp(&at));
+    let before = stamps();
+    let mut command = fixture.ohjaa();
+    command
+        .arg("--root")
+        .arg(&fixture.dir)
+        .args(["report", "--json"])
+        .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+        .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+        .current_dir(&repo);
+    let (stdout, stderr, code) = output_of(&mut command);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert_eq!(
+        stamps(),
+        before,
+        "report --json wrote the log or a bookmark"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["schema"], "ohjaa-marks.v1");
+    let keys = |value: &serde_json::Value| {
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        keys(&json),
+        [
+            "complete",
+            "entries",
+            "generated",
+            "proposals",
+            "report",
+            "schema",
+            "sessions"
+        ]
+    );
+    assert_eq!(json["entries"], serde_json::json!([]), "no entries here");
+    assert_eq!(json["proposals"]["listed"], true);
+    let waiting = &json["proposals"]["waiting"][0];
+    assert_eq!(keys(waiting), ["name", "repo", "scope", "since", "title"]);
+    assert_eq!(waiting["name"], "rust-only");
+    assert_eq!(waiting["scope"], "ours");
+    assert_eq!(waiting["title"], "Code is Rust.");
+    assert_eq!(json["report"]["schema"], "ohjaa-report.v1");
+
+    // At a terminal too: `--json` is never the person's report.
+    if let Some(said) = under_a_terminal(&command) {
+        assert!(said.contains("ohjaa-marks.v1"), "{said}");
+        assert_eq!(stamps(), before, "report --json at a terminal wrote");
+        assert!(!state.join("report-shown-at").exists());
+        // The control: the report for people, at the same terminal, is
+        // the week's.
+        let mut human = fixture.ohjaa();
+        human
+            .arg("--root")
+            .arg(&fixture.dir)
+            .arg("report")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+            .current_dir(&repo);
+        let said = under_a_terminal(&human).unwrap();
+        assert!(said.contains("ohjaa report, "), "{said}");
+        assert!(state.join("report-shown-at").exists(), "{said}");
+        assert_ne!(log_stamp(&at), before.1, "the week was marked");
+        assert_eq!(log_stamp(&log), before.0, "the log is only read");
+    }
+    fixture.cleanup();
+}
+
 #[test]
 fn a_command_that_only_reads_says_a_held_log_is_busy_and_never_waits_on_it() {
     if !git_available() {
@@ -5033,10 +5146,14 @@ fn a_command_that_only_reads_says_a_held_log_is_busy_and_never_waits_on_it() {
     );
     let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert!(
-        report["gaps"].as_array().unwrap().iter().any(|gap| gap
-            .as_str()
+        report["report"]["gaps"]
+            .as_array()
             .unwrap()
-            .contains("busy (another ohjaa holds it)")),
+            .iter()
+            .any(|gap| gap
+                .as_str()
+                .unwrap()
+                .contains("busy (another ohjaa holds it)")),
         "{stdout}"
     );
     let (stdout, stderr, code) = ohjaa(&["usage", "export"]);

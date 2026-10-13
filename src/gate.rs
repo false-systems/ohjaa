@@ -1,5 +1,7 @@
-//! `ohjaa gate`: run the gate a push will judge for the repository here,
-//! and leave the receipt the push looks for.
+//! `ohjaa gate`: run the gate a push is judged by for the repository here,
+//! and leave the receipt that proves HEAD: the push finds it, and so do the
+//! marks (`.sykli/receipt.json`, and the copy `sykli run` keeps under
+//! `.sykli/receipts/`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -67,8 +69,8 @@ fn shown(words: &[std::ffi::OsString]) -> String {
         .join(" ")
 }
 
-/// `ohjaa gate`: run the gate for the repository here, the way a push will
-/// judge it, and leave the receipt the push looks for. One git process (the
+/// `ohjaa gate`: run the gate for the repository here, the way a push is
+/// judged, and leave the receipt that proves HEAD. One git process (the
 /// repository's config); the rest is sykli's.
 pub fn gate_here(print_only: bool) -> Result<i32> {
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
@@ -147,7 +149,7 @@ pub fn gate_here(print_only: bool) -> Result<i32> {
         .context("cannot run sykli")?;
     let code = status.code().unwrap_or(1);
     if status.success() {
-        println!("ohjaa gate: passed: .sykli/receipt.json verifies for HEAD, so it can be pushed");
+        println!("ohjaa gate: passed: .sykli/receipt.json verifies for HEAD, so HEAD is proven");
     } else {
         println!("ohjaa gate: failed: sykli verify exited {code}");
     }

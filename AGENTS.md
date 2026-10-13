@@ -32,12 +32,12 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   is machine-local history of what each session was briefed, read back,
   committed, finished and handed over, plus explicitly attributed usage receipts — deleting it loses no knowledge, it never
   blocks a launch, and a broken log is reported, never replaced. Everything
-  else — fleet, perimeter, coverage — is derived now and stored never. No
+  else — fleet, perimeter, coverage, marks — is derived now and stored never. No
   knowledge index, no cache, no daemon.
 - **The workflow lives in the home, outside every repository.**
   `~/.config/ohjaa` holds each repository's entry (`repos/<owner>/<repo>/`:
-  the branch and the gate, plus its generated hooks folder and
-  `gated.config`), the generated `git/` config and `roots`. Only
+  the branch ohjaa observes and the gate it is judged by, plus its generated
+  hooks folder and `gated.config`), the generated `git/` config and `roots`. Only
   repositories whose remote names an entry run ohjaa's hooks, and only the
   hooks that entry needs; no other git command anywhere starts ohjaa, and
   ohjaa works its git facts out once instead of asking git again. Outside the
@@ -46,7 +46,13 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   records each before making it, and `apply --undo` puts them back; `ohjaa
   adopt` writes only in the home. Nothing is installed on or written into a
   repository, and the dispatcher always runs a repository's own hooks after
-  the gate.
+  observing.
+- **Observe, mark and flag; never refuse for the workflow.** A push to an
+  entry's branch is handed to sykli and, when sykli does not prove it,
+  pushed and flagged, never stopped; only a repository's own hooks refuse.
+  Each commit on that branch is marked proven, failed or unproven from the
+  receipts on disk, and a briefing opens with the flag while the branch is
+  not proven at its tip.
 - **`ohjaa run` stays the parent of the session until it ends**, so leaving
   always writes its record, whatever the exit. Session states are observed, not
   declared: the agent's lifecycle testimony is its read-back (`ohjaa oriented`)

@@ -17,6 +17,7 @@ mod hook;
 mod intake;
 mod knowledge;
 mod lifecycle;
+mod mark;
 mod process;
 mod report;
 mod roots;
@@ -204,14 +205,19 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// What went around the workflow: sessions without read-back or handover,
-    /// default-branch commits without passing evidence, and agent sessions run
-    /// without ohjaa (through vessa). Derived now; exits 4 when it could not
-    /// read everything.
+    /// What went around the workflow: the marks on each entry's branch (✓
+    /// proven, ✗ failed, ? unproven, tip first), sessions without read-back or
+    /// handover, default-branch commits without passing evidence, and agent
+    /// sessions run without ohjaa (through vessa). Derived now; exits 4 when it
+    /// could not read everything.
     Report {
         /// The window: `7d`, `24h`, a date or an RFC 3339 time.
         #[arg(long, default_value = "7d")]
         since: String,
+        /// Print `ohjaa-marks.v1` JSON instead (see the README): the marks,
+        /// the proposals waiting for a person, the sessions still open or
+        /// orphaned, and the window's report. Writes nothing, not even the
+        /// report's bookmark.
         #[arg(long)]
         json: bool,
     },
@@ -301,18 +307,18 @@ enum Cmd {
         4  drift: a line marked DRIFT says what, and what fixes it\n\n\
         For each clone under the roots whose remote names an entry: git must\n\
         resolve its core.hooksPath to <home>/hooks (a pattern that missed, or the\n\
-        repository's own core.hooksPath, means the gate does not run there), and\n\
+        repository's own core.hooksPath, means its pushes are not observed), and\n\
         each hook of its own must have a dispatcher (else git skips it).")]
     Doctor,
-    /// Write a repository's entry into the home: the branch its gate protects
-    /// (origin's default branch) and the gate itself, copied from the
+    /// Write a repository's entry into the home: the branch ohjaa observes
+    /// (origin's default branch) and the gate it is judged by, copied from the
     /// repository's sykli.json on that branch, else written by
     /// `sykli init --contract`; then regenerate the home's git config. Neither
     /// git's global config nor the repository is written.
     Adopt {
         /// The repository (any directory inside it).
         path: PathBuf,
-        /// The branch to gate, when origin/HEAD does not name it.
+        /// The branch to observe, when origin/HEAD does not name it.
         #[arg(long)]
         branch: Option<String>,
         /// Rewrite an existing entry.
@@ -320,20 +326,22 @@ enum Cmd {
         force: bool,
     },
     /// The git hook dispatcher every hook in <home>/hooks execs. pre-push
-    /// runs the repository's gate, when the home has an entry for it; every
-    /// hook then runs the repository's own hook, with the same arguments and
-    /// stdin.
+    /// observes a push to the entry's branch, when the home has an entry for
+    /// the repository, and never refuses it; every hook then runs the
+    /// repository's own hook, with the same arguments and stdin.
     #[command(after_help = "Exit codes:\n  \
-        0  passed (and the repository's own hook, if any, passed)\n  \
-        1  the gate refused the push\n  \
-        2  could not evaluate: an unreadable entry or pre-push input, or no repository\n  \
+        0  the repository's own hook, if any, passed\n  \
+        2  not a git hook, or the repository's own hooks cannot be found\n  \
         N  otherwise, the repository's own hook's status\n\n\
         The repository is found by the URL git pushes to; its entry is\n\
-        <home>/repos/<owner>/<repo>/. The gate is\n  \
-        sykli hook pre-push --contract <entry>/sykli.json <remote> <url>\n\
-        When the sykli on PATH cannot take --contract, a push to the entry's\n\
-        branch is refused; other branches pass. The repository's own hook is\n\
-        $(git rev-parse --git-common-dir)/hooks/<name>, run when executable.")]
+        <home>/repos/<owner>/<repo>/. A push that moves the entry's branch is\n\
+        handed, quietly, to\n  \
+        sykli hook pre-push --contract <entry>/sykli.json --branch <branch> <remote> <url>\n\
+        When sykli does not accept it, or cannot judge it (no sykli, one without\n\
+        --contract and --branch, an entry without a gate), the push goes on and\n\
+        one line flags it: ohjaa: UNPROVEN push to <branch> (<why>). The\n\
+        repository's own hook is $(git rev-parse --git-common-dir)/hooks/<name>,\n\
+        run when executable; it still refuses what it refuses.")]
     Hook {
         /// The git hook's name, e.g. pre-push.
         name: String,
@@ -341,12 +349,12 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
     },
-    /// Run the gate for the repository here, as a push to its gated branch
-    /// will judge it: the contract of the entry origin names (else the
+    /// Prove HEAD: run the gate for the repository here, as a push to its
+    /// observed branch is judged: the contract of the entry origin names (else the
     /// repository's own sykli.json), run into .sykli/receipt.json and verified
     /// for HEAD. Prints the contract and every command it runs.
     #[command(after_help = "Exit codes:\n  \
-        0  passed: .sykli/receipt.json verifies for HEAD\n  \
+        0  passed: .sykli/receipt.json verifies for HEAD, so HEAD is proven\n  \
         N  sykli's status: the run or the verify failed\n  \
         2  no gate here: origin names no entry, and there is no sykli.json\n\n\
         Runs, from the repository root:\n  \
@@ -762,8 +770,17 @@ fn cmd_brief(
         eprintln!("ohjaa: --scope {path} is not inside a Git repository; no repository knowledge or context was read there");
     }
     let here = dirs.repo_root.clone().unwrap_or(std::env::current_dir()?);
-    // The last session's warnings come before anything else; its record after
-    // the knowledge.
+    // The entry's branch unproven at its tip comes first of all, then the
+    // last session's warnings; its record after the knowledge.
+    if !knowledge_only {
+        if let Some(flag) = dirs
+            .repo_root
+            .as_deref()
+            .and_then(|top| mark::at_launch(top).1)
+        {
+            println!("{flag}\n");
+        }
+    }
     let (warnings, last) = last_session_here(&dirs, &here).unzip();
     if let Some(warnings) = warnings.filter(|warnings| !knowledge_only && !warnings.is_empty()) {
         println!("{warnings}");
@@ -1821,13 +1838,21 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     for warning in &scan.warnings {
         eprintln!("ohjaa: warning: {warning}");
     }
-    // The workflow gate, where an entry says it applies: what doctor checks
-    // for this one repository (a few git calls, none outside a gated one).
-    if in_repo {
-        for warning in gitconfig::launch_warnings(&root) {
+    // Where an entry says ohjaa observes this repository: what doctor checks
+    // for it, and whether the entry's branch is proven at its tip (a few git
+    // calls and one sykli verify at most, none outside an observed one).
+    let mark_flag = if in_repo {
+        let (warnings, flag) = mark::at_launch(&root);
+        for warning in warnings {
             eprintln!("ohjaa: warning: {warning}");
         }
-    }
+        if let Some(flag) = &flag {
+            eprintln!("ohjaa: {flag}");
+        }
+        flag
+    } else {
+        None
+    };
 
     // A footgun guard: ohjaa flags after `--` belong to the agent.
     for misplaced in [
@@ -1892,7 +1917,11 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         let perimeter = scoped_perimeter_text(&view, &root);
         let how = lifecycle_briefing(&root, in_repo, &scoped_repos);
         let orphaned = sessions::render_orphaned(&orphaned_here);
+        // The entry's branch unproven at its tip comes first of all: what
+        // everyone builds on.
+        let flagged = mark_flag.clone().unwrap_or_default();
         let parts: Vec<&str> = [
+            flagged.as_str(),
             orphaned.as_str(),
             warnings.as_str(),
             knowledge.as_str(),
@@ -2102,8 +2131,9 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         )
     })
     .unwrap_or_default();
-    // Asked at most once, and only when a commit needs it.
-    let sykli = lifecycle::Sykli::default();
+    // Asked at most once, and only when a commit needs it. A repository with
+    // an entry is judged by its gate.
+    let sykli = lifecycle::sykli_with_entries();
     // Outside a repository the folder itself has no commits or pull request
     // to observe; the record says why, and asks neither git nor gh there.
     let launch = if in_repo {

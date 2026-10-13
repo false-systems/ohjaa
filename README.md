@@ -26,9 +26,9 @@ ohjaa graph rust-only                  # a node, its neighbours, who was briefed
 ohjaa fleet                            # who is live, across every repo
 ohjaa system                           # what every tool in the fleet is, derived now
 ohjaa apply                            # apply the workflow from ~/.config/ohjaa, outside every repo
-ohjaa adopt ~/projects/sykli           # give a repo an entry: its branch and its gate
+ohjaa adopt ~/projects/sykli           # give a repo an entry: the branch ohjaa observes, and its gate
 ohjaa doctor                           # what differs from what apply would make it
-ohjaa gate                             # run this repo's gate, as a push will judge it
+ohjaa gate                             # prove HEAD: run this repo's gate, as a push is judged
 ```
 
 ## Why
@@ -135,17 +135,20 @@ ohjaa report                    # the last 7 days
 ohjaa report --since 30d --json # ohjaa-report.v1
 ```
 
-`ohjaa report` derives, now, three lists for the window:
+`ohjaa report` derives, now, the marks on every entry's branch (see "Observe,
+mark, flag" below) and three lists for the window:
 
 - **Sessions without read-back or handover:** ended sessions in the log that
   never ran `ohjaa oriented`, or left no `ohjaa handover`.
 - **Commits on a default branch without passing evidence.**
   - For every git repository under the roots, these are the first-parent
-    commits its default branch (`origin/<default>`, else the local one)
-    gained in the window, by commit time, at most 100 per repository.
+    commits its default branch (`origin/<default>`, else the local one; for a
+    repository with an entry, `origin/<the entry's branch>`) gained in the
+    window, by commit time, at most 100 per repository.
   - Each is checked with `sykli verify --commit` against every receipt of its
-    tree, in every checkout and under the git common dir. It passes when any
-    one of them verifies.
+    tree, in every checkout and under the git common dir, and against the
+    entry's gate when the repository has an entry (else the contract in the
+    commit). It passes when any one of them verifies.
   - Listed: what sykli refused, and what was never run in a checkout that
     still exists.
   - The rest are counted by why: verified; no sykli contract; made in a
@@ -543,7 +546,7 @@ ohjaa apply                            # later runs read the roots it wrote down
 ohjaa apply --undo                     # put back what apply changed; entries and roots stay
 ohjaa apply --prune                    # also remove dispatchers no clone needs any more
 ohjaa adopt ~/projects/taso            # entry: origin's default branch, and the gate
-ohjaa gate                             # run this repo's gate, as a push will judge it
+ohjaa gate                             # prove HEAD: run this repo's gate, as a push is judged
 ohjaa gate --print                     # the contract and the commands, run nothing
 ohjaa doctor                           # read-only; exits 4 on drift
 ```
@@ -555,7 +558,7 @@ ohjaa doctor                           # read-only; exits 4 on drift
 patterns are host-agnostic and case-insensitive (`**/o/r`, `**/o/r.git`,
 `**/o/r/`, `**/o/r.git/`, and the same after `*:` for scp-like URLs, plus a
 short form for each global `insteadOf` rule), because a pattern that misses
-lets a push past the gate, while one that matches too much only costs a
+leaves a push unobserved, while one that matches too much only costs a
 process that finds no entry. Any remote of a clone counts. A `pushurl`, a
 repository-local `insteadOf`, or the repository's own `core.hooksPath`
 (perusta, selko and vartio set one) is not seen by the patterns: `ohjaa doctor`
@@ -565,16 +568,16 @@ generated files are written atomically and checked with `git config --file
 … --list` first, since an unreadable one would break every git command.
 
 **The dispatcher** (`ohjaa hook <name>`) finds the repository by the URL git
-pushes to. On pre-push, with an entry, the push is judged by
-`sykli hook pre-push --contract <entry>/sykli.json --branch <entry's branch>
-<remote> <url>`, and a refusal stops it. A sykli without both flags, or an
-entry without a gate, refuses every push to the entry's branch. Then, for
-every hook, the dispatcher runs the repository's own hook,
-`<common dir>/hooks/<name>`, with the same arguments and the same stdin, and
-exits with its status. `push-to-checkout`, `proc-receive` and
+pushes to. On pre-push, with an entry, a push that moves the entry's branch
+is observed: it is handed, quietly, to `sykli hook pre-push --contract
+<entry>/sykli.json --branch <entry's branch> <remote> <url>`. Nothing is
+refused for it (see "Observe, mark, flag"). Then, for every hook, the
+dispatcher runs the repository's own hook, `<common dir>/hooks/<name>`, with
+the same arguments and the same stdin, and exits with its status: a
+repository's own hook still refuses what it refuses. `push-to-checkout`, `proc-receive` and
 `fsmonitor-watchman` never get a dispatcher, because a file of that name
 changes what git does. The dispatchers exec ohjaa, and the pre-push one hands
-the gate to sykli, by the paths `apply` found on PATH, so a git client started
+the push to sykli, by the paths `apply` found on PATH, so a git client started
 without your PATH (a GUI) runs them too.
 
 **Few git processes.** Facts are worked out once and passed down. A hook that
@@ -584,14 +587,113 @@ its own either, and hands sykli `--repo-root` and `--git-common-dir` when
 sykli takes them. `ohjaa gate` starts one (the repository's config);
 `doctor` two for the machine (`git --version`, the global config with
 includes) and one per clone (its config, with `insteadOf` applied in Rust).
+The briefing's flag costs at most three (the clone's config, which the drift
+warnings share, and one `git log` for the walk) and one `sykli verify`; the
+report's marks two per entry (its clone's config and the walk), and `sykli
+verify` only for a commit with a receipt of its tree that says it passed.
 `tests/config_home.rs` holds these budgets.
 
-**`ohjaa gate`** runs the gate a push will judge, from the repository root:
-`mkdir -p .sykli && sykli run <contract> --json > .sykli/receipt.json &&
-sykli verify .sykli/receipt.json --contract <contract> --commit HEAD`, where
-the contract is the entry's, or the repository's own `sykli.json` when origin
-names no entry. It prints the contract and every command, and exits with
-sykli's status. Agents are taught this one command.
+**`ohjaa gate`** proves HEAD: it runs the gate a push is judged by, from the
+repository root: `mkdir -p .sykli && sykli run <contract> --json >
+.sykli/receipt.json && sykli verify .sykli/receipt.json --contract <contract>
+--commit HEAD`, where the contract is the entry's, or the repository's own
+`sykli.json` when origin names no entry. It prints the contract and every
+command, and exits with sykli's status. The receipt stays in that worktree
+(`.sykli/receipt.json`, and the copy `sykli run` writes under
+`.sykli/receipts/`), where the push and the marks find it; sykli has no
+command that keeps a receipt anywhere else, but `sykli hook pre-push` copies
+the one that proved a push into `<git common dir>/sykli/receipts/`, which
+outlives the worktree. Agents are taught this one command.
+
+### Observe, mark, flag
+
+Nothing is refused for the workflow's sake. A push is observed, each commit on
+an entry's branch is marked, and what is not proven is flagged to the people
+and agents who build on it.
+
+**Observe.** A push that moves the entry's branch is handed to `sykli hook
+pre-push` against the entry's gate, with its output kept back. When sykli
+accepts it, nothing is said. When it does not (no receipt of the commit's
+tree in that worktree, a failed or stale one), or cannot judge it (no sykli,
+one without `--contract` and `--branch`, an entry without a gate), the push
+goes on, and one line says so, after the repository's own hook:
+
+```
+ohjaa: UNPROVEN push to main (no receipt in this worktree is a run of its tree). It is pushed and flagged; prove it with: ohjaa gate
+```
+
+**Mark.** Each commit on the entry's branch is, derived now and stored never:
+✓ **proven** when a receipt of its tree verifies (`sykli verify <receipt>
+--contract <entry>/sykli.json --commit <sha>`); ✗ **failed** when a receipt
+of its tree is here and did not pass; ? **unproven** when there is none, or
+sykli could not say. The walk starts where the clone last saw origin
+(`refs/remotes/origin/<branch>`: no fetch, no network) and goes back along
+first parents to the first proven commit, at most 50, tip first. Shas and
+trees come from one `git log`; receipts are read as files, from the clone's
+layout: `<common>/sykli/receipts/` (what sykli kept for accepted pushes) and,
+in every worktree, `.sykli/receipts/` and `.sykli/receipt.json`. A forge's
+merge of an up-to-date pull request has the tree of its head, so a receipt
+of the head proves the merge. `ohjaa report` shows the marks of every entry:
+
+```
+Marks on each entry's branch, tip first (✓ proven · ✗ failed · ? unproven):
+- false-systems/taso main (as of last fetch 2026-10-13 09:12 UTC): ? 4be01c2 ✗ 77a1f0e ✓ 0c9d3b1
+```
+
+**Flag.** When the entry's branch is not proven at its tip, the briefing of
+`ohjaa run` (and `ohjaa brief`) opens with it, before anything else, and the
+launch says it on stderr:
+
+```
+FLAG: main of false-systems/taso is unproven since 77a1f0e (2 commits: ? 4be01c2, ✗ 77a1f0e; as of last fetch 2026-10-13 09:12 UTC). Start by running `ohjaa gate` on main and fix forward what fails.
+```
+
+The flags a session's record raises at leaving (a broken `origin/main`, its
+own refused work) judge a repository with an entry by its gate too.
+
+### `ohjaa report --json`: `ohjaa-marks.v1`
+
+One machine-readable view for other tools. Computing it writes nothing: not
+the session log (opened read-only), not the report's bookmarks
+(`report-at`, `report-shown-at`), even at a terminal. Exits 4 when the
+report has gaps, as the text does.
+
+```
+{
+  "schema": "ohjaa-marks.v1",
+  "generated": "<RFC 3339>",
+  "complete": true,                      // false: something could not be read
+  "entries": [{                          // every entry in the home
+    "repo": "owner/name",
+    "branch": "main", "ref": "origin/main",
+    "clone": "<the clone walked>",       // the one that fetched last
+    "fetched": "<RFC 3339>" | null,      // as of last fetch (FETCH_HEAD)
+    "ended": "proven" | "root" | "cap" | "not_asked",
+    "proven_at_tip": false,
+    "commits": [{                        // tip first, down to the first proven one, at most 50
+      "sha": "…", "tree": "…",
+      "mark": "proven" | "failed" | "unproven",
+      "why": "…" | null,                 // what sykli said; null when proven
+      "author": "…", "authored": "<RFC 3339>", "subject": "…"
+    }],
+    "error": null | "why it has no marks" // then the rest are null and commits is []
+  }],
+  "proposals": {                         // waiting for a person's decision
+    "listed": true,                      // false, with "why", when they could not be read
+    "waiting": [{ "scope": "ours", "name": "…", "title": "<first line>",
+                  "since": "YYYY-MM-DD", "repo": "<path>" | null }]
+  },
+  "sessions": [{                         // still open, or closed as orphaned in the window
+    "id": "…", "agent": "…", "repo": "…", "intent": "…",
+    "started": "<RFC 3339>", "state": "open" | "orphaned"
+  }],
+  "report": { "schema": "ohjaa-report.v1", … }  // the window's lists, as before
+}
+```
+
+`ended` says why the walk stopped: at a proven commit, at the branch's first
+commit, after 50, or before a commit only sykli could judge with no `sykli
+verify` left to ask. `src/report.rs` pins this shape in a test.
 
 **`apply`** runs as the `ohjaa` on PATH (anything else is refused unless
 `--bin` names it, so a `cargo run` cannot re-point every hook). It refuses,
