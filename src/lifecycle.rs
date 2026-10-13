@@ -409,8 +409,9 @@ pub fn receipts_in<'a>(checkouts: impl IntoIterator<Item = &'a Path>) -> Receipt
 /// that verified each push it accepted), which outlive a worktree removed
 /// with its `.sykli/`. Those are run from `repo`.
 pub fn receipts_of_clone(repo: &Path, checkouts: &[Worktree]) -> Receipts {
-    let kept = git(repo, &["rev-parse", "--git-common-dir"])
-        .map(|common| repo.join(common).join("sykli").join("receipts"));
+    let kept = crate::gitconfig::common_dir(repo)
+        .ok()
+        .map(|common| common.join("sykli").join("receipts"));
     receipts_from(
         checkouts
             .iter()

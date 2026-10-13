@@ -64,13 +64,24 @@ pub fn gate_here(home: &Path, repo: &Path) -> Option<Gate> {
         .to_lowercase();
     let named = config.contains("[include")
         || entries.iter().any(|entry| {
-            config.contains(&format!("{}/{}", entry.owner, entry.name).to_lowercase())
+            names(
+                &config,
+                &format!("{}/{}", entry.owner, entry.name).to_lowercase(),
+            )
         });
     if !named {
         return None;
     }
     let listing = gitconfig::clone_listing(&top).ok()?;
     gate_of(home, &top, &common, &listing)
+}
+
+/// Whether `text` names `owner/name` as a whole: `acme/r1` in
+/// `…/acme/r1.git`, never in `…/acme/r10` or `…/xacme/r1`.
+fn names(text: &str, slug: &str) -> bool {
+    let part = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    text.match_indices(slug)
+        .any(|(at, _)| !text[..at].ends_with(part) && !text[at + slug.len()..].starts_with(part))
 }
 
 /// One commit on the branch, and its mark.
@@ -586,6 +597,15 @@ mod tests {
              got b)"
         );
         assert_eq!(why(&Check::Passed), None);
+    }
+
+    #[test]
+    fn a_config_names_an_entry_only_as_a_whole() {
+        let config = "[remote \"origin\"]\n\turl = git@github.com:acme/r1.git\n";
+        assert!(names(config, "acme/r1"));
+        assert!(names("url = /srv/acme/r1\n", "acme/r1"));
+        assert!(!names("url = git@github.com:acme/r10.git\n", "acme/r1"));
+        assert!(!names("url = git@github.com:xacme/r1.git\n", "acme/r1"));
     }
 
     /// When origin's branch last moved, from its reflog: a push moves it as

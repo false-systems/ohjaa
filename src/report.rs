@@ -329,14 +329,9 @@ fn default_branches(
     let mut clones = std::collections::HashSet::new();
     for repo in repos {
         // A worktree of a clone already read is the same clone.
-        let common = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["rev-parse", "--git-common-dir"])
-            .output()
+        // From the layout; git only when the layout does not say.
+        let common = crate::gitconfig::common_dir(repo)
             .ok()
-            .filter(|o| o.status.success())
-            .map(|o| repo.join(String::from_utf8_lossy(&o.stdout).trim()))
             .and_then(|common| std::fs::canonicalize(common).ok());
         if common.is_some_and(|common| !clones.insert(common)) {
             continue;
