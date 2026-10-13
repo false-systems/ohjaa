@@ -6,6 +6,14 @@
 //! agent *before* it acts, together with the live perimeter of the fleet.
 //! Agents may propose Knowledge; only a person makes it current.
 
+mod adopt;
+mod apply;
+mod doctor;
+mod flat_toml;
+mod gate;
+mod gitconfig;
+mod home;
+mod hook;
 mod intake;
 mod knowledge;
 mod lifecycle;
@@ -14,6 +22,7 @@ mod report;
 mod roots;
 mod scan;
 mod sessions;
+mod shell_init;
 mod system;
 mod usage;
 
@@ -238,6 +247,122 @@ enum Cmd {
     /// A knowledge node and its neighbours: what it builds on, what builds on
     /// it, what it replaced, and which sessions were briefed with it.
     Graph { id: String },
+    /// Apply the workflow from the home (~/.config/ohjaa), outside every
+    /// repository: git runs ohjaa's hooks only in repositories whose remote
+    /// names an entry. Also the global ignore block and the shell launcher.
+    /// Idempotent; --undo takes it all back.
+    #[command(after_help = "Exit codes:\n  \
+        0  applied, undone, or nothing to change\n  \
+        1  git is older than 2.36, or a change could not be made\n  \
+        2  refused: no roots file and no --root (apply does not guess where the\n     \
+           repositories are: run it once with --root <dir>)\n  \
+        3  refused: a global core.hooksPath (see --force), an ohjaa that is not the\n     \
+           one on PATH (see --bin), or --prune without a roots file\n\n\
+        Writes in the home:\n  \
+        repos/<o>/<r>/hooks/<name>    exec <ohjaa> hook <name> \"$@\": pre-push, and each\n                                \
+        hook that entry's clones under the roots have of their own\n  \
+        repos/<o>/<r>/gated.config    core.hooksPath = that entry's hooks/\n  \
+        git/config                    includeIf \"hasconfig:remote.*.url:<pattern>\" per entry\n  \
+        roots                         from --root on the first run: where the repositories are\n  \
+        applied.toml                  what apply changes outside the home, kept before each change\n\
+        Changes outside it, and nothing else:\n  \
+        git's global config    [include] path = <home>/git/config (once)\n  \
+        git's global excludes  a block marked \"ohjaa apply\" holding .sykli/ .teko/\n  \
+        ~/.zshrc               [[ -x <ohjaa> ]] && eval \"$(<ohjaa> shell-init zsh)\", in place\n                         \
+        of a line that sources ~/projects/ohjaa-launch.zsh\n\
+        <ohjaa> is the ohjaa on PATH (or --bin), and the pre-push dispatchers name\n\
+        the sykli on PATH, both by absolute path. Dispatchers are only added;\n\
+        --prune removes the ones no clone needs. --undo puts the three changes back\n\
+        as they were (a hooksPath --force removed comes back at the end of [core],\n\
+        a global config apply created is removed), and removes what apply wrote\n\
+        in the home except the entries and the roots.")]
+    Apply {
+        /// Print every change, and make none.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove a global core.hooksPath (it would run in every repository).
+        #[arg(long)]
+        force: bool,
+        /// Also remove dispatchers no clone under the roots needs (needs a roots file).
+        #[arg(long, conflicts_with = "undo")]
+        prune: bool,
+        /// The ohjaa the hooks and the launcher run, instead of the one on PATH.
+        #[arg(long, value_name = "PATH", conflicts_with = "undo")]
+        bin: Option<PathBuf>,
+        /// Take back what apply changed outside the home, and what it generated.
+        #[arg(long)]
+        undo: bool,
+    },
+    /// Report what differs from what `apply` would make it and, clone by
+    /// clone, whether git runs ohjaa's hooks where an entry says it should.
+    /// Read-only.
+    #[command(after_help = "Exit codes:\n  \
+        0  healthy\n  \
+        4  drift: a line marked DRIFT says what, and what fixes it\n\n\
+        For each clone under the roots whose remote names an entry: git must\n\
+        resolve its core.hooksPath to <home>/hooks (a pattern that missed, or the\n\
+        repository's own core.hooksPath, means the gate does not run there), and\n\
+        each hook of its own must have a dispatcher (else git skips it).")]
+    Doctor,
+    /// Write a repository's entry into the home: the branch its gate protects
+    /// (origin's default branch) and the gate itself, copied from the
+    /// repository's sykli.json on that branch, else written by
+    /// `sykli init --contract`; then regenerate the home's git config. Neither
+    /// git's global config nor the repository is written.
+    Adopt {
+        /// The repository (any directory inside it).
+        path: PathBuf,
+        /// The branch to gate, when origin/HEAD does not name it.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Rewrite an existing entry.
+        #[arg(long)]
+        force: bool,
+    },
+    /// The git hook dispatcher every hook in <home>/hooks execs. pre-push
+    /// runs the repository's gate, when the home has an entry for it; every
+    /// hook then runs the repository's own hook, with the same arguments and
+    /// stdin.
+    #[command(after_help = "Exit codes:\n  \
+        0  passed (and the repository's own hook, if any, passed)\n  \
+        1  the gate refused the push\n  \
+        2  could not evaluate: an unreadable entry or pre-push input, or no repository\n  \
+        N  otherwise, the repository's own hook's status\n\n\
+        The repository is found by the URL git pushes to; its entry is\n\
+        <home>/repos/<owner>/<repo>/. The gate is\n  \
+        sykli hook pre-push --contract <entry>/sykli.json <remote> <url>\n\
+        When the sykli on PATH cannot take --contract, a push to the entry's\n\
+        branch is refused; other branches pass. The repository's own hook is\n\
+        $(git rev-parse --git-common-dir)/hooks/<name>, run when executable.")]
+    Hook {
+        /// The git hook's name, e.g. pre-push.
+        name: String,
+        /// The arguments git passed to the hook.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+    /// Run the gate for the repository here, as a push to its gated branch
+    /// will judge it: the contract of the entry origin names (else the
+    /// repository's own sykli.json), run into .sykli/receipt.json and verified
+    /// for HEAD. Prints the contract and every command it runs.
+    #[command(after_help = "Exit codes:\n  \
+        0  passed: .sykli/receipt.json verifies for HEAD\n  \
+        N  sykli's status: the run or the verify failed\n  \
+        2  no gate here: origin names no entry, and there is no sykli.json\n\n\
+        Runs, from the repository root:\n  \
+        mkdir -p .sykli && sykli run <contract> --json > .sykli/receipt.json &&\n  \
+        sykli verify .sykli/receipt.json --contract <contract> --commit HEAD")]
+    Gate {
+        /// Print the contract and the commands, and run nothing.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Print the shell functions that route `claude` and `codex` through
+    /// `ohjaa run`. Load them with: eval "$(ohjaa shell-init zsh)"
+    ShellInit {
+        /// zsh is the only one.
+        shell: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -341,6 +466,15 @@ fn git_root() -> Option<PathBuf> {
     git(&["rev-parse", "--show-toplevel"], None)
         .ok()
         .map(PathBuf::from)
+}
+
+/// The repository around the current directory, asked of git only when the
+/// roots must be derived from it: none given, and no roots file.
+fn git_root_for_roots(explicit: &[PathBuf]) -> Option<PathBuf> {
+    let configured = roots::config_path().is_some_and(|path| path.is_file());
+    (explicit.is_empty() && !configured)
+        .then(git_root)
+        .flatten()
 }
 
 fn repos(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -1687,6 +1821,13 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     for warning in &scan.warnings {
         eprintln!("ohjaa: warning: {warning}");
     }
+    // The workflow gate, where an entry says it applies: what doctor checks
+    // for this one repository (a few git calls, none outside a gated one).
+    if in_repo {
+        for warning in gitconfig::launch_warnings(&root) {
+            eprintln!("ohjaa: warning: {warning}");
+        }
+    }
 
     // A footgun guard: ohjaa flags after `--` belong to the agent.
     for misplaced in [
@@ -2534,6 +2675,18 @@ fn shell_word(word: &str) -> String {
 }
 
 fn main() {
+    // `ohjaa hook <name> ARGS…` hands git's arguments on exactly as git gave
+    // them. Through clap, one that looks like an ohjaa flag (`--root`) would be
+    // taken as one, so the dispatcher's path goes around it; `--help` still
+    // goes through clap.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv.len() >= 3 && argv[1] == "hook" && !argv[2].to_string_lossy().starts_with('-') {
+        let code = hook::run(&argv[2].to_string_lossy(), &argv[3..]).unwrap_or_else(|error| {
+            eprintln!("ohjaa hook: {error:#}");
+            2
+        });
+        std::process::exit(code);
+    }
     let cli = Cli::parse();
     let result = match &cli.command {
         Cmd::Run {
@@ -2601,6 +2754,37 @@ fn main() {
         Cmd::Usage { action } => cmd_usage(action),
         Cmd::Report { since, json } => cmd_report(&cli.root, since, *json),
         Cmd::Graph { id } => cmd_graph(id),
+        Cmd::Apply {
+            dry_run,
+            force,
+            prune,
+            bin,
+            undo,
+        } => {
+            if *undo {
+                apply::undo(*dry_run)
+            } else {
+                apply::apply(
+                    apply::Options {
+                        dry_run: *dry_run,
+                        force: *force,
+                        prune: *prune,
+                        bin: bin.as_deref(),
+                    },
+                    &cli.root,
+                    git_root_for_roots(&cli.root).as_deref(),
+                )
+            }
+        }
+        Cmd::Doctor => doctor::doctor(&cli.root, git_root_for_roots(&cli.root).as_deref()),
+        Cmd::Adopt {
+            path,
+            branch,
+            force,
+        } => adopt::adopt(path, branch.as_deref(), *force),
+        Cmd::Hook { name, args } => hook::run(name, args),
+        Cmd::ShellInit { shell } => shell_init::shell_init(shell),
+        Cmd::Gate { print } => gate::gate_here(*print),
         Cmd::Intake {
             since,
             sources,

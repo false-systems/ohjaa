@@ -118,6 +118,10 @@ pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Re
     let stderr = drain(Box::new(child.stderr.take().expect("piped stderr")));
 
     let deadline = Instant::now() + timeout;
+    // Polled from 1 ms, doubling to 20 ms: most children (a `git rev-parse`
+    // in a hook that runs on every commit) are done within a few
+    // milliseconds, and a fixed 20 ms poll would be most of their cost.
+    let mut poll = Duration::from_millis(1);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -130,7 +134,8 @@ pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Re
             kill_group(&mut child);
             anyhow::bail!("{program} did not finish within {}s", timeout.as_secs());
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(poll);
+        poll = (poll * 2).min(Duration::from_millis(20));
     };
 
     // The child has exited, but something it started may still hold the

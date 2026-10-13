@@ -34,6 +34,19 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   blocks a launch, and a broken log is reported, never replaced. Everything
   else — fleet, perimeter, coverage — is derived now and stored never. No
   knowledge index, no cache, no daemon.
+- **The workflow lives in the home, outside every repository.**
+  `~/.config/ohjaa` holds each repository's entry (`repos/<owner>/<repo>/`:
+  the branch and the gate, plus its generated hooks folder and
+  `gated.config`), the generated `git/` config and `roots`. Only
+  repositories whose remote names an entry run ohjaa's hooks, and only the
+  hooks that entry needs; no other git command anywhere starts ohjaa, and
+  ohjaa works its git facts out once instead of asking git again. Outside the
+  home, `ohjaa apply` changes only one `include.path` in git's global config,
+  a marked block in git's global excludes file and one line of `~/.zshrc`,
+  records each before making it, and `apply --undo` puts them back; `ohjaa
+  adopt` writes only in the home. Nothing is installed on or written into a
+  repository, and the dispatcher always runs a repository's own hooks after
+  the gate.
 - **`ohjaa run` stays the parent of the session until it ends**, so leaving
   always writes its record, whatever the exit. Session states are observed, not
   declared: the agent's lifecycle testimony is its read-back (`ohjaa oriented`)
@@ -66,7 +79,10 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 - Never edit `vendor/faija-knowledge/`; refresh it with
   `scripts/vendor-faija-knowledge.sh`. The format belongs to faija.
 - Tests must never read or write the person's real knowledge: the CLI tests
-  sandbox `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `OHJAA_OURS`.
+  sandbox `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `OHJAA_OURS`. The
+  workflow-home tests (`tests/config_home.rs`) empty the environment and also
+  sandbox `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`, `CARGO_HOME`, `TMPDIR`
+  and `PATH`: `apply` writes git's global config and `~/.zshrc`.
 
 ## Validation
 
