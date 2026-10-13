@@ -24,7 +24,7 @@ use crate::home::{self, absolute, RepoId};
 use crate::hook::{facts_for_sykli, quote_path};
 use crate::lifecycle;
 use crate::process;
-use crate::sessions::{self, ReceiptRef, ValidationKind, ValidationRef};
+use crate::sessions::{self, ObservedBranch, ReceiptRef, ValidationKind, ValidationRef};
 
 /// The gate of the repository at `top`.
 struct Gate {
@@ -134,7 +134,7 @@ impl Request {
     /// Write the request into the session's record, before sykli is asked:
     /// HEAD and its tree (one git process), the contract and the hash its
     /// lock pins. Says why when it is not recorded; never stops the gate.
-    fn record(top: &Path, gate: &Gate) -> Option<Request> {
+    fn record(top: &Path, common: &Path, gate: &Gate) -> Option<Request> {
         let not = |why: String| {
             println!("ohjaa gate: {why}: this request is not recorded");
             None
@@ -188,16 +188,18 @@ impl Request {
         let (Some(commit), Some(tree)) = (oid(0), oid(1)) else {
             return not("HEAD has no commit yet".to_owned());
         };
-        let kind = if gate.branch.is_some() && oid(2).as_deref() == Some(commit.as_str()) {
-            ValidationKind::Integrated
-        } else {
-            ValidationKind::Candidate
-        };
+        // Never integrated before sykli says what ran (`settle_kind`): a run
+        // of uncommitted changes at the tip is no run of the tip.
+        let observed_branch = gate.branch.as_ref().map(|name| ObservedBranch {
+            name: name.clone(),
+            tip: oid(2),
+            updated_ms: crate::mark::updated(common, name).map(|at| at.ms),
+        });
         let requested_ms = now_ms();
         let validation = ValidationRef {
             request: sessions::new_request_id(requested_ms),
             run: None,
-            kind,
+            kind: ValidationKind::Candidate,
             repo: std::fs::canonicalize(top)
                 .unwrap_or_else(|_| top.to_path_buf())
                 .to_string_lossy()
@@ -209,6 +211,14 @@ impl Request {
             lock_digest: None,
             requested_ms,
             receipt: None,
+            common: Some(
+                std::fs::canonicalize(common)
+                    .unwrap_or_else(|_| common.to_path_buf())
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            observed_branch,
+            ran: None,
         };
         let log = match crate::knowledge::state_home() {
             Ok(state) => sessions::store_path(&state.join("ohjaa")),
@@ -235,6 +245,7 @@ impl Request {
             store.update(&self.session, |s| {
                 if let Some(validation) = s.validations.iter_mut().find(|v| v.request == self.id) {
                     change(validation);
+                    validation.settle_kind();
                 }
             })
         });
@@ -286,7 +297,7 @@ fn kept_receipt(top: &Path, printed: &Value, since_ms: i64) -> Option<ReceiptRef
 /// judged, and leave the receipt that proves HEAD. One git process (the
 /// repository's config), and inside a session one more (HEAD and its tree,
 /// for the request); the rest is sykli's.
-pub fn gate_here(print_only: bool) -> Result<i32> {
+pub fn gate_here(print_only: bool, wait: Duration) -> Result<i32> {
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let (top, common) = repo_at(&cwd)?;
     let listing = gitconfig::clone_listing(&top)?;
@@ -339,13 +350,26 @@ pub fn gate_here(print_only: bool) -> Result<i32> {
     std::fs::create_dir_all(&sykli_dir)
         .with_context(|| format!("cannot create {}", sykli_dir.display()))?;
     let receipt_path = sykli_dir.join("receipt.json");
-    let request = Request::record(&top, &gate);
+    let request = Request::record(&top, &common, &gate);
     // A sykli with durable runs gets the run detached, and is asked about it
     // by its id.
-    let durable = run_help.contains("--detach") && lifecycle::sykli_status_takes_runs();
-    let ran = if durable {
+    let status_help = if run_help.contains("--detach") {
+        lifecycle::sykli_status_help()
+    } else {
+        lifecycle::StatusHelp::default()
+    };
+    let ran = if status_help.runs {
         println!("$ sykli run {quoted}{} --detach --json", extra(&run_facts));
-        detached(&top, &contract, &run_facts, &receipt_path, request.as_ref())?
+        detached(
+            &top,
+            &common,
+            &contract,
+            &run_facts,
+            &receipt_path,
+            request.as_ref(),
+            status_help,
+            wait,
+        )?
     } else {
         println!("$ {run}");
         foreground(&top, &contract, &run_facts, &receipt_path, request.as_ref())?
@@ -407,6 +431,15 @@ fn foreground(
                 });
                 request.fill("the receipt", |validation| {
                     validation.run = printed["run"].as_str().map(str::to_owned);
+                    // What ran, in the receipt's words: a dirty run, or one
+                    // of another tree, is never integrated.
+                    validation.ran =
+                        printed["subject"]["tree_oid"]
+                            .as_str()
+                            .map(|tree| sessions::Ran {
+                                tree: tree.to_owned(),
+                                dirty: printed["subject"]["dirty"].as_bool().unwrap_or(true),
+                            });
                     validation.lock_digest = printed["lock_digest"].as_str().map(str::to_owned);
                     if validation.contract_digest.is_none() {
                         validation.contract_digest =
@@ -426,18 +459,29 @@ fn foreground(
     Ok(Ok(()))
 }
 
+/// `ohjaa gate`'s exit when sykli has not said: the run is still going past
+/// `--wait`, or it ended in a state other than completed (interrupted, lost,
+/// indeterminate). Not proven, and not failed (EX_TEMPFAIL: ask again later).
+pub const NOT_YET: i32 = 75;
+
 /// `sykli run <contract> --detach --json`, which answers `{schema:
 /// "sykli-run.v1", run}` once the run is recorded: the run id is filled in
 /// at once, then sykli is asked about the run (`sykli status --run <id>
-/// --json`) until it ends, and the receipt it names is filled in and saved
-/// as `.sykli/receipt.json`. Should this gate be stopped meanwhile, the run
-/// goes on, and its id is in the record. `Err(code)` when it did not pass.
+/// --json`) until it ends or `wait` has passed, what it says ran is filled
+/// in, and the receipt it names is filled in and saved as
+/// `.sykli/receipt.json`. Should this gate be stopped meanwhile, the run goes
+/// on, and its id is in the record. `Err(code)` when it did not pass:
+/// [`NOT_YET`] when sykli has not said it passed or failed.
+#[allow(clippy::too_many_arguments)]
 fn detached(
     top: &Path,
+    common: &Path,
     contract: &Path,
     facts: &[std::ffi::OsString],
     receipt_path: &Path,
     request: Option<&Request>,
+    help: lifecycle::StatusHelp,
+    wait: Duration,
 ) -> Result<std::result::Result<(), i32>> {
     let output = Command::new("sykli")
         .arg("run")
@@ -471,35 +515,56 @@ fn detached(
         });
     }
     println!("ohjaa gate: sykli run {run} requested");
+    let ask_again = format!("ask again with: sykli status --run {run}");
     let mut poll = Duration::from_millis(100);
     let started = Instant::now();
     let mut waiting_said = false;
+    let mut subject_filled = false;
     let status = loop {
-        let status = match lifecycle::sykli_run_status(top, &run) {
+        let status = match lifecycle::sykli_run_status(top, Some(common), help, &run) {
             Ok(status) => status,
             Err(why) => {
                 println!(
-                    "ohjaa gate: sykli could not say what became of run {run}: {why}; ask it \
-                     again with: sykli status --run {run}"
+                    "ohjaa gate: not proven: sykli could not say what became of run {run}: \
+                     {why}; it is recorded, {ask_again}"
                 );
-                return Ok(Err(1));
+                return Ok(Err(NOT_YET));
             }
         };
+        // What ran, as soon as sykli says: a dirty run is never integrated.
+        if !subject_filled {
+            if let (Some(request), Some(ran)) = (request, lifecycle::ran_of_status(&status)) {
+                request.fill("what sykli ran", |validation| validation.ran = Some(ran));
+                subject_filled = true;
+            }
+        }
         if !matches!(status["state"].as_str(), Some("requested" | "running")) {
             break status;
         }
+        if started.elapsed() >= wait {
+            println!(
+                "ohjaa gate: not proven yet: {}; still running after {}s, so not failed \
+                 either. It is recorded; {ask_again}",
+                lifecycle::describe_run_status(&run, &status),
+                wait.as_secs()
+            );
+            return Ok(Err(NOT_YET));
+        }
         if !waiting_said && started.elapsed() > Duration::from_secs(2) {
-            println!("ohjaa gate: waiting for sykli run {run}");
+            println!(
+                "ohjaa gate: waiting for sykli run {run} (at most {}s)",
+                wait.as_secs()
+            );
             waiting_said = true;
         }
-        std::thread::sleep(poll);
+        std::thread::sleep(poll.min(wait.saturating_sub(started.elapsed())));
         poll = (poll * 2).min(Duration::from_secs(1));
     };
     println!(
         "ohjaa gate: {}",
         lifecycle::describe_run_status(&run, &status)
     );
-    let receipt = lifecycle::receipt_of_status(&status);
+    let receipt = lifecycle::receipt_of_status(&status, top);
     if let Some(request) = request {
         request.fill("the receipt", |validation| {
             validation.receipt = receipt.clone();
@@ -507,15 +572,24 @@ fn detached(
             if validation.contract_digest.is_none() {
                 validation.contract_digest = status["contract_digest"].as_str().map(str::to_owned);
             }
+            if let Some(ran) = lifecycle::ran_of_status(&status) {
+                validation.ran = Some(ran);
+            }
         });
     }
-    if status["state"] != "completed" {
-        println!("ohjaa gate: failed: sykli run {run} did not complete");
-        return Ok(Err(1));
+    if lifecycle::run_ended_unknown(&status) {
+        println!(
+            "ohjaa gate: not proven: sykli says the run ended without completing, so what it \
+             ran is unknown; not failed. It is recorded; {ask_again}"
+        );
+        return Ok(Err(NOT_YET));
     }
     let Some(receipt) = receipt else {
-        println!("ohjaa gate: failed: sykli names no receipt for run {run}");
-        return Ok(Err(1));
+        println!(
+            "ohjaa gate: not proven: sykli names no receipt for run {run}; it is recorded, \
+             {ask_again}"
+        );
+        return Ok(Err(NOT_YET));
     };
     // Saved where a push and the marks look, as the foreground run leaves it.
     let bytes = std::fs::read(&receipt.path)

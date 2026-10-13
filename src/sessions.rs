@@ -136,12 +136,64 @@ pub struct ValidationRef {
     /// The receipt sykli wrote for it, once there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<ReceiptRef>,
+    /// The clone's git common dir: sykli keeps its runs there, so they can be
+    /// asked about from any checkout of the clone once this one is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common: Option<String>,
+    /// The branch the entry observes, as this clone last saw it when the
+    /// validation was requested: never a statement about the remote now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_branch: Option<ObservedBranch>,
+    /// What sykli says ran: the tree, and whether anything beside it was
+    /// dirty. It may differ from `tree`: a run of uncommitted changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran: Option<Ran>,
+}
+
+/// `origin/<branch>` in the requesting clone, as of its last update there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedBranch {
+    pub name: String,
+    /// Where `origin/<branch>` was; `None` when the clone has no such ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip: Option<String>,
+    /// When it last moved in this clone (its reflog, else its file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_ms: Option<i64>,
+}
+
+/// The subject of a run, in sykli's words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ran {
+    pub tree: String,
+    pub dirty: bool,
 }
 
 impl ValidationRef {
     /// Still waiting on sykli's word: a run id and no receipt yet.
     pub fn pending(&self) -> bool {
         self.run.is_some() && self.receipt.is_none()
+    }
+
+    /// Integrated only when sykli says the run was of exactly the commit's
+    /// tree, nothing dirty beside it, and the commit was the observed
+    /// branch's tip as this clone saw it; a candidate otherwise, and until
+    /// sykli has said what ran.
+    pub fn settle_kind(&mut self) {
+        let at_tip = self
+            .observed_branch
+            .as_ref()
+            .and_then(|branch| branch.tip.as_deref())
+            == Some(self.commit.as_str());
+        let exact = self
+            .ran
+            .as_ref()
+            .is_some_and(|ran| !ran.dirty && ran.tree == self.tree);
+        self.kind = if at_tip && exact {
+            ValidationKind::Integrated
+        } else {
+            ValidationKind::Candidate
+        };
     }
 }
 
@@ -1456,6 +1508,8 @@ pub fn render_still_running(
 pub struct Said {
     pub text: String,
     pub receipt: Option<ReceiptRef>,
+    /// sykli says the run is over (in whatever state).
+    pub ended: bool,
 }
 
 /// ` (intent <id>)` when the session carries an Intent id.
@@ -1499,16 +1553,25 @@ pub fn render_validations(
             (None, Some(receipt)) => format!("no sykli run id{}", describe_receipt(receipt)),
             (Some(run), Some(receipt)) => format!("sykli run {run}{}", describe_receipt(receipt)),
             (Some(run), None) => match said(validation) {
-                Some(Said { text, receipt }) => format!(
+                Some(Said { text, receipt, .. }) => format!(
                     "{text}{}",
                     receipt.as_ref().map(describe_receipt).unwrap_or_default()
                 ),
                 None => format!("sykli run {run}, no receipt recorded (sykli not asked)"),
             },
         };
+        // What sykli ran, when it is not exactly the commit's tree.
+        let ran = match &validation.ran {
+            Some(ran) if ran.dirty || ran.tree != validation.tree => format!(
+                "; sykli ran tree {}{}",
+                short(&ran.tree),
+                if ran.dirty { ", dirty" } else { "" }
+            ),
+            _ => String::new(),
+        };
         let _ = writeln!(
             out,
-            "{prefix}validation {} ({kind}, {} tree {}): {answer}",
+            "{prefix}validation {} ({kind}, {} tree {}{ran}): {answer}",
             validation.request,
             short(&validation.commit),
             short(&validation.tree)
@@ -2809,6 +2872,9 @@ mod tests {
             lock_digest: None,
             requested_ms: 1,
             receipt: None,
+            common: None,
+            observed_branch: None,
+            ran: None,
         };
         let receipt = ReceiptRef {
             path: "/r/a/.sykli/receipts/rcpt_abc.json".to_owned(),
@@ -2820,6 +2886,7 @@ mod tests {
             Some(Said {
                 text: "sykli says run r9 is running: 1 running".to_owned(),
                 receipt: None,
+                ended: false,
             })
         };
         let unknown = base.clone();

@@ -6,24 +6,26 @@
 //! that was meant to stop the session.
 //!
 //! The session runs in a process group of its own, led by `toimija run` (the
-//! agent stays in toimija's group), and its entering record names that group:
-//! whether the session still runs can then be told apart from whether its
-//! ohjaa does, even after ohjaa was killed. When ohjaa holds the terminal,
-//! it hands the terminal to the session's group, as a shell gives a job the
-//! terminal, so the agent reads it and Ctrl-C reaches it; Ctrl-Z stops the
-//! session and then ohjaa, so the shell sees its job stopped, and `fg` gives
-//! the terminal back to the session. ohjaa takes the terminal back when the
-//! session ends.
+//! agent stays in toimija's group), and its entering record names that group
+//! before toimija runs: whether the session still runs can then be told apart
+//! from whether its ohjaa does, even after ohjaa was killed. ohjaa does with
+//! the terminal what a job-control shell does with a job's (the `terminal`
+//! module): the session holds it while ohjaa's job is in the foreground,
+//! stops and is continued with ohjaa's job, and gives it back at its end.
 //!
 //! The rule, per signal, while the session runs (unix):
 //!
 //! | signal | ohjaa | why |
 //! |---|---|---|
-//! | SIGINT | survives, never forwards | Ctrl-C reaches the session's group, which holds the terminal; a second copy makes agents like `claude` quit instead of interrupt |
-//! | SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 | survives, forwards the first of each to `toimija run` | a supervisor may aim them at ohjaa alone; when the session's group got them too, the session receives them twice |
+//! | SIGINT, SIGQUIT | survives; passes each one to the session's group while the session does not hold the terminal | holding it, the session got the terminal's Ctrl-C itself, and a second copy makes agents like `claude` quit instead of interrupt; not holding it, nothing else can bring it one |
+//! | SIGTERM, SIGHUP, SIGUSR1, SIGUSR2 | survives, passes the first of each to the session's group, with a SIGCONT | a shell's `kill %1` (or a supervisor) reaches only ohjaa's group; a stopped session must be continued to act on it |
 //! | SIGALRM, SIGVTALRM, SIGPROF, SIGXCPU, SIGXFSZ | survives | they concern ohjaa's own timers and limits, which it never sets |
+//! | SIGCONT | continues, noted | ohjaa stopped with its job and was continued: the session is continued too |
 //! | SIGKILL, SIGSTOP | cannot be caught | SIGKILL loses the leaving; the session's group outlives it, and the next launch says so |
 //!
+//! Where the session shares ohjaa's group (a terminal without job control
+//! above ohjaa, see `terminal`), signals to the group reached it already:
+//! SIGINT is never passed on, the others to `toimija run` alone, as before.
 //! To stop a session from outside, send SIGTERM to ohjaa, or SIGINT to the
 //! session's process group (its record's `pgid`).
 //!
@@ -101,25 +103,96 @@ mod signals {
         }
     }
 
+    /// Set by SIGCONT: ohjaa, stopped with its job, was continued.
+    static CONTINUED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn on_continue(_: libc::c_int) {
+        CONTINUED.store(true, Ordering::SeqCst);
+    }
+
     pub fn supervise() {
         let handler = on_signal as extern "C" fn(libc::c_int);
         set_all(handler as libc::sighandler_t);
+        let continued = on_continue as extern "C" fn(libc::c_int);
+        // SAFETY: a handler that only stores an atomic; SIGCONT still
+        // continues the process whatever its disposition.
+        unsafe {
+            libc::signal(libc::SIGCONT, continued as libc::sighandler_t);
+        }
     }
 
-    /// Forward the first of each forwardable signal received so far. With
-    /// `before_spawn`, SIGINT too: one that arrived before the child existed
-    /// never reached it through the process group.
-    pub fn forward_pending(child: u32, forwarded: &mut u32, before_spawn: bool) {
+    /// Stop ohjaa's own process group (its job: a pipeline with ohjaa in it
+    /// stops whole) with `signal`, whose default action ohjaa keeps, and
+    /// return once it has been continued. The stop may land after kill(2)
+    /// returns (another thread may take it), so this waits for the SIGCONT
+    /// itself; should ohjaa's group no longer be stoppable (`still`: the shell
+    /// above it is gone, so the stop was dropped), it gives up waiting.
+    pub fn stop_own_group(signal: libc::c_int, still: fn() -> bool) {
+        CONTINUED.store(false, Ordering::SeqCst);
+        // SAFETY: kill(2) of our own process group.
+        unsafe {
+            libc::kill(0, signal);
+        }
+        let mut waited = 0u32;
+        while !CONTINUED.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += 1;
+            if waited.is_multiple_of(200) && !still() {
+                break;
+            }
+        }
+    }
+
+    /// Where the forwarded signals go, decided by the caller for the moment.
+    pub struct Targets {
+        /// The session's `toimija run`.
+        pub child: libc::pid_t,
+        /// Its process group, when it has one of its own; `None` while it
+        /// shares ohjaa's (then a signal to the whole group reached it).
+        pub group: Option<libc::pid_t>,
+        /// SIGINT and SIGQUIT go to the session too: nothing else can bring
+        /// it one (no terminal, or the session does not hold it).
+        pub interrupts: bool,
+    }
+
+    /// Pass on what arrived. SIGINT and SIGQUIT each time one arrives, when
+    /// `targets.interrupts` (or `before_spawn`: one that arrived before the
+    /// child existed never reached it), to the session's group; the others
+    /// the first of each, to the group with a SIGCONT after (a stopped
+    /// group can then act on them), or to `toimija run` alone while the
+    /// session shares ohjaa's group.
+    pub fn forward_pending(targets: &Targets, forwarded: &mut u32, before_spawn: bool) {
         let pending = PENDING.load(Ordering::SeqCst);
+        let send = |signal: libc::c_int| {
+            // SAFETY: plain kill(2) of our own child, or of its group.
+            unsafe {
+                match targets.group {
+                    Some(group) => {
+                        libc::kill(-group, signal);
+                        if signal != libc::SIGCONT {
+                            libc::kill(-group, libc::SIGCONT);
+                        }
+                    }
+                    None => {
+                        libc::kill(targets.child, signal);
+                    }
+                }
+            }
+        };
         for (signal, forward) in HANDLED {
             let b = bit(signal);
-            let forward = forward || (before_spawn && signal == libc::SIGINT);
-            if forward && pending & b != 0 && *forwarded & b == 0 {
-                *forwarded |= b;
-                // SAFETY: plain kill(2) on the pid of a child not yet reaped.
-                unsafe {
-                    libc::kill(child as libc::pid_t, signal);
+            if pending & b == 0 {
+                continue;
+            }
+            if matches!(signal, libc::SIGINT | libc::SIGQUIT) {
+                // Taken each time: a later one is passed on as well.
+                PENDING.fetch_and(!b, Ordering::SeqCst);
+                if before_spawn || targets.interrupts {
+                    send(signal);
                 }
+            } else if forward && *forwarded & b == 0 {
+                *forwarded |= b;
+                send(signal);
             }
         }
     }
@@ -134,6 +207,10 @@ mod signals {
     pub fn restore() {
         LEAVING.store(false, Ordering::SeqCst);
         set_all(libc::SIG_DFL);
+        // SAFETY: the default disposition back.
+        unsafe {
+            libc::signal(libc::SIGCONT, libc::SIG_DFL);
+        }
     }
 }
 
@@ -146,34 +223,51 @@ pub fn supervise() {
     signals::supervise();
 }
 
-/// The session's process group (unix): `toimija run` leads a group of its
-/// own, so whether the session still runs can be told apart from whether its
-/// ohjaa does. When ohjaa holds the terminal (its group is in the
-/// foreground), the session's group gets it, as a shell gives a job the
-/// terminal, so the agent reads it and Ctrl-C reaches it; ohjaa takes it back
-/// when the session stops or ends.
+/// The session's process group, and the terminal (unix).
+///
+/// `toimija run` leads a process group of its own, so whether the session
+/// still runs can be told apart from whether its ohjaa does. With that group
+/// apart from ohjaa's, ohjaa does with the terminal what a job-control shell
+/// does with a job's, at every moment, not only at the spawn:
+///
+/// - while ohjaa's group is the terminal's foreground group, the session's
+///   group gets the terminal, and a stopped one is continued;
+/// - when the session stops on the terminal (Ctrl-Z; reading or writing it
+///   from the background), ohjaa takes the terminal back and stops its own
+///   group with the same signal, so the shell sees the job stopped and why;
+///   when continued, the session is continued too (with the terminal again
+///   when continued in the foreground);
+/// - the session ending gives the terminal back to ohjaa's group.
+///
+/// That needs a shell above ohjaa that keeps the terminal (job control): its
+/// parent is in its session and in another process group, or ohjaa leads the
+/// session itself. Under a wrapper without job control (`sh -c`), a killed
+/// ohjaa would leave the terminal with a group nobody gives it back from, so
+/// there the session shares ohjaa's group, as before, and has no group of
+/// its own to be told apart by. Without a terminal at all the session has
+/// its group, and there is nothing to hand over.
 #[cfg(unix)]
-mod group {
+mod terminal {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::sync::atomic::{AtomicI32, Ordering};
 
-    /// The terminal handed to the session's group, by file descriptor; -1
-    /// when none was.
-    static TERMINAL: AtomicI32 = AtomicI32::new(-1);
+    /// No terminal; the terminal, with job control above; the terminal,
+    /// without.
+    const NO_TERMINAL: i32 = 0;
+    const JOB: i32 = 1;
+    const LEADER: i32 = 2;
+    const SHARED: i32 = 3;
 
-    /// A descriptor (0, 1 or 2) of the controlling terminal, while ohjaa's
-    /// own group is in its foreground.
-    fn foreground_terminal() -> Option<libc::c_int> {
-        // SAFETY: plain queries of the process and its descriptors.
-        unsafe {
-            (0..3).find(|&fd| libc::isatty(fd) == 1 && libc::tcgetpgrp(fd) == libc::getpgrp())
-        }
-    }
+    static MODE: AtomicI32 = AtomicI32::new(NO_TERMINAL);
+    /// `/dev/tty`, opened for as long as the session runs in JOB or LEADER.
+    static TTY: AtomicI32 = AtomicI32::new(-1);
 
-    /// Make `fd`'s foreground group `pgid`. From a background group the call
-    /// raises SIGTTOU, which is ignored for its length, as shells do.
+    /// Make the terminal's foreground group `pgid`. From a background group
+    /// the call raises SIGTTOU, which is ignored for its length, as shells
+    /// do. Async-signal-safe, so it also runs between fork and exec.
     fn give(fd: libc::c_int, pgid: libc::pid_t) {
-        // SAFETY: async-signal-safe calls only, so this also runs between
-        // fork and exec; the disposition is put back as it was.
+        // SAFETY: async-signal-safe calls only; the disposition is put back
+        // as it was.
         unsafe {
             let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             libc::tcsetpgrp(fd, pgid);
@@ -181,131 +275,395 @@ mod group {
         }
     }
 
-    /// Start the command's process as the leader of a group of its own, in
-    /// the foreground when ohjaa holds the terminal.
-    pub fn own(command: &mut std::process::Command) {
+    fn tty() -> Option<libc::c_int> {
+        let fd = TTY.load(Ordering::SeqCst);
+        (fd >= 0).then_some(fd)
+    }
+
+    /// The terminal's foreground group.
+    fn holder(fd: libc::c_int) -> libc::pid_t {
+        // SAFETY: a query of the terminal.
+        unsafe { libc::tcgetpgrp(fd) }
+    }
+
+    /// Whether ohjaa's own group is in the foreground.
+    fn foreground(fd: libc::c_int) -> bool {
+        // SAFETY: a query of our own process group.
+        holder(fd) == unsafe { libc::getpgrp() }
+    }
+
+    /// Whether a shell with job control is above ohjaa: its parent is in its
+    /// session and in another process group (the shell made ohjaa's job a
+    /// group of its own, and keeps the terminal). Then ohjaa's group is not
+    /// orphaned, and a stop signal stops it.
+    fn job_controlled() -> bool {
+        // SAFETY: plain queries of this process and its parent.
+        unsafe {
+            let parent = libc::getppid();
+            libc::getsid(parent) == libc::getsid(0) && libc::getpgid(parent) != libc::getpgrp()
+        }
+    }
+
+    /// Decide, before the spawn, how the session meets the terminal.
+    fn decide() -> i32 {
+        // SAFETY: plain queries of this process and its parent, and an open
+        // of the controlling terminal that never makes one.
+        unsafe {
+            let fd = libc::open(
+                c"/dev/tty".as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            );
+            if fd < 0 {
+                return NO_TERMINAL;
+            }
+            let mode = if libc::getsid(0) == libc::getpid() {
+                LEADER
+            } else if job_controlled() {
+                JOB
+            } else {
+                SHARED
+            };
+            if mode == SHARED {
+                libc::close(fd);
+            } else {
+                TTY.store(fd, Ordering::SeqCst);
+            }
+            mode
+        }
+    }
+
+    /// What writes the session's group into its entering record.
+    pub type Record = Box<dyn FnOnce(u32, i64) + Send>;
+
+    /// Two pipes between ohjaa and the child: it says its pid, ohjaa records
+    /// its group, then lets it go on to exec. Nothing runs in a group the
+    /// log does not name, unless the log could not be written.
+    pub struct Handshake {
+        /// The child's ends: it writes its pid on one, waits on the other.
+        child_says: OwnedFd,
+        child_waits: OwnedFd,
+        helper: std::thread::JoinHandle<Option<(u32, i64)>>,
+    }
+
+    fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+        let mut fds = [0; 2];
+        // SAFETY: pipe(2) into a local array; both ends are owned at once,
+        // and close on exec.
+        unsafe {
+            if libc::pipe(fds.as_mut_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for fd in fds {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            Ok((OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])))
+        }
+    }
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as i64)
+    }
+
+    /// Start the command's process as the leader of a process group of its
+    /// own (unless the session shares ohjaa's), in the foreground when ohjaa
+    /// holds the terminal, and `record` its group (pgid, when it was made)
+    /// before it execs. `None` when it shares ohjaa's group.
+    pub fn own(
+        command: &mut std::process::Command,
+        record: Record,
+    ) -> (Option<Handshake>, Option<Record>) {
+        use std::io::{Read as _, Write as _};
         use std::os::unix::process::CommandExt as _;
-        let terminal = foreground_terminal();
-        TERMINAL.store(terminal.unwrap_or(-1), Ordering::SeqCst);
-        // SAFETY: the closure only makes async-signal-safe calls (setpgid,
-        // getpid, signal, tcsetpgrp), as code between fork and exec must.
+        let mode = decide();
+        MODE.store(mode, Ordering::SeqCst);
+        if mode == SHARED {
+            return (None, None);
+        }
+        let handover = tty().filter(|&fd| foreground(fd));
+        let ((says_read, says), (waits, go)) = match (pipe(), pipe()) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                // No handshake: the group is recorded after the spawn.
+                // SAFETY: as below, without the pipes.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::setpgid(0, 0) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if let Some(fd) = handover {
+                            give(fd, libc::getpid());
+                        }
+                        Ok(())
+                    });
+                }
+                return (None, Some(record));
+            }
+        };
+        // The child's copies of the helper's ends are closed first, or the
+        // child would hold a writer of the pipe it waits on, and never see
+        // ohjaa go.
+        let (said_fd, go_fd) = (says_read.as_raw_fd(), go.as_raw_fd());
+        let helper = std::thread::spawn(move || {
+            let mut said = std::fs::File::from(says_read);
+            let mut pid = [0u8; 4];
+            said.read_exact(&mut pid).ok()?;
+            let pid = u32::from_ne_bytes(pid);
+            let at_ms = now_ms();
+            record(pid, at_ms);
+            // Dropped without a write when the record panicked: the child
+            // reads nothing, and never runs unrecorded.
+            let mut go = std::fs::File::from(go);
+            go.write_all(b"g").ok()?;
+            Some((pid, at_ms))
+        });
+        let (says_fd, waits_fd) = (says.as_raw_fd(), waits.as_raw_fd());
+        // SAFETY: between fork and exec, only async-signal-safe calls:
+        // setpgid, getpid, signal, tcsetpgrp, write, read.
         unsafe {
             command.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if let Some(fd) = terminal {
+                if let Some(fd) = handover {
                     give(fd, libc::getpid());
                 }
-                Ok(())
+                libc::close(said_fd);
+                libc::close(go_fd);
+                let pid = (libc::getpid() as u32).to_ne_bytes();
+                if libc::write(says_fd, pid.as_ptr().cast(), pid.len()) != pid.len() as isize {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut go = [0u8; 1];
+                loop {
+                    match libc::read(waits_fd, go.as_mut_ptr().cast(), 1) {
+                        1 => return Ok(()),
+                        -1 if std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::Interrupted => {}
+                        // ohjaa is gone before its record named the group.
+                        // (No allocation here, between fork and exec.)
+                        _ => return Err(std::io::Error::from_raw_os_error(libc::ECANCELED)),
+                    }
+                }
             });
+        }
+        (
+            Some(Handshake {
+                child_says: says,
+                child_waits: waits,
+                helper,
+            }),
+            None,
+        )
+    }
+
+    impl Handshake {
+        /// After the spawn: the group, as recorded (pgid, when), if it was.
+        pub fn finish(self) -> Option<(u32, i64)> {
+            // The child's ends: closed, so a helper still waiting (no child
+            // was made) sees the end of its pipe.
+            drop(self.child_says);
+            drop(self.child_waits);
+            self.helper.join().ok().flatten()
         }
     }
 
-    /// Just after the spawn, from ohjaa's side too, so neither order of the
+    /// From ohjaa's side too, just after the spawn, so neither order of the
     /// two processes leaves a moment where the group or the terminal is not
     /// yet the session's. Failures are the child having done it already.
-    pub fn spawned(child: u32) {
-        let Ok(pid) = libc::pid_t::try_from(child) else {
+    pub fn spawned(child: libc::pid_t) {
+        if MODE.load(Ordering::SeqCst) == SHARED {
             return;
-        };
+        }
         // SAFETY: setpgid on our own child; errors (it already exec'd, or
         // already leads its group) are expected and ignored.
         unsafe {
-            libc::setpgid(pid, pid);
+            libc::setpgid(child, child);
         }
-        let fd = TERMINAL.load(Ordering::SeqCst);
-        if fd >= 0 {
-            give(fd, pid);
+        if let Some(fd) = tty().filter(|&fd| foreground(fd)) {
+            give(fd, child);
         }
     }
 
-    /// Take the terminal back for ohjaa's own group, when it was handed to
-    /// the session's group `child` and that group (or nobody: the group
-    /// ended) still holds it. Never from anyone else: after `bg` the shell
-    /// holds it.
-    pub fn take_back(child: libc::pid_t) {
-        let fd = TERMINAL.load(Ordering::SeqCst);
-        if fd < 0 {
+    /// The session's own process group, when it has one.
+    pub fn group(child: libc::pid_t) -> Option<libc::pid_t> {
+        (MODE.load(Ordering::SeqCst) != SHARED).then_some(child)
+    }
+
+    /// Whether SIGINT and SIGQUIT sent to ohjaa are passed on to the
+    /// session: it has a group of its own and does not hold the terminal,
+    /// so the terminal's Ctrl-C did not reach it.
+    pub fn interrupts_to_session(child: libc::pid_t) -> bool {
+        match MODE.load(Ordering::SeqCst) {
+            SHARED => false,
+            NO_TERMINAL => true,
+            _ => tty().is_none_or(|fd| holder(fd) != child),
+        }
+    }
+
+    /// While ohjaa's group is in the foreground, the session gets the
+    /// terminal, and is continued should it have stopped for it: a job
+    /// brought to the foreground (`fg`) after it started in the background.
+    pub fn follow(child: libc::pid_t) {
+        if !matches!(MODE.load(Ordering::SeqCst), JOB | LEADER) {
             return;
         }
-        // SAFETY: queries of the terminal and of a process group; signal 0
-        // sends nothing.
-        let holder = unsafe { libc::tcgetpgrp(fd) };
-        let nobody = holder > 0
-            && unsafe { libc::kill(-holder, 0) } != 0
+        if let Some(fd) = tty() {
+            if foreground(fd) {
+                give(fd, child);
+                // SAFETY: continuing our own child's group.
+                unsafe {
+                    libc::kill(-child, libc::SIGCONT);
+                }
+            }
+        }
+    }
+
+    /// Take the terminal back for ohjaa's own group, when the session's group
+    /// holds it, or nobody does any more (the group ended). Never from anyone
+    /// else: after `bg` the shell holds it.
+    pub fn take_back(child: libc::pid_t) {
+        let Some(fd) = tty() else {
+            return;
+        };
+        let held = holder(fd);
+        // SAFETY: signal 0 sends nothing; a query of our own group.
+        let nobody = held > 0
+            && unsafe { libc::kill(-held, 0) } != 0
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if holder == child || nobody {
-            // SAFETY: a query of our own process group.
+        if held == child || nobody {
             give(fd, unsafe { libc::getpgrp() });
         }
     }
 
-    /// The session's group was stopped (Ctrl-Z reaches only the group that
-    /// holds the terminal): stop ohjaa as well, so its shell sees the job
-    /// stopped and takes the terminal. When ohjaa is continued in the
-    /// foreground (`fg`), the terminal goes back to the session; continued
-    /// either way, so is the session's group. Without a terminal handed over
-    /// (whoever stopped the group continues it) nothing is done.
-    pub fn stopped(child: u32) {
-        let fd = TERMINAL.load(Ordering::SeqCst);
-        let Ok(pid) = libc::pid_t::try_from(child) else {
-            return;
-        };
-        if fd < 0 {
-            return;
-        }
-        take_back(pid);
-        // SAFETY: stopping ourselves with the default action of SIGTSTP,
-        // which ohjaa never handles; then a query of the terminal, and
-        // continuing our own child's group.
-        unsafe {
-            libc::raise(libc::SIGTSTP);
-            if libc::tcgetpgrp(fd) == libc::getpgrp() {
-                give(fd, pid);
+    /// The session's group stopped with `signal`. A job-control stop
+    /// (SIGTSTP from Ctrl-Z or the agent; SIGTTIN or SIGTTOU from the
+    /// terminal in the background) stops ohjaa's own group with the same
+    /// signal once the terminal is back with it, so the shell sees the job
+    /// stopped and why. `true` when ohjaa stopped and has been continued:
+    /// then [`resume`] continues the session. Any other stop (SIGSTOP from
+    /// outside) is left to whoever sent it; leading the session itself,
+    /// there is no shell to tell, and the session goes on.
+    pub fn stopped(child: libc::pid_t, signal: libc::c_int) -> bool {
+        let job_stop = matches!(signal, libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU);
+        match MODE.load(Ordering::SeqCst) {
+            JOB if job_stop => {
+                take_back(child);
+                super::signals::stop_own_group(signal, job_controlled);
+                true
             }
-            libc::kill(-pid, libc::SIGCONT);
+            LEADER if job_stop => true,
+            _ => false,
         }
     }
+
+    /// Continued after [`stopped`]: the session too, with the terminal when
+    /// ohjaa is in the foreground again.
+    pub fn resume(child: libc::pid_t) {
+        if let Some(fd) = tty().filter(|&fd| foreground(fd)) {
+            give(fd, child);
+        }
+        // SAFETY: continuing our own child's group.
+        unsafe {
+            libc::kill(-child, libc::SIGCONT);
+        }
+    }
+
+    /// The session is over: the terminal is closed again.
+    pub fn done() {
+        let fd = TTY.swap(-1, Ordering::SeqCst);
+        if fd >= 0 {
+            // SAFETY: our own descriptor, no longer used.
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+/// The session's process group, prepared before the spawn: what
+/// [`own_group`] set up, finished by [`group_started`].
+pub struct Group {
+    #[cfg(unix)]
+    handshake: Option<terminal::Handshake>,
+    /// The record to write after the spawn, when no handshake could be set
+    /// up to write it before the exec.
+    #[cfg(unix)]
+    record: Option<terminal::Record>,
 }
 
 /// Start the session's process (`toimija run`) as the leader of a process
-/// group of its own, holding the terminal when ohjaa did.
-pub fn own_group(command: &mut Command) {
-    #[cfg(unix)]
-    group::own(command);
-    #[cfg(not(unix))]
-    let _ = command;
-}
-
-/// Called once the session's process exists: its process group's id (its
-/// pid), which the entering record keeps; `None` where there are no process
-/// groups.
-pub fn group_started(child: &Child) -> Option<u32> {
+/// group of its own, holding the terminal when ohjaa does, and have
+/// `record` write the group (pgid, and when it was made) into the entering
+/// record before the process execs. Under a terminal without job control
+/// above ohjaa, the session shares ohjaa's group instead (see the
+/// `terminal` module).
+pub fn own_group(command: &mut Command, record: Box<dyn FnOnce(u32, i64) + Send>) -> Group {
     #[cfg(unix)]
     {
-        group::spawned(child.id());
-        Some(child.id())
+        let (handshake, record) = terminal::own(command, record);
+        Group { handshake, record }
     }
     #[cfg(not(unix))]
     {
-        let _ = child;
+        let _ = (command, record);
+        Group {}
+    }
+}
+
+/// Once the spawn returned (`child`, when it did): the session's group as
+/// recorded (pgid, when it was made); `None` when the session shares
+/// ohjaa's group, or there are no process groups.
+pub fn group_started(group: Group, child: Option<&Child>) -> Option<(u32, i64)> {
+    #[cfg(unix)]
+    {
+        let recorded = group.handshake.and_then(terminal::Handshake::finish);
+        let child = child?;
+        let pid = libc::pid_t::try_from(child.id()).ok()?;
+        terminal::spawned(pid);
+        terminal::group(pid)?;
+        recorded.or_else(|| {
+            // No handshake: recorded now, after the spawn.
+            let at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as i64);
+            if let Some(record) = group.record {
+                record(child.id(), at_ms);
+            }
+            Some((child.id(), at_ms))
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (group, child);
         None
     }
 }
 
-/// Wait for the session to end, forwarding stop signals aimed at ohjaa, and
-/// following its group when it is stopped and continued. The terminal comes
-/// back to ohjaa's group when the session ends.
+/// Wait for the session to end: pass on the signals aimed at ohjaa (see the
+/// table above), and do with the terminal what a job-control shell does
+/// (see the `terminal` module). The terminal comes back to ohjaa's group
+/// when the session ends.
 pub fn wait(child: &mut Child) -> std::io::Result<ExitStatus> {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt as _;
         let pid = libc::pid_t::try_from(child.id())
             .map_err(|_| std::io::Error::other("the session's pid does not fit a pid_t"))?;
+        let targets = || signals::Targets {
+            child: pid,
+            group: terminal::group(pid),
+            interrupts: terminal::interrupts_to_session(pid),
+        };
         let mut forwarded = 0;
         // Whatever arrived while the session was being started.
-        signals::forward_pending(child.id(), &mut forwarded, true);
+        signals::forward_pending(&targets(), &mut forwarded, true);
+        let ended = |result| {
+            terminal::take_back(pid);
+            terminal::done();
+            result
+        };
         loop {
             let mut status: libc::c_int = 0;
             // SAFETY: waitpid on our own child, which nothing else reaps.
@@ -313,20 +671,24 @@ pub fn wait(child: &mut Child) -> std::io::Result<ExitStatus> {
                 unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
             if waited == pid {
                 if libc::WIFSTOPPED(status) {
-                    group::stopped(child.id());
+                    if terminal::stopped(pid, libc::WSTOPSIG(status)) {
+                        // Continued: what the shell sent with it (`kill %1`
+                        // sends SIGTERM and SIGCONT) goes first.
+                        signals::forward_pending(&targets(), &mut forwarded, false);
+                        terminal::resume(pid);
+                    }
                     continue;
                 }
-                group::take_back(pid);
-                return Ok(ExitStatus::from_raw(status));
+                return ended(Ok(ExitStatus::from_raw(status)));
             }
             if waited < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
-                    group::take_back(pid);
-                    return Err(error);
+                    return ended(Err(error));
                 }
             }
-            signals::forward_pending(child.id(), &mut forwarded, false);
+            signals::forward_pending(&targets(), &mut forwarded, false);
+            terminal::follow(pid);
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -2343,11 +2705,14 @@ fn clean(checkout: &Path) -> bool {
 /// What sykli says of a run, from `sykli status --run <id> --json`
 /// (`sykli-run-status.v1`, KATANA D3): `sykli says run <id> completed: 1
 /// passed, 1 cached`. Its words, labelled as its; the task states are
-/// counted in a fixed order, cached apart from passed.
+/// counted in a fixed order, cached apart from passed. A run that ended in
+/// any state but `completed` (interrupted, lost, indeterminate, …) proved
+/// nothing and failed nothing, and is said so; only a run that completed
+/// with a failing task is a failure, and its tasks say that.
 pub fn describe_run_status(run: &str, status: &Value) -> String {
-    let state = status["state"].as_str().unwrap_or("in an unknown state");
-    let state = match state {
-        "requested" | "running" => format!("is {state}"),
+    let word = status["state"].as_str().unwrap_or("in an unknown state");
+    let state = match word {
+        "requested" | "running" => format!("is {word}"),
         other => other.to_owned(),
     };
     let mut counts: Vec<(String, usize)> = [
@@ -2374,48 +2739,99 @@ pub fn describe_run_status(run: &str, status: &Value) -> String {
         .filter(|(_, n)| *n > 0)
         .map(|(name, n)| format!("{n} {name}"))
         .collect();
-    if tasks.is_empty() {
-        format!("sykli says run {run} {state}: no tasks")
+    let tasks = if tasks.is_empty() {
+        "no tasks".to_owned()
     } else {
-        format!("sykli says run {run} {state}: {}", tasks.join(", "))
-    }
+        tasks.join(", ")
+    };
+    let unknown = if run_ended_unknown(status) {
+        " (not proven, not failed: unknown)"
+    } else {
+        ""
+    };
+    format!("sykli says run {run} {state}: {tasks}{unknown}")
 }
 
-/// The receipt a `sykli-run-status.v1` names, once the run has one.
-pub fn receipt_of_status(status: &Value) -> Option<ReceiptRef> {
-    let path = status["receipt"]["path"].as_str()?;
+/// Whether sykli says the run is over without having completed: what it ran
+/// is unknown, never a failure.
+pub fn run_ended_unknown(status: &Value) -> bool {
+    !matches!(
+        status["state"].as_str(),
+        Some("requested" | "running" | "completed")
+    )
+}
+
+/// The receipt a `sykli-run-status.v1` names, once the run has one: a
+/// relative path is taken from `from`, the checkout sykli was asked in.
+pub fn receipt_of_status(status: &Value, from: &Path) -> Option<ReceiptRef> {
+    let path = Path::new(status["receipt"]["path"].as_str()?);
     Some(ReceiptRef {
-        path: path.to_owned(),
+        path: from.join(path).to_string_lossy().into_owned(),
         digest: status["receipt"]["digest"].as_str().map(str::to_owned),
     })
 }
 
-/// Whether this sykli has durable runs (KATANA D3) to ask about: `sykli
-/// status --help` names `--run`.
-pub fn sykli_status_takes_runs() -> bool {
-    process::run(
+/// What sykli says ran (`subject.tree`, `subject.dirty`) in a
+/// `sykli-run-status.v1`, once it says.
+pub fn ran_of_status(status: &Value) -> Option<crate::sessions::Ran> {
+    Some(crate::sessions::Ran {
+        tree: status["subject"]["tree"].as_str()?.to_owned(),
+        dirty: status["subject"]["dirty"].as_bool()?,
+    })
+}
+
+/// What `sykli status --help` says: whether it has durable runs to ask
+/// about (`--run`, KATANA D3), and whether it takes the repository's facts
+/// (`--repo-root` and `--git-common-dir`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatusHelp {
+    pub runs: bool,
+    pub facts: bool,
+}
+
+/// Ask `sykli status --help` once.
+pub fn sykli_status_help() -> StatusHelp {
+    let help = process::run(
         Command::new("sykli").args(["status", "--help"]),
         None,
         process::LOCAL,
     )
-    .is_ok_and(|output| {
-        output.status.success()
-            && format!(
-                "{}{}",
-                output.stdout_text(),
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .contains("--run")
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| {
+        format!(
+            "{}{}",
+            output.stdout_text(),
+            String::from_utf8_lossy(&output.stderr)
+        )
     })
+    .unwrap_or_default();
+    StatusHelp {
+        runs: help.contains("--run"),
+        facts: help.contains("--repo-root") && help.contains("--git-common-dir"),
+    }
 }
 
-/// `sykli status --run <id> --json`, from `repo`: the run's status, or why
-/// sykli could not say.
-pub fn sykli_run_status(repo: &Path, run: &str) -> Result<Value, String> {
+/// `sykli status --run <id> --json`, from the checkout `repo` (handed
+/// `--repo-root` and `--git-common-dir` when sykli takes them and `common`
+/// is known): the run's status, or why sykli could not say.
+pub fn sykli_run_status(
+    repo: &Path,
+    common: Option<&Path>,
+    help: StatusHelp,
+    run: &str,
+) -> Result<Value, String> {
+    let mut command = Command::new("sykli");
+    command.args(["status", "--run", run]);
+    if let (true, Some(common)) = (help.facts, common) {
+        command
+            .arg("--repo-root")
+            .arg(repo)
+            .arg("--git-common-dir")
+            .arg(common);
+    }
     let output = process::run(
-        Command::new("sykli")
-            .args(["status", "--run", run, "--json"])
-            .current_dir(repo),
+        command.arg("--json").current_dir(repo),
         None,
         process::LOCAL,
     )
@@ -2434,14 +2850,42 @@ pub fn sykli_run_status(repo: &Path, run: &str) -> Result<Value, String> {
     Ok(status)
 }
 
+/// A checkout of the clone a validation was requested in, to ask sykli
+/// from: the one it was requested in while it exists, else any other the
+/// common dir knows (its main worktree, then its linked ones), since sykli
+/// keeps its runs in the common dir, which outlives a removed worktree.
+/// Files only.
+pub fn checkout_of(validation: &ValidationRef) -> Option<PathBuf> {
+    let requested = PathBuf::from(&validation.repo);
+    if requested.is_dir() {
+        return Some(requested);
+    }
+    let common = Path::new(validation.common.as_deref()?);
+    let main = (common.file_name().is_some_and(|name| name == ".git"))
+        .then(|| common.parent().map(Path::to_path_buf))
+        .flatten();
+    let linked = std::fs::read_dir(common.join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let gitdir = std::fs::read_to_string(entry.path().join("gitdir")).ok()?;
+            Some(entry.path().join(gitdir.trim()).parent()?.to_path_buf())
+        });
+    main.into_iter()
+        .chain(linked)
+        .find(|checkout| checkout.is_dir())
+}
+
 /// What sykli says now of each pending validation shown (a run id, no
 /// receipt recorded): `sykli status --run`, asked once per run per command,
-/// and only once some pending one is shown; whether sykli can be asked at
-/// all (`sykli status --help`) is asked once, too. Said as sykli's words,
-/// never stored: the run's own journal is sykli's, and authoritative.
+/// and only once some pending one is shown; `sykli status --help` is asked
+/// once, too. Said as sykli's words, never stored: the run's own journal is
+/// sykli's, and authoritative. Asked from any checkout of the clone that is
+/// left (see [`checkout_of`]).
 #[derive(Debug, Default)]
 pub struct RunStatus {
-    takes_runs: std::cell::OnceCell<bool>,
+    help: std::cell::OnceCell<StatusHelp>,
     said: std::cell::RefCell<HashMap<String, Said>>,
 }
 
@@ -2457,25 +2901,35 @@ impl RunStatus {
         let text = |text: String| Said {
             text,
             receipt: None,
+            ended: false,
         };
-        let said = if !*self.takes_runs.get_or_init(sykli_status_takes_runs) {
+        let help = *self.help.get_or_init(sykli_status_help);
+        let said = if !help.runs {
             text(format!(
                 "sykli run {run}: sykli cannot be asked about runs here (no `sykli status --run`)"
             ))
-        } else if !Path::new(&validation.repo).is_dir() {
-            text(format!(
-                "sykli run {run}: sykli not asked, its checkout {} is gone",
-                validation.repo
-            ))
         } else {
-            match sykli_run_status(Path::new(&validation.repo), run) {
-                Ok(status) => Said {
-                    text: describe_run_status(run, &status),
-                    receipt: receipt_of_status(&status),
-                },
-                Err(why) => text(format!(
-                    "sykli could not say what became of run {run}: {why}"
+            match checkout_of(validation) {
+                None => text(format!(
+                    "sykli run {run}: sykli not asked, no checkout of its clone is left ({})",
+                    validation.repo
                 )),
+                Some(checkout) => {
+                    let common = validation.common.as_deref().map(Path::new);
+                    match sykli_run_status(&checkout, common, help, run) {
+                        Ok(status) => Said {
+                            text: describe_run_status(run, &status),
+                            receipt: receipt_of_status(&status, &checkout),
+                            ended: !matches!(
+                                status["state"].as_str(),
+                                Some("requested" | "running")
+                            ),
+                        },
+                        Err(why) => text(format!(
+                            "sykli could not say what became of run {run}: {why}"
+                        )),
+                    }
+                }
             }
         };
         self.said.borrow_mut().insert(run.to_owned(), said.clone());
@@ -3431,6 +3885,7 @@ mod tests {
             "schema": "sykli-run-status.v1",
             "run": "r1",
             "state": "running",
+            "subject": {"tree": "t1", "commit": null, "dirty": true},
             "tasks": [
                 {"name": "a", "state": "cached"},
                 {"name": "b", "state": "passed"},
@@ -3444,18 +3899,36 @@ mod tests {
             describe_run_status("r1", &status),
             "sykli says run r1 is running: 1 passed, 2 cached, 1 running, 1 odd"
         );
-        assert_eq!(receipt_of_status(&status), None);
-        let done = serde_json::json!({
-            "state": "interrupted",
-            "tasks": [],
-            "receipt": {"path": "/r/.sykli/receipts/rcpt_ab.json", "digest": "ab"},
-        });
+        assert_eq!(receipt_of_status(&status, Path::new("/r")), None);
         assert_eq!(
-            describe_run_status("r2", &done),
-            "sykli says run r2 interrupted: no tasks"
+            ran_of_status(&status),
+            Some(crate::sessions::Ran {
+                tree: "t1".to_owned(),
+                dirty: true
+            })
         );
+        // Over, but not completed: unknown, never failed.
+        for state in ["interrupted", "lost", "indeterminate"] {
+            let done = serde_json::json!({"state": state, "tasks": []});
+            assert!(run_ended_unknown(&done), "{state}");
+            assert_eq!(
+                describe_run_status("r2", &done),
+                format!("sykli says run r2 {state}: no tasks (not proven, not failed: unknown)")
+            );
+        }
+        let completed = serde_json::json!({
+            "state": "completed",
+            "tasks": [{"name": "a", "state": "failed"}],
+            "receipt": {"path": ".sykli/receipts/rcpt_ab.json", "digest": "ab"},
+        });
+        assert!(!run_ended_unknown(&completed));
         assert_eq!(
-            receipt_of_status(&done),
+            describe_run_status("r3", &completed),
+            "sykli says run r3 completed: 1 failed"
+        );
+        // A relative receipt path is taken from where sykli was asked.
+        assert_eq!(
+            receipt_of_status(&completed, Path::new("/r")),
             Some(ReceiptRef {
                 path: "/r/.sykli/receipts/rcpt_ab.json".to_owned(),
                 digest: Some("ab".to_owned()),

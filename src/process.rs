@@ -213,38 +213,53 @@ pub fn ohjaa_alive(pid: u32, started_ms: i64) -> Option<bool> {
     }
 }
 
-/// Whether the process group `pgid`, started at `started_ms`, still has a
-/// live member: a session's agent may outlive the ohjaa that started it.
-/// A member that has exited and not been reaped yet (a zombie) is not live,
-/// and a group of that id whose leader started after `started_ms` (a couple
-/// of seconds of slack for the clock tick) is another group, the id reused.
-/// `None` when that cannot be told: a group is never declared gone on a
-/// guess.
+/// Whether the session's process group `pgid`, made at `started_ms`, still
+/// runs: its leader (`toimija run`, whose pid is the group's id) does. The
+/// agent stays in toimija's group and toimija waits for it, so the leader
+/// outlives the agent; a process the agent left behind in the group (a
+/// background shell, a server) does not keep the session running. A leader
+/// that has exited and not been reaped yet (a zombie) is gone, and a process
+/// with that pid in another group, or one that started after `started_ms`
+/// (a couple of seconds of slack for the clock tick), is another process,
+/// the id reused. `None` when that cannot be told: a group is never
+/// declared gone on a guess.
 pub fn group_alive(pgid: u32, started_ms: i64) -> Option<bool> {
     #[cfg(unix)]
     {
-        let group = libc::pid_t::try_from(pgid).ok().filter(|pgid| *pgid > 1)?;
-        // SAFETY: signal 0 to a process group sends nothing; kill(2) only
-        // says whether the group has a member (EPERM: one of another user's).
-        let exists = unsafe { libc::kill(-group, 0) } == 0
+        let leader = libc::pid_t::try_from(pgid).ok().filter(|pgid| *pgid > 1)?;
+        // SAFETY: signal 0 sends nothing; kill(2) only says whether the pid
+        // exists (EPERM: it does, as another user's).
+        let exists = unsafe { libc::kill(leader, 0) } == 0
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
         if !exists {
             return Some(false);
         }
         let output = run(
             Command::new("ps").args([
-                "-A", "-o", "pid=", "-o", "pgid=", "-o", "etime=", "-o", "stat=",
+                "-o",
+                "pid=",
+                "-o",
+                "pgid=",
+                "-o",
+                "etime=",
+                "-o",
+                "stat=",
+                "-p",
+                &pgid.to_string(),
             ]),
             None,
             LOCAL,
         )
-        .ok()
-        .filter(|output| output.status.success())?;
+        .ok()?;
+        if !output.status.success() && output.stdout.is_empty() {
+            // ps ran and found no such process: gone between kill(2) and ps.
+            return Some(false);
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
             .as_secs() as i64;
-        Some(group_lives(&output.stdout_text(), pgid, started_ms, now))
+        Some(leads(&output.stdout_text(), pgid, started_ms, now))
     }
     #[cfg(not(unix))]
     {
@@ -253,13 +268,13 @@ pub fn group_alive(pgid: u32, started_ms: i64) -> Option<bool> {
     }
 }
 
-/// From `ps -A -o pid= -o pgid= -o etime= -o stat=` at `now` (unix
-/// seconds): whether group `pgid`, started at `started_ms`, has a member
-/// that is not a zombie, and is not another group that reuses its id.
+/// From `ps -o pid= -o pgid= -o etime= -o stat= -p <pgid>` at `now` (unix
+/// seconds): whether the process `pgid` still leads its group, made at
+/// `started_ms`: it runs (not a zombie), in that group, and started no later
+/// than the group was made.
 #[cfg(unix)]
-fn group_lives(listing: &str, pgid: u32, started_ms: i64, now: i64) -> bool {
-    let mut live = false;
-    for line in listing.lines() {
+fn leads(listing: &str, pgid: u32, started_ms: i64, now: i64) -> bool {
+    listing.lines().any(|line| {
         let mut fields = line.split_whitespace();
         let (Some(pid), Some(group), Some(elapsed), Some(stat)) = (
             fields.next().and_then(|pid| pid.parse::<u32>().ok()),
@@ -267,18 +282,13 @@ fn group_lives(listing: &str, pgid: u32, started_ms: i64, now: i64) -> bool {
             fields.next().and_then(elapsed_seconds),
             fields.next(),
         ) else {
-            continue;
-        };
-        if group != pgid {
-            continue;
-        }
-        // Its leader started after the group did: the id was reused.
-        if pid == pgid && now - elapsed > started_ms.div_euclid(1000) + 2 {
             return false;
-        }
-        live |= !stat.starts_with('Z');
-    }
-    live
+        };
+        pid == pgid
+            && group == pgid
+            && !stat.starts_with('Z')
+            && now - elapsed <= started_ms.div_euclid(1000) + 2
+    })
 }
 
 /// `ps`'s elapsed time, `[[dd-]hh:]mm:ss`, in seconds.
@@ -322,19 +332,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_group_lives_while_a_member_does_and_is_never_another_group_of_its_id() {
-        let listing = "  501   501    01:00 Ss\n  502   501    00:30 S+\n  600   600 00:05 R\n";
+    fn a_group_runs_while_its_leader_does_and_is_never_another_group_of_its_id() {
         let now = 10_000;
-        // Started 60 s ago, as its leader did.
-        assert!(group_lives(listing, 501, (now - 60) * 1000, now));
-        // Its leader started 55 s after the group recorded: the id was reused.
-        assert!(!group_lives(listing, 501, (now - 115) * 1000, now));
-        // Only zombies left: nothing lives.
-        let zombies = "  501   501    01:00 Z\n  502   501    00:30 Z+\n";
-        assert!(!group_lives(zombies, 501, (now - 60) * 1000, now));
-        // The leader gone, a member left: still the group.
-        assert!(group_lives("  502   501    00:30 S\n", 501, 0, now));
-        assert!(!group_lives(listing, 777, 0, now), "no such group");
+        let leader = "  501   501    01:00 Ss\n";
+        // Its leader started 60 s ago, as the group did.
+        assert!(leads(leader, 501, (now - 60) * 1000, now));
+        // Its leader started 55 s after the group was made: the id was reused.
+        assert!(!leads(leader, 501, (now - 115) * 1000, now));
+        // An exited leader not reaped yet is gone.
+        assert!(!leads(
+            "  501   501    01:00 Z\n",
+            501,
+            (now - 60) * 1000,
+            now
+        ));
+        // That pid, in another group now: another process.
+        assert!(!leads(
+            "  501   777    01:00 S\n",
+            501,
+            (now - 60) * 1000,
+            now
+        ));
+        // No such process listed.
+        assert!(!leads("", 501, 0, now));
     }
 
     #[cfg(unix)]

@@ -371,14 +371,22 @@ enum Cmd {
     #[command(after_help = "Exit codes:\n  \
         0  passed: .sykli/receipt.json verifies for HEAD, so HEAD is proven\n  \
         N  sykli's status: the run or the verify failed\n  \
-        2  no gate here: origin names no entry, and there is no sykli.json\n\n\
+        2  no gate here: origin names no entry, and there is no sykli.json\n  \
+        75 not proven and not failed: a durable sykli run is still going after\n     \
+        --wait, or sykli says it ended without completing; it is recorded\n\n\
         Runs, from the repository root:\n  \
         mkdir -p .sykli && sykli run <contract> --json > .sykli/receipt.json &&\n  \
-        sykli verify .sykli/receipt.json --contract <contract> --commit HEAD")]
+        sykli verify .sykli/receipt.json --contract <contract> --commit HEAD\n\
+        With a sykli that has durable runs (sykli run --detach), the run is\n\
+        handed over detached and asked about by its id until it ends.")]
     Gate {
         /// Print the contract and the commands, and run nothing.
         #[arg(long)]
         print: bool,
+        /// With durable sykli runs: how long to wait for the run, in seconds,
+        /// before saying it is still running (exit 75; the run goes on).
+        #[arg(long, value_name = "SECONDS", default_value_t = 1800)]
+        wait: u64,
     },
     /// Print the shell functions that route `claude` and `codex` through
     /// `ohjaa run`. Load them with: eval "$(ohjaa shell-init zsh)"
@@ -897,6 +905,7 @@ fn last_session_here(
         (latest, log.all().map(|(all, _)| all).unwrap_or_default())
     };
     let latest_id = latest.as_ref().map(|s| s.id.clone());
+    let pending = pending_here(&all, latest_id.as_deref(), repo, &here, runs);
     let mut earlier: Vec<sessions::Session> = all
         .into_iter()
         .filter(|s| Some(&s.id) != latest_id.as_ref() && sessions::observed_in(s, &here))
@@ -907,11 +916,89 @@ fn last_session_here(
         sessions::render_warnings(latest.as_ref(), &earlier, &here, |repo, branch, commit| {
             lifecycle::still_at(Path::new(repo), branch, commit)
         });
-    let last = latest
+    let mut last = latest
         .as_ref()
         .map(|session| sessions::render_last_with(session, &here, &|v| runs.ask(v)))
         .unwrap_or_default();
+    last.push_str(&pending);
     (!warnings.is_empty() || !last.is_empty()).then_some((warnings, last))
+}
+
+/// How long a validation an earlier session left pending is still named in
+/// a briefing, while sykli does not say it ended.
+const PENDING_FOR_MS: i64 = 7 * 86_400_000;
+
+/// The validations earlier sessions requested in this clone (`repo`, keyed
+/// `here`) and left pending (a sykli run id, no receipt): a validation
+/// outlives the session that asked for it. Each is asked about (`runs`) and
+/// named, as sykli says it now, until sykli says it ended; one sykli cannot
+/// be asked about is named for a week from its request, then counted. The
+/// last session's own are in its block, not here. Empty when there are none.
+fn pending_here(
+    all: &[sessions::Session],
+    latest: Option<&str>,
+    repo: &Path,
+    here: &str,
+    runs: &lifecycle::RunStatus,
+) -> String {
+    use std::fmt::Write as _;
+    let pending: Vec<(&sessions::Session, &sessions::ValidationRef)> = all
+        .iter()
+        .filter(|session| session.left.is_some() && Some(session.id.as_str()) != latest)
+        .flat_map(|session| session.validations.iter().map(move |v| (session, v)))
+        .filter(|(_, v)| v.pending())
+        .collect();
+    if pending.is_empty() {
+        return String::new();
+    }
+    // This clone's common dir, from its layout: a sibling worktree's
+    // validations are this clone's too.
+    let common = crate::gitconfig::common_dir(repo)
+        .ok()
+        .map(|common| repo_key(&common));
+    let mut pending: Vec<_> = pending
+        .into_iter()
+        .filter(|(_, v)| v.repo == here || (common.is_some() && v.common == common))
+        .collect();
+    if pending.is_empty() {
+        return String::new();
+    }
+    pending.sort_by_key(|(_, v)| std::cmp::Reverse(v.requested_ms));
+    let now_ms = intake::now_seconds() * 1000;
+    let mut lines = String::new();
+    let mut older = 0;
+    for (session, validation) in pending {
+        let said = runs.ask(validation);
+        if said.as_ref().is_some_and(|said| said.ended) {
+            continue;
+        }
+        let asked = said
+            .as_ref()
+            .is_some_and(|said| said.text.starts_with("sykli says"));
+        if !asked && now_ms - validation.requested_ms > PENDING_FOR_MS {
+            older += 1;
+            continue;
+        }
+        let line =
+            sessions::render_validations(std::slice::from_ref(validation), "- ", &|_| said.clone());
+        let _ = writeln!(
+            lines,
+            "{} (session {}, pending since {})",
+            line.trim_end(),
+            session.id,
+            sessions::clock(validation.requested_ms)
+        );
+    }
+    if older > 0 {
+        let _ = writeln!(
+            lines,
+            "- {older} more requested over a week ago that sykli cannot be asked about"
+        );
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("Validations earlier sessions here left pending:\n{lines}")
 }
 
 /// The session this command runs inside, named by `ohjaa run`.
@@ -1705,8 +1792,12 @@ struct Intent {
 enum IntentOrigin {
     /// Minted at this launch.
     New,
-    /// Continued: the newest session in the log that carries it.
-    ContinuedFrom(String),
+    /// Continued: the newest session in the log that carries it, and the
+    /// repository it ran in when that is not this one.
+    ContinuedFrom {
+        session: String,
+        elsewhere: Option<String>,
+    },
     /// Continued, but the log could not be read to find it (why).
     Unchecked(String),
 }
@@ -1716,7 +1807,14 @@ impl Intent {
     fn briefing_line(&self, session: &str) -> String {
         let origin = match &self.origin {
             IntentOrigin::New => "new".to_owned(),
-            IntentOrigin::ContinuedFrom(from) => format!("continued from session {from}"),
+            IntentOrigin::ContinuedFrom {
+                session,
+                elsewhere: None,
+            } => format!("continued from session {session}"),
+            IntentOrigin::ContinuedFrom {
+                session,
+                elsewhere: Some(repo),
+            } => format!("continued from session {session}, which worked on it in {repo}"),
             IntentOrigin::Unchecked(why) => {
                 format!("continued; the session log could not be read to check it ({why})")
             }
@@ -1729,19 +1827,25 @@ impl Intent {
     }
 }
 
-/// The Intent of a new session: continued with `--intent-id` (its text from
-/// the newest session that carries it, unless `--intent` gives another), or
-/// new, with an id minted now. An id no session in the log carries is
-/// refused; a log that cannot be read never refuses a launch, and the
-/// continuation is then said to be unchecked.
+/// The Intent of a new session in `here`: continued with `--intent-id` (its
+/// text from the newest session that carries it, unless `--intent` gives
+/// another), or new, with an id minted now (`in-<ms>-<pid>`, real
+/// milliseconds). An id no session in the log carries is refused; a log
+/// that cannot be read never refuses a launch, and the continuation is then
+/// said to be unchecked. An Intent last worked on in another repository is
+/// continued (an Intent may span repositories), and that is said.
 fn resolve_intent(
     dirs: &Dirs,
+    here: &str,
     text: Option<&str>,
     id: Option<&str>,
 ) -> std::result::Result<Intent, String> {
     let Some(id) = id else {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as i64);
         return Ok(Intent {
-            id: sessions::new_intent_id(intake::now_seconds() * 1000),
+            id: sessions::new_intent_id(now_ms),
             text: text.unwrap_or_default().to_owned(),
             origin: IntentOrigin::New,
         });
@@ -1776,10 +1880,14 @@ fn resolve_intent(
     else {
         return Err(format!("no session in the log carries intent {id}"));
     };
+    let here_too = newest.repo == here || newest.scoped.iter().any(|s| s.repo == here);
     Ok(Intent {
         id: id.to_owned(),
         text: text.map_or(newest.intent, str::to_owned),
-        origin: IntentOrigin::ContinuedFrom(newest.id),
+        origin: IntentOrigin::ContinuedFrom {
+            session: newest.id,
+            elsewhere: (!here_too).then_some(newest.repo),
+        },
     })
 }
 
@@ -2001,7 +2109,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // interactive Codex launch can wait for the person's first message.
     let dirs = Dirs::resolve(in_repo.then_some(root.as_path()))?;
     // The Intent: continued, from the sessions that carry its id, or new.
-    let intent = match resolve_intent(&dirs, intent, intent_id) {
+    let intent = match resolve_intent(&dirs, &repo_key(&root), intent, intent_id) {
         Ok(intent) => intent,
         Err(why) => {
             eprintln!("ohjaa: {why}");
@@ -2009,6 +2117,17 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             return Ok(REFUSED);
         }
     };
+    if let IntentOrigin::ContinuedFrom {
+        session,
+        elsewhere: Some(repo),
+    } = &intent.origin
+    {
+        eprintln!(
+            "ohjaa: intent {} was last worked on in {repo} (session {session}); it is \
+             continued here",
+            intent.id
+        );
+    }
     // Sessions left open by an ohjaa that is gone (a SIGKILL, a crash, a
     // restart) are closed first, so they are queued and can be the last session
     // here. One whose own process group still runs is still running: left open.
@@ -2228,9 +2347,25 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
 
     // Stay the parent: leaving must run when the session ends, however it ends.
     // The session leads a process group of its own (holding the terminal when
-    // ohjaa did), so a later launch can tell whether it still runs.
-    lifecycle::own_group(&mut command);
-    let mut child = match command.spawn() {
+    // ohjaa does), so a later launch can tell whether it still runs; the
+    // entering record names the group before the session execs.
+    let record = {
+        let (dirs, id) = (dirs.clone(), session_id.clone());
+        Box::new(move |pgid: u32, at_ms: i64| {
+            if let Some(store) = session_store(&dirs) {
+                if let Err(error) = store.update(&id, |s| {
+                    s.pgid = Some(pgid);
+                    s.group_started_ms = Some(at_ms);
+                }) {
+                    eprintln!("ohjaa: {error}; the session's process group is not recorded");
+                }
+            }
+        })
+    };
+    let group = lifecycle::own_group(&mut command, record);
+    let spawned = command.spawn();
+    let group = lifecycle::group_started(group, spawned.as_ref().ok());
+    let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
             // No session ran; still, no entering is left without its leaving.
@@ -2256,22 +2391,9 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             return Err(error).context("failed to run toimija");
         }
     };
-    // Its process group, in the entering record as soon as it exists: a
-    // later launch tells by it whether the session outlived this ohjaa.
-    if let Some(pgid) = lifecycle::group_started(&child) {
-        let at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(started_ms, |since| since.as_millis() as i64);
+    if let Some((pgid, at_ms)) = group {
         session.pgid = Some(pgid);
         session.group_started_ms = Some(at_ms);
-        if let Some(store) = session_store(&dirs) {
-            if let Err(error) = store.update(&session_id, |s| {
-                s.pgid = Some(pgid);
-                s.group_started_ms = Some(at_ms);
-            }) {
-                eprintln!("ohjaa: {error}; the session's process group is not recorded");
-            }
-        }
     }
     let waited = lifecycle::wait(&mut child);
 
@@ -3018,7 +3140,7 @@ fn main() {
         } => adopt::adopt(path, branch.as_deref(), *force),
         Cmd::Hook { name, args } => hook::run(name, args),
         Cmd::ShellInit { shell } => shell_init::shell_init(shell),
-        Cmd::Gate { print } => gate::gate_here(*print),
+        Cmd::Gate { print, wait } => gate::gate_here(*print, std::time::Duration::from_secs(*wait)),
         Cmd::Intake {
             since,
             sources,
