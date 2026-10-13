@@ -5199,3 +5199,303 @@ fn a_command_that_only_reads_says_a_held_log_is_busy_and_never_waits_on_it() {
     assert_eq!(export["sessions"].as_array().unwrap().len(), 1, "{stdout}");
     fixture.cleanup();
 }
+
+// ---- KATANA D4 ----------------------------------------------------------------
+
+/// `ohjaa usage export` (ohjaa-sessions.v1) from `repo`.
+fn export_of(fixture: &Fixture, repo: &Path) -> serde_json::Value {
+    let (stdout, stderr, code) =
+        output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(repo));
+    assert_eq!(code, Some(0), "{stderr}");
+    serde_json::from_str(&stdout).unwrap()
+}
+
+/// D4: an Intent has an id of its own, apart from every session's id; a
+/// later session continues it with `--intent-id`, and `--task` is recorded.
+#[test]
+fn an_intent_has_an_id_that_a_later_session_continues() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intent-id");
+    let repo = fixture.make_git_repo("work");
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "fix the parser",
+                "--task",
+                "start with the lexer",
+                "--",
+                "-c",
+                "exit 0",
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let briefing = fixture.argv().join("\n");
+    let first = export_of(&fixture, &repo)["sessions"][0].clone();
+    let id = first["id"].as_str().unwrap().to_owned();
+    let intent = first["intent_id"]
+        .as_str()
+        .expect("an intent id")
+        .to_owned();
+    assert!(intent.starts_with("in-") && intent != id, "{intent} {id}");
+    assert_eq!(first["task"], "start with the lexer");
+    assert!(
+        briefing.contains(&format!(
+            "This session is {id}; its intent is {intent}, new. Continue it in a later \
+             session with: ohjaa run <agent> --intent-id {intent}"
+        )),
+        "{briefing}"
+    );
+
+    // Continued: a new session, the same intent, and its text comes with it.
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent-id", &intent, "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let export = export_of(&fixture, &repo);
+    let second = export["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] != id.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(second["intent_id"], intent.as_str());
+    assert_eq!(second["intent"], "fix the parser");
+    assert!(second.get("task").is_none(), "no task given: {second:#}");
+    let argv = fixture.argv();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--intent" && pair[1] == "fix the parser"),
+        "toimija gets the intent's text: {argv:?}"
+    );
+    let briefing = argv.join("\n");
+    assert!(
+        briefing.contains(&format!(
+            "its intent is {intent}, continued from session {id}"
+        )),
+        "{briefing}"
+    );
+    // `brief` names the last session's intent by its id.
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(
+        stdout.contains(&format!("- intent: fix the parser (intent {intent})")),
+        "{stdout}"
+    );
+
+    // An intent no session carries is refused before anything starts.
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent-id", "in-1-1", "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        stderr.contains("no session in the log carries intent in-1-1"),
+        "{stderr}"
+    );
+    assert_eq!(
+        export_of(&fixture, &repo)["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    // Neither an intent nor an intent id: nothing to launch for.
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--", "-c", "exit 0"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    fixture.cleanup();
+}
+
+/// Whether any process is left in process group `pgid`.
+fn group_alive(pgid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", "--", &format!("-{pgid}")])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// D4, audit finding 5: the session runs in a process group of its own,
+/// which its entering record names. A session whose ohjaa was killed while
+/// its agent runs on is still running, not orphaned; once the agent is gone
+/// too, it is closed as orphaned.
+#[test]
+fn a_session_whose_agent_outlives_its_killed_ohjaa_is_still_running_not_orphaned() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("still-running");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let agent_pid = fixture.dir.join("agent.pid");
+    let mut child = spawn_session(
+        &fixture,
+        &repo,
+        // Written whole, then moved into place: never read half written.
+        &format!(
+            "echo $$ > '{0}.new'; mv '{0}.new' '{0}'; exec sleep 60",
+            agent_pid.display()
+        ),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !agent_pid.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let agent: u32 = fs::read_to_string(&agent_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The group is recorded just after the spawn: wait for that write.
+    let entering = loop {
+        let entering = export_of(&fixture, &repo)["sessions"][0].clone();
+        if entering.get("pgid").is_some() || std::time::Instant::now() > deadline {
+            break entering;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let id = entering["id"].as_str().unwrap().to_owned();
+    let pgid = entering["pgid"]
+        .as_u64()
+        .expect("the group, in the entering record") as u32;
+    assert_eq!(
+        pgid, agent,
+        "the agent leads its own group (toimija execs it)"
+    );
+    signal(child.id(), "KILL");
+    let _ = child.wait();
+    assert!(group_alive(pgid), "the agent outlives its ohjaa");
+
+    // The next launch sees the agent still at work: still running, not orphaned.
+    let launch = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["run", "sh", "--intent", "next", "--", "-c", "exit 0"])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .current_dir(&repo),
+        )
+    };
+    let (_, stderr, code) = launch();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!("ohjaa: session {id} (sh, started "))
+            && stderr.contains(&format!(
+                "is still running in process group {pgid}, but the ohjaa that started it is \
+                 gone; it is left open"
+            )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("closed as orphaned"), "{stderr}");
+    let briefing = fixture.argv().join("\n");
+    assert!(
+        briefing.contains(&format!("STILL RUNNING: session {id} (sh, long)")),
+        "{briefing}"
+    );
+    let export = export_of(&fixture, &repo);
+    let first = export["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id.as_str())
+        .unwrap()
+        .clone();
+    assert!(first.get("left").is_none(), "still open: {first:#}");
+    // The report says the same, as its own state.
+    let (stdout, _, _) = output_of(
+        fixture
+            .ohjaa()
+            .arg("--root")
+            .arg(&fixture.dir)
+            .args(["report", "--json", "--marks"])
+            .current_dir(&repo),
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let state = report["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id.as_str())
+        .map(|s| s["state"].clone());
+    assert_eq!(state, Some(serde_json::json!("ohjaa_gone")), "{report:#}");
+
+    // The agent ends too: now it is an orphan.
+    signal(agent, "KILL");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while group_alive(pgid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (_, stderr, code) = launch();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!("ohjaa: session {id} (sh, started "))
+            && stderr.contains("was left open by an ohjaa that is gone; closed as orphaned"),
+        "{stderr}"
+    );
+    let export = export_of(&fixture, &repo);
+    let first = export["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(first["left"]["orphaned"], true, "{first:#}");
+    fixture.cleanup();
+}
+
+/// D4, audit finding 3: a phase whose receipt reused tasks from sykli's
+/// cache is said so in the record and the next briefing; cached is never
+/// folded into passed.
+#[test]
+fn a_receipt_that_reused_cached_tasks_is_said_so() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("cached-phase");
+    let repo = fixture.make_git_repo("work");
+    let script = r#"set -e
+        echo one > one; git add one; git commit -q -m one
+        tree=$(git rev-parse 'HEAD^{tree}')
+        mkdir -p .sykli/receipts
+        printf '{"schema":"sykli-receipt.v1","outcome":"passed","started_at_ms":%s000,"subject":{"tree_oid":"%s","head_tree_oid":"%s","dirty":false},"tasks":[{"name":"a","outcome":"passed"},{"name":"b","outcome":"cached"}]}' "$(date +%s)" "$tree" "$tree" > .sykli/receipts/rcpt_one.json
+        echo two > two; git add two; git commit -q -m two
+        tree=$(git rev-parse 'HEAD^{tree}')
+        printf '{"schema":"sykli-receipt.v1","outcome":"cached","started_at_ms":%s000,"subject":{"tree_oid":"%s","head_tree_oid":"%s","dirty":false},"tasks":[{"name":"a","outcome":"cached"},{"name":"b","outcome":"cached"}]}' "$(date +%s)" "$tree" "$tree" > .sykli/receipts/rcpt_two.json"#;
+    let (_, stderr, code) = run_session(&fixture, &repo, script);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("receipt: passed (1 of 2 tasks cached)")
+            && stderr.contains("receipt: cached (all 2 tasks cached)"),
+        "{stderr}"
+    );
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(
+        stdout.contains(
+            "- work: 2 commit(s), 1 whose sykli receipt says passed (1 reusing cached tasks), \
+             1 whose receipt says cached (no task run)"
+        ),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
