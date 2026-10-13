@@ -126,6 +126,9 @@ pub struct Report {
     /// What could not be read or judged, each with why: a report with gaps
     /// says so, and exits 4.
     pub gaps: Vec<String>,
+    /// The window (its three lists) was read; `false` for the marks alone
+    /// (`--marks`), which read no default-branch window and ask no vessa.
+    pub window: bool,
 }
 
 /// A proposal, or a proposed node, waiting for a person's decision.
@@ -167,6 +170,18 @@ pub fn parse_since(text: &str, now_ms: i64) -> Result<i64> {
 /// repositories `repos` (those under the roots), and vessa's sessions when
 /// vessa is on PATH.
 pub fn build(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Report {
+    build_with(dirs, repos, since_ms, now_ms, true)
+}
+
+/// The marks of every entry, what waits for a person and the sessions still
+/// open or orphaned, alone: no default-branch window and no vessa, so it
+/// costs two git processes per entry and a `sykli verify` only where a
+/// receipt says it passed (`ohjaa report --marks`).
+pub fn build_marks(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Report {
+    build_with(dirs, repos, since_ms, now_ms, false)
+}
+
+fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window: bool) -> Report {
     let mut gaps = Vec::new();
     // Opened only to read: a report never writes the log (#41).
     let logged: Vec<Session> = match sessions::Reader::open(&sessions::store_path(&dirs.state)) {
@@ -190,11 +205,19 @@ pub fn build(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Repo
             Vec::new()
         }
     };
-    let untold = untold(&logged, since_ms, now_ms);
+    let untold = if window {
+        untold(&logged, since_ms, now_ms)
+    } else {
+        Vec::new()
+    };
     // One sykli for both: a commit the window and the marks share is asked
     // about once, and a repository with an entry is judged by its gate.
     let sykli = lifecycle::sykli_with_entries();
-    let (unproven, judged) = default_branches(repos, since_ms, &sykli, &mut gaps);
+    let (unproven, judged) = if window {
+        default_branches(repos, since_ms, &sykli, &mut gaps)
+    } else {
+        (Vec::new(), Judged::default())
+    };
     let marks = match crate::home::ohjaa_home() {
         Ok(home) => mark::of_entries(&crate::home::absolute(home), repos, &sykli),
         Err(error) => {
@@ -209,11 +232,15 @@ pub fn build(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Repo
     }
     let proposals = waiting(dirs);
     let open = open_sessions(&logged, since_ms, now_ms);
-    let natives = native_sessions(since_ms, now_ms, &mut gaps).map(|listed| {
-        let (judgeable, mut natives) = listed;
-        natives.bypasses = bypasses(judgeable, &logged);
-        natives
-    });
+    let natives = if window {
+        native_sessions(since_ms, now_ms, &mut gaps).map(|listed| {
+            let (judgeable, mut natives) = listed;
+            natives.bypasses = bypasses(judgeable, &logged);
+            natives
+        })
+    } else {
+        Ok(Natives::default())
+    };
     if let Ok(natives) = &natives {
         if !natives.undated.is_empty() {
             gaps.push(format!(
@@ -233,6 +260,7 @@ pub fn build(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Repo
         proposals,
         open,
         gaps,
+        window,
     }
 }
 
@@ -337,10 +365,11 @@ fn default_branches(
             judged.commits += 1;
             match &on.check {
                 Check::Passed => judged.verified += 1,
-                Check::Failed { .. } | Check::Unchecked => unproven.push(Unproven {
-                    repo: repo.to_string_lossy().into_owned(),
-                    on,
-                }),
+                Check::Failed { .. } | Check::Unchecked | Check::OtherContract { .. } => unproven
+                    .push(Unproven {
+                        repo: repo.to_string_lossy().into_owned(),
+                        on,
+                    }),
                 Check::UncheckedGone => {
                     judged.gone += 1;
                     if on.merge {
@@ -640,9 +669,8 @@ fn folder(cwd: &str) -> &str {
 
 fn describe_check(check: &Check) -> String {
     match check {
-        Check::Failed { why } => format!("FAILED sykli verify: {why}"),
         Check::Unchecked => "unchecked: no sykli run of it where it was made".to_owned(),
-        other => format!("{other:?}"),
+        other => sessions::describe_check(other),
     }
 }
 
@@ -690,7 +718,15 @@ pub fn render(report: &Report) -> String {
         sessions::clock(report.since_ms),
         sessions::clock(report.until_ms)
     );
-    if !report.marks.is_empty() {
+    if !report.window {
+        out.clear();
+        let _ = writeln!(
+            out,
+            "ohjaa report, the marks at {}",
+            sessions::clock(report.until_ms)
+        );
+    }
+    if !report.marks.is_empty() || !report.window {
         let _ = writeln!(
             out,
             "\nMarks on each entry's branch, tip first (✓ proven · ✗ failed · ? unproven):"
@@ -705,6 +741,13 @@ pub fn render(report: &Report) -> String {
                 }
             }
         }
+        if report.marks.is_empty() {
+            let _ = writeln!(out, "- no repository has an entry (ohjaa adopt <repo>)");
+        }
+    }
+    if !report.window {
+        say_gaps(report, &mut out);
+        return out;
     }
     let _ = writeln!(
         out,
@@ -797,6 +840,11 @@ pub fn render(report: &Report) -> String {
             );
         }
     }
+    say_gaps(report, &mut out);
+    out
+}
+
+fn say_gaps(report: &Report, out: &mut String) {
     if !report.gaps.is_empty() {
         let _ = writeln!(
             out,
@@ -806,13 +854,13 @@ pub fn render(report: &Report) -> String {
             let _ = writeln!(out, "- {gap}");
         }
     }
-    out
 }
 
 /// `ohjaa report --json`: `ohjaa-marks.v1` (the README's "ohjaa-marks.v1"
 /// pins it). The marks on every entry's branch, what waits for a person,
 /// the sessions still open or orphaned, and the window's report as
-/// `ohjaa-report.v1` under `report`. Computing it writes nothing.
+/// `ohjaa-report.v1` under `report` (`null` with `--marks`). Computing it
+/// writes nothing.
 pub fn to_json(report: &Report) -> Value {
     let rfc = |ms: i64| intake::rfc3339(ms.div_euclid(1000));
     let entries: Vec<Value> = report
@@ -823,18 +871,18 @@ pub fn to_json(report: &Report) -> Value {
                 "repo": marks.gate.slug,
                 "branch": marks.gate.branch,
                 "ref": format!("origin/{}", marks.gate.branch),
+                "tip": marks.commits.first().map(|tip| tip.commit.as_str()),
                 "clone": marks.gate.top,
-                "fetched": marks.fetched_ms.map(rfc),
+                "updated": marks.updated.as_ref().map(|at| rfc(at.ms)),
+                "updated_by": marks.updated.as_ref().and_then(|at| at.by),
                 "ended": marks.ended.word(),
                 "proven_at_tip": marks.proven_at_tip(),
                 "commits": marks.commits.iter().map(|walked| json!({
                     "sha": walked.commit,
                     "tree": walked.tree,
                     "mark": mark::word(&walked.check),
-                    "why": match &walked.check {
-                        Check::Passed => Value::Null,
-                        check => Value::from(describe_check(check)),
-                    },
+                    "code": mark::code(&walked.check),
+                    "why": mark::why(&walked.check),
                     "author": walked.author,
                     "authored": rfc(walked.authored * 1000),
                     "subject": walked.subject,
@@ -845,8 +893,10 @@ pub fn to_json(report: &Report) -> Value {
                 "repo": slug,
                 "branch": Value::Null,
                 "ref": Value::Null,
+                "tip": Value::Null,
                 "clone": Value::Null,
-                "fetched": Value::Null,
+                "updated": Value::Null,
+                "updated_by": Value::Null,
                 "ended": Value::Null,
                 "proven_at_tip": false,
                 "commits": [],
@@ -883,7 +933,7 @@ pub fn to_json(report: &Report) -> Value {
             Err(why) => json!({"listed": false, "why": why, "waiting": []}),
         },
         "sessions": report.open.iter().map(session).collect::<Vec<_>>(),
-        "report": report_json(report),
+        "report": if report.window { report_json(report) } else { Value::Null },
     })
 }
 
@@ -914,6 +964,7 @@ fn report_json(report: &Report) -> Value {
             "committed": rfc(u.on.committed * 1000),
             "check": match &u.on.check {
                 Check::Failed { .. } => "failed",
+                Check::OtherContract { .. } => "other_contract",
                 _ => "unchecked",
             },
             "why": describe_check(&u.on.check),
@@ -1358,6 +1409,7 @@ mod tests {
             proposals: Ok(Vec::new()),
             open: Vec::new(),
             gaps: Vec::new(),
+            window: true,
         }
     }
 
@@ -1386,7 +1438,10 @@ mod tests {
                 "acme/widget".to_owned(),
                 Ok(mark::Marks {
                     gate,
-                    fetched_ms: Some(5_000),
+                    updated: Some(mark::Updated {
+                        ms: 5_000,
+                        by: Some("fetch"),
+                    }),
                     commits: vec![
                         walked("c3", Check::Unchecked),
                         walked(
@@ -1441,16 +1496,21 @@ mod tests {
         let entry = &json["entries"][0];
         assert_eq!(
             keys(entry),
-            "branch,clone,commits,ended,error,fetched,proven_at_tip,ref,repo"
+            "branch,clone,commits,ended,error,proven_at_tip,ref,repo,tip,updated,updated_by"
         );
         assert_eq!(entry["repo"], "acme/widget");
         assert_eq!(entry["ref"], "origin/main");
-        assert_eq!(entry["fetched"], "1970-01-01T00:00:05Z");
+        assert_eq!(entry["tip"], "c3");
+        assert_eq!(entry["updated"], "1970-01-01T00:00:05Z");
+        assert_eq!(entry["updated_by"], "fetch");
         assert_eq!(entry["ended"], "proven");
         assert_eq!(entry["proven_at_tip"], false);
         assert_eq!(entry["error"], Value::Null);
         let commit = &entry["commits"][1];
-        assert_eq!(keys(commit), "author,authored,mark,sha,subject,tree,why");
+        assert_eq!(
+            keys(commit),
+            "author,authored,code,mark,sha,subject,tree,why"
+        );
         assert_eq!(commit["sha"], "c2");
         assert_eq!(commit["tree"], "tree-c2");
         assert_eq!(commit["author"], "Ann");
@@ -1463,6 +1523,11 @@ mod tests {
             .map(|c| c["mark"].as_str().unwrap())
             .collect();
         assert_eq!(marks, ["unproven", "failed", "proven"]);
+        assert_eq!(commit["code"], "failed");
+        assert_eq!(commit["why"], "refused: outcome");
+        assert_eq!(entry["commits"][0]["code"], "no_receipt");
+        assert_eq!(entry["commits"][0]["why"], "no receipt of its tree here");
+        assert_eq!(entry["commits"][2]["code"], "proven");
         assert_eq!(entry["commits"][2]["why"], Value::Null);
         let gone = &json["entries"][1];
         assert_eq!(keys(gone), keys(entry), "one shape, marked or not");
@@ -1480,6 +1545,12 @@ mod tests {
         assert_eq!(json["sessions"][0]["state"], "orphaned");
         assert_eq!(json["report"]["schema"], "ohjaa-report.v1");
         assert_eq!(json["complete"], false, "vessa could not be read");
+        // The marks alone: the same keys, no window.
+        report.window = false;
+        let marks_only = to_json(&report);
+        assert_eq!(keys(&marks_only), keys(&json));
+        assert_eq!(marks_only["report"], Value::Null);
+        assert_eq!(marks_only["entries"], json["entries"]);
     }
 
     #[test]

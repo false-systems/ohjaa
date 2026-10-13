@@ -1,10 +1,13 @@
 //! Marks: what each commit on an entry's branch is, derived now and stored
 //! never. Nothing is written into a repository, and ohjaa keeps nothing.
 //!
-//! - ✓ proven: a receipt of its tree verifies, `sykli verify <receipt>
-//!   --contract <the entry's gate> --commit <sha>`;
-//! - ✗ failed: a receipt of its tree is here, and it did not pass;
-//! - ? unproven: no receipt of its tree is here, or sykli could not say.
+//! - ✓ proven: sykli accepted a receipt of its tree against the entry's
+//!   contract, `sykli verify <receipt> --contract <the entry's gate> --commit
+//!   <sha>` (receipts are unsigned files: this is what sykli accepted, not a
+//!   run of the tree);
+//! - ✗ failed: the newest run of its tree here failed;
+//! - ? unproven: no receipt of its tree is here, it passed under another
+//!   contract or lock than the gate's now, or sykli could not say.
 //!
 //! The walk starts where this clone last saw origin's copy of the entry's
 //! branch (`refs/remotes/origin/<branch>`: no fetch, no network) and goes back
@@ -110,8 +113,8 @@ impl Ended {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Marks {
     pub gate: Gate,
-    /// When this clone last fetched (`FETCH_HEAD`), in milliseconds.
-    pub fetched_ms: Option<i64>,
+    /// When `origin/<branch>` last moved in this clone, and how.
+    pub updated: Option<Updated>,
     /// Tip first.
     pub commits: Vec<Walked>,
     pub ended: Ended,
@@ -153,15 +156,81 @@ pub fn word(check: &Check) -> &'static str {
     }
 }
 
-/// When the clone whose common git dir is `common` last fetched, in
-/// milliseconds: `FETCH_HEAD`'s time.
-pub fn fetched(common: &Path) -> Option<i64> {
-    let modified = std::fs::metadata(common.join("FETCH_HEAD"))
-        .ok()?
-        .modified()
-        .ok()?;
-    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-    i64::try_from(since.as_millis()).ok()
+/// A stable code for why a commit has its mark, for tools to read.
+pub fn code(check: &Check) -> &'static str {
+    match check {
+        Check::Passed => "proven",
+        Check::Failed { .. } => "failed",
+        Check::OtherContract { .. } => "other_contract",
+        Check::Unchecked => "no_receipt",
+        Check::UncheckedGone => "no_receipt_checkout_gone",
+        Check::Unverified { .. } => "could_not_say",
+        Check::Stale { .. } => "stale",
+    }
+}
+
+/// Why a commit has its mark, for a person; `None` when it is proven.
+pub fn why(check: &Check) -> Option<String> {
+    Some(match check {
+        Check::Passed => return None,
+        Check::Failed { why } => why.clone(),
+        Check::OtherContract { why } => {
+            format!("passed under another contract than the gate's ({why})")
+        }
+        Check::Unchecked => "no receipt of its tree here".to_owned(),
+        Check::UncheckedGone => {
+            "no receipt of its tree here, and the checkout it was made in is gone".to_owned()
+        }
+        Check::Unverified { why } => format!("sykli could not say: {why}"),
+        Check::Stale { why } => format!("judged on a checkout, not on the commit: {why}"),
+    })
+}
+
+/// When `origin/<branch>` last moved in a clone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Updated {
+    /// Milliseconds.
+    pub ms: i64,
+    /// `push` or `fetch`, when its reflog says which.
+    pub by: Option<&'static str>,
+}
+
+/// When `origin/<branch>` last moved in the clone whose common git dir is
+/// `common`: the last line of its reflog (a push moves it as well as a
+/// fetch, and says so), else the time of its file. Files only.
+pub fn updated(common: &Path, branch: &str) -> Option<Updated> {
+    let reference = Path::new("refs/remotes/origin").join(branch);
+    let logged = std::fs::read_to_string(common.join("logs").join(&reference))
+        .ok()
+        .and_then(|log| {
+            let last = log.lines().rev().find(|line| !line.trim().is_empty())?;
+            let (meta, message) = last.split_once('\t').unwrap_or((last, ""));
+            let mut fields = meta.split_whitespace().rev();
+            let _zone = fields.next()?;
+            let seconds: i64 = fields.next()?.parse().ok()?;
+            let by = if message.starts_with("update by push") {
+                Some("push")
+            } else if message.starts_with("fetch") || message.starts_with("pull") {
+                Some("fetch")
+            } else {
+                None
+            };
+            Some(Updated {
+                ms: seconds * 1000,
+                by,
+            })
+        });
+    logged.or_else(|| {
+        let modified = std::fs::metadata(common.join(&reference))
+            .ok()?
+            .modified()
+            .ok()?;
+        let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(Updated {
+            ms: i64::try_from(since.as_millis()).ok()?,
+            by: None,
+        })
+    })
 }
 
 /// The marks on `gate`'s branch, against `receipts`: one git process, and
@@ -233,7 +302,7 @@ pub fn walk(gate: &Gate, sykli: &Sykli, receipts: &Receipts) -> Result<Marks, St
     });
     Ok(Marks {
         gate: gate.clone(),
-        fetched_ms: fetched(&gate.common),
+        updated: updated(&gate.common, &gate.branch),
         commits,
         ended,
     })
@@ -243,11 +312,16 @@ fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
 }
 
+/// `origin/main as of a push at <time>`: what the marks were read from.
 fn as_of(marks: &Marks) -> String {
-    marks.fetched_ms.map_or_else(
-        || "never fetched here".to_owned(),
-        |ms| format!("as of last fetch {}", sessions::clock(ms)),
-    )
+    let reference = format!("origin/{}", marks.gate.branch);
+    match &marks.updated {
+        Some(Updated { ms, by: Some(by) }) => {
+            format!("{reference} as of a {by} at {}", sessions::clock(*ms))
+        }
+        Some(Updated { ms, by: None }) => format!("{reference} as of {}", sessions::clock(*ms)),
+        None => format!("{reference}, its update time unknown"),
+    }
 }
 
 /// The flag a briefing opens with when the entry's branch is not proven at
@@ -265,11 +339,26 @@ pub fn flag(marks: &Marks) -> Option<String> {
     if n > 5 {
         listed.push("…".to_owned());
     }
-    let since = match marks.ended {
-        Ended::Proven => format!("is unproven since {}", short(&oldest.commit)),
-        Ended::Root => "has never been proven".to_owned(),
-        Ended::Cap => format!("is unproven in each of its last {n} commits"),
-        Ended::NotAsked => format!("is unproven since at least {}", short(&oldest.commit)),
+    // Runs that passed under another contract are not proven against the
+    // gate as it is now: said so, never as if nothing had ever passed.
+    let other = unproven
+        .iter()
+        .filter(|walked| matches!(walked.check, Check::OtherContract { .. }))
+        .count();
+    let oldest = short(&oldest.commit);
+    let since = match (marks.ended, other > 0) {
+        (Ended::Proven, false) => format!("is unproven since {oldest}"),
+        (Ended::Proven, true) => format!("is not proven against its current gate since {oldest}"),
+        (Ended::Root, false) => "has never been proven".to_owned(),
+        (Ended::Root, true) => "has never been proven against its current gate".to_owned(),
+        (Ended::Cap, false) => format!("is unproven in each of its last {n} commits"),
+        (Ended::Cap, true) => {
+            format!("is not proven against its current gate in any of its last {n} commits")
+        }
+        (Ended::NotAsked, false) => format!("is unproven since at least {oldest}"),
+        (Ended::NotAsked, true) => {
+            format!("is not proven against its current gate since at least {oldest}")
+        }
     };
     let commits = if n == 1 { "commit" } else { "commits" };
     let count = if marks.ended == Ended::Cap {
@@ -277,9 +366,14 @@ pub fn flag(marks: &Marks) -> Option<String> {
     } else {
         format!("{n} {commits}: ")
     };
+    let passed = if other > 0 {
+        format!("; {other} passed under another contract")
+    } else {
+        String::new()
+    };
     Some(format!(
-        "FLAG: {branch} of {} {since} ({count}{}; {}). Start by running `ohjaa gate` on \
-         {branch} and fix forward what fails.",
+        "FLAG: {branch} of {} {since} ({count}{}{passed}; {}). Start by running `ohjaa gate` \
+         on {branch} and fix forward what fails.",
         marks.gate.slug,
         listed.join(", "),
         as_of(marks)
@@ -312,7 +406,7 @@ pub fn line(marks: &Marks) -> String {
 /// none. An entry is marked in the clones under the roots (`repos`) whose
 /// origin names it: a clone's config file must name the entry before git is
 /// asked about it (one process), and the walk is one more. With several
-/// clones of one entry, the walk is in the one that fetched last, against
+/// clones of one entry, the walk is in the one updated last, against
 /// the receipts of all of them.
 pub fn of_entries(
     home: &Path,
@@ -347,7 +441,8 @@ pub fn of_entries(
                 .iter()
                 .filter(|gate| gate.slug.eq_ignore_ascii_case(&slug))
                 .collect();
-            let marked = match mine.iter().max_by_key(|gate| fetched(&gate.common)) {
+            let last = |gate: &&&Gate| updated(&gate.common, &gate.branch).map(|at| at.ms);
+            let marked = match mine.iter().max_by_key(last) {
                 Some(gate) => {
                     let mut receipts = Receipts::default();
                     for clone in &mine {
@@ -404,7 +499,7 @@ mod tests {
                 top: PathBuf::from("/r"),
                 common: PathBuf::from("/r/.git"),
             },
-            fetched_ms: None,
+            updated: None,
             commits: checks
                 .iter()
                 .enumerate()
@@ -433,12 +528,13 @@ mod tests {
         assert_eq!(
             flag(&proven).unwrap(),
             "FLAG: main of acme/widget is unproven since 1111111 (2 commits: ? 0000000, ✗ \
-             1111111; never fetched here). Start by running `ohjaa gate` on main and fix \
-             forward what fails."
+             1111111; origin/main, its update time unknown). Start by running `ohjaa gate` on \
+             main and fix forward what fails."
         );
         assert_eq!(
             line(&proven),
-            "acme/widget main (never fetched here): ? 0000000 ✗ 1111111 ✓ 2222222"
+            "acme/widget main (origin/main, its update time unknown): ? 0000000 ✗ 1111111 ✓ \
+             2222222"
         );
         assert_eq!(flag(&marks(&[Check::Passed], Ended::Proven)), None);
         assert_eq!(flag(&marks(&[], Ended::Root)), None, "nothing on it");
@@ -452,7 +548,7 @@ mod tests {
         assert!(
             capped.starts_with(
                 "FLAG: main of acme/widget is unproven in each of its last 7 commits (? "
-            ) && capped.contains(", …; never fetched here)"),
+            ) && capped.contains(", …; origin/main, its update time unknown)"),
             "{capped}"
         );
         let not_asked = flag(&marks(&[Check::Unchecked], Ended::NotAsked)).unwrap();
@@ -460,5 +556,75 @@ mod tests {
             not_asked.contains("is unproven since at least 0000000 (1 commit: "),
             "{not_asked}"
         );
+
+        // B1: a run that passed under another contract is not proven
+        // against the gate as it is now, and it is said so.
+        let other = Check::OtherContract {
+            why: "refused: contract expected a but got b".to_owned(),
+        };
+        let regated = marks(&[Check::Unchecked, other.clone()], Ended::Root);
+        assert_eq!(
+            flag(&regated).unwrap(),
+            "FLAG: main of acme/widget has never been proven against its current gate (2 \
+             commits: ? 0000000, ? 1111111; 1 passed under another contract; origin/main, its \
+             update time unknown). Start by running `ohjaa gate` on main and fix forward what \
+             fails."
+        );
+        let since = flag(&marks(&[other.clone(), Check::Passed], Ended::Proven)).unwrap();
+        assert!(
+            since.starts_with(
+                "FLAG: main of acme/widget is not proven against its current gate since 0000000"
+            ),
+            "{since}"
+        );
+        assert_eq!(symbol(&other), "?");
+        assert_eq!(word(&other), "unproven");
+        assert_eq!(code(&other), "other_contract");
+        assert_eq!(
+            why(&other).unwrap(),
+            "passed under another contract than the gate's (refused: contract expected a but \
+             got b)"
+        );
+        assert_eq!(why(&Check::Passed), None);
+    }
+
+    /// When origin's branch last moved, from its reflog: a push moves it as
+    /// well as a fetch, and says which; else its file's time.
+    #[test]
+    fn the_branch_is_read_as_of_its_last_update() {
+        let common = std::env::temp_dir().join(format!("ohjaa-updated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&common);
+        let log = common.join("logs/refs/remotes/origin");
+        std::fs::create_dir_all(&log).unwrap();
+        let zeros = "0".repeat(40);
+        std::fs::write(
+            log.join("main"),
+            format!(
+                "{zeros} {zeros} A <a@x> 1700000000 +0200\tfetch: fast-forward\n\
+                 {zeros} {zeros} A <a@x> 1700000060 +0200\tupdate by push\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            updated(&common, "main"),
+            Some(Updated {
+                ms: 1_700_000_060_000,
+                by: Some("push")
+            })
+        );
+        std::fs::write(
+            log.join("main"),
+            format!("{zeros} {zeros} A <a@x> 1700000000 +0200\tfetch origin: fast-forward\n"),
+        )
+        .unwrap();
+        assert_eq!(updated(&common, "main").unwrap().by, Some("fetch"));
+        // No reflog: the ref's own file.
+        std::fs::create_dir_all(common.join("refs/remotes/origin")).unwrap();
+        std::fs::write(common.join("refs/remotes/origin/trunk"), "x\n").unwrap();
+        let file = updated(&common, "trunk").unwrap();
+        assert_eq!(file.by, None);
+        assert!(file.ms > 1_700_000_000_000);
+        assert_eq!(updated(&common, "gone"), None);
+        std::fs::remove_dir_all(&common).unwrap();
     }
 }

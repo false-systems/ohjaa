@@ -24,8 +24,9 @@ use std::process::{Command, Output};
 /// in sykli's words unless the repository has `.sykli/receipt.json`, and an
 /// accepted one says so on stderr. `run` passes unless `$SANDBOX/fail-gate`
 /// exists, and its receipt names the tree in `$SANDBOX/tree`; `verify` passes
-/// a receipt that says passed. It runs no git, so a trace2 count is ohjaa's
-/// own.
+/// a receipt that says passed, and refuses one made under `other-contract`
+/// as a contract mismatch (exit 4). It runs no git, so a trace2 count is
+/// ohjaa's own.
 const SYKLI_STUB: &str = r#"#!/bin/sh
 printf '%s|%s\n' "$PWD" "$*" >> "$SANDBOX/sykli-calls"
 facts() {
@@ -88,6 +89,9 @@ case "$1" in
       echo "      --commit <REV>  judge the receipt as evidence for this commit"
       echo "With --commit the subject is the commit, and nothing is read from the checkout."
       facts; exit 0
+    fi
+    if grep -q other-contract "$2"; then
+      echo "refused: contract expected 1111 but got 2222" >&2; exit 4
     fi
     grep -q passed "$2" || { echo "refused: outcome expected passed" >&2; exit 1; }
     exit 0;;
@@ -1639,8 +1643,46 @@ fn receipt(path: &Path, tree: &str, outcome: &str, at_ms: u64) {
     .unwrap();
 }
 
+/// A receipt of a run that passed under another contract than the gate's.
+fn receipt_under_another_contract(path: &Path, tree: &str, at_ms: u64) {
+    receipt(path, tree, "passed", at_ms);
+    let text = fs::read_to_string(path).unwrap();
+    let text = text.replacen(
+        "\"schema\"",
+        "\"contract_hash\":\"other-contract\",\"schema\"",
+        1,
+    );
+    fs::write(path, text).unwrap();
+}
+
 fn short(commit: &str) -> &str {
     &commit[..7]
+}
+
+/// `text` with every `YYYY-MM-DD HH:MM UTC` as `<time>`.
+fn blank_times(text: &str) -> String {
+    let shape: Vec<char> = "dddd-dd-dd dd:dd UTC".chars().collect();
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let fits = at + shape.len() <= chars.len()
+            && shape.iter().zip(&chars[at..]).all(|(want, got)| {
+                if *want == 'd' {
+                    got.is_ascii_digit()
+                } else {
+                    want == got
+                }
+            });
+        if fits {
+            out.push_str("<time>");
+            at += shape.len();
+        } else {
+            out.push(chars[at]);
+            at += 1;
+        }
+    }
+    out
 }
 
 impl Sandbox {
@@ -1648,10 +1690,16 @@ impl Sandbox {
         self.git(repo, &["rev-parse", &format!("{rev}^{{tree}}")])
     }
 
-    /// `ohjaa report` over the projects folder, as text.
+    /// `ohjaa report` over the projects folder, as text, its times blanked.
     fn report(&self, cwd: &Path) -> String {
         let output = self.ohjaa_in(cwd, &["report", "--root", &self.projects()]);
-        text(&output).0
+        blank_times(&text(&output).0)
+    }
+
+    /// `ohjaa brief` here, its times blanked.
+    fn brief(&self, cwd: &Path) -> String {
+        let output = self.ohjaa_in(cwd, &["brief"]);
+        blank_times(&text(&output).0)
     }
 
     /// `ohjaa report --json` over the projects folder.
@@ -1708,7 +1756,7 @@ fn marks_are_derived_from_receipts_tip_first() {
 
     let report = sandbox.report(&repo);
     let line = format!(
-        "- acme/widget main (never fetched here): ? {} ✗ {} ✓ {}\n",
+        "- acme/widget main (origin/main as of a push at <time>): ? {} ✗ {} ✓ {}\n",
         short(&c3),
         short(&c2),
         short(&c1)
@@ -1812,8 +1860,10 @@ fn marks_are_derived_from_receipts_tip_first() {
     );
     let report = sandbox.report(&repo);
     assert!(
-        report.contains("- acme/widget main (as of last fetch 2")
-            && report.contains(&format!("UTC): ✓ {}\n", short(&merge))),
+        report.contains(&format!(
+            "- acme/widget main (origin/main as of a fetch at <time>): ✓ {}\n",
+            short(&merge)
+        )),
         "{report}"
     );
 }
@@ -1833,16 +1883,16 @@ fn the_briefing_opens_with_the_flag_and_ohjaa_gate_flips_the_tip() {
     let c2 = sandbox.commit(&repo, "two");
     sandbox.git(&repo, &["push", "-q", "origin", "main"]);
 
-    let output = sandbox.ohjaa_in(&repo, &["brief"]);
-    let (stdout, stderr) = text(&output);
+    let stdout = sandbox.brief(&repo);
     let never = format!(
-        "FLAG: main of acme/widget has never been proven (3 commits: ? {}, ? {}, ? {}; never \
-         fetched here). Start by running `ohjaa gate` on main and fix forward what fails.\n",
+        "FLAG: main of acme/widget has never been proven (3 commits: ? {}, ? {}, ? {}; \
+         origin/main as of a push at <time>). Start by running `ohjaa gate` on main and fix \
+         forward what fails.\n",
         short(&c2),
         short(&c1),
         short(&init)
     );
-    assert!(stdout.starts_with(&never), "{stdout}{stderr}");
+    assert!(stdout.starts_with(&never), "{stdout}");
 
     // Proven below: unproven since the commit above it, one sykli verify.
     receipt(
@@ -1853,10 +1903,10 @@ fn the_briefing_opens_with_the_flag_and_ohjaa_gate_flips_the_tip() {
     );
     let before = sandbox.verifies();
     let output = sandbox.ohjaa_in(&repo, &["run", "claude", "--intent", "x", "--dry-run"]);
-    let (_, stderr) = text(&output);
+    let stderr = blank_times(&text(&output).1);
     let since = format!(
-        "FLAG: main of acme/widget is unproven since {c} (1 commit: ? {c}; never fetched \
-         here). Start by running `ohjaa gate` on main and fix forward what fails.",
+        "FLAG: main of acme/widget is unproven since {c} (1 commit: ? {c}; origin/main as of \
+         a push at <time>). Start by running `ohjaa gate` on main and fix forward what fails.",
         c = short(&c2)
     );
     assert!(stderr.contains(&format!("ohjaa: {since}\n")), "{stderr}");
@@ -1883,7 +1933,7 @@ fn the_briefing_opens_with_the_flag_and_ohjaa_gate_flips_the_tip() {
     assert!(!stdout.contains("FLAG:"), "{stdout}");
     assert!(
         sandbox.report(&repo).contains(&format!(
-            "- acme/widget main (never fetched here): ✓ {}\n",
+            "- acme/widget main (origin/main as of a push at <time>): ✓ {}\n",
             short(&c2)
         )),
         "{}",
@@ -1894,6 +1944,194 @@ fn the_briefing_opens_with_the_flag_and_ohjaa_gate_flips_the_tip() {
     let (plain, _) = sandbox.repo("acme", "plain", &[]);
     let output = sandbox.ohjaa_in(&plain, &["brief"]);
     assert!(!text(&output).0.contains("FLAG:"), "{}", text(&output).0);
+}
+
+/// B1: a run that passed under another contract than the gate's now (the
+/// gate was edited and re-locked, or the run used the repository's own
+/// sykli.json) is not proven against the gate, and never "failed": ✗ is
+/// only for a run that failed.
+#[test]
+fn a_run_that_passed_under_another_contract_is_unproven_not_failed() {
+    let mut sandbox = Sandbox::new("other-contract");
+    sandbox.stub_contract = "fast";
+    let (repo, _) = sandbox.repo("acme", "widget", &[]);
+    sandbox.entry("acme", "widget", Some("{}\n"));
+    sandbox.apply();
+    let init = sandbox.git(&repo, &["rev-parse", "HEAD"]);
+    let c1 = sandbox.commit(&repo, "one");
+    receipt_under_another_contract(
+        &repo.join(".git/sykli/receipts/rcpt_1.json"),
+        &sandbox.tree(&repo, "HEAD"),
+        1_000,
+    );
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+
+    let report = sandbox.report(&repo);
+    assert!(
+        report.contains(&format!(
+            "- acme/widget main (origin/main as of a push at <time>): ? {} ? {} (nothing on it \
+             is proven)\n",
+            short(&c1),
+            short(&init)
+        )),
+        "{report}"
+    );
+    assert!(
+        !report
+            .lines()
+            .any(|line| line.starts_with("- acme/widget main") && line.contains('✗')),
+        "{report}"
+    );
+    let json = sandbox.report_json(&repo);
+    let tip = &json["entries"][0]["commits"][0];
+    assert_eq!(tip["mark"], "unproven", "{json:#}");
+    assert_eq!(tip["code"], "other_contract", "{json:#}");
+    assert_eq!(
+        tip["why"],
+        "passed under another contract than the gate's (refused: contract expected 1111 but \
+         got 2222)"
+    );
+    assert_eq!(json["entries"][0]["commits"][1]["code"], "no_receipt");
+    assert_eq!(
+        json["entries"][0]["commits"][1]["why"],
+        "no receipt of its tree here"
+    );
+    let stdout = sandbox.brief(&repo);
+    assert!(
+        stdout.starts_with(&format!(
+            "FLAG: main of acme/widget has never been proven against its current gate (2 \
+             commits: ? {}, ? {}; 1 passed under another contract; origin/main as of a push at \
+             <time>). Start by running `ohjaa gate` on main and fix forward what fails.\n",
+            short(&c1),
+            short(&init)
+        )),
+        "{stdout}"
+    );
+
+    // A run that failed is ✗, still.
+    let c2 = sandbox.commit(&repo, "two");
+    receipt(
+        &repo.join(".sykli/receipts/rcpt_2.json"),
+        &sandbox.tree(&repo, "HEAD"),
+        "failed",
+        2_000,
+    );
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+    let report = sandbox.report(&repo);
+    assert!(
+        report.contains(&format!(
+            ": ✗ {} ? {} ? {} (nothing on it is proven)\n",
+            short(&c2),
+            short(&c1),
+            short(&init)
+        )),
+        "{report}"
+    );
+}
+
+/// Should-fix 1: nothing the workflow does refuses a push, not even a
+/// workflow home that cannot be found (no HOME, no XDG_CONFIG_HOME).
+#[test]
+fn a_push_without_a_home_lands_flagged_unobserved() {
+    let mut sandbox = Sandbox::new("no-home");
+    sandbox.stub_contract = "1";
+    let (repo, bare) = sandbox.repo("acme", "widget", &[]);
+    sandbox.entry("acme", "widget", Some("{}\n"));
+    sandbox.apply();
+    let head = sandbox.commit(&repo, "a");
+    let output = sandbox
+        .command("git", &repo)
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["push", "origin", "main"])
+        .output()
+        .unwrap();
+    let (_, stderr) = text(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr
+            .contains("ohjaa: UNOBSERVED push to acme/widget: the workflow home cannot be found (")
+            && stderr.contains("). It is pushed"),
+        "{stderr}"
+    );
+    assert_eq!(sandbox.git(&bare, &["rev-parse", "main"]), head);
+}
+
+/// Should-fix 2: the push and the marks agree. A commit proven in another
+/// worktree of the clone (its receipt there) is a quiet push from this one,
+/// asked of the sykli `apply` recorded, not of PATH's; one proven nowhere is
+/// flagged.
+#[test]
+fn a_commit_proven_in_another_worktree_is_a_quiet_push() {
+    let mut sandbox = Sandbox::new("other-worktree");
+    sandbox.stub_contract = "fast";
+    let (repo, bare) = sandbox.repo("acme", "widget", &[]);
+    sandbox.entry("acme", "widget", Some("{}\n"));
+    sandbox.apply();
+    let linked = sandbox.dir.join("linked");
+    sandbox.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "work",
+            &linked.to_string_lossy(),
+            "main",
+        ],
+    );
+    let head = sandbox.commit(&linked, "proven-there");
+    receipt(
+        &linked.join(".sykli/receipt.json"),
+        &sandbox.tree(&linked, "HEAD"),
+        "passed",
+        1_000,
+    );
+    sandbox.git(&repo, &["merge", "-q", "--ff-only", "work"]);
+    // A client without your PATH: only the sykli the dispatcher names.
+    let push = |sandbox: &Sandbox| {
+        sandbox
+            .command("/usr/bin/git", &repo)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["push", "origin", "main"])
+            .output()
+            .unwrap()
+    };
+    let output = push(&sandbox);
+    let (_, stderr) = text(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(sandbox.git(&bare, &["rev-parse", "main"]), head);
+    assert!(
+        !stderr.contains("ohjaa:"),
+        "proven in another worktree: quiet: {stderr}"
+    );
+    let calls = sandbox.read("sykli-calls");
+    assert!(
+        calls.contains(&format!(
+            "|verify {} --contract ",
+            linked.join(".sykli/receipt.json").display()
+        )) && calls.contains(&format!("--commit {head}")),
+        "{calls}"
+    );
+    assert!(
+        sandbox
+            .report(&repo)
+            .contains(&format!(": ✓ {}\n", short(&head))),
+        "the marks say the same"
+    );
+
+    let next = sandbox.commit(&repo, "nowhere");
+    let output = push(&sandbox);
+    let (_, stderr) = text(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(sandbox.git(&bare, &["rev-parse", "main"]), next);
+    assert!(
+        stderr.contains(
+            "ohjaa: UNPROVEN push to main (no receipt in this worktree is a run of its tree)"
+        ),
+        "proven nowhere: flagged: {stderr}"
+    );
 }
 
 // ---- against the real sykli --------------------------------------------------
@@ -2027,7 +2265,7 @@ fn real_sykli_marks_proven_failed_unproven_and_a_forge_merge() {
     let report = sandbox.report(&repo);
     assert!(
         report.contains(&format!(
-            "- acme/widget main (never fetched here): ? {} ✗ {} ✓ {}\n",
+            "- acme/widget main (origin/main as of a push at <time>): ? {} ✗ {} ✓ {}\n",
             short(&c3),
             short(&c2),
             short(&c1)
@@ -2085,7 +2323,10 @@ fn real_sykli_marks_proven_failed_unproven_and_a_forge_merge() {
     assert_ne!(merge, head);
     let report = sandbox.report(&repo);
     assert!(
-        report.contains(&format!("UTC): ✓ {}\n", short(&merge))),
+        report.contains(&format!(
+            "- acme/widget main (origin/main as of a fetch at <time>): ✓ {}\n",
+            short(&merge)
+        )),
         "the merge has its proven head's tree: {report}"
     );
 }
@@ -2098,16 +2339,16 @@ fn real_sykli_the_briefing_flags_first_and_ohjaa_gate_flips_the_tip() {
     let tip = sandbox.state(&repo, "ok, unproven", "unproven");
     sandbox.git(&repo, &["push", "-q", "origin", "main"]);
 
-    let output = sandbox.ohjaa_in(&repo, &["brief"]);
-    let (stdout, stderr) = text(&output);
+    let stdout = sandbox.brief(&repo);
     assert!(
         stdout.starts_with(&format!(
-            "FLAG: main of acme/widget has never been proven (2 commits: ? {}, ? {}; never \
-             fetched here). Start by running `ohjaa gate` on main and fix forward what fails.\n",
+            "FLAG: main of acme/widget has never been proven (2 commits: ? {}, ? {}; \
+             origin/main as of a push at <time>). Start by running `ohjaa gate` on main and \
+             fix forward what fails.\n",
             short(&tip),
             short(&init)
         )),
-        "{stdout}{stderr}"
+        "{stdout}"
     );
     let output = sandbox.ohjaa_in(&repo, &["run", "claude", "--intent", "x", "--dry-run"]);
     let (_, stderr) = text(&output);
@@ -2123,10 +2364,114 @@ fn real_sykli_the_briefing_flags_first_and_ohjaa_gate_flips_the_tip() {
     let report = sandbox.report(&repo);
     assert!(
         report.contains(&format!(
-            "- acme/widget main (never fetched here): ✓ {}\n",
+            "- acme/widget main (origin/main as of a push at <time>): ✓ {}\n",
             short(&tip)
         )),
         "{report}"
+    );
+}
+
+#[test]
+#[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
+fn real_sykli_a_new_gate_leaves_old_proofs_unproven_not_failed() {
+    let (sandbox, repo, _) = Sandbox::with_real_sykli("real-regate");
+    let init = sandbox.git(&repo, &["rev-parse", "HEAD"]);
+    let c1 = sandbox.state(&repo, "ok, one", "one");
+    let (code, said) = sandbox.gate(&repo);
+    assert_eq!(code, Some(0), "{said}");
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+    assert!(
+        sandbox
+            .report(&repo)
+            .contains(&format!(": ✓ {}\n", short(&c1))),
+        "{}",
+        sandbox.report(&repo)
+    );
+
+    // The gate gains a task, and is locked again.
+    let contract = sandbox.config().join("repos/acme/widget/sykli.json");
+    fs::write(
+        &contract,
+        format!(
+            "{},{}]}}",
+            REAL_GATE.strip_suffix("]}").unwrap(),
+            r#"{"name":"more","run":"true","inputs":["state.txt"]}"#
+        ),
+    )
+    .unwrap();
+    let output = sandbox
+        .command("sykli", &repo)
+        .arg("lock")
+        .arg(&contract)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output).1);
+
+    let report = sandbox.report(&repo);
+    assert!(
+        report.contains(&format!(
+            ": ? {} ? {} (nothing on it is proven)\n",
+            short(&c1),
+            short(&init)
+        )) && !report
+            .lines()
+            .any(|line| line.starts_with("- acme/widget main") && line.contains('✗')),
+        "{report}"
+    );
+    let json = sandbox.report_json(&repo);
+    assert_eq!(
+        json["entries"][0]["commits"][0]["code"], "other_contract",
+        "{json:#}"
+    );
+    let stdout = sandbox.brief(&repo);
+    assert!(
+        stdout.starts_with(&format!(
+            "FLAG: main of acme/widget has never been proven against its current gate (2 \
+             commits: ? {}, ? {}; 1 passed under another contract; ",
+            short(&c1),
+            short(&init)
+        )),
+        "{stdout}"
+    );
+}
+
+#[test]
+#[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
+fn real_sykli_a_commit_proven_in_another_worktree_is_a_quiet_push() {
+    let (sandbox, repo, bare) = Sandbox::with_real_sykli("real-elsewhere");
+    let linked = sandbox.dir.join("linked");
+    sandbox.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "work",
+            &linked.to_string_lossy(),
+            "main",
+        ],
+    );
+    let head = sandbox.state(&linked, "ok, there", "proven there");
+    let (code, said) = sandbox.gate(&linked);
+    assert_eq!(code, Some(0), "{said}");
+    sandbox.git(&repo, &["merge", "-q", "--ff-only", "work"]);
+    let output = sandbox.git_out(&repo, &["push", "origin", "main"]);
+    let (_, stderr) = text(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(sandbox.git(&bare, &["rev-parse", "main"]), head);
+    assert!(!stderr.contains("ohjaa:"), "{stderr}");
+
+    let next = sandbox.state(&repo, "ok, nowhere", "proven nowhere");
+    let output = sandbox.git_out(&repo, &["push", "origin", "main"]);
+    let (_, stderr) = text(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(sandbox.git(&bare, &["rev-parse", "main"]), next);
+    assert!(
+        stderr.contains(
+            "ohjaa: UNPROVEN push to main (no receipt in this worktree is a run of its tree)"
+        ),
+        "{stderr}"
     );
 }
 
@@ -2324,6 +2669,12 @@ fn every_command_stays_within_its_git_budget() {
     let mut sandbox = Sandbox::new("budget");
     // A sykli that takes the repository's facts: ohjaa hands them over.
     sandbox.stub_contract = "fast";
+    // A vessa that lists nothing, and says when it is asked.
+    write_executable(
+        &sandbox.dir.join("bin/vessa"),
+        "#!/bin/sh\necho \"$*\" >> \"$SANDBOX/vessa-calls\"\n\
+         echo '{\"schema\":\"vessa-usage.v1\",\"warnings\":[],\"sessions\":[]}'\n",
+    );
     let (gated, bare) = sandbox.repo("acme", "gated", &[("sykli.json", "{}\n")]);
     let (own, _) = sandbox.repo("acme", "own", &[("sykli.json", "{}\n")]);
     write_executable(
@@ -2463,7 +2814,6 @@ fn every_command_stays_within_its_git_budget() {
 
     // pre-push: `git push` through the dispatcher, against the same push
     // with no hooks at all. Each pushes one new commit to the observed main.
-    let init = sandbox.git(&gated, &["rev-parse", "HEAD"]);
     let calls = || sandbox.read("sykli-calls").lines().count();
     let push = |what: &str, hooks: bool| {
         sandbox.commit(&gated, what);
@@ -2509,6 +2859,66 @@ fn every_command_stays_within_its_git_budget() {
         1,
     );
 
+    // pre-push of a commit sykli does not see proven from this worktree but
+    // the marks do (its receipt in another one): the commit's tree, asked
+    // once, and one sykli verify.
+    let elsewhere = sandbox.dir.join("elsewhere");
+    sandbox.git(
+        &gated,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "elsewhere",
+            &elsewhere.to_string_lossy(),
+            "main",
+        ],
+    );
+    let proven = sandbox.commit(&elsewhere, "proven-elsewhere");
+    receipt(
+        &elsewhere.join(".sykli/receipt.json"),
+        &sandbox.tree(&elsewhere, "HEAD"),
+        "passed",
+        500,
+    );
+    sandbox.git(&gated, &["merge", "-q", "--ff-only", "elsewhere"]);
+    let verifies_before = sandbox
+        .read("sykli-calls")
+        .lines()
+        .filter(|line| line.contains("|verify ") && line.contains("--commit"))
+        .count();
+    let (starts, output) = sandbox.git_starts(sandbox.command("git", &gated).args([
+        "push",
+        "-q",
+        "origin",
+        "HEAD:refs/heads/main",
+    ]));
+    assert!(output.status.success(), "{}", text(&output).1);
+    assert!(!text(&output).1.contains("ohjaa:"), "{}", text(&output).1);
+    assert_eq!(sandbox.git(&bare, &["rev-parse", "main"]), proven);
+    assert!(started(&starts, "rev-parse"), "the commit's tree was asked");
+    let verifies = sandbox
+        .read("sykli-calls")
+        .lines()
+        .filter(|line| line.contains("|verify ") && line.contains("--commit"))
+        .count()
+        - verifies_before;
+    budget(
+        "ohjaa hook pre-push (proven elsewhere)",
+        starts.len().saturating_sub(direct),
+        1,
+    );
+    budget(
+        "ohjaa hook pre-push (proven elsewhere): sykli verify",
+        verifies,
+        1,
+    );
+    // One more on top, proven nowhere: main is unproven at its tip again,
+    // above the commit proven elsewhere.
+    let (_, _, said) = push("on-top", true);
+    assert!(said.contains("ohjaa: UNPROVEN push to main ("), "{said}");
+
     // ohjaa gate: one git process, then sykli's own, with the facts.
     let (starts, output) = sandbox.git_starts(sandbox.command("ohjaa", &gated).arg("gate"));
     assert!(output.status.success(), "{}", text(&output).1);
@@ -2550,14 +2960,8 @@ fn every_command_stays_within_its_git_budget() {
     );
     budget("ohjaa doctor (4 clones)", starts.len(), 2 + 2 * 4);
 
-    // The marks need sykli once: the first commit on main is proven (a
-    // receipt sykli kept), the two pushed above it are not.
-    receipt(
-        &gated.join(".git/sykli/receipts/rcpt_init.json"),
-        &sandbox.tree(&gated, &init),
-        "passed",
-        1_000,
-    );
+    // The marks need sykli once: the commit proven elsewhere; the one pushed
+    // above it is not proven, and nothing below is asked about.
     let verified = || {
         sandbox
             .read("sykli-calls")
@@ -2628,7 +3032,7 @@ fn every_command_stays_within_its_git_budget() {
                 .command("ohjaa", &gated)
                 .args(["report", "--root", &root]),
         );
-        let (stdout, _) = text(&output);
+        let stdout = blank_times(&text(&output).0);
         assert!(stdout.starts_with("ohjaa report, "), "{stdout}");
         let logs = starts
             .iter()
@@ -2647,8 +3051,8 @@ fn every_command_stays_within_its_git_budget() {
     };
     let (with, stdout, verifies, logs, listings) = reported(&sandbox);
     for marked in [
-        "- acme/gated main (never fetched here): ? ",
-        "- acme/own main (never fetched here): ? ",
+        "- acme/gated main (origin/main as of a push at <time>): ? ",
+        "- acme/own main (origin/main as of a push at <time>): ? ",
     ] {
         assert!(stdout.contains(marked), "no marks {marked:?}: {stdout}");
     }
@@ -2674,6 +3078,59 @@ fn every_command_stays_within_its_git_budget() {
         2 * 2,
     );
     budget("ohjaa report's marks: sykli verify", verifies, 1);
+
+    // ohjaa report --json --marks: the marks, the proposals and the sessions
+    // only, for other tools to read often: no window, no vessa. Beyond the
+    // same with no entries, which reads no clone at all.
+    let vessa = || sandbox.read("vessa-calls").lines().count();
+    assert!(vessa() > 0, "the full report asks vessa");
+    let marks_only = |sandbox: &Sandbox| {
+        let before = verified();
+        let asked = vessa();
+        let (starts, output) = sandbox.git_starts(
+            sandbox
+                .command("ohjaa", &gated)
+                .args(["report", "--json", "--marks", "--root", &root]),
+        );
+        let (stdout, stderr) = text(&output);
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}{stderr}"));
+        let walks = starts
+            .iter()
+            .filter(|line| line.contains("\"log\"") && line.contains("--max-count=50"))
+            .count();
+        let window = started(&starts, "worktree") || started(&starts, "--walk-reflogs");
+        assert_eq!(vessa(), asked, "vessa is not asked");
+        (starts.len(), json, verified() - before, walks, window)
+    };
+    let (with, json, verifies, walks, window) = marks_only(&sandbox);
+    assert_eq!(json["schema"], "ohjaa-marks.v1");
+    assert_eq!(json["report"], serde_json::Value::Null, "no window");
+    let marked: Vec<&str> = json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["repo"].as_str().unwrap())
+        .collect();
+    assert_eq!(marked, ["acme/gated", "acme/own"]);
+    assert!(
+        json["entries"][0]["commits"].as_array().unwrap().len() > 1,
+        "{json:#}"
+    );
+    assert_eq!(walks, 2, "one walk per entry");
+    assert!(!window, "the window is not read");
+    fs::rename(&repos, sandbox.config().join("repos.aside")).unwrap();
+    let (without, json, _, none, _) = marks_only(&sandbox);
+    fs::rename(sandbox.config().join("repos.aside"), &repos).unwrap();
+    assert_eq!(json["entries"], serde_json::json!([]));
+    assert_eq!(none, 0);
+    budget(
+        "ohjaa report --json --marks (2 entries)",
+        with.saturating_sub(without),
+        2 * 2,
+    );
+    budget("ohjaa report --json --marks: sykli verify", verifies, 1);
+    budget("ohjaa report --json --marks, no entries", without, 1);
 
     let over: Vec<_> = report
         .iter()

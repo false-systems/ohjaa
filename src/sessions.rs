@@ -118,6 +118,10 @@ pub enum Check {
     /// sykli refused on the checkout it ran in, not on the commit: a sykli
     /// that still compares the tree on disk, in a checkout that has moved on.
     Stale { why: String },
+    /// A receipt of its tree passed, but under another contract or lock than
+    /// the one it is judged by now (sykli verify exit 4): the gate was edited
+    /// since, or the run used another contract. Not proven, and not failed.
+    OtherContract { why: String },
 }
 
 /// A commit that reached the default branch during the session: one this
@@ -815,7 +819,7 @@ fn describe_evidence(evidence: Option<&Evidence>) -> String {
     }
 }
 
-fn describe_check(check: &Check) -> String {
+pub fn describe_check(check: &Check) -> String {
     match check {
         Check::Passed => "verified: passed (sykli verify --commit)".to_owned(),
         Check::Failed { why } => format!("FAILED sykli verify: {why}"),
@@ -826,6 +830,9 @@ fn describe_check(check: &Check) -> String {
         Check::Unverified { why } => format!("unverified: {why}"),
         Check::Stale { why } => {
             format!("stale: sykli checked the checkout, not the commit ({why})")
+        }
+        Check::OtherContract { why } => {
+            format!("unproven: it passed under another contract than the gate's ({why})")
         }
     }
 }
@@ -1129,7 +1136,7 @@ pub fn flags(session: &Session) -> Vec<Flag> {
             // What others build on: the remote default branch where it is now.
             let broken_tip = landed.at_tip
                 && is_remote(&landed.onto)
-                && (refused || matches!(check, Check::Unchecked));
+                && (refused || matches!(check, Check::Unchecked | Check::OtherContract { .. }));
             if !broken_tip && !(mine && refused) {
                 continue;
             }

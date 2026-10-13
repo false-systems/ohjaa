@@ -360,7 +360,6 @@ impl Receipts {
         self.0.get(tree).map_or(&[], Vec::as_slice)
     }
 
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -1698,6 +1697,11 @@ pub struct Sykli {
     verified: std::cell::Cell<usize>,
     /// How many times it may run in all; `None`: as often as it is needed.
     allowance: std::cell::Cell<Option<usize>>,
+    /// The sykli to run, when not the one on PATH: the one `ohjaa apply`
+    /// recorded in a dispatcher.
+    program: Option<PathBuf>,
+    /// How long one sykli call may take; `None`: [`process::LOCAL`].
+    limit: Option<std::time::Duration>,
 }
 
 impl Sykli {
@@ -1707,6 +1711,25 @@ impl Sykli {
             home: Some(home),
             ..Sykli::default()
         }
+    }
+
+    /// The same, running `program` for sykli, and each call for at most
+    /// `limit`: a git hook's, which a person waits on.
+    pub fn with_program(home: PathBuf, program: PathBuf, limit: std::time::Duration) -> Sykli {
+        Sykli {
+            home: Some(home),
+            program: Some(program),
+            limit: Some(limit),
+            ..Sykli::default()
+        }
+    }
+
+    fn command(&self) -> Command {
+        Command::new(self.program.as_deref().unwrap_or(Path::new("sykli")))
+    }
+
+    fn timeout(&self) -> std::time::Duration {
+        self.limit.unwrap_or(process::LOCAL)
     }
 
     /// Let `sykli verify` run at most `times` more times.
@@ -1740,9 +1763,9 @@ impl Sykli {
         self.binds_commits
             .get_or_init(|| {
                 let output = process::run(
-                    Command::new("sykli").args(["verify", "--help"]),
+                    self.command().args(["verify", "--help"]),
                     None,
-                    process::LOCAL,
+                    self.timeout(),
                 )
                 .map_err(|error| format!("sykli could not be asked: {error:#}"))?;
                 let help = format!(
@@ -1782,8 +1805,12 @@ impl Sykli {
             return known.clone();
         }
         let check = self.ask_gate(gate, commit, tree, receipts, alive);
-        // What sykli could not say may be said when it is asked again.
-        if !matches!(check, Check::Unverified { .. }) {
+        // Only what sykli said is kept: what it could not say may be said
+        // when it is asked again, and with no receipt it was never asked.
+        if !matches!(
+            check,
+            Check::Unverified { .. } | Check::Unchecked | Check::UncheckedGone
+        ) {
             self.judged.borrow_mut().insert(key, check.clone());
         }
         check
@@ -1843,15 +1870,18 @@ impl Sykli {
         for receipt in passing.iter().take(MAX_ASKED) {
             if !self.may_verify() {
                 if verdicts.is_empty() {
-                    verdicts.push(Check::Unverified {
-                        why: "sykli was not asked again".to_owned(),
-                    });
+                    verdicts.push((
+                        receipt.at,
+                        Check::Unverified {
+                            why: "sykli was not asked again".to_owned(),
+                        },
+                    ));
                 }
                 break;
             }
             self.verified.set(self.verified.get() + 1);
             let output = process::run(
-                Command::new("sykli")
+                self.command()
                     .arg("verify")
                     .arg(&receipt.path)
                     .arg("--contract")
@@ -1860,28 +1890,44 @@ impl Sykli {
                     .args(["--commit", commit])
                     .current_dir(&gate.top),
                 None,
-                process::LOCAL,
+                self.timeout(),
             );
             match output {
-                Err(error) => verdicts.push(Check::Unverified {
-                    why: format!("sykli verify could not run: {error:#}"),
-                }),
+                Err(error) => verdicts.push((
+                    receipt.at,
+                    Check::Unverified {
+                        why: format!("sykli verify could not run: {error:#}"),
+                    },
+                )),
                 Ok(output) if output.status.success() => return Check::Passed,
-                Ok(output) => verdicts.push(verdict(
-                    true,
-                    true,
-                    output.status.code(),
-                    output.failure_detail(),
+                Ok(output) => verdicts.push((
+                    receipt.at,
+                    verdict(true, true, output.status.code(), output.failure_detail()),
                 )),
             }
         }
-        let refused = |check: &Check| matches!(check, Check::Failed { .. });
-        let mut check = match verdicts.iter().position(|check| !refused(check)) {
-            Some(at) => verdicts.swap_remove(at),
-            None => verdicts.swap_remove(0),
-        };
+        // The runs that failed are their receipts' word, unasked.
+        for receipt in candidates
+            .iter()
+            .filter(|receipt| !matches!(receipt.evidence.outcome.as_str(), "passed" | "cached"))
+        {
+            verdicts.push((
+                receipt.at,
+                Check::Failed {
+                    why: format!(
+                        "its receipt says the run {} ({})",
+                        receipt.evidence.outcome,
+                        receipt.path.display()
+                    ),
+                },
+            ));
+        }
+        let mut check = settle(verdicts);
         if passing.len() > MAX_ASKED {
-            if let Check::Failed { why } | Check::Unverified { why } = &mut check {
+            if let Check::Failed { why }
+            | Check::Unverified { why }
+            | Check::OtherContract { why } = &mut check
+            {
                 why.push_str(&format!(
                     " (sykli was asked about the best {MAX_ASKED} of {} receipts of its tree)",
                     passing.len()
@@ -1961,48 +2007,50 @@ impl Sykli {
                     checkout.join(name).is_file()
                 }
             }) else {
-                verdicts.push(Check::Unverified {
-                    why: format!(
-                        "no sykli contract (sykli.json or sykli.rs) in {}",
-                        checkout.display()
-                    ),
-                });
+                verdicts.push((
+                    receipt.at,
+                    Check::Unverified {
+                        why: format!(
+                            "no sykli contract (sykli.json or sykli.rs) in {}",
+                            checkout.display()
+                        ),
+                    },
+                ));
                 continue;
             };
             self.verified.set(self.verified.get() + 1);
             let output = process::run(
-                Command::new("sykli")
+                self.command()
                     .arg("verify")
                     .arg(&receipt.path)
                     .args(["--contract", contract, "--commit", commit])
                     .current_dir(checkout),
                 None,
-                process::LOCAL,
+                self.timeout(),
             );
-            verdicts.push(match output {
-                Err(error) => Check::Unverified {
-                    why: format!("sykli verify could not run: {error:#}"),
+            verdicts.push((
+                receipt.at,
+                match output {
+                    Err(error) => Check::Unverified {
+                        why: format!("sykli verify could not run: {error:#}"),
+                    },
+                    Ok(output) if output.status.success() => return Check::Passed,
+                    Ok(output) => verdict(
+                        from_the_commit,
+                        is_the_commit,
+                        output.status.code(),
+                        output.failure_detail(),
+                    ),
                 },
-                Ok(output) if output.status.success() => return Check::Passed,
-                Ok(output) => verdict(
-                    from_the_commit,
-                    is_the_commit,
-                    output.status.code(),
-                    output.failure_detail(),
-                ),
-            });
+            ));
         }
-        // Refused only when every receipt asked was; else what could not be
-        // said of the best one that was not refused.
-        let refused = |check: &Check| matches!(check, Check::Failed { .. });
-        let mut check = match verdicts.iter().position(|check| !refused(check)) {
-            Some(at) => verdicts.swap_remove(at),
-            None => verdicts.swap_remove(0),
-        };
+        let mut check = settle(verdicts);
         // Said when the cap left receipts unasked: one of them might pass.
         if candidates.len() > MAX_ASKED {
-            if let Check::Failed { why } | Check::Unverified { why } | Check::Stale { why } =
-                &mut check
+            if let Check::Failed { why }
+            | Check::Unverified { why }
+            | Check::Stale { why }
+            | Check::OtherContract { why } = &mut check
             {
                 why.push_str(&format!(
                     " (sykli was asked about the best {MAX_ASKED} of {} receipts of its tree)",
@@ -2014,11 +2062,28 @@ impl Sykli {
     }
 }
 
+/// What the receipts of one tree say when none of them proved it, from
+/// (when the run started, what was said of it): what sykli could not say of
+/// one, since that one might have passed; else the newest run's word, a run
+/// that failed or one that passed under another contract.
+fn settle(mut verdicts: Vec<(i64, Check)>) -> Check {
+    let unsaid = |check: &Check| matches!(check, Check::Unverified { .. } | Check::Stale { .. });
+    if let Some(at) = verdicts.iter().position(|(_, check)| unsaid(check)) {
+        return verdicts.swap_remove(at).1;
+    }
+    verdicts
+        .into_iter()
+        .max_by_key(|(at, _)| *at)
+        .map_or(Check::Unchecked, |(_, check)| check)
+}
+
 /// What a non-zero `sykli verify --commit` means. A sykli that reads
 /// everything from the commit (`from_the_commit`) refuses only the commit
-/// itself (exit 1, 3 or 4, the first failing check on stderr); exit 2 is that
-/// it could not verify (a bad revision, arguments, not a receipt), and any
-/// other end (a crash, a kill) says nothing about the commit either. One that
+/// itself (exit 1 or 3, the first failing check on stderr), and exit 4 says
+/// the receipt passed under another contract or lock than the one it is
+/// judged by now: not proven, never failed. Exit 2 is that it could not
+/// verify (a bad revision, arguments, not a receipt), and any other end (a
+/// crash, a kill) says nothing about the commit either. One that
 /// still compares the checkout on disk refuses the commit on its own run
 /// (`commit`, `clean`, `submodules`, `outcome`, `records`), but on the tree,
 /// inputs or contract on disk only where the checkout is the commit
@@ -2031,7 +2096,8 @@ fn verdict(from_the_commit: bool, is_the_commit: bool, exit: Option<i32>, why: S
     }
     if from_the_commit {
         return match exit {
-            Some(1 | 3 | 4) => Check::Failed { why },
+            Some(1 | 3) => Check::Failed { why },
+            Some(4) => Check::OtherContract { why },
             // A crash, a kill or an exit sykli does not document says nothing
             // about the commit.
             _ => Check::Unverified {
@@ -2852,17 +2918,21 @@ mod tests {
     fn a_refusal_fails_the_commit_only_when_it_is_about_the_commit() {
         let why = |check: &str| format!("refused: {check} expected a but got b");
         // sykli#67 as merged reads everything from the commit.
-        for (exit, check) in [
-            (1, "outcome"),
-            (3, "commit"),
-            (3, "submodules"),
-            (4, "contract"),
-        ] {
+        for (exit, check) in [(1, "outcome"), (3, "commit"), (3, "submodules")] {
             assert!(
                 matches!(
                     verdict(true, false, Some(exit), why(check)),
                     Check::Failed { .. }
                 ),
+                "{check}"
+            );
+        }
+        // A run that passed under another contract or lock: not proven
+        // against this one, and never failed.
+        for check in ["contract", "lock"] {
+            assert_eq!(
+                verdict(true, true, Some(4), why(check)),
+                Check::OtherContract { why: why(check) },
                 "{check}"
             );
         }

@@ -5085,6 +5085,31 @@ fn report_json_is_ohjaa_marks_v1_and_writes_nothing() {
     assert_eq!(waiting["title"], "Code is Rust.");
     assert_eq!(json["report"]["schema"], "ohjaa-report.v1");
 
+    // `--marks`: the same view without the window, its keys the same.
+    let mut marks_only = fixture.ohjaa();
+    marks_only
+        .arg("--root")
+        .arg(&fixture.dir)
+        .args(["report", "--json", "--marks"])
+        .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+        .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+        .current_dir(&repo);
+    let (stdout, stderr, code) = output_of(&mut marks_only);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let marks: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(keys(&marks), keys(&json));
+    assert_eq!(marks["report"], serde_json::Value::Null);
+    assert_eq!(marks["proposals"], json["proposals"]);
+    assert_eq!(stamps(), before, "report --json --marks wrote");
+    if let Some(said) = under_a_terminal(&marks_only) {
+        assert!(said.contains("ohjaa-marks.v1"), "{said}");
+        assert_eq!(
+            stamps(),
+            before,
+            "report --json --marks at a terminal wrote"
+        );
+    }
+
     // At a terminal too: `--json` is never the person's report.
     if let Some(said) = under_a_terminal(&command) {
         assert!(said.contains("ohjaa-marks.v1"), "{said}");

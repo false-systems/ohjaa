@@ -584,14 +584,16 @@ without your PATH (a GUI) runs them too.
 only chains starts no git: git runs it from the work tree's root, and the
 common directory comes from the repository's layout. pre-push starts none of
 its own either, and hands sykli `--repo-root` and `--git-common-dir` when
-sykli takes them. `ohjaa gate` starts one (the repository's config);
+sykli takes them; only when sykli does not accept a push and the clone holds
+receipts does it start one (the commit's tree) and one `sykli verify`.
+`ohjaa gate` starts one (the repository's config);
 `doctor` two for the machine (`git --version`, the global config with
 includes) and one per clone (its config, with `insteadOf` applied in Rust).
 The briefing's flag costs at most three (the clone's config, which the drift
 warnings share, and one `git log` for the walk) and one `sykli verify`; the
-report's marks two per entry (its clone's config and the walk), and `sykli
-verify` only for a commit with a receipt of its tree that says it passed.
-`tests/config_home.rs` holds these budgets.
+report's marks, and `report --json --marks`, two per entry (its clone's
+config and the walk), and `sykli verify` only for a commit with a receipt of
+its tree that says it passed. `tests/config_home.rs` holds these budgets.
 
 **`ohjaa gate`** proves HEAD: it runs the gate a push is judged by, from the
 repository root: `mkdir -p .sykli && sykli run <contract> --json >
@@ -609,35 +611,61 @@ outlives the worktree. Agents are taught this one command.
 
 Nothing is refused for the workflow's sake. A push is observed, each commit on
 an entry's branch is marked, and what is not proven is flagged to the people
-and agents who build on it.
+and agents who build on it. Only a repository's own hooks refuse.
 
 **Observe.** A push that moves the entry's branch is handed to `sykli hook
-pre-push` against the entry's gate, with its output kept back. When sykli
-accepts it, nothing is said. When it does not (no receipt of the commit's
-tree in that worktree, a failed or stale one), or cannot judge it (no sykli,
-one without `--contract` and `--branch`, an entry without a gate), the push
-goes on, and one line says so, after the repository's own hook:
+pre-push` against the entry's gate, with its output kept back, for at most
+15 seconds. When sykli accepts it, nothing is said. sykli looks for a receipt
+only in the worktree that pushes, so when it does not accept the push, the
+commit is asked about as the marks ask (every worktree's receipts: one git
+process for its tree, one `sykli verify`, by the sykli the dispatcher names):
+a commit proven in another worktree is a quiet push too. Otherwise (no
+receipt of the commit's tree, a failed one, one under another contract), or
+when sykli cannot judge it (no sykli, one without `--contract` and
+`--branch`, an entry without a gate, sykli out of time), the push goes on,
+and one line says so, after the repository's own hook:
 
 ```
 ohjaa: UNPROVEN push to main (no receipt in this worktree is a run of its tree). It is pushed and flagged; prove it with: ohjaa gate
 ```
 
+When ohjaa cannot observe the push at all (no workflow home, an entry it
+cannot read), the push goes on with `ohjaa: UNOBSERVED push to <owner/repo>:
+<why>`.
+
 **Mark.** Each commit on the entry's branch is, derived now and stored never:
-✓ **proven** when a receipt of its tree verifies (`sykli verify <receipt>
---contract <entry>/sykli.json --commit <sha>`); ✗ **failed** when a receipt
-of its tree is here and did not pass; ? **unproven** when there is none, or
-sykli could not say. The walk starts where the clone last saw origin
-(`refs/remotes/origin/<branch>`: no fetch, no network) and goes back along
-first parents to the first proven commit, at most 50, tip first. Shas and
-trees come from one `git log`; receipts are read as files, from the clone's
-layout: `<common>/sykli/receipts/` (what sykli kept for accepted pushes) and,
-in every worktree, `.sykli/receipts/` and `.sykli/receipt.json`. A forge's
-merge of an up-to-date pull request has the tree of its head, so a receipt
-of the head proves the merge. `ohjaa report` shows the marks of every entry:
+- ✓ **proven**: sykli accepted a receipt of its tree against the entry's
+  contract (`sykli verify <receipt> --contract <entry>/sykli.json --commit
+  <sha>` exits 0);
+- ✗ **failed**: the newest run of its tree here failed (its receipt says so,
+  or sykli refused it for its outcome or evidence);
+- ? **unproven**: no receipt of its tree here; or it passed under another
+  contract or lock than the entry's now (the gate was edited and locked
+  again since, or the run used the repository's own `sykli.json`); or sykli
+  could not say.
+
+✓ means exactly that sykli accepted a receipt for this tree against the
+entry's contract. Receipts are unsigned files that any local session can
+write, and `sykli verify` checks a receipt against the commit's tree, its
+contract and its lock, not by running the tree again: a forged receipt can
+make a commit look proven (one cheap forgery, editing `tree_oid`, is filed on
+sykli). A mark is evidence from this machine's sessions, not a CI result.
+
+The walk starts where the clone last saw origin (`refs/remotes/origin/
+<branch>`: no fetch, no network), and goes back along first parents to the
+first proven commit, at most 50, tip first. Shas and trees come from one
+`git log`; receipts are read as files, from the clone's layout:
+`<common>/sykli/receipts/` (what sykli kept for accepted pushes) and, in
+every worktree, `.sykli/receipts/` and `.sykli/receipt.json`. A forge's merge
+of an up-to-date pull request has the tree of its head, so a receipt of the
+head proves the merge. The marks are as of the last update of `origin/<branch>`
+here, which its reflog dates and says the kind of (a fetch, or a push from
+this clone). `ohjaa report` shows the marks of every entry, and `ohjaa report
+--marks` only them:
 
 ```
 Marks on each entry's branch, tip first (✓ proven · ✗ failed · ? unproven):
-- false-systems/taso main (as of last fetch 2026-10-13 09:12 UTC): ? 4be01c2 ✗ 77a1f0e ✓ 0c9d3b1
+- false-systems/taso main (origin/main as of a fetch at 2026-10-13 09:12 UTC): ? 4be01c2 ✗ 77a1f0e ✓ 0c9d3b1
 ```
 
 **Flag.** When the entry's branch is not proven at its tip, the briefing of
@@ -645,8 +673,12 @@ Marks on each entry's branch, tip first (✓ proven · ✗ failed · ? unproven)
 launch says it on stderr:
 
 ```
-FLAG: main of false-systems/taso is unproven since 77a1f0e (2 commits: ? 4be01c2, ✗ 77a1f0e; as of last fetch 2026-10-13 09:12 UTC). Start by running `ohjaa gate` on main and fix forward what fails.
+FLAG: main of false-systems/taso is unproven since 77a1f0e (2 commits: ? 4be01c2, ✗ 77a1f0e; origin/main as of a fetch at 2026-10-13 09:12 UTC). Start by running `ohjaa gate` on main and fix forward what fails.
 ```
+
+When some of those commits passed under another contract, it says the branch
+is "not proven against its current gate" (or "has never been proven against
+its current gate"), and how many passed under another one.
 
 The flags a session's record raises at leaving (a broken `origin/main`, its
 own refused work) judge a repository with an entry by its gate too.
@@ -658,6 +690,13 @@ the session log (opened read-only), not the report's bookmarks
 (`report-at`, `report-shown-at`), even at a terminal. Exits 4 when the
 report has gaps, as the text does.
 
+The full report reads every repository's default-branch window and asks vessa
+(up to a minute): on a root of about 50 repositories, some 500 git processes.
+`ohjaa report --json --marks` is the view to read often: the same document
+with `report` null, from two git processes per entry (its clone's config and
+the walk) and a `sykli verify` only for a commit whose receipt says it passed;
+no window, no vessa.
+
 ```
 {
   "schema": "ohjaa-marks.v1",
@@ -666,14 +705,18 @@ report has gaps, as the text does.
   "entries": [{                          // every entry in the home
     "repo": "owner/name",
     "branch": "main", "ref": "origin/main",
-    "clone": "<the clone walked>",       // the one that fetched last
-    "fetched": "<RFC 3339>" | null,      // as of last fetch (FETCH_HEAD)
+    "tip": "<sha>" | null,               // where origin/main is here
+    "clone": "<the clone walked>",       // the one whose origin/main moved last
+    "updated": "<RFC 3339>" | null,      // when origin/main last moved here
+    "updated_by": "fetch" | "push" | null,
     "ended": "proven" | "root" | "cap" | "not_asked",
     "proven_at_tip": false,
     "commits": [{                        // tip first, down to the first proven one, at most 50
       "sha": "…", "tree": "…",
       "mark": "proven" | "failed" | "unproven",
-      "why": "…" | null,                 // what sykli said; null when proven
+      "code": "proven" | "failed" | "other_contract" | "no_receipt"
+            | "no_receipt_checkout_gone" | "could_not_say" | "stale",
+      "why": "…" | null,                 // for a person; null when proven
       "author": "…", "authored": "<RFC 3339>", "subject": "…"
     }],
     "error": null | "why it has no marks" // then the rest are null and commits is []
@@ -687,7 +730,7 @@ report has gaps, as the text does.
     "id": "…", "agent": "…", "repo": "…", "intent": "…",
     "started": "<RFC 3339>", "state": "open" | "orphaned"
   }],
-  "report": { "schema": "ohjaa-report.v1", … }  // the window's lists, as before
+  "report": { "schema": "ohjaa-report.v1", … } | null  // the window's lists; null with --marks
 }
 ```
 

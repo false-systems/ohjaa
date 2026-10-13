@@ -220,6 +220,11 @@ enum Cmd {
         /// report's bookmark.
         #[arg(long)]
         json: bool,
+        /// The marks alone (with --json, also the proposals and the open
+        /// sessions): no window, no vessa; two git processes per entry, and
+        /// sykli verify only where a receipt says it passed.
+        #[arg(long)]
+        marks: bool,
     },
     /// State 2, from inside a session: read back what you know before the
     /// first change. The goal in one line, the rules that apply, who else is
@@ -337,11 +342,15 @@ enum Cmd {
         <home>/repos/<owner>/<repo>/. A push that moves the entry's branch is\n\
         handed, quietly, to\n  \
         sykli hook pre-push --contract <entry>/sykli.json --branch <branch> <remote> <url>\n\
-        When sykli does not accept it, or cannot judge it (no sykli, one without\n\
+        for at most 15 s. When sykli does not accept it, the commit is asked about\n\
+        as the marks ask (a receipt in any worktree of the clone). When that does\n\
+        not prove it either, or sykli cannot judge it (no sykli, one without\n\
         --contract and --branch, an entry without a gate), the push goes on and\n\
-        one line flags it: ohjaa: UNPROVEN push to <branch> (<why>). The\n\
-        repository's own hook is $(git rev-parse --git-common-dir)/hooks/<name>,\n\
-        run when executable; it still refuses what it refuses.")]
+        one line flags it: ohjaa: UNPROVEN push to <branch> (<why>). A push ohjaa\n\
+        cannot observe at all (no workflow home, an unreadable entry) goes on\n\
+        with: ohjaa: UNOBSERVED push to <owner/repo>: <why>. The repository's\n\
+        own hook is $(git rev-parse --git-common-dir)/hooks/<name>, run when\n\
+        executable; it still refuses what it refuses.")]
     Hook {
         /// The git hook's name, e.g. pre-push.
         name: String,
@@ -1376,14 +1385,19 @@ fn default_drafter() -> String {
 
 /// The git repositories a report reads: those under the roots.
 fn report_repos(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    roots::git_repos(&roots::load(roots, git_root().as_deref()))
+    roots::git_repos(&roots::load(roots, git_root_for_roots(roots).as_deref()))
 }
 
-fn cmd_report(roots: &[PathBuf], since: &str, json: bool) -> Result<i32> {
+fn cmd_report(roots: &[PathBuf], since: &str, json: bool, marks: bool) -> Result<i32> {
     let dirs = dirs()?;
     let now_ms = intake::now_seconds() * 1000;
     let since_ms = report::parse_since(since, now_ms)?;
-    let report = report::build(&dirs, &report_repos(roots)?, since_ms, now_ms);
+    let repos = report_repos(roots)?;
+    let report = if marks {
+        report::build_marks(&dirs, &repos, since_ms, now_ms)
+    } else {
+        report::build(&dirs, &repos, since_ms, now_ms)
+    };
     if json {
         println!(
             "{}",
@@ -1393,8 +1407,8 @@ fn cmd_report(roots: &[PathBuf], since: &str, json: bool) -> Result<i32> {
         print!("{}", report::render(&report));
     }
     // A report a person read at a terminal was said; a complete one is the
-    // week's. Never one for a script or an agent.
-    if !json && std::io::stdout().is_terminal() {
+    // week's. Never one for a script or an agent, nor the marks alone.
+    if !json && !marks && std::io::stdout().is_terminal() {
         if let Err(error) = report::shown(&dirs, now_ms, report.complete()) {
             eprintln!("ohjaa: {error:#}");
         }
@@ -2782,7 +2796,7 @@ fn main() {
         } => cmd_handover(unfinished.as_deref(), next.as_deref(), surprised.as_deref()),
         Cmd::Session { id } => cmd_session(id.as_deref()),
         Cmd::Usage { action } => cmd_usage(action),
-        Cmd::Report { since, json } => cmd_report(&cli.root, since, *json),
+        Cmd::Report { since, json, marks } => cmd_report(&cli.root, since, *json, *marks),
         Cmd::Graph { id } => cmd_graph(id),
         Cmd::Apply {
             dry_run,
