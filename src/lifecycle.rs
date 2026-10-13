@@ -5,17 +5,27 @@
 //! while it waits it must not die of a signal, and it must never swallow one
 //! that was meant to stop the session.
 //!
+//! The session runs in a process group of its own, led by `toimija run` (the
+//! agent stays in toimija's group), and its entering record names that group:
+//! whether the session still runs can then be told apart from whether its
+//! ohjaa does, even after ohjaa was killed. When ohjaa holds the terminal,
+//! it hands the terminal to the session's group, as a shell gives a job the
+//! terminal, so the agent reads it and Ctrl-C reaches it; Ctrl-Z stops the
+//! session and then ohjaa, so the shell sees its job stopped, and `fg` gives
+//! the terminal back to the session. ohjaa takes the terminal back when the
+//! session ends.
+//!
 //! The rule, per signal, while the session runs (unix):
 //!
 //! | signal | ohjaa | why |
 //! |---|---|---|
-//! | SIGINT | survives, never forwards | Ctrl-C already reaches the whole foreground group; a second copy makes agents like `claude` quit instead of interrupt |
-//! | SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 | survives, forwards the first of each to `toimija run` | a supervisor may aim them at ohjaa alone; when the whole group got them too, the session receives them twice |
+//! | SIGINT | survives, never forwards | Ctrl-C reaches the session's group, which holds the terminal; a second copy makes agents like `claude` quit instead of interrupt |
+//! | SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 | survives, forwards the first of each to `toimija run` | a supervisor may aim them at ohjaa alone; when the session's group got them too, the session receives them twice |
 //! | SIGALRM, SIGVTALRM, SIGPROF, SIGXCPU, SIGXFSZ | survives | they concern ohjaa's own timers and limits, which it never sets |
-//! | SIGKILL, SIGSTOP | cannot be caught | SIGKILL loses the record |
+//! | SIGKILL, SIGSTOP | cannot be caught | SIGKILL loses the leaving; the session's group outlives it, and the next launch says so |
 //!
 //! To stop a session from outside, send SIGTERM to ohjaa, or SIGINT to the
-//! whole process group.
+//! session's process group (its record's `pgid`).
 //!
 //! The handlers go in just before the session is recorded and spawned, so a
 //! signal in that window is kept and passed on once the child exists (SIGINT
@@ -38,7 +48,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::process;
-use crate::sessions::{Check, Evidence, Exit, Finished, Phase};
+use crate::sessions::{Check, Evidence, Exit, Finished, Phase, ReceiptRef, Said, ValidationRef};
 
 #[cfg(unix)]
 mod signals {
@@ -136,16 +146,185 @@ pub fn supervise() {
     signals::supervise();
 }
 
-/// Wait for the session to end, forwarding stop signals aimed at ohjaa.
+/// The session's process group (unix): `toimija run` leads a group of its
+/// own, so whether the session still runs can be told apart from whether its
+/// ohjaa does. When ohjaa holds the terminal (its group is in the
+/// foreground), the session's group gets it, as a shell gives a job the
+/// terminal, so the agent reads it and Ctrl-C reaches it; ohjaa takes it back
+/// when the session stops or ends.
+#[cfg(unix)]
+mod group {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    /// The terminal handed to the session's group, by file descriptor; -1
+    /// when none was.
+    static TERMINAL: AtomicI32 = AtomicI32::new(-1);
+
+    /// A descriptor (0, 1 or 2) of the controlling terminal, while ohjaa's
+    /// own group is in its foreground.
+    fn foreground_terminal() -> Option<libc::c_int> {
+        // SAFETY: plain queries of the process and its descriptors.
+        unsafe {
+            (0..3).find(|&fd| libc::isatty(fd) == 1 && libc::tcgetpgrp(fd) == libc::getpgrp())
+        }
+    }
+
+    /// Make `fd`'s foreground group `pgid`. From a background group the call
+    /// raises SIGTTOU, which is ignored for its length, as shells do.
+    fn give(fd: libc::c_int, pgid: libc::pid_t) {
+        // SAFETY: async-signal-safe calls only, so this also runs between
+        // fork and exec; the disposition is put back as it was.
+        unsafe {
+            let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            libc::tcsetpgrp(fd, pgid);
+            libc::signal(libc::SIGTTOU, previous);
+        }
+    }
+
+    /// Start the command's process as the leader of a group of its own, in
+    /// the foreground when ohjaa holds the terminal.
+    pub fn own(command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt as _;
+        let terminal = foreground_terminal();
+        TERMINAL.store(terminal.unwrap_or(-1), Ordering::SeqCst);
+        // SAFETY: the closure only makes async-signal-safe calls (setpgid,
+        // getpid, signal, tcsetpgrp), as code between fork and exec must.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if let Some(fd) = terminal {
+                    give(fd, libc::getpid());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    /// Just after the spawn, from ohjaa's side too, so neither order of the
+    /// two processes leaves a moment where the group or the terminal is not
+    /// yet the session's. Failures are the child having done it already.
+    pub fn spawned(child: u32) {
+        let Ok(pid) = libc::pid_t::try_from(child) else {
+            return;
+        };
+        // SAFETY: setpgid on our own child; errors (it already exec'd, or
+        // already leads its group) are expected and ignored.
+        unsafe {
+            libc::setpgid(pid, pid);
+        }
+        let fd = TERMINAL.load(Ordering::SeqCst);
+        if fd >= 0 {
+            give(fd, pid);
+        }
+    }
+
+    /// Take the terminal back for ohjaa's own group, when it was handed to
+    /// the session's group `child` and that group (or nobody: the group
+    /// ended) still holds it. Never from anyone else: after `bg` the shell
+    /// holds it.
+    pub fn take_back(child: libc::pid_t) {
+        let fd = TERMINAL.load(Ordering::SeqCst);
+        if fd < 0 {
+            return;
+        }
+        // SAFETY: queries of the terminal and of a process group; signal 0
+        // sends nothing.
+        let holder = unsafe { libc::tcgetpgrp(fd) };
+        let nobody = holder > 0
+            && unsafe { libc::kill(-holder, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if holder == child || nobody {
+            // SAFETY: a query of our own process group.
+            give(fd, unsafe { libc::getpgrp() });
+        }
+    }
+
+    /// The session's group was stopped (Ctrl-Z reaches only the group that
+    /// holds the terminal): stop ohjaa as well, so its shell sees the job
+    /// stopped and takes the terminal. When ohjaa is continued in the
+    /// foreground (`fg`), the terminal goes back to the session; continued
+    /// either way, so is the session's group. Without a terminal handed over
+    /// (whoever stopped the group continues it) nothing is done.
+    pub fn stopped(child: u32) {
+        let fd = TERMINAL.load(Ordering::SeqCst);
+        let Ok(pid) = libc::pid_t::try_from(child) else {
+            return;
+        };
+        if fd < 0 {
+            return;
+        }
+        take_back(pid);
+        // SAFETY: stopping ourselves with the default action of SIGTSTP,
+        // which ohjaa never handles; then a query of the terminal, and
+        // continuing our own child's group.
+        unsafe {
+            libc::raise(libc::SIGTSTP);
+            if libc::tcgetpgrp(fd) == libc::getpgrp() {
+                give(fd, pid);
+            }
+            libc::kill(-pid, libc::SIGCONT);
+        }
+    }
+}
+
+/// Start the session's process (`toimija run`) as the leader of a process
+/// group of its own, holding the terminal when ohjaa did.
+pub fn own_group(command: &mut Command) {
+    #[cfg(unix)]
+    group::own(command);
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
+/// Called once the session's process exists: its process group's id (its
+/// pid), which the entering record keeps; `None` where there are no process
+/// groups.
+pub fn group_started(child: &Child) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        group::spawned(child.id());
+        Some(child.id())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child;
+        None
+    }
+}
+
+/// Wait for the session to end, forwarding stop signals aimed at ohjaa, and
+/// following its group when it is stopped and continued. The terminal comes
+/// back to ohjaa's group when the session ends.
 pub fn wait(child: &mut Child) -> std::io::Result<ExitStatus> {
     #[cfg(unix)]
     {
+        use std::os::unix::process::ExitStatusExt as _;
+        let pid = libc::pid_t::try_from(child.id())
+            .map_err(|_| std::io::Error::other("the session's pid does not fit a pid_t"))?;
         let mut forwarded = 0;
         // Whatever arrived while the session was being started.
         signals::forward_pending(child.id(), &mut forwarded, true);
         loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(status);
+            let mut status: libc::c_int = 0;
+            // SAFETY: waitpid on our own child, which nothing else reaps.
+            let waited =
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+            if waited == pid {
+                if libc::WIFSTOPPED(status) {
+                    group::stopped(child.id());
+                    continue;
+                }
+                group::take_back(pid);
+                return Ok(ExitStatus::from_raw(status));
+            }
+            if waited < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    group::take_back(pid);
+                    return Err(error);
+                }
             }
             signals::forward_pending(child.id(), &mut forwarded, false);
             std::thread::sleep(Duration::from_millis(50));
@@ -524,9 +703,20 @@ fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Rec
                 Some(true) => head.is_none_or(|head| head == tree),
                 None => true,
             };
+            // What each task did: run, or reused from sykli's cache. Counted
+            // apart, so a reuse is never shown as a run that passed.
+            let tasks = receipt["tasks"].as_array().map_or(&[][..], Vec::as_slice);
+            let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
             let evidence = Evidence {
                 outcome: outcome.to_owned(),
                 dirty,
+                tasks: count(tasks.len()),
+                cached: count(
+                    tasks
+                        .iter()
+                        .filter(|task| task["outcome"] == "cached")
+                        .count(),
+                ),
             };
             found.add(
                 tree,
@@ -1698,6 +1888,9 @@ pub struct Sykli {
     verified: std::cell::Cell<usize>,
     /// How many times it may run in all; `None`: as often as it is needed.
     allowance: std::cell::Cell<Option<usize>>,
+    /// What the receipt sykli verified for each commit said of its run: how
+    /// many tasks it ran, and how many it reused from the cache.
+    proofs: std::cell::RefCell<HashMap<String, Evidence>>,
     /// The sykli to run, when not the one on PATH: the one `ohjaa apply`
     /// recorded in a dispatcher.
     program: Option<PathBuf>,
@@ -1731,6 +1924,18 @@ impl Sykli {
 
     fn timeout(&self) -> std::time::Duration {
         self.limit.unwrap_or(process::LOCAL)
+    }
+
+    fn proved(&self, commit: &str, receipt: &Receipt) {
+        self.proofs
+            .borrow_mut()
+            .insert(commit.to_owned(), receipt.evidence.clone());
+    }
+
+    /// What the receipt that proved `commit` says of its run, once sykli
+    /// verified one here: so a reuse of the cache is said as such.
+    pub fn proof(&self, commit: &str) -> Option<Evidence> {
+        self.proofs.borrow().get(commit).cloned()
     }
 
     /// Let `sykli verify` run at most `times` more times.
@@ -1900,7 +2105,10 @@ impl Sykli {
                         why: format!("sykli verify could not run: {error:#}"),
                     },
                 )),
-                Ok(output) if output.status.success() => return Check::Passed,
+                Ok(output) if output.status.success() => {
+                    self.proved(commit, receipt);
+                    return Check::Passed;
+                }
                 Ok(output) => verdicts.push((
                     receipt.at,
                     verdict(true, true, output.status.code(), output.failure_detail()),
@@ -2035,7 +2243,10 @@ impl Sykli {
                     Err(error) => Check::Unverified {
                         why: format!("sykli verify could not run: {error:#}"),
                     },
-                    Ok(output) if output.status.success() => return Check::Passed,
+                    Ok(output) if output.status.success() => {
+                        self.proved(commit, receipt);
+                        return Check::Passed;
+                    }
                     Ok(output) => verdict(
                         from_the_commit,
                         is_the_commit,
@@ -2127,6 +2338,149 @@ fn clean(checkout: &Path) -> bool {
         &["status", "--porcelain", "--", ".", ":(exclude).sykli"],
     )
     .is_some_and(|status| status.is_empty())
+}
+
+/// What sykli says of a run, from `sykli status --run <id> --json`
+/// (`sykli-run-status.v1`, KATANA D3): `sykli says run <id> completed: 1
+/// passed, 1 cached`. Its words, labelled as its; the task states are
+/// counted in a fixed order, cached apart from passed.
+pub fn describe_run_status(run: &str, status: &Value) -> String {
+    let state = status["state"].as_str().unwrap_or("in an unknown state");
+    let state = match state {
+        "requested" | "running" => format!("is {state}"),
+        other => other.to_owned(),
+    };
+    let mut counts: Vec<(String, usize)> = [
+        "passed",
+        "cached",
+        "failed",
+        "interrupted",
+        "lost",
+        "running",
+        "pending",
+    ]
+    .iter()
+    .map(|name| ((*name).to_owned(), 0))
+    .collect();
+    for task in status["tasks"].as_array().map_or(&[][..], Vec::as_slice) {
+        let name = task["state"].as_str().unwrap_or("unknown");
+        match counts.iter_mut().find(|(known, _)| known == name) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((name.to_owned(), 1)),
+        }
+    }
+    let tasks: Vec<String> = counts
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(name, n)| format!("{n} {name}"))
+        .collect();
+    if tasks.is_empty() {
+        format!("sykli says run {run} {state}: no tasks")
+    } else {
+        format!("sykli says run {run} {state}: {}", tasks.join(", "))
+    }
+}
+
+/// The receipt a `sykli-run-status.v1` names, once the run has one.
+pub fn receipt_of_status(status: &Value) -> Option<ReceiptRef> {
+    let path = status["receipt"]["path"].as_str()?;
+    Some(ReceiptRef {
+        path: path.to_owned(),
+        digest: status["receipt"]["digest"].as_str().map(str::to_owned),
+    })
+}
+
+/// Whether this sykli has durable runs (KATANA D3) to ask about: `sykli
+/// status --help` names `--run`.
+pub fn sykli_status_takes_runs() -> bool {
+    process::run(
+        Command::new("sykli").args(["status", "--help"]),
+        None,
+        process::LOCAL,
+    )
+    .is_ok_and(|output| {
+        output.status.success()
+            && format!(
+                "{}{}",
+                output.stdout_text(),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .contains("--run")
+    })
+}
+
+/// `sykli status --run <id> --json`, from `repo`: the run's status, or why
+/// sykli could not say.
+pub fn sykli_run_status(repo: &Path, run: &str) -> Result<Value, String> {
+    let output = process::run(
+        Command::new("sykli")
+            .args(["status", "--run", run, "--json"])
+            .current_dir(repo),
+        None,
+        process::LOCAL,
+    )
+    .map_err(|error| format!("{error:#}"))?;
+    if !output.status.success() {
+        return Err(output.failure_detail());
+    }
+    let status: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("its answer is not JSON ({error})"))?;
+    if status["schema"] != "sykli-run-status.v1" {
+        return Err(format!(
+            "its answer is not sykli-run-status.v1 (schema {})",
+            status["schema"]
+        ));
+    }
+    Ok(status)
+}
+
+/// What sykli says now of each pending validation shown (a run id, no
+/// receipt recorded): `sykli status --run`, asked once per run per command,
+/// and only once some pending one is shown; whether sykli can be asked at
+/// all (`sykli status --help`) is asked once, too. Said as sykli's words,
+/// never stored: the run's own journal is sykli's, and authoritative.
+#[derive(Debug, Default)]
+pub struct RunStatus {
+    takes_runs: std::cell::OnceCell<bool>,
+    said: std::cell::RefCell<HashMap<String, Said>>,
+}
+
+impl RunStatus {
+    pub fn ask(&self, validation: &ValidationRef) -> Option<Said> {
+        if !validation.pending() {
+            return None;
+        }
+        let run = validation.run.as_deref()?;
+        if let Some(known) = self.said.borrow().get(run) {
+            return Some(known.clone());
+        }
+        let text = |text: String| Said {
+            text,
+            receipt: None,
+        };
+        let said = if !*self.takes_runs.get_or_init(sykli_status_takes_runs) {
+            text(format!(
+                "sykli run {run}: sykli cannot be asked about runs here (no `sykli status --run`)"
+            ))
+        } else if !Path::new(&validation.repo).is_dir() {
+            text(format!(
+                "sykli run {run}: sykli not asked, its checkout {} is gone",
+                validation.repo
+            ))
+        } else {
+            match sykli_run_status(Path::new(&validation.repo), run) {
+                Ok(status) => Said {
+                    text: describe_run_status(run, &status),
+                    receipt: receipt_of_status(&status),
+                },
+                Err(why) => text(format!(
+                    "sykli could not say what became of run {run}: {why}"
+                )),
+            }
+        };
+        self.said.borrow_mut().insert(run.to_owned(), said.clone());
+        Some(said)
+    }
 }
 
 /// The toimija session the child ran: toimija names it `<secs>-<pid>` after
@@ -3067,5 +3421,45 @@ mod tests {
             .status()
             .unwrap();
         assert_eq!(exit_of(status), Exit::Signal { signal: 15 });
+    }
+
+    /// sykli's status of a run, said as sykli's, the task states counted in
+    /// a fixed order: cached apart from passed, never folded into it.
+    #[test]
+    fn a_run_status_is_said_as_sykli_says_it() {
+        let status = serde_json::json!({
+            "schema": "sykli-run-status.v1",
+            "run": "r1",
+            "state": "running",
+            "tasks": [
+                {"name": "a", "state": "cached"},
+                {"name": "b", "state": "passed"},
+                {"name": "c", "state": "running"},
+                {"name": "d", "state": "odd"},
+                {"name": "e", "state": "cached"},
+            ],
+            "receipt": null,
+        });
+        assert_eq!(
+            describe_run_status("r1", &status),
+            "sykli says run r1 is running: 1 passed, 2 cached, 1 running, 1 odd"
+        );
+        assert_eq!(receipt_of_status(&status), None);
+        let done = serde_json::json!({
+            "state": "interrupted",
+            "tasks": [],
+            "receipt": {"path": "/r/.sykli/receipts/rcpt_ab.json", "digest": "ab"},
+        });
+        assert_eq!(
+            describe_run_status("r2", &done),
+            "sykli says run r2 interrupted: no tasks"
+        );
+        assert_eq!(
+            receipt_of_status(&done),
+            Some(ReceiptRef {
+                path: "/r/.sykli/receipts/rcpt_ab.json".to_owned(),
+                digest: Some("ab".to_owned()),
+            })
+        );
     }
 }

@@ -909,6 +909,11 @@ mod tests {
             drafted: false,
             usage: Vec::new(),
             usage_refused: None,
+            intent_id: None,
+            task: None,
+            pgid: None,
+            group_started_ms: None,
+            validations: Vec::new(),
         };
         let ended = |exit: Exit| Left {
             exit,

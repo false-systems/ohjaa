@@ -67,11 +67,82 @@ pub struct Handover {
 }
 
 /// A sykli receipt whose subject is a commit's tree.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
     pub outcome: String,
     /// Whether the worktree had changes beyond the commit when sykli ran.
     pub dirty: bool,
+    /// How many tasks the receipt records; older records omit it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tasks: u32,
+    /// How many of them sykli reused from its cache instead of running:
+    /// said as cached, never counted as passed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cached: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// Whether a validation is of work on its way to the observed branch, or of
+/// what is already on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationKind {
+    Candidate,
+    Integrated,
+}
+
+/// The receipt sykli wrote for a validation: its path, and its sha256 as
+/// sykli gave it (the name it keeps the receipt under, or its status).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptRef {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+/// A validation requested from inside a session (`ohjaa gate`). It is a
+/// reference, never an outcome: what became of the run is sykli's to say,
+/// and while no receipt is recorded sykli is asked again whenever it is
+/// shown. Written before sykli is asked; sykli's run id and the receipt are
+/// filled in as sykli gives them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationRef {
+    /// ohjaa's id for the request (`rq-…`).
+    pub request: String,
+    /// sykli's id for the run, once sykli gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    /// Integrated: HEAD was the observed branch's tip as this clone last saw
+    /// it (`origin/<branch>`); candidate: anything else.
+    pub kind: ValidationKind,
+    /// The checkout it was requested in.
+    pub repo: String,
+    /// HEAD when it was requested, and its tree.
+    pub commit: String,
+    pub tree: String,
+    /// The contract it was requested against.
+    pub contract: String,
+    /// The contract's hash: the one its `sykli.lock` pins, else the one sykli
+    /// reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_digest: Option<String>,
+    /// The lock's digest, as sykli reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_digest: Option<String>,
+    pub requested_ms: i64,
+    /// The receipt sykli wrote for it, once there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<ReceiptRef>,
+}
+
+impl ValidationRef {
+    /// Still waiting on sykli's word: a run id and no receipt yet.
+    pub fn pending(&self) -> bool {
+        self.run.is_some() && self.receipt.is_none()
+    }
 }
 
 /// One phase of work: a commit, and what sykli saw on it.
@@ -284,7 +355,25 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub outside_repo: bool,
     pub intent: String,
+    /// The Intent this session works on. It is separate from the session's
+    /// own id: minted when a session is given `--intent`, and carried by each
+    /// session that continues it with `--intent-id`. Older records have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_id: Option<String>,
+    /// What it was asked to do (`--task`), as given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
     pub started_ms: i64,
+    /// The process group the session runs in (`toimija run` leads it, and
+    /// the agent runs in it). Whether the group is alive says whether the
+    /// session is, even after the ohjaa that started it is gone. Recorded
+    /// just after the spawn; older records have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgid: Option<u32>,
+    /// When the group was started: a group of that id led by a process that
+    /// started later is another one, the id reused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_started_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,6 +398,9 @@ pub struct Session {
     /// refusal is said, never shown as "not collected".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_refused: Option<String>,
+    /// Validations requested from inside the session, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validations: Vec<ValidationRef>,
 }
 
 impl Session {
@@ -766,10 +858,53 @@ pub fn new_id(started_ms: i64) -> String {
     format!("oh-{started_ms}-{}", std::process::id())
 }
 
+/// A fresh Intent id, in the same style as a session's: when it was minted,
+/// and by which ohjaa. Never a session's id: its prefix differs.
+pub fn new_intent_id(at_ms: i64) -> String {
+    format!("in-{at_ms}-{}", std::process::id())
+}
+
+/// A fresh id for a validation request (`ohjaa gate`), in the same style.
+pub fn new_request_id(at_ms: i64) -> String {
+    format!("rq-{at_ms}-{}", std::process::id())
+}
+
 /// The pid of the ohjaa that started a session, from its id.
 pub fn pid_of(id: &str) -> Option<u32> {
     let (_, pid) = id.strip_prefix("oh-")?.rsplit_once('-')?;
     pid.parse().ok().filter(|pid| *pid > 0)
+}
+
+/// What a session still open in the log is, observed now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Open {
+    /// Its ohjaa still runs, or that cannot be told: it is left alone.
+    Running,
+    /// Its ohjaa is gone, but the session's own process group still runs (or
+    /// that cannot be told): its agent outlived its ohjaa. Not an orphan;
+    /// its leaving will not be recorded.
+    OhjaaGone,
+    /// Its ohjaa is gone, and so is its process group (or none was
+    /// recorded): an orphan.
+    Orphaned,
+}
+
+/// Observe an open session now: its ohjaa by the pid in its id, then its
+/// process group (`pgid`). A process is never declared gone on a guess.
+pub fn observe_open(session: &Session) -> Open {
+    let Some(pid) = pid_of(&session.id) else {
+        return Open::Running;
+    };
+    if pid == std::process::id()
+        || crate::process::ohjaa_alive(pid, session.started_ms) != Some(false)
+    {
+        return Open::Running;
+    }
+    let started = session.group_started_ms.unwrap_or(session.started_ms);
+    match session.pgid {
+        Some(pgid) if crate::process::group_alive(pgid, started) != Some(false) => Open::OhjaaGone,
+        _ => Open::Orphaned,
+    }
 }
 
 /// Session ids are names, never paths.
@@ -814,8 +949,19 @@ fn describe_end(left: &Left) -> String {
 fn describe_evidence(evidence: Option<&Evidence>) -> String {
     match evidence {
         Some(e) if e.dirty => format!("receipt: {} (dirty tree)", e.outcome),
-        Some(e) => format!("receipt: {}", e.outcome),
+        Some(e) => format!("receipt: {}{}", e.outcome, describe_cached(e)),
         None => "no sykli receipt".to_owned(),
+    }
+}
+
+/// How much of a run sykli reused from its cache instead of running it, said
+/// apart from what ran: ` (1 of 3 tasks cached)`, ` (all 2 tasks cached)`,
+/// or nothing when every task ran (or the receipt does not say).
+pub fn describe_cached(evidence: &Evidence) -> String {
+    match (evidence.cached, evidence.tasks) {
+        (0, _) => String::new(),
+        (cached, tasks) if cached >= tasks => format!(" (all {cached} tasks cached)"),
+        (cached, tasks) => format!(" ({cached} of {tasks} tasks cached)"),
     }
 }
 
@@ -841,6 +987,16 @@ pub fn describe_check(check: &Check) -> String {
 /// receipt's word before it.
 fn describe_landed(landed: &Landed) -> String {
     match &landed.check {
+        // The receipt sykli accepted, when it reused its cache: said so.
+        Some(Check::Passed) => format!(
+            "{}{}",
+            describe_check(&Check::Passed),
+            landed
+                .evidence
+                .as_ref()
+                .map(describe_cached)
+                .unwrap_or_default()
+        ),
         Some(check) => describe_check(check),
         None => format!(
             "{} (not verified: {})",
@@ -947,7 +1103,17 @@ fn handover_lines(handover: Option<&Handover>, out: &mut String) {
 }
 
 /// The leaving record, as printed at exit: observed first, then testimony.
+#[cfg(test)]
 pub fn render_record(session: &Session) -> String {
+    render_record_with(session, &|_| None)
+}
+
+/// The leaving record, with what sykli says now of each validation the
+/// session requested (`said`, asked by the caller).
+pub fn render_record_with(
+    session: &Session,
+    said: &dyn Fn(&ValidationRef) -> Option<Said>,
+) -> String {
     let mut out = String::new();
     let ended = session.left.as_ref().map_or_else(
         || "still open".to_owned(),
@@ -970,7 +1136,15 @@ pub fn render_record(session: &Session) -> String {
         }
     }
     out.push_str("─ observed (written by ohjaa; the agent cannot change it) ─\n");
-    let _ = writeln!(out, "intent        {}", session.intent);
+    let _ = writeln!(
+        out,
+        "intent        {}{}",
+        session.intent,
+        intent_note(session)
+    );
+    if let Some(task) = &session.task {
+        let _ = writeln!(out, "task          {task}");
+    }
     let readback = match &session.readback {
         Some(r) => format!("read back at {}", &clock(r.at_ms)[11..]),
         None => "no read-back".to_owned(),
@@ -1043,6 +1217,11 @@ pub fn render_record(session: &Session) -> String {
             let _ = writeln!(out, "toimija       {toimija}");
         }
     }
+    out.push_str(&render_validations(
+        &session.validations,
+        "requested     ",
+        said,
+    ));
     out.push_str("─ usage (imported source assertions; estimates are not bills) ─\n");
     if let Some(why) = &session.usage_refused {
         let _ = writeln!(out, "refused: {why}");
@@ -1219,8 +1398,12 @@ pub fn observed_in(session: &Session, here: &str) -> bool {
 }
 
 /// Sessions closed as orphaned at this launch, for the very top of its
-/// briefing: nothing they did was observed.
-pub fn render_orphaned(orphans: &[Session]) -> String {
+/// briefing: nothing they did was observed. With the validations each
+/// requested, a pending one as sykli says it now (`said`).
+pub fn render_orphaned(
+    orphans: &[Session],
+    said: &dyn Fn(&ValidationRef) -> Option<Said>,
+) -> String {
     let mut out = String::new();
     for session in orphans {
         let _ = writeln!(
@@ -1232,6 +1415,103 @@ pub fn render_orphaned(orphans: &[Session]) -> String {
             session.agent,
             session.intent,
             clock(session.started_ms)
+        );
+        out.push_str(&render_validations(&session.validations, "  - ", said));
+    }
+    out
+}
+
+/// Sessions whose ohjaa is gone while their own process group still runs:
+/// not orphans. Their agent may still be at work, and their leaving will
+/// not be recorded. With the validations each requested, as for an orphan.
+pub fn render_still_running(
+    sessions: &[Session],
+    said: &dyn Fn(&ValidationRef) -> Option<Said>,
+) -> String {
+    let mut out = String::new();
+    for session in sessions {
+        let _ = writeln!(
+            out,
+            "STILL RUNNING: session {} ({}, {}), started {}: its process group {} still \
+             runs, but the ohjaa that started it is gone, so its leaving will not be \
+             recorded. Its work may still be changing; check `git log` and its worktree \
+             before building on it.",
+            session.id,
+            session.agent,
+            session.intent,
+            clock(session.started_ms),
+            session
+                .pgid
+                .map_or_else(|| "?".to_owned(), |pgid| pgid.to_string())
+        );
+        out.push_str(&render_validations(&session.validations, "  - ", said));
+    }
+    out
+}
+
+/// What sykli says of a pending validation now, asked by the caller: the
+/// words to show, labelled as sykli's, and the receipt sykli named, if it
+/// did. Shown, never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Said {
+    pub text: String,
+    pub receipt: Option<ReceiptRef>,
+}
+
+/// ` (intent <id>)` when the session carries an Intent id.
+fn intent_note(session: &Session) -> String {
+    session
+        .intent_id
+        .as_ref()
+        .map_or_else(String::new, |id| format!(" (intent {id})"))
+}
+
+/// `; receipt <path> (sha256 <12>)`.
+fn describe_receipt(receipt: &ReceiptRef) -> String {
+    match &receipt.digest {
+        Some(digest) => format!(
+            "; receipt {} (sha256 {})",
+            receipt.path,
+            digest.get(..12).unwrap_or(digest)
+        ),
+        None => format!("; receipt {} (no digest)", receipt.path),
+    }
+}
+
+/// One line per validation, each after `prefix`: what ohjaa recorded when it
+/// asked (its request, kind, commit and tree), then sykli's run and receipt
+/// as recorded. A pending one (a run id, no receipt yet) is said as sykli
+/// says it now (`said`, asked by the caller), labelled as sykli's. Nothing
+/// here is a verdict of ohjaa's.
+pub fn render_validations(
+    refs: &[ValidationRef],
+    prefix: &str,
+    said: &dyn Fn(&ValidationRef) -> Option<Said>,
+) -> String {
+    let mut out = String::new();
+    for validation in refs {
+        let kind = match validation.kind {
+            ValidationKind::Candidate => "candidate",
+            ValidationKind::Integrated => "integrated",
+        };
+        let answer = match (&validation.run, &validation.receipt) {
+            (None, None) => "no sykli run id; no receipt recorded".to_owned(),
+            (None, Some(receipt)) => format!("no sykli run id{}", describe_receipt(receipt)),
+            (Some(run), Some(receipt)) => format!("sykli run {run}{}", describe_receipt(receipt)),
+            (Some(run), None) => match said(validation) {
+                Some(Said { text, receipt }) => format!(
+                    "{text}{}",
+                    receipt.as_ref().map(describe_receipt).unwrap_or_default()
+                ),
+                None => format!("sykli run {run}, no receipt recorded (sykli not asked)"),
+            },
+        };
+        let _ = writeln!(
+            out,
+            "{prefix}validation {} ({kind}, {} tree {}): {answer}",
+            validation.request,
+            short(&validation.commit),
+            short(&validation.tree)
         );
     }
     out
@@ -1406,14 +1686,28 @@ fn describe_finished(finished: &Finished) -> String {
 fn summarise_work(phases: Option<&Vec<Phase>>) -> String {
     match phases {
         Some(phases) => {
-            let claimed = phases
-                .iter()
-                .filter(|p| p.evidence.as_ref().is_some_and(|e| e.outcome == "passed"))
-                .count();
-            format!(
-                "{} commit(s), {claimed} whose sykli receipt says passed",
-                phases.len()
-            )
+            let says = |outcome: &str| {
+                phases
+                    .iter()
+                    .filter_map(|p| p.evidence.as_ref())
+                    .filter(|e| e.outcome == outcome)
+                    .collect::<Vec<_>>()
+            };
+            let passed = says("passed");
+            let reusing = passed.iter().filter(|e| e.cached > 0).count();
+            let cached = says("cached").len();
+            let mut said = format!(
+                "{} commit(s), {} whose sykli receipt says passed",
+                phases.len(),
+                passed.len()
+            );
+            if reusing > 0 {
+                let _ = write!(said, " ({reusing} reusing cached tasks)");
+            }
+            if cached > 0 {
+                let _ = write!(said, ", {cached} whose receipt says cached (no task run)");
+            }
+            said
         }
         None => "commits not observed".to_owned(),
     }
@@ -1442,7 +1736,17 @@ fn summarise_finished(finished: &Finished) -> String {
 /// "Last session here", for the next session's entering briefing in `here`
 /// (a `LATEST` key). A session launched elsewhere that named `here` with
 /// `--scope` says where it was launched, so it never reads as launched here.
+#[cfg(test)]
 pub fn render_last(session: &Session, here: &str) -> String {
+    render_last_with(session, here, &|_| None)
+}
+
+/// The same, with what sykli says now of each validation it requested.
+pub fn render_last_with(
+    session: &Session,
+    here: &str,
+    said: &dyn Fn(&ValidationRef) -> Option<Said>,
+) -> String {
     let mut out = String::new();
     // Only ended sessions are "the last session here" (see `note_latest`);
     // a record without its leaving is said as exactly that, never as a crash.
@@ -1463,7 +1767,7 @@ pub fn render_last(session: &Session, here: &str) -> String {
         "Last session here ({}, {}, {ended}{launched}):",
         session.id, session.agent
     );
-    let _ = writeln!(out, "- intent: {}", session.intent);
+    let _ = writeln!(out, "- intent: {}{}", session.intent, intent_note(session));
     let scoped = session
         .left
         .as_ref()
@@ -1543,6 +1847,8 @@ pub fn render_last(session: &Session, here: &str) -> String {
             }
         }
     }
+    // Observed, not testimony: the validations it requested, as sykli says now.
+    out.push_str(&render_validations(&session.validations, "- ", said));
     match &session.handover {
         None => out.push_str("- it left no handover\n"),
         Some(h) => {
@@ -1595,6 +1901,11 @@ mod tests {
             drafted: false,
             usage: Vec::new(),
             usage_refused: None,
+            intent_id: None,
+            task: None,
+            pgid: None,
+            group_started_ms: None,
+            validations: Vec::new(),
         }
     }
 
@@ -1637,6 +1948,7 @@ mod tests {
                         evidence: Some(Evidence {
                             outcome: "passed".to_owned(),
                             dirty: false,
+                            ..Default::default()
                         }),
                         ..Default::default()
                     }]),
@@ -2029,6 +2341,7 @@ mod tests {
                     evidence: Some(Evidence {
                         outcome: "passed".to_owned(),
                         dirty: false,
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },
@@ -2157,6 +2470,7 @@ mod tests {
             evidence: Some(Evidence {
                 outcome: "passed".to_owned(),
                 dirty: false,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2215,6 +2529,7 @@ mod tests {
             head_evidence: Some(Evidence {
                 outcome: "passed".to_owned(),
                 dirty: false,
+                ..Default::default()
             }),
             head: Some("feedface00".to_owned()),
             head_check: Some(Check::Failed {
@@ -2476,5 +2791,75 @@ mod tests {
         for bad in ["", "../x", "a/b", "a b", ".", &"x".repeat(65)] {
             assert!(!is_valid_id(bad), "{bad}");
         }
+    }
+
+    /// A validation is said as recorded, and a pending one (a run id, no
+    /// receipt) as sykli says it now: asked only for that one.
+    #[test]
+    fn validations_are_references_and_only_a_pending_one_is_asked_about() {
+        let base = ValidationRef {
+            request: "rq-1-2".to_owned(),
+            run: None,
+            kind: ValidationKind::Candidate,
+            repo: "/r/a".to_owned(),
+            commit: "c0mmit0000".to_owned(),
+            tree: "7ree000000".to_owned(),
+            contract: "/h/sykli.json".to_owned(),
+            contract_digest: None,
+            lock_digest: None,
+            requested_ms: 1,
+            receipt: None,
+        };
+        let receipt = ReceiptRef {
+            path: "/r/a/.sykli/receipts/rcpt_abc.json".to_owned(),
+            digest: Some("0123456789abcdef".to_owned()),
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let said = |v: &ValidationRef| {
+            asked.borrow_mut().push(v.request.clone());
+            Some(Said {
+                text: "sykli says run r9 is running: 1 running".to_owned(),
+                receipt: None,
+            })
+        };
+        let unknown = base.clone();
+        let foreground = ValidationRef {
+            request: "rq-2-2".to_owned(),
+            receipt: Some(ReceiptRef {
+                path: "/r/a/.sykli/receipt.json".to_owned(),
+                digest: None,
+            }),
+            ..base.clone()
+        };
+        let done = ValidationRef {
+            request: "rq-3-2".to_owned(),
+            run: Some("r8".to_owned()),
+            kind: ValidationKind::Integrated,
+            receipt: Some(receipt),
+            ..base.clone()
+        };
+        let pending = ValidationRef {
+            request: "rq-4-2".to_owned(),
+            run: Some("r9".to_owned()),
+            ..base
+        };
+        assert!(pending.pending() && !done.pending() && !unknown.pending());
+        let lines = render_validations(&[unknown, foreground, done, pending], "- ", &said);
+        assert_eq!(
+            lines,
+            "- validation rq-1-2 (candidate, c0mmit0 tree 7ree000): no sykli run id; no receipt \
+             recorded\n\
+             - validation rq-2-2 (candidate, c0mmit0 tree 7ree000): no sykli run id; receipt \
+             /r/a/.sykli/receipt.json (no digest)\n\
+             - validation rq-3-2 (integrated, c0mmit0 tree 7ree000): sykli run r8; receipt \
+             /r/a/.sykli/receipts/rcpt_abc.json (sha256 0123456789ab)\n\
+             - validation rq-4-2 (candidate, c0mmit0 tree 7ree000): sykli says run r9 is \
+             running: 1 running\n"
+        );
+        assert_eq!(
+            *asked.borrow(),
+            ["rq-4-2"],
+            "only the pending one is asked about"
+        );
     }
 }

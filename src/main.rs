@@ -71,10 +71,16 @@ enum Cmd {
     Run {
         /// Agent command, e.g. claude / codex.
         agent: String,
-        /// Why this session exists.
-        #[arg(long)]
-        intent: String,
-        /// What to do; forwarded to `toimija run --task`.
+        /// Why this session exists. A new Intent, with an id of its own,
+        /// unless --intent-id continues one.
+        #[arg(long, required_unless_present = "intent_id")]
+        intent: Option<String>,
+        /// Continue an existing Intent in this new session: its id, as a
+        /// session that worked on it was given (`in-…`). Its text comes with
+        /// it unless --intent gives another.
+        #[arg(long, value_name = "ID")]
+        intent_id: Option<String>,
+        /// What to do; forwarded to `toimija run --task`, and recorded.
         #[arg(long)]
         task: Option<String>,
         /// Paths this session expects to touch (repeatable).
@@ -790,7 +796,9 @@ fn cmd_brief(
             println!("{flag}\n");
         }
     }
-    let (warnings, last) = last_session_here(&dirs, &here).unzip();
+    // sykli is asked about each pending validation shown, once.
+    let runs = lifecycle::RunStatus::default();
+    let (warnings, last) = last_session_here(&dirs, &here, &runs).unzip();
     if let Some(warnings) = warnings.filter(|warnings| !knowledge_only && !warnings.is_empty()) {
         println!("{warnings}");
     }
@@ -868,8 +876,13 @@ const STANDING_LOOKBACK: usize = 50;
 /// What the log knows of this repository: the warnings for the very top of a
 /// briefing (the last session's flags, and any earlier session's flag about a
 /// branch that still sits at the flagged commit, including one a session only
-/// found here saw), and "Last session here". `None` when it knows neither.
-fn last_session_here(dirs: &Dirs, repo: &Path) -> Option<(String, String)> {
+/// found here saw), and "Last session here", with what sykli says now of the
+/// validations it left pending (`runs`). `None` when it knows neither.
+fn last_session_here(
+    dirs: &Dirs,
+    repo: &Path,
+    runs: &lifecycle::RunStatus,
+) -> Option<(String, String)> {
     let here = repo_key(repo);
     // Read in one short open, let go before any git is asked.
     let (latest, all) = {
@@ -896,7 +909,7 @@ fn last_session_here(dirs: &Dirs, repo: &Path) -> Option<(String, String)> {
         });
     let last = latest
         .as_ref()
-        .map(|session| sessions::render_last(session, &here))
+        .map(|session| sessions::render_last_with(session, &here, &|v| runs.ask(v)))
         .unwrap_or_default();
     (!warnings.is_empty() || !last.is_empty()).then_some((warnings, last))
 }
@@ -1011,7 +1024,12 @@ fn cmd_session(id: Option<&str>) -> Result<i32> {
     };
     match session {
         Some(session) => {
-            print!("{}", sessions::render_record(&session));
+            // With what sykli says now of the validations it left pending.
+            let runs = lifecycle::RunStatus::default();
+            print!(
+                "{}",
+                sessions::render_record_with(&session, &|v| runs.ask(v))
+            );
             Ok(0)
         }
         None => {
@@ -1676,9 +1694,99 @@ fn cmd_intake(
 
 // ---- launching --------------------------------------------------------------
 
+/// The Intent a session works on: an id of its own, never a session's, and
+/// its text (`--intent`).
+struct Intent {
+    id: String,
+    text: String,
+    origin: IntentOrigin,
+}
+
+enum IntentOrigin {
+    /// Minted at this launch.
+    New,
+    /// Continued: the newest session in the log that carries it.
+    ContinuedFrom(String),
+    /// Continued, but the log could not be read to find it (why).
+    Unchecked(String),
+}
+
+impl Intent {
+    /// The line the briefing opens "How this session works" with.
+    fn briefing_line(&self, session: &str) -> String {
+        let origin = match &self.origin {
+            IntentOrigin::New => "new".to_owned(),
+            IntentOrigin::ContinuedFrom(from) => format!("continued from session {from}"),
+            IntentOrigin::Unchecked(why) => {
+                format!("continued; the session log could not be read to check it ({why})")
+            }
+        };
+        format!(
+            "This session is {session}; its intent is {}, {origin}. Continue it in a later \
+             session with: ohjaa run <agent> --intent-id {}\n",
+            self.id, self.id
+        )
+    }
+}
+
+/// The Intent of a new session: continued with `--intent-id` (its text from
+/// the newest session that carries it, unless `--intent` gives another), or
+/// new, with an id minted now. An id no session in the log carries is
+/// refused; a log that cannot be read never refuses a launch, and the
+/// continuation is then said to be unchecked.
+fn resolve_intent(
+    dirs: &Dirs,
+    text: Option<&str>,
+    id: Option<&str>,
+) -> std::result::Result<Intent, String> {
+    let Some(id) = id else {
+        return Ok(Intent {
+            id: sessions::new_intent_id(intake::now_seconds() * 1000),
+            text: text.unwrap_or_default().to_owned(),
+            origin: IntentOrigin::New,
+        });
+    };
+    if sessions::pid_of(id).is_some() {
+        return Err(format!(
+            "{id} is a session's id, not an intent's: an intent id starts `in-`"
+        ));
+    }
+    if !sessions::is_valid_id(id) || !id.starts_with("in-") {
+        return Err(format!("{id} is not an intent id (`in-…`)"));
+    }
+    let carried = session_reader(dirs)
+        .ok_or_else(|| "the session log could not be opened".to_owned())
+        .and_then(|log| log.all().map_err(|error| error.to_string()));
+    // A blank --intent gives no text: the Intent's own comes with it.
+    let text = text.filter(|text| !text.trim().is_empty());
+    let all = match carried {
+        Ok((all, _)) => all,
+        Err(why) => {
+            return Ok(Intent {
+                id: id.to_owned(),
+                text: text.map_or_else(|| format!("continuing intent {id}"), str::to_owned),
+                origin: IntentOrigin::Unchecked(why),
+            })
+        }
+    };
+    let Some(newest) = all
+        .into_iter()
+        .filter(|s| s.intent_id.as_deref() == Some(id))
+        .max_by_key(|s| s.started_ms)
+    else {
+        return Err(format!("no session in the log carries intent {id}"));
+    };
+    Ok(Intent {
+        id: id.to_owned(),
+        text: text.map_or(newest.intent, str::to_owned),
+        origin: IntentOrigin::ContinuedFrom(newest.id),
+    })
+}
+
 struct RunOptions<'a> {
     agent: &'a str,
-    intent: &'a str,
+    intent: Option<&'a str>,
+    intent_id: Option<&'a str>,
     task: Option<&'a str>,
     scope: &'a [String],
     dry_run: bool,
@@ -1692,6 +1800,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let RunOptions {
         agent,
         intent,
+        intent_id,
         task,
         scope,
         dry_run,
@@ -1873,6 +1982,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         "--dry-run",
         "--no-briefing",
         "--intent",
+        "--intent-id",
         "--task",
         "--scope",
         "--usage-file",
@@ -1890,10 +2000,32 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // perimeter (who and what is around). Keep it separate from a task so an
     // interactive Codex launch can wait for the person's first message.
     let dirs = Dirs::resolve(in_repo.then_some(root.as_path()))?;
+    // The Intent: continued, from the sessions that carry its id, or new.
+    let intent = match resolve_intent(&dirs, intent, intent_id) {
+        Ok(intent) => intent,
+        Err(why) => {
+            eprintln!("ohjaa: {why}");
+            eprintln!("ohjaa: refusing to launch");
+            return Ok(REFUSED);
+        }
+    };
     // Sessions left open by an ohjaa that is gone (a SIGKILL, a crash, a
     // restart) are closed first, so they are queued and can be the last session
-    // here.
-    let orphans = close_orphans(&dirs, !dry_run);
+    // here. One whose own process group still runs is still running: left open.
+    let (orphans, still_running) = close_orphans(&dirs, !dry_run);
+    for session in &still_running {
+        eprintln!(
+            "ohjaa: session {} ({}, started {}, in {}) is still running in process group {}, \
+             but the ohjaa that started it is gone; it is left open",
+            session.id,
+            session.agent,
+            sessions::clock(session.started_ms),
+            session.repo,
+            session
+                .pgid
+                .map_or_else(|| "?".to_owned(), |pgid| pgid.to_string())
+        );
+    }
     // Read while the agent works; said after the record.
     let weekly = (!dry_run).then(|| weekly_report(&dirs, roots)).flatten();
     let here_key = repo_key(&root);
@@ -1908,10 +2040,12 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             if dry_run { "would be closed" } else { "closed" }
         );
     }
-    let orphaned_here: Vec<sessions::Session> = orphans
-        .into_iter()
-        .filter(|s| s.repo == here_key || s.scoped.iter().any(|scoped| scoped.repo == here_key))
-        .collect();
+    let here = |s: &sessions::Session| {
+        s.repo == here_key || s.scoped.iter().any(|scoped| scoped.repo == here_key)
+    };
+    let orphaned_here: Vec<sessions::Session> = orphans.into_iter().filter(|s| here(s)).collect();
+    let still_running_here: Vec<sessions::Session> =
+        still_running.into_iter().filter(|s| here(s)).collect();
     let started_ms = intake::now_seconds() * 1000;
     let session_id = sessions::new_id(started_ms);
     let mut delivered = Vec::new();
@@ -1920,7 +2054,9 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     } else {
         let (knowledge, nodes) = knowledge_for_work(&dirs, &scoped_repos)?;
         delivered = nodes;
-        let (warnings, last) = last_session_here(&dirs, &root).unwrap_or_default();
+        // sykli is asked about each pending validation shown, once.
+        let runs = lifecycle::RunStatus::default();
+        let (warnings, last) = last_session_here(&dirs, &root, &runs).unwrap_or_default();
         repos(roots)?;
         let scans = in_repo
             .then(|| scan.clone())
@@ -1929,13 +2065,20 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             .collect();
         let view = selected_perimeter(&root, in_repo, &scoped_repos, scans, outside.clone());
         let perimeter = scoped_perimeter_text(&view, &root);
-        let how = lifecycle_briefing(&root, in_repo, &scoped_repos);
-        let orphaned = sessions::render_orphaned(&orphaned_here);
+        let how = lifecycle_briefing(
+            &intent.briefing_line(&session_id),
+            &root,
+            in_repo,
+            &scoped_repos,
+        );
+        let orphaned = sessions::render_orphaned(&orphaned_here, &|v| runs.ask(v));
+        let still = sessions::render_still_running(&still_running_here, &|v| runs.ask(v));
         // The entry's branch unproven at its tip comes first of all: what
         // everyone builds on.
         let flagged = mark_flag.clone().unwrap_or_default();
         let parts: Vec<&str> = [
             flagged.as_str(),
+            still.as_str(),
             orphaned.as_str(),
             warnings.as_str(),
             knowledge.as_str(),
@@ -1962,7 +2105,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     }
 
     let mut command = Command::new("toimija");
-    command.arg("run").arg("--intent").arg(intent);
+    command.arg("run").arg("--intent").arg(&intent.text);
     if let Some(task) = task {
         command.arg("--task").arg(task);
     }
@@ -2049,7 +2192,11 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         agent: agent.to_owned(),
         repo: repo_key(&root),
         outside_repo: !in_repo,
-        intent: intent.to_owned(),
+        intent: intent.text.clone(),
+        intent_id: Some(intent.id.clone()),
+        task: task.map(str::to_owned),
+        pgid: None,
+        group_started_ms: None,
         started_ms,
         branch: in_repo.then(|| lifecycle::branch(&root)).flatten(),
         head_at_start: in_repo.then(|| lifecycle::head(&root)).flatten(),
@@ -2068,6 +2215,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         drafted: false,
         usage: Vec::new(),
         usage_refused: None,
+        validations: Vec::new(),
     };
     // From here to the end of leaving, a signal is kept, not fatal.
     lifecycle::supervise();
@@ -2079,6 +2227,9 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     eprintln!("ohjaa: session {session_id} entering");
 
     // Stay the parent: leaving must run when the session ends, however it ends.
+    // The session leads a process group of its own (holding the terminal when
+    // ohjaa did), so a later launch can tell whether it still runs.
+    lifecycle::own_group(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -2105,6 +2256,23 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             return Err(error).context("failed to run toimija");
         }
     };
+    // Its process group, in the entering record as soon as it exists: a
+    // later launch tells by it whether the session outlived this ohjaa.
+    if let Some(pgid) = lifecycle::group_started(&child) {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(started_ms, |since| since.as_millis() as i64);
+        session.pgid = Some(pgid);
+        session.group_started_ms = Some(at_ms);
+        if let Some(store) = session_store(&dirs) {
+            if let Err(error) = store.update(&session_id, |s| {
+                s.pgid = Some(pgid);
+                s.group_started_ms = Some(at_ms);
+            }) {
+                eprintln!("ohjaa: {error}; the session's process group is not recorded");
+            }
+        }
+    }
     let waited = lifecycle::wait(&mut child);
 
     // State 5, leaving: observe what happened, keep the agent's testimony,
@@ -2295,7 +2463,13 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // Written with `let _`: a closed terminal must not turn printing into a
     // panic after the record is already safe.
     let mut stderr = std::io::stderr();
-    let _ = writeln!(stderr, "\n{}", sessions::render_record(&session));
+    // The validations it requested, with what sykli says of them now.
+    let runs = lifecycle::RunStatus::default();
+    let _ = writeln!(
+        stderr,
+        "\n{}",
+        sessions::render_record_with(&session, &|v| runs.ask(v))
+    );
     if session.left.as_ref().is_some_and(|left| left.interrupted) {
         let _ = writeln!(
             stderr,
@@ -2324,12 +2498,14 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
 /// as orphaned (observed at this launch), which queues it for `ohjaa intake`
 /// and ranks it by its start among the sessions where it ran; with `write`
 /// false (a dry run) it is only said. A session whose ohjaa may still run, or
-/// cannot be told, is left alone.
-fn close_orphans(dirs: &Dirs, write: bool) -> Vec<sessions::Session> {
+/// cannot be told, is left alone. So is one whose own process group (its
+/// entering record names it) still runs: its agent outlived its ohjaa, and
+/// it is returned apart, as still running.
+fn close_orphans(dirs: &Dirs, write: bool) -> (Vec<sessions::Session>, Vec<sessions::Session>) {
     // A dry run only says what it would close: it opens the log to read.
     let store = if write {
         let Some(store) = session_store(dirs) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         Some(store)
     } else {
@@ -2339,21 +2515,24 @@ fn close_orphans(dirs: &Dirs, write: bool) -> Vec<sessions::Session> {
         Some(store) => store.all(),
         None => match session_reader(dirs) {
             Some(log) => log.all(),
-            None => return Vec::new(),
+            None => return (Vec::new(), Vec::new()),
         },
     };
     let Ok((all, _)) = all else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let now_ms = intake::now_seconds() * 1000;
     let mut closed = Vec::new();
+    let mut still_running = Vec::new();
     for session in all.into_iter().filter(|s| s.left.is_none()) {
-        let Some(pid) = sessions::pid_of(&session.id) else {
-            continue;
-        };
-        if pid == std::process::id() || process::ohjaa_alive(pid, session.started_ms) != Some(false)
-        {
-            continue;
+        match sessions::observe_open(&session) {
+            sessions::Open::Running => continue,
+            // Its ohjaa is gone; its agent is not.
+            sessions::Open::OhjaaGone => {
+                still_running.push(session);
+                continue;
+            }
+            sessions::Open::Orphaned => {}
         }
         let left = sessions::Left::orphaned(now_ms);
         let Some(store) = &store else {
@@ -2375,7 +2554,7 @@ fn close_orphans(dirs: &Dirs, write: bool) -> Vec<sessions::Session> {
             Err(error) => eprintln!("ohjaa: {error}"),
         }
     }
-    closed
+    (closed, still_running)
 }
 
 /// Every other session's time in a checkout while this one ran (`started_ms`
@@ -2545,16 +2724,13 @@ fn observe_repo(
     let landed = work
         .landed
         .iter()
-        .map(|arrived| sessions::Landed {
-            commit: arrived.commit.clone(),
-            subject: arrived.subject.clone(),
-            onto: arrived.onto.clone(),
+        .map(|arrived| {
             // sykli is asked about the tip of each of this session's pushes, as a
             // pre-push Boundary would be, and about where the remote default
             // branch is now, whoever pushed it: a broken main is the
             // repository's state. The commits before a tip are their receipts'
             // word.
-            check: ((arrived.tip && arrived.attributed)
+            let check = ((arrived.tip && arrived.attributed)
                 || (arrived.at_tip && arrived.onto.contains('/')))
             .then(|| {
                 unless_interrupted(|| {
@@ -2570,13 +2746,25 @@ fn observe_repo(
                 .unwrap_or_else(|| sessions::Check::Unverified {
                     why: "leaving was interrupted".to_owned(),
                 })
-            }),
-            evidence: work
-                .receipts
-                .get(&arrived.tree)
-                .map(|receipt| receipt.evidence.clone()),
-            at_tip: arrived.at_tip,
-            unattributed: !arrived.attributed,
+            });
+            // A proven commit: the receipt sykli accepted, so a reuse of its
+            // cache is said as one.
+            let proof = (check == Some(sessions::Check::Passed))
+                .then(|| sykli.proof(&arrived.commit))
+                .flatten();
+            sessions::Landed {
+                commit: arrived.commit.clone(),
+                subject: arrived.subject.clone(),
+                onto: arrived.onto.clone(),
+                check,
+                evidence: proof.or_else(|| {
+                    work.receipts
+                        .get(&arrived.tree)
+                        .map(|receipt| receipt.evidence.clone())
+                }),
+                at_tip: arrived.at_tip,
+                unattributed: !arrived.attributed,
+            }
         })
         .collect();
     Observed {
@@ -2641,7 +2829,7 @@ fn scope_reaches(session: &scan::Session, dir: &Path) -> bool {
 /// for only where there is a contract for it to run. Launched outside a
 /// repository, the agent is told which scoped repositories are observed, and
 /// that work anywhere else has to be named in its handover.
-fn lifecycle_briefing(root: &Path, in_repo: bool, scoped: &[PathBuf]) -> String {
+fn lifecycle_briefing(intent: &str, root: &Path, in_repo: bool, scoped: &[PathBuf]) -> String {
     let names = scoped
         .iter()
         .map(|repo| repo.file_name().unwrap_or_default().to_string_lossy())
@@ -2680,7 +2868,7 @@ fn lifecycle_briefing(root: &Path, in_repo: bool, scoped: &[PathBuf]) -> String 
     format!(
         "\
 How this session works (ohjaa):
-If no concrete task is assigned, acknowledge and wait; the wrapper has already
+{intent}If no concrete task is assigned, acknowledge and wait; the wrapper has already
 recorded entry. Do not run orientation, discovery or handover tools just to start.
 Once a task is assigned, use this briefing and the Toimija packet as your starting
 knowledge. Read the named files to resolve gaps; do not repeat repository discovery.
@@ -2736,6 +2924,7 @@ fn main() {
         Cmd::Run {
             agent,
             intent,
+            intent_id,
             task,
             scope,
             dry_run,
@@ -2744,7 +2933,8 @@ fn main() {
             passthrough,
         } => cmd_run(RunOptions {
             agent,
-            intent,
+            intent: intent.as_deref(),
+            intent_id: intent_id.as_deref(),
             task: task.as_deref(),
             scope,
             dry_run: *dry_run,
