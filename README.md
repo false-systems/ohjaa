@@ -221,44 +221,64 @@ its handover, and the record shows them as its words. Leaving always writes the
 record, crash or not; a missing handover is recorded as none. Only losing ohjaa
 itself (a SIGKILL, a crash, a restart) skips leaving. The session runs in a
 process group of its own (`toimija run` leads it, the agent stays in it), and
-its entering record names that group (`pgid`, with when it was started), so a
-later launch tells the session apart from its ohjaa:
+its entering record names that group (`pgid`, with when it was made) before
+toimija runs at all: the child says its pid, ohjaa records it, and only then
+does the child exec. So a later launch tells the session apart from its ohjaa:
 
-- ohjaa gone, the group still running: **still running** (`STILL RUNNING:` at
-  the top of the briefing, and `ohjaa_gone` in `report --json`). Its agent
-  outlived its ohjaa and may still be changing things; the session is left
-  open, and its leaving will not be recorded.
-- ohjaa and the group both gone (or an older record with no group): the next
+- ohjaa gone, the group's leader still running: **still running** (`STILL
+  RUNNING:` at the top of the briefing, and `ohjaa_gone` in `report --json`).
+  Its agent outlived its ohjaa and may still be changing things; the session
+  is left open, and its leaving will not be recorded.
+- ohjaa and the leader both gone (or an older record with no group): the next
   launch closes it as `orphaned (observed at next launch)`, queues it for
   `ohjaa intake`, and opens its briefing with it when it ran here.
 
-A group of the same id led by a process that started after the session's
-group did is another group, the id reused, and a group with only exited,
-unreaped members is gone. Only the absence is observed, never a cause, and an
-orphan ranks by when it started: a session that really ended after that stays
-the last session here.
+The leader decides, not every member: toimija waits for its agent, so a
+process the agent left behind in the group (a background shell, a server)
+does not keep a dead session running. A leader that exited and was not reaped
+yet is gone, and a process with that pid in another group, or one that
+started after the group was made, is another process, the id reused. Under a
+wrapper without job control (`sh -c 'ohjaa run …'`) at a terminal, the session
+shares ohjaa's process group instead (see the signals below), and has no
+group of its own to be told apart by: a later launch judges it by its ohjaa
+alone, as before. Only the absence is observed, never a cause, and an orphan
+ranks by when it started: a session that really ended after that stays the
+last session here.
 
-**Intent.** An Intent has an id of its own (`in-<ms>-<pid>`, in the same style
-as a session's `oh-<ms>-<pid>`, and never one of them): `ohjaa run --intent
+**Intent.** An Intent has an id of its own (`in-<ms>-<pid>`, minted in real
+milliseconds, so never a session's `oh-<ms>-<pid>`): `ohjaa run --intent
 "…"` mints one, and `ohjaa run <agent> --intent-id <id>` continues it in a new
 session, its text coming from the newest session that carries it unless
 `--intent` gives another. An id no session in the log carries is refused
 (exit 3); a log that cannot be read never refuses a launch, and the briefing
-says the continuation is unchecked. The briefing names both ids ("This
-session is oh-…; its intent is in-…, new"), the record and the next briefing
-show it (`intent  fix the parser (intent in-…)`), and `--task` is recorded as
-given. Older records have no intent id.
+says the continuation is unchecked. An Intent may span repositories: one last
+worked on in another repository is continued, and that is said on the
+terminal and in the briefing ("continued from session oh-…, which worked on
+it in <repo>"). The briefing names both ids ("This session is oh-…; its
+intent is in-…, new"), the record and the next briefing show it (`intent
+fix the parser (intent in-…)`), and `--task` is recorded as given. Older
+records have no intent id.
 
 **Validations.** `ohjaa gate` inside a session writes a validation reference
 into the session's record before it asks sykli (see `ohjaa gate` below): a
 reference, never an outcome. The record and the next briefing list each one
 in the observed part, before the handover: its request, kind, commit and
-tree, then sykli's run id and receipt (path and sha256) as recorded. One with a
-run id and no receipt yet is pending: at leaving, when an orphan is closed, in
-`ohjaa session` and in every briefing, sykli is asked about it (`sykli status
---run <id> --json`, once per run) and its answer is shown as sykli's (`sykli
-says run … is running: 1 running, 1 pending`), never stored. A sykli without
-`sykli status --run` is said to be one that cannot be asked.
+tree (and the tree sykli ran, when it is not exactly the commit's, or was
+dirty), then sykli's run id and receipt (path and sha256) as recorded. One
+with a run id and no receipt yet is pending: at leaving, when an orphan is
+closed, in `ohjaa session` and in every briefing, sykli is asked about it
+(`sykli status --run <id> --json`, once per run) and its answer is shown as
+sykli's (`sykli says run … is running: 1 running, 1 pending`), never stored.
+sykli is asked from the checkout the run was requested in, else from any
+checkout of its clone that is left (sykli keeps its runs in the clone's
+common dir, which outlives a removed worktree), handed `--repo-root` and
+`--git-common-dir` when it takes them. A run that ended in any state but
+`completed` (interrupted, lost, indeterminate) is said as not proven and not
+failed. A pending validation outlives its session: every briefing in the
+clone names those earlier sessions left pending ("Validations earlier
+sessions here left pending:"), until sykli says the run ended; one sykli
+cannot be asked about is named for a week from its request, then counted. A
+sykli without `sykli status --run` is said to be one that cannot be asked.
 
 The next session here, and in every repository it named with `--scope` (never
 one it was only found working in), is briefed with the last session's record:
@@ -344,21 +364,36 @@ request head (never what could not be checked, nor what is not shown to be the
 session's); a non-zero exit; a missing handover; an orphaned session. Those are
 facts, not anyone's words, and the drafter is told so.
 
-Signals, while a session runs (unix):
+Signals and the terminal, while a session runs (unix). The session's process
+group is apart from ohjaa's, so ohjaa does with the terminal what a
+job-control shell does with a job's, at every moment, not only at the start:
 
-- **Ctrl-C** reaches the agent directly: the session's process group holds the
-  terminal while it runs (ohjaa hands it over, as a shell gives a job the
-  terminal, and takes it back at the end). ohjaa never passes it on: a second
-  Ctrl-C makes agents like `claude` quit instead of interrupt. **Ctrl-Z** stops
-  the session and then ohjaa, so the shell sees its job stopped; `fg` gives
-  the terminal back to the session.
-- **SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2** sent to ohjaa are survived and
-  passed on to the session once each. To stop a session from outside, send
-  SIGTERM to ohjaa, or SIGINT to the session's process group (its record's
-  `pgid`).
-- **After the session ends**, any of these cuts leaving short (the tools still
-  running are killed) and the record is still written, with what was known by
-  then; the normal dispositions come back once it is saved.
+- **While ohjaa's job is in the foreground**, the session's group holds the
+  terminal: the agent reads it, and **Ctrl-C** (and Ctrl-backslash) reaches it
+  directly. ohjaa does not pass it on again: a second Ctrl-C makes agents like
+  `claude` quit instead of interrupt.
+- **Ctrl-Z** (or the agent suspending itself) stops the session, then ohjaa's
+  job with the same signal, once ohjaa has the terminal back, so the shell
+  sees the job stopped. The same goes for a session that reads or writes the
+  terminal from the background (`ohjaa run … &`): the shell shows the job
+  `suspended (tty input)`. `fg` gives the session the terminal again and
+  continues it; `bg` continues it without.
+- **SIGINT and SIGQUIT sent to ohjaa** while the session does not hold the
+  terminal (no terminal at all, or ohjaa's job not in the foreground) are
+  passed to the session's group, each time: nothing else can bring it one.
+- **SIGTERM, SIGHUP, SIGUSR1, SIGUSR2** sent to ohjaa are survived and passed
+  to the session's group once each, with a SIGCONT, so a stopped session can
+  act on them: Ctrl-Z, then `kill %1`, ends it at once. To stop a session from
+  outside, send SIGTERM to ohjaa, or SIGINT to the session's process group
+  (its record's `pgid`).
+- **Under a wrapper without job control** (`sh -c 'ohjaa run …'`) at a
+  terminal, nobody would give the terminal back should ohjaa be killed while
+  the session held it, so the session shares ohjaa's process group, as it
+  always did, and the terminal is not handed over.
+- **After the session ends**, the terminal is ohjaa's group's again, and any
+  of these signals cuts leaving short (the tools still running are killed)
+  and the record is still written, with what was known by then; the normal
+  dispositions come back once it is saved.
 - **SIGKILL** cannot be caught: it loses the leaving. The session's group
   outlives it, and the next launch says whether it still runs (above).
 
@@ -666,11 +701,14 @@ recorded. A `ValidationRef` holds:
 | field | what | from |
 |---|---|---|
 | `request` | ohjaa's id for the request, `rq-<ms>-<pid>` | ohjaa, at once |
-| `kind` | `integrated` when HEAD is the entry branch's tip as this clone last saw it (`origin/<branch>`), else `candidate` | git, at once |
 | `repo`, `commit`, `tree` | the checkout, HEAD and its tree | git, at once |
+| `common` | the clone's git common dir, where sykli keeps its runs | the layout, at once |
+| `observed_branch` | `{name, tip, updated_ms}`: the entry's branch, where `origin/<branch>` was in this clone, and when it last moved here (its reflog): never a statement about the remote now | git and the reflog, at once |
 | `contract`, `contract_digest` | the gate, and the hash its `sykli.lock` pins (else the one sykli reports) | the lock, at once |
 | `requested_ms` | when | ohjaa, at once |
 | `run` | sykli's run id, once sykli gives one | sykli |
+| `ran` | `{tree, dirty}`: what sykli says ran (a run of uncommitted changes runs another tree, dirty) | sykli |
+| `kind` | `candidate`; `integrated` only once sykli says the run was of exactly the commit's tree, nothing dirty beside it, and the commit was `observed_branch.tip` | from the above |
 | `lock_digest` | the lock's sha256, as sykli reports it | sykli |
 | `receipt` | `{path, digest}`: the receipt sykli keeps of the run (`.sykli/receipts/rcpt_<sha256>.json`, digest as sykli names it), else `.sykli/receipt.json` without a digest | sykli |
 
@@ -680,14 +718,19 @@ and `sykli status --help` naming `--run`), the gate hands the run over
 detached, `sykli run <contract> --detach --json`, which answers `{schema:
 "sykli-run.v1", run}` once sykli has recorded the run; the run id goes into the
 record at once, then the gate asks `sykli status --run <id> --json`
-(`sykli-run-status.v1`) until the run ends, says sykli's answer, records the
-receipt it names, saves it as `.sykli/receipt.json` and verifies it as above.
-Should the gate or its session be stopped meanwhile, the run goes on in sykli,
-and its id is in the record for whoever asks next. With any other sykli the
-gate runs in the foreground, as always, and fills in the run id only if the
-receipt names one. The D3 shapes are read as KATANA's DECISIONS.md writes
-them; the tests drive them with a stub, and a real sykli with durable runs is
-not released yet.
+(`sykli-run-status.v1`, handed `--repo-root` and `--git-common-dir` when sykli
+takes them) until the run ends, says sykli's answer, records what ran and the
+receipt it names (a relative path is taken from the checkout), saves it as
+`.sykli/receipt.json` and verifies it as above. It waits at most `--wait`
+seconds (30 minutes by default). A run still going then, or one sykli says
+ended in any state but `completed` (interrupted, lost, indeterminate), is not
+proven and not failed: the gate says so and exits 75, and the run stays
+recorded for whoever asks next. Only a completed run whose receipt does not
+pass is a failure. Should the gate or its session be stopped meanwhile, the
+run goes on in sykli. With any other sykli the gate runs in the foreground,
+as always, and fills in the run id only if the receipt names one. The D3
+shapes are read as KATANA's DECISIONS.md writes them; the tests drive them
+with a stub, and a real sykli with durable runs is not released yet.
 
 ### Observe, mark, flag
 
