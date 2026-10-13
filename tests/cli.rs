@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const STUB: &str = r#"#!/bin/sh
+# The window between the spawn and the record: ohjaa killed at once.
+if [ -n "${OHJAA_STUB_KILL_PARENT:-}" ] && [ "$1" = run ]; then kill -9 "$PPID"; fi
 printf '%s|%s\n' "$PWD" "$*" >> "$OHJAA_STUB_CALLS"
 if [ "$1" = run ]; then printf '%s\n' "$@" > "$OHJAA_STUB_ARGV"; fi
 case "$PWD" in
@@ -2332,14 +2334,26 @@ fn sigterm_to_ohjaa_reaches_the_session_and_leaving_still_runs() {
     fixture.cleanup();
 }
 
+/// Without a terminal nothing but ohjaa can bring the session an interrupt
+/// (it runs in a process group of its own): SIGINT sent to ohjaa reaches the
+/// session's group once, never twice, and the session decides what it means.
+/// With the terminal, Ctrl-C reaches the session directly (tests/terminal.rs).
 #[test]
-fn sigint_aimed_at_ohjaa_alone_does_not_cut_the_session_short() {
+fn sigint_to_ohjaa_without_a_terminal_reaches_the_session_once() {
     if !git_available() {
         return;
     }
     let fixture = Fixture::new("sigint");
     let repo = fixture.make_git_repo("work");
-    let child = spawn_session(&fixture, &repo, "sleep 1; exit 4");
+    let interrupts = fixture.dir.join("interrupts");
+    let child = spawn_session(
+        &fixture,
+        &repo,
+        &format!(
+            "trap 'echo int >> \"{}\"' INT; sleep 2; exit 4",
+            interrupts.display()
+        ),
+    );
     std::thread::sleep(std::time::Duration::from_millis(300));
     signal(child.id(), "INT");
     let output = child.wait_with_output().unwrap();
@@ -2347,9 +2361,14 @@ fn sigint_aimed_at_ohjaa_alone_does_not_cut_the_session_short() {
     assert_eq!(
         output.status.code(),
         Some(4),
-        "ohjaa waited for the session: {stderr}"
+        "the session handled it, and ohjaa waited for its end: {stderr}"
     );
     assert!(stderr.contains("ended: exit 4"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&interrupts).unwrap_or_default(),
+        "int\n",
+        "the session got the interrupt, once"
+    );
     fixture.cleanup();
 }
 
@@ -3741,7 +3760,11 @@ fn a_session_whose_ohjaa_was_killed_is_closed_as_orphaned_at_the_next_launch() {
     let mut child = spawn_session(
         &fixture,
         &repo,
-        &format!("echo $$ > '{}'; exec sleep 30", agent_pid.display()),
+        // Written whole, then moved into place: never read half written.
+        &format!(
+            "echo $$ > '{0}.new'; mv '{0}.new' '{0}'; exec sleep 30",
+            agent_pid.display()
+        ),
     );
     signal(child.id(), "KILL");
     let _ = child.wait();
@@ -5294,6 +5317,31 @@ fn an_intent_has_an_id_that_a_later_session_continues() {
         "{stdout}"
     );
 
+    // Continued in another repository: an Intent may span them, and where it
+    // was last worked on is said, on the terminal and in the briefing.
+    let other = fixture.make_git_repo("other");
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent-id", &intent, "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&other),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let work = fs::canonicalize(&repo).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "ohjaa: intent {intent} was last worked on in {} (session ",
+            work.display()
+        )) && stderr.contains("); it is continued here"),
+        "{stderr}"
+    );
+    let briefing = fixture.argv().join("\n");
+    assert!(
+        briefing.contains(&format!("which worked on it in {}.", work.display())),
+        "{briefing}"
+    );
+
     // An intent no session carries is refused before anything starts.
     let (_, stderr, code) = output_of(
         fixture
@@ -5312,7 +5360,8 @@ fn an_intent_has_an_id_that_a_later_session_continues() {
             .as_array()
             .unwrap()
             .len(),
-        2
+        3,
+        "the refused launch recorded nothing"
     );
     // Neither an intent nor an intent id: nothing to launch for.
     let (_, stderr, code) = output_of(
@@ -5461,6 +5510,147 @@ fn a_session_whose_agent_outlives_its_killed_ohjaa_is_still_running_not_orphaned
         .unwrap()
         .clone();
     assert_eq!(first["left"]["orphaned"], true, "{first:#}");
+    fixture.cleanup();
+}
+
+/// Nit 1 of the review of #45: a process the agent left behind in the
+/// session's group (a background shell, a server) does not keep a session
+/// running whose ohjaa and agent are gone: the group's leader decides.
+#[test]
+fn a_process_left_in_the_group_does_not_keep_a_dead_session_running() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("stray");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let (pids, stray) = (fixture.dir.join("agent.pid"), fixture.dir.join("stray.pid"));
+    let mut child = spawn_session(
+        &fixture,
+        &repo,
+        // Written whole, then moved into place: never read half written.
+        &format!(
+            "sleep 60 & echo $! > '{1}.new'; mv '{1}.new' '{1}'; \
+             echo $$ > '{0}.new'; mv '{0}.new' '{0}'; exec sleep 60",
+            pids.display(),
+            stray.display()
+        ),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !pids.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let read = |path: &Path| -> u32 { fs::read_to_string(path).unwrap().trim().parse().unwrap() };
+    let (agent, left_behind) = (read(&pids), read(&stray));
+    let entering = loop {
+        let entering = export_of(&fixture, &repo)["sessions"][0].clone();
+        if entering.get("pgid").is_some() || std::time::Instant::now() > deadline {
+            break entering;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let id = entering["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        entering["pgid"].as_u64(),
+        Some(u64::from(agent)),
+        "{entering:#}"
+    );
+    signal(child.id(), "KILL");
+    let _ = child.wait();
+    signal(agent, "KILL");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while Command::new("kill")
+        .args(["-0", &agent.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        group_alive(agent),
+        "what the agent left behind is still in its group"
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent", "next", "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    signal(left_behind, "KILL");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!("ohjaa: session {id} (sh, started "))
+            && stderr.contains("was left open by an ohjaa that is gone; closed as orphaned"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("still running"), "{stderr}");
+    fixture.cleanup();
+}
+
+/// Nit 2 of the review of #45: the session's group is in its entering record
+/// before toimija runs at all, so an ohjaa killed the moment toimija starts
+/// still leaves a record that names the group: the next launch sees the
+/// agent still running, never an orphan.
+#[test]
+fn the_group_is_recorded_before_toimija_runs() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("window");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let pids = fixture.dir.join("agent.pid");
+    let mut ohjaa = fixture
+        .ohjaa()
+        .args([
+            "run",
+            "sh",
+            "--intent",
+            "window",
+            "--no-briefing",
+            "--",
+            "-c",
+        ])
+        .arg(format!(
+            "echo $$ > '{0}.new'; mv '{0}.new' '{0}'; exec sleep 60",
+            pids.display()
+        ))
+        .env("OHJAA_STUB_RUN_AGENT", "1")
+        .env("OHJAA_STUB_KILL_PARENT", "1")
+        .current_dir(&repo)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = ohjaa.wait();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !pids.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let agent: u32 = fs::read_to_string(&pids).unwrap().trim().parse().unwrap();
+    let entering = export_of(&fixture, &repo)["sessions"][0].clone();
+    assert_eq!(
+        entering["pgid"].as_u64(),
+        Some(u64::from(agent)),
+        "the group, recorded before toimija ran: {entering:#}"
+    );
+    let (_, stderr, _) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent", "next", "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    signal(agent, "KILL");
+    assert!(
+        stderr.contains("is still running in process group"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("closed as orphaned"), "{stderr}");
     fixture.cleanup();
 }
 

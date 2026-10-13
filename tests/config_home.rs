@@ -39,6 +39,8 @@ use std::process::{Command, Output};
 /// own.
 const SYKLI_STUB: &str = r#"#!/bin/sh
 printf '%s|%s\n' "$PWD" "$*" >> "$SANDBOX/sykli-calls"
+# Who asks about runs: the caller a test names, so a straggler is never counted.
+[ "$1" = status ] && printf '%s|%s\n' "${SYKLI_CALLER:-}" "$*" >> "$SANDBOX/status-calls"
 facts() {
   if [ "${STUB_SYKLI_CONTRACT:-}" = fast ]; then
     echo "      --repo-root <DIR>        the repository's work tree"
@@ -49,6 +51,9 @@ digest() { (sha256sum 2>/dev/null || shasum -a 256) < "$1" | cut -c1-64; }
 # The receipt of a run: printed, and kept as sykli keeps it.
 receipt() {
   tree=$(cat "$SANDBOX/tree" 2>/dev/null)
+  # With $SANDBOX/dirty-tree, a run of uncommitted changes: that tree, dirty.
+  ran=$tree; dirty=false
+  [ -f "$SANDBOX/dirty-tree" ] && { ran=$(cat "$SANDBOX/dirty-tree"); dirty=true; }
   t1=passed; top=$1; more=""
   if [ -f "$SANDBOX/with-cached" ] || [ -f "$SANDBOX/all-cached" ]; then
     more=',{"name":"u","outcome":"cached","source":"cache"}'
@@ -58,8 +63,8 @@ receipt() {
   run_field=""
   [ -n "$2" ] && run_field="\"run\":\"$2\","
   mkdir -p .sykli/receipts
-  printf '{"schema":"sykli-receipt.v1",%s"contract_hash":"c0ffee","lock_digest":"10c4","outcome":"%s","started_at_ms":%s,"subject":{"tree_oid":"%s","head_tree_oid":"%s","dirty":false},"tasks":[{"name":"t","outcome":"%s"}%s]}\n' \
-    "$run_field" "$top" "$(date +%s)000" "$tree" "$tree" "$t1" "$more" > .sykli/receipts/.new
+  printf '{"schema":"sykli-receipt.v1",%s"contract_hash":"c0ffee","lock_digest":"10c4","outcome":"%s","started_at_ms":%s,"subject":{"tree_oid":"%s","head_tree_oid":"%s","dirty":%s},"tasks":[{"name":"t","outcome":"%s"}%s]}\n' \
+    "$run_field" "$top" "$(date +%s)000" "$ran" "$tree" "$dirty" "$t1" "$more" > .sykli/receipts/.new
   sum=$(digest .sykli/receipts/.new)
   mv .sykli/receipts/.new ".sykli/receipts/rcpt_$sum.json"
   echo "$PWD/.sykli/receipts/rcpt_$sum.json"
@@ -141,14 +146,19 @@ case "$1" in
     if [ ! -f "$SANDBOX/runs/$run/receipt" ] && [ ! -f "$SANDBOX/hold-runs" ]; then
       (cd "$(cat "$SANDBOX/runs/$run/cwd")" && receipt passed "$run") > "$SANDBOX/runs/$run/receipt"
     fi
-    tree=$(cat "$SANDBOX/tree" 2>/dev/null)
-    if [ -f "$SANDBOX/runs/$run/receipt" ]; then
+    tree=$(cat "$SANDBOX/tree" 2>/dev/null); dirty=false
+    [ -f "$SANDBOX/dirty-tree" ] && { tree=$(cat "$SANDBOX/dirty-tree"); dirty=true; }
+    if [ -f "$SANDBOX/run-state" ] && [ ! -f "$SANDBOX/runs/$run/receipt" ]; then
+      # With $SANDBOX/run-state, a run that ended so, without a receipt.
+      printf '{"schema":"sykli-run-status.v1","run":"%s","state":"%s","subject":{"tree":"%s","commit":null,"dirty":%s},"tasks":[{"name":"t","state":"interrupted","attempts":[]}],"receipt":null}\n' \
+        "$run" "$(cat "$SANDBOX/run-state")" "$tree" "$dirty"
+    elif [ -f "$SANDBOX/runs/$run/receipt" ]; then
       path=$(cat "$SANDBOX/runs/$run/receipt")
-      printf '{"schema":"sykli-run-status.v1","run":"%s","state":"completed","subject":{"tree":"%s","commit":null,"dirty":false},"contract_digest":"c0ffee","lock_digest":"10c4","tasks":[{"name":"t","state":"passed","attempts":[{"id":"a1","started":1,"finished":2,"exit":0,"signal":null,"outcome":"passed","supersedes":null}]},{"name":"u","state":"cached","attempts":[]}],"receipt":{"path":"%s","digest":"%s"}}\n' \
-        "$run" "$tree" "$path" "$(digest "$path")"
+      printf '{"schema":"sykli-run-status.v1","run":"%s","state":"completed","subject":{"tree":"%s","commit":null,"dirty":%s},"contract_digest":"c0ffee","lock_digest":"10c4","tasks":[{"name":"t","state":"passed","attempts":[{"id":"a1","started":1,"finished":2,"exit":0,"signal":null,"outcome":"passed","supersedes":null}]},{"name":"u","state":"cached","attempts":[]}],"receipt":{"path":"%s","digest":"%s"}}\n' \
+        "$run" "$tree" "$dirty" "$path" "$(digest "$path")"
     else
-      printf '{"schema":"sykli-run-status.v1","run":"%s","state":"running","subject":{"tree":"%s","commit":null,"dirty":false},"contract_digest":"c0ffee","lock_digest":"10c4","tasks":[{"name":"t","state":"running","attempts":[{"id":"a1","started":1,"finished":null,"exit":null,"signal":null,"outcome":null,"supersedes":null}]},{"name":"u","state":"pending","attempts":[]}],"receipt":null}\n' \
-        "$run" "$tree"
+      printf '{"schema":"sykli-run-status.v1","run":"%s","state":"running","subject":{"tree":"%s","commit":null,"dirty":%s},"contract_digest":"c0ffee","lock_digest":"10c4","tasks":[{"name":"t","state":"running","attempts":[{"id":"a1","started":1,"finished":null,"exit":null,"signal":null,"outcome":null,"supersedes":null}]},{"name":"u","state":"pending","attempts":[]}],"receipt":null}\n' \
+        "$run" "$tree" "$dirty"
     fi
     exit 0;;
   verify)
@@ -2270,6 +2280,18 @@ impl Sandbox {
         (stdout, blank_times(&stderr))
     }
 
+    /// How many times `caller` (its SYKLI_CALLER) asked sykli about `run`
+    /// (`status --run <run>`), or about any run with `run` empty.
+    fn status_asks(&self, caller: &str, run: &str) -> usize {
+        self.read("status-calls")
+            .lines()
+            .filter(|line| {
+                line.strip_prefix(&format!("{caller}|status --run {run}"))
+                    .is_some()
+            })
+            .count()
+    }
+
     /// An entry whose gate's lock pins it as `pin`.
     fn locked_entry(&self, owner: &str, name: &str, pin: &str) -> PathBuf {
         self.entry(owner, name, Some("{}\n"));
@@ -2409,6 +2431,44 @@ fn ohjaa_gate_records_its_request_before_asking_sykli() {
     assert_eq!(integrated.len(), 1, "{export:#}");
     assert_eq!(integrated[0]["kind"], "integrated", "{export:#}");
     assert_eq!(integrated[0]["commit"], head.as_str());
+    assert_eq!(
+        integrated[0]["ran"],
+        serde_json::json!({"tree": tree, "dirty": false}),
+        "what sykli says ran: {export:#}"
+    );
+    assert_eq!(integrated[0]["observed_branch"]["name"], "main");
+    assert_eq!(integrated[0]["observed_branch"]["tip"], head.as_str());
+    assert!(
+        integrated[0]["observed_branch"]["updated_ms"].is_i64(),
+        "when origin/main last moved here: {export:#}"
+    );
+
+    // Should-fix 3 of the review of #45: at the tip, but a run of
+    // uncommitted changes: a candidate, never integrated, and what ran is
+    // said.
+    fs::write(sandbox.dir.join("dirty-tree"), "d1rty7ree").unwrap();
+    let (_, stderr) = sandbox.session_running(&repo, "ohjaa gate");
+    fs::remove_file(sandbox.dir.join("dirty-tree")).unwrap();
+    let export = sandbox.export(&repo);
+    let dirty = export["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["validations"].as_array().cloned().unwrap_or_default())
+        .find(|v| v["ran"]["dirty"] == true)
+        .unwrap_or_else(|| panic!("{export:#}"));
+    assert_eq!(dirty["kind"], "candidate", "{dirty:#}");
+    assert_eq!(dirty["commit"], head.as_str());
+    assert_eq!(dirty["tree"], tree.as_str());
+    assert_eq!(dirty["ran"]["tree"], "d1rty7ree");
+    assert!(
+        stderr.contains(&format!(
+            "(candidate, {} tree {}; sykli ran tree d1rty7r, dirty)",
+            short(&head),
+            short(&tree)
+        )),
+        "{stderr}"
+    );
 }
 
 /// D4 against the durable runs of D3: the gate records sykli's run id as
@@ -2467,11 +2527,7 @@ fn a_durable_run_is_recorded_by_id_and_sykli_is_asked_about_it() {
     );
     assert!(stderr.contains(&recorded), "{recorded}\n{stderr}");
     assert_eq!(
-        sandbox
-            .read("sykli-calls")
-            .lines()
-            .filter(|line| line.contains(&format!("status --run {run} --json")))
-            .count(),
+        sandbox.status_asks("", &run),
         1,
         "asked by the gate until the run ended, once here, and never at leaving"
     );
@@ -2498,15 +2554,12 @@ fn a_durable_run_is_recorded_by_id_and_sykli_is_asked_about_it() {
     );
     // The run finishes; the next briefing asks again, once.
     fs::remove_file(sandbox.dir.join("hold-runs")).unwrap();
-    let asked = || {
+    let (starts, output) = sandbox.git_starts(
         sandbox
-            .read("sykli-calls")
-            .lines()
-            .filter(|line| line.contains(&format!("status --run {pending_run} --json")))
-            .count()
-    };
-    let before = asked();
-    let (starts, output) = sandbox.git_starts(sandbox.command("ohjaa", &repo).arg("brief"));
+            .command("ohjaa", &repo)
+            .arg("brief")
+            .env("SYKLI_CALLER", "brief"),
+    );
     let brief = text(&output).0;
     assert!(
         brief.contains(&format!(
@@ -2514,7 +2567,11 @@ fn a_durable_run_is_recorded_by_id_and_sykli_is_asked_about_it() {
         )),
         "{brief}"
     );
-    assert_eq!(asked() - before, 1, "sykli is asked once per pending run");
+    assert_eq!(
+        sandbox.status_asks("brief", &pending_run),
+        1,
+        "sykli is asked once per pending run"
+    );
     // What sykli said is never stored.
     let stored = serde_json::to_string(&sandbox.export(&repo)).unwrap();
     assert!(
@@ -2532,6 +2589,148 @@ fn a_durable_run_is_recorded_by_id_and_sykli_is_asked_about_it() {
         text(&output).0
     );
     assert_eq!(starts.len(), without.len(), "the same git processes");
+}
+
+impl Sandbox {
+    /// A sandbox with a durable-run sykli (D3), `acme/widget` cloned with an
+    /// entry whose lock pins its gate, and HEAD's tree as the runs' tree.
+    fn durable(tag: &str) -> (Sandbox, PathBuf) {
+        let mut sandbox = Sandbox::new(tag);
+        sandbox.stub_contract = "fast";
+        sandbox.stub_d3 = true;
+        let (repo, _) = sandbox.repo("acme", "widget", &[]);
+        sandbox.locked_entry("acme", "widget", "c0ffee");
+        sandbox.apply();
+        let tree = sandbox.tree(&repo, "HEAD");
+        fs::write(sandbox.dir.join("tree"), &tree).unwrap();
+        (sandbox, repo)
+    }
+
+    /// Every validation in the log, oldest session first.
+    fn all_validations(&self, cwd: &Path) -> Vec<serde_json::Value> {
+        self.export(cwd)["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|s| s["validations"].as_array().cloned().unwrap_or_default())
+            .collect()
+    }
+}
+
+/// Nit 5 and the D3 field analysis of the review of #45: a durable run still
+/// going past `--wait`, or one sykli says ended in a state other than
+/// completed, is not proven and not failed: exit 75, said as sykli says it,
+/// and the run stays recorded for whoever asks next.
+#[test]
+fn a_durable_run_not_done_is_neither_proven_nor_failed() {
+    let (sandbox, repo) = Sandbox::durable("not-done");
+    fs::write(sandbox.dir.join("hold-runs"), "").unwrap();
+    let (stdout, _) = sandbox.session_running(&repo, "ohjaa gate --wait 1; echo GATE-EXIT=$?");
+    assert!(stdout.contains("GATE-EXIT=75"), "{stdout}");
+    assert!(
+        stdout.contains("is running: 1 running, 1 pending; still running after 1s, so not failed"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("ohjaa gate: failed"), "{stdout}");
+    let held = sandbox.all_validations(&repo);
+    assert!(
+        held[0]["run"].is_string() && held[0].get("receipt").is_none(),
+        "{held:#?}"
+    );
+
+    // Ended, but not completed (D3 says interrupted; audit-sykli.md names
+    // indeterminate): unknown, never failed.
+    for state in ["interrupted", "indeterminate"] {
+        fs::write(sandbox.dir.join("run-state"), state).unwrap();
+        let (stdout, _) = sandbox.session_running(&repo, "ohjaa gate; echo GATE-EXIT=$?");
+        assert!(stdout.contains("GATE-EXIT=75"), "{state}: {stdout}");
+        assert!(
+            stdout.contains(&format!(
+                " {state}: 1 interrupted (not proven, not failed: unknown)"
+            )),
+            "{state}: {stdout}"
+        );
+        assert!(!stdout.contains("ohjaa gate: failed"), "{state}: {stdout}");
+    }
+}
+
+/// Should-fix 4 of the review of #45: sykli keeps its runs in the clone's
+/// common dir, so a pending run is asked about from any checkout of the
+/// clone once the worktree it was requested in is removed.
+#[test]
+fn a_pending_run_is_asked_about_from_the_clone_once_its_worktree_is_gone() {
+    let (sandbox, repo) = Sandbox::durable("wt-gone");
+    let worktree = sandbox.dir.join("projects/widget-wt");
+    sandbox.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            &worktree.to_string_lossy(),
+            "main",
+        ],
+    );
+    fs::write(sandbox.dir.join("hold-runs"), "").unwrap();
+    sandbox.session_running(&worktree, "ohjaa gate & g=$!; sleep 2; kill -9 $g; exit 0");
+    let pending = sandbox.all_validations(&repo)[0].clone();
+    let run = pending["run"].as_str().expect("a run id").to_owned();
+    let session = sandbox.export(&repo)["sessions"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    sandbox.git(
+        &repo,
+        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+    );
+    assert!(!worktree.exists());
+    let output = sandbox.ohjaa_in(&repo, &["session", &session]);
+    let (stdout, stderr) = text(&output);
+    assert!(
+        stdout.contains(&format!("sykli says run {run} is running")),
+        "{stdout}{stderr}"
+    );
+    // Asked from the main clone, handed the clone's facts.
+    let asked = format!(
+        "{}|status --run {run} --repo-root {} --git-common-dir {} --json",
+        repo.display(),
+        repo.display(),
+        repo.join(".git").display()
+    );
+    assert!(
+        sandbox.read("sykli-calls").contains(&asked),
+        "{asked}\n{}",
+        sandbox.read("sykli-calls")
+    );
+}
+
+/// Should-fix 5 of the review of #45 (BRIEF §11): a pending validation
+/// outlives the session that asked for it. Every briefing here names it, as
+/// sykli says it now, after more sessions came and went, until sykli says it
+/// ended.
+#[test]
+fn a_pending_run_is_named_in_briefings_until_sykli_says_it_ended() {
+    let (sandbox, repo) = Sandbox::durable("pending-on");
+    fs::write(sandbox.dir.join("hold-runs"), "").unwrap();
+    sandbox.session_running(&repo, "ohjaa gate & g=$!; sleep 2; kill -9 $g; exit 0");
+    let run = sandbox.all_validations(&repo)[0]["run"]
+        .as_str()
+        .expect("a run id")
+        .to_owned();
+    // Another session here, which asked for nothing.
+    sandbox.session_running(&repo, "exit 0");
+    let brief = sandbox.brief(&repo);
+    assert!(
+        brief.contains("Validations earlier sessions here left pending:")
+            && brief.contains(&format!("sykli says run {run} is running")),
+        "{brief}"
+    );
+    // sykli says it ended: no longer named.
+    fs::remove_file(sandbox.dir.join("hold-runs")).unwrap();
+    let brief = sandbox.brief(&repo);
+    assert!(!brief.contains(&run), "{brief}");
 }
 
 /// D4, audit finding 3: a proof that reused tasks from sykli's cache says so,
@@ -2877,6 +3076,22 @@ fn real_sykli_a_gate_in_a_session_records_the_receipt_sykli_kept() {
         digest,
         "the name sykli keeps it under is its sha256"
     );
+
+    // Should-fix 3 of the review of #45, as the review found it: HEAD is
+    // origin/main's tip, with an uncommitted edit. sykli runs the edited
+    // tree and says so: a candidate, never integrated.
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+    let tree = sandbox.tree(&repo, "HEAD");
+    fs::write(repo.join("state.txt"), "ok, edited\n").unwrap();
+    // (sykli verify refuses a dirty run for HEAD: the gate fails, as it should.)
+    sandbox.session_running(&repo, "ohjaa gate; exit 0");
+    let refs = sandbox.all_validations(&repo);
+    let dirty = refs.last().unwrap();
+    assert_eq!(dirty["commit"], head.as_str(), "{dirty:#}");
+    assert_eq!(dirty["tree"], tree.as_str(), "{dirty:#}");
+    assert_eq!(dirty["kind"], "candidate", "{dirty:#}");
+    assert_eq!(dirty["ran"]["dirty"], true, "{dirty:#}");
+    assert_ne!(dirty["ran"]["tree"], tree.as_str(), "{dirty:#}");
 }
 
 #[test]
@@ -3492,20 +3707,13 @@ fn every_command_stays_within_its_git_budget() {
 
     // The same against a sykli with durable runs (D3): the run handed over
     // detached and asked about by its id, with the same git processes.
-    let status_calls = || {
-        sandbox
-            .read("sykli-calls")
-            .lines()
-            .filter(|line| line.contains("|status --run "))
-            .count()
-    };
-    let asked_before = status_calls();
     let (starts, output) = sandbox.git_starts(
         sandbox
             .command("ohjaa", &gated)
             .arg("gate")
             .env("OHJAA_SESSION", &session)
-            .env("STUB_SYKLI_D3", "1"),
+            .env("STUB_SYKLI_D3", "1")
+            .env("SYKLI_CALLER", "gate"),
     );
     let (stdout, stderr) = text(&output);
     assert!(output.status.success(), "{stdout}{stderr}");
@@ -3520,7 +3728,7 @@ fn every_command_stays_within_its_git_budget() {
         "the run id was recorded: {refs:#?}"
     );
     assert!(
-        status_calls() > asked_before,
+        sandbox.status_asks("gate", "") > 0,
         "sykli was asked about the run"
     );
     assert!(started(&starts, "cat-file"), "{starts:#?}");
@@ -3533,14 +3741,20 @@ fn every_command_stays_within_its_git_budget() {
     // A run still going: the gate is stopped once the run's id is recorded,
     // and the run is left pending in the session's record.
     fs::write(sandbox.dir.join("hold-runs"), "").unwrap();
-    let mut held = sandbox
-        .command("ohjaa", &gated)
-        .arg("gate")
-        .env("OHJAA_SESSION", &session)
-        .env("STUB_SYKLI_D3", "1")
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    // In a group of its own, so it is stopped with what it started; its
+    // asks are its own (SYKLI_CALLER), never counted as another's.
+    let mut held = std::os::unix::process::CommandExt::process_group(
+        sandbox
+            .command("ohjaa", &gated)
+            .arg("gate")
+            .env("OHJAA_SESSION", &session)
+            .env("STUB_SYKLI_D3", "1")
+            .env("SYKLI_CALLER", "held")
+            .stdout(std::process::Stdio::null()),
+        0,
+    )
+    .spawn()
+    .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let pending = loop {
         let refs = validations(&sandbox.export(&gated), 0);
@@ -3550,17 +3764,20 @@ fn every_command_stays_within_its_git_budget() {
         assert!(std::time::Instant::now() < deadline, "no run id: {refs:#?}");
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    held.kill().unwrap();
+    Command::new("kill")
+        .args(["-KILL", "--", &format!("-{}", held.id())])
+        .status()
+        .unwrap();
     held.wait().unwrap();
 
     // ohjaa brief asks sykli about the pending run (and only it), beyond the
     // same briefing from a sykli that cannot be asked: no git process more.
-    let asked_before = status_calls();
     let (with, output) = sandbox.git_starts(
         sandbox
             .command("ohjaa", &gated)
             .arg("brief")
-            .env("STUB_SYKLI_D3", "1"),
+            .env("STUB_SYKLI_D3", "1")
+            .env("SYKLI_CALLER", "brief"),
     );
     assert!(
         text(&output)
@@ -3569,7 +3786,16 @@ fn every_command_stays_within_its_git_budget() {
         "{}",
         text(&output).0
     );
-    assert_eq!(status_calls() - asked_before, 1, "sykli was asked, once");
+    assert_eq!(
+        sandbox.status_asks("brief", &pending),
+        1,
+        "sykli was asked about the pending run, once"
+    );
+    assert_eq!(
+        sandbox.status_asks("brief", ""),
+        1,
+        "and about nothing else"
+    );
     let (without, output) = sandbox.git_starts(sandbox.command("ohjaa", &gated).arg("brief"));
     assert!(
         text(&output)
@@ -3587,13 +3813,13 @@ fn every_command_stays_within_its_git_budget() {
     // The hook path never asks about runs: a push through the dispatcher
     // with a run pending is measured against the plain push above.
     let calls_before = sandbox.read("sykli-calls").lines().count();
-    let asked_before = status_calls();
     sandbox.commit(&gated, "with-a-run-pending");
     let (starts, output) = sandbox.git_starts(
         sandbox
             .command("git", &gated)
             .args(["push", "-q", "origin", "HEAD:refs/heads/main"])
-            .env("STUB_SYKLI_D3", "1"),
+            .env("STUB_SYKLI_D3", "1")
+            .env("SYKLI_CALLER", "push"),
     );
     assert!(output.status.success(), "{}", text(&output).1);
     assert!(started(&starts, "push"), "no git push in the trace");
@@ -3606,7 +3832,11 @@ fn every_command_stays_within_its_git_budget() {
         sandbox.read("sykli-calls").lines().count() > calls_before,
         "the push was handed to sykli"
     );
-    assert_eq!(status_calls(), asked_before, "the hook asks about no run");
+    assert_eq!(
+        sandbox.status_asks("push", ""),
+        0,
+        "the hook asks about no run"
+    );
     budget(
         "ohjaa hook pre-push (a run pending)",
         starts.len().saturating_sub(direct),
