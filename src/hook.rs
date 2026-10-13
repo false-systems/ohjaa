@@ -2,16 +2,21 @@
 //!
 //! A repository whose remote names an entry includes `core.hooksPath =
 //! <home>/hooks` (see `gitconfig`), where each needed hook is a dispatcher into
-//! this command: pre-push, and every hook a gated clone has of its own. No
+//! this command: pre-push, and every hook an observed clone has of its own. No
 //! other repository runs it. Two jobs:
 //!
-//! 1. **The gate (pre-push only).** The repository is found by the URL git
-//!    pushes to. When the home has an entry for it with a contract, sykli
-//!    judges the push against that contract. A refusal stops the push.
+//! 1. **Observing (pre-push only).** The repository is found by the URL git
+//!    pushes to. When the home has an entry for it and the push moves the
+//!    entry's branch, sykli judges the push against the entry's gate, quietly;
+//!    a commit it does not accept is asked about as the marks ask (a receipt
+//!    in any worktree of the clone). Nothing is refused for it: a push that
+//!    is not proven, or cannot be judged or observed at all, goes on, and
+//!    one line flags it.
 //! 2. **Chaining (every hook).** A `core.hooksPath` switches off the clone's
 //!    own `.git/hooks`, so the dispatcher runs the repository's own hook,
 //!    `$(git rev-parse --git-common-dir)/hooks/<name>` when executable, with
-//!    the same arguments and the same stdin, and exits with its status.
+//!    the same arguments and the same stdin, and exits with its status: the
+//!    repository's own hooks still refuse what they refuse.
 //!
 //! Nothing is ever written into the repository.
 
@@ -23,6 +28,8 @@ use std::process::{Command, ExitStatus, Stdio};
 use anyhow::{Context, Result};
 
 use crate::home::{self, RepoId};
+use crate::lifecycle;
+use crate::process;
 
 /// Every hook git runs, as git 2.54 lists them (`githooks(5)`).
 pub const HOOK_NAMES: [&str; 28] = [
@@ -123,9 +130,7 @@ pub fn on_path(name: &str) -> Option<PathBuf> {
         .map(|path| std::path::absolute(&path).unwrap_or(path))
 }
 
-/// Refused, as sykli's hooks say it.
-const REFUSED: i32 = 1;
-/// Could not evaluate.
+/// Could not run: not a hook, or the repository's own hooks cannot be found.
 const CANNOT: i32 = 2;
 
 pub fn run(name: &str, args: &[OsString]) -> Result<i32> {
@@ -142,14 +147,18 @@ pub fn run(name: &str, args: &[OsString]) -> Result<i32> {
             return Ok(CANNOT);
         }
     };
-    let mut input = None;
+    let mut observed = Observed::default();
     if name == "pre-push" {
-        match gate(args, &here)? {
-            Gate::Refused(code) => return Ok(code),
-            Gate::Passed(read) => input = read,
+        observed = observe(args, &here);
+    }
+    let code = chain(name, args, observed.input.as_deref(), &here.common)?;
+    // Said last, where the person sees it, and only for a push that goes.
+    if code == 0 {
+        if let Some(flag) = observed.flag {
+            eprintln!("{flag}");
         }
     }
-    chain(name, args, input.as_deref(), &here.common)
+    Ok(code)
 }
 
 /// Where git runs a hook, worked out once: the work tree's root (git's
@@ -193,10 +202,12 @@ fn here() -> Result<Here> {
     })
 }
 
-enum Gate {
-    Refused(i32),
-    /// Passed; carries git's stdin when the gate read it, for the chained hook.
-    Passed(Option<Vec<u8>>),
+/// What observing a push found: git's stdin when it was read (the chained
+/// hook gets it), and the flag to say when the push goes.
+#[derive(Default)]
+struct Observed {
+    input: Option<Vec<u8>>,
+    flag: Option<String>,
 }
 
 /// One line of git's pre-push stdin.
@@ -221,7 +232,7 @@ fn updates(input: &str) -> std::result::Result<Vec<Update>, String> {
         .collect()
 }
 
-/// The sykli the gate is handed to: the one `apply` recorded in the
+/// The sykli a push is handed to: the one `apply` recorded in the
 /// dispatcher (`OHJAA_SYKLI`), else the one on PATH.
 fn sykli_program() -> PathBuf {
     std::env::var_os("OHJAA_SYKLI")
@@ -253,16 +264,16 @@ fn sykli_help(sykli: &Path) -> std::result::Result<String, String> {
 
 /// Why this sykli cannot judge a push against a contract outside the
 /// repository for exactly the entry's branch, if it cannot. Both flags are
-/// required: without `--branch`, sykli would gate the branch
+/// required: without `--branch`, sykli would judge the branch
 /// `refs/remotes/<remote>/HEAD` names, which need not be the entry's.
-fn cannot_gate(help: &str) -> Option<String> {
+fn cannot_judge(help: &str) -> Option<String> {
     let lacking: Vec<&str> = ["--contract", "--branch"]
         .into_iter()
         .filter(|flag| !help.contains(flag))
         .collect();
     (!lacking.is_empty()).then(|| {
         format!(
-            "the sykli on PATH cannot gate a branch against a contract kept outside the \
+            "this sykli cannot judge a branch against a contract kept outside the \
              repository (`sykli hook pre-push --help` names no {}); update sykli",
             lacking.join(" and no ")
         )
@@ -283,85 +294,128 @@ pub fn facts_for_sykli(help: &str, top: Option<&Path>, common: &Path) -> Vec<OsS
     }
 }
 
-fn read_stdin() -> Result<Vec<u8>> {
+/// What git pushes, read whole; what could be read when reading fails, and
+/// why (the push goes on all the same).
+fn read_stdin() -> (Vec<u8>, Option<String>) {
     let mut input = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut input)
-        .context("cannot read what git pushes")?;
-    Ok(input)
-}
-
-/// Refuse when the push moves the entry's branch, saying `why` it cannot be
-/// judged; let every other push through. A push to the gated branch never
-/// passes unjudged.
-fn refuse_the_gated_branch(input: Vec<u8>, slug: &str, branch: &str, why: &str) -> Gate {
-    const HOOK: &str = "ohjaa hook pre-push";
-    let text = String::from_utf8_lossy(&input);
-    let updates = match updates(&text) {
-        Ok(updates) => updates,
-        Err(error) => {
-            eprintln!("{HOOK}: cannot read what is pushed: {error}");
-            return Gate::Refused(CANNOT);
-        }
-    };
-    let gated = format!("refs/heads/{branch}");
-    let pushed = updates
-        .iter()
-        .find(|update| update.remote_ref == gated && !update.local_sha.bytes().all(|b| b == b'0'));
-    match pushed {
-        Some(update) => {
-            let sha = &update.local_sha;
-            eprintln!(
-                "{HOOK}: refusing to push {} to {gated} of {slug}: {why}",
-                &sha[..sha.len().min(12)]
-            );
-            Gate::Refused(REFUSED)
-        }
-        None => Gate::Passed(Some(input)),
+    match std::io::stdin().read_to_end(&mut input) {
+        Ok(_) => (input, None),
+        Err(error) => (
+            input,
+            Some(format!("what git pushes cannot be read: {error}")),
+        ),
     }
 }
 
-/// The gate: the URL is git's `$2`, the entry is a file, and the repository's
-/// facts come from [`here`], so no git process is started here.
-fn gate(args: &[OsString], here: &Here) -> Result<Gate> {
-    const HOOK: &str = "ohjaa hook pre-push";
+/// How long sykli may take with a push a person waits on: past it, the push
+/// goes on, flagged.
+const SYKLI_LIMIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The flag for a push to `branch` that is not proven, `why` in sykli's
+/// words (or why sykli could not be asked).
+fn unproven(branch: &str, why: &str) -> String {
+    format!(
+        "ohjaa: UNPROVEN push to {branch} ({why}). It is pushed and flagged; prove it with: \
+         ohjaa gate"
+    )
+}
+
+/// The flag for a push ohjaa could not observe at all.
+fn unobserved(slug: &str, why: &str) -> String {
+    format!("ohjaa: UNOBSERVED push to {slug}: {why}. It is pushed; fix it, then: ohjaa doctor")
+}
+
+/// sykli's reason, from what `sykli hook pre-push` said on stderr: its first
+/// line, without the hook's name or the commit and ref the flag names again.
+fn sykli_reason(stderr: &str) -> Option<String> {
+    let line = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let line = line.strip_prefix("sykli hook pre-push: ").unwrap_or(line);
+    // `refusing to push <sha> to <ref>: <reason>`
+    let reason = line
+        .strip_prefix("refusing to push ")
+        .and_then(|rest| rest.split_once(": ").map(|(_, reason)| reason))
+        .unwrap_or(line);
+    Some(reason.to_owned())
+}
+
+/// Observe a push: never refuse it, whatever fails here. The URL is git's
+/// `$2`, the entry is a file, and the repository's facts come from [`here`],
+/// so no git process is started on the way. A push that moves the entry's
+/// branch is handed to `sykli hook pre-push` against the entry's gate,
+/// quietly. sykli looks for a receipt only in the worktree that pushes; when
+/// it does not accept the push, the commit is asked about as the marks ask
+/// (every worktree's receipts, one git process for its tree and one `sykli
+/// verify`), so a commit proven in another worktree is not flagged. Else, or
+/// when sykli cannot be asked, the push goes on with a flag.
+fn observe(args: &[OsString], here: &Here) -> Observed {
     let url = args.get(1).map(|url| url.to_string_lossy().into_owned());
     let Some(id) = url.as_deref().and_then(RepoId::parse) else {
-        return Ok(Gate::Passed(None));
-    };
-    let home = home::ohjaa_home()?;
-    let entry = match home::find_entry(&home, &id) {
-        Ok(Some(entry)) => entry,
-        Ok(None) => return Ok(Gate::Passed(None)),
-        Err(error) => {
-            eprintln!("{HOOK}: refusing the push: the entry for {id} cannot be read: {error:#}");
-            eprintln!("{HOOK}: fix it, or skip every hook once with: git push --no-verify");
-            return Ok(Gate::Refused(CANNOT));
-        }
+        return Observed::default();
     };
     let slug = id.slug();
-    let input = read_stdin()?;
-    // An entry means the repository is meant to be gated: without its gate,
-    // its branch is refused, never let through.
+    let observed = |flag: Option<String>, input: Vec<u8>| Observed {
+        input: Some(input),
+        flag,
+    };
+    let home = match home::ohjaa_home() {
+        Ok(home) => home::absolute(home),
+        Err(error) => {
+            let (input, _) = read_stdin();
+            let why = format!("the workflow home cannot be found ({error:#})");
+            return observed(Some(unobserved(&slug, &why)), input);
+        }
+    };
+    let entry = match home::find_entry(&home, &id) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return Observed::default(),
+        Err(error) => {
+            let (input, _) = read_stdin();
+            let why = format!("its entry cannot be read ({error:#})");
+            return observed(Some(unobserved(&slug, &why)), input);
+        }
+    };
+    let (input, unread) = read_stdin();
+    if let Some(why) = unread {
+        return observed(Some(unproven(&entry.branch, &why)), input);
+    }
+    let text = String::from_utf8_lossy(&input).into_owned();
+    let pushed = match updates(&text) {
+        Ok(updates) => updates,
+        Err(error) => {
+            let flag = unproven(
+                &entry.branch,
+                &format!("what is pushed cannot be read: {error}"),
+            );
+            return observed(Some(flag), input);
+        }
+    };
+    let observed_ref = format!("refs/heads/{}", entry.branch);
+    let Some(sha) = pushed
+        .iter()
+        .find(|update| {
+            update.remote_ref == observed_ref && !update.local_sha.bytes().all(|b| b == b'0')
+        })
+        .map(|update| update.local_sha.clone())
+    else {
+        return observed(None, input);
+    };
     if !entry.has_contract() {
         let why = format!(
-            "it has an entry but no gate ({} is missing); write one with \
-             `ohjaa adopt --force`, or remove the entry",
+            "its entry has no gate: {} is missing (ohjaa adopt --force)",
             entry.contract().display()
         );
-        return Ok(refuse_the_gated_branch(input, &slug, &entry.branch, &why));
+        return observed(Some(unproven(&entry.branch, &why)), input);
     }
     let sykli = sykli_program();
     let help = match sykli_help(&sykli) {
         Ok(help) => help,
-        Err(why) => {
-            let why = format!("its gate is {}, but {why}", entry.contract().display());
-            return Ok(refuse_the_gated_branch(input, &slug, &entry.branch, &why));
-        }
+        Err(why) => return observed(Some(unproven(&entry.branch, &why)), input),
     };
-    if let Some(why) = cannot_gate(&help) {
-        let why = format!("its gate is {}, but {why}", entry.contract().display());
-        return Ok(refuse_the_gated_branch(input, &slug, &entry.branch, &why));
+    if let Some(why) = cannot_judge(&help) {
+        return observed(Some(unproven(&entry.branch, &why)), input);
     }
     let mut command = Command::new(&sykli);
     command
@@ -370,17 +424,69 @@ fn gate(args: &[OsString], here: &Here) -> Result<Gate> {
         .args(["--branch", &entry.branch])
         .args(facts_for_sykli(&help, here.top.as_deref(), &here.common))
         .args(args.iter().take(2));
-    let status =
-        run_with_input(&mut command, Some(&input)).context("cannot run sykli hook pre-push")?;
-    if status.success() {
-        return Ok(Gate::Passed(Some(input)));
+    let why = match process::run(&mut command, Some(&input), SYKLI_LIMIT) {
+        Ok(output) if output.status.success() => return observed(None, input),
+        Err(error) => {
+            let why = format!("sykli hook pre-push could not run: {error:#}");
+            return observed(Some(unproven(&entry.branch, &why)), input);
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            sykli_reason(&stderr)
+                .unwrap_or_else(|| format!("sykli hook pre-push exited {}", output.status))
+        }
+    };
+    let gate = here.top.as_ref().map(|top| lifecycle::Gate {
+        slug: slug.clone(),
+        branch: entry.branch.clone(),
+        contract: home::absolute(entry.contract()),
+        top: top.clone(),
+        common: here.common.clone(),
+    });
+    let proven_elsewhere = gate.is_some_and(|gate| proven_in_the_clone(&gate, &home, &sykli, &sha));
+    let flag = (!proven_elsewhere).then(|| unproven(&entry.branch, &why));
+    observed(flag, input)
+}
+
+/// Whether `commit` is proven as the marks would say: a receipt of its tree
+/// in any worktree of the clone, or kept by sykli, verifies against the
+/// gate. One git process (the commit's tree) and one `sykli verify` at most,
+/// by the sykli the dispatcher names.
+fn proven_in_the_clone(gate: &lifecycle::Gate, home: &Path, sykli: &Path, commit: &str) -> bool {
+    let receipts = lifecycle::receipts_of_layout(&gate.common);
+    // No receipt anywhere in the clone: nothing to ask git or sykli about.
+    if receipts.is_empty() {
+        return false;
     }
-    eprintln!(
-        "{HOOK}: the gate for {slug} ({}, branch {}) refused this push; run it with: ohjaa gate",
-        entry.contract().display(),
-        entry.branch
-    );
-    Ok(Gate::Refused(exit_code(status).max(REFUSED)))
+    let mut command = Command::new("git");
+    command.arg("--git-dir").arg(&gate.common).args([
+        "rev-parse",
+        "--verify",
+        "-q",
+        &format!("{commit}^{{tree}}"),
+    ]);
+    for var in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+    ] {
+        command.env_remove(var);
+    }
+    let Some(tree) = process::run(&mut command, None, process::LOCAL)
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| output.stdout_text().trim().to_owned())
+    else {
+        return false;
+    };
+    if receipts.of(&tree).is_empty() {
+        return false;
+    }
+    let judge =
+        lifecycle::Sykli::with_program(home.to_path_buf(), sykli.to_path_buf(), SYKLI_LIMIT);
+    judge.allow_verifies(1);
+    judge.check_gated(gate, commit, &tree, &receipts, true) == crate::sessions::Check::Passed
 }
 
 /// The common git directory as git's on-disk layout names it
@@ -573,8 +679,8 @@ mod tests {
             facts_for_sykli(both, None, common).is_empty(),
             "a bare repository"
         );
-        assert_eq!(cannot_gate("--contract --branch"), None);
-        assert!(cannot_gate("--contract")
+        assert_eq!(cannot_judge("--contract --branch"), None);
+        assert!(cannot_judge("--contract")
             .unwrap()
             .contains("names no --branch"));
     }
@@ -632,6 +738,27 @@ mod tests {
         );
         assert_eq!(found(&root, None, None), None, "no layout here: ask git");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_flag_carries_sykli_s_first_reason() {
+        let refused = "sykli hook pre-push: refusing to push 191f7b020a58 to refs/heads/main: \
+                       no receipt in this worktree is a run of its tree\n\
+                       sykli hook pre-push: to produce a receipt, check out 191f7b020a58\n";
+        assert_eq!(
+            sykli_reason(refused).as_deref(),
+            Some("no receipt in this worktree is a run of its tree")
+        );
+        assert_eq!(
+            sykli_reason("\nsykli hook pre-push: cannot evaluate: bad stdin\n").as_deref(),
+            Some("cannot evaluate: bad stdin")
+        );
+        assert_eq!(sykli_reason(" \n"), None);
+        assert_eq!(
+            unproven("main", "why"),
+            "ohjaa: UNPROVEN push to main (why). It is pushed and flagged; prove it with: \
+             ohjaa gate"
+        );
     }
 
     #[test]

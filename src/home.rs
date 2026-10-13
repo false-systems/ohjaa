@@ -115,7 +115,7 @@ impl RepoId {
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub dir: PathBuf,
-    /// The branch the gate protects.
+    /// The branch ohjaa observes, judged by the gate.
     pub branch: String,
 }
 
@@ -140,8 +140,8 @@ pub fn entry_dir(home: &Path, id: &RepoId) -> PathBuf {
 /// What `repo.toml` holds: the branch, and nothing else.
 pub fn repo_toml(id: &RepoId, branch: &str) -> String {
     format!(
-        "# ohjaa's entry for {}, written by `ohjaa adopt`. The gate beside it\n\
-         # (sykli.json) protects this branch; nothing else about the repo lives here.\n\
+        "# ohjaa's entry for {}, written by `ohjaa adopt`. ohjaa observes this branch,\n\
+         # judged by the gate beside it (sykli.json); nothing else about the repo lives here.\n\
          branch = {}\n",
         id.slug(),
         flat_toml::quote(branch)

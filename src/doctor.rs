@@ -109,8 +109,8 @@ fn check_dispatchers(
             ));
         } else {
             found.drift(format!(
-                "{slug}: the dispatchers exec {}, which is gone: pushes to the entry's branch \
-                 fail, and so do commits in clones that chain a hook of their own (ohjaa apply)",
+                "{slug}: the dispatchers exec {}, which is gone: pushes in its clones fail, and \
+                 so do commits in clones that chain a hook of their own (ohjaa apply)",
                 ohjaa.display()
             ));
         }
@@ -119,14 +119,14 @@ fn check_dispatchers(
         match sykli {
             Some(sykli) if gitconfig::executable(&sykli) => {}
             Some(sykli) => found.drift(format!(
-                "{slug}: the pre-push dispatcher hands the gate to {}, which is gone: pushes \
-                 to the entry's branch are refused (ohjaa apply)",
+                "{slug}: the pre-push dispatcher hands pushes to {}, which is gone: every push \
+                 to the entry's branch is flagged unproven, never judged (ohjaa apply)",
                 sykli.display()
             )),
             None => found.drift(format!(
                 "{slug}: the pre-push dispatcher names no sykli (it was not on PATH when apply \
-                 ran), so a git client without your PATH refuses pushes to the entry's \
-                 branch (ohjaa apply)"
+                 ran), so a git client without your PATH flags every push to the entry's \
+                 branch unproven (ohjaa apply)"
             )),
         }
     }
@@ -214,7 +214,7 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
     for (path, text) in &expected {
         if !path.is_file() {
             found.drift(format!(
-                "{} is missing: the gate is off (ohjaa apply)",
+                "{} is missing: nothing is observed (ohjaa apply)",
                 path.display()
             ));
         } else if global.is_some() && read_or_empty(path).is_ok_and(|now| &now == text) {
@@ -324,7 +324,7 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
         match home::read_entry(&entry.dir) {
             Ok(Some(read)) if read.has_contract() => {
                 readable += 1;
-                found.ok(format!("{slug}: gates {}", read.branch));
+                found.ok(format!("{slug}: observes {}", read.branch));
             }
             Ok(Some(read)) => found.drift(format!(
                 "{slug}: no gate ({} is missing)",
@@ -358,7 +358,7 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
             let drift = gitconfig::clone_drift(&home, clone);
             if drift.is_empty() {
                 found.ok(format!(
-                    "{named}: gated; git runs {} here{}",
+                    "{named}: observed; git runs {} here{}",
                     clone.hooks_path.as_deref().unwrap_or_default(),
                     if clone.own.is_empty() {
                         String::new()
@@ -381,7 +381,7 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
     }
     if !plain.is_empty() {
         println!(
-            "  -      not gated (no entry; git never runs ohjaa there): {}",
+            "  -      not observed (no entry; git never runs ohjaa there): {}",
             plain.join(", ")
         );
     }

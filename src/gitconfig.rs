@@ -633,7 +633,12 @@ fn entries_named(home: &Path, listing: &Listing) -> Vec<(String, PathBuf)> {
 /// config), and its layout.
 pub fn gated_clone(home: &Path, repo: &Path) -> Result<Option<Gated>> {
     let listing = clone_listing(repo)?;
-    let entries = entries_named(home, &listing);
+    gated_from(home, repo, &common_dir(repo)?, &listing)
+}
+
+/// The clone at `repo`, if the remotes in its config `listing` name an entry.
+fn gated_from(home: &Path, repo: &Path, common: &Path, listing: &Listing) -> Result<Option<Gated>> {
+    let entries = entries_named(home, listing);
     if entries.is_empty() {
         return Ok(None);
     }
@@ -641,7 +646,7 @@ pub fn gated_clone(home: &Path, repo: &Path) -> Result<Option<Gated>> {
         path: repo.to_path_buf(),
         slugs: entries.iter().map(|(slug, _)| slug.clone()).collect(),
         entries: entries.into_iter().map(|(_, dir)| dir).collect(),
-        own: own_hooks_in(&common_dir(repo)?),
+        own: own_hooks_in(common),
         hooks_path: listing.hooks_path(),
     }))
 }
@@ -684,9 +689,9 @@ pub fn needed_hooks(
     Ok(needed)
 }
 
-/// What is wrong with a gated clone: (a) git does not resolve its
-/// `core.hooksPath` to the hooks of an entry it names, so the gate does not
-/// run; (b) a hook of its own has no dispatcher there, so git skips it.
+/// What is wrong with an observed clone: (a) git does not resolve its
+/// `core.hooksPath` to the hooks of an entry it names, so its pushes are not
+/// observed; (b) a hook of its own has no dispatcher there, so git skips it.
 pub fn clone_drift(home: &Path, clone: &Gated) -> Vec<String> {
     let mut drift = Vec::new();
     let routed = clone.hooks_path.as_deref().and_then(|path| {
@@ -699,12 +704,12 @@ pub fn clone_drift(home: &Path, clone: &Gated) -> Vec<String> {
     match (&clone.hooks_path, &routed) {
         (_, Some(_)) => {}
         (Some(path), None) => drift.push(format!(
-            "its own core.hooksPath ({path}) overrides ohjaa's: workflow gate not applied \
-             here: the repo's own hooks run"
+            "its own core.hooksPath ({path}) overrides ohjaa's: its pushes are not \
+             observed here: the repo's own hooks run"
         )),
         (None, None) => drift.push(format!(
             "git does not include {} for it: no pattern there matches its remotes, or \
-             `ohjaa apply` has not run; the gate is not applied (ohjaa apply)",
+             `ohjaa apply` has not run; its pushes are not observed (ohjaa apply)",
             include_file(home).display()
         )),
     }
@@ -740,26 +745,36 @@ pub fn clone_drift(home: &Path, clone: &Gated) -> Vec<String> {
     drift
 }
 
-/// For `ohjaa run`: the same checks for the repository a session starts in.
-/// Nothing at all without an entry; else one git process and the layout.
-pub fn launch_warnings(repo: &Path) -> Vec<String> {
-    let Ok(home) = home::ohjaa_home() else {
-        return Vec::new();
-    };
-    if entry_names(&home).map_or(true, |entries| entries.is_empty()) {
-        return Vec::new();
+/// For `ohjaa run` and `ohjaa brief`: the same checks for the repository a
+/// session starts in, and the gate origin's entry gives it. Nothing at all
+/// without an entry; else one git process (its config) and the layout.
+pub fn launch_view(home: &Path, repo: &Path) -> (Vec<String>, Option<crate::lifecycle::Gate>) {
+    if entry_names(home).map_or(true, |entries| entries.is_empty()) {
+        return (Vec::new(), None);
     }
-    match gated_clone(&home, repo) {
-        Ok(Some(clone)) => clone_drift(&home, &clone)
+    let cannot = |error: anyhow::Error| {
+        vec![format!(
+            "cannot tell whether ohjaa observes {}: {error:#}",
+            repo.display()
+        )]
+    };
+    let read = common_dir(repo).and_then(|common| Ok((clone_listing(repo)?, common)));
+    let (listing, common) = match read {
+        Ok(read) => read,
+        Err(error) => return (cannot(error), None),
+    };
+    let warnings = match gated_from(home, repo, &common, &listing) {
+        Ok(Some(clone)) => clone_drift(home, &clone)
             .into_iter()
             .map(|drift| format!("{} ({}): {drift}", repo.display(), clone.slugs.join(", ")))
             .collect(),
         Ok(None) => Vec::new(),
-        Err(error) => vec![format!(
-            "cannot tell whether the workflow gate applies in {}: {error:#}",
-            repo.display()
-        )],
-    }
+        Err(error) => cannot(error),
+    };
+    (
+        warnings,
+        crate::mark::gate_of(home, repo, &common, &listing),
+    )
 }
 
 /// The work tree's root and the common git directory of the repository at

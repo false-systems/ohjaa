@@ -360,9 +360,17 @@ impl Receipts {
         self.0.get(tree).map_or(&[], Vec::as_slice)
     }
 
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Every receipt of `other` too.
+    pub fn extend(&mut self, other: Receipts) {
+        for (tree, all) in other.0 {
+            for receipt in all {
+                self.add(&tree, receipt);
+            }
+        }
     }
 
     fn add(&mut self, tree: &str, receipt: Receipt) {
@@ -401,13 +409,66 @@ pub fn receipts_in<'a>(checkouts: impl IntoIterator<Item = &'a Path>) -> Receipt
 /// that verified each push it accepted), which outlive a worktree removed
 /// with its `.sykli/`. Those are run from `repo`.
 pub fn receipts_of_clone(repo: &Path, checkouts: &[Worktree]) -> Receipts {
-    let kept = git(repo, &["rev-parse", "--git-common-dir"])
-        .map(|common| repo.join(common).join("sykli").join("receipts"));
+    let kept = crate::gitconfig::common_dir(repo)
+        .ok()
+        .map(|common| common.join("sykli").join("receipts"));
     receipts_from(
         checkouts
             .iter()
-            .map(|w| (w.path.join(".sykli").join("receipts"), w.path.as_path()))
+            .flat_map(|w| {
+                [
+                    (w.path.join(".sykli").join("receipts"), w.path.as_path()),
+                    (w.path.join(".sykli").join("receipt.json"), w.path.as_path()),
+                ]
+            })
             .chain(kept.map(|dir| (dir, repo))),
+    )
+}
+
+/// The receipts of a clone found from its layout alone, without asking git:
+/// those sykli keeps under the common dir (`<common>/sykli/receipts`, the
+/// receipt that verified each push its hook accepted) and, in every worktree
+/// (the main one, and each `<common>/worktrees/*/gitdir` names), the ones
+/// `sykli run` writes (`.sykli/receipts/`) and the one `ohjaa gate` saves
+/// (`.sykli/receipt.json`).
+pub fn receipts_of_layout(common: &Path) -> Receipts {
+    let mut checkouts: Vec<PathBuf> = Vec::new();
+    if common.file_name().is_some_and(|name| name == ".git") {
+        if let Some(main) = common.parent() {
+            checkouts.push(canonical(main));
+        }
+    }
+    if let Ok(linked) = std::fs::read_dir(common.join("worktrees")) {
+        for entry in linked.flatten() {
+            let Ok(gitdir) = std::fs::read_to_string(entry.path().join("gitdir")) else {
+                continue;
+            };
+            let gitdir = entry.path().join(gitdir.trim());
+            if let Some(worktree) = gitdir.parent() {
+                checkouts.push(canonical(worktree));
+            }
+        }
+    }
+    let kept_in = checkouts
+        .first()
+        .cloned()
+        .unwrap_or_else(|| common.to_path_buf());
+    let mut dirs: Vec<(PathBuf, PathBuf)> = checkouts
+        .iter()
+        .flat_map(|checkout| {
+            [
+                (checkout.join(".sykli").join("receipts"), checkout.clone()),
+                (
+                    checkout.join(".sykli").join("receipt.json"),
+                    checkout.clone(),
+                ),
+            ]
+        })
+        .collect();
+    dirs.push((common.join("sykli").join("receipts"), kept_in));
+    receipts_from(
+        dirs.iter()
+            .map(|(dir, checkout)| (dir.clone(), checkout.as_path())),
     )
 }
 
@@ -421,11 +482,16 @@ pub fn receipts_of_clone(repo: &Path, checkouts: &[Worktree]) -> Receipts {
 fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Receipts {
     let mut found = Receipts::default();
     for (dir, checkout) in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
+        // A folder of receipts, or one receipt file (`.sykli/receipt.json`).
+        let paths: Vec<PathBuf> = if dir.is_file() {
+            vec![dir]
+        } else {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            entries.flatten().map(|entry| entry.path()).collect()
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for path in paths {
             if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
@@ -981,7 +1047,8 @@ pub struct OnDefault {
 /// The most default-branch commits a report reads in one repository.
 pub const MAX_REPORTED: usize = 100;
 
-/// The commits on `repo`'s default branch (the remote one, else the local)
+/// The commits on `repo`'s default branch (the remote one, else the local;
+/// for a repository with an entry, origin's copy of the entry's branch)
 /// committed after `since` (unix seconds), first parent only, newest first,
 /// at most [`MAX_REPORTED`] (`true` beside them when the window held more),
 /// each with what sykli says of it, against the receipts in every checkout
@@ -992,7 +1059,11 @@ pub fn default_branch_since(
     sykli: &Sykli,
 ) -> Option<(Vec<OnDefault>, bool)> {
     let repo = canonical(repo);
-    let reference = default_branch(&repo).into_iter().next()?;
+    // An entry names the branch it observes; else the default branch.
+    let reference = match sykli.gate_for(&repo) {
+        Some(gate) => format!("refs/remotes/origin/{}", gate.branch),
+        None => default_branch(&repo).into_iter().next()?,
+    };
     let onto = reference
         .strip_prefix("refs/remotes/")
         .or_else(|| reference.strip_prefix("refs/heads/"))
@@ -1066,6 +1137,15 @@ pub fn default_branch_since(
         })
         .collect();
     Some((judged, capped))
+}
+
+/// A sykli that judges a repository whose origin names an entry in the
+/// workflow home by the entry's gate (every other one by its own contract).
+pub fn sykli_with_entries() -> Sykli {
+    match crate::home::ohjaa_home() {
+        Ok(home) => Sykli::with_home(crate::home::absolute(home)),
+        Err(_) => Sykli::default(),
+    }
 }
 
 /// Whether this sykli can bind a receipt to a commit, and why not when it
@@ -1578,23 +1658,115 @@ pub fn still_at(repo: &Path, branch: &str, commit: &str) -> bool {
 /// The most receipts of one tree sykli is asked about, best first.
 const MAX_ASKED: usize = 5;
 
+/// An entry's gate for one clone: the contract the workflow home keeps for
+/// the repository its origin names, the branch it observes, and the clone
+/// (a checkout's top level and the common git dir), which sykli is handed
+/// instead of asking git for it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gate {
+    /// `owner/name`.
+    pub slug: String,
+    pub branch: String,
+    /// Outside the repository: `sykli verify` reads it, and the lock beside
+    /// it, from their files.
+    pub contract: PathBuf,
+    pub top: PathBuf,
+    pub common: PathBuf,
+}
+
 /// This machine's sykli, asked at most once per leaving whether it can bind
 /// a receipt to a commit (`sykli verify --commit`).
+///
+/// Made [`Sykli::with_home`], a repository whose origin names an entry in
+/// that workflow home is judged by the entry's gate, not by a contract in the
+/// commit; a commit judged once against a gate is not asked about again.
 #[derive(Debug, Default)]
 pub struct Sykli {
     /// `Ok(true)`: `--commit` reads everything from the commit (sykli#67 as
     /// merged); `Ok(false)`: it also checks the checkout on disk.
     binds_commits: std::cell::OnceCell<Result<bool, String>>,
+    /// `sykli verify --help` names `--repo-root` and `--git-common-dir`.
+    takes_facts: std::cell::OnceCell<bool>,
+    /// Where entries are looked up; `None` judges every repository by its
+    /// own contract.
+    home: Option<PathBuf>,
+    /// Each repository's gate, by its canonical path.
+    gates: std::cell::RefCell<HashMap<PathBuf, Option<Gate>>>,
+    /// What a gate said of a commit: (contract, commit) to the verdict.
+    judged: std::cell::RefCell<HashMap<(PathBuf, String), Check>>,
+    /// How many times `sykli verify` ran.
+    verified: std::cell::Cell<usize>,
+    /// How many times it may run in all; `None`: as often as it is needed.
+    allowance: std::cell::Cell<Option<usize>>,
+    /// The sykli to run, when not the one on PATH: the one `ohjaa apply`
+    /// recorded in a dispatcher.
+    program: Option<PathBuf>,
+    /// How long one sykli call may take; `None`: [`process::LOCAL`].
+    limit: Option<std::time::Duration>,
 }
 
 impl Sykli {
+    /// A sykli that judges a repository with an entry in `home` by its gate.
+    pub fn with_home(home: PathBuf) -> Sykli {
+        Sykli {
+            home: Some(home),
+            ..Sykli::default()
+        }
+    }
+
+    /// The same, running `program` for sykli, and each call for at most
+    /// `limit`: a git hook's, which a person waits on.
+    pub fn with_program(home: PathBuf, program: PathBuf, limit: std::time::Duration) -> Sykli {
+        Sykli {
+            home: Some(home),
+            program: Some(program),
+            limit: Some(limit),
+            ..Sykli::default()
+        }
+    }
+
+    fn command(&self) -> Command {
+        Command::new(self.program.as_deref().unwrap_or(Path::new("sykli")))
+    }
+
+    fn timeout(&self) -> std::time::Duration {
+        self.limit.unwrap_or(process::LOCAL)
+    }
+
+    /// Let `sykli verify` run at most `times` more times.
+    pub fn allow_verifies(&self, times: usize) {
+        self.allowance.set(Some(self.verified.get() + times));
+    }
+
+    /// Whether `sykli verify` may still run.
+    pub fn may_verify(&self) -> bool {
+        self.allowance
+            .get()
+            .is_none_or(|allowed| self.verified.get() < allowed)
+    }
+
+    /// The gate an entry gives `repo`: one git process (its config) the
+    /// first time it is asked, none when the home has no entries.
+    pub fn gate_for(&self, repo: &Path) -> Option<Gate> {
+        let home = self.home.as_deref()?;
+        let key = canonical(repo);
+        if let Some(known) = self.gates.borrow().get(&key) {
+            return known.clone();
+        }
+        let gate = crate::mark::gate_here(home, &key);
+        self.gates.borrow_mut().insert(key, gate.clone());
+        gate
+    }
+
+    /// Ask sykli once whether it can bind a receipt to a commit, and
+    /// whether it takes the repository's facts.
     fn binds_commits(&self) -> Result<bool, String> {
         self.binds_commits
             .get_or_init(|| {
                 let output = process::run(
-                    Command::new("sykli").args(["verify", "--help"]),
+                    self.command().args(["verify", "--help"]),
                     None,
-                    process::LOCAL,
+                    self.timeout(),
                 )
                 .map_err(|error| format!("sykli could not be asked: {error:#}"))?;
                 let help = format!(
@@ -1602,6 +1774,9 @@ impl Sykli {
                     output.stdout_text(),
                     String::from_utf8_lossy(&output.stderr)
                 );
+                let _ = self
+                    .takes_facts
+                    .set(help.contains("--repo-root") && help.contains("--git-common-dir"));
                 if help.contains("--commit") {
                     Ok(help.contains("nothing is read from the"))
                 } else {
@@ -1609,6 +1784,158 @@ impl Sykli {
                 }
             })
             .clone()
+    }
+
+    /// What the entry's gate says of `commit` (whose tree is `tree`):
+    /// `sykli verify <receipt> --contract <gate> --commit <commit>`, handed
+    /// the clone's facts when sykli takes them. Only receipts that say they
+    /// passed are asked about, best first, until one verifies: a receipt
+    /// that says the run failed is not a pass, and needs no sykli to say so.
+    /// With no receipt of the tree it was never run here (`alive`: and the
+    /// checkout it was made in still exists).
+    pub fn check_gated(
+        &self,
+        gate: &Gate,
+        commit: &str,
+        tree: &str,
+        receipts: &Receipts,
+        alive: bool,
+    ) -> Check {
+        let key = (gate.contract.clone(), commit.to_owned());
+        if let Some(known) = self.judged.borrow().get(&key) {
+            return known.clone();
+        }
+        let check = self.ask_gate(gate, commit, tree, receipts, alive);
+        // Only what sykli said is kept: what it could not say may be said
+        // when it is asked again, and with no receipt it was never asked.
+        if !matches!(
+            check,
+            Check::Unverified { .. } | Check::Unchecked | Check::UncheckedGone
+        ) {
+            self.judged.borrow_mut().insert(key, check.clone());
+        }
+        check
+    }
+
+    fn ask_gate(
+        &self,
+        gate: &Gate,
+        commit: &str,
+        tree: &str,
+        receipts: &Receipts,
+        alive: bool,
+    ) -> Check {
+        let candidates = receipts.of(tree);
+        if candidates.is_empty() {
+            return if alive {
+                Check::Unchecked
+            } else {
+                Check::UncheckedGone
+            };
+        }
+        let passing: Vec<&Receipt> = candidates
+            .iter()
+            .filter(|receipt| matches!(receipt.evidence.outcome.as_str(), "passed" | "cached"))
+            .collect();
+        if passing.is_empty() {
+            let newest = &candidates[0];
+            return Check::Failed {
+                why: format!(
+                    "its receipt says the run {} ({})",
+                    newest.evidence.outcome,
+                    newest.path.display()
+                ),
+            };
+        }
+        match self.binds_commits() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Check::Unverified {
+                    why: "this sykli's verify --commit reads the checkout too; update sykli"
+                        .to_owned(),
+                }
+            }
+            Err(why) => return Check::Unverified { why },
+        }
+        let facts: Vec<&std::ffi::OsStr> = if self.takes_facts.get().copied().unwrap_or(false) {
+            vec![
+                "--repo-root".as_ref(),
+                gate.top.as_os_str(),
+                "--git-common-dir".as_ref(),
+                gate.common.as_os_str(),
+            ]
+        } else {
+            Vec::new()
+        };
+        let mut verdicts = Vec::new();
+        for receipt in passing.iter().take(MAX_ASKED) {
+            if !self.may_verify() {
+                if verdicts.is_empty() {
+                    verdicts.push((
+                        receipt.at,
+                        Check::Unverified {
+                            why: "sykli was not asked again".to_owned(),
+                        },
+                    ));
+                }
+                break;
+            }
+            self.verified.set(self.verified.get() + 1);
+            let output = process::run(
+                self.command()
+                    .arg("verify")
+                    .arg(&receipt.path)
+                    .arg("--contract")
+                    .arg(&gate.contract)
+                    .args(&facts)
+                    .args(["--commit", commit])
+                    .current_dir(&gate.top),
+                None,
+                self.timeout(),
+            );
+            match output {
+                Err(error) => verdicts.push((
+                    receipt.at,
+                    Check::Unverified {
+                        why: format!("sykli verify could not run: {error:#}"),
+                    },
+                )),
+                Ok(output) if output.status.success() => return Check::Passed,
+                Ok(output) => verdicts.push((
+                    receipt.at,
+                    verdict(true, true, output.status.code(), output.failure_detail()),
+                )),
+            }
+        }
+        // The runs that failed are their receipts' word, unasked.
+        for receipt in candidates
+            .iter()
+            .filter(|receipt| !matches!(receipt.evidence.outcome.as_str(), "passed" | "cached"))
+        {
+            verdicts.push((
+                receipt.at,
+                Check::Failed {
+                    why: format!(
+                        "its receipt says the run {} ({})",
+                        receipt.evidence.outcome,
+                        receipt.path.display()
+                    ),
+                },
+            ));
+        }
+        let mut check = settle(verdicts);
+        if passing.len() > MAX_ASKED {
+            if let Check::Failed { why }
+            | Check::Unverified { why }
+            | Check::OtherContract { why } = &mut check
+            {
+                why.push_str(&format!(
+                    " (sykli was asked about the best {MAX_ASKED} of {} receipts of its tree)",
+                    passing.len()
+                ));
+            }
+        }
+        check
     }
 
     /// What sykli says about `commit` (whose tree is `tree`) in `repo`:
@@ -1625,6 +1952,9 @@ impl Sykli {
     /// never passes anything, and a commit with no contract cannot be checked.
     /// With no receipt, `alive` says whether the checkout it was made in, and
     /// so its receipts, still exists: when not, it cannot be observed.
+    ///
+    /// A repository whose origin names an entry (made [`Sykli::with_home`])
+    /// is judged by the entry's gate instead: [`Sykli::check_gated`].
     pub fn check(
         &self,
         repo: &Path,
@@ -1634,6 +1964,9 @@ impl Sykli {
         checkouts: &[Worktree],
         alive: bool,
     ) -> Check {
+        if let Some(gate) = self.gate_for(repo) {
+            return self.check_gated(&gate, commit, tree, receipts, alive);
+        }
         let candidates = receipts.of(tree);
         if candidates.is_empty() {
             let has_contract = ["sykli.json", "sykli.rs"]
@@ -1675,47 +2008,50 @@ impl Sykli {
                     checkout.join(name).is_file()
                 }
             }) else {
-                verdicts.push(Check::Unverified {
-                    why: format!(
-                        "no sykli contract (sykli.json or sykli.rs) in {}",
-                        checkout.display()
-                    ),
-                });
+                verdicts.push((
+                    receipt.at,
+                    Check::Unverified {
+                        why: format!(
+                            "no sykli contract (sykli.json or sykli.rs) in {}",
+                            checkout.display()
+                        ),
+                    },
+                ));
                 continue;
             };
+            self.verified.set(self.verified.get() + 1);
             let output = process::run(
-                Command::new("sykli")
+                self.command()
                     .arg("verify")
                     .arg(&receipt.path)
                     .args(["--contract", contract, "--commit", commit])
                     .current_dir(checkout),
                 None,
-                process::LOCAL,
+                self.timeout(),
             );
-            verdicts.push(match output {
-                Err(error) => Check::Unverified {
-                    why: format!("sykli verify could not run: {error:#}"),
+            verdicts.push((
+                receipt.at,
+                match output {
+                    Err(error) => Check::Unverified {
+                        why: format!("sykli verify could not run: {error:#}"),
+                    },
+                    Ok(output) if output.status.success() => return Check::Passed,
+                    Ok(output) => verdict(
+                        from_the_commit,
+                        is_the_commit,
+                        output.status.code(),
+                        output.failure_detail(),
+                    ),
                 },
-                Ok(output) if output.status.success() => return Check::Passed,
-                Ok(output) => verdict(
-                    from_the_commit,
-                    is_the_commit,
-                    output.status.code(),
-                    output.failure_detail(),
-                ),
-            });
+            ));
         }
-        // Refused only when every receipt asked was; else what could not be
-        // said of the best one that was not refused.
-        let refused = |check: &Check| matches!(check, Check::Failed { .. });
-        let mut check = match verdicts.iter().position(|check| !refused(check)) {
-            Some(at) => verdicts.swap_remove(at),
-            None => verdicts.swap_remove(0),
-        };
+        let mut check = settle(verdicts);
         // Said when the cap left receipts unasked: one of them might pass.
         if candidates.len() > MAX_ASKED {
-            if let Check::Failed { why } | Check::Unverified { why } | Check::Stale { why } =
-                &mut check
+            if let Check::Failed { why }
+            | Check::Unverified { why }
+            | Check::Stale { why }
+            | Check::OtherContract { why } = &mut check
             {
                 why.push_str(&format!(
                     " (sykli was asked about the best {MAX_ASKED} of {} receipts of its tree)",
@@ -1727,11 +2063,28 @@ impl Sykli {
     }
 }
 
+/// What the receipts of one tree say when none of them proved it, from
+/// (when the run started, what was said of it): what sykli could not say of
+/// one, since that one might have passed; else the newest run's word, a run
+/// that failed or one that passed under another contract.
+fn settle(mut verdicts: Vec<(i64, Check)>) -> Check {
+    let unsaid = |check: &Check| matches!(check, Check::Unverified { .. } | Check::Stale { .. });
+    if let Some(at) = verdicts.iter().position(|(_, check)| unsaid(check)) {
+        return verdicts.swap_remove(at).1;
+    }
+    verdicts
+        .into_iter()
+        .max_by_key(|(at, _)| *at)
+        .map_or(Check::Unchecked, |(_, check)| check)
+}
+
 /// What a non-zero `sykli verify --commit` means. A sykli that reads
 /// everything from the commit (`from_the_commit`) refuses only the commit
-/// itself (exit 1, 3 or 4, the first failing check on stderr); exit 2 is that
-/// it could not verify (a bad revision, arguments, not a receipt), and any
-/// other end (a crash, a kill) says nothing about the commit either. One that
+/// itself (exit 1 or 3, the first failing check on stderr), and exit 4 says
+/// the receipt passed under another contract or lock than the one it is
+/// judged by now: not proven, never failed. Exit 2 is that it could not
+/// verify (a bad revision, arguments, not a receipt), and any other end (a
+/// crash, a kill) says nothing about the commit either. One that
 /// still compares the checkout on disk refuses the commit on its own run
 /// (`commit`, `clean`, `submodules`, `outcome`, `records`), but on the tree,
 /// inputs or contract on disk only where the checkout is the commit
@@ -1744,7 +2097,8 @@ fn verdict(from_the_commit: bool, is_the_commit: bool, exit: Option<i32>, why: S
     }
     if from_the_commit {
         return match exit {
-            Some(1 | 3 | 4) => Check::Failed { why },
+            Some(1 | 3) => Check::Failed { why },
+            Some(4) => Check::OtherContract { why },
             // A crash, a kill or an exit sykli does not document says nothing
             // about the commit.
             _ => Check::Unverified {
@@ -1815,6 +2169,59 @@ pub fn pick_toimija_session(payload: &Value, child_pid: u32, started_ms: i64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The receipts of a clone, from its files alone: those sykli keeps
+    /// under the common dir, and in each worktree (git names the linked ones
+    /// in `<common>/worktrees/*/gitdir`, absolute or relative) those `sykli
+    /// run` writes and the one `ohjaa gate` saves.
+    #[test]
+    fn receipts_are_found_from_the_layout_alone() {
+        let root = std::env::temp_dir().join(format!("ohjaa-layout-r-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |path: PathBuf, tree: &str, outcome: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                format!(
+                    r#"{{"schema":"sykli-receipt.v1","outcome":"{outcome}","started_at_ms":1,"subject":{{"tree_oid":"{tree}","dirty":false}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let (main, near, far) = (root.join("main"), root.join("near"), root.join("far"));
+        let common = main.join(".git");
+        write(common.join("sykli/receipts/rcpt_a.json"), "kept", "passed");
+        write(main.join(".sykli/receipts/rcpt_b.json"), "ran", "failed");
+        write(near.join(".sykli/receipt.json"), "gate", "passed");
+        write(far.join(".sykli/receipts/rcpt_c.json"), "far", "passed");
+        for (id, gitdir) in [
+            ("near", "../../../../near/.git".to_owned()),
+            ("far", format!("{}\n", far.join(".git").display())),
+        ] {
+            let dir = common.join("worktrees").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("gitdir"), gitdir).unwrap();
+        }
+        let found = receipts_of_layout(&common);
+        let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
+        assert_eq!(
+            found["kept"].checkout,
+            canonical(&main),
+            "run from the main checkout"
+        );
+        assert_eq!(found["ran"].evidence.outcome, "failed");
+        assert_eq!(found["gate"].checkout, canonical(&near));
+        assert_eq!(
+            found["gate"].path,
+            canonical(&near).join(".sykli/receipt.json")
+        );
+        assert_eq!(found["far"].checkout, canonical(&far));
+        // A bare clone has no main checkout; what sykli keeps is still read.
+        let bare = root.join("bare.git");
+        write(bare.join("sykli/receipts/rcpt_d.json"), "bare", "passed");
+        assert_eq!(receipts_of_layout(&bare)["bare"].checkout, bare);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     fn repo(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("ohjaa-life-{name}-{}", std::process::id()));
@@ -2512,17 +2919,21 @@ mod tests {
     fn a_refusal_fails_the_commit_only_when_it_is_about_the_commit() {
         let why = |check: &str| format!("refused: {check} expected a but got b");
         // sykli#67 as merged reads everything from the commit.
-        for (exit, check) in [
-            (1, "outcome"),
-            (3, "commit"),
-            (3, "submodules"),
-            (4, "contract"),
-        ] {
+        for (exit, check) in [(1, "outcome"), (3, "commit"), (3, "submodules")] {
             assert!(
                 matches!(
                     verdict(true, false, Some(exit), why(check)),
                     Check::Failed { .. }
                 ),
+                "{check}"
+            );
+        }
+        // A run that passed under another contract or lock: not proven
+        // against this one, and never failed.
+        for check in ["contract", "lock"] {
+            assert_eq!(
+                verdict(true, true, Some(4), why(check)),
+                Check::OtherContract { why: why(check) },
                 "{check}"
             );
         }

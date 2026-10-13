@@ -22,8 +22,9 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::intake::{self, Candidate};
-use crate::knowledge::Dirs;
+use crate::knowledge::{self, Dirs};
 use crate::lifecycle;
+use crate::mark;
 use crate::process;
 use crate::sessions::{self, Check, Session};
 
@@ -115,9 +116,32 @@ pub struct Report {
     /// The native sessions not run through ohjaa, or why they could not be
     /// judged.
     pub natives: Result<Natives, String>,
+    /// The marks on each entry's branch, or why it has none, by `owner/name`.
+    pub marks: Vec<(String, Result<mark::Marks, String>)>,
+    /// What waits for a person's decision, or why it could not be listed.
+    pub proposals: Result<Vec<Waiting>, String>,
+    /// Sessions in the log that are still open, and those closed as orphaned
+    /// that started in the window.
+    pub open: Vec<Untold>,
     /// What could not be read or judged, each with why: a report with gaps
     /// says so, and exits 4.
     pub gaps: Vec<String>,
+    /// The window (its three lists) was read; `false` for the marks alone
+    /// (`--marks`), which read no default-branch window and ask no vessa.
+    pub window: bool,
+}
+
+/// A proposal, or a proposed node, waiting for a person's decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Waiting {
+    pub scope: String,
+    pub name: String,
+    /// Its body's first line.
+    pub title: String,
+    /// Its `as_of` date.
+    pub since: String,
+    /// For a repo proposal: the repository.
+    pub repo: Option<String>,
 }
 
 impl Report {
@@ -146,6 +170,18 @@ pub fn parse_since(text: &str, now_ms: i64) -> Result<i64> {
 /// repositories `repos` (those under the roots), and vessa's sessions when
 /// vessa is on PATH.
 pub fn build(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Report {
+    build_with(dirs, repos, since_ms, now_ms, true)
+}
+
+/// The marks of every entry, what waits for a person and the sessions still
+/// open or orphaned, alone: no default-branch window and no vessa, so it
+/// costs two git processes per entry and a `sykli verify` only where a
+/// receipt says it passed (`ohjaa report --marks`).
+pub fn build_marks(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Report {
+    build_with(dirs, repos, since_ms, now_ms, false)
+}
+
+fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window: bool) -> Report {
     let mut gaps = Vec::new();
     // Opened only to read: a report never writes the log (#41).
     let logged: Vec<Session> = match sessions::Reader::open(&sessions::store_path(&dirs.state)) {
@@ -169,13 +205,42 @@ pub fn build(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Repo
             Vec::new()
         }
     };
-    let untold = untold(&logged, since_ms, now_ms);
-    let (unproven, judged) = default_branches(repos, since_ms, &mut gaps);
-    let natives = native_sessions(since_ms, now_ms, &mut gaps).map(|listed| {
-        let (judgeable, mut natives) = listed;
-        natives.bypasses = bypasses(judgeable, &logged);
-        natives
-    });
+    let untold = if window {
+        untold(&logged, since_ms, now_ms)
+    } else {
+        Vec::new()
+    };
+    // One sykli for both: a commit the window and the marks share is asked
+    // about once, and a repository with an entry is judged by its gate.
+    let sykli = lifecycle::sykli_with_entries();
+    let (unproven, judged) = if window {
+        default_branches(repos, since_ms, &sykli, &mut gaps)
+    } else {
+        (Vec::new(), Judged::default())
+    };
+    let marks = match crate::home::ohjaa_home() {
+        Ok(home) => mark::of_entries(&crate::home::absolute(home), repos, &sykli),
+        Err(error) => {
+            gaps.push(format!("the workflow home cannot be found: {error:#}"));
+            Vec::new()
+        }
+    };
+    for (slug, marked) in &marks {
+        if let Err(why) = marked {
+            gaps.push(format!("{slug}: not marked: {why}"));
+        }
+    }
+    let proposals = waiting(dirs);
+    let open = open_sessions(&logged, since_ms, now_ms);
+    let natives = if window {
+        native_sessions(since_ms, now_ms, &mut gaps).map(|listed| {
+            let (judgeable, mut natives) = listed;
+            natives.bypasses = bypasses(judgeable, &logged);
+            natives
+        })
+    } else {
+        Ok(Natives::default())
+    };
     if let Ok(natives) = &natives {
         if !natives.undated.is_empty() {
             gaps.push(format!(
@@ -191,8 +256,60 @@ pub fn build(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Repo
         unproven,
         judged,
         natives,
+        marks,
+        proposals,
+        open,
         gaps,
+        window,
     }
+}
+
+/// What waits for a person: every proposal, and every proposed node in a
+/// scope directory. Files only.
+fn waiting(dirs: &Dirs) -> Result<Vec<Waiting>, String> {
+    let loaded = knowledge::load(dirs).map_err(|error| format!("{error:#}"))?;
+    let (pending, _) = knowledge::pending(dirs, &loaded).map_err(|error| format!("{error:#}"))?;
+    Ok(pending
+        .into_iter()
+        .map(|pending| Waiting {
+            scope: pending.scope.name().to_owned(),
+            name: pending.node.id.clone(),
+            title: pending
+                .node
+                .body
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or_default()
+                .to_owned(),
+            since: pending.node.as_of.to_string(),
+            repo: pending.repo.map(|repo| repo.to_string_lossy().into_owned()),
+        })
+        .collect())
+}
+
+/// Sessions in the log that never ended, and those closed as orphaned
+/// (their ohjaa was gone) that started in the window, oldest first.
+pub fn open_sessions(logged: &[Session], since_ms: i64, now_ms: i64) -> Vec<Untold> {
+    let mut open: Vec<Untold> = logged
+        .iter()
+        .filter(|s| match &s.left {
+            None => true,
+            Some(left) => left.orphaned && s.started_ms > since_ms && s.started_ms <= now_ms,
+        })
+        .map(|s| Untold {
+            id: s.id.clone(),
+            agent: s.agent.clone(),
+            repo: s.repo.clone(),
+            intent: s.intent.clone(),
+            started_ms: s.started_ms,
+            no_readback: s.readback.is_none(),
+            no_handover: s.handover.is_none(),
+            orphaned: s.left.as_ref().is_some_and(|left| left.orphaned),
+        })
+        .collect();
+    open.sort_by_key(|s| s.started_ms);
+    open
 }
 
 /// Every first-parent commit each repository's default branch gained in the
@@ -200,6 +317,7 @@ pub fn build(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64) -> Repo
 fn default_branches(
     repos: &[PathBuf],
     since_ms: i64,
+    sykli: &lifecycle::Sykli,
     gaps: &mut Vec<String>,
 ) -> (Vec<Unproven>, Judged) {
     let mut unproven = Vec::new();
@@ -208,24 +326,18 @@ fn default_branches(
         gaps.push("there are no git repositories under the roots".to_owned());
         return (unproven, judged);
     }
-    let sykli = lifecycle::Sykli::default();
     let mut clones = std::collections::HashSet::new();
     for repo in repos {
         // A worktree of a clone already read is the same clone.
-        let common = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["rev-parse", "--git-common-dir"])
-            .output()
+        // From the layout; git only when the layout does not say.
+        let common = crate::gitconfig::common_dir(repo)
             .ok()
-            .filter(|o| o.status.success())
-            .map(|o| repo.join(String::from_utf8_lossy(&o.stdout).trim()))
             .and_then(|common| std::fs::canonicalize(common).ok());
         if common.is_some_and(|common| !clones.insert(common)) {
             continue;
         }
         let Some((commits, capped)) =
-            lifecycle::default_branch_since(repo, since_ms.div_euclid(1000), &sykli)
+            lifecycle::default_branch_since(repo, since_ms.div_euclid(1000), sykli)
         else {
             // A repository with no default branch has nothing to report.
             if has_commits(repo) && has_default_branch(repo) {
@@ -248,10 +360,11 @@ fn default_branches(
             judged.commits += 1;
             match &on.check {
                 Check::Passed => judged.verified += 1,
-                Check::Failed { .. } | Check::Unchecked => unproven.push(Unproven {
-                    repo: repo.to_string_lossy().into_owned(),
-                    on,
-                }),
+                Check::Failed { .. } | Check::Unchecked | Check::OtherContract { .. } => unproven
+                    .push(Unproven {
+                        repo: repo.to_string_lossy().into_owned(),
+                        on,
+                    }),
                 Check::UncheckedGone => {
                     judged.gone += 1;
                     if on.merge {
@@ -266,7 +379,7 @@ fn default_branches(
             }
         }
     }
-    if let Some(why) = lifecycle::sykli_cannot_bind(&sykli) {
+    if let Some(why) = lifecycle::sykli_cannot_bind(sykli) {
         if judged.could_not_say > 0 {
             gaps.push(format!(
                 "sykli could not verify commits ({why}): only commits never run are listed"
@@ -551,9 +664,8 @@ fn folder(cwd: &str) -> &str {
 
 fn describe_check(check: &Check) -> String {
     match check {
-        Check::Failed { why } => format!("FAILED sykli verify: {why}"),
         Check::Unchecked => "unchecked: no sykli run of it where it was made".to_owned(),
-        other => format!("{other:?}"),
+        other => sessions::describe_check(other),
     }
 }
 
@@ -601,6 +713,37 @@ pub fn render(report: &Report) -> String {
         sessions::clock(report.since_ms),
         sessions::clock(report.until_ms)
     );
+    if !report.window {
+        out.clear();
+        let _ = writeln!(
+            out,
+            "ohjaa report, the marks at {}",
+            sessions::clock(report.until_ms)
+        );
+    }
+    if !report.marks.is_empty() || !report.window {
+        let _ = writeln!(
+            out,
+            "\nMarks on each entry's branch, tip first (✓ proven · ✗ failed · ? unproven):"
+        );
+        for (slug, marked) in &report.marks {
+            match marked {
+                Ok(marks) => {
+                    let _ = writeln!(out, "- {}", mark::line(marks));
+                }
+                Err(why) => {
+                    let _ = writeln!(out, "- {slug}: not marked: {why}");
+                }
+            }
+        }
+        if report.marks.is_empty() {
+            let _ = writeln!(out, "- no repository has an entry (ohjaa adopt <repo>)");
+        }
+    }
+    if !report.window {
+        say_gaps(report, &mut out);
+        return out;
+    }
     let _ = writeln!(
         out,
         "\nSessions without read-back or handover ({}):",
@@ -692,6 +835,11 @@ pub fn render(report: &Report) -> String {
             );
         }
     }
+    say_gaps(report, &mut out);
+    out
+}
+
+fn say_gaps(report: &Report, out: &mut String) {
     if !report.gaps.is_empty() {
         let _ = writeln!(
             out,
@@ -701,11 +849,91 @@ pub fn render(report: &Report) -> String {
             let _ = writeln!(out, "- {gap}");
         }
     }
-    out
 }
 
-/// The report as `ohjaa-report.v1` JSON.
+/// `ohjaa report --json`: `ohjaa-marks.v1` (the README's "ohjaa-marks.v1"
+/// pins it). The marks on every entry's branch, what waits for a person,
+/// the sessions still open or orphaned, and the window's report as
+/// `ohjaa-report.v1` under `report` (`null` with `--marks`). Computing it
+/// writes nothing.
 pub fn to_json(report: &Report) -> Value {
+    let rfc = |ms: i64| intake::rfc3339(ms.div_euclid(1000));
+    let entries: Vec<Value> = report
+        .marks
+        .iter()
+        .map(|(slug, marked)| match marked {
+            Ok(marks) => json!({
+                "repo": marks.gate.slug,
+                "branch": marks.gate.branch,
+                "ref": format!("origin/{}", marks.gate.branch),
+                "tip": marks.commits.first().map(|tip| tip.commit.as_str()),
+                "clone": marks.gate.top,
+                "updated": marks.updated.as_ref().map(|at| rfc(at.ms)),
+                "updated_by": marks.updated.as_ref().and_then(|at| at.by),
+                "ended": marks.ended.word(),
+                "proven_at_tip": marks.proven_at_tip(),
+                "commits": marks.commits.iter().map(|walked| json!({
+                    "sha": walked.commit,
+                    "tree": walked.tree,
+                    "mark": mark::word(&walked.check),
+                    "code": mark::code(&walked.check),
+                    "why": mark::why(&walked.check),
+                    "author": walked.author,
+                    "authored": rfc(walked.authored * 1000),
+                    "subject": walked.subject,
+                })).collect::<Vec<_>>(),
+                "error": Value::Null,
+            }),
+            Err(why) => json!({
+                "repo": slug,
+                "branch": Value::Null,
+                "ref": Value::Null,
+                "tip": Value::Null,
+                "clone": Value::Null,
+                "updated": Value::Null,
+                "updated_by": Value::Null,
+                "ended": Value::Null,
+                "proven_at_tip": false,
+                "commits": [],
+                "error": why,
+            }),
+        })
+        .collect();
+    let session = |s: &Untold| {
+        json!({
+            "id": s.id,
+            "agent": s.agent,
+            "repo": s.repo,
+            "intent": s.intent,
+            "started": rfc(s.started_ms),
+            "state": if s.orphaned { "orphaned" } else { "open" },
+        })
+    };
+    json!({
+        "schema": "ohjaa-marks.v1",
+        "generated": rfc(report.until_ms),
+        "complete": report.complete(),
+        "entries": entries,
+        "proposals": match &report.proposals {
+            Ok(waiting) => json!({
+                "listed": true,
+                "waiting": waiting.iter().map(|w| json!({
+                    "scope": w.scope,
+                    "name": w.name,
+                    "title": w.title,
+                    "since": w.since,
+                    "repo": w.repo,
+                })).collect::<Vec<_>>(),
+            }),
+            Err(why) => json!({"listed": false, "why": why, "waiting": []}),
+        },
+        "sessions": report.open.iter().map(session).collect::<Vec<_>>(),
+        "report": if report.window { report_json(report) } else { Value::Null },
+    })
+}
+
+/// The window's report as `ohjaa-report.v1` JSON.
+fn report_json(report: &Report) -> Value {
     let rfc = |ms: i64| intake::rfc3339(ms.div_euclid(1000));
     let j = &report.judged;
     json!({
@@ -731,6 +959,7 @@ pub fn to_json(report: &Report) -> Value {
             "committed": rfc(u.on.committed * 1000),
             "check": match &u.on.check {
                 Check::Failed { .. } => "failed",
+                Check::OtherContract { .. } => "other_contract",
                 _ => "unchecked",
             },
             "why": describe_check(&u.on.check),
@@ -1171,8 +1400,152 @@ mod tests {
             }],
             judged: Judged::default(),
             natives,
+            marks: Vec::new(),
+            proposals: Ok(Vec::new()),
+            open: Vec::new(),
             gaps: Vec::new(),
+            window: true,
         }
+    }
+
+    /// `ohjaa report --json` is `ohjaa-marks.v1`, read by other tools
+    /// (viemäri): renaming or dropping a field breaks them silently.
+    #[test]
+    fn the_marks_json_keeps_its_v1_shape() {
+        let gate = lifecycle::Gate {
+            slug: "acme/widget".to_owned(),
+            branch: "main".to_owned(),
+            contract: PathBuf::from("/h/repos/acme/widget/sykli.json"),
+            top: PathBuf::from("/r/widget"),
+            common: PathBuf::from("/r/widget/.git"),
+        };
+        let walked = |sha: &str, check: Check| mark::Walked {
+            commit: sha.to_owned(),
+            tree: format!("tree-{sha}"),
+            author: "Ann".to_owned(),
+            authored: 60,
+            subject: format!("subject {sha}"),
+            check,
+        };
+        let mut report = sample(Err("vessa is not on PATH".to_owned()));
+        report.marks = vec![
+            (
+                "acme/widget".to_owned(),
+                Ok(mark::Marks {
+                    gate,
+                    updated: Some(mark::Updated {
+                        ms: 5_000,
+                        by: Some("fetch"),
+                    }),
+                    commits: vec![
+                        walked("c3", Check::Unchecked),
+                        walked(
+                            "c2",
+                            Check::Failed {
+                                why: "refused: outcome".to_owned(),
+                            },
+                        ),
+                        walked("c1", Check::Passed),
+                    ],
+                    ended: mark::Ended::Proven,
+                }),
+            ),
+            (
+                "acme/gone".to_owned(),
+                Err("no clone under the roots has it as origin".to_owned()),
+            ),
+        ];
+        report.proposals = Ok(vec![Waiting {
+            scope: "mine".to_owned(),
+            name: "lean".to_owned(),
+            title: "Lean first.".to_owned(),
+            since: "2026-10-01".to_owned(),
+            repo: None,
+        }]);
+        report.open = vec![Untold {
+            id: "oh-9".to_owned(),
+            agent: "claude".to_owned(),
+            repo: "/r/widget".to_owned(),
+            intent: "fix".to_owned(),
+            started_ms: 7_000,
+            no_readback: true,
+            no_handover: true,
+            orphaned: true,
+        }];
+        let json = to_json(&report);
+        let keys = |value: &Value| {
+            let mut keys: Vec<&str> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            keys.join(",")
+        };
+        assert_eq!(json["schema"], "ohjaa-marks.v1");
+        assert_eq!(
+            keys(&json),
+            "complete,entries,generated,proposals,report,schema,sessions"
+        );
+        let entry = &json["entries"][0];
+        assert_eq!(
+            keys(entry),
+            "branch,clone,commits,ended,error,proven_at_tip,ref,repo,tip,updated,updated_by"
+        );
+        assert_eq!(entry["repo"], "acme/widget");
+        assert_eq!(entry["ref"], "origin/main");
+        assert_eq!(entry["tip"], "c3");
+        assert_eq!(entry["updated"], "1970-01-01T00:00:05Z");
+        assert_eq!(entry["updated_by"], "fetch");
+        assert_eq!(entry["ended"], "proven");
+        assert_eq!(entry["proven_at_tip"], false);
+        assert_eq!(entry["error"], Value::Null);
+        let commit = &entry["commits"][1];
+        assert_eq!(
+            keys(commit),
+            "author,authored,code,mark,sha,subject,tree,why"
+        );
+        assert_eq!(commit["sha"], "c2");
+        assert_eq!(commit["tree"], "tree-c2");
+        assert_eq!(commit["author"], "Ann");
+        assert_eq!(commit["authored"], "1970-01-01T00:01:00Z");
+        assert_eq!(commit["subject"], "subject c2");
+        let marks: Vec<&str> = entry["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["mark"].as_str().unwrap())
+            .collect();
+        assert_eq!(marks, ["unproven", "failed", "proven"]);
+        assert_eq!(commit["code"], "failed");
+        assert_eq!(commit["why"], "refused: outcome");
+        assert_eq!(entry["commits"][0]["code"], "no_receipt");
+        assert_eq!(entry["commits"][0]["why"], "no receipt of its tree here");
+        assert_eq!(entry["commits"][2]["code"], "proven");
+        assert_eq!(entry["commits"][2]["why"], Value::Null);
+        let gone = &json["entries"][1];
+        assert_eq!(keys(gone), keys(entry), "one shape, marked or not");
+        assert_eq!(gone["error"], "no clone under the roots has it as origin");
+        assert_eq!(gone["commits"], json!([]));
+        assert_eq!(keys(&json["proposals"]), "listed,waiting");
+        assert_eq!(
+            keys(&json["proposals"]["waiting"][0]),
+            "name,repo,scope,since,title"
+        );
+        assert_eq!(
+            keys(&json["sessions"][0]),
+            "agent,id,intent,repo,started,state"
+        );
+        assert_eq!(json["sessions"][0]["state"], "orphaned");
+        assert_eq!(json["report"]["schema"], "ohjaa-report.v1");
+        assert_eq!(json["complete"], false, "vessa could not be read");
+        // The marks alone: the same keys, no window.
+        report.window = false;
+        let marks_only = to_json(&report);
+        assert_eq!(keys(&marks_only), keys(&json));
+        assert_eq!(marks_only["report"], Value::Null);
+        assert_eq!(marks_only["entries"], json["entries"]);
     }
 
     #[test]
