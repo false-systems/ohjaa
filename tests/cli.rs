@@ -1601,13 +1601,14 @@ fn leaving_picks_up_a_fresh_receipt_without_changing_the_agent_exit() {
     let fixture = Fixture::new("usage-leaving");
     let repo = fixture.make_git_repo("work");
     let path = fixture.dir.join("receipt.json");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        + 1000;
-    let data = serde_json::json!({"schema":"agent-usage.v1","agent":"sh","session_id":"native-leaving","source":"fixture","observed_at_ms":now,"complete":false,"limitations":["fixture"],"entries":[]});
-    let script = format!("printf '%s' '{}' > \"$OHJAA_USAGE_FILE\"; exit 7", data);
+    // Stamped by the agent while it runs, as a real agent stamps one: after
+    // the session started, however long ohjaa took to start it. (A stamp
+    // taken here, before ohjaa runs, is fresh only while ohjaa starts within
+    // its margin, and a loaded machine misses it.) The quotes close around
+    // the stamp, so the shell expands it.
+    let data = r#"{"schema":"agent-usage.v1","agent":"sh","session_id":"native-leaving","source":"fixture","observed_at_ms":OBSERVED,"complete":false,"limitations":["fixture"],"entries":[]}"#
+        .replace("OBSERVED", "'\"$(date +%s)000\"'");
+    let script = format!("printf '%s' '{data}' > \"$OHJAA_USAGE_FILE\"; exit 7");
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -1629,9 +1630,14 @@ fn leaving_picks_up_a_fresh_receipt_without_changing_the_agent_exit() {
     let (out, _, code) = output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
     assert_eq!(code, Some(0));
     let export: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(
-        export["sessions"][0]["usage"][0]["session_id"],
-        "native-leaving"
+    let session = &export["sessions"][0];
+    assert_eq!(session["usage"][0]["session_id"], "native-leaving");
+    // Fresh: observed within the session, never before it started.
+    let observed = session["usage"][0]["observed_at_ms"].as_i64().unwrap();
+    assert!(
+        observed >= session["started_ms"].as_i64().unwrap()
+            && observed <= session["left"]["ended_ms"].as_i64().unwrap(),
+        "{session:#}"
     );
     let (_, stderr, code) = output_of(
         fixture
