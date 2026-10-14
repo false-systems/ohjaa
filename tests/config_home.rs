@@ -4918,6 +4918,22 @@ fn law_two_no_reviewer_judges_a_change_it_made() {
         stderr.contains("refused (law 2") && stderr.contains("Rae Reviewer <rae@example.invalid>"),
         "{stderr}"
     );
+    // The same, with Rae's commit the oldest of a Change longer than the
+    // record keeps (200 commits): every commit is checked, not those kept.
+    let mut more = sandbox.command("sh", &repo);
+    more.args([
+        "-c",
+        "git checkout -q feat/rae && i=0; while [ $i -lt 205 ]; do \
+         git commit -q --allow-empty -m \"ann $i\"; i=$((i+1)); done; git checkout -q main",
+    ]);
+    for (key, value) in ANN {
+        more.env(key, value);
+    }
+    assert!(more.output().unwrap().status.success());
+    let output = sandbox.judge_as(&repo, &RAE, &["main..feat/rae", "--verdict", "approve"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(3), "{stdout}{stderr}");
+    assert!(stderr.contains("refused (law 2"), "{stderr}");
 
     // Rae judging Ann's session work: recorded, Rae the reviewer.
     let (_, head) = sandbox.authored(&repo, "feat/ann");
@@ -5208,7 +5224,8 @@ fn a_public_repository_shares_no_judgement_unless_its_entry_opts_in_and_never_a_
             }
             let note: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(note["head"], head.as_str(), "{line}");
-            assert!(note["id"].as_str().unwrap().starts_with("jd-"), "{line}");
+            let id = note["id"].as_str().unwrap();
+            assert!(id.starts_with("jd-") || id.starts_with("rs-"), "{line}");
             assert_eq!(note["redacted"], true, "{line}");
         }
     };
@@ -5260,6 +5277,75 @@ fn a_public_repository_shares_no_judgement_unless_its_entry_opts_in_and_never_a_
         text(&output).1.contains("visibility = \"private\""),
         "{}",
         text(&output).1
+    );
+
+    // An answer in a public repository names no one either.
+    sandbox.entry_says(
+        "acme",
+        "widget",
+        Some("visibility = \"public\"\nshare_judgements = true".to_owned()),
+    );
+    let id = sandbox.judgements(&repo, &head, &[])["judgements"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut respond = sandbox.command("ohjaa", &repo);
+    respond.args(["judge", "respond", &id, "secret-project is fine"]);
+    for (key, value) in ANN {
+        respond.env(key, value);
+    }
+    assert_eq!(respond.output().unwrap().status.code(), Some(0));
+    check(&sandbox.note_lines(&repo, &head));
+    // An Intent id is an id: free text is refused, never published.
+    let output = sandbox.judge_as(
+        &repo,
+        &RAE,
+        &[
+            "main..feat/x",
+            "--verdict",
+            "approve",
+            "--intent-id",
+            "secret-project",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output).1);
+    assert!(
+        text(&output).1.contains("not an intent id"),
+        "{}",
+        text(&output).1
+    );
+}
+
+/// D8 point 3: an entry that was private and is public now never publishes
+/// the notes written while it was private, which name people: the push is
+/// refused while the notes ref holds any note that is not redacted.
+#[test]
+fn notes_written_while_private_are_never_pushed_once_the_entry_is_public() {
+    let (sandbox, repo, bare) = Sandbox::stage5("went-public", Some("private"));
+    let (_, head) = sandbox.authored(&repo, "feat/x");
+    let output = sandbox.judge_as(&repo, &RAE, &["main..feat/x", "--verdict", "approve"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    assert!(sandbox.note_lines(&repo, &head)[0].contains("Rae Reviewer"));
+    sandbox.entry_says(
+        "acme",
+        "widget",
+        Some("visibility = \"public\"\nshare_judgements = true".to_owned()),
+    );
+    let output = sandbox.judge_as(
+        &repo,
+        &RAE,
+        &["main..feat/x", "--verdict", "approve", "--push"],
+    );
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("not shared") && stderr.contains("not redacted"),
+        "{stderr}"
+    );
+    assert_eq!(
+        sandbox.git(&bare, &["for-each-ref", "refs/notes/"]),
+        "",
+        "nothing pushed"
     );
 }
 
