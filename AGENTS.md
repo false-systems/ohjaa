@@ -31,13 +31,20 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   in git. The **session log**, in redb at `$XDG_STATE_HOME/ohjaa/sessions.redb`,
   is machine-local history of what each session was briefed, read back,
   committed, finished and handed over, plus explicitly attributed usage receipts, references to the validations `ohjaa gate` and ohjaa itself requested (sykli's run ids and receipts, never outcomes), and the Judgements `ohjaa judge` recorded with their answers (each written once, never changed) — deleting it loses no knowledge, it never
-  blocks a launch, and a broken log is reported, never replaced. Everything
+  blocks a launch, and a broken log is reported, never replaced. Beside it,
+  `$XDG_STATE_HOME/ohjaa` holds one validation folder per clone
+  (`integrated/<clone>/`: the clone's one rolling validation checkout, the
+  cargo target dir that checkout builds in, and copies of its runs'
+  receipts) and the locks that let one ohjaa at a time ask for a clone's
+  validation or write its notes. Everything
   else — fleet, perimeter, coverage, marks — is derived now and stored never. No
   knowledge index, no cache, no daemon.
 - **The workflow lives in the home, outside every repository.**
   `~/.config/ohjaa` holds each repository's entry (`repos/<owner>/<repo>/`:
-  the branch ohjaa observes and the gate it is judged by, plus its generated
-  hooks folder and `gated.config`), the generated `git/` config and `roots`. Only
+  the branch ohjaa observes (`repo.toml`, nothing else), how its Judgements
+  are shared (`sharing.toml`, written by a person), the gate it is judged by,
+  plus its generated hooks folder and `gated.config`), the generated `git/`
+  config and `roots`. Only
   repositories whose remote names an entry run ohjaa's hooks, and only the
   hooks that entry needs; no other git command anywhere starts ohjaa, and
   ohjaa works its git facts out once instead of asking git again. Outside the
@@ -45,10 +52,13 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   a marked block in git's global excludes file and one line of `~/.zshrc`,
   records each before making it, and `apply --undo` puts them back; `ohjaa
   adopt` writes only in the home. Nothing is installed on or written into a
-  repository but two things git keeps beside it: a Judgement's note, a data
-  ref (`refs/notes/ohjaa/judgements`), pushed only when asked; and a
-  checkout of a landed commit to validate, a linked worktree kept in ohjaa's
-  state directory. No file, hook or config of a repository is written, and
+  repository but what git keeps beside it: Judgements' notes, data refs
+  (`refs/notes/ohjaa/judgements`, append-only, pushed only when asked, and
+  `refs/notes/ohjaa/fetched/judgements`, origin's as last fetched); and the
+  clone's one validation checkout, a linked worktree kept in ohjaa's state
+  directory (`$XDG_STATE_HOME/ohjaa/integrated/<clone>/checkout`, whose admin
+  folder git keeps in the clone's `.git/worktrees/`). No file, hook or config
+  of a repository is written, and
   the dispatcher always runs a repository's own hooks after observing.
 - **Observe, mark and flag; never refuse for the workflow.** A push to an
   entry's branch is handed to sykli and, when sykli does not prove it,
@@ -77,9 +87,13 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   in `ohjaa intake` (review comments, drafting), when a session leaves (its
   branch's pull request, bounded, recorded as unknown when gh cannot say), and
   `git push` or `git fetch` of `refs/notes/ohjaa/judgements` only when asked
-  (`ohjaa judge --push` or an entry's `push_judgements`, for an entry that
-  shares them; `ohjaa judgements --fetch`). Every other command works from the
-  filesystem and local CLIs.
+  (`ohjaa judge --push` or an entry's `push_judgements`, for an entry whose
+  `sharing.toml` shares them; `ohjaa judgements --fetch`, into
+  `refs/notes/ohjaa/fetched/judgements`). A push publishes the union of this
+  clone's lines, origin's and the session log's, never a merge that drops
+  one; for an entry that is not private, never a line or a notes commit that
+  names anyone, at the tip or anywhere in the history it would send. Every
+  other command works from the filesystem and local CLIs.
 - Failed coverage is never rendered as an empty result. If a scan could not
   look, it says so and exits non-zero.
 
@@ -92,7 +106,11 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   first change, and write the handover with `ohjaa handover` before you finish.
   Never write another session's testimony.
 - Never judge a Change you made, and never work around `ohjaa judge`'s law-2
-  refusal (another identity, another session's id). Answer a Judgement with
+  refusal (another identity, another session's id, a dropped
+  `OHJAA_SESSION`, a session started inside your own). This rule is
+  testimony, not a Boundary: ohjaa observes the judging process (the live
+  session whose process group holds it), not its environment, and records
+  what it cannot show as not established. Answer a Judgement with
   `ohjaa judge respond`; never edit or remove one.
 - Never edit `vendor/faija-knowledge/`; refresh it with
   `scripts/vendor-faija-knowledge.sh`. The format belongs to faija.
