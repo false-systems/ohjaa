@@ -2250,16 +2250,20 @@ enum Answer {
 }
 
 /// The tiers of a `sykli-verify.v1` verdict a proof stands on: the
-/// receipt's schema, the contract it ran under, the source (the commit's
-/// tree and every declared input the run read), its records' consistency,
-/// and the outcome. sykli establishes no provenance, producer or execution
-/// (receipts are unsigned), and a proof here claims none.
-const PROOF_TIERS: [&str; 5] = ["schema", "contract", "source", "consistency", "outcome"];
+/// receipt's identity, against the commit. Its schema, the contract it ran
+/// under, the source (the commit's tree and every declared input the run
+/// read) and its records' consistency. Not the outcome: that is the
+/// receipt's claim, since receipts are unsigned (sykli establishes no
+/// provenance, producer or execution either). It is read from the verdict's
+/// `outcome` check as claimed, whether sykli lists it among the tiers it
+/// established (sykli main as of 5acdf91) or not (as it is moving to).
+const IDENTITY_TIERS: [&str; 4] = ["schema", "contract", "source", "consistency"];
 
 /// Whether what `sykli verify <receipt> --commit <commit> --json` printed,
-/// exiting 0, proves `commit`: a `sykli-verify.v1` document that judged
-/// that commit, verified it and established every one of [`PROOF_TIERS`].
-/// Else why not, for "sykli could not say".
+/// exiting 0, proves `commit` as the receipt claims: a `sykli-verify.v1`
+/// document that judged that commit, verified it, established every one of
+/// [`IDENTITY_TIERS`], and whose `outcome` check passed on a claimed
+/// `passed` or `cached`. Else why not, for "sykli could not say".
 fn proves(document: &[u8], commit: &str) -> Result<(), String> {
     let document: Value = serde_json::from_slice(document)
         .map_err(|error| format!("sykli verify --json printed no verdict ({error})"))?;
@@ -2282,17 +2286,30 @@ fn proves(document: &[u8], commit: &str) -> Result<(), String> {
         .as_array()
         .map(|tiers| tiers.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    let missing: Vec<&str> = PROOF_TIERS
+    let missing: Vec<&str> = IDENTITY_TIERS
         .into_iter()
         .filter(|tier| !established.contains(tier))
         .collect();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !missing.is_empty() {
+        return Err(format!(
             "sykli verified it without establishing its {}",
             missing.join(", ")
-        ))
+        ));
+    }
+    let Some(outcome) = document["checks"]
+        .as_array()
+        .and_then(|checks| checks.iter().find(|check| check["name"] == "outcome"))
+    else {
+        return Err("sykli's verdict names no outcome the receipt claims".to_owned());
+    };
+    let claimed = outcome["actual"].as_str().unwrap_or("nothing");
+    let a_pass = claimed
+        .split_whitespace()
+        .any(|word| matches!(word, "passed" | "cached"));
+    if outcome["ok"] == true && a_pass {
+        Ok(())
+    } else {
+        Err(format!("the receipt claims {claimed}, not a pass"))
     }
 }
 

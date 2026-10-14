@@ -315,12 +315,16 @@ the receipt is. What sykli can do is read from the flags `sykli verify --help`
 lists, never from its sentences: one that lists `--commit` judges the commit
 alone, nothing from the checkout (sykli#67 as merged), and one that also lists
 `--json` is asked for its `sykli-verify.v1` verdict, whose trust tiers say what
-it established:
+it established. A pass stands on the receipt's identity against the commit:
+its schema, contract, source (the commit's tree and inputs) and the records'
+consistency. The outcome is the receipt's claim, as sykli's own trust
+statement says (receipts are unsigned), read from the verdict's `outcome`
+check whether sykli lists it as established or not:
 
 | sykli says | the record says | flag |
 |---|---|---|
-| exit 0; with `--json`, a verdict that judged the commit, verified it and established its schema, contract, source, consistency and outcome | `verified: passed` | no |
-| exit 0 with `--json`, but a verdict that does not prove it (another schema, another subject, a tier not established) | `unverified: …` | no |
+| exit 0; with `--json`, a verdict that judged the commit, verified it, established its schema, contract, source and consistency, and whose `outcome` check passed on a claimed `passed` or `cached` | `verified: passed` | no |
+| exit 0 with `--json`, but a verdict that does not prove it (another schema, another subject, an identity tier not established, no claimed pass) | `unverified: …` | no |
 | exit 1 or 3: refused the commit (another tree, a dirty run, an input the commit does not have, a failed outcome, contradictory records) | `FAILED sykli verify: …` | **yes** |
 | exit 4: it passed under another contract or lock than the one it is judged by now | `unproven: it passed under another contract than the gate's (…)` | **yes** where it is `origin/<default>`'s tip; otherwise no |
 | exit 2: it could not verify (a bad revision, arguments, not a receipt) | `unverified: sykli verify could not verify: …` | no |
@@ -777,11 +781,13 @@ cannot read), the push goes on with `ohjaa: UNOBSERVED push to <owner/repo>:
   could not say.
 
 ✓ means exactly that sykli accepted a receipt for this tree against the
-entry's contract. Receipts are unsigned files that any local session can
-write, and `sykli verify` checks a receipt against the commit's tree, its
-contract and its lock, not by running the tree again: a forged receipt can
-make a commit look proven (one cheap forgery, editing `tree_oid`, is filed on
-sykli). A mark is evidence from this machine's sessions, not a CI result.
+entry's contract: sykli verified the receipt's identity against this commit;
+the outcome is the receipt's claim. Receipts are unsigned files that any
+local session can write, and `sykli verify` checks a receipt against the
+commit's tree, its contract and its lock, not by running the tree again: a
+forged receipt can make a commit look proven (one cheap forgery, editing
+`tree_oid`, is filed on sykli). A mark is evidence from this machine's
+sessions, not a CI result.
 
 The walk starts where the clone last saw origin (`refs/remotes/origin/
 <branch>`: no fetch, no network), and goes back along first parents to the
