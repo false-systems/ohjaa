@@ -70,7 +70,7 @@ fn gate_of(top: &Path, listing: &Listing) -> Result<Option<Gate>> {
 
 /// `sykli <command> --help`, said on stdout or stderr; empty when sykli
 /// cannot be asked.
-fn sykli_help(command: &str) -> String {
+pub(crate) fn sykli_help(command: &str) -> String {
     Command::new("sykli")
         .args([command, "--help"])
         .stdin(std::process::Stdio::null())
@@ -109,7 +109,7 @@ fn now_ms() -> i64 {
 /// The hash `contract`'s lock (`sykli.lock` beside it) pins for it, read as
 /// sykli reads it: `sykli-lock.v1`'s one hash, or `sykli-lock.v2`'s entry
 /// for the contract's file name. `None` without a lock that pins it.
-fn pinned(contract: &Path) -> Option<String> {
+pub(crate) fn pinned(contract: &Path) -> Option<String> {
     let lock: Value =
         serde_json::from_slice(&std::fs::read(contract.with_file_name("sykli.lock")).ok()?).ok()?;
     match lock["schema"].as_str()? {
@@ -219,6 +219,7 @@ impl Request {
             ),
             observed_branch,
             ran: None,
+            not_dispatched: None,
         };
         let log = match crate::knowledge::state_home() {
             Ok(state) => sessions::store_path(&state.join("ohjaa")),

@@ -825,6 +825,16 @@ pub fn start_of(repo: &Path) -> Start {
     start
 }
 
+/// Where ohjaa's own validation checkouts are (see `integrated`), canonical:
+/// it makes nothing in them, so their reflogs are never read for work (their
+/// receipts still are).
+pub fn validation_checkouts() -> Option<PathBuf> {
+    let state = crate::knowledge::state_home().ok()?;
+    Some(canonical(&crate::integrated::checkouts_root(
+        &state.join("ohjaa"),
+    )))
+}
+
 /// One checkout of a repository: its main worktree or a linked one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
@@ -983,23 +993,7 @@ pub fn receipts_of_clone(repo: &Path, checkouts: &[Worktree]) -> Receipts {
 /// `sykli run` writes (`.sykli/receipts/`) and the one `ohjaa gate` saves
 /// (`.sykli/receipt.json`).
 pub fn receipts_of_layout(common: &Path) -> Receipts {
-    let mut checkouts: Vec<PathBuf> = Vec::new();
-    if common.file_name().is_some_and(|name| name == ".git") {
-        if let Some(main) = common.parent() {
-            checkouts.push(canonical(main));
-        }
-    }
-    if let Ok(linked) = std::fs::read_dir(common.join("worktrees")) {
-        for entry in linked.flatten() {
-            let Ok(gitdir) = std::fs::read_to_string(entry.path().join("gitdir")) else {
-                continue;
-            };
-            let gitdir = entry.path().join(gitdir.trim());
-            if let Some(worktree) = gitdir.parent() {
-                checkouts.push(canonical(worktree));
-            }
-        }
-    }
+    let checkouts = layout_checkouts(common);
     let kept_in = checkouts
         .first()
         .cloned()
@@ -1021,6 +1015,33 @@ pub fn receipts_of_layout(common: &Path) -> Receipts {
         dirs.iter()
             .map(|(dir, checkout)| (dir.clone(), checkout.as_path())),
     )
+}
+
+/// Every checkout of the clone whose common git dir is `common`, canonical,
+/// from its layout alone (no git): the main one when the common dir is its
+/// `.git`, then each linked one `<common>/worktrees/*/gitdir` names, whether
+/// or not its folder still exists.
+pub fn layout_checkouts(common: &Path) -> Vec<PathBuf> {
+    let mut checkouts: Vec<PathBuf> = Vec::new();
+    if common.file_name().is_some_and(|name| name == ".git") {
+        if let Some(main) = common.parent() {
+            checkouts.push(canonical(main));
+        }
+    }
+    if let Ok(linked) = std::fs::read_dir(common.join("worktrees")) {
+        let mut linked: Vec<PathBuf> = linked.flatten().map(|entry| entry.path()).collect();
+        linked.sort();
+        for admin in linked {
+            let Ok(gitdir) = std::fs::read_to_string(admin.join("gitdir")) else {
+                continue;
+            };
+            let gitdir = admin.join(gitdir.trim());
+            if let Some(worktree) = gitdir.parent() {
+                checkouts.push(canonical(worktree));
+            }
+        }
+    }
+    checkouts
 }
 
 /// The sykli receipts in these folders, each with the checkout it is run
@@ -1108,18 +1129,18 @@ fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Rec
 const MAX_PHASES: usize = 50;
 
 /// One reflog entry: `reference` moved to `commit`, at `at` (unix seconds).
-struct Move {
-    reference: String,
-    at: i64,
-    commit: String,
-    subject: String,
+pub(crate) struct Move {
+    pub(crate) reference: String,
+    pub(crate) at: i64,
+    pub(crate) commit: String,
+    pub(crate) subject: String,
 }
 
-const REFLOG_FORMAT: &str = "--format=%gD%x1f%H%x1f%gs";
+pub(crate) const REFLOG_FORMAT: &str = "--format=%gD%x1f%H%x1f%gs";
 
 /// Reflog entries, newest first per reference, from `git <args>` run with
 /// `--date=unix` and [`REFLOG_FORMAT`].
-fn reflog(dir: &Path, args: &[&str]) -> Option<Vec<Move>> {
+pub(crate) fn reflog(dir: &Path, args: &[&str]) -> Option<Vec<Move>> {
     let log = git(dir, args)?;
     Some(
         log.lines()
@@ -1300,7 +1321,15 @@ pub fn observe(
     // Every commit a checkout that still exists records making, at any time:
     // its sykli receipts would be there.
     let mut made_alive: HashSet<String> = HashSet::new();
+    let ours = validation_checkouts();
     for checkout in &all {
+        // ohjaa's own validation checkouts: nothing is made there.
+        if ours
+            .as_ref()
+            .is_some_and(|ours| checkout.path.starts_with(ours))
+        {
+            continue;
+        }
         let Some(moves) = reflog(
             &checkout.path,
             &[
@@ -1647,7 +1676,14 @@ pub fn default_branch_since(
     // What a checkout that still exists records making: its receipts would
     // be there.
     let mut alive = HashSet::new();
+    let ours = validation_checkouts();
     for checkout in &all {
+        if ours
+            .as_ref()
+            .is_some_and(|ours| checkout.path.starts_with(ours))
+        {
+            continue;
+        }
         let moves = reflog(
             &checkout.path,
             &[
@@ -2024,7 +2060,7 @@ fn existing(repo: &Path, commits: &[String]) -> Option<Vec<String>> {
 /// reset, a fast-forward, a rebase's start or finish). Judged by git's own
 /// wording, `<action>: <message>`. The action carries the command's
 /// arguments (`pull -q --rebase (pick)`), so replays match by their suffix.
-fn created_here(subject: &str) -> bool {
+pub(crate) fn created_here(subject: &str) -> bool {
     const REPLAYED: [&str; 7] = [
         "(pick)",
         "(reword)",
@@ -2835,11 +2871,13 @@ pub fn ran_of_status(status: &Value) -> Option<crate::sessions::Ran> {
 }
 
 /// What `sykli status --help` says: whether it has durable runs to ask
-/// about (`--run`, KATANA D3), and whether it takes the repository's facts
-/// (`--repo-root` and `--git-common-dir`).
+/// about (`--run`, KATANA D3), whether it judges what applies to a commit
+/// (`--commit` and `--contract`, `sykli-commit-status.v1`), and whether it
+/// takes the repository's facts (`--repo-root` and `--git-common-dir`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StatusHelp {
     pub runs: bool,
+    pub commit: bool,
     pub facts: bool,
 }
 
@@ -2862,6 +2900,7 @@ pub fn sykli_status_help() -> StatusHelp {
     .unwrap_or_default();
     StatusHelp {
         runs: process::names_flag(&help, "--run"),
+        commit: process::names_flag(&help, "--commit") && process::names_flag(&help, "--contract"),
         facts: process::names_flag(&help, "--repo-root")
             && process::names_flag(&help, "--git-common-dir"),
     }

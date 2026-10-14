@@ -136,6 +136,12 @@ pub struct Report {
     /// The window (its three lists) was read; `false` for the marks alone
     /// (`--marks`), which read no default-branch window and ask no vessa.
     pub window: bool,
+    /// The integrated validations sessions asked sykli for (KATANA D5),
+    /// each with the session that recorded it: references, never verdicts.
+    pub integrated: Vec<(String, sessions::ValidationRef)>,
+    /// The Judgements recorded in the window and the Changes with none, as
+    /// `ohjaa-marks.v1` says them (`judgement::report_json`).
+    pub judgements: Value,
 }
 
 /// A proposal, or a proposed node, waiting for a person's decision.
@@ -256,6 +262,19 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
             ));
         }
     }
+    // The integrated validations sessions asked for, and the Judgements:
+    // from the log, read once above (and the Judgement tables of it).
+    let integrated = logged
+        .iter()
+        .flat_map(|session| {
+            session
+                .validations
+                .iter()
+                .filter(|v| v.kind == sessions::ValidationKind::Integrated)
+                .map(|v| (session.id.clone(), v.clone()))
+        })
+        .collect();
+    let judgements = crate::judgement::report_json(&logged, since_ms);
     Report {
         since_ms,
         until_ms: now_ms,
@@ -268,6 +287,8 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
         open,
         gaps,
         window,
+        integrated,
+        judgements,
     }
 }
 
@@ -909,12 +930,36 @@ pub fn to_json(report: &Report) -> Value {
                 "updated_by": marks.updated.as_ref().and_then(|at| at.by),
                 "ended": marks.ended.word(),
                 "proven_at_tip": marks.proven_at_tip(),
+                // Additive (KATANA D5): every commit here is on the observed
+                // branch, so its mark is the integrated State's; and the
+                // integrated validations sessions asked sykli for, of these
+                // commits, by reference.
+                "integrated": json!({
+                    "commit": marks.commits.first().map(|tip| tip.commit.as_str()),
+                    "status": marks.commits.first().map_or("unverified", |tip| integrated_word(&tip.check)),
+                    "requested": report
+                        .integrated
+                        .iter()
+                        .filter(|(_, v)| marks.commits.iter().any(|c| c.commit == v.commit))
+                        .map(|(session, v)| json!({
+                            "request": v.request,
+                            "run": v.run,
+                            "commit": v.commit,
+                            "tree": v.tree,
+                            "requested": rfc(v.requested_ms),
+                            "session": session,
+                            "checkout": v.repo,
+                            "not_dispatched": v.not_dispatched,
+                        }))
+                        .collect::<Vec<_>>(),
+                }),
                 "commits": marks.commits.iter().map(|walked| json!({
                     "sha": walked.commit,
                     "tree": walked.tree,
                     "mark": mark::word(&walked.check),
                     "code": mark::code(&walked.check),
                     "why": mark::why(&walked.check),
+                    "integrated": integrated_word(&walked.check),
                     // For a proven commit, the accepted receipt's tasks and
                     // how many of them it reused from sykli's cache.
                     "tasks": walked.proof.as_ref().map(|proof| proof.tasks),
@@ -935,6 +980,7 @@ pub fn to_json(report: &Report) -> Value {
                 "updated_by": Value::Null,
                 "ended": Value::Null,
                 "proven_at_tip": false,
+                "integrated": Value::Null,
                 "commits": [],
                 "error": why,
             }),
@@ -975,8 +1021,23 @@ pub fn to_json(report: &Report) -> Value {
             Err(why) => json!({"listed": false, "why": why, "waiting": []}),
         },
         "sessions": report.open.iter().map(session).collect::<Vec<_>>(),
+        // Additive (KATANA D5): the Judgements recorded in the window, and
+        // the Changes of ended sessions that no Judgement covers.
+        "judgements": report.judgements,
         "report": if report.window { report_json(report) } else { Value::Null },
     })
+}
+
+/// A commit on the observed branch is the integrated State: `passed`,
+/// `failed` or `unverified`, from its mark (sykli's word on a receipt of
+/// exactly its tree; a candidate's result counts only where the trees are
+/// the same).
+fn integrated_word(check: &Check) -> &'static str {
+    match check {
+        Check::Passed => "passed",
+        Check::Failed { .. } => "failed",
+        _ => "unverified",
+    }
 }
 
 /// The window's report as `ohjaa-report.v1` JSON.
@@ -1454,6 +1515,8 @@ mod tests {
             open: Vec::new(),
             gaps: Vec::new(),
             window: true,
+            integrated: Vec::new(),
+            judgements: json!({"listed": true, "recorded": [], "pending": []}),
         }
     }
 
@@ -1521,6 +1584,27 @@ mod tests {
             since: "2026-10-01".to_owned(),
             repo: None,
         }]);
+        let validation = |request: &str, commit: &str| sessions::ValidationRef {
+            request: request.to_owned(),
+            run: Some("run-9".to_owned()),
+            kind: sessions::ValidationKind::Integrated,
+            repo: "/s/ohjaa/integrated/widget-0/c3".to_owned(),
+            commit: commit.to_owned(),
+            tree: format!("tree-{commit}"),
+            contract: "/h/repos/acme/widget/sykli.json".to_owned(),
+            contract_digest: None,
+            lock_digest: None,
+            requested_ms: 6_000,
+            receipt: None,
+            common: Some("/r/widget/.git".to_owned()),
+            observed_branch: None,
+            ran: None,
+            not_dispatched: None,
+        };
+        report.integrated = vec![
+            ("oh-8".to_owned(), validation("rq-9-9", "c3")),
+            ("oh-8".to_owned(), validation("rq-9-8", "elsewhere")),
+        ];
         report.open = vec![Untold {
             id: "oh-9".to_owned(),
             agent: "claude".to_owned(),
@@ -1546,13 +1630,41 @@ mod tests {
         assert_eq!(json["schema"], "ohjaa-marks.v1");
         assert_eq!(
             keys(&json),
-            "complete,entries,generated,proposals,report,schema,sessions"
+            "complete,entries,generated,judgements,proposals,report,schema,sessions"
         );
         let entry = &json["entries"][0];
         assert_eq!(
             keys(entry),
-            "branch,clone,commits,ended,error,proven_at_tip,ref,repo,tip,updated,updated_by"
+            "branch,clone,commits,ended,error,integrated,proven_at_tip,ref,repo,tip,updated,\
+             updated_by"
         );
+        // Additive (KATANA D5): the integrated State at the tip, and the
+        // integrated validations asked for, by reference.
+        assert_eq!(keys(&entry["integrated"]), "commit,requested,status");
+        assert_eq!(entry["integrated"]["commit"], "c3");
+        assert_eq!(entry["integrated"]["status"], "unverified");
+        let requested = &entry["integrated"]["requested"][0];
+        assert_eq!(
+            keys(requested),
+            "checkout,commit,not_dispatched,request,requested,run,session,tree"
+        );
+        assert_eq!(requested["request"], "rq-9-9");
+        assert_eq!(requested["run"], "run-9");
+        assert_eq!(requested["session"], "oh-8");
+        assert_eq!(requested["commit"], "c3");
+        assert_eq!(
+            entry["integrated"]["requested"].as_array().unwrap().len(),
+            1,
+            "only the validations of commits on the branch"
+        );
+        let integrated: Vec<&str> = entry["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["integrated"].as_str().unwrap())
+            .collect();
+        assert_eq!(integrated, ["unverified", "failed", "passed"]);
+        assert_eq!(keys(&json["judgements"]), "listed,pending,recorded");
         assert_eq!(entry["repo"], "acme/widget");
         assert_eq!(entry["ref"], "origin/main");
         assert_eq!(entry["tip"], "c3");
@@ -1564,7 +1676,7 @@ mod tests {
         let commit = &entry["commits"][1];
         assert_eq!(
             keys(commit),
-            "author,authored,cached,code,mark,sha,subject,tasks,tree,why"
+            "author,authored,cached,code,integrated,mark,sha,subject,tasks,tree,why"
         );
         // Additive: the accepted receipt's tasks and how many it reused from
         // the cache, for a proven commit only.
@@ -1601,6 +1713,7 @@ mod tests {
         assert_eq!(keys(gone), keys(entry), "one shape, marked or not");
         assert_eq!(gone["error"], "no clone under the roots has it as origin");
         assert_eq!(gone["commits"], json!([]));
+        assert_eq!(gone["integrated"], Value::Null);
         assert_eq!(keys(&json["proposals"]), "listed,waiting");
         assert_eq!(
             keys(&json["proposals"]["waiting"][0]),

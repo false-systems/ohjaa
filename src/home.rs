@@ -7,7 +7,8 @@
 //! ```text
 //! ~/.config/ohjaa/
 //!   repos/<owner>/<repo>/            lower case
-//!     repo.toml    branch = "main"   the only per-repo workflow fact
+//!     repo.toml    branch = "main"   the branch ohjaa observes; and, written by a
+//!                  person: visibility, share_judgements, push_judgements
 //!     sykli.json   the gate (a sykli contract), inputs repo-relative
 //!     sykli.lock
 //!     hooks/<name>                   exec <ohjaa> hook <name> "$@", for pre-push
@@ -111,12 +112,57 @@ impl RepoId {
     }
 }
 
+/// Whether a repository is public or private, as its entry says. ohjaa asks
+/// no forge (it has no network for this), so only the entry knows; an entry
+/// that does not say is treated as public: nothing that may name private
+/// things leaves this machine on a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    Private,
+    Public,
+    /// The entry does not say.
+    Unknown,
+}
+
+impl Visibility {
+    pub fn word(self) -> &'static str {
+        match self {
+            Visibility::Private => "private",
+            Visibility::Public => "public",
+            Visibility::Unknown => "unknown",
+        }
+    }
+}
+
+/// What an entry says about sharing Judgements, beyond its branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sharing {
+    /// `visibility = "private" | "public"`.
+    pub visibility: Visibility,
+    /// `share_judgements = true | false`, when the entry says.
+    pub share_judgements: Option<bool>,
+    /// `push_judgements = true`: `ohjaa judge` pushes the notes ref itself.
+    pub push_judgements: bool,
+}
+
+impl Default for Sharing {
+    fn default() -> Self {
+        Sharing {
+            visibility: Visibility::Unknown,
+            share_judgements: None,
+            push_judgements: false,
+        }
+    }
+}
+
 /// A repository's entry: where the workflow keeps its gate.
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub dir: PathBuf,
     /// The branch ohjaa observes, judged by the gate.
     pub branch: String,
+    /// Whether its Judgements are shared, and how (see [`Sharing`]).
+    pub sharing: Sharing,
 }
 
 impl Entry {
@@ -137,36 +183,84 @@ pub fn entry_dir(home: &Path, id: &RepoId) -> PathBuf {
         .join(id.name.to_ascii_lowercase())
 }
 
-/// What `repo.toml` holds: the branch, and nothing else.
-pub fn repo_toml(id: &RepoId, branch: &str) -> String {
-    format!(
+/// What `repo.toml` holds: the branch, and what the entry says about sharing
+/// Judgements when it says anything (kept as it was when `adopt --force`
+/// rewrites the entry: only a person writes those).
+pub fn repo_toml(id: &RepoId, branch: &str, sharing: &Sharing) -> String {
+    let mut text = format!(
         "# ohjaa's entry for {}, written by `ohjaa adopt`. ohjaa observes this branch,\n\
-         # judged by the gate beside it (sykli.json); nothing else about the repo lives here.\n\
+         # judged by the gate beside it (sykli.json).\n\
          branch = {}\n",
         id.slug(),
         flat_toml::quote(branch)
-    )
+    );
+    if sharing.visibility != Visibility::Unknown {
+        text.push_str(&format!(
+            "visibility = {}\n",
+            flat_toml::quote(sharing.visibility.word())
+        ));
+    }
+    if let Some(share) = sharing.share_judgements {
+        text.push_str(&format!("share_judgements = {share}\n"));
+    }
+    if sharing.push_judgements {
+        text.push_str("push_judgements = true\n");
+    }
+    text
 }
 
-fn parse_repo_toml(text: &str) -> std::result::Result<String, String> {
+/// The keys `repo.toml` may hold.
+const REPO_KEYS: [&str; 4] = [
+    "branch",
+    "visibility",
+    "share_judgements",
+    "push_judgements",
+];
+
+fn parse_repo_toml(text: &str) -> std::result::Result<(String, Sharing), String> {
     let tables = flat_toml::parse(text)?;
     if let Some(table) = tables.keys().find(|name| !name.is_empty()) {
         return Err(format!(
-            "unknown table [{table}]; repo.toml holds only branch"
+            "unknown table [{table}]; repo.toml holds only {}",
+            REPO_KEYS.join(", ")
         ));
     }
-    flat_toml::only_keys(&tables, "", &["branch"])?;
-    let branch = tables[""]
-        .get("branch")
-        .ok_or("no branch = \"…\"")?
-        .to_owned();
+    flat_toml::only_keys(&tables, "", &REPO_KEYS)?;
+    let top = &tables[""];
+    let branch = top.get("branch").ok_or("no branch = \"…\"")?.to_owned();
     if branch.is_empty() || branch.starts_with('-') || branch.chars().any(char::is_whitespace) {
         return Err(format!("{branch:?} is not a branch name"));
     }
-    Ok(branch
-        .strip_prefix("refs/heads/")
-        .unwrap_or(&branch)
-        .to_owned())
+    let flag = |key: &str| -> std::result::Result<Option<bool>, String> {
+        match top.get(key).map(String::as_str) {
+            None => Ok(None),
+            Some("true") => Ok(Some(true)),
+            Some("false") => Ok(Some(false)),
+            Some(other) => Err(format!("{key} is true or false, not {other:?}")),
+        }
+    };
+    let visibility = match top.get("visibility").map(String::as_str) {
+        None => Visibility::Unknown,
+        Some("private") => Visibility::Private,
+        Some("public") => Visibility::Public,
+        Some(other) => {
+            return Err(format!(
+                "visibility is \"private\" or \"public\", not {other:?}"
+            ))
+        }
+    };
+    let sharing = Sharing {
+        visibility,
+        share_judgements: flag("share_judgements")?,
+        push_judgements: flag("push_judgements")?.unwrap_or(false),
+    };
+    Ok((
+        branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&branch)
+            .to_owned(),
+        sharing,
+    ))
 }
 
 /// The entry at `dir`, `Ok(None)` when there is none. A directory with files
@@ -176,11 +270,12 @@ pub fn read_entry(dir: &Path) -> Result<Option<Entry>> {
     let path = dir.join("repo.toml");
     match std::fs::read_to_string(&path) {
         Ok(text) => {
-            let branch = parse_repo_toml(&text)
+            let (branch, sharing) = parse_repo_toml(&text)
                 .map_err(|why| anyhow::anyhow!("{}: {why}", path.display()))?;
             Ok(Some(Entry {
                 dir: dir.to_path_buf(),
                 branch,
+                sharing,
             }))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -448,12 +543,33 @@ mod tests {
     }
 
     #[test]
-    fn repo_toml_holds_the_branch_and_nothing_else() {
+    fn repo_toml_holds_the_branch_and_how_judgements_are_shared() {
         let id = RepoId::parse("git@github.com:acme/widget.git").unwrap();
-        assert_eq!(parse_repo_toml(&repo_toml(&id, "main")).unwrap(), "main");
+        let plain = Sharing::default();
         assert_eq!(
-            parse_repo_toml("branch = \"refs/heads/trunk\"").unwrap(),
+            parse_repo_toml(&repo_toml(&id, "main", &plain)).unwrap(),
+            ("main".to_owned(), plain)
+        );
+        assert_eq!(
+            parse_repo_toml("branch = \"refs/heads/trunk\"").unwrap().0,
             "trunk"
+        );
+        // What a person wrote about sharing survives a rewrite.
+        let said = Sharing {
+            visibility: Visibility::Public,
+            share_judgements: Some(true),
+            push_judgements: true,
+        };
+        assert_eq!(
+            parse_repo_toml(&repo_toml(&id, "main", &said)).unwrap().1,
+            said
+        );
+        assert_eq!(
+            parse_repo_toml("branch = \"main\"\nvisibility = \"private\"\n")
+                .unwrap()
+                .1
+                .visibility,
+            Visibility::Private
         );
         for (text, why) in [
             ("", "no branch"),
@@ -464,6 +580,14 @@ mod tests {
             ),
             ("[gate]\nbranch = \"main\"", "unknown table"),
             ("branch = main", "only \"text\" values"),
+            (
+                "branch = \"main\"\nvisibility = \"internal\"",
+                "visibility is \"private\" or \"public\"",
+            ),
+            (
+                "branch = \"main\"\nshare_judgements = \"yes\"",
+                "share_judgements is true or false",
+            ),
         ] {
             let error = parse_repo_toml(text).unwrap_err();
             assert!(error.contains(why), "{text:?}: {error}");

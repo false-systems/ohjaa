@@ -4702,10 +4702,11 @@ impl Sandbox {
         .unwrap();
     }
 
-    /// Another clone of `bare` (`projects/<name>`) that pushes one commit to
-    /// main: origin/main moves on elsewhere. Its new tip.
+    /// Another clone of `bare` (`elsewhere/<name>`, outside the roots: the
+    /// marks are walked in the clone here) that pushes one commit to main:
+    /// origin/main moves on elsewhere. Its new tip.
     fn pushed_elsewhere(&self, bare: &Path, name: &str, file: &str) -> String {
-        let other = self.dir.join("projects").join(name);
+        let other = self.dir.join("elsewhere").join(name);
         self.git(
             &self.dir,
             &[
@@ -5197,7 +5198,7 @@ fn a_public_repository_shares_no_judgement_unless_its_entry_opts_in_and_never_a_
         "Ann",
         "ann@",
         "secret-project",
-        &sandbox.dir.to_string_lossy().into_owned(),
+        &sandbox.dir.to_string_lossy(),
     ];
     let check = |lines: &[String]| {
         assert!(!lines.is_empty());
@@ -5301,14 +5302,19 @@ fn a_landing_on_the_observed_branch_is_validated_as_the_integrated_state() {
     assert_ne!(landed_tree, candidate_tree);
     assert_ne!(landed, candidate);
 
-    // Recorded in the leaving session, as an integrated validation.
+    // Recorded in the leaving session, as an integrated validation (its
+    // launch asked for one of the tip it found unverified, too).
     let record = sandbox.session_record(&repo, "land the feature");
     let refs = record["validations"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    assert_eq!(refs.len(), 1, "{record:#}");
-    let integrated = &refs[0];
+    let of_landed: Vec<&serde_json::Value> = refs
+        .iter()
+        .filter(|v| v["commit"] == landed.as_str())
+        .collect();
+    assert_eq!(of_landed.len(), 1, "{record:#}");
+    let integrated = of_landed[0];
     assert_eq!(integrated["kind"], "integrated", "{record:#}");
     assert_eq!(integrated["commit"], landed.as_str());
     assert_eq!(integrated["tree"], landed_tree.as_str());
@@ -5324,15 +5330,13 @@ fn a_landing_on_the_observed_branch_is_validated_as_the_integrated_state() {
         .iter()
         .find(|s| s["intent"] == "land the feature")
         .unwrap_or_else(|| panic!("{at_dispatch:#}"));
-    assert_eq!(
-        then["validations"][0]["request"], integrated["request"],
-        "{then:#}"
-    );
-    assert_eq!(
-        then["validations"][0]["run"],
-        serde_json::Value::Null,
-        "{then:#}"
-    );
+    let recorded = then["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["request"] == integrated["request"])
+        .unwrap_or_else(|| panic!("not recorded before dispatch: {then:#}"));
+    assert_eq!(recorded["run"], serde_json::Value::Null, "{then:#}");
     // Run in a checkout of exactly that commit, outside the repository.
     let checkout = PathBuf::from(integrated["repo"].as_str().unwrap());
     assert!(
@@ -5395,11 +5399,15 @@ fn a_landing_on_the_observed_branch_is_validated_as_the_integrated_state() {
     assert_eq!(entry["tip"], landed.as_str(), "{json:#}");
     assert_eq!(entry["commits"][0]["integrated"], "unverified", "{json:#}");
     assert_eq!(entry["integrated"]["status"], "unverified", "{json:#}");
-    assert_eq!(
-        entry["integrated"]["requested"][0]["request"], integrated["request"],
-        "{json:#}"
-    );
-    assert_eq!(entry["integrated"]["requested"][0]["run"], run, "{json:#}");
+    let requested = entry["integrated"]["requested"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["commit"] == landed.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("{json:#}"));
+    assert_eq!(requested["request"], integrated["request"], "{json:#}");
+    assert_eq!(requested["run"], run, "{json:#}");
 
     // sykli ran the landed tree and it passed: integrated passed.
     fs::remove_file(sandbox.dir.join("hold-runs")).unwrap();
@@ -5417,6 +5425,8 @@ fn a_landing_on_the_observed_branch_is_validated_as_the_integrated_state() {
 
     // A candidate landed as it is (a fast-forward) has the same tree: sykli
     // has a current receipt of it, so no run is asked for, and it is said.
+    // (sykli now says the landing above passed: no launch asks for it.)
+    sandbox.commit_status(&landed, &landed_tree, "passed", None);
     sandbox.git(&repo, &["checkout", "-q", "-b", "feat2"]);
     let same = sandbox.commit(&repo, "feature-two");
     sandbox.commit_status(&same, &sandbox.tree(&repo, "HEAD"), "passed", None);
@@ -5496,7 +5506,7 @@ fn the_briefing_shows_candidate_and_integrated_states_and_asks_once_for_an_unver
     assert!(refs[0]["run"].is_string(), "{record:#}");
     assert!(
         briefing.contains(&format!(
-            "ohjaa asked sykli to validate it: request {}",
+            "ohjaa asks sykli to validate it: request {}",
             refs[0]["request"].as_str().unwrap()
         )),
         "{briefing}"
@@ -5664,7 +5674,7 @@ fn sessions_in_every_worktree_of_the_clone_are_counted_and_named_at_launch() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("Sessions in this clone's other worktrees at launch")
+        stderr.contains("Sessions in the other worktrees of this clone at launch")
             && stderr.contains("1790-42 (codex) in ")
             && stderr.contains("on lexer")
             && stderr.contains("rework the lexer"),
@@ -5672,9 +5682,24 @@ fn sessions_in_every_worktree_of_the_clone_are_counted_and_named_at_launch() {
     );
 }
 
+/// The git processes ohjaa itself started: trace2's top-level sessions. A
+/// git that git started (a fetch's `upload-pack`, a push's `receive-pack`,
+/// an automatic `maintenance`) carries its parent's session id before a `/`.
+fn own(starts: &[String]) -> usize {
+    starts
+        .iter()
+        .filter(|line| {
+            line.split_once("\"sid\":\"")
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .is_some_and(|(sid, _)| !sid.contains('/'))
+        })
+        .count()
+}
+
 /// "We don't want to run git git git", Stage 5: the Judgement and its notes,
 /// and the stale-base check on the hook path, each measured as git's trace2
-/// counts it, with a positive control that it did what it says.
+/// counts it (ohjaa's own processes; the transport's are git's), with a
+/// positive control that it did what it says.
 #[test]
 fn judgements_and_the_stale_base_check_stay_within_their_git_budget() {
     let (sandbox, repo, bare) = Sandbox::stage5("budget5", Some("private"));
@@ -5703,7 +5728,7 @@ fn judgements_and_the_stale_base_check_stay_within_their_git_budget() {
         "the note was written"
     );
     assert!(started(&starts, "notes"), "{starts:#?}");
-    budget("ohjaa judge (a person)", starts.len(), 6);
+    budget("ohjaa judge (a person)", own(&starts), 6);
 
     // Inside a session: also the reviewer's own commits (its checkout's
     // reflog and the clone's branches).
@@ -5752,7 +5777,7 @@ fn judgements_and_the_stale_base_check_stay_within_their_git_budget() {
         started(&starts, "--walk-reflogs"),
         "its checkout's reflog: {starts:#?}"
     );
-    budget("ohjaa judge (inside a session)", starts.len(), 6);
+    budget("ohjaa judge (inside a session)", own(&starts), 6);
     fs::write(&stop, "").unwrap();
     session.wait().unwrap();
 
@@ -5763,7 +5788,7 @@ fn judgements_and_the_stale_base_check_stay_within_their_git_budget() {
     let (starts, output) = sandbox.git_starts(&mut judge);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
     assert_eq!(sandbox.note_lines(&bare, &head).len(), 3, "pushed");
-    budget("ohjaa judge --push", starts.len(), 9);
+    budget("ohjaa judge --push", own(&starts), 9);
 
     // An answer: the identity and the note.
     let id = sandbox.judgements(&repo, &head, &[])["judgements"][0]["id"]
@@ -5780,13 +5805,13 @@ fn judgements_and_the_stale_base_check_stay_within_their_git_budget() {
         4,
         "the answer's note"
     );
-    budget("ohjaa judge respond", starts.len(), 3);
+    budget("ohjaa judge respond", own(&starts), 3);
 
     // Reading: the commit, and the notes of each source.
     let (starts, output) =
         sandbox.git_starts(sandbox.command("ohjaa", &repo).args(["judgements", &head]));
     assert!(text(&output).0.contains(&id), "{}", text(&output).0);
-    budget("ohjaa judgements <commit>", starts.len(), 3);
+    budget("ohjaa judgements <commit>", own(&starts), 3);
     let (starts, output) =
         sandbox.git_starts(
             sandbox
@@ -5795,7 +5820,7 @@ fn judgements_and_the_stale_base_check_stay_within_their_git_budget() {
         );
     assert!(text(&output).0.contains(&id), "{}", text(&output).0);
     assert!(started(&starts, "fetch"), "{starts:#?}");
-    budget("ohjaa judgements <commit> --fetch", starts.len(), 4);
+    budget("ohjaa judgements <commit> --fetch", own(&starts), 4);
 
     // The hook path: a push of a branch validated on a base that moved since
     // starts no git process beyond the push itself, and says so.
@@ -5835,6 +5860,97 @@ fn judgements_and_the_stale_base_check_stay_within_their_git_budget() {
         "ohjaa hook pre-push (a base that moved)",
         through.len().saturating_sub(direct.len()),
         0,
+    );
+
+    // The briefing's validation lines read HEAD from git's files: no git
+    // process beyond the same dry run from a sykli without `status
+    // --commit`; sykli is asked, about the tip and about HEAD.
+    sandbox.git(&repo, &["checkout", "-q", "feat/x"]);
+    let asks = || sandbox.read("commit-asks").lines().count();
+    let dry_run = |status_commit: bool| {
+        let mut command = sandbox.command("ohjaa", &repo);
+        command.args(["run", "claude", "--intent", "look", "--dry-run"]);
+        if !status_commit {
+            command.env_remove("STUB_SYKLI_STATUS_COMMIT");
+        }
+        let before = asks();
+        let (starts, output) = sandbox.git_starts(&mut command);
+        assert!(
+            text(&output).1.contains("ohjaa: dry-run; would run:"),
+            "{}",
+            text(&output).1
+        );
+        (own(&starts), asks() - before, text(&output).1)
+    };
+    let (with, asked, said) = dry_run(true);
+    assert_eq!(asked, 2, "the tip and HEAD: {said}");
+    assert!(said.contains("candidate unverified: HEAD "), "{said}");
+    let (without, none, _) = dry_run(false);
+    assert_eq!(none, 0);
+    budget(
+        "ohjaa run's briefing (integrated and candidate)",
+        with.saturating_sub(without),
+        0,
+    );
+    sandbox.git(&repo, &["checkout", "-q", "main"]);
+
+    // A launch that asks for an integrated validation of the tip: one git
+    // process for its checkout, beyond the same launch whose tip sykli
+    // already has a run of.
+    let tip = sandbox.git(&repo, &["rev-parse", "origin/main"]);
+    let launch = |verdict: &str| {
+        sandbox.commit_status(&tip, "", verdict, None);
+        let mut command = sandbox.command("ohjaa", &repo);
+        command.args(["run", "sh", "--intent", "launch", "--", "-c", "true"]);
+        let (starts, output) = sandbox.git_starts(&mut command);
+        assert!(output.status.success(), "{}", text(&output).1);
+        (starts, text(&output).1)
+    };
+    let (asking, said) = launch("none");
+    assert!(said.contains("ohjaa: integrated validation rq-"), "{said}");
+    assert!(
+        started(&asking, "worktree"),
+        "its checkout was made: {asking:#?}"
+    );
+    let (pending, said) = launch("pending");
+    assert!(said.contains("a run of it is pending"), "{said}");
+    // Leaving reads each checkout's reflog for the work made there, never a
+    // validation checkout's: nothing is made in one, and they accumulate.
+    let reads = |path: &Path| {
+        let path = path.to_string_lossy().into_owned();
+        pending
+            .iter()
+            .filter(|line| line.contains("\"--walk-reflogs\"") && line.contains(&path))
+            .count()
+    };
+    assert!(reads(&repo) > 0, "leaving read the checkout's reflog");
+    assert_eq!(
+        reads(&sandbox.dir.join("state/ohjaa/integrated")),
+        0,
+        "nor a validation checkout's"
+    );
+    // The request's own git processes: those that name ohjaa's validation
+    // checkouts (leaving's work varies with what the window holds, so the
+    // two launches are not subtracted).
+    let checkouts = sandbox
+        .dir
+        .join("state/ohjaa/integrated")
+        .to_string_lossy()
+        .into_owned();
+    let naming: Vec<&String> = asking
+        .iter()
+        .filter(|line| line.contains(&checkouts))
+        .collect();
+    assert!(
+        naming
+            .iter()
+            .all(|line| line.contains("\"worktree\",\"add\"")),
+        "{naming:#?}"
+    );
+    budget(
+        "ohjaa run asking for an integrated validation",
+        naming.len(),
+        1,
     );
 
     let over: Vec<_> = report
@@ -5877,9 +5993,14 @@ fn real_sykli_a_landing_is_validated_as_the_integrated_state() {
         sandbox.tree(&repo, &candidate)
     );
     let record = sandbox.session_record(&repo, "land the feature");
-    let integrated = record["validations"][0].clone();
+    let integrated = record["validations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|v| v["commit"] == landed.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("no validation of the landing: {record:#}"));
     assert_eq!(integrated["kind"], "integrated", "{record:#}");
-    assert_eq!(integrated["commit"], landed.as_str(), "{record:#}");
     assert!(integrated["run"].is_string(), "{record:#}");
     // sykli's own word on the landed commit, once the run is done.
     let contract = sandbox.config().join("repos/acme/widget/sykli.json");
