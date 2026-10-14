@@ -1048,90 +1048,215 @@ mod tests {
         }
     }
 
+    /// What adopt gives the one task of a contract whose command is `run`
+    /// and whose other members are `members` (JSON, without the braces).
+    fn given(members: &str, run: &str) -> Vec<&'static str> {
+        let contract = format!(
+            r#"{{"schema":"sykli-contract.v1","tasks":[{{"name":"t","run":{}{}{members}}}]}}"#,
+            serde_json::to_string(run).unwrap(),
+            if members.is_empty() { "" } else { "," }
+        );
+        let (_, tasks) = read_contract(&contract).unwrap();
+        tasks
+            .missing
+            .into_iter()
+            .flat_map(|unsaid| unsaid.vars)
+            .collect()
+    }
+
+    const BOTH: &[&str] = &["CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"];
+    const TARGET_ONLY: &[&str] = &["CARGO_TARGET_DIR"];
+    const NOTHING: &[&str] = &[];
+
+    /// The 45 constructs of the review of #48 (finding 1), each naming both
+    /// variables, and what adopt gives the task: `(case, wrong on e366124,
+    /// command, given)`. Only a setting certain to reach every cargo counts:
+    /// 27 (an `export` at the top level, before the first cargo) and 41 (an
+    /// assignment on the cargo word itself) say the target dir, so they are
+    /// given nothing. The other 43 are given both lines, and where their
+    /// command does set the variables when it runs (18, 29, 30, 37, …), its
+    /// own setting overrides the line. The 24 marked wrong were read as
+    /// declared on e366124 while a cargo ran with neither.
+    const REVIEW_48: [(u8, bool, &str, &[&str]); 45] = [
+        (1, true, "(export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y); cargo test", BOTH),
+        (2, true, "(unset CARGO_TARGET_DIR CARGO_BUILD_BUILD_DIR); cargo test", BOTH),
+        (3, true, "true || export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test", BOTH),
+        (4, true, "[ -n \"$CI\" ] && export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test", BOTH),
+        (5, true, "if [ -n \"$CI\" ]; then export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; fi; cargo test", BOTH),
+        (6, true, "f() { export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; }; cargo test", BOTH),
+        (7, false, "sh -c 'export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y'; cargo test", BOTH),
+        (8, false, "echo \"export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y\"; cargo test", BOTH),
+        (9, true, "X=$(export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y); cargo test", BOTH),
+        (10, true, "echo `export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y`; cargo test", BOTH),
+        (11, true, "cat <<EOF\nexport CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y\nEOF\ncargo test", BOTH),
+        (12, true, "# old; export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y\ncargo test", BOTH),
+        (13, false, "cargo test # CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y", BOTH),
+        (14, true, "CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y cargo fmt --check # don't\ncargo test # it's slow", BOTH),
+        (15, true, "CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y cargo fmt --check; \\\ncargo test", BOTH),
+        (16, false, "CARGO_TARGET_DIRX=1 CARGO_BUILD_BUILD_DIRX=1 cargo test", BOTH),
+        (17, false, "echo test | CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y xargs cargo", BOTH),
+        (18, false, "CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y nice cargo test", BOTH),
+        (19, false, "nice env CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y cargo test", BOTH),
+        (20, true, "readonly CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test", BOTH),
+        (21, true, "declare CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test", BOTH),
+        (22, true, "{ export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; } | cat; cargo test", BOTH),
+        (23, true, "case \"$CI\" in yes) export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y;; esac; cargo test", BOTH),
+        (24, true, "while false; do export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; done; cargo test", BOTH),
+        (25, false, "env -i PATH=\"$PATH\" cargo test", BOTH),
+        (26, true, "CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y echo hi; sh -c 'cargo test'", BOTH),
+        (27, false, "export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test", NOTHING),
+        (28, false, "unset CARGO_TARGET_DIR CARGO_BUILD_BUILD_DIR; cargo test", BOTH),
+        (29, false, "CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test", BOTH),
+        (30, false, "export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y && cargo test", BOTH),
+        (31, false, "for d in a; do export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; done; cargo test", BOTH),
+        (32, true, "test -z \"$CI\" || export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test", BOTH),
+        (33, false, "export \"CARGO_TARGET_DIR=x\" \"CARGO_BUILD_BUILD_DIR=y\"; cargo test", BOTH),
+        (34, true, "local CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test", BOTH),
+        (35, true, "typeset CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test", BOTH),
+        (36, true, "export -n CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test", BOTH),
+        (37, false, "CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y exec cargo test", BOTH),
+        (38, false, "command export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test", BOTH),
+        (39, false, "eval 'export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y'; cargo test", BOTH),
+        (40, false, "set -a; CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test", BOTH),
+        (41, false, "cd . && CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y cargo test", NOTHING),
+        (42, false, "CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y timeout 600 cargo test", BOTH),
+        (43, false, "cargo test && CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y cargo doc", BOTH),
+        (44, true, "(export CARGO_TARGET_DIR=t CARGO_BUILD_BUILD_DIR=b; cargo build -p x); cargo test\n", BOTH),
+        (45, true, "cd sub && export CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y | true; cargo test\n", BOTH),
+    ];
+
+    /// More commands, beyond the review's: what certainly says where every
+    /// cargo builds, and what only nearly does.
+    const MORE: [(&str, &[&str]); 30] = [
+        // Certain, for every cargo.
+        ("cargo test --target-dir t", NOTHING),
+        ("cargo build --target-dir=t && cargo test --config 'build.target-dir=\"t\"'", NOTHING),
+        ("cargo test --config=build.target-dir=t", NOTHING),
+        ("export CARGO_TARGET_DIR=\"$PWD/t\"; cargo test", NOTHING),
+        ("export CARGO_TARGET_DIR=${PWD}/t\ncd sub && cargo test", NOTHING),
+        ("set -e; export CARGO_BUILD_TARGET_DIR=t; cargo build && cargo test", NOTHING),
+        ("CARGO_TARGET_DIR=t cargo build; CARGO_BUILD_TARGET_DIR=t cargo test", NOTHING),
+        ("RUSTDOCFLAGS='-D warnings' CARGO_TARGET_DIR=\"$PWD/t\" cargo doc", NOTHING),
+        ("if true; then CARGO_TARGET_DIR=t cargo test; fi", NOTHING),
+        ("CARGO_TARGET_DIR=t cargo test 2>&1 | tee log", NOTHING),
+        // The build dir only: the target dir's line.
+        ("cd sub && CARGO_BUILD_BUILD_DIR=b cargo test", TARGET_ONLY),
+        ("cargo test --config build.build-dir=b", TARGET_ONLY),
+        ("export CARGO_BUILD_BUILD_DIR=b; cargo test", TARGET_ONLY),
+        // Not certain: both lines.
+        ("cargo test -- --target-dir t", BOTH),
+        ("cargo build --target-dir t; cargo test", BOTH),
+        ("cargo test # --target-dir t", BOTH),
+        ("echo cargo --target-dir t; sh -c 'cargo test'", BOTH),
+        ("nice cargo test --target-dir t", BOTH),
+        ("export CARGO_TARGET_DIR=t; unset CARGO_TARGET_DIR; cargo test", BOTH),
+        ("export CARGO_TARGET_DIR=t; env -u CARGO_TARGET_DIR cargo test", BOTH),
+        ("export CARGO_TARGET_DIR=t # here\ncargo test", BOTH),
+        ("export CARGO_TARGET_DIR=t >/dev/null; cargo test", BOTH),
+        ("export CARGO_TARGET_DIR=\"$(pwd)/t\"; cargo test", BOTH),
+        ("export -- CARGO_TARGET_DIR=t; cargo test", BOTH),
+        ("declare -x CARGO_TARGET_DIR=t; cargo test", BOTH),
+        ("cargo fmt --check\nexport CARGO_TARGET_DIR=t\ncargo test", BOTH),
+        ("echo CARGO_TARGET_DIR=x; cargo test", BOTH),
+        ("\"CARGO_TARGET_DIR\"=t cargo test", BOTH),
+        ("cargo test 2>&1 | CARGO_TARGET_DIR=t tee log", BOTH),
+        ("CARGO_TARGET_DIR=t sh -c 'cargo test'", BOTH),
+    ];
+
     #[test]
-    fn a_command_says_a_variable_only_where_sh_sets_it_for_every_cargo() {
-        let cases: &[(&str, &[&str])] = &[
-            (
-                "CARGO_TARGET_DIR=\"$PWD/t\" cargo test",
-                &["CARGO_TARGET_DIR"],
-            ),
-            (
-                "RUSTDOCFLAGS='-D warnings' CARGO_BUILD_BUILD_DIR=b cargo doc",
-                &["CARGO_BUILD_BUILD_DIR", "RUSTDOCFLAGS"],
-            ),
-            (
-                "export CARGO_BUILD_BUILD_DIR=b; cargo test",
-                &["CARGO_BUILD_BUILD_DIR"],
-            ),
-            (
-                "cd native && CARGO_TARGET_DIR=t cargo test",
-                &["CARGO_TARGET_DIR"],
-            ),
-            (
-                "env -i A=1 -u CARGO_TARGET_DIR cargo test",
-                &["A", "CARGO_TARGET_DIR"],
-            ),
-            (
-                "env --unset=CARGO_TARGET_DIR cargo test",
-                &["CARGO_TARGET_DIR"],
-            ),
-            (
-                "/usr/bin/env CARGO_TARGET_DIR=t cargo test",
-                &["CARGO_TARGET_DIR"],
-            ),
-            ("unset CARGO_TARGET_DIR; cargo test", &["CARGO_TARGET_DIR"]),
-            (
-                "if true; then CARGO_TARGET_DIR=t cargo test; fi",
-                &["CARGO_TARGET_DIR"],
-            ),
-            (
-                "CARGO_TARGET_DIR=t cargo test 2>&1 | tee log",
-                &["CARGO_TARGET_DIR"],
-            ),
-            (
-                "declare -x CARGO_TARGET_DIR=t; cargo test",
-                &["CARGO_TARGET_DIR"],
-            ),
-            (
-                "cat <(CARGO_TARGET_DIR=t cargo metadata)",
-                &["CARGO_TARGET_DIR"],
-            ),
-            (
-                "export CARGO_TARGET_DIR=t; CARGO_BUILD_BUILD_DIR=b cargo build && \
-                 CARGO_BUILD_BUILD_DIR=c cargo test",
-                &["CARGO_BUILD_BUILD_DIR", "CARGO_TARGET_DIR"],
-            ),
-            // No cargo in sight: what it sets for the command that runs it.
-            (
-                "CARGO_TARGET_DIR=t sh -c 'cargo test'",
-                &["CARGO_TARGET_DIR"],
-            ),
-        ];
-        for &(run, names) in cases {
-            let mut said = names_set_in(run);
-            said.sort();
-            assert_eq!(said, names, "{run}");
+    fn a_command_says_where_cargo_builds_only_where_that_is_certain() {
+        let mut wrong = Vec::new();
+        for (case, _, run, expected) in REVIEW_48 {
+            if given("", run) != expected {
+                wrong.push(format!("{case}: {run:?} is given {:?}", given("", run)));
+            }
         }
-        for run in [
-            "echo CARGO_TARGET_DIR=x; cargo test",
-            "cargo test --config CARGO_TARGET_DIR=x",
-            "printf '%s' 'CARGO_TARGET_DIR=x' > f; cargo test",
-            "sh -c 'CARGO_TARGET_DIR=t cargo test'",
-            "env cargo test CARGO_TARGET_DIR=t",
-            "export CARGO_TARGET_DIR; cargo test",
-            "cargo test > CARGO_TARGET_DIR=x",
-            "\"CARGO_TARGET_DIR\"=t cargo test",
-            "CARGO_TARGET_DIR=t cargo build; cargo test",
-            "cargo build; CARGO_TARGET_DIR=t cargo test",
-            "CARGO_TARGET_DIR=t; cargo test",
-            "cargo test 2>&1 | CARGO_TARGET_DIR=t tee log",
-        ] {
-            assert!(
-                names_set_in(run).is_empty(),
-                "{run}: {:?}",
-                names_set_in(run)
-            );
+        for (run, expected) in MORE {
+            if given("", run) != expected {
+                wrong.push(format!("{run:?} is given {:?}", given("", run)));
+            }
         }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A cargo that writes down, one line a run, whether it was told where
+    /// to build: the target dir (`CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`,
+    /// or `--target-dir` or `--config build.target-dir=…` before `--`) and the
+    /// build dir (`CARGO_BUILD_BUILD_DIR`, or `--config build.build-dir=…`).
+    fn fake_cargo(log: &Path) -> String {
+        format!(
+            r#"#!/bin/sh
+target=${{CARGO_TARGET_DIR+yes}}${{CARGO_BUILD_TARGET_DIR+yes}}
+build=${{CARGO_BUILD_BUILD_DIR+yes}}
+config=
+for arg in "$@"; do
+  [ "$arg" = -- ] && break
+  [ -n "$config" ] && arg="--config=$arg"
+  config=
+  case "$arg" in
+    --target-dir|--target-dir=*|--config=build.target-dir*) target=yes;;
+    --config=build.build-dir*) build=yes;;
+    --config) config=yes;;
+  esac
+done
+echo "target=${{target:-no}} build=${{build:-no}}" >> '{}'
+"#,
+            log.display()
+        )
+    }
+
+    /// What adopt counts as said holds under sh: each command, run as sykli
+    /// runs a task (`sh -c`, with only PATH, HOME and TMPDIR) and given no
+    /// line, tells every cargo that runs the target dir when adopt gives no
+    /// `CARGO_TARGET_DIR`, and the build dir when adopt gives that alone. (A
+    /// line adopt does give either reaches cargo or is overridden by the
+    /// command's own setting.)
+    #[test]
+    fn what_adopt_counts_as_said_holds_under_sh() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("ohjaa-under-sh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (bin, work, log) = (dir.join("bin"), dir.join("work"), dir.join("cargo-log"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        std::fs::write(bin.join("cargo"), fake_cargo(&log)).unwrap();
+        std::fs::set_permissions(bin.join("cargo"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let runs = REVIEW_48
+            .iter()
+            .map(|(_, _, run, _)| *run)
+            .chain(MORE.iter().map(|(run, _)| *run));
+        let mut wrong = Vec::new();
+        let mut ran = 0;
+        for run in runs {
+            let _ = std::fs::remove_file(&log);
+            Command::new("/bin/sh")
+                .args(["-c", "--", run])
+                .current_dir(&work)
+                .env_clear()
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("HOME", &dir)
+                .env("TMPDIR", &dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            let given = given("", run);
+            for told in std::fs::read_to_string(&log).unwrap_or_default().lines() {
+                ran += 1;
+                let target = told.contains("target=yes");
+                let build = told.contains("build=yes");
+                if !given.contains(&"CARGO_TARGET_DIR") && !target {
+                    wrong.push(format!("{run:?} is given {given:?}, and a cargo ran: {told}"));
+                } else if given == ["CARGO_TARGET_DIR"] && !build {
+                    wrong.push(format!("{run:?} is given {given:?}, and a cargo ran: {told}"));
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(ran > 60, "the fake cargo ran {ran} times");
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
