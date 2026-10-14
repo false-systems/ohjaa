@@ -124,7 +124,7 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
     println!("ohjaa adopt: {} -> {}", id, dir.display());
     println!("  branch = {branch:?} (repo.toml)");
     println!("  {source}");
-    declare_worktree_cache(&top, &dir, &home);
+    declare_worktree_cache(&top, &common, &dir, &home);
     // The home's git config now names this repository too; git's global
     // config is not touched (it includes the home's file once, from apply).
     let global = gitconfig::GlobalFacts::read()?;
@@ -253,11 +253,34 @@ fn write_entry(top: &Path, id: &RepoId, dir: &Path, branch: &str, force: bool) -
 /// the worktree the run is in (`<git-common-dir>/sykli/worktrees/<id>/cache`).
 const WORKTREE_CACHE: &str = "${worktree_cache}";
 
-/// What a task that runs cargo declares, so that a gate never runs a binary
-/// or test another worktree built in a shared target dir (or build dir).
-const WORKTREE_CACHE_ENV: [(&str, &str); 2] = [
-    ("CARGO_TARGET_DIR", "${worktree_cache}/cargo-target"),
-    ("CARGO_BUILD_BUILD_DIR", "${worktree_cache}/cargo-build"),
+/// One of the two places cargo builds in, and the line that puts it in the
+/// worktree's own directory, so that a gate never runs a binary or test
+/// another worktree built there.
+struct Setting {
+    /// The variable adopt declares, and its value.
+    var: &'static str,
+    value: &'static str,
+    /// The variables that say where it is. A task that names one of them in
+    /// its `env` or `inherit`, or sets or unsets one in its command, already
+    /// says it, and is never given the line.
+    said_by: &'static [&'static str],
+}
+
+/// The target dir, where cargo leaves what it builds (`CARGO_TARGET_DIR`,
+/// else `build.target-dir`, which `CARGO_BUILD_TARGET_DIR` sets), and the
+/// build dir, where it keeps intermediate artifacts, test binaries among
+/// them (`build.build-dir`).
+const SETTINGS: [Setting; 2] = [
+    Setting {
+        var: "CARGO_TARGET_DIR",
+        value: "${worktree_cache}/cargo-target",
+        said_by: &["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"],
+    },
+    Setting {
+        var: "CARGO_BUILD_BUILD_DIR",
+        value: "${worktree_cache}/cargo-build",
+        said_by: &["CARGO_BUILD_BUILD_DIR"],
+    },
 ];
 
 const CONTRACT_SCHEMA: &str = "sykli-contract.v1";
@@ -401,30 +424,298 @@ fn runs_cargo(run: &str) -> bool {
     words(run).any(|word| word == "cargo" || word.ends_with("/cargo"))
 }
 
-/// Whether a task already says where cargo builds: either variable in its
-/// `env` or `inherit`, or assigned in its command. Never overridden.
-fn declares_build_dirs(task: &Json, run: &str) -> std::result::Result<bool, String> {
-    let named = |name: &str| WORKTREE_CACHE_ENV.iter().any(|(var, _)| *var == name);
-    let env = match task.get("env") {
-        None => false,
-        Some(Json::Object(members)) => members.iter().any(|(name, _)| named(name)),
-        Some(_) => return Err("a contract with a task whose env is not an object".to_owned()),
+/// A command's simple commands, each as its words, split as sh splits them:
+/// at blanks outside quotes, and at the operators that end a simple command
+/// (`;`, `&`, `|`, `(`, `)`, a backquote, a newline). Quotes stay in their
+/// word (`A='x y'` is one word), and a redirection is dropped with its
+/// target.
+fn simple_commands(run: &str) -> Vec<Vec<String>> {
+    struct Split {
+        commands: Vec<Vec<String>>,
+        word: String,
+        redirected: bool,
+    }
+    impl Split {
+        fn end_word(&mut self) {
+            let word = std::mem::take(&mut self.word);
+            if word.is_empty() || std::mem::take(&mut self.redirected) {
+                return;
+            }
+            if let Some(command) = self.commands.last_mut() {
+                command.push(word);
+            }
+        }
+        fn end_command(&mut self) {
+            self.end_word();
+            // A redirection has no target past its command (`<(…)`).
+            self.redirected = false;
+            if self.commands.last().is_some_and(|words| !words.is_empty()) {
+                self.commands.push(Vec::new());
+            }
+        }
+    }
+    let mut split = Split {
+        commands: vec![Vec::new()],
+        word: String::new(),
+        redirected: false,
     };
-    let inherited = match task.get("inherit") {
-        None => false,
-        Some(Json::Array(names)) => names.iter().filter_map(Json::as_str).any(named),
-        Some(_) => return Err("a contract with a task whose inherit is not a list".to_owned()),
-    };
-    let assigned = words(run).any(|word| word.split_once('=').is_some_and(|(name, _)| named(name)));
-    Ok(env || inherited || assigned)
+    let mut quote = None;
+    let mut chars = run.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(open) = quote {
+            split.word.push(c);
+            if c == open {
+                quote = None;
+            } else if c == '\\' && open == '"' {
+                split.word.extend(chars.next());
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                split.word.push(c);
+            }
+            '\\' => {
+                split.word.push(c);
+                split.word.extend(chars.next());
+            }
+            ';' | '&' | '|' | '(' | ')' | '`' | '\n' => split.end_command(),
+            '<' | '>' => {
+                // `2>&1`: the digits name a descriptor, and are no word.
+                if split.word.chars().all(|digit| digit.is_ascii_digit()) {
+                    split.word.clear();
+                } else {
+                    split.end_word();
+                }
+                while chars
+                    .next_if(|next| matches!(next, '<' | '>' | '&' | '|'))
+                    .is_some()
+                {}
+                split.redirected = true;
+            }
+            c if c.is_whitespace() => split.end_word(),
+            c => split.word.push(c),
+        }
+    }
+    split.end_command();
+    split.commands.retain(|words| !words.is_empty());
+    split.commands
 }
 
-/// A contract's tasks that run cargo, and of those the ones that declare
-/// neither variable: the ones adopt gives the lines to.
+/// Whether `word` is a shell variable's name.
+fn is_name(word: &str) -> bool {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// The name an assignment word sets (`NAME=…`, the name unquoted).
+fn assigned(word: &str) -> Option<&str> {
+    let (name, _) = word.split_once('=')?;
+    is_name(name).then_some(name)
+}
+
+/// Words that open or close a compound command, and so stand before a
+/// simple command's own words.
+const RESERVED: [&str; 13] = [
+    "!", "{", "}", "if", "then", "elif", "else", "fi", "do", "done", "while", "until", "time",
+];
+
+/// The variables a command sets or unsets, where sh does, for every cargo it
+/// runs: each simple command with a word `cargo` has it in effect, by an
+/// assignment before its command word (`CARGO_TARGET_DIR=t cargo test`) or
+/// before `env`'s, a name `env` is told to unset (`env -u NAME`), or an
+/// earlier `export`, `readonly`, `declare`, `typeset`, `local` or `unset` of
+/// it. So `CARGO_TARGET_DIR=t cargo build; cargo test` does not say it for
+/// the second, a word that only looks like an assignment (`echo
+/// CARGO_TARGET_DIR=x`) says nothing, and neither does a shell variable that
+/// is not exported (`CARGO_TARGET_DIR=t; cargo test`). A command inside quotes
+/// (`sh -c '…'`) is not read: when no cargo is in sight, what the command sets
+/// anywhere counts, and a setting made inside is missed. A line adopt then
+/// gives the task is overridden by the command's own setting wherever that
+/// applies, never the other way round.
+fn names_set_in(run: &str) -> Vec<String> {
+    // Set or unset for the rest of the command.
+    let mut lasting: Vec<String> = Vec::new();
+    // In effect for every simple command so far that runs cargo.
+    let mut every: Option<Vec<String>> = None;
+    // Set anywhere, for a command whose cargo is out of sight.
+    let mut anywhere: Vec<String> = Vec::new();
+    for command in simple_commands(run) {
+        let runs = command
+            .iter()
+            .any(|word| word == "cargo" || word.ends_with("/cargo"));
+        let mut words = command
+            .iter()
+            .map(String::as_str)
+            .skip_while(|word| RESERVED.contains(word))
+            .peekable();
+        let mut here = Vec::new();
+        while let Some(name) = words.peek().and_then(|word| assigned(word)) {
+            here.push(name.to_owned());
+            words.next();
+        }
+        let program = words.next().unwrap_or_default();
+        match program.rsplit('/').next().unwrap_or(program) {
+            "export" | "readonly" | "declare" | "typeset" | "local" => {
+                lasting.extend(words.filter_map(assigned).map(str::to_owned));
+            }
+            "unset" => lasting.extend(words.filter(|word| is_name(word)).map(str::to_owned)),
+            "env" => {
+                while let Some(word) = words.next() {
+                    if let Some(name) = assigned(word) {
+                        here.push(name.to_owned());
+                    } else if word == "-u" || word == "--unset" {
+                        here.extend(words.next().map(str::to_owned));
+                    } else if let Some(name) = word
+                        .strip_prefix("--unset=")
+                        .or_else(|| word.strip_prefix("-u"))
+                        .filter(|name| is_name(name))
+                    {
+                        here.push(name.to_owned());
+                    } else if !word.starts_with('-') {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !program.is_empty() {
+            anywhere.extend(here.iter().cloned());
+        }
+        if runs {
+            let in_effect: Vec<String> = here.into_iter().chain(lasting.iter().cloned()).collect();
+            every = Some(match every {
+                None => in_effect,
+                Some(so_far) => so_far
+                    .into_iter()
+                    .filter(|name| in_effect.contains(name))
+                    .collect(),
+            });
+        }
+    }
+    every.unwrap_or_else(|| {
+        anywhere.extend(lasting);
+        anywhere
+    })
+}
+
+/// The settings a cargo task leaves unsaid. Each counts as said where the
+/// task names one of its variables: in `env` (its own value), in `inherit`
+/// (the value of whoever runs the gate, so a task that inherits only one of
+/// the two is given the other), or set or unset by its command where sh does
+/// (see [`names_set_in`]).
+fn unsaid(task: &Json, run: &str) -> std::result::Result<Vec<&'static Setting>, String> {
+    let mut said = names_set_in(run);
+    match task.get("env") {
+        None => {}
+        Some(Json::Object(members)) => said.extend(members.iter().map(|(name, _)| name.clone())),
+        Some(_) => return Err("a contract with a task whose env is not an object".to_owned()),
+    }
+    match task.get("inherit") {
+        None => {}
+        Some(Json::Array(names)) => {
+            said.extend(names.iter().filter_map(Json::as_str).map(str::to_owned));
+        }
+        Some(_) => return Err("a contract with a task whose inherit is not a list".to_owned()),
+    }
+    Ok(SETTINGS
+        .iter()
+        .filter(|setting| {
+            !setting
+                .said_by
+                .iter()
+                .any(|var| said.iter().any(|name| name == var))
+        })
+        .collect())
+}
+
+/// Whether a string anywhere in `value` names `${worktree_cache}`.
+fn names_placeholder(value: &Json) -> bool {
+    match value {
+        Json::String(text) => text.contains(WORKTREE_CACHE),
+        Json::Array(items) => items.iter().any(names_placeholder),
+        Json::Object(members) => members.iter().any(|(_, value)| names_placeholder(value)),
+        Json::Null | Json::Bool(_) | Json::Number(_) => false,
+    }
+}
+
+/// A cargo task that leaves a setting unsaid, and the variables adopt gives
+/// it for them.
+#[derive(Debug, PartialEq)]
+pub struct Unsaid {
+    pub task: String,
+    pub vars: Vec<&'static str>,
+}
+
+/// A contract's tasks that run cargo, those of them that leave a setting
+/// unsaid (the ones adopt gives lines to), and the tasks that name
+/// `${worktree_cache}`.
 #[derive(Debug, Default, PartialEq)]
 pub struct CargoTasks {
     pub cargo: Vec<String>,
-    pub missing: Vec<String>,
+    pub missing: Vec<Unsaid>,
+    pub placeholder: Vec<String>,
+}
+
+impl CargoTasks {
+    /// The tasks that leave a setting unsaid, as adopt and doctor name them:
+    /// one that says the other names what it lacks (`own (no
+    /// CARGO_BUILD_BUILD_DIR)`).
+    pub fn lacking(&self) -> String {
+        self.missing
+            .iter()
+            .map(|unsaid| {
+                if unsaid.vars.len() == SETTINGS.len() {
+                    unsaid.task.clone()
+                } else {
+                    format!("{} (no {})", unsaid.task, unsaid.vars.join(", no "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// What adopt gives them, the tasks given the same variables together:
+    /// `CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for fmt, test;
+    /// CARGO_TARGET_DIR for inherited`.
+    fn given(&self) -> String {
+        let mut groups: Vec<(&[&str], Vec<&str>)> = Vec::new();
+        for unsaid in &self.missing {
+            match groups
+                .iter_mut()
+                .find(|(vars, _)| *vars == unsaid.vars.as_slice())
+            {
+                Some((_, tasks)) => tasks.push(&unsaid.task),
+                None => groups.push((&unsaid.vars, vec![&unsaid.task])),
+            }
+        }
+        groups
+            .iter()
+            .enumerate()
+            .map(|(at, (vars, tasks))| {
+                format!(
+                    "{}{} for {}",
+                    vars.join(" and "),
+                    if at == 0 { " declared" } else { "" },
+                    tasks.join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// The cargo tasks that say both settings, kept as they say them.
+    fn kept(&self) -> Vec<&str> {
+        self.cargo
+            .iter()
+            .filter(|name| !self.missing.iter().any(|unsaid| &unsaid.task == *name))
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 /// The contract and its cargo tasks, when it is a `sykli-contract.v1`
@@ -446,12 +737,22 @@ fn read_contract(text: &str) -> std::result::Result<(Json, CargoTasks), String> 
         ) else {
             return Err("a contract with a task that has no name or no run".to_owned());
         };
+        if names_placeholder(task) {
+            found.placeholder.push(name.to_owned());
+        }
         if !runs_cargo(run) {
             continue;
         }
         found.cargo.push(name.to_owned());
-        if !declares_build_dirs(task, run)? {
-            found.missing.push(name.to_owned());
+        let vars: Vec<&'static str> = unsaid(task, run)?
+            .into_iter()
+            .map(|setting| setting.var)
+            .collect();
+        if !vars.is_empty() {
+            found.missing.push(Unsaid {
+                task: name.to_owned(),
+                vars,
+            });
         }
     }
     Ok((contract, found))
@@ -466,10 +767,10 @@ pub fn cargo_tasks(path: &Path) -> std::result::Result<CargoTasks, String> {
         .map_err(|why| format!("{} is {why}", path.display()))
 }
 
-/// The lines added to each task named in `missing`: at the end of its own
-/// `env`, or as a new `env` where sykli's emitter puts one (after `run`, or
-/// after `workdir`).
-fn declare_in(contract: &mut Json, missing: &[String]) {
+/// The lines each task in `missing` is given: at the end of its own `env`,
+/// or as a new `env` where sykli's emitter puts one (after `run`, or after
+/// `workdir`).
+fn declare_in(contract: &mut Json, missing: &[Unsaid]) {
     let Json::Object(members) = contract else {
         return;
     };
@@ -477,19 +778,26 @@ fn declare_in(contract: &mut Json, missing: &[String]) {
         return;
     };
     for task in tasks {
-        if !task
+        let Some(unsaid) = task
             .get("name")
             .and_then(Json::as_str)
-            .is_some_and(|name| missing.iter().any(|m| m == name))
-        {
+            .and_then(|name| missing.iter().find(|unsaid| unsaid.task == name))
+        else {
             continue;
-        }
+        };
+        let lines: Vec<(String, Json)> = SETTINGS
+            .iter()
+            .filter(|setting| unsaid.vars.contains(&setting.var))
+            .map(|setting| {
+                (
+                    setting.var.to_owned(),
+                    Json::String(setting.value.to_owned()),
+                )
+            })
+            .collect();
         let Json::Object(fields) = task else {
             continue;
         };
-        let lines = WORKTREE_CACHE_ENV
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), Json::String((*value).to_owned())));
         match fields.iter().position(|(name, _)| name == "env") {
             Some(at) => {
                 if let (_, Json::Object(env)) = &mut fields[at] {
@@ -501,7 +809,7 @@ fn declare_in(contract: &mut Json, missing: &[String]) {
                     .iter()
                     .rposition(|(name, _)| name == "run" || name == "workdir")
                     .map_or(fields.len(), |at| at + 1);
-                fields.insert(at, ("env".to_owned(), Json::Object(lines.collect())));
+                fields.insert(at, ("env".to_owned(), Json::Object(lines)));
             }
         }
     }
@@ -513,8 +821,8 @@ fn declare_in(contract: &mut Json, missing: &[String]) {
 /// does names the placeholder in `sykli run --help`; it is matched as that
 /// token, the contract's own syntax, never as a sentence (sentences get
 /// reworded). An older sykli passes it to the task as written, and cargo then
-/// builds in a `${worktree_cache}/` folder inside the work tree. `Err` says
-/// which sykli does not.
+/// builds in a `${worktree_cache}/` folder inside the work tree. `Err` names
+/// each sykli that does not.
 pub fn sykli_expands_worktree_cache(home: &Path) -> std::result::Result<(), String> {
     let Some(on_path) = crate::hook::on_path("sykli") else {
         return Err("no sykli is on PATH".to_owned());
@@ -525,42 +833,62 @@ pub fn sykli_expands_worktree_cache(home: &Path) -> std::result::Result<(), Stri
     if let Some(recorded) = recorded.filter(|recorded| *recorded != on_path) {
         asked.push((recorded, "the sykli the pre-push dispatcher runs"));
     }
+    let mut not = Vec::new();
     for (sykli, which) in asked {
-        let help = Command::new(&sykli)
+        match Command::new(&sykli)
             .args(["run", "--help"])
             .stdin(std::process::Stdio::null())
             .output()
-            .map_err(|error| format!("{which} ({}) cannot be run: {error}", sykli.display()))?;
-        if !String::from_utf8_lossy(&help.stdout).contains(WORKTREE_CACHE) {
-            return Err(format!(
-                "{which} ({}) does not name {WORKTREE_CACHE} in `sykli run --help`",
+        {
+            Err(error) => not.push(format!(
+                "{which} ({}) cannot be run: {error}",
                 sykli.display()
-            ));
+            )),
+            Ok(help) if !String::from_utf8_lossy(&help.stdout).contains(WORKTREE_CACHE) => {
+                not.push(format!(
+                    "{which} ({}) does not name {WORKTREE_CACHE} in `sykli run --help`",
+                    sykli.display()
+                ));
+            }
+            Ok(_) => {}
         }
     }
-    Ok(())
-}
-
-/// `sykli lock <contract>`, run in the repository the contract judges.
-fn lock_again(top: &Path, contract: &Path) -> std::result::Result<(), String> {
-    let mut lock = Command::new("sykli");
-    lock.arg("lock").arg(contract).current_dir(top);
-    let output =
-        process::run(&mut lock, None, process::LOCAL).map_err(|error| format!("{error:#}"))?;
-    if output.status.success() {
+    if not.is_empty() {
         Ok(())
     } else {
-        Err(output.failure_detail())
+        Err(not.join(", and "))
     }
 }
 
-/// KATANA D10: each cargo task of the entry's gate that says nothing of
-/// where cargo builds gains `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`
-/// under `${worktree_cache}`, and a gate that had a lock is locked again.
-/// Only when every sykli that runs the gate expands the placeholder. Says
-/// what it did; never fails the adoption: a gate it cannot change is kept as
-/// copied.
-fn declare_worktree_cache(top: &Path, dir: &Path, home: &Path) {
+/// `sykli <command> <contract>` (`validate`, `lock`), run in the repository
+/// the contract judges and handed its facts when that command takes them
+/// (`sykli <command> --help` names `--repo-root` and `--git-common-dir`), so
+/// sykli asks git nothing ohjaa already knows.
+fn sykli_on(
+    command: &str,
+    top: &Path,
+    common: &Path,
+    contract: &Path,
+) -> std::result::Result<process::Output, String> {
+    let help = crate::gate::sykli_help(command);
+    let mut sykli = Command::new("sykli");
+    sykli
+        .arg(command)
+        .arg(contract)
+        .args(crate::hook::facts_for_sykli(&help, Some(top), common))
+        .current_dir(top);
+    process::run(&mut sykli, None, process::LOCAL).map_err(|error| format!("{error:#}"))
+}
+
+/// KATANA D10: each cargo task of the entry's gate is given, under
+/// `${worktree_cache}`, the variable of each setting it leaves unsaid
+/// (`CARGO_TARGET_DIR`, `CARGO_BUILD_BUILD_DIR`), and a gate that had a lock
+/// is locked again. Only when every sykli that runs the gate expands the
+/// placeholder, and only when the copied lock pins the gate as copied: a
+/// lock that does not means the repository changed its gate without `sykli
+/// lock`, and adopt never locks what the repository did not. Says what it
+/// did; never fails the adoption: a gate it cannot change is kept as copied.
+fn declare_worktree_cache(top: &Path, common: &Path, dir: &Path, home: &Path) {
     let contract = dir.join("sykli.json");
     let lock = dir.join("sykli.lock");
     let text = match std::fs::read_to_string(&contract) {
@@ -587,14 +915,53 @@ fn declare_worktree_cache(top: &Path, dir: &Path, home: &Path) {
     if tasks.missing.is_empty() {
         return;
     }
-    let names = tasks.missing.join(", ");
     if let Err(why) = sykli_expands_worktree_cache(home) {
         println!(
-            "  {WORKTREE_CACHE}: not declared for {names}: {why}, and an older sykli passes it \
-             on as written, to build inside the work tree; gate runs may share a target dir \
-             across worktrees until it is updated (then: ohjaa adopt --force)"
+            "  {WORKTREE_CACHE}: not declared for {}: {why}, and an older sykli passes it on as \
+             written, to build inside the work tree; gate runs may share a target dir across \
+             worktrees until it is updated (then: ohjaa adopt --force)",
+            tasks.lacking()
         );
         return;
+    }
+    let copied_lock = std::fs::read(&lock).ok();
+    if copied_lock.is_some() {
+        let kept = format!("the gate is kept as copied, without {WORKTREE_CACHE}");
+        let refused = match sykli_on("validate", top, common, &contract) {
+            Ok(output) if output.status.success() => None,
+            // sykli names the lock the gate drifted from by its path.
+            Ok(output)
+                if output.status.code() == Some(1)
+                    && output
+                        .failure_detail()
+                        .contains(&lock.display().to_string()) =>
+            {
+                Some(format!(
+                    "the sykli.lock copied with the gate does not pin it ({}): the repository's \
+                     own lock is out of date, so {kept}: adopt locks again only a gate its own \
+                     lock pins (lock it in the repository with sykli lock, then: ohjaa adopt \
+                     --force)",
+                    output.failure_detail()
+                ))
+            }
+            Ok(output) if output.status.code() == Some(1) => Some(format!(
+                "the gate as copied does not validate ({}), so {kept}",
+                output.failure_detail()
+            )),
+            Ok(output) => Some(format!(
+                "sykli validate {} failed ({}), so {kept}",
+                contract.display(),
+                output.failure_detail()
+            )),
+            Err(why) => Some(format!(
+                "sykli validate {} could not run ({why}), so {kept}",
+                contract.display()
+            )),
+        };
+        if let Some(why) = refused {
+            eprintln!("ohjaa adopt: warning: {why}");
+            return;
+        }
     }
     declare_in(&mut json, &tasks.missing);
     let mut declared = match serde_json::to_string_pretty(&json) {
@@ -607,13 +974,16 @@ fn declare_worktree_cache(top: &Path, dir: &Path, home: &Path) {
     if text.ends_with('\n') {
         declared.push('\n');
     }
-    let copied_lock = std::fs::read(&lock).ok();
     let written =
         home::write_file(&contract, &declared, None).map_err(|error| format!("{error:#}"));
     let locked = match (&written, &copied_lock) {
         (Err(why), _) => Err(why.clone()),
-        (Ok(()), Some(_)) => lock_again(top, &contract)
-            .map_err(|why| format!("sykli lock {} failed ({why})", contract.display())),
+        (Ok(()), Some(_)) => match sykli_on("lock", top, common, &contract) {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => Err(output.failure_detail()),
+            Err(why) => Err(why),
+        }
+        .map_err(|why| format!("sykli lock {} failed ({why})", contract.display())),
         (Ok(()), None) => Ok(()),
     };
     if let Err(why) = locked {
@@ -635,15 +1005,10 @@ fn declare_worktree_cache(top: &Path, dir: &Path, home: &Path) {
         }
         return;
     }
-    let kept: Vec<&str> = tasks
-        .cargo
-        .iter()
-        .filter(|name| !tasks.missing.contains(name))
-        .map(String::as_str)
-        .collect();
+    let kept = tasks.kept();
     println!(
-        "  {WORKTREE_CACHE}: {} declared for {names}, {}{}",
-        WORKTREE_CACHE_ENV.map(|(name, _)| name).join(" and "),
+        "  {WORKTREE_CACHE}: {}, {}{}",
+        tasks.given(),
         if copied_lock.is_some() {
             "and sykli.lock locked again"
         } else {
@@ -684,35 +1049,159 @@ mod tests {
     }
 
     #[test]
-    fn a_build_dir_declared_anywhere_is_never_overridden() {
-        let task = |json: &str| serde_json::from_str::<Json>(json).unwrap();
-        for (json, run) in [
-            (r#"{"env":{"CARGO_TARGET_DIR":"t"}}"#, "cargo test"),
-            (r#"{"env":{"CARGO_BUILD_BUILD_DIR":"b"}}"#, "cargo test"),
-            (r#"{"inherit":["CARGO_TARGET_DIR"]}"#, "cargo test"),
-            ("{}", "CARGO_TARGET_DIR=\"$PWD/t\" cargo test"),
-            ("{}", "export CARGO_BUILD_BUILD_DIR=b; cargo test"),
+    fn a_command_says_a_variable_only_where_sh_sets_it_for_every_cargo() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "CARGO_TARGET_DIR=\"$PWD/t\" cargo test",
+                &["CARGO_TARGET_DIR"],
+            ),
+            (
+                "RUSTDOCFLAGS='-D warnings' CARGO_BUILD_BUILD_DIR=b cargo doc",
+                &["CARGO_BUILD_BUILD_DIR", "RUSTDOCFLAGS"],
+            ),
+            (
+                "export CARGO_BUILD_BUILD_DIR=b; cargo test",
+                &["CARGO_BUILD_BUILD_DIR"],
+            ),
+            (
+                "cd native && CARGO_TARGET_DIR=t cargo test",
+                &["CARGO_TARGET_DIR"],
+            ),
+            (
+                "env -i A=1 -u CARGO_TARGET_DIR cargo test",
+                &["A", "CARGO_TARGET_DIR"],
+            ),
+            (
+                "env --unset=CARGO_TARGET_DIR cargo test",
+                &["CARGO_TARGET_DIR"],
+            ),
+            (
+                "/usr/bin/env CARGO_TARGET_DIR=t cargo test",
+                &["CARGO_TARGET_DIR"],
+            ),
+            ("unset CARGO_TARGET_DIR; cargo test", &["CARGO_TARGET_DIR"]),
+            (
+                "if true; then CARGO_TARGET_DIR=t cargo test; fi",
+                &["CARGO_TARGET_DIR"],
+            ),
+            (
+                "CARGO_TARGET_DIR=t cargo test 2>&1 | tee log",
+                &["CARGO_TARGET_DIR"],
+            ),
+            (
+                "declare -x CARGO_TARGET_DIR=t; cargo test",
+                &["CARGO_TARGET_DIR"],
+            ),
+            (
+                "cat <(CARGO_TARGET_DIR=t cargo metadata)",
+                &["CARGO_TARGET_DIR"],
+            ),
+            (
+                "export CARGO_TARGET_DIR=t; CARGO_BUILD_BUILD_DIR=b cargo build && \
+                 CARGO_BUILD_BUILD_DIR=c cargo test",
+                &["CARGO_BUILD_BUILD_DIR", "CARGO_TARGET_DIR"],
+            ),
+            // No cargo in sight: what it sets for the command that runs it.
+            (
+                "CARGO_TARGET_DIR=t sh -c 'cargo test'",
+                &["CARGO_TARGET_DIR"],
+            ),
+        ];
+        for &(run, names) in cases {
+            let mut said = names_set_in(run);
+            said.sort();
+            assert_eq!(said, names, "{run}");
+        }
+        for run in [
+            "echo CARGO_TARGET_DIR=x; cargo test",
+            "cargo test --config CARGO_TARGET_DIR=x",
+            "printf '%s' 'CARGO_TARGET_DIR=x' > f; cargo test",
+            "sh -c 'CARGO_TARGET_DIR=t cargo test'",
+            "env cargo test CARGO_TARGET_DIR=t",
+            "export CARGO_TARGET_DIR; cargo test",
+            "cargo test > CARGO_TARGET_DIR=x",
+            "\"CARGO_TARGET_DIR\"=t cargo test",
+            "CARGO_TARGET_DIR=t cargo build; cargo test",
+            "cargo build; CARGO_TARGET_DIR=t cargo test",
+            "CARGO_TARGET_DIR=t; cargo test",
+            "cargo test 2>&1 | CARGO_TARGET_DIR=t tee log",
         ] {
-            assert_eq!(
-                declares_build_dirs(&task(json), run),
-                Ok(true),
-                "{json} {run}"
+            assert!(
+                names_set_in(run).is_empty(),
+                "{run}: {:?}",
+                names_set_in(run)
             );
         }
-        for (json, run) in [
-            ("{}", "cargo test"),
+    }
+
+    #[test]
+    fn a_task_is_given_each_setting_it_does_not_say_and_nothing_it_does() {
+        let task = |json: &str| serde_json::from_str::<Json>(json).unwrap();
+        let vars = |json: &str, run: &str| -> Vec<&'static str> {
+            unsaid(&task(json), run)
+                .unwrap()
+                .into_iter()
+                .map(|setting| setting.var)
+                .collect()
+        };
+        let both = ["CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"];
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("{}", "cargo test", &both),
+            ("{}", "echo CARGO_TARGET_DIR=x; cargo test", &both),
+            ("{}", "CARGO_TARGET_DIR=t cargo build; cargo test", &both),
             (
                 r#"{"env":{"RUST_BACKTRACE":"1"},"inherit":["HOME"]}"#,
                 "cargo test --target-dir=t",
+                &both,
             ),
-        ] {
-            assert_eq!(
-                declares_build_dirs(&task(json), run),
-                Ok(false),
-                "{json} {run}"
-            );
+            (
+                r#"{"env":{"CARGO_TARGET_DIR":"t"}}"#,
+                "cargo test",
+                &["CARGO_BUILD_BUILD_DIR"],
+            ),
+            (
+                r#"{"env":{"CARGO_BUILD_TARGET_DIR":"t"}}"#,
+                "cargo test",
+                &["CARGO_BUILD_BUILD_DIR"],
+            ),
+            (
+                r#"{"env":{"CARGO_BUILD_BUILD_DIR":"b"}}"#,
+                "cargo test",
+                &["CARGO_TARGET_DIR"],
+            ),
+            // Inheriting one: whoever runs the gate decides that one; the
+            // other is given.
+            (
+                r#"{"inherit":["CARGO_BUILD_BUILD_DIR"]}"#,
+                "cargo test",
+                &["CARGO_TARGET_DIR"],
+            ),
+            (
+                r#"{"inherit":["CARGO_TARGET_DIR"]}"#,
+                "cargo test",
+                &["CARGO_BUILD_BUILD_DIR"],
+            ),
+            (
+                "{}",
+                "unset CARGO_TARGET_DIR; cargo test",
+                &["CARGO_BUILD_BUILD_DIR"],
+            ),
+            (
+                r#"{"env":{"CARGO_BUILD_TARGET_DIR":"t"},"inherit":["CARGO_BUILD_BUILD_DIR"]}"#,
+                "cargo test",
+                &[],
+            ),
+            (
+                "{}",
+                "CARGO_TARGET_DIR=t CARGO_BUILD_BUILD_DIR=b cargo test",
+                &[],
+            ),
+        ];
+        for &(json, run, given) in cases {
+            assert_eq!(vars(json, run), given, "{json} {run}");
         }
-        assert!(declares_build_dirs(&task(r#"{"env":["x"]}"#), "cargo test").is_err());
+        assert!(unsaid(&task(r#"{"env":["x"]}"#), "cargo test").is_err());
+        assert!(unsaid(&task(r#"{"inherit":"x"}"#), "cargo test").is_err());
     }
 
     #[test]
@@ -731,13 +1220,28 @@ mod tests {
 
     #[test]
     fn the_lines_go_where_sykli_puts_env_and_nothing_else_moves() {
-        let text = r#"{"schema":"sykli-contract.v1","tasks":[{"inputs":["a"],"name":"t","run":"cargo test","outputs":["o"]},{"name":"u","run":"true"}],"z":1.5}"#;
+        let text = r#"{"schema":"sykli-contract.v1","tasks":[{"inputs":["a"],"name":"t","run":"cargo test","outputs":["o"]},{"name":"u","run":"true"},{"name":"v","run":"cargo test","env":{"CARGO_TARGET_DIR":"own"}}],"z":1.5}"#;
         let (mut contract, tasks) = read_contract(text).unwrap();
-        assert_eq!(tasks.missing, ["t"]);
+        assert_eq!(tasks.lacking(), "t, v (no CARGO_BUILD_BUILD_DIR)");
+        assert_eq!(
+            tasks.given(),
+            "CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for t; CARGO_BUILD_BUILD_DIR \
+             for v"
+        );
         declare_in(&mut contract, &tasks.missing);
         assert_eq!(
             serde_json::to_string(&contract).unwrap(),
-            r#"{"schema":"sykli-contract.v1","tasks":[{"inputs":["a"],"name":"t","run":"cargo test","env":{"CARGO_TARGET_DIR":"${worktree_cache}/cargo-target","CARGO_BUILD_BUILD_DIR":"${worktree_cache}/cargo-build"},"outputs":["o"]},{"name":"u","run":"true"}],"z":1.5}"#
+            r#"{"schema":"sykli-contract.v1","tasks":[{"inputs":["a"],"name":"t","run":"cargo test","env":{"CARGO_TARGET_DIR":"${worktree_cache}/cargo-target","CARGO_BUILD_BUILD_DIR":"${worktree_cache}/cargo-build"},"outputs":["o"]},{"name":"u","run":"true"},{"name":"v","run":"cargo test","env":{"CARGO_TARGET_DIR":"own","CARGO_BUILD_BUILD_DIR":"${worktree_cache}/cargo-build"}}],"z":1.5}"#
         );
+    }
+
+    #[test]
+    fn a_task_names_the_placeholder_wherever_a_string_of_it_does() {
+        let (_, tasks) = read_contract(
+            r#"{"schema":"sykli-contract.v1","tasks":[{"name":"a","run":"cargo test","env":{"CARGO_TARGET_DIR":"${worktree_cache}/t"}},{"name":"b","run":"make","env":{"X":"${worktree_cache}"}},{"name":"c","run":"cargo test"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(tasks.placeholder, ["a", "b"]);
+        assert_eq!(tasks.lacking(), "a (no CARGO_BUILD_BUILD_DIR), c");
     }
 }
