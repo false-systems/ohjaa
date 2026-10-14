@@ -6,7 +6,8 @@
 //!
 //! Sandboxed like the CLI tests: HOME, XDG_CONFIG_HOME, XDG_STATE_HOME,
 //! OHJAA_OURS, GIT_CONFIG_GLOBAL and PATH; no real toimija, agent or ohjaa
-//! state. Skipped, and said so, where there is no shell or no pty.
+//! state. Skipped, and said so, where there is no shell, pty or git; in CI
+//! (`CI` set) that fails instead, so an image without them cannot go green.
 
 #![cfg(unix)]
 
@@ -108,30 +109,49 @@ fn git(dir: &Path, args: &[&str], home: &Path) {
     assert!(status.success(), "git {args:?}");
 }
 
+/// A terminal test this machine cannot run: skipped, and said so; in CI
+/// (`CI` set and not empty) it fails instead, so a CI image without a
+/// shell, a pty or git cannot pass them without running them.
+fn skip(why: &str) -> Option<Terminal> {
+    skip_under(std::env::var_os("CI"), why)
+}
+
+fn skip_under(ci: Option<std::ffi::OsString>, why: &str) -> Option<Terminal> {
+    if ci.is_some_and(|ci| !ci.is_empty()) {
+        panic!("{why}: the terminal tests cannot run here, and CI is set");
+    }
+    eprintln!("skipped: {why}");
+    None
+}
+
+#[test]
+fn a_terminal_test_that_cannot_run_fails_in_ci_and_is_skipped_elsewhere() {
+    assert!(skip_under(None, "no pty").is_none());
+    assert!(skip_under(Some("".into()), "no pty").is_none());
+    let in_ci = std::panic::catch_unwind(|| skip_under(Some("true".into()), "no pty"));
+    assert!(in_ci.is_err(), "skipped in CI");
+}
+
 impl Terminal {
     /// A shell on a pty of its own (its controlling terminal), in a sandbox
     /// with a git repository to work in. `None` (said) where this machine
-    /// has no shell with job control, no pty or no git.
+    /// has no shell with job control, no pty or no git; see [`skip`].
     fn new(tag: &str) -> Option<Terminal> {
         let Some((shell, args, prompt)) = shell() else {
-            eprintln!("skipped: no zsh or bash for a job-control shell");
-            return None;
+            return skip("no zsh or bash for a job-control shell");
         };
         if Command::new("git").arg("--version").output().is_err() {
-            eprintln!("skipped: no git");
-            return None;
+            return skip("no git");
         }
         // SAFETY: plain pty setup calls on fds this function owns.
         let (master, slave) = unsafe {
             let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
             if master < 0 || libc::grantpt(master) != 0 || libc::unlockpt(master) != 0 {
-                eprintln!("skipped: no pty");
-                return None;
+                return skip("no pty");
             }
             let name = libc::ptsname(master);
             if name.is_null() {
-                eprintln!("skipped: no pty name");
-                return None;
+                return skip("no pty name");
             }
             let slave = std::ffi::CStr::from_ptr(name).to_owned();
             (master, slave)
