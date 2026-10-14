@@ -62,8 +62,14 @@ use std::process::{Command, Output};
 /// names `${worktree_cache}` (an older one does not). `lock <contract>` pins
 /// the contract's sha256 in the `sykli.lock` beside it, as
 /// `{"schema":"sykli-lock.v2","contracts":{"sykli.json":"<sha256>"}}`, and
-/// fails (exit 2, nothing written) with `$SANDBOX/lock-fails`. Without those
-/// it runs no git, so a trace2 count is ohjaa's own.
+/// fails (exit 2, nothing written) with `$SANDBOX/lock-fails`; `validate
+/// <contract>` says invalid (exit 1, in sykli's words) when a `sykli.lock`
+/// beside it pins another digest, and of any gate with
+/// `$SANDBOX/gate-invalid`. Like sykli's, those two find the
+/// repository with one `git rev-parse` unless they are handed
+/// `--repo-root` and `--git-common-dir`. Nothing else runs git (without the
+/// files above), so a trace2 count is ohjaa's own and what ohjaa leaves sykli
+/// to ask git.
 const SYKLI_STUB: &str = r#"#!/bin/sh
 printf '%s|%s\n' "$PWD" "$*" >> "$SANDBOX/sykli-calls"
 # Who asks about runs: the caller a test names, so a straggler is never counted.
@@ -134,10 +140,37 @@ case "$1" in
     fi
     [ "$2" = --contract ] && { printf '{"version":"1","tasks":{}}\n' > "$3"; exit 0; }
     exit 2;;
-  lock)
-    [ -f "$SANDBOX/lock-fails" ] && { echo "error: cannot hash $2" >&2; exit 2; }
-    lock="$(dirname "$2")/sykli.lock"
-    printf '{"schema":"sykli-lock.v2","contracts":{"sykli.json":"%s"}}\n' "$(digest "$2")" > "$lock"
+  lock|validate)
+    if [ "$2" = --help ]; then
+      echo "Usage: sykli $1 [OPTIONS] [CONTRACT]"
+      facts; exit 0
+    fi
+    sub=$1; shift; contract=""; root=""; common=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --repo-root) root=$2; shift;;
+        --git-common-dir) common=$2; shift;;
+        *) [ -n "$contract" ] || contract=$1;;
+      esac
+      shift
+    done
+    # As sykli finds the repository a contract judges, unless it is told.
+    if [ -z "$root" ] || [ -z "$common" ]; then
+      git rev-parse --path-format=absolute --show-toplevel --git-common-dir >/dev/null 2>&1
+    fi
+    lock="$(dirname "$contract")/sykli.lock"
+    if [ "$sub" = validate ]; then
+      if [ -f "$SANDBOX/gate-invalid" ]; then
+        echo "invalid $contract: task \"fmt\" has an empty command" >&2; exit 1
+      fi
+      if [ -f "$lock" ] && ! grep -q "\"sykli.json\":\"$(digest "$contract")\"" "$lock"; then
+        echo "invalid $contract: contract differs from $lock; run \`sykli lock\` to accept it" >&2
+        exit 1
+      fi
+      echo "valid: $contract"; exit 0
+    fi
+    [ -f "$SANDBOX/lock-fails" ] && { echo "error: cannot hash $contract" >&2; exit 2; }
+    printf '{"schema":"sykli-lock.v2","contracts":{"sykli.json":"%s"}}\n' "$(digest "$contract")" > "$lock"
     echo "locked: $lock"; exit 0;;
   run)
     if [ "$2" = --help ]; then
@@ -1285,9 +1318,10 @@ fn adopt_asks_sykli_for_a_gate_kept_outside_the_repo_and_refuses_when_it_cannot(
 // ---- KATANA D10: a gate builds in its worktree's own directory -------------
 
 /// A Rust repository's gate, laid out as sykli writes one: tasks that run
-/// cargo (one with a `workdir`, one with an `env` of its own), one that names
-/// its own target dir, one that inherits a build dir, and one that runs no
-/// cargo.
+/// cargo and say nothing of where it builds (one with a `workdir`, one with
+/// an `env` of its own), one that names its own target dir only, one that
+/// inherits only the build dir, one that says both (its target dir as
+/// `CARGO_BUILD_TARGET_DIR`), and one that runs no cargo.
 const RUST_GATE: &str = r#"{
   "schema": "sykli-contract.v1",
   "tasks": [
@@ -1334,6 +1368,16 @@ const RUST_GATE: &str = r#"{
       ]
     },
     {
+      "name": "both",
+      "run": "cargo bench --no-run",
+      "env": {
+        "CARGO_BUILD_TARGET_DIR": "target/bench"
+      },
+      "inherit": [
+        "CARGO_BUILD_BUILD_DIR"
+      ]
+    },
+    {
       "name": "lint",
       "run": "./scripts/lint.sh"
     }
@@ -1341,10 +1385,10 @@ const RUST_GATE: &str = r#"{
 }
 "#;
 
-/// [`RUST_GATE`] as adopt leaves it in the entry: each cargo task that
-/// declared neither variable gains both, where sykli's own emitter puts
-/// `env` (after `run`, or after `workdir`), or at the end of its own `env`.
-/// Nothing else moves.
+/// [`RUST_GATE`] as adopt leaves it in the entry: each cargo task gains the
+/// variable of each setting it does not declare, where sykli's own emitter
+/// puts `env` (after `run`, or after `workdir`), or at the end of its own
+/// `env`. What a task declares is never overridden, and nothing else moves.
 const RUST_GATE_DECLARED: &str = r#"{
   "schema": "sykli-contract.v1",
   "tasks": [
@@ -1390,12 +1434,26 @@ const RUST_GATE_DECLARED: &str = r#"{
       "name": "own",
       "run": "cargo build --release",
       "env": {
-        "CARGO_TARGET_DIR": "target/own"
+        "CARGO_TARGET_DIR": "target/own",
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
       }
     },
     {
       "name": "inherited",
       "run": "cargo clippy",
+      "env": {
+        "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target"
+      },
+      "inherit": [
+        "CARGO_BUILD_BUILD_DIR"
+      ]
+    },
+    {
+      "name": "both",
+      "run": "cargo bench --no-run",
+      "env": {
+        "CARGO_BUILD_TARGET_DIR": "target/bench"
+      },
       "inherit": [
         "CARGO_BUILD_BUILD_DIR"
       ]
@@ -1408,10 +1466,21 @@ const RUST_GATE_DECLARED: &str = r#"{
 }
 "#;
 
+/// The cargo tasks of [`RUST_GATE`] that lack a setting, as adopt and
+/// doctor name them.
+const RUST_GATE_LACKING: &str =
+    "fmt, doc, test, own (no CARGO_BUILD_BUILD_DIR), inherited (no CARGO_TARGET_DIR)";
+
+/// What adopt says it gave [`RUST_GATE`]'s tasks.
+const RUST_GATE_GIVEN: &str = "CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for fmt, \
+     doc, test; CARGO_BUILD_BUILD_DIR for own; CARGO_TARGET_DIR for inherited";
+
 /// An Erlang gate, like ote's: rebar3 and make under mise, no cargo.
 const ERLANG_GATE: &str = r#"{"schema":"sykli-contract.v1","tasks":[{"name":"fmt","run":"env REBAR_CACHE_DIR=$PWD/_build/rebar-cache rebar3 fmt --check","inputs":["rebar.config"]},{"name":"test","run":"mise exec -- make test","after":["fmt"]}]}
 "#;
 
+/// A lock that pins no contract here: a repository's sykli.json changed
+/// after it was locked.
 const COPIED_LOCK: &str = "{\"schema\":\"sykli-lock.v2\",\"contracts\":{\"sykli.json\":\"0\"}}\n";
 
 /// The lock the stub sykli writes for `contract`.
@@ -1430,7 +1499,10 @@ fn adopt_declares_a_worktree_cache_for_each_cargo_task_and_locks_the_gate_again(
     let (rusty, _) = sandbox.repo(
         "acme",
         "rusty",
-        &[("sykli.json", RUST_GATE), ("sykli.lock", COPIED_LOCK)],
+        &[
+            ("sykli.json", RUST_GATE),
+            ("sykli.lock", &stub_lock(RUST_GATE)),
+        ],
     );
     let (erl, _) = sandbox.repo(
         "acme",
@@ -1462,9 +1534,8 @@ fn adopt_declares_a_worktree_cache_for_each_cargo_task_and_locks_the_gate_again(
         sandbox.read("sykli-calls")
     );
     for said in [
-        "  ${worktree_cache}: CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for fmt, \
-         doc, test, and sykli.lock locked again",
-        "kept as they declare it: own, inherited",
+        &format!("  ${{worktree_cache}}: {RUST_GATE_GIVEN}, and sykli.lock locked again"),
+        "; kept as they declare it: both\n",
     ] {
         assert!(stdout.contains(said), "missing {said:?} in:\n{stdout}");
     }
@@ -1510,13 +1581,236 @@ fn adopt_declares_a_worktree_cache_for_each_cargo_task_and_locks_the_gate_again(
     assert!(!stdout.contains("worktree_cache"), "{stdout}");
 }
 
+/// The review of #47, finding 1: a repository whose sykli.json changed
+/// without `sykli lock` has a lock that no longer pins it, and every gate run
+/// refuses it. adopt locks again only a gate whose copied lock pins it: here
+/// the gate is kept as copied, without the lines and unlocked, and adopt says
+/// the repository's own lock is out of date.
+#[test]
+fn adopt_locks_again_only_a_gate_its_own_lock_pins() {
+    let sandbox = Sandbox::new("d10-stale");
+    fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
+    let (rusty, _) = sandbox.repo(
+        "acme",
+        "rusty",
+        &[("sykli.json", RUST_GATE), ("sykli.lock", COPIED_LOCK)],
+    );
+    let entry = sandbox.config().join("repos/acme/rusty");
+    let contract = entry.join("sykli.json");
+
+    let output = sandbox.ohjaa(&["adopt", &rusty.to_string_lossy()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(fs::read_to_string(&contract).unwrap(), RUST_GATE);
+    assert_eq!(
+        fs::read_to_string(entry.join("sykli.lock")).unwrap(),
+        COPIED_LOCK
+    );
+    let calls = sandbox.read("sykli-calls");
+    assert!(
+        calls.contains(&format!(
+            "{}|validate {}\n",
+            rusty.display(),
+            contract.display()
+        )),
+        "the copy is validated first: {calls}"
+    );
+    assert!(!calls.contains("|lock "), "nothing is locked: {calls}");
+    for said in [
+        format!(
+            "ohjaa adopt: warning: the sykli.lock copied with the gate does not pin it \
+             (invalid {}: contract differs from {}",
+            contract.display(),
+            entry.join("sykli.lock").display()
+        ),
+        "the repository's own lock is out of date".to_owned(),
+        "the gate is kept as copied, without ${worktree_cache}".to_owned(),
+    ] {
+        assert!(stderr.contains(&said), "missing {said:?} in:\n{stderr}");
+    }
+    assert!(!stdout.contains("declared for"), "{stdout}");
+
+    // Locked in the repository, and adopted again: now it gains its lines.
+    fs::write(rusty.join("sykli.lock"), stub_lock(RUST_GATE)).unwrap();
+    sandbox.git(&rusty, &["commit", "-q", "-am", "lock"]);
+    sandbox.git(
+        &rusty,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "-q",
+            "origin",
+            "main",
+        ],
+    );
+    let output = sandbox.ohjaa(&["adopt", &rusty.to_string_lossy(), "--force"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(!stderr.contains("out of date"), "{stderr}");
+    assert_eq!(fs::read_to_string(&contract).unwrap(), RUST_GATE_DECLARED);
+    assert_eq!(
+        fs::read_to_string(entry.join("sykli.lock")).unwrap(),
+        stub_lock(RUST_GATE_DECLARED)
+    );
+}
+
+/// A gate sykli refuses for itself, not for its lock: kept as copied, and
+/// said so in sykli's words, never as a lock out of date.
+#[test]
+fn adopt_keeps_a_gate_sykli_refuses_as_copied() {
+    let sandbox = Sandbox::new("d10-invalid");
+    fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
+    fs::write(sandbox.dir.join("gate-invalid"), "").unwrap();
+    let (rusty, _) = sandbox.repo(
+        "acme",
+        "rusty",
+        &[
+            ("sykli.json", RUST_GATE),
+            ("sykli.lock", &stub_lock(RUST_GATE)),
+        ],
+    );
+    let entry = sandbox.config().join("repos/acme/rusty");
+    let output = sandbox.ohjaa(&["adopt", &rusty.to_string_lossy()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(
+        fs::read_to_string(entry.join("sykli.json")).unwrap(),
+        RUST_GATE
+    );
+    assert_eq!(
+        fs::read_to_string(entry.join("sykli.lock")).unwrap(),
+        stub_lock(RUST_GATE)
+    );
+    assert!(
+        stderr.contains(&format!(
+            "ohjaa adopt: warning: the gate as copied does not validate (invalid {}: task \
+             \"fmt\" has an empty command), so the gate is kept as copied, without \
+             ${{worktree_cache}}",
+            entry.join("sykli.json").display()
+        )) && !stderr.contains("out of date"),
+        "{stderr}"
+    );
+    assert!(!sandbox.read("sykli-calls").contains("|lock "));
+}
+
+/// The review of #47, finding 7: a task is declared only where it says both
+/// settings, the target dir (`CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR`)
+/// and the build dir, each in its `env`, its `inherit`, or set or unset by
+/// its command where sh does, for every cargo it runs. A task gains only what
+/// it does not say; a word that only looks like an assignment (an argument of
+/// `echo`) says nothing, and an assignment before one cargo says nothing of
+/// the next.
+#[test]
+fn adopt_gives_a_cargo_task_only_the_settings_it_does_not_declare() {
+    const SAID: &str = r#"{"schema":"sykli-contract.v1","tasks":[{"name":"echoed","run":"echo CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test"},{"name":"first-only","run":"CARGO_TARGET_DIR=t CARGO_BUILD_BUILD_DIR=b cargo build; cargo test"},{"name":"inherits-target","run":"cargo test","inherit":["CARGO_TARGET_DIR"]},{"name":"build-target","run":"cargo test","env":{"CARGO_BUILD_TARGET_DIR":"t"}},{"name":"unsets","run":"unset CARGO_TARGET_DIR; cargo test"},{"name":"prefixed","run":"cd native && CARGO_TARGET_DIR=\"$PWD/t\" CARGO_BUILD_BUILD_DIR=b cargo test"},{"name":"exported","run":"export CARGO_BUILD_TARGET_DIR=t; env -u CARGO_BUILD_BUILD_DIR cargo test"},{"name":"quoted","run":"sh -c 'CARGO_TARGET_DIR=t cargo test'"}]}
+"#;
+    const SAID_DECLARED: &str = r#"{
+  "schema": "sykli-contract.v1",
+  "tasks": [
+    {
+      "name": "echoed",
+      "run": "echo CARGO_TARGET_DIR=x CARGO_BUILD_BUILD_DIR=y; cargo test",
+      "env": {
+        "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+      }
+    },
+    {
+      "name": "first-only",
+      "run": "CARGO_TARGET_DIR=t CARGO_BUILD_BUILD_DIR=b cargo build; cargo test",
+      "env": {
+        "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+      }
+    },
+    {
+      "name": "inherits-target",
+      "run": "cargo test",
+      "env": {
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+      },
+      "inherit": [
+        "CARGO_TARGET_DIR"
+      ]
+    },
+    {
+      "name": "build-target",
+      "run": "cargo test",
+      "env": {
+        "CARGO_BUILD_TARGET_DIR": "t",
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+      }
+    },
+    {
+      "name": "unsets",
+      "run": "unset CARGO_TARGET_DIR; cargo test",
+      "env": {
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+      }
+    },
+    {
+      "name": "prefixed",
+      "run": "cd native && CARGO_TARGET_DIR=\"$PWD/t\" CARGO_BUILD_BUILD_DIR=b cargo test"
+    },
+    {
+      "name": "exported",
+      "run": "export CARGO_BUILD_TARGET_DIR=t; env -u CARGO_BUILD_BUILD_DIR cargo test"
+    },
+    {
+      "name": "quoted",
+      "run": "sh -c 'CARGO_TARGET_DIR=t cargo test'",
+      "env": {
+        "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+      }
+    }
+  ]
+}
+"#;
+    let sandbox = Sandbox::new("d10-said");
+    fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
+    let (said, _) = sandbox.repo(
+        "acme",
+        "said",
+        &[("sykli.json", SAID), ("sykli.lock", &stub_lock(SAID))],
+    );
+    sandbox.apply();
+    let output = sandbox.ohjaa(&["adopt", &said.to_string_lossy()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let entry = sandbox.config().join("repos/acme/said");
+    assert_eq!(
+        fs::read_to_string(entry.join("sykli.json")).unwrap(),
+        SAID_DECLARED
+    );
+    assert!(
+        stdout.contains(
+            "  ${worktree_cache}: CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for \
+             echoed, first-only, quoted; CARGO_BUILD_BUILD_DIR for inherits-target, build-target, unsets, \
+             and sykli.lock locked again; kept as they declare it: prefixed, exported\n"
+        ),
+        "{stdout}"
+    );
+    let output = sandbox.ohjaa(&["doctor"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("ok     acme/said: every cargo task declares where it builds"),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn an_older_sykli_gets_no_worktree_cache_lines_and_adopt_says_so() {
     let sandbox = Sandbox::new("d10-old");
     let (rusty, _) = sandbox.repo(
         "acme",
         "rusty",
-        &[("sykli.json", RUST_GATE), ("sykli.lock", COPIED_LOCK)],
+        &[
+            ("sykli.json", RUST_GATE),
+            ("sykli.lock", &stub_lock(RUST_GATE)),
+        ],
     );
     let entry = sandbox.config().join("repos/acme/rusty");
 
@@ -1529,10 +1823,12 @@ fn an_older_sykli_gets_no_worktree_cache_lines_and_adopt_says_so() {
     );
     assert_eq!(
         fs::read_to_string(entry.join("sykli.lock")).unwrap(),
-        COPIED_LOCK
+        stub_lock(RUST_GATE)
     );
     for said in [
-        "  ${worktree_cache}: not declared for fmt, doc, test: the sykli on PATH (",
+        &format!(
+            "  ${{worktree_cache}}: not declared for {RUST_GATE_LACKING}: the sykli on PATH ("
+        ),
         "does not name ${worktree_cache} in `sykli run --help`",
         "gate runs may share a target dir across worktrees",
     ] {
@@ -1548,24 +1844,7 @@ fn an_older_sykli_gets_no_worktree_cache_lines_and_adopt_says_so() {
     // an older one, as apply recorded it: still no lines.
     fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
     sandbox.apply();
-    let old = sandbox.dir.join("old/sykli");
-    fs::create_dir_all(old.parent().unwrap()).unwrap();
-    write_executable(
-        &old,
-        "#!/bin/sh\necho 'Usage: sykli run [OPTIONS] [CONTRACT]'\n",
-    );
-    let record = sandbox.config().join("applied.toml");
-    let recorded = fs::read_to_string(&record).unwrap();
-    let line = recorded
-        .lines()
-        .find(|line| line.starts_with("sykli = "))
-        .unwrap_or_else(|| panic!("apply recorded no sykli:\n{recorded}"))
-        .to_owned();
-    fs::write(
-        &record,
-        recorded.replace(&line, &format!("sykli = \"{}\"", old.display())),
-    )
-    .unwrap();
+    let old = sandbox.older_recorded_sykli();
     let output = sandbox.ohjaa(&["adopt", &rusty.to_string_lossy(), "--force"]);
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
@@ -1575,12 +1854,38 @@ fn an_older_sykli_gets_no_worktree_cache_lines_and_adopt_says_so() {
     );
     assert!(
         stdout.contains(&format!(
-            "not declared for fmt, doc, test: the sykli the pre-push dispatcher runs ({}) \
+            "not declared for {RUST_GATE_LACKING}: the sykli the pre-push dispatcher runs ({}) \
              does not name ${{worktree_cache}}",
             old.display()
         )),
         "{stdout}"
     );
+}
+
+impl Sandbox {
+    /// An older sykli (its `run --help` names no `${worktree_cache}`), made
+    /// the one apply recorded for the pre-push dispatcher.
+    fn older_recorded_sykli(&self) -> PathBuf {
+        let old = self.dir.join("old/sykli");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        write_executable(
+            &old,
+            "#!/bin/sh\necho 'Usage: sykli run [OPTIONS] [CONTRACT]'\n",
+        );
+        let record = self.config().join("applied.toml");
+        let recorded = fs::read_to_string(&record).unwrap();
+        let line = recorded
+            .lines()
+            .find(|line| line.starts_with("sykli = "))
+            .unwrap_or_else(|| panic!("apply recorded no sykli:\n{recorded}"))
+            .to_owned();
+        fs::write(
+            &record,
+            recorded.replace(&line, &format!("sykli = \"{}\"", old.display())),
+        )
+        .unwrap();
+        old
+    }
 }
 
 #[test]
@@ -1591,7 +1896,10 @@ fn a_gate_sykli_cannot_lock_again_is_kept_as_copied() {
     let (rusty, _) = sandbox.repo(
         "acme",
         "rusty",
-        &[("sykli.json", RUST_GATE), ("sykli.lock", COPIED_LOCK)],
+        &[
+            ("sykli.json", RUST_GATE),
+            ("sykli.lock", &stub_lock(RUST_GATE)),
+        ],
     );
     let entry = sandbox.config().join("repos/acme/rusty");
     let output = sandbox.ohjaa(&["adopt", &rusty.to_string_lossy()]);
@@ -1603,7 +1911,7 @@ fn a_gate_sykli_cannot_lock_again_is_kept_as_copied() {
     );
     assert_eq!(
         fs::read_to_string(entry.join("sykli.lock")).unwrap(),
-        COPIED_LOCK
+        stub_lock(RUST_GATE)
     );
     assert!(
         stderr.contains(&format!(
@@ -1621,7 +1929,10 @@ fn doctor_flags_cargo_tasks_that_may_share_a_target_dir_across_worktrees() {
     let (rusty, _) = sandbox.repo(
         "acme",
         "rusty",
-        &[("sykli.json", RUST_GATE), ("sykli.lock", COPIED_LOCK)],
+        &[
+            ("sykli.json", RUST_GATE),
+            ("sykli.lock", &stub_lock(RUST_GATE)),
+        ],
     );
     let (erl, _) = sandbox.repo("acme", "erl", &[("sykli.json", ERLANG_GATE)]);
     sandbox.apply();
@@ -1633,10 +1944,10 @@ fn doctor_flags_cargo_tasks_that_may_share_a_target_dir_across_worktrees() {
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
     assert!(
-        stdout.contains(
-            "note   acme/rusty: fmt, doc, test run cargo without ${worktree_cache}: gate runs \
-             may share a target dir across worktrees, and the sykli on PATH ("
-        ),
+        stdout.contains(&format!(
+            "note   acme/rusty: {RUST_GATE_LACKING} run cargo without ${{worktree_cache}}: gate \
+             runs may share a target dir across worktrees, and the sykli on PATH ("
+        )),
         "{stdout}"
     );
 
@@ -1646,10 +1957,10 @@ fn doctor_flags_cargo_tasks_that_may_share_a_target_dir_across_worktrees() {
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(4), "{stdout}{stderr}");
     assert!(
-        stdout.contains(
-            "DRIFT  acme/rusty: fmt, doc, test run cargo without ${worktree_cache}: gate runs \
-             may share a target dir across worktrees (ohjaa adopt --force <its clone>)"
-        ),
+        stdout.contains(&format!(
+            "DRIFT  acme/rusty: {RUST_GATE_LACKING} run cargo without ${{worktree_cache}}: gate \
+             runs may share a target dir across worktrees (ohjaa adopt --force <its clone>)"
+        )),
         "{stdout}"
     );
     assert!(
@@ -1670,6 +1981,131 @@ fn doctor_flags_cargo_tasks_that_may_share_a_target_dir_across_worktrees() {
         ),
         "{stdout}"
     );
+}
+
+/// The review of #47, finding 2: with the lines in, doctor still asks every
+/// sykli that runs the gate. An older one (a downgrade, or the one the
+/// pre-push dispatcher runs) passes `${worktree_cache}` on as written, and
+/// cargo builds in a `${worktree_cache}/` folder inside the work tree: drift,
+/// naming that sykli.
+#[test]
+fn doctor_flags_a_placeholder_an_older_sykli_would_pass_on_as_written() {
+    let sandbox = Sandbox::new("d10-downgrade");
+    fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
+    let (rusty, _) = sandbox.repo(
+        "acme",
+        "rusty",
+        &[
+            ("sykli.json", RUST_GATE),
+            ("sykli.lock", &stub_lock(RUST_GATE)),
+        ],
+    );
+    sandbox.apply();
+    sandbox.adopt(&rusty);
+    let doctor = || {
+        let output = sandbox.ohjaa(&["doctor"]);
+        let (stdout, stderr) = text(&output);
+        (output.status.code(), format!("{stdout}{stderr}"))
+    };
+    let (code, said) = doctor();
+    assert_eq!(code, Some(0), "every sykli expands it: {said}");
+
+    // The sykli on PATH is an older one now.
+    fs::remove_file(sandbox.dir.join("worktree-cache")).unwrap();
+    let (code, said) = doctor();
+    assert_eq!(code, Some(4), "{said}");
+    for line in [
+        format!(
+            "DRIFT  acme/rusty: fmt, doc, test, own, inherited name ${{worktree_cache}}, but the \
+             sykli on PATH ({}) does not name ${{worktree_cache}} in `sykli run --help`",
+            sandbox.dir.join("bin/sykli").display()
+        ),
+        "so cargo builds in a `${worktree_cache}/` folder inside the work tree".to_owned(),
+    ] {
+        assert!(said.contains(&line), "missing {line:?} in:\n{said}");
+    }
+    assert!(
+        !said.contains("every cargo task declares where it builds"),
+        "{said}"
+    );
+
+    // The sykli on PATH knows it again; the pre-push dispatcher's does not.
+    fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
+    let old = sandbox.older_recorded_sykli();
+    let (code, said) = doctor();
+    assert_eq!(code, Some(4), "{said}");
+    assert!(
+        said.contains(&format!(
+            "DRIFT  acme/rusty: fmt, doc, test, own, inherited name ${{worktree_cache}}, but the \
+             sykli the pre-push dispatcher runs ({}) does not name ${{worktree_cache}}",
+            old.display()
+        )),
+        "{said}"
+    );
+}
+
+/// The review of #47, finding 6: an adopt cut short between writing the
+/// gate and locking it leaves a lock that pins the gate as it was copied,
+/// and every gate run and push of the entry is then refused. doctor asks
+/// sykli (`validate`, handed the clone's facts) and says so; adopt --force
+/// mends it.
+#[test]
+fn doctor_flags_an_entry_whose_lock_does_not_pin_its_gate() {
+    let mut sandbox = Sandbox::new("d10-torn");
+    sandbox.stub_contract = "fast";
+    fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
+    let (rusty, _) = sandbox.repo(
+        "acme",
+        "rusty",
+        &[
+            ("sykli.json", RUST_GATE),
+            ("sykli.lock", &stub_lock(RUST_GATE)),
+        ],
+    );
+    sandbox.apply();
+    sandbox.adopt(&rusty);
+    let entry = sandbox.config().join("repos/acme/rusty");
+    let contract = entry.join("sykli.json");
+    let doctor = || {
+        let output = sandbox.ohjaa(&["doctor"]);
+        let (stdout, stderr) = text(&output);
+        (output.status.code(), format!("{stdout}{stderr}"))
+    };
+    let (code, said) = doctor();
+    assert_eq!(code, Some(0), "{said}");
+    assert!(
+        said.contains("ok     acme/rusty: its sykli.lock pins its gate"),
+        "{said}"
+    );
+    let calls = sandbox.read("sykli-calls");
+    assert!(
+        calls.contains(&format!(
+            "{0}|validate {1} --repo-root {0} --git-common-dir {2}\n",
+            rusty.display(),
+            contract.display(),
+            rusty.join(".git").display()
+        )),
+        "{calls}"
+    );
+
+    // Cut short: the gate with its lines, its lock as it was copied.
+    fs::write(entry.join("sykli.lock"), stub_lock(RUST_GATE)).unwrap();
+    let (code, said) = doctor();
+    assert_eq!(code, Some(4), "{said}");
+    assert!(
+        said.contains(&format!(
+            "DRIFT  acme/rusty: its gate does not validate against its sykli.lock (invalid {}: \
+             contract differs from {}",
+            contract.display(),
+            entry.join("sykli.lock").display()
+        )) && said.contains("every gate run and push of it is refused"),
+        "{said}"
+    );
+
+    let output = sandbox.ohjaa(&["adopt", &rusty.to_string_lossy(), "--force"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    let (code, said) = doctor();
+    assert_eq!(code, Some(0), "{said}");
 }
 
 #[test]
@@ -3515,6 +3951,9 @@ fn a_proof_that_reused_cached_tasks_says_so() {
 // OHJAA_TEST_SYKLI. CI's runners have no sykli, so they are ignored there:
 //
 //     OHJAA_TEST_SYKLI=/path/to/sykli cargo test --test config_home -- --ignored
+//
+// One also needs a sykli from before `${worktree_cache}` (such as 68b99b6),
+// named by OHJAA_TEST_OLDER_SYKLI.
 
 const NEEDS_SYKLI: &str = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored";
 
@@ -3945,52 +4384,91 @@ fn real_sykli_a_commit_proven_in_another_worktree_is_a_quiet_push() {
     );
 }
 
+/// A gate with a cargo task and one that fails while `state.txt` says
+/// broken, for the real sykli.
+const REAL_CARGO_GATE: &str = r#"{"schema":"sykli-contract.v1","tasks":[{"name":"test","run":"cargo test","inputs":["state.txt"]},{"name":"ok","run":"! grep -q broken state.txt","inputs":["state.txt"]}]}
+"#;
+
+/// The sykli an environment variable names, or a panic that says which.
+fn sykli_named_by(var: &str) -> PathBuf {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| panic!("needs a real sykli: {var}=<path> cargo test -- --ignored"))
+}
+
+impl Sandbox {
+    /// Make `sykli` the one on the sandbox's PATH (and so the one apply
+    /// records for the pre-push dispatcher: the same path).
+    fn use_sykli(&self, sykli: &Path) {
+        let bin = self.dir.join("bin/sykli");
+        let _ = fs::remove_file(&bin);
+        std::os::unix::fs::symlink(sykli, &bin).unwrap();
+    }
+
+    /// A sandbox whose sykli is `sykli`, with a `cargo` that writes down where
+    /// it was told to build (a task sees PATH, HOME and TMPDIR, and what its
+    /// contract declares), and `acme/widget` cloned: [`REAL_CARGO_GATE`]
+    /// locked by that sykli and pushed, then applied.
+    fn with_a_real_cargo_gate(tag: &str, sykli: &Path) -> (Sandbox, PathBuf) {
+        let sandbox = Sandbox::new(tag);
+        sandbox.use_sykli(sykli);
+        write_executable(
+            &sandbox.dir.join("bin/cargo"),
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$PWD\" \"$CARGO_TARGET_DIR\" \
+             \"$CARGO_BUILD_BUILD_DIR\" >> \"$HOME/cargo-env\"\n",
+        );
+        let (repo, _) = sandbox.repo(
+            "acme",
+            "widget",
+            &[("state.txt", "ok\n"), ("sykli.json", REAL_CARGO_GATE)],
+        );
+        let output = sandbox
+            .command("sykli", &repo)
+            .args(["lock", "sykli.json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", text(&output).1);
+        sandbox.git(&repo, &["add", "sykli.lock"]);
+        sandbox.git(&repo, &["commit", "-q", "-m", "lock"]);
+        sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+        sandbox.apply();
+        (sandbox, repo)
+    }
+
+    /// `ohjaa doctor`, with its exit code and all it said.
+    fn doctor(&self) -> (Option<i32>, String) {
+        let output = self.ohjaa(&["doctor"]);
+        let (stdout, stderr) = text(&output);
+        (output.status.code(), format!("{stdout}{stderr}"))
+    }
+}
+
 /// KATANA D10 against sykli main: adopt declares `${worktree_cache}` for a
 /// cargo task, the real `sykli lock` pins the entry's gate (so `sykli
 /// validate` finds no drift), and each worktree's gate then builds in a
-/// directory of its own, outside every work tree. The `cargo` here is a stub
-/// that writes down where it was told to build.
+/// directory of its own, outside every work tree. sykli is handed the
+/// clone's facts, so it asks git nothing (the review of #47, finding 5).
 #[test]
 #[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
 fn real_sykli_adopt_gives_each_worktree_its_own_cargo_build_directories() {
-    let sykli = std::env::var_os("OHJAA_TEST_SYKLI")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| panic!("{NEEDS_SYKLI}"));
-    let sandbox = Sandbox::new("real-d10");
-    let bin = sandbox.dir.join("bin");
-    fs::remove_file(bin.join("sykli")).unwrap();
-    std::os::unix::fs::symlink(&sykli, bin.join("sykli")).unwrap();
-    // A task sees PATH, HOME and TMPDIR, and what its contract declares.
-    write_executable(
-        &bin.join("cargo"),
-        "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$PWD\" \"$CARGO_TARGET_DIR\" \
-         \"$CARGO_BUILD_BUILD_DIR\" >> \"$HOME/cargo-env\"\n",
-    );
-    let gate = r#"{"schema":"sykli-contract.v1","tasks":[{"name":"test","run":"cargo test","inputs":["state.txt"]},{"name":"ok","run":"! grep -q broken state.txt","inputs":["state.txt"]}]}
-"#;
-    let (repo, _) = sandbox.repo(
-        "acme",
-        "widget",
-        &[("state.txt", "ok\n"), ("sykli.json", gate)],
-    );
-    let output = sandbox
-        .command("sykli", &repo)
-        .args(["lock", "sykli.json"])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{}", text(&output).1);
-    sandbox.git(&repo, &["add", "sykli.lock"]);
-    sandbox.git(&repo, &["commit", "-q", "-m", "lock"]);
-    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
-    sandbox.apply();
+    let sykli = sykli_named_by("OHJAA_TEST_SYKLI");
+    let (sandbox, repo) = Sandbox::with_a_real_cargo_gate("real-d10", &sykli);
 
-    let output = sandbox.ohjaa(&["adopt", &repo.to_string_lossy()]);
+    let (starts, output) = sandbox.git_starts(
+        sandbox
+            .command("ohjaa", &sandbox.dir)
+            .args(["adopt", &repo.to_string_lossy()]),
+    );
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
     assert!(
         stdout.contains("${worktree_cache}: CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for test, and sykli.lock locked again"),
         "{stdout}"
+    );
+    assert!(
+        !starts.iter().any(|line| line.contains("--show-toplevel")),
+        "sykli asked git for the repository: {starts:#?}"
     );
     let contract = sandbox.config().join("repos/acme/widget/sykli.json");
     let output = sandbox
@@ -4043,6 +4521,140 @@ fn real_sykli_adopt_gives_each_worktree_its_own_cargo_build_directories() {
     for checkout in [&repo, &linked] {
         assert!(!checkout.join("${worktree_cache}").exists());
     }
+}
+
+/// The review of #47, finding 1, against sykli main: the repository's gate
+/// changed without `sykli lock`. adopt keeps the gate exactly as copied, so
+/// the entry is as unlocked as the repository, and says the repository's own
+/// lock is out of date; it never locks what the repository did not.
+#[test]
+#[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
+fn real_sykli_adopt_keeps_a_gate_its_own_lock_no_longer_pins() {
+    let sykli = sykli_named_by("OHJAA_TEST_SYKLI");
+    let (sandbox, repo) = Sandbox::with_a_real_cargo_gate("real-stale", &sykli);
+    let edited = REAL_CARGO_GATE.replace(r#""name":"ok""#, r#""name":"still-ok""#);
+    fs::write(repo.join("sykli.json"), &edited).unwrap();
+    sandbox.git(&repo, &["commit", "-q", "-am", "edited, not locked"]);
+    sandbox.git(
+        &repo,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "-q",
+            "origin",
+            "main",
+        ],
+    );
+    let output = sandbox
+        .command("sykli", &repo)
+        .args(["validate", "sykli.json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "the repository's own gate");
+
+    let output = sandbox.ohjaa(&["adopt", &repo.to_string_lossy()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("the repository's own lock is out of date"),
+        "{stderr}"
+    );
+    let entry = sandbox.config().join("repos/acme/widget");
+    assert_eq!(
+        fs::read_to_string(entry.join("sykli.json")).unwrap(),
+        edited
+    );
+    assert_eq!(
+        fs::read(entry.join("sykli.lock")).unwrap(),
+        fs::read(repo.join("sykli.lock")).unwrap()
+    );
+    let output = sandbox
+        .command("sykli", &repo)
+        .arg("validate")
+        .arg(entry.join("sykli.json"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the entry is no more locked than the repository: {}",
+        text(&output).0
+    );
+}
+
+/// The review of #47, finding 6, against sykli main: an adopt cut short
+/// between writing the gate and locking it (the gate with its lines, the
+/// lock as copied) makes every gate refuse the entry, and doctor says so.
+#[test]
+#[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
+fn real_sykli_doctor_flags_an_entry_whose_lock_does_not_pin_its_gate() {
+    let sykli = sykli_named_by("OHJAA_TEST_SYKLI");
+    let (sandbox, repo) = Sandbox::with_a_real_cargo_gate("real-torn", &sykli);
+    sandbox.adopt(&repo);
+    let (code, said) = sandbox.doctor();
+    assert_eq!(code, Some(0), "{said}");
+    assert!(
+        said.contains("ok     acme/widget: its sykli.lock pins its gate"),
+        "{said}"
+    );
+
+    let entry = sandbox.config().join("repos/acme/widget");
+    fs::copy(repo.join("sykli.lock"), entry.join("sykli.lock")).unwrap();
+    let (code, said) = sandbox.gate(&repo);
+    assert_eq!(code, Some(2), "every gate refuses it: {said}");
+    assert!(said.contains("contract differs from"), "{said}");
+    let (code, said) = sandbox.doctor();
+    assert_eq!(code, Some(4), "{said}");
+    assert!(
+        said.contains("DRIFT  acme/widget: its gate does not validate against its sykli.lock (")
+            && said.contains("contract differs from"),
+        "{said}"
+    );
+
+    let output = sandbox.ohjaa(&["adopt", &repo.to_string_lossy(), "--force"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    let (code, said) = sandbox.doctor();
+    assert_eq!(code, Some(0), "{said}");
+}
+
+/// The review of #47, finding 2, against two real syklis: adopt with sykli
+/// main gives the gate its lines. With a sykli from before
+/// `${worktree_cache}` first on PATH (OHJAA_TEST_OLDER_SYKLI, such as
+/// 68b99b6) the gate still passes, but cargo is told to build in a
+/// `${worktree_cache}/` folder inside the work tree, and doctor says so.
+#[test]
+#[ignore = "needs a real sykli and an older one: OHJAA_TEST_SYKLI=<path> OHJAA_TEST_OLDER_SYKLI=<path> cargo test -- --ignored"]
+fn real_sykli_doctor_flags_lines_an_older_sykli_would_build_inside_the_work_tree() {
+    let sykli = sykli_named_by("OHJAA_TEST_SYKLI");
+    let older = sykli_named_by("OHJAA_TEST_OLDER_SYKLI");
+    let (sandbox, repo) = Sandbox::with_a_real_cargo_gate("real-older", &sykli);
+    sandbox.adopt(&repo);
+    let (code, said) = sandbox.doctor();
+    assert_eq!(code, Some(0), "{said}");
+
+    sandbox.use_sykli(&older);
+    let (code, said) = sandbox.gate(&repo);
+    assert_eq!(code, Some(0), "the older sykli still passes it: {said}");
+    let seen = fs::read_to_string(sandbox.home().join("cargo-env")).unwrap();
+    assert_eq!(
+        seen,
+        format!(
+            "{}|${{worktree_cache}}/cargo-target|${{worktree_cache}}/cargo-build\n",
+            repo.display()
+        ),
+        "cargo is told to build inside the work tree"
+    );
+    let (code, said) = sandbox.doctor();
+    assert_eq!(code, Some(4), "{said}");
+    assert!(
+        said.contains(&format!(
+            "DRIFT  acme/widget: test name ${{worktree_cache}}, but the sykli on PATH ({}) does \
+             not name ${{worktree_cache}} in `sykli run --help`",
+            sandbox.dir.join("bin/sykli").display()
+        )),
+        "{said}"
+    );
 }
 
 /// Should-fix 3: settings in a file git's global config includes count.
@@ -4315,6 +4927,73 @@ fn every_command_stays_within_its_git_budget() {
         .is_file());
     assert!(started(&starts, "cat-file"), "{starts:#?}");
     budget("ohjaa adopt", starts.len(), 4 + 2);
+
+    // adopt again once origin's gate has cargo tasks and a lock that pins
+    // it, with a sykli that expands ${worktree_cache}: the copy is validated
+    // and locked again, each handed the clone's facts, so sykli asks git
+    // nothing and the adopt starts no git process the same adopt of a gate
+    // with no cargo task does not (the review of #47, finding 5).
+    let readopt = || {
+        let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&[
+            "adopt",
+            &gated.to_string_lossy(),
+            "--force",
+        ]));
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+        (starts, stdout)
+    };
+    let (plain, _) = readopt();
+    fs::write(gated.join("sykli.json"), RUST_GATE).unwrap();
+    fs::write(gated.join("sykli.lock"), stub_lock(RUST_GATE)).unwrap();
+    sandbox.git(&gated, &["add", "sykli.lock"]);
+    sandbox.git(&gated, &["commit", "-q", "-am", "a gate with cargo tasks"]);
+    sandbox.git(
+        &gated,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "-q",
+            "origin",
+            "main",
+        ],
+    );
+    fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
+    let (relocked, stdout) = readopt();
+    assert!(
+        stdout.contains(&format!(
+            "${{worktree_cache}}: {RUST_GATE_GIVEN}, and sykli.lock locked again"
+        )),
+        "{stdout}"
+    );
+    let gate = sandbox.config().join("repos/acme/gated/sykli.json");
+    let told = format!(
+        "--repo-root {} --git-common-dir {}",
+        gated.display(),
+        gated.join(".git").display()
+    );
+    let calls = sandbox.read("sykli-calls");
+    for sub in ["validate", "lock"] {
+        assert!(
+            calls.contains(&format!("|{sub} {} {told}\n", gate.display())),
+            "sykli {sub} was not handed the facts: {calls}"
+        );
+    }
+    assert!(
+        !relocked.iter().any(|line| line.contains("--show-toplevel")),
+        "sykli asked git for the repository: {relocked:#?}"
+    );
+    assert_eq!(
+        relocked.len(),
+        plain.len(),
+        "validating and locking again started git: {relocked:#?}"
+    );
+    budget(
+        "ohjaa adopt --force (cargo tasks, locked again)",
+        relocked.len(),
+        4 + 2,
+    );
     sandbox.adopt(&own);
 
     // apply with two entries, nothing to change: now it reads the clones.
@@ -4691,10 +5370,29 @@ fn every_command_stays_within_its_git_budget() {
     );
     fs::remove_file(sandbox.dir.join("hold-runs")).unwrap();
 
-    // doctor: two for the machine, at most two per clone.
+    // doctor: two for the machine, at most two per clone. Asking sykli
+    // whether the gated entry's lock pins its gate starts none: sykli is
+    // handed the clone's facts.
+    let validated = || {
+        sandbox
+            .read("sykli-calls")
+            .lines()
+            .filter(|line| line.contains(&format!("|validate {} {told}", gate.display())))
+            .count()
+    };
+    let before = validated();
     let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&["doctor", "--root", &root]));
     let (stdout, _) = text(&output);
     assert!(stdout.contains("ohjaa doctor: "), "{stdout}");
+    assert!(
+        stdout.contains("ok     acme/gated: its sykli.lock pins its gate"),
+        "{stdout}"
+    );
+    assert_eq!(
+        validated(),
+        before + 1,
+        "doctor asked sykli once, with the facts"
+    );
     for clone in [
         "gated (acme/gated)",
         "own (acme/own)",
