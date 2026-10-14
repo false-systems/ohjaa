@@ -2254,16 +2254,17 @@ enum Answer {
 /// under, the source (the commit's tree and every declared input the run
 /// read) and its records' consistency. Not the outcome: that is the
 /// receipt's claim, since receipts are unsigned (sykli establishes no
-/// provenance, producer or execution either). It is read from the verdict's
-/// `outcome` check as claimed, whether sykli lists it among the tiers it
-/// established (sykli main as of 5acdf91) or not (as it is moving to).
+/// provenance, producer or execution either). It is read as claimed
+/// (`claimed_outcome`, or an older sykli's `outcome` check), whether sykli
+/// lists it among the tiers it established (sykli main as of 5acdf91) or
+/// not (as it is moving to).
 const IDENTITY_TIERS: [&str; 4] = ["schema", "contract", "source", "consistency"];
 
 /// Whether what `sykli verify <receipt> --commit <commit> --json` printed,
 /// exiting 0, proves `commit` as the receipt claims: a `sykli-verify.v1`
 /// document that judged that commit, verified it, established every one of
-/// [`IDENTITY_TIERS`], and whose `outcome` check passed on a claimed
-/// `passed` or `cached`. Else why not, for "sykli could not say".
+/// [`IDENTITY_TIERS`], and says the receipt claims `passed` or `cached`.
+/// Else why not, for "sykli could not say".
 fn proves(document: &[u8], commit: &str) -> Result<(), String> {
     let document: Value = serde_json::from_slice(document)
         .map_err(|error| format!("sykli verify --json printed no verdict ({error})"))?;
@@ -2295,6 +2296,16 @@ fn proves(document: &[u8], commit: &str) -> Result<(), String> {
             "sykli verified it without establishing its {}",
             missing.join(", ")
         ));
+    }
+    // The receipt's claim is sykli's machine field `claimed_outcome`. Only
+    // a sykli without it (5acdf91 and before) has it read from the words of
+    // its `outcome` check (`"actual":"passed with 2 task records"`), the one
+    // place that sykli says it, and only where that check passed.
+    if let Some(claimed) = document["claimed_outcome"].as_str() {
+        return match claimed {
+            "passed" | "cached" => Ok(()),
+            _ => Err(format!("the receipt claims {claimed}, not a pass")),
+        };
     }
     let Some(outcome) = document["checks"]
         .as_array()
@@ -3902,6 +3913,24 @@ mod tests {
             let why = proves(verdict.as_bytes(), commit).unwrap_err();
             assert!(why.contains(said), "{said}: {why}");
         }
+        // A sykli with `claimed_outcome` is read by that field alone; the
+        // outcome check's words are only the fallback for one without it.
+        let with_field = |claimed: &str, checks: &str| {
+            document("sykli-verify.v1", "commit", true, identity, claim, checks).replacen(
+                "\"checks\"",
+                &format!("\"claimed_outcome\":\"{claimed}\",\"checks\""),
+                1,
+            )
+        };
+        let worded_otherwise = outcome("as claimed,", true);
+        for verdict in [
+            with_field("passed", &worded_otherwise),
+            with_field("cached", ""),
+        ] {
+            assert_eq!(proves(verdict.as_bytes(), commit), Ok(()), "{verdict}");
+        }
+        let why = proves(with_field("failed", &passed).as_bytes(), commit).unwrap_err();
+        assert!(why.contains("claims failed"), "{why}");
         // Another commit's verdict proves nothing of this one.
         let other = document("sykli-verify.v1", "commit", true, today, unsigned, &passed);
         assert!(proves(other.as_bytes(), "beef").is_err());

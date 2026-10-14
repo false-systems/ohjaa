@@ -318,12 +318,13 @@ alone, nothing from the checkout (sykli#67 as merged), and one that also lists
 it established. A pass stands on the receipt's identity against the commit:
 its schema, contract, source (the commit's tree and inputs) and the records'
 consistency. The outcome is the receipt's claim, as sykli's own trust
-statement says (receipts are unsigned), read from the verdict's `outcome`
-check whether sykli lists it as established or not:
+statement says (receipts are unsigned), read from the verdict's
+`claimed_outcome` (an older sykli without it: its `outcome` check) whether
+sykli lists it as established or not:
 
 | sykli says | the record says | flag |
 |---|---|---|
-| exit 0; with `--json`, a verdict that judged the commit, verified it, established its schema, contract, source and consistency, and whose `outcome` check passed on a claimed `passed` or `cached` | `verified: passed` | no |
+| exit 0; with `--json`, a verdict that judged the commit, verified it, established its schema, contract, source and consistency, and that says the receipt claims `passed` or `cached` | `verified: passed` | no |
 | exit 0 with `--json`, but a verdict that does not prove it (another schema, another subject, an identity tier not established, no claimed pass) | `unverified: …` | no |
 | exit 1 or 3: refused the commit (another tree, a dirty run, an input the commit does not have, a failed outcome, contradictory records) | `FAILED sykli verify: …` | **yes** |
 | exit 4: it passed under another contract or lock than the one it is judged by now | `unproven: it passed under another contract than the gate's (…)` | **yes** where it is `origin/<default>`'s tip; otherwise no |

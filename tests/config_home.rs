@@ -30,7 +30,9 @@ use std::process::{Command, Output};
 /// `--json`, and answers it with a `sykli-verify.v1` verdict (in the schema,
 /// and with the tiers established and not, that `$SANDBOX/verify-schema`,
 /// `$SANDBOX/verify-established` and `$SANDBOX/verify-not-established` hold,
-/// when they exist). `run` writes its receipt as sykli does,
+/// when they exist; with `$SANDBOX/verify-claimed-outcome`, as a newer sykli,
+/// its `claimed_outcome` field says the receipt's claim, and the outcome
+/// check's words do not). `run` writes its receipt as sykli does,
 /// also as `.sykli/receipts/rcpt_<sha256>.json`: one task, passed (with
 /// `$SANDBOX/with-cached` a second one reused from the cache; with
 /// `$SANDBOX/all-cached` both reused, the run `cached`). With STUB_SYKLI_D3 it is the
@@ -193,8 +195,15 @@ case "$1" in
       claimed=passed
       grep -q '"outcome":"cached"' "$rcpt" && claimed=cached
       grep -q failed "$rcpt" && claimed=failed
-      printf '{"schema":"%s","subject":{"kind":"commit","rev":"%s"},"verified":%s,"exit":%s,"checks":[{"name":"outcome","ok":%s,"expected":"passed or cached with complete task records","actual":"%s with 1 task records"}],"trust":{"established":[%s],"not_established":[%s]}}\n' \
-        "$schema" "$rev" "$1" "$2" "$1" "$claimed" "$tiers" "$not"
+      # With $SANDBOX/verify-claimed-outcome, the newer sykli: the claim as
+      # its own field, and the check's words no longer saying it.
+      field=""; actual="$claimed with 1 task records"
+      if [ -f "$SANDBOX/verify-claimed-outcome" ]; then
+        field="\"claimed_outcome\":\"$(cat "$SANDBOX/verify-claimed-outcome")\","
+        actual="as claimed, with 1 task records"
+      fi
+      printf '{"schema":"%s","subject":{"kind":"commit","rev":"%s"},"verified":%s,"exit":%s,%s"checks":[{"name":"outcome","ok":%s,"expected":"passed or cached with complete task records","actual":"%s"}],"trust":{"established":[%s],"not_established":[%s]}}\n' \
+        "$schema" "$rev" "$1" "$2" "$field" "$1" "$actual" "$tiers" "$not"
     }
     if grep -q other-contract "$2"; then
       verdict false 4; echo "refused: contract expected 1111 but got 2222" >&2; exit 4
@@ -1912,6 +1921,22 @@ fn a_commit_is_proven_by_sykli_verifys_flags_and_its_json_verdict() {
     .unwrap();
     let report = sandbox.report(&repo);
     assert!(report.contains(&proven), "{report}");
+
+    // Up to here the claim was read from the outcome check's words (no
+    // `claimed_outcome`: sykli up to 5acdf91). A sykli with the field is
+    // read by it alone, whatever the check's words say.
+    fs::write(sandbox.dir.join("verify-claimed-outcome"), "passed").unwrap();
+    let report = sandbox.report(&repo);
+    assert!(report.contains(&proven), "{report}");
+    fs::write(sandbox.dir.join("verify-claimed-outcome"), "failed").unwrap();
+    let json = sandbox.report_json(&repo);
+    let commit = &json["entries"][0]["commits"][0];
+    assert_eq!(commit["code"], "could_not_say", "{json:#}");
+    assert!(
+        commit["why"].as_str().unwrap().contains("claims failed"),
+        "{json:#}"
+    );
+    fs::remove_file(sandbox.dir.join("verify-claimed-outcome")).unwrap();
 
     // Without the contract, either way: not proven, and said why.
     fs::write(
