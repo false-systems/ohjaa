@@ -714,7 +714,9 @@ its tree that says it passed. The briefing's validation lines start no git
 (HEAD is read from git's files) and ask `sykli status --commit` about the tip
 and HEAD; a launch that asks for an integrated validation starts at most three
 more for the clone's validation checkout (made: `worktree add` and `status`;
-reused: `checkout -f`, `clean` and `status`). A pre-push of any other branch than the
+reused: `checkout -f`, `clean` and `status`; two more where the commit has
+submodules, `submodule deinit` and `submodule foreach`; and it all again, made
+from nothing, when the reset or its check fails). A pre-push of any other branch than the
 observed one reads the session log and the clone's ref as files, for a base
 that moved: no process. `tests/config_home.rs` holds these budgets.
 
@@ -896,24 +898,39 @@ checkout`, a linked worktree of the clone (git keeps its admin folder in
 `<common>/worktrees/`; no file, hook or config of the repository is
 written). Before every run it is:
 
-1. **left alone while a run there is still going**: the newest run handed
-   over in it is asked about (`sykli status --run`); while sykli says it is
-   requested or running, nothing is reset under it, no request is recorded,
-   and the line says "the validation checkout is busy with sykli run … so
-   none is asked for now" (a later launch asks);
-2. **its last run's receipt kept**: when that run is done, the receipt it
+1. **left alone while a run there may still be going**: the newest run
+   handed over in it is asked about (`sykli status --run`). The checkout is
+   **busy**, nothing is reset under it, no request is recorded, and the line
+   says "the validation checkout is busy with sykli run … so none is asked
+   for now" (a later launch asks), whenever sykli says the run is requested
+   or running; or any of its tasks is still running, or any attempt has not
+   finished (a run sykli calls `lost`, its coordinator gone, may still have
+   one); or any attempt's process group still has a member (a task that left
+   a process behind); or sykli cannot say what became of the run, or cannot
+   be asked. A run that is gone for good keeps it busy until a person removes
+   the checkout folder (the line says which); the next launch then makes it
+   afresh;
+2. **its last run's receipt kept**: when that run has ended, the receipt it
    names (in the checkout's `.sykli/receipts/`) is copied into
    `integrated/<clone>/receipts/<request>.json` and recorded in that
    request's `receipt`, with sykli's digest, so no evidence lives only in a
    checkout;
 3. **reset to exactly the landed commit**: `git -c core.hooksPath=/dev/null
-   checkout -q -f --detach <commit>`, then `clean -q -ffdx -e .sykli`
-   (sykli's receipts stay, everything else another run left goes: build
-   folders, untracked and changed files); made from nothing (`worktree add
-   --detach --force`) when it is missing or the reset fails;
-4. **verified**: HEAD is the commit, and `git status --porcelain=v1
-   --untracked-files=all --ignored -- . ':(exclude).sykli'` says nothing.
-   Otherwise the request is recorded as not dispatched, and why.
+   checkout -q -f --detach <commit>`; where the commit has submodules,
+   `submodule deinit -q -f --all`, so each is as a fresh checkout has it (not
+   populated: its work tree, ignored files and changes go; nothing is
+   fetched, and the gate initialises what it needs); then `clean -q -ffdx -e
+   /.sykli` (sykli's own folder at the top stays, everything else another
+   run left goes: build folders, untracked and changed files, and a `.sykli`
+   folder deeper down);
+4. **verified**: HEAD is the commit; `git status --porcelain=v1
+   --untracked-files=all --ignored --ignore-submodules=none -- .
+   ':(exclude).sykli'` says nothing; and, with submodules, `submodule foreach
+   --recursive` finds none populated. When the reset or the check fails, the
+   checkout is made again from nothing (`worktree remove --force`, then
+   `worktree add --detach --force`) and verified again: a leftover never
+   blocks validation for good. Only when that fails too is the request
+   recorded as not dispatched, and why.
 
 Then `sykli run <gate> --detach --json` there. Its run id is filled in, or,
 when the run could not be handed over, why (`not_dispatched`). Because the
@@ -1080,20 +1097,34 @@ ohjaa judgements feat/parser [--json] [--fetch]
 ohjaa judgements --rebuild-public              # this clone's notes, redacted, no history
 ```
 
-**The reviewer is observed, not declared.** ohjaa reads the process table
-once (`ps`) and walks from `ohjaa judge` up through its ancestors. A live
-session in the log (open, not left) whose recorded process group holds one
-of them, or whose `ohjaa run` is one of them, is a session the judging
-process runs inside, whatever its environment says. The innermost one is the
-reviewer (an Agent, by its session id). Outside every one, `OHJAA_SESSION`
-names the session the process claims (an Agent, not shown to be it); without
-it, the reviewer is the person git names here (`git var
-GIT_COMMITTER_IDENT`). A process that drops `OHJAA_SESSION`, takes a
-person's git identity, runs in a session started inside another, or claims
-another live session's id is the session it runs in. ohjaa **cannot tell a
-person from an agent** running outside every ohjaa session (a session's
-agent that escaped its process group with `setsid`, or one started with
-`command claude`), and says so.
+**The reviewer is observed, not declared, and from the kernel.** ohjaa takes
+`ohjaa judge`'s own pid, parent, process group and session from the kernel
+(getpid, getppid, getpgrp, getsid), then each ancestor's (`proc_pidinfo` on
+macOS, `/proc/<pid>/stat` on Linux; never a `ps` on PATH, which anything in
+a session can put first). A session in the log, **open or ended**, whose
+recorded process group holds one of those processes (as its group or its
+session), or whose `ohjaa run` is one of them, is a session the judging
+process runs inside, whatever its environment says. A group id reused since
+is told apart by when its leader began (the kernel's start time: a pid reused
+a second later is another process); with its leader gone, an ended session's
+group counts when a process of the chain in it began before the session
+ended: a process its agent left behind (a background job, a double fork)
+is still that session's. The innermost session is the reviewer (an Agent, by
+its session id). Outside every one, `OHJAA_SESSION` names the session the
+process claims (an Agent, not shown to be it); without it, the reviewer is
+the person git names here (`git var GIT_COMMITTER_IDENT`), **shown only as
+far as the process has a controlling terminal**: without one (a background
+job, a daemon, anything after `setsid`), the person is claimed, not shown. A
+process that drops `OHJAA_SESSION`, takes a person's git identity, runs in a
+session started inside another, claims another live session's id, or was
+left behind by a session that has ended is the session it runs in.
+
+**What ohjaa cannot show, it never claims.** An agent's process that fully
+leaves every recorded process group (a double fork and `setsid`), and then
+acquires a terminal of its own (`script`, a terminal multiplexer), looks
+like a person, and so does an agent started outside ohjaa (`command
+claude`): ohjaa cannot prove otherwise locally. `established` therefore
+means **"no sign of an author"**, never proof that a person judged.
 
 **The record**, in the session log's `judgements` table
 (`ohjaa-judgement.v1`), holds:
@@ -1107,7 +1138,7 @@ agent that escaped its process group with `setsid`, or one started with
 | `evidence` | `asked` (the `sykli status --commit <head> --contract <gate> --json` it ran) and `refs`: sykli's run ids and receipts (path, sha256), never a verdict: sykli is asked again whenever it matters; or `not_asked`, and why |
 | `verdict` | `approve`, `request_changes` or `reject` |
 | `findings`, `severity`, `blocking`, `uncertainty` | as given |
-| `at_ms`, `provenance` | when; `ohjaa <version>`, the reviewing session, whether stdin and stdout were a terminal, `session_env` (`OHJAA_SESSION` as given: testimony) and `inside` (the live sessions the process was observed to run inside, innermost first) |
+| `at_ms`, `provenance` | when; `ohjaa <version>`, the reviewing session, whether stdin and stdout were a terminal, `session_env` (`OHJAA_SESSION` as given: testimony), `inside` (the sessions, live or ended, the process was observed to run inside, innermost first) and `controlling_terminal` |
 | `independence` | two facts, apart: `judge` (below) and `evidence` (`established: false`, and why: sykli's receipts are this machine's, unsigned, and not reproduced by the reviewer; `sykli verify` establishes their schema, contract, source and consistency, not their provenance, producer or execution) |
 
 **Law 2: refused**, and nothing recorded (exit 3), when a session the
@@ -1116,16 +1147,23 @@ have made a commit of the Change, or a person's identity is on one no ended
 session's record holds:
 
 - **an Agent session.** The log's records say what each ended session made
-  (never the clock: sessions start and end in whole seconds); while a
-  session is still open, its own checkout's reflog showing a commit created
-  since it started makes it its own, even with another open session sharing
-  that checkout (who made it cannot be shown, and the refusal says with
-  whom); a branch of the clone showing one created then in another checkout
-  makes it its own unless another session was in the clone: an open one at
-  that second, or an ended one that saw it made beside it. The reflogs are
-  read once per checkout and once for the clone's branches;
+  (never the clock: sessions start and end in whole seconds), and an ended
+  session that left the judging process behind is refused for what its
+  record holds; while a session is still open, its own checkout's reflog
+  showing a commit created since it started makes it its own, even with
+  another open session sharing that checkout (who made it cannot be shown,
+  and the refusal says with whom); a branch of the clone showing one created
+  then in another checkout makes it its own unless another session was in
+  the clone: an open one at that second, or an ended one that saw it made
+  beside it. The reflogs are read once per checkout and once for the clone's
+  branches;
 - **a Person** whose identity is on a commit of the Change, as author or
-  committer, that no ended session's record holds.
+  committer, that no ended session's record holds;
+- **where ohjaa cannot see, it fails closed**: when the process's ancestry
+  cannot be read whole and a session made (or, open in the clone, may have
+  made) the Change; and when a person is not shown (no controlling terminal)
+  while the Change holds commits no ended session's record holds and a
+  session is open in the clone.
 
 Law 2 is checked over every commit of the Change, however long; the record
 keeps the newest 200. A session that has ended, or that the log does not
@@ -1136,12 +1174,12 @@ hold, cannot be named by `OHJAA_SESSION`.
 
 - every commit of the Change is held by the record of an **ended** session,
   none of them the reviewer's (`unattributed` is 0);
-- the judging process runs inside **no live session but the reviewer's
-  own** (its process group, or an ancestor's, or their ohjaa) — and could be
-  observed at all;
+- the judging process runs inside **no session, live or ended, but the
+  reviewer's own live one** (its process group, or an ancestor's, or their
+  ohjaa) — and its ancestry could be read whole from the kernel;
 - `OHJAA_SESSION` is **unset** (a person, whose git identity is on no commit
-  of the Change) or names **the reviewer's own session**, which the process
-  runs in.
+  of the Change, **at a controlling terminal**) or names **the reviewer's
+  own session**, which the process runs in.
 
 Otherwise the Judgement is still recorded (a person's review is never
 refused for what ohjaa cannot show), with `established: false` and every
@@ -1152,7 +1190,8 @@ more. Examples:
 
 | what happened | recorded |
 |---|---|
-| Rae, outside every session, judges Ann's agent's ended session's commits | `established: true` |
+| Rae, at her terminal, outside every session, judges Ann's agent's ended session's commits | `established: true` (no sign of an author) |
+| the same with no controlling terminal (a background job, a cron, after `setsid`) | recorded; not established: a person claimed, not shown |
 | agent session B, in its own process group as `OHJAA_SESSION` says, judges ended session A's | `established: true`; the same agent program as A is said, "independent only procedurally" |
 | Ann, as a person, judges what her agent's ended session made under her identity | recorded; not established: her identity is on its commits, and ohjaa cannot tell her from an agent with it |
 | an agent drops `OHJAA_SESSION` and sets `GIT_COMMITTER_*` to Rae's, inside session A that made the commits | **refused**: the process is session A's |
@@ -1161,6 +1200,10 @@ more. Examples:
 | an agent session B drops `OHJAA_SESSION` after A ended, to judge as "the person" | recorded as agent session B; not established: `OHJAA_SESSION` is not set inside B's group |
 | a commit made in a scratch clone and fetched; a reflog expired; a commit in a worktree while another session was open | recorded; not established: commits no ended session's record holds (and, when so, under the reviewer's git identity) |
 | a commit made outside every session under Ann's identity, judged by an agent session acting as Ann | recorded; not established: unattributed, and under the identity the reviewer acts under (Ann as a person is refused) |
+| a process session A left behind (`cmd &`, a double fork), still in A's process group, judging A's Change once A has ended, as Rae | **refused**: it is session A's, and A's record holds the commit |
+| the same after `setsid` too (no group, no terminal), A ended | recorded as person Rae; not established: no controlling terminal |
+| the same while A is still open (its commit in no record yet) | **refused**: a person not shown, while a session open here may have made the commit |
+| a `ps` on PATH that lies, fails, or is missing | no effect: who runs where is the kernel's word |
 
 `ohjaa judge` says which on stdout ("the judge's independence of the
 authors: procedural, established", or "… is not established: …"), and so do
@@ -1210,10 +1253,15 @@ changed on one side only replace the other's, so a line force-written on
 origin with a Judgement's id would silently drop the genuine one. The union
 is written as one notes commit (`git fast-import`) whose parents are this
 clone's tip and origin's, so the push is a fast-forward of origin's and
-never rewrites it; no line present here or in the log is ever dropped, and
-a line someone removed or replaced on origin comes back with the next push
-from a clone that had it. Two different lines claiming one Judgement's id
-are both kept: a **conflict**, which `ohjaa judgements` shows.
+never rewrites it; no line present here or in the log is ever dropped, every
+line is kept byte for byte (one that is not UTF-8, or ends in `\r`, too),
+and a line someone removed or replaced on origin comes back with the next
+push from a clone that had it. Two different lines claiming one Judgement's
+id are both kept: a **conflict**, which `ohjaa judgements` shows. When
+origin moved between the fetch and the push (another clone pushed first:
+`git push --porcelain` says `[rejected]`), ohjaa fetches, unites and pushes
+again, up to 8 times with a backoff that doubles from 50 ms (capped at
+1.5 s, with jitter); only then is it "not shared", with git's rejection line.
 
 What may be shared is the entry's to say, in its **`sharing.toml`**, beside
 `repo.toml` (ohjaa asks no forge; an ohjaa from before Judgements never reads
@@ -1229,26 +1277,49 @@ that file, so its `repo.toml` stays one it can read):
 no name, email, finding's words, uncertainty or path: only the Judgement's
 id, the Change's hashes, the verdict, severity and blocking, counts, session
 and Intent ids, sykli's run ids and receipt digests (`"redacted": true`). An
-Intent id must be one (`in-<ms>-<pid>`): free text is refused. Before any
-push of such an entry, ohjaa checks **everything the push would publish**,
-not only the tip: every line of this clone's notes and of the lines the log
-re-attaches, and every line of every note in the history the push would
-send (each notes commit reachable from this clone's tip and not from
-origin's: `git log --raw` and one `cat-file --batch`), each of those commits
-by `ohjaa <ohjaa@invalid>` in `+0000`. A line passes only if it is exactly
-what ohjaa writes without names (a line that merely says `"redacted": true`
-does not) or origin holds it already. Anything else refuses the push: the
-Judgement stays recorded on this machine, and the exit is 1. A note written
-while the entry was private, removed since with `git notes remove`, is still
-in that history, and refuses it too. **`ohjaa judgements --rebuild-public`**
+Intent id must be one (`in-<ms>-<pid>`): free text is refused. A line passes
+only if it is exactly what ohjaa writes without names (a line that merely
+says `"redacted": true` does not). Before any push of such an entry, ohjaa
+checks, in this order:
+
+1. **origin's notes, as fetched**: every line at their tip and in their whole
+   history, and every notes commit in it. If origin already publishes a line
+   that does not pass (pushed while the entry was private, or by another
+   clone with plain git), or a notes commit by a person, the push is
+   **refused** (exit 1): a push from here would publish them again, in its
+   union and in a history that holds them, and origin's named lines are never
+   merged into this clone's notes. Only rewriting origin's ref removes them;
+   that is a person's decision and a force push, which ohjaa never makes. The
+   refusal says how many, and prints what a person would run from this clone:
+
+   ```
+   git fetch origin +refs/notes/ohjaa/judgements:refs/notes/ohjaa/fetched/judgements
+   ohjaa judgements --rebuild-public
+   git push --force origin refs/notes/ohjaa/judgements:refs/notes/ohjaa/judgements
+   ```
+
+   Other clones keep their own copies until each rebuilds too (their pushes
+   are refused meanwhile, their tips naming people), and a forge may keep the
+   old commits reachable by id until it collects them;
+2. **everything this push would publish**: every line of this clone's notes
+   and of the lines the log re-attaches, and every line of every note in the
+   history the push would send (each notes commit reachable from this clone's
+   tip and not from origin's), each of those commits by `ohjaa
+   <ohjaa@invalid>` in `+0000`. A note written while the entry was private,
+   removed since with `git notes remove`, is still in that history, and
+   refuses the push too.
+
+Three git processes: origin's history and the history to send (`git log
+--raw` each), and their notes (one `cat-file --batch`). The Judgement stays
+recorded on this machine either way. **`ohjaa judgements --rebuild-public`**
 rewrites this clone's `refs/notes/ohjaa/judgements` as one commit by `ohjaa
 <ohjaa@invalid>` with no history, holding only redacted lines: every
-redacted line of its notes, and this machine's Judgements of the clone (and
-their answers) in their redacted form. Every other line is dropped from the
-ref (the log keeps this machine's Judgements); the old history is no longer
-reachable from the ref, so no push publishes it (git's reflog keeps it on
-this machine only). It pushes nothing; the next `ohjaa judge … --push`
-does. `--push` for an entry that does not share is refused before anything
+redacted line of its notes and of origin's (as last fetched), and this
+machine's Judgements of the clone (and their answers) in their redacted form.
+Every other line is dropped from the ref (the log keeps this machine's
+Judgements); the old history is no longer reachable from the ref (git's
+reflog keeps it on this machine only). It pushes nothing and never changes
+origin. `--push` for an entry that does not share is refused before anything
 is recorded (exit 3). sykli, tapio and false-agent-protocol are public.
 
 **Reading.** `ohjaa judgements <commit>` lists every Judgement whose Change
@@ -1268,10 +1339,13 @@ that nothing here verifies, its names shown as "(claimed)"; a line that says
 `"redacted": false` and names someone is no more than that. Two records of
 one id that say different things (a named line and its own redacted form
 say the same) are each `conflict: true`, and the text says "CONFLICT", with
-the log's record the authoritative one here. Every control character from a
-note is shown as `?`. `--json` prints `ohjaa-judgements.v1`: `{schema,
-commit, judgements: [… + sources, trust, conflict], responses: [… + sources,
-trust, conflict], unreadable}`.
+the log's record the authoritative one here. A note line that is no Judgement
+and no answer (not UTF-8, not JSON or cut short, or another schema) is
+listed as **INVALID**, with why and where it was read, never dropped from
+view. Every control character from a note is shown as `?`. `--json` prints
+`ohjaa-judgements.v1`: `{schema, commit, judgements: [… + sources, trust,
+conflict], responses: [… + sources, trust, conflict], invalid: [{line,
+bytes, why, sources, trust}], unreadable}`.
 
 **In the briefing**, after the last session here: the Judgements of this
 clone from the last week, each with whether the judge's independence is
@@ -1288,9 +1362,10 @@ more (`merge-base`) when the base is not named; with `--push` five more
 (fetch, the two refs' notes listed, read in one `cat-file`, the push), one
 more when origin's notes are not already in this clone's history
 (`merge-base --is-ancestor`), one more to write the union (`fast-import`),
-and two more for an entry that is not private (the history's `log --raw`
-and its notes); `ohjaa judge respond` three; `ohjaa judgements` two, four
-with `--fetch`. Observing the reviewer is one `ps`, never git.
+three more for an entry that is not private (origin's history and the one to
+send, `log --raw` each, and their notes), and all of it again for each push
+origin rejected; `ohjaa judge respond` three; `ohjaa judgements` two, four
+with `--fetch`. Observing the reviewer asks the kernel, never git or `ps`.
 
 ## What it will never do
 

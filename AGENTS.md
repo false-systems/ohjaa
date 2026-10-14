@@ -21,7 +21,8 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 - One Rust crate producing a single `ohjaa` binary. Dependencies stay minimal —
   `anyhow`, `clap`, `serde`, `serde_json`, the vendored `faija-knowledge`
   (knowledge-node.v1), `redb` (the session log) and `libc` (signal
-  dispositions while a session runs) — and every addition needs a reason. Tests
+  dispositions while a session runs, and the kernel's word on processes) — and
+  every addition needs a reason. Tests
   alone also use `sha2` and `serde_yaml` (the parser toimija reads
   `.toimija/repo.yaml` with, so a config toimija cannot parse fails CI here).
 - **Ohjaa holds Knowledge; toimija reports facts.** Never reimplement anything
@@ -92,7 +93,8 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   `refs/notes/ohjaa/fetched/judgements`). A push publishes the union of this
   clone's lines, origin's and the session log's, never a merge that drops
   one; for an entry that is not private, never a line or a notes commit that
-  names anyone, at the tip or anywhere in the history it would send. Every
+  names anyone, at the tip or anywhere in the history it would send, and
+  none while origin's own notes already name anyone. Every
   other command works from the filesystem and local CLIs.
 - Failed coverage is never rendered as an empty result. If a scan could not
   look, it says so and exits non-zero.
@@ -107,11 +109,14 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   Never write another session's testimony.
 - Never judge a Change you made, and never work around `ohjaa judge`'s law-2
   refusal (another identity, another session's id, a dropped
-  `OHJAA_SESSION`, a session started inside your own). This rule is
-  testimony, not a Boundary: ohjaa observes the judging process (the live
-  session whose process group holds it), not its environment, and records
-  what it cannot show as not established. Answer a Judgement with
-  `ohjaa judge respond`; never edit or remove one.
+  `OHJAA_SESSION`, a session started inside your own, a process left
+  behind). This rule is testimony, not a Boundary: ohjaa observes the
+  judging process from the kernel (any session, live or ended, whose process
+  group holds it or an ancestor), not its environment, and records what it
+  cannot show as not established. `established` means no sign of an author,
+  never proof of a person: a process that fully left every recorded process
+  group and acquired a terminal can still look like one. Answer a Judgement
+  with `ohjaa judge respond`; never edit or remove one.
 - Never edit `vendor/faija-knowledge/`; refresh it with
   `scripts/vendor-faija-knowledge.sh`. The format belongs to faija.
 - Tests must never read or write the person's real knowledge: the CLI tests
