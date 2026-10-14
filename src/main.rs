@@ -15,6 +15,8 @@ mod gitconfig;
 mod home;
 mod hook;
 mod intake;
+mod integrated;
+mod judgement;
 mod knowledge;
 mod lifecycle;
 mod mark;
@@ -388,11 +390,119 @@ enum Cmd {
         #[arg(long, value_name = "SECONDS", default_value_t = 1800)]
         wait: u64,
     },
+    /// Record an independent Judgement of a Change (base..head) and its
+    /// exact State. The reviewer is observed: the live ohjaa session whose
+    /// process group holds this process (or an ancestor), whatever
+    /// OHJAA_SESSION says; outside every one, the person git names here.
+    /// Refused when the reviewer made any commit of the Change (law 2). Kept
+    /// in the session log, and attached to the head as a git note under
+    /// refs/notes/ohjaa/judgements.
+    #[command(
+        args_conflicts_with_subcommands = true,
+        subcommand_negates_reqs = true,
+        after_help = "Exit codes:\n  \
+        0  recorded\n  \
+        1  recorded, but not shared: --push did not reach origin\n  \
+        2  nothing to judge: the range cannot be resolved, or holds no commit\n  \
+        3  refused, nothing recorded: the reviewer made a commit of the Change\n     \
+           (law 2; a process a session left behind is that session); an author\n     \
+           is not ruled out where ohjaa cannot see (it fails closed);\n     \
+           OHJAA_SESSION names no live session in the log; or --push for a\n     \
+           repository whose Judgements are not shared\n  \
+        4  not recorded: the session log could not be read or written (busy\n     \
+           past 20s, or broken), or the repository or its entry cannot be read\n\n\
+        The judge's procedural independence is `established` only when every\n\
+        commit of the Change is held by an ended session's record, none the\n\
+        reviewer's; this process runs inside no session, live or ended, but the\n\
+        reviewer's own live one (the kernel's word on its process group and its\n\
+        ancestors'); and OHJAA_SESSION is unset (a person at a controlling\n\
+        terminal, whose git identity is on no commit of the Change) or names\n\
+        that session. Otherwise it is recorded, with `established: false` and\n\
+        each reason. `established` means no sign of an author, never proof of a\n\
+        person: an agent's process that left every recorded group and took a\n\
+        terminal looks like one, and a reflog is the agent's own testimony.\n\n\
+        RANGE is base..head, or a head alone: its base is then where it leaves\n\
+        origin's copy of the entry's branch. The evidence considered is what\n\
+        `sykli status --commit <head> --contract <gate> --json` names (runs and\n\
+        receipts, by reference). Judgements of a private repository (its entry's\n\
+        sharing.toml says visibility = \"private\") are shared when asked; of any\n\
+        other, only with share_judgements = true there, and their notes hold ids,\n\
+        hashes and the verdict only. --push (or push_judgements = true) pushes\n\
+        refs/notes/ohjaa/judgements to origin as the union of this clone's lines,\n\
+        origin's and the session log's: no line is dropped, and none is replaced."
+    )]
+    Judge {
+        #[command(subcommand)]
+        action: Option<JudgeCmd>,
+        /// base..head, or a head (default HEAD).
+        #[arg(default_value = "HEAD")]
+        range: String,
+        #[arg(long, value_enum, required = true)]
+        verdict: Option<judgement::Verdict>,
+        /// What was found (repeatable).
+        #[arg(long = "finding", value_name = "TEXT")]
+        findings: Vec<String>,
+        #[arg(long, value_enum)]
+        severity: Option<judgement::Severity>,
+        /// The findings block the Change.
+        #[arg(long)]
+        blocking: bool,
+        /// What the reviewer could not check, or is unsure of.
+        #[arg(long, value_name = "TEXT")]
+        uncertainty: Option<String>,
+        /// The Intent the Change serves, when its sessions do not say.
+        #[arg(long, value_name = "ID")]
+        intent_id: Option<String>,
+        /// Push the notes ref to origin once recorded (shared repositories).
+        #[arg(long)]
+        push: bool,
+    },
+    /// Every Judgement of a commit (and the answers to them), from this
+    /// machine's log and the notes, each marked with where it was read
+    /// (log, note, merged, fetched), whether it is authoritative here, and
+    /// whether another record of its id says otherwise (a conflict).
+    #[command(
+        after_help = "--rebuild-public rewrites this clone's refs/notes/ohjaa/judgements as one\n\
+        commit by ohjaa <ohjaa@invalid> with no history, holding only redacted lines:\n\
+        every redacted line of its notes, and this machine's Judgements of the clone\n\
+        in their redacted form. Every other line is dropped from the ref (the session\n\
+        log keeps this machine's Judgements), and the old history is no longer\n\
+        reachable from it, so no push publishes it; git's reflog keeps it on this\n\
+        machine only. Nothing is pushed. For an entry made public after it was\n\
+        private: a note removed with `git notes remove` is still in the history."
+    )]
+    Judgements {
+        /// The commit (default HEAD).
+        #[arg(default_value = "HEAD")]
+        commit: String,
+        #[arg(long)]
+        json: bool,
+        /// First fetch origin's shared notes (refs/notes/ohjaa/judgements)
+        /// into refs/notes/ohjaa/fetched/judgements.
+        #[arg(long)]
+        fetch: bool,
+        /// Rewrite this clone's notes ref with redacted lines only, and no
+        /// history (see below).
+        #[arg(long, conflicts_with_all = ["json", "fetch"])]
+        rebuild_public: bool,
+    },
     /// Print the shell functions that route `claude` and `codex` through
     /// `ohjaa run`. Load them with: eval "$(ohjaa shell-init zsh)"
     ShellInit {
         /// zsh is the only one.
         shell: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum JudgeCmd {
+    /// Answer a Judgement: a record of its own beside it, never a change to
+    /// it. From inside a session, or as the person git names here.
+    Respond {
+        /// The Judgement's id (`jd-…`).
+        judgement: String,
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
     },
 }
 
@@ -721,6 +831,72 @@ fn knowledge_for_work(
     Ok((text, delivered))
 }
 
+/// The sessions toimija sees in the other worktrees of the clone `root` is
+/// a checkout of (from the clone's layout; never `folder` itself, nor a
+/// checkout ohjaa made to validate an integrated State), each asked as the
+/// launch checkout is, side by side.
+fn clone_scans(root: &Path, folder: &Path) -> Vec<Scan> {
+    let Ok(common) = gitconfig::common_dir(root) else {
+        return Vec::new();
+    };
+    let ours = lifecycle::validation_checkouts();
+    let others: Vec<PathBuf> = lifecycle::layout_checkouts(&common)
+        .into_iter()
+        .filter(|checkout| checkout != folder && checkout.is_dir())
+        .filter(|checkout| ours.as_ref().is_none_or(|ours| !checkout.starts_with(ours)))
+        .collect();
+    std::thread::scope(|scope| {
+        others
+            .iter()
+            .map(|checkout| scope.spawn(move || scan_repo(checkout)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("scan thread panicked"))
+            .collect()
+    })
+}
+
+/// The briefing's part naming the sessions in the clone's other worktrees;
+/// empty when there are none and every worktree could be read.
+fn clone_sessions_text(scans: &[Scan]) -> String {
+    use std::fmt::Write as _;
+    let mut lines = String::new();
+    for scan in scans {
+        if scan.coverage != Coverage::Available {
+            let _ = writeln!(
+                lines,
+                "- {}: its sessions could not be read completely ({})",
+                scan.repo.display(),
+                coverage_detail(scan)
+            );
+        }
+        for session in scan.occupying() {
+            let _ = writeln!(
+                lines,
+                "- {} ({}) in {} on {} ({}{}): {}",
+                session.id,
+                session.agent,
+                session.worktree.display(),
+                session.branch.as_deref().unwrap_or("no branch"),
+                session.liveness,
+                if session.idle_seconds >= 0 {
+                    format!(", seen {}", ago(session.idle_seconds))
+                } else {
+                    String::new()
+                },
+                session.intent
+            );
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Sessions in the other worktrees of this clone at launch (toimija liveness; not proof of \
+         current work):\n{lines}"
+    )
+}
+
 fn selected_perimeter(
     root: &Path,
     in_repo: bool,
@@ -796,12 +972,34 @@ fn cmd_brief(
     // The entry's branch unproven at its tip comes first of all, then the
     // last session's warnings; its record after the knowledge.
     if !knowledge_only {
-        if let Some(flag) = dirs
-            .repo_root
-            .as_deref()
-            .and_then(|top| mark::at_launch(top).1)
-        {
-            println!("{flag}\n");
+        if let Some(top) = dirs.repo_root.as_deref() {
+            let launch = mark::at_launch(top);
+            if let Some(flag) = &launch.flag {
+                println!("{flag}\n");
+            }
+            // What sykli says of the tip and of HEAD here; nothing is asked for.
+            if let Some(marks) = &launch.marks {
+                let caps = integrated::Caps::ask(false);
+                let all = session_reader(&dirs)
+                    .and_then(|log| log.all().ok())
+                    .map(|(all, _)| all)
+                    .unwrap_or_default();
+                let head = gitconfig::read_head(top, &marks.gate.common);
+                let view = integrated::at_launch(
+                    marks,
+                    head.as_ref()
+                        .map(|(commit, branch)| (commit.as_str(), branch.as_deref())),
+                    &all,
+                    integrated::Mode::Brief,
+                    &dirs.state,
+                    &sessions::store_path(&dirs.state),
+                    &caps,
+                );
+                let text = view.briefing();
+                if !text.is_empty() {
+                    println!("{text}");
+                }
+            }
         }
     }
     // sykli is asked about each pending validation shown, once.
@@ -820,6 +1018,13 @@ fn cmd_brief(
     }
     if let Some(last) = last.filter(|last| !last.is_empty()) {
         print!("\n{last}");
+    }
+    if let Some(top) = dirs.repo_root.as_deref() {
+        let folder = std::fs::canonicalize(top).unwrap_or_else(|_| top.to_path_buf());
+        let siblings = clone_sessions_text(&clone_scans(top, &folder));
+        if !siblings.is_empty() {
+            print!("\n{siblings}");
+        }
     }
     // Validate configured discovery roots; do not derive unrelated repositories.
     repos(roots)?;
@@ -906,6 +1111,22 @@ fn last_session_here(
     };
     let latest_id = latest.as_ref().map(|s| s.id.clone());
     let pending = pending_here(&all, latest_id.as_deref(), repo, &here, runs);
+    // The Judgements of this clone, and its Changes with none (D5).
+    let judged = match judgement::logged() {
+        Ok((judgements, responses)) => {
+            let mut checkouts: Vec<String> = crate::gitconfig::common_dir(repo)
+                .map(|common| lifecycle::layout_checkouts(&common))
+                .unwrap_or_default()
+                .iter()
+                .map(|checkout| checkout.to_string_lossy().into_owned())
+                .collect();
+            if !checkouts.contains(&here) {
+                checkouts.push(here.clone());
+            }
+            judgement::briefing(&all, &judgements, &responses, &checkouts)
+        }
+        Err(error) => format!("Judgements here: the session log could not be read ({error:#})\n"),
+    };
     let mut earlier: Vec<sessions::Session> = all
         .into_iter()
         .filter(|s| Some(&s.id) != latest_id.as_ref() && sessions::observed_in(s, &here))
@@ -921,6 +1142,12 @@ fn last_session_here(
         .map(|session| sessions::render_last_with(session, &here, &|v| runs.ask(v)))
         .unwrap_or_default();
     last.push_str(&pending);
+    if !judged.is_empty() {
+        if !last.is_empty() {
+            last.push('\n');
+        }
+        last.push_str(&judged);
+    }
     (!warnings.is_empty() || !last.is_empty()).then_some((warnings, last))
 }
 
@@ -1995,8 +2222,45 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         .filter(here)
         .filter(|s| s.is_quiet())
         .count();
+    // The sessions in the clone's other worktrees: toimija keeps each
+    // worktree's apart, so each is asked (D5, audit finding 9).
+    let clone_scans = if in_repo {
+        clone_scans(&root, &folder)
+    } else {
+        Vec::new()
+    };
     if in_repo {
         eprintln!("ohjaa: {live} sibling session(s) in this checkout at launch");
+        let elsewhere: Vec<String> = clone_scans
+            .iter()
+            .flat_map(|scan| scan.occupying())
+            .map(|s| {
+                format!(
+                    "{} ({}, {})",
+                    s.id,
+                    s.agent,
+                    s.worktree.file_name().unwrap_or_default().to_string_lossy()
+                )
+            })
+            .collect();
+        if !elsewhere.is_empty() {
+            eprintln!(
+                "ohjaa: {} more session(s) in other worktrees of this clone at launch: {}",
+                elsewhere.len(),
+                elsewhere.join(", ")
+            );
+        }
+        for scan in clone_scans
+            .iter()
+            .filter(|scan| scan.coverage != Coverage::Available)
+        {
+            eprintln!(
+                "ohjaa: the sessions in {}, a worktree of this clone, could not be read \
+                 completely: {}",
+                scan.repo.display(),
+                coverage_detail(scan)
+            );
+        }
         if !outside_seen {
             eprintln!(
                 "ohjaa: could not read sessions outside repositories, so any scoped here are \
@@ -2072,18 +2336,18 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // Where an entry says ohjaa observes this repository: what doctor checks
     // for it, and whether the entry's branch is proven at its tip (a few git
     // calls and one sykli verify at most, none outside an observed one).
-    let mark_flag = if in_repo {
-        let (warnings, flag) = mark::at_launch(&root);
-        for warning in warnings {
-            eprintln!("ohjaa: warning: {warning}");
-        }
-        if let Some(flag) = &flag {
-            eprintln!("ohjaa: {flag}");
-        }
-        flag
+    let launch_marks = if in_repo {
+        mark::at_launch(&root)
     } else {
-        None
+        mark::AtLaunch::default()
     };
+    for warning in &launch_marks.warnings {
+        eprintln!("ohjaa: warning: {warning}");
+    }
+    if let Some(flag) = &launch_marks.flag {
+        eprintln!("ohjaa: {flag}");
+    }
+    let mark_flag = launch_marks.flag.clone();
 
     // A footgun guard: ohjaa flags after `--` belong to the agent.
     for misplaced in [
@@ -2168,6 +2432,38 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let started_ms = intake::now_seconds() * 1000;
     let session_id = sessions::new_id(started_ms);
     let mut delivered = Vec::new();
+    // What sykli says of the observed branch's tip (the integrated State)
+    // and of HEAD (a candidate), with a stale base flagged; a launch asks
+    // for a run of an unverified tip, recorded with this session first.
+    let (mut validation, integrated_caps) = match (&launch_marks.marks, no_briefing) {
+        (Some(marks), false) => {
+            let caps = integrated::Caps::ask(true);
+            let head = gitconfig::read_head(&root, &marks.gate.common);
+            let all = session_reader(&dirs)
+                .and_then(|log| log.all().ok())
+                .map(|(all, _)| all)
+                .unwrap_or_default();
+            let view = integrated::at_launch(
+                marks,
+                head.as_ref()
+                    .map(|(commit, branch)| (commit.as_str(), branch.as_deref())),
+                &all,
+                if dry_run {
+                    integrated::Mode::DryRun
+                } else {
+                    integrated::Mode::Launch
+                },
+                &dirs.state,
+                &sessions::store_path(&dirs.state),
+                &caps,
+            );
+            for line in &view.lines {
+                eprintln!("ohjaa: {line}");
+            }
+            (view, Some(caps))
+        }
+        _ => (integrated::AtLaunch::default(), None),
+    };
     let briefing = if no_briefing {
         None
     } else {
@@ -2193,16 +2489,20 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         let orphaned = sessions::render_orphaned(&orphaned_here, &|v| runs.ask(v));
         let still = sessions::render_still_running(&still_running_here, &|v| runs.ask(v));
         // The entry's branch unproven at its tip comes first of all: what
-        // everyone builds on.
+        // everyone builds on; then what sykli says of it and of HEAD.
         let flagged = mark_flag.clone().unwrap_or_default();
+        let validated = validation.briefing();
+        let siblings = clone_sessions_text(&clone_scans);
         let parts: Vec<&str> = [
             flagged.as_str(),
+            validated.as_str(),
             still.as_str(),
             orphaned.as_str(),
             warnings.as_str(),
             knowledge.as_str(),
             last.as_str(),
             how.as_str(),
+            siblings.as_str(),
             perimeter.as_str(),
         ]
         .into_iter()
@@ -2334,16 +2634,64 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         drafted: false,
         usage: Vec::new(),
         usage_refused: None,
-        validations: Vec::new(),
+        // An integrated validation the briefing asked for: recorded with
+        // the entering, before sykli is asked (invariant A).
+        validations: validation
+            .request
+            .iter()
+            .map(|request| request.validation.clone())
+            .collect(),
     };
     // From here to the end of leaving, a signal is kept, not fatal.
     lifecycle::supervise();
-    if let Some(store) = session_store(&dirs) {
-        if let Err(error) = store.put(&session) {
-            eprintln!("ohjaa: {error}; this session will not be recorded");
+    let entered = match session_store(&dirs) {
+        Some(store) => match store.put(&session) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("ohjaa: {error}; this session will not be recorded");
+                false
+            }
+        },
+        None => false,
+    };
+    eprintln!("ohjaa: session {session_id} entering");
+    if let (Some(request), Some(caps), Some(marks)) =
+        (&validation.request, &integrated_caps, &launch_marks.marks)
+    {
+        if entered {
+            let log = sessions::store_path(&dirs.state);
+            match integrated::dispatch_recorded(
+                &log,
+                &dirs.state,
+                &session_id,
+                &marks.gate,
+                request,
+                caps,
+            ) {
+                integrated::Asked::Recorded { request: id, run } => match run {
+                    Ok(run) => eprintln!(
+                        "ohjaa: integrated validation {id}: sykli run {run}, in {}",
+                        request.checkout.display()
+                    ),
+                    Err(why) => eprintln!(
+                        "ohjaa: integrated validation {id} is recorded, and could not be handed \
+                         to sykli: {why}"
+                    ),
+                },
+                integrated::Asked::NotRecorded(why) => {
+                    eprintln!("ohjaa: integrated validation not asked for: {why}")
+                }
+            }
+        } else {
+            let why = "this session could not be recorded first, so sykli was not asked";
+            eprintln!("ohjaa: integrated validation not asked for: {why}");
+            for validation in &mut session.validations {
+                validation.not_dispatched = Some(why.to_owned());
+            }
         }
     }
-    eprintln!("ohjaa: session {session_id} entering");
+    // Handed over (or not to be): another launch in this clone may decide.
+    drop(validation.lock.take());
 
     // Stay the parent: leaving must run when the session ends, however it ends.
     // The session leads a process group of its own (holding the terminal when
@@ -2418,6 +2766,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         .then_some(&scan)
         .into_iter()
         .chain(scoped_scans.iter())
+        .chain(clone_scans.iter())
         .flat_map(|scan| scan.occupying().filter(|s| !s.is_quiet()))
         .map(|s| {
             let worktree =
@@ -2581,6 +2930,21 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             });
         }
     }
+    // A landing this session saw reach an entry's observed branch: sykli is
+    // asked to validate the integrated State, recorded in this session
+    // first (D5). Only once the leaving is recorded, and not when a signal
+    // cut leaving short.
+    let mut integrated_lines = Vec::new();
+    if recorded_ok && !process::cancelled() {
+        integrated_lines = integrated_at_leaving(&dirs, &session, &sykli);
+        if !integrated_lines.is_empty() {
+            if let Some(updated) =
+                session_reader(&dirs).and_then(|log| log.get(&session_id).ok().flatten())
+            {
+                session = updated;
+            }
+        }
+    }
     let _ = std::io::stdout().flush();
     // Written with `let _`: a closed terminal must not turn printing into a
     // panic after the record is already safe.
@@ -2606,6 +2970,9 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             "ohjaa: this record could not be saved; it is shown above only"
         )
     };
+    for line in &integrated_lines {
+        let _ = writeln!(stderr, "ohjaa: {line}");
+    }
     say_weekly(weekly);
     // Said again last, where the person looks when the session ends.
     for flag in sessions::flags(&session) {
@@ -2613,6 +2980,50 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     }
     lifecycle::restore_signals();
     Ok(lifecycle::exit_code(exit))
+}
+
+/// At leaving: each commit the session saw land on an entry's observed
+/// branch (`origin/<branch>`) that the branch still sits at, in the launch
+/// repository and every one it named with `--scope`. sykli is asked what
+/// applies to it, and an integrated validation is asked for where it has no
+/// current receipt (see `integrated::at_landing`). The lines to say.
+fn integrated_at_leaving(
+    dirs: &Dirs,
+    session: &sessions::Session,
+    sykli: &lifecycle::Sykli,
+) -> Vec<String> {
+    let Some(left) = &session.left else {
+        return Vec::new();
+    };
+    let launch = (!session.outside_repo).then(|| (session.repo.as_str(), &left.landed[..]));
+    let scoped = left
+        .scoped
+        .iter()
+        .filter(|scoped| !scoped.found)
+        .map(|scoped| (scoped.repo.as_str(), &scoped.landed[..]));
+    let log = sessions::store_path(&dirs.state);
+    let mut caps = None;
+    let mut lines = Vec::new();
+    for (repo, landed) in launch.into_iter().chain(scoped) {
+        let Some(gate) = sykli.gate_for(Path::new(repo)) else {
+            continue;
+        };
+        let onto = format!("origin/{}", gate.branch);
+        for landed in landed.iter().filter(|l| l.at_tip && l.onto == onto) {
+            let caps = caps.get_or_insert_with(|| integrated::Caps::ask(true));
+            // The log is read again under the clone's lock: another ohjaa may
+            // have asked already.
+            lines.push(integrated::at_landing(
+                &log,
+                &dirs.state,
+                &session.id,
+                &gate,
+                &landed.commit,
+                caps,
+            ));
+        }
+    }
+    lines
 }
 
 /// Sessions left open by an ohjaa that is gone (killed, crashed or restarted:
@@ -3141,6 +3552,43 @@ fn main() {
         Cmd::Hook { name, args } => hook::run(name, args),
         Cmd::ShellInit { shell } => shell_init::shell_init(shell),
         Cmd::Gate { print, wait } => gate::gate_here(*print, std::time::Duration::from_secs(*wait)),
+        Cmd::Judge {
+            action: Some(JudgeCmd::Respond { judgement, text }),
+            ..
+        } => judgement::respond(judgement, &text.join(" ")),
+        Cmd::Judge {
+            action: None,
+            range,
+            verdict,
+            findings,
+            severity,
+            blocking,
+            uncertainty,
+            intent_id,
+            push,
+        } => match verdict {
+            Some(verdict) => judgement::judge(&judgement::JudgeArgs {
+                range,
+                verdict: *verdict,
+                findings,
+                severity: *severity,
+                blocking: *blocking,
+                uncertainty: uncertainty.as_deref(),
+                intent_id: intent_id.as_deref(),
+                push: *push,
+            }),
+            None => Err(anyhow::anyhow!("--verdict is required")),
+        },
+        Cmd::Judgements {
+            rebuild_public: true,
+            ..
+        } => judgement::rebuild_public(),
+        Cmd::Judgements {
+            commit,
+            json,
+            fetch,
+            ..
+        } => judgement::list(commit, *json, *fetch),
         Cmd::Intake {
             since,
             sources,

@@ -9,7 +9,7 @@ Read `.toimija/current.md` before reading anything else in this repo; it is your
 Do not start with a broad file crawl. Read `.toimija/current.md` first, then
 declare why you are here: `toimija intent "<why>" [--scope <path>]`.
 
-This repo is one small crate — twenty modules, no lib, plus the vendored
+This repo is one small crate — twenty-two modules, no lib, plus the vendored
 `faija-knowledge`. Read them before proposing structure for it.
 
 Only a person accepts, rejects, retires or confirms Knowledge. Do not add

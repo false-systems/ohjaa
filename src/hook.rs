@@ -398,6 +398,23 @@ fn observe(args: &[OsString], here: &Here) -> Observed {
         }
     };
     let observed_ref = format!("refs/heads/{}", entry.branch);
+    // Every other branch pushed: a commit a session validated on a base
+    // the observed branch has moved from since is flagged, never stopped.
+    // Files only (the session log, read-only, and this clone's ref).
+    let others: Vec<(String, String)> = pushed
+        .iter()
+        .filter(|update| {
+            update.remote_ref != observed_ref
+                && update.remote_ref.starts_with("refs/heads/")
+                && !update.local_sha.bytes().all(|b| b == b'0')
+        })
+        .map(|update| (update.local_sha.clone(), update.remote_ref.clone()))
+        .collect();
+    let stale = crate::integrated::stale_at_push(&here.common, &entry.branch, &others);
+    let observed = |flag: Option<String>, input: Vec<u8>| {
+        let lines: Vec<String> = stale.iter().cloned().chain(flag).collect();
+        observed((!lines.is_empty()).then(|| lines.join("\n")), input)
+    };
     let Some(sha) = pushed
         .iter()
         .find(|update| {

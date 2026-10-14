@@ -59,12 +59,58 @@ pub fn entry_gated(entry: &Path) -> PathBuf {
 
 /// The environment a git run of ohjaa's own must not inherit from a hook
 /// that started it: it would point git at another repository.
-const REPO_ENV: [&str; 4] = [
+pub const REPO_ENV: [&str; 4] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
     "GIT_INDEX_FILE",
 ];
+
+/// The commit a checkout's HEAD names, and its branch (`None` detached), from
+/// git's files: the checkout's own git dir (`.git`, or the one its `.git`
+/// file names) holds HEAD, the common dir its branch. `None` when the files
+/// do not say.
+pub fn read_head(top: &Path, common: &Path) -> Option<(String, Option<String>)> {
+    let dot_git = top.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        top.join(text.strip_prefix("gitdir:")?.trim())
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref:") {
+        Some(reference) => {
+            let reference = reference.trim();
+            let commit = read_ref(common, reference)?;
+            let branch = reference.strip_prefix("refs/heads/").map(str::to_owned);
+            Some((commit, branch))
+        }
+        None => (head.len() >= 40 && head.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| (head.to_owned(), None)),
+    }
+}
+
+/// Where `name` (`refs/remotes/origin/main`) points in the clone whose
+/// common git dir is `common`, read from git's files without asking git: its
+/// loose file, else its line in `packed-refs`. `None` when neither holds it
+/// (or the clone keeps its refs in a reftable): what cannot be read is
+/// never guessed.
+pub fn read_ref(common: &Path, name: &str) -> Option<String> {
+    let hex = |text: &str| {
+        let text = text.trim();
+        (text.len() >= 40 && text.chars().all(|c| c.is_ascii_hexdigit())).then(|| text.to_owned())
+    };
+    if let Ok(text) = std::fs::read_to_string(common.join(name)) {
+        return hex(&text);
+    }
+    let packed = std::fs::read_to_string(common.join("packed-refs")).ok()?;
+    packed.lines().find_map(|line| {
+        let (oid, reference) = line.split_once(' ')?;
+        (reference == name).then(|| hex(oid)).flatten()
+    })
+}
 
 /// Git that reads no config but what it is given: git reads the global
 /// config before anything else, even for `--version`, so one unreadable

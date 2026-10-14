@@ -490,27 +490,43 @@ pub fn of_entries(
         .collect()
 }
 
+/// What a launch in a repository learns of its entry's branch.
+#[derive(Debug, Default)]
+pub struct AtLaunch {
+    /// The drift warnings doctor would give the clone.
+    pub warnings: Vec<String>,
+    /// The flag, when the entry's branch is not proven at its tip.
+    pub flag: Option<String>,
+    /// The marks themselves, when the walk could be made.
+    pub marks: Option<Marks>,
+}
+
 /// For `ohjaa run` and `ohjaa brief` in the repository at `top`: the
 /// drift warnings doctor would give it, and the flag when the entry's branch
 /// is not proven at its tip. Nothing at all without an entry; else one git
 /// process for the clone's config, one for the walk, and `sykli verify` at
 /// most once.
-pub fn at_launch(top: &Path) -> (Vec<String>, Option<String>) {
+pub fn at_launch(top: &Path) -> AtLaunch {
     let Ok(home) = home::ohjaa_home() else {
-        return (Vec::new(), None);
+        return AtLaunch::default();
     };
     let home = home::absolute(home);
     let (warnings, gate) = gitconfig::launch_view(&home, top);
     let Some(gate) = gate else {
-        return (warnings, None);
+        return AtLaunch {
+            warnings,
+            ..AtLaunch::default()
+        };
     };
     let sykli = Sykli::with_home(home);
     sykli.allow_verifies(1);
     let receipts = lifecycle::receipts_of_layout(&gate.common);
-    let flag = walk(&gate, &sykli, &receipts)
-        .ok()
-        .and_then(|marks| flag(&marks));
-    (warnings, flag)
+    let marks = walk(&gate, &sykli, &receipts).ok();
+    AtLaunch {
+        warnings,
+        flag: marks.as_ref().and_then(flag),
+        marks,
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! The small, strict piece of TOML that ohjaa's config home is written in:
-//! `[table]` and `[dotted.table]` headers, `key = "text"` pairs, comments and
-//! blank lines. Every file ohjaa writes in it (`repo.toml`, `applied.toml`) is
+//! `[table]` and `[dotted.table]` headers, `key = "text"` pairs, `key =
+//! true` and `key = false` (read as the word), comments and blank lines. Every file ohjaa writes in it (`repo.toml`, `applied.toml`) is
 //! valid TOML that any TOML reader reads the same way.
 //!
 //! Anything outside that subset is an error naming its line, never skipped:
@@ -102,11 +102,23 @@ pub fn parse(text: &str) -> Result<Tables, String> {
             return Err(fail(format!("{key:?} is not a plain key")));
         }
         let value = value.trim_start();
-        let after_quote = value
-            .strip_prefix('"')
-            .filter(|rest| !rest.starts_with("\"\""))
-            .ok_or_else(|| fail("only \"text\" values are read here".into()))?;
-        let (value, rest) = basic_string(after_quote).map_err(fail)?;
+        // A TOML boolean is read as its word: `true` or `false`.
+        let boolean = ["true", "false"].into_iter().find_map(|word| {
+            let rest = value.strip_prefix(word)?;
+            (rest.is_empty() || rest.starts_with([' ', '\t', '#'])).then(|| (word.to_owned(), rest))
+        });
+        let (value, rest) = match boolean {
+            Some(read) => read,
+            None => {
+                let after_quote = value
+                    .strip_prefix('"')
+                    .filter(|rest| !rest.starts_with("\"\""))
+                    .ok_or_else(|| {
+                        fail("only \"text\" values, true and false are read here".into())
+                    })?;
+                basic_string(after_quote).map_err(fail)?
+            }
+        };
         let rest = rest.trim();
         if !(rest.is_empty() || rest.starts_with('#')) {
             return Err(fail("text after the value".into()));
@@ -206,6 +218,16 @@ mod tests {
             let error = parse(text).unwrap_err();
             assert!(error.starts_with("line "), "{text:?}: {error}");
             assert!(error.contains(why), "{text:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn true_and_false_are_read_as_their_words() {
+        let tables = parse("a = true\nb = false # off\nc = \"true\"\n").unwrap();
+        assert_eq!(tables[""]["a"], "true");
+        assert_eq!(tables[""]["b"], "false");
+        for text in ["k = truer\n", "k = True\n", "k = true false\n"] {
+            assert!(parse(text).is_err(), "{text:?}");
         }
     }
 
