@@ -261,8 +261,8 @@ struct Setting {
     var: &'static str,
     value: &'static str,
     /// The variables that say where it is. A task that names one of them in
-    /// its `env` or `inherit`, or sets or unsets one in its command, already
-    /// says it, and is never given the line.
+    /// its `env` or `inherit`, or certainly sets one for every cargo in its
+    /// command, already says it, and is never given the line.
     said_by: &'static [&'static str],
 }
 
@@ -524,90 +524,143 @@ const RESERVED: [&str; 13] = [
     "!", "{", "}", "if", "then", "elif", "else", "fi", "do", "done", "while", "until", "time",
 ];
 
-/// The variables a command sets or unsets, where sh does, for every cargo it
-/// runs: each simple command with a word `cargo` has it in effect, by an
-/// assignment before its command word (`CARGO_TARGET_DIR=t cargo test`) or
-/// before `env`'s, a name `env` is told to unset (`env -u NAME`), or an
-/// earlier `export`, `readonly`, `declare`, `typeset`, `local` or `unset` of
-/// it. So `CARGO_TARGET_DIR=t cargo build; cargo test` does not say it for
-/// the second, a word that only looks like an assignment (`echo
-/// CARGO_TARGET_DIR=x`) says nothing, and neither does a shell variable that
-/// is not exported (`CARGO_TARGET_DIR=t; cargo test`). A command inside quotes
-/// (`sh -c '…'`) is not read: when no cargo is in sight, what the command sets
-/// anywhere counts, and a setting made inside is missed. A line adopt then
-/// gives the task is overridden by the command's own setting wherever that
-/// applies, never the other way round.
+/// Recognize only declarations whose scope is evident without interpreting
+/// shell code. Anything uncertain gets defaults; a command's own assignment
+/// still wins. Never infer exports from conditionals, subshells or wrappers.
 fn names_set_in(run: &str) -> Vec<String> {
-    // Set or unset for the rest of the command.
-    let mut lasting: Vec<String> = Vec::new();
-    // In effect for every simple command so far that runs cargo.
+    if run.contains(['#', '`', '\\', '(', ')'])
+        || run.contains("<<")
+        || run
+            .split("${")
+            .skip(1)
+            .any(|part| part.split_once('}').is_none_or(|(name, _)| !is_name(name)))
+    {
+        return Vec::new();
+    }
+    let commands = simple_commands(run);
+    // A leading unconditional export, separated only by ; or newline.
+    let mut remaining = run.trim_start();
+    let mut exported = Vec::new();
+    let mut prefix = 0;
+    while let Some(end) = remaining.find([';', '\n']) {
+        let line = &remaining[..end];
+        if line.contains(['&', '|', '<', '>']) {
+            break;
+        }
+        let parts = simple_commands(line);
+        let Some(words) = parts.first().filter(|_| parts.len() == 1) else {
+            break;
+        };
+        if words.first().is_some_and(|word| word == "export")
+            && words.len() > 1
+            && words[1..].iter().all(|word| assigned(word).is_some())
+        {
+            exported.extend(
+                words[1..]
+                    .iter()
+                    .filter_map(|word| assigned(word))
+                    .map(str::to_owned),
+            );
+        } else if words.iter().map(String::as_str).collect::<Vec<_>>() != ["set", "-e"] {
+            break;
+        }
+        prefix += 1;
+        remaining = remaining[end + 1..].trim_start();
+    }
+    // Unknown commands can unset variables or run hidden cargo.
+    if commands.iter().skip(prefix).any(|command| {
+        let program = command.iter().find(|word| assigned(word).is_none());
+        !program.is_some_and(|word| word == "cd" || word == "cargo" || word.ends_with("/cargo"))
+    }) {
+        exported.clear();
+    }
     let mut every: Option<Vec<String>> = None;
-    // Set anywhere, for a command whose cargo is out of sight.
-    let mut anywhere: Vec<String> = Vec::new();
-    for command in simple_commands(run) {
-        let runs = command
-            .iter()
-            .any(|word| word == "cargo" || word.ends_with("/cargo"));
+    for command in commands {
         let mut words = command
             .iter()
             .map(String::as_str)
             .skip_while(|word| RESERVED.contains(word))
             .peekable();
-        let mut here = Vec::new();
+        let mut here = exported.clone();
         while let Some(name) = words.peek().and_then(|word| assigned(word)) {
             here.push(name.to_owned());
             words.next();
         }
         let program = words.next().unwrap_or_default();
-        match program.rsplit('/').next().unwrap_or(program) {
-            "export" | "readonly" | "declare" | "typeset" | "local" => {
-                lasting.extend(words.filter_map(assigned).map(str::to_owned));
+        if program != "cargo" && !program.ends_with("/cargo") {
+            // A quoted or wrapped cargo is not covered by other invocations.
+            if command.iter().any(|word| runs_cargo(word)) {
+                return Vec::new();
             }
-            "unset" => lasting.extend(words.filter(|word| is_name(word)).map(str::to_owned)),
-            "env" => {
-                while let Some(word) = words.next() {
-                    if let Some(name) = assigned(word) {
-                        here.push(name.to_owned());
-                    } else if word == "-u" || word == "--unset" {
-                        here.extend(words.next().map(str::to_owned));
-                    } else if let Some(name) = word
-                        .strip_prefix("--unset=")
-                        .or_else(|| word.strip_prefix("-u"))
-                        .filter(|name| is_name(name))
+            continue;
+        }
+        // Expansion can insert `--` before an apparent Cargo flag. Do not
+        // credit flags in such a command; prefix assignments still apply.
+        let args: Vec<_> = words.collect();
+        let literal_flags = args.iter().all(|word| {
+            if word.contains(['$', '*', '?', '[']) {
+                return false;
+            }
+            // One enclosing quote pair is clear; concatenated fragments
+            // could spell an otherwise invisible option terminator.
+            match word.chars().next() {
+                Some(quote @ ('\'' | '"')) => word
+                    .strip_prefix(quote)
+                    .and_then(|inner| inner.strip_suffix(quote))
+                    .is_some_and(|inner| !inner.contains(quote)),
+                _ => !word.contains(['\'', '"']),
+            }
+        });
+        let mut args = args
+            .into_iter()
+            .take_while(|word| literal_flags && word.trim_matches(['\'', '"']) != "--")
+            .peekable();
+        while let Some(arg) = args.next() {
+            if arg == "--target-dir" && args.peek().is_some()
+                || arg
+                    .strip_prefix("--target-dir=")
+                    .is_some_and(|value| !value.is_empty())
+            {
+                here.push("CARGO_TARGET_DIR".to_owned());
+            }
+            let config = if arg == "--config" {
+                args.next()
+            } else {
+                arg.strip_prefix("--config=")
+            };
+            if let Some(config) = config {
+                let config = config.trim_matches(['\'', '"']);
+                for (key, var) in [
+                    ("build.target-dir=", "CARGO_TARGET_DIR"),
+                    ("build.build-dir=", "CARGO_BUILD_BUILD_DIR"),
+                ] {
+                    if config
+                        .strip_prefix(key)
+                        .is_some_and(|value| !value.is_empty())
                     {
-                        here.push(name.to_owned());
-                    } else if !word.starts_with('-') {
-                        break;
+                        here.push(var.to_owned());
                     }
                 }
             }
-            _ => {}
         }
-        if !program.is_empty() {
-            anywhere.extend(here.iter().cloned());
+        // Different spellings still describe the same target-directory choice.
+        if here.iter().any(|name| name == "CARGO_BUILD_TARGET_DIR") {
+            here.push("CARGO_TARGET_DIR".to_owned());
         }
-        if runs {
-            let in_effect: Vec<String> = here.into_iter().chain(lasting.iter().cloned()).collect();
-            every = Some(match every {
-                None => in_effect,
-                Some(so_far) => so_far
-                    .into_iter()
-                    .filter(|name| in_effect.contains(name))
-                    .collect(),
-            });
-        }
+        every = Some(match every {
+            None => here,
+            Some(previous) => previous
+                .into_iter()
+                .filter(|name| here.contains(name))
+                .collect(),
+        });
     }
-    every.unwrap_or_else(|| {
-        anywhere.extend(lasting);
-        anywhere
-    })
+    every.unwrap_or_default()
 }
 
-/// The settings a cargo task leaves unsaid. Each counts as said where the
-/// task names one of its variables: in `env` (its own value), in `inherit`
-/// (the value of whoever runs the gate, so a task that inherits only one of
-/// the two is given the other), or set or unset by its command where sh does
-/// (see [`names_set_in`]).
+/// A task with an explicit target directory keeps its whole layout. Otherwise
+/// supply only the settings absent from env, inherit and certain command
+/// declarations (see names_set_in).
 fn unsaid(task: &Json, run: &str) -> std::result::Result<Vec<&'static Setting>, String> {
     let mut said = names_set_in(run);
     match task.get("env") {
@@ -621,6 +674,15 @@ fn unsaid(task: &Json, run: &str) -> std::result::Result<Vec<&'static Setting>, 
             said.extend(names.iter().filter_map(Json::as_str).map(str::to_owned));
         }
         Some(_) => return Err("a contract with a task whose inherit is not a list".to_owned()),
+    }
+    // Cargo's build directory defaults under an explicitly chosen target
+    // directory. Do not split a task's own layout by supplying the other line.
+    if SETTINGS[0]
+        .said_by
+        .iter()
+        .any(|var| said.iter().any(|name| name == var))
+    {
+        return Ok(Vec::new());
     }
     Ok(SETTINGS
         .iter()
@@ -929,23 +991,10 @@ fn declare_worktree_cache(top: &Path, common: &Path, dir: &Path, home: &Path) {
         let kept = format!("the gate is kept as copied, without {WORKTREE_CACHE}");
         let refused = match sykli_on("validate", top, common, &contract) {
             Ok(output) if output.status.success() => None,
-            // sykli names the lock the gate drifted from by its path.
-            Ok(output)
-                if output.status.code() == Some(1)
-                    && output
-                        .failure_detail()
-                        .contains(&lock.display().to_string()) =>
-            {
-                Some(format!(
-                    "the sykli.lock copied with the gate does not pin it ({}): the repository's \
-                     own lock is out of date, so {kept}: adopt locks again only a gate its own \
-                     lock pins (lock it in the repository with sykli lock, then: ohjaa adopt \
-                     --force)",
-                    output.failure_detail()
-                ))
-            }
             Ok(output) if output.status.code() == Some(1) => Some(format!(
-                "the gate as copied does not validate ({}), so {kept}",
+                "the repository's sykli.lock does not validate its sykli.json; {kept}. \
+                 Validate the contract and run sykli lock in the repository, land both on its \
+                 observed branch, then ohjaa adopt --force <its clone>. Sykli says: {}",
                 output.failure_detail()
             )),
             Ok(output) => Some(format!(
@@ -1127,16 +1176,31 @@ mod tests {
 
     /// More commands, beyond the review's: what certainly says where every
     /// cargo builds, and what only nearly does.
-    const MORE: [(&str, &[&str]); 30] = [
+    const MORE: [(&str, &[&str]); 33] = [
         // Certain, for every cargo.
         ("cargo test --target-dir t", NOTHING),
-        ("cargo build --target-dir=t && cargo test --config 'build.target-dir=\"t\"'", NOTHING),
+        (
+            "cargo build --target-dir=t && cargo test --config 'build.target-dir=\"t\"'",
+            NOTHING,
+        ),
         ("cargo test --config=build.target-dir=t", NOTHING),
         ("export CARGO_TARGET_DIR=\"$PWD/t\"; cargo test", NOTHING),
-        ("export CARGO_TARGET_DIR=${PWD}/t\ncd sub && cargo test", NOTHING),
-        ("set -e; export CARGO_BUILD_TARGET_DIR=t; cargo build && cargo test", NOTHING),
-        ("CARGO_TARGET_DIR=t cargo build; CARGO_BUILD_TARGET_DIR=t cargo test", NOTHING),
-        ("RUSTDOCFLAGS='-D warnings' CARGO_TARGET_DIR=\"$PWD/t\" cargo doc", NOTHING),
+        (
+            "export CARGO_TARGET_DIR=${PWD}/t\ncd sub && cargo test",
+            NOTHING,
+        ),
+        (
+            "set -e; export CARGO_BUILD_TARGET_DIR=t; cargo build && cargo test",
+            NOTHING,
+        ),
+        (
+            "CARGO_TARGET_DIR=t cargo build; CARGO_BUILD_TARGET_DIR=t cargo test",
+            NOTHING,
+        ),
+        (
+            "RUSTDOCFLAGS='-D warnings' CARGO_TARGET_DIR=\"$PWD/t\" cargo doc",
+            NOTHING,
+        ),
         ("if true; then CARGO_TARGET_DIR=t cargo test; fi", NOTHING),
         ("CARGO_TARGET_DIR=t cargo test 2>&1 | tee log", NOTHING),
         // The build dir only: the target dir's line.
@@ -1145,18 +1209,30 @@ mod tests {
         ("export CARGO_BUILD_BUILD_DIR=b; cargo test", TARGET_ONLY),
         // Not certain: both lines.
         ("cargo test -- --target-dir t", BOTH),
+        ("cargo test '--' --target-dir t", BOTH),
+        ("cargo test '-''-' --target-dir t", BOTH),
+        ("ARGS=--; cargo test $ARGS --target-dir t", BOTH),
         ("cargo build --target-dir t; cargo test", BOTH),
         ("cargo test # --target-dir t", BOTH),
         ("echo cargo --target-dir t; sh -c 'cargo test'", BOTH),
         ("nice cargo test --target-dir t", BOTH),
-        ("export CARGO_TARGET_DIR=t; unset CARGO_TARGET_DIR; cargo test", BOTH),
-        ("export CARGO_TARGET_DIR=t; env -u CARGO_TARGET_DIR cargo test", BOTH),
+        (
+            "export CARGO_TARGET_DIR=t; unset CARGO_TARGET_DIR; cargo test",
+            BOTH,
+        ),
+        (
+            "export CARGO_TARGET_DIR=t; env -u CARGO_TARGET_DIR cargo test",
+            BOTH,
+        ),
         ("export CARGO_TARGET_DIR=t # here\ncargo test", BOTH),
         ("export CARGO_TARGET_DIR=t >/dev/null; cargo test", BOTH),
         ("export CARGO_TARGET_DIR=\"$(pwd)/t\"; cargo test", BOTH),
         ("export -- CARGO_TARGET_DIR=t; cargo test", BOTH),
         ("declare -x CARGO_TARGET_DIR=t; cargo test", BOTH),
-        ("cargo fmt --check\nexport CARGO_TARGET_DIR=t\ncargo test", BOTH),
+        (
+            "cargo fmt --check\nexport CARGO_TARGET_DIR=t\ncargo test",
+            BOTH,
+        ),
         ("echo CARGO_TARGET_DIR=x; cargo test", BOTH),
         ("\"CARGO_TARGET_DIR\"=t cargo test", BOTH),
         ("cargo test 2>&1 | CARGO_TARGET_DIR=t tee log", BOTH),
@@ -1247,10 +1323,12 @@ echo "target=${{target:-no}} build=${{build:-no}}" >> '{}'
                 ran += 1;
                 let target = told.contains("target=yes");
                 let build = told.contains("build=yes");
-                if !given.contains(&"CARGO_TARGET_DIR") && !target {
-                    wrong.push(format!("{run:?} is given {given:?}, and a cargo ran: {told}"));
-                } else if given == ["CARGO_TARGET_DIR"] && !build {
-                    wrong.push(format!("{run:?} is given {given:?}, and a cargo ran: {told}"));
+                if !given.contains(&"CARGO_TARGET_DIR") && !target
+                    || given == ["CARGO_TARGET_DIR"] && !build
+                {
+                    wrong.push(format!(
+                        "{run:?} is given {given:?}, and a cargo ran: {told}"
+                    ));
                 }
             }
         }
@@ -1259,72 +1337,70 @@ echo "target=${{target:-no}} build=${{build:-no}}" >> '{}'
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// The review of #48, finding 2: a task that certainly says where cargo
+    /// builds (its target dir, by its env, its inherit, its command or a
+    /// flag) is given nothing, not even the build dir's line: cargo's build
+    /// dir defaults to that target dir, so the task's layout stays as it
+    /// meant (test binaries under `<its target dir>/debug/deps`). A task that
+    /// says only its build dir is given the target dir's line, and one that
+    /// says neither both.
     #[test]
-    fn a_task_is_given_each_setting_it_does_not_say_and_nothing_it_does() {
-        let task = |json: &str| serde_json::from_str::<Json>(json).unwrap();
-        let vars = |json: &str, run: &str| -> Vec<&'static str> {
-            unsaid(&task(json), run)
-                .unwrap()
-                .into_iter()
-                .map(|setting| setting.var)
-                .collect()
-        };
-        let both = ["CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"];
+    fn a_task_that_says_its_target_dir_is_given_nothing() {
         let cases: &[(&str, &str, &[&str])] = &[
-            ("{}", "cargo test", &both),
-            ("{}", "echo CARGO_TARGET_DIR=x; cargo test", &both),
-            ("{}", "CARGO_TARGET_DIR=t cargo build; cargo test", &both),
+            ("", "cargo test", BOTH),
             (
-                r#"{"env":{"RUST_BACKTRACE":"1"},"inherit":["HOME"]}"#,
-                "cargo test --target-dir=t",
-                &both,
-            ),
-            (
-                r#"{"env":{"CARGO_TARGET_DIR":"t"}}"#,
+                r#""env":{"RUST_BACKTRACE":"1"},"inherit":["HOME"]"#,
                 "cargo test",
-                &["CARGO_BUILD_BUILD_DIR"],
+                BOTH,
             ),
+            // The target dir, said: nothing.
+            (r#""env":{"CARGO_TARGET_DIR":"t"}"#, "cargo test", NOTHING),
             (
-                r#"{"env":{"CARGO_BUILD_TARGET_DIR":"t"}}"#,
+                r#""env":{"CARGO_BUILD_TARGET_DIR":"t"}"#,
                 "cargo test",
-                &["CARGO_BUILD_BUILD_DIR"],
+                NOTHING,
             ),
+            (r#""inherit":["CARGO_TARGET_DIR"]"#, "cargo test", NOTHING),
             (
-                r#"{"env":{"CARGO_BUILD_BUILD_DIR":"b"}}"#,
+                r#""inherit":["CARGO_BUILD_TARGET_DIR"]"#,
                 "cargo test",
-                &["CARGO_TARGET_DIR"],
+                NOTHING,
             ),
-            // Inheriting one: whoever runs the gate decides that one; the
-            // other is given.
+            ("", "CARGO_TARGET_DIR=t cargo test", NOTHING),
+            ("", "export CARGO_BUILD_TARGET_DIR=t; cargo test", NOTHING),
+            ("", "cargo test --target-dir=t", NOTHING),
+            // A CARGO_TARGET_DIR line would override this one too.
+            ("", "cargo test --config 'build.target-dir=\"t\"'", NOTHING),
             (
-                r#"{"inherit":["CARGO_BUILD_BUILD_DIR"]}"#,
+                r#""env":{"CARGO_BUILD_BUILD_DIR":"b"}"#,
+                "cargo test --target-dir t",
+                NOTHING,
+            ),
+            // Only the build dir, said: the target dir's line.
+            (
+                r#""env":{"CARGO_BUILD_BUILD_DIR":"b"}"#,
                 "cargo test",
-                &["CARGO_TARGET_DIR"],
+                TARGET_ONLY,
             ),
             (
-                r#"{"inherit":["CARGO_TARGET_DIR"]}"#,
+                r#""inherit":["CARGO_BUILD_BUILD_DIR"]"#,
                 "cargo test",
-                &["CARGO_BUILD_BUILD_DIR"],
+                TARGET_ONLY,
             ),
-            (
-                "{}",
-                "unset CARGO_TARGET_DIR; cargo test",
-                &["CARGO_BUILD_BUILD_DIR"],
-            ),
-            (
-                r#"{"env":{"CARGO_BUILD_TARGET_DIR":"t"},"inherit":["CARGO_BUILD_BUILD_DIR"]}"#,
-                "cargo test",
-                &[],
-            ),
-            (
-                "{}",
-                "CARGO_TARGET_DIR=t CARGO_BUILD_BUILD_DIR=b cargo test",
-                &[],
-            ),
+            ("", "CARGO_BUILD_BUILD_DIR=b cargo test", TARGET_ONLY),
+            ("", "cargo test --config build.build-dir=b", TARGET_ONLY),
         ];
-        for &(json, run, given) in cases {
-            assert_eq!(vars(json, run), given, "{json} {run}");
+        let mut wrong = Vec::new();
+        for &(members, run, expected) in cases {
+            if given(members, run) != expected {
+                wrong.push(format!(
+                    "{{{members}}} {run:?} is given {:?}",
+                    given(members, run)
+                ));
+            }
         }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        let task = |json: &str| serde_json::from_str::<Json>(json).unwrap();
         assert!(unsaid(&task(r#"{"env":["x"]}"#), "cargo test").is_err());
         assert!(unsaid(&task(r#"{"inherit":"x"}"#), "cargo test").is_err());
     }
@@ -1345,18 +1421,17 @@ echo "target=${{target:-no}} build=${{build:-no}}" >> '{}'
 
     #[test]
     fn the_lines_go_where_sykli_puts_env_and_nothing_else_moves() {
-        let text = r#"{"schema":"sykli-contract.v1","tasks":[{"inputs":["a"],"name":"t","run":"cargo test","outputs":["o"]},{"name":"u","run":"true"},{"name":"v","run":"cargo test","env":{"CARGO_TARGET_DIR":"own"}}],"z":1.5}"#;
+        let text = r#"{"schema":"sykli-contract.v1","tasks":[{"inputs":["a"],"name":"t","run":"cargo test","outputs":["o"]},{"name":"u","run":"true"},{"name":"v","run":"cargo test","env":{"CARGO_BUILD_BUILD_DIR":"own"}},{"name":"w","run":"cargo test","env":{"CARGO_TARGET_DIR":"own"}}],"z":1.5}"#;
         let (mut contract, tasks) = read_contract(text).unwrap();
-        assert_eq!(tasks.lacking(), "t, v (no CARGO_BUILD_BUILD_DIR)");
+        assert_eq!(tasks.lacking(), "t, v (no CARGO_TARGET_DIR)");
         assert_eq!(
             tasks.given(),
-            "CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for t; CARGO_BUILD_BUILD_DIR \
-             for v"
+            "CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for t; CARGO_TARGET_DIR for v"
         );
         declare_in(&mut contract, &tasks.missing);
         assert_eq!(
             serde_json::to_string(&contract).unwrap(),
-            r#"{"schema":"sykli-contract.v1","tasks":[{"inputs":["a"],"name":"t","run":"cargo test","env":{"CARGO_TARGET_DIR":"${worktree_cache}/cargo-target","CARGO_BUILD_BUILD_DIR":"${worktree_cache}/cargo-build"},"outputs":["o"]},{"name":"u","run":"true"},{"name":"v","run":"cargo test","env":{"CARGO_TARGET_DIR":"own","CARGO_BUILD_BUILD_DIR":"${worktree_cache}/cargo-build"}}],"z":1.5}"#
+            r#"{"schema":"sykli-contract.v1","tasks":[{"inputs":["a"],"name":"t","run":"cargo test","env":{"CARGO_TARGET_DIR":"${worktree_cache}/cargo-target","CARGO_BUILD_BUILD_DIR":"${worktree_cache}/cargo-build"},"outputs":["o"]},{"name":"u","run":"true"},{"name":"v","run":"cargo test","env":{"CARGO_BUILD_BUILD_DIR":"own","CARGO_TARGET_DIR":"${worktree_cache}/cargo-target"}},{"name":"w","run":"cargo test","env":{"CARGO_TARGET_DIR":"own"}}],"z":1.5}"#
         );
     }
 
@@ -1367,6 +1442,6 @@ echo "target=${{target:-no}} build=${{build:-no}}" >> '{}'
         )
         .unwrap();
         assert_eq!(tasks.placeholder, ["a", "b"]);
-        assert_eq!(tasks.lacking(), "a (no CARGO_BUILD_BUILD_DIR), c");
+        assert_eq!(tasks.lacking(), "c");
     }
 }

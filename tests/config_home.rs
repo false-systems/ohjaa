@@ -1434,8 +1434,7 @@ const RUST_GATE_DECLARED: &str = r#"{
       "name": "own",
       "run": "cargo build --release",
       "env": {
-        "CARGO_TARGET_DIR": "target/own",
-        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+        "CARGO_TARGET_DIR": "target/own"
       }
     },
     {
@@ -1468,12 +1467,11 @@ const RUST_GATE_DECLARED: &str = r#"{
 
 /// The cargo tasks of [`RUST_GATE`] that lack a setting, as adopt and
 /// doctor name them.
-const RUST_GATE_LACKING: &str =
-    "fmt, doc, test, own (no CARGO_BUILD_BUILD_DIR), inherited (no CARGO_TARGET_DIR)";
+const RUST_GATE_LACKING: &str = "fmt, doc, test, inherited (no CARGO_TARGET_DIR)";
 
 /// What adopt says it gave [`RUST_GATE`]'s tasks.
 const RUST_GATE_GIVEN: &str = "CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for fmt, \
-     doc, test; CARGO_BUILD_BUILD_DIR for own; CARGO_TARGET_DIR for inherited";
+     doc, test; CARGO_TARGET_DIR for inherited";
 
 /// An Erlang gate, like ote's: rebar3 and make under mise, no cargo.
 const ERLANG_GATE: &str = r#"{"schema":"sykli-contract.v1","tasks":[{"name":"fmt","run":"env REBAR_CACHE_DIR=$PWD/_build/rebar-cache rebar3 fmt --check","inputs":["rebar.config"]},{"name":"test","run":"mise exec -- make test","after":["fmt"]}]}
@@ -1535,7 +1533,7 @@ fn adopt_declares_a_worktree_cache_for_each_cargo_task_and_locks_the_gate_again(
     );
     for said in [
         &format!("  ${{worktree_cache}}: {RUST_GATE_GIVEN}, and sykli.lock locked again"),
-        "; kept as they declare it: both\n",
+        "; kept as they declare it: own, both\n",
     ] {
         assert!(stdout.contains(said), "missing {said:?} in:\n{stdout}");
     }
@@ -1618,12 +1616,11 @@ fn adopt_locks_again_only_a_gate_its_own_lock_pins() {
     assert!(!calls.contains("|lock "), "nothing is locked: {calls}");
     for said in [
         format!(
-            "ohjaa adopt: warning: the sykli.lock copied with the gate does not pin it \
-             (invalid {}: contract differs from {}",
+            "Sykli says: invalid {}: contract differs from {}",
             contract.display(),
             entry.join("sykli.lock").display()
         ),
-        "the repository's own lock is out of date".to_owned(),
+        "the repository's sykli.lock does not validate its sykli.json".to_owned(),
         "the gate is kept as copied, without ${worktree_cache}".to_owned(),
     ] {
         assert!(stderr.contains(&said), "missing {said:?} in:\n{stderr}");
@@ -1684,9 +1681,7 @@ fn adopt_keeps_a_gate_sykli_refuses_as_copied() {
     );
     assert!(
         stderr.contains(&format!(
-            "ohjaa adopt: warning: the gate as copied does not validate (invalid {}: task \
-             \"fmt\" has an empty command), so the gate is kept as copied, without \
-             ${{worktree_cache}}",
+            "Sykli says: invalid {}: task \"fmt\" has an empty command",
             entry.join("sykli.json").display()
         )) && !stderr.contains("out of date"),
         "{stderr}"
@@ -1727,9 +1722,6 @@ fn adopt_gives_a_cargo_task_only_the_settings_it_does_not_declare() {
     {
       "name": "inherits-target",
       "run": "cargo test",
-      "env": {
-        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
-      },
       "inherit": [
         "CARGO_TARGET_DIR"
       ]
@@ -1738,14 +1730,14 @@ fn adopt_gives_a_cargo_task_only_the_settings_it_does_not_declare() {
       "name": "build-target",
       "run": "cargo test",
       "env": {
-        "CARGO_BUILD_TARGET_DIR": "t",
-        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+        "CARGO_BUILD_TARGET_DIR": "t"
       }
     },
     {
       "name": "unsets",
       "run": "unset CARGO_TARGET_DIR; cargo test",
       "env": {
+        "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
         "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
       }
     },
@@ -1755,7 +1747,11 @@ fn adopt_gives_a_cargo_task_only_the_settings_it_does_not_declare() {
     },
     {
       "name": "exported",
-      "run": "export CARGO_BUILD_TARGET_DIR=t; env -u CARGO_BUILD_BUILD_DIR cargo test"
+      "run": "export CARGO_BUILD_TARGET_DIR=t; env -u CARGO_BUILD_BUILD_DIR cargo test",
+      "env": {
+        "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+      }
     },
     {
       "name": "quoted",
@@ -1787,8 +1783,8 @@ fn adopt_gives_a_cargo_task_only_the_settings_it_does_not_declare() {
     assert!(
         stdout.contains(
             "  ${worktree_cache}: CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for \
-             echoed, first-only, quoted; CARGO_BUILD_BUILD_DIR for inherits-target, build-target, unsets, \
-             and sykli.lock locked again; kept as they declare it: prefixed, exported\n"
+             echoed, first-only, unsets, exported, quoted, and sykli.lock locked again; \
+             kept as they declare it: inherits-target, build-target, prefixed\n"
         ),
         "{stdout}"
     );
@@ -2016,7 +2012,7 @@ fn doctor_flags_a_placeholder_an_older_sykli_would_pass_on_as_written() {
     assert_eq!(code, Some(4), "{said}");
     for line in [
         format!(
-            "DRIFT  acme/rusty: fmt, doc, test, own, inherited name ${{worktree_cache}}, but the \
+            "DRIFT  acme/rusty: fmt, doc, test, inherited name ${{worktree_cache}}, but the \
              sykli on PATH ({}) does not name ${{worktree_cache}} in `sykli run --help`",
             sandbox.dir.join("bin/sykli").display()
         ),
@@ -2036,7 +2032,7 @@ fn doctor_flags_a_placeholder_an_older_sykli_would_pass_on_as_written() {
     assert_eq!(code, Some(4), "{said}");
     assert!(
         said.contains(&format!(
-            "DRIFT  acme/rusty: fmt, doc, test, own, inherited name ${{worktree_cache}}, but the \
+            "DRIFT  acme/rusty: fmt, doc, test, inherited name ${{worktree_cache}}, but the \
              sykli the pre-push dispatcher runs ({}) does not name ${{worktree_cache}}",
             old.display()
         )),
@@ -2074,7 +2070,7 @@ fn doctor_flags_an_entry_whose_lock_does_not_pin_its_gate() {
     let (code, said) = doctor();
     assert_eq!(code, Some(0), "{said}");
     assert!(
-        said.contains("ok     acme/rusty: its sykli.lock pins its gate"),
+        said.contains("ok     acme/rusty: sykli validate accepts its sykli.lock"),
         "{said}"
     );
     let calls = sandbox.read("sykli-calls");
@@ -2098,7 +2094,7 @@ fn doctor_flags_an_entry_whose_lock_does_not_pin_its_gate() {
              contract differs from {}",
             contract.display(),
             entry.join("sykli.lock").display()
-        )) && said.contains("every gate run and push of it is refused"),
+        )) && said.contains("a push is flagged UNPROVEN, not refused"),
         "{said}"
     );
 
@@ -4557,7 +4553,7 @@ fn real_sykli_adopt_keeps_a_gate_its_own_lock_no_longer_pins() {
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
     assert!(
-        stderr.contains("the repository's own lock is out of date"),
+        stderr.contains("the repository's sykli.lock does not validate its sykli.json"),
         "{stderr}"
     );
     let entry = sandbox.config().join("repos/acme/widget");
@@ -4595,7 +4591,7 @@ fn real_sykli_doctor_flags_an_entry_whose_lock_does_not_pin_its_gate() {
     let (code, said) = sandbox.doctor();
     assert_eq!(code, Some(0), "{said}");
     assert!(
-        said.contains("ok     acme/widget: its sykli.lock pins its gate"),
+        said.contains("ok     acme/widget: sykli validate accepts its sykli.lock"),
         "{said}"
     );
 
@@ -5385,7 +5381,7 @@ fn every_command_stays_within_its_git_budget() {
     let (stdout, _) = text(&output);
     assert!(stdout.contains("ohjaa doctor: "), "{stdout}");
     assert!(
-        stdout.contains("ok     acme/gated: its sykli.lock pins its gate"),
+        stdout.contains("ok     acme/gated: sykli validate accepts its sykli.lock"),
         "{stdout}"
     );
     assert_eq!(

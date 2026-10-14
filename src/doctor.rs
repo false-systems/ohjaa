@@ -201,10 +201,10 @@ fn check_worktree_cache(
 
 /// An entry's gate against the `sykli.lock` beside it, as sykli judges it
 /// (`sykli validate`). A lock that no longer pins its gate (an adopt cut
-/// short between writing the two, or a hand edit) makes every gate run and
-/// push of the entry refuse it. sykli is run from the entry's clone and
-/// handed its facts when one is under the roots, so it asks git nothing;
-/// else from the entry, where it asks git once.
+/// short between writing the two, or a hand edit) prevents gate evidence;
+/// pushes are flagged UNPROVEN, never refused for the workflow. Sykli runs
+/// from the entry's clone and is handed its facts when one is under the
+/// roots, so it asks git nothing; else from the entry, where it asks once.
 fn check_lock(
     found: &mut Findings,
     slug: &str,
@@ -228,15 +228,19 @@ fn check_lock(
             validate.current_dir(contract.parent().unwrap_or(Path::new("/")));
         }
     }
-    let unknown =
-        |why: String| format!("{slug}: whether its sykli.lock pins its gate is unknown: {why}");
+    let unknown = |why: String| {
+        format!("{slug}: whether sykli validate accepts its sykli.lock is unknown: {why}")
+    };
     match process::run(&mut validate, None, process::LOCAL) {
         Ok(output) if output.status.success() => {
-            found.ok(format!("{slug}: its sykli.lock pins its gate"));
+            found.ok(format!("{slug}: sykli validate accepts its sykli.lock"));
         }
         Ok(output) if output.status.code() == Some(1) => found.drift(format!(
-            "{slug}: its gate does not validate against its sykli.lock ({}): every gate run and \
-             push of it is refused (ohjaa adopt --force <its clone>)",
+            "{slug}: its gate does not validate against its sykli.lock ({}): gate runs cannot \
+             prove it; a push is flagged UNPROVEN, not refused. \
+             If the repository's own contract and lock do not validate, fix them with sykli \
+             validate and sykli lock and land both on its observed branch first; then \
+             ohjaa adopt --force <its clone>",
             output.failure_detail()
         )),
         Ok(output) => found.note(unknown(format!(
