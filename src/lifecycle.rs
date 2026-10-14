@@ -236,7 +236,9 @@ pub fn supervise() {
 ///   from the background), ohjaa takes the terminal back and stops its own
 ///   group with the same signal, so the shell sees the job stopped and why;
 ///   when continued, the session is continued too (with the terminal again
-///   when continued in the foreground);
+///   when continued in the foreground). A stop ohjaa sees only once its
+///   group is in the foreground again (`fg` came first) is the case above:
+///   the session gets the terminal and is continued, and nothing stops;
 /// - the session ending gives the terminal back to ohjaa's group.
 ///
 /// That needs a shell above ohjaa that keeps the terminal (job control): its
@@ -541,14 +543,22 @@ mod terminal {
     /// (SIGTSTP from Ctrl-Z or the agent; SIGTTIN or SIGTTOU from the
     /// terminal in the background) stops ohjaa's own group with the same
     /// signal once the terminal is back with it, so the shell sees the job
-    /// stopped and why. `true` when ohjaa stopped and has been continued:
-    /// then [`resume`] continues the session. Any other stop (SIGSTOP from
-    /// outside) is left to whoever sent it; leading the session itself,
-    /// there is no shell to tell, and the session goes on.
+    /// stopped and why. Unless ohjaa's group holds the terminal already: the
+    /// shell brought the job to the foreground (`fg`) after the session
+    /// stopped and before ohjaa saw it, so the session gets the terminal and
+    /// goes on, as in [`follow`]; stopping the job then would hand the
+    /// terminal back to the shell, and the next line typed for the agent
+    /// would run there. `true` when the session is to go on: [`resume`]
+    /// continues it. Any other stop (SIGSTOP from outside) is left to
+    /// whoever sent it; leading the session itself, there is no shell to
+    /// tell, and the session goes on.
     pub fn stopped(child: libc::pid_t, signal: libc::c_int) -> bool {
         let job_stop = matches!(signal, libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU);
         match MODE.load(Ordering::SeqCst) {
             JOB if job_stop => {
+                if tty().is_some_and(foreground) {
+                    return true;
+                }
                 take_back(child);
                 super::signals::stop_own_group(signal, job_controlled);
                 true
@@ -558,8 +568,8 @@ mod terminal {
         }
     }
 
-    /// Continued after [`stopped`]: the session too, with the terminal when
-    /// ohjaa is in the foreground again.
+    /// The session goes on after [`stopped`]: it is continued, with the
+    /// terminal when ohjaa is in the foreground.
     pub fn resume(child: libc::pid_t) {
         if let Some(fd) = tty().filter(|&fd| foreground(fd)) {
             give(fd, child);
@@ -672,8 +682,8 @@ pub fn wait(child: &mut Child) -> std::io::Result<ExitStatus> {
             if waited == pid {
                 if libc::WIFSTOPPED(status) {
                     if terminal::stopped(pid, libc::WSTOPSIG(status)) {
-                        // Continued: what the shell sent with it (`kill %1`
-                        // sends SIGTERM and SIGCONT) goes first.
+                        // The session goes on: what the shell sent with its
+                        // SIGCONT (`kill %1` sends SIGTERM too) goes first.
                         signals::forward_pending(&targets(), &mut forwarded, false);
                         terminal::resume(pid);
                     }

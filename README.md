@@ -377,7 +377,10 @@ job-control shell does with a job's, at every moment, not only at the start:
   sees the job stopped. The same goes for a session that reads or writes the
   terminal from the background (`ohjaa run … &`): the shell shows the job
   `suspended (tty input)`. `fg` gives the session the terminal again and
-  continues it; `bg` continues it without.
+  continues it; `bg` continues it without. A stop ohjaa sees only after `fg`
+  has brought its job back (`bg`, then `fg` at once; or ohjaa stopped alone)
+  stops nothing: the session gets the terminal, and what is typed next
+  reaches the agent, not the shell.
 - **SIGINT and SIGQUIT sent to ohjaa** while the session does not hold the
   terminal (no terminal at all, or ohjaa's job not in the foreground) are
   passed to the session's group, each time: nothing else can bring it one.
