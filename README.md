@@ -640,7 +640,8 @@ starts it.
                   visibility = "private" | "public", share_judgements = true | false,
                   push_judgements = true. adopt --force never touches it, and an ohjaa
                   from before Judgements never reads it (its repo.toml stays one it reads)
-    sykli.json    the gate (a sykli contract), inputs repo-relative
+    sykli.json    the gate (a sykli contract), inputs repo-relative; its cargo tasks
+                  build under ${worktree_cache} (KATANA D10)
     sykli.lock
     hooks/pre-push, hooks/<name>    exec '<ohjaa>' hook <name> "$@": pre-push, and each
                                     hook this entry's clones have of their own
@@ -1079,6 +1080,37 @@ default branch holds them (not the working tree, which another session may be
 editing), or asks `sykli init --contract <entry>/sykli.json` for a new one,
 then regenerates `git/` and writes the entry's dispatchers. It never touches
 git's global config, and takes no lock in the repository.
+
+**One build directory per worktree (KATANA D10).** A shared Cargo target dir
+(`~/.cargo/config.toml`'s `build.target-dir`, or a build-dir) lets a gate in
+one worktree run a binary another worktree built, and a receipt then claims a
+pass for code that never ran. So `adopt` gives each task of the entry's gate
+whose command runs cargo (a word of it is `cargo`) both of these, in its
+`env`, as sykli's README recommends:
+
+```json
+"CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
+"CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+```
+
+and, when the gate came with a `sykli.lock`, locks it again (`sykli lock
+<entry>/sykli.json`, in the repository). A task that already names either
+variable (in `env`, in `inherit`, or assigned in its command) is kept as it
+declares it, and a task that runs no cargo (rebar3, make, mise) is never
+touched. Only the entry's copy changes; the repository's own `sykli.json`
+stays as it is, and agents' own cargo commands keep the shared directory.
+
+Only when every sykli that runs the gate expands the placeholder: the one on
+PATH and the one the pre-push dispatcher runs (as `apply` recorded it). A
+sykli that does names `${worktree_cache}` in `sykli run --help`, matched as
+that token, never as a sentence. An older one passes it on as written, and
+cargo would build in a `${worktree_cache}/` folder inside the work tree, so
+then adopt adds nothing and says so. When `sykli lock` fails, the gate is
+kept as copied, with a warning. `ohjaa doctor` flags (drift) a gate whose
+cargo tasks lack the lines while every sykli knows them ("gate runs may share
+a target dir across worktrees"; `ohjaa adopt --force` adds them), and notes it
+while one does not. Adding the lines changes the gate's digest, so receipts
+from before read as another contract's.
 
 ## Independent Judgement
 

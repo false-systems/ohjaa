@@ -132,6 +132,48 @@ fn check_dispatchers(
     }
 }
 
+/// KATANA D10: an entry's gate whose cargo tasks say nothing of where cargo
+/// builds lets one worktree's gate run what another built in a shared target
+/// dir. Drift while the syklis that run it expand `${worktree_cache}` (adopt
+/// would add the lines), a note while one does not.
+fn check_worktree_cache(
+    found: &mut Findings,
+    slug: &str,
+    contract: &Path,
+    home: &Path,
+    expands: &mut Option<std::result::Result<(), String>>,
+) {
+    let tasks = match crate::adopt::cargo_tasks(contract) {
+        Ok(tasks) => tasks,
+        Err(why) => {
+            found.note(format!(
+                "{slug}: whether its cargo tasks build per worktree is unknown: {why}"
+            ));
+            return;
+        }
+    };
+    if tasks.cargo.is_empty() {
+        return;
+    }
+    if tasks.missing.is_empty() {
+        found.ok(format!(
+            "{slug}: every cargo task declares where it builds (${{worktree_cache}} or its own)"
+        ));
+        return;
+    }
+    let lacking = format!(
+        "{slug}: {} run cargo without ${{worktree_cache}}: gate runs may share a target dir \
+         across worktrees",
+        tasks.missing.join(", ")
+    );
+    match expands.get_or_insert_with(|| crate::adopt::sykli_expands_worktree_cache(home)) {
+        Ok(()) => found.drift(format!("{lacking} (ohjaa adopt --force <its clone>)")),
+        Err(why) => found.note(format!(
+            "{lacking}, and {why} (update it, then ohjaa adopt --force)"
+        )),
+    }
+}
+
 /// Where the roots come from, for doctor to say.
 fn roots_source(explicit: &[PathBuf]) -> String {
     if !explicit.is_empty() {
@@ -319,12 +361,16 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
 
     println!("entries ({}):", home.join("repos").display());
     let mut readable = 0;
+    // Whether the syklis that run the gates expand ${worktree_cache}: asked
+    // once, and only when a gate has a cargo task that lacks the lines.
+    let mut expands: Option<std::result::Result<(), String>> = None;
     for entry in &entries {
         let slug = format!("{}/{}", entry.owner, entry.name);
         match home::read_entry(&entry.dir) {
             Ok(Some(read)) if read.has_contract() => {
                 readable += 1;
                 found.ok(format!("{slug}: observes {}", read.branch));
+                check_worktree_cache(&mut found, &slug, &read.contract(), &home, &mut expands);
             }
             Ok(Some(read)) => found.drift(format!(
                 "{slug}: no gate ({} is missing)",
