@@ -474,6 +474,99 @@ fn ctrl_z_then_kill_ends_the_stopped_session() {
     assert!(tty.shell_answers(20), "{}", tty.report());
 }
 
+/// The re-review of #45: Ctrl-Z, `bg`, then `fg` 30 ms later. After `bg` the
+/// session reads the terminal from the background and stops (SIGTTIN); when
+/// `fg` gives ohjaa's job the terminal before ohjaa has seen that stop, the
+/// session must get the terminal and go on. Stopping ohjaa's job again
+/// instead hands the terminal back to the shell, and the next line typed for
+/// the agent runs as a command.
+#[test]
+fn ctrl_z_bg_then_a_quick_fg_gives_the_session_the_terminal() {
+    let Some(mut tty) = Terminal::new("bg-quick-fg") else {
+        return;
+    };
+    tty.type_line(OHJAA_RUN);
+    assert!(tty.logged("AGENT-START", 15), "{}", tty.report());
+    std::thread::sleep(Duration::from_millis(500));
+    let prompt = &tty.prompt[..4];
+    // Each round is a chance for `fg` to land before ohjaa sees the stop.
+    for round in 1..=5 {
+        tty.mark();
+        tty.send("\x1a");
+        assert!(
+            tty.expect(prompt, 10),
+            "round {round}: not suspended: {}",
+            tty.report()
+        );
+        tty.send("bg\r");
+        std::thread::sleep(Duration::from_millis(30));
+        tty.send("fg\r");
+        std::thread::sleep(Duration::from_millis(1000));
+        let line = format!("typed-{round}");
+        tty.type_line(&line);
+        assert!(
+            tty.logged(&format!("AGENT-READ:[{line}]"), 10),
+            "round {round}: {line} did not reach the agent: {}",
+            tty.report()
+        );
+        assert!(
+            !tty.all().contains("not found"),
+            "round {round}: the shell ran a line typed for the agent: {}",
+            tty.report()
+        );
+    }
+    tty.send("\x03");
+    assert!(tty.logged("AGENT-INT", 10), "{}", tty.report());
+    assert!(tty.shell_answers(20), "{}", tty.report());
+}
+
+/// The re-review of #45: ohjaa alone is stopped (`kill -TSTP` to its pid),
+/// so the shell takes the terminal, and the session, reading it from the
+/// background, stops too. The terminal does that with SIGTTIN; it is sent
+/// here directly, as a line typed at the shell wakes the blocked reader on
+/// macOS but not on Linux. `fg` then gives ohjaa's job the terminal: the
+/// session must get it too, and the next line typed reach the agent, never
+/// the shell.
+#[test]
+fn ohjaa_stopped_alone_then_fg_gives_the_session_the_terminal() {
+    let Some(mut tty) = Terminal::new("tstp-fg") else {
+        return;
+    };
+    tty.type_line(OHJAA_RUN);
+    assert!(tty.logged("AGENT-START", 15), "{}", tty.report());
+    // The stub toimija execs the agent: it leads the session's group.
+    let (agent, ohjaa) = tty.agent();
+    std::thread::sleep(Duration::from_millis(500));
+    tty.mark();
+    // SAFETY: plain kill(2) of this test's own processes.
+    unsafe {
+        libc::kill(ohjaa, libc::SIGTSTP);
+    }
+    let prompt = &tty.prompt[..4];
+    assert!(tty.expect(prompt, 10), "not suspended: {}", tty.report());
+    // SAFETY: as above, to the session's group.
+    unsafe {
+        libc::kill(-agent, libc::SIGTTIN);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    tty.type_line("fg");
+    std::thread::sleep(Duration::from_millis(1000));
+    tty.type_line("typed-after-fg");
+    assert!(
+        tty.logged("AGENT-READ:[typed-after-fg]", 10),
+        "the line did not reach the agent: {}",
+        tty.report()
+    );
+    assert!(
+        !tty.all().contains("not found"),
+        "the shell ran a line typed for the agent: {}",
+        tty.report()
+    );
+    tty.send("\x03");
+    assert!(tty.logged("AGENT-INT", 10), "{}", tty.report());
+    assert!(tty.shell_answers(20), "{}", tty.report());
+}
+
 /// Nit 6: under a wrapper without job control (`sh -c`), a SIGKILLed ohjaa
 /// must not leave the terminal with a group nobody will give back: once the
 /// agent is gone too, the wrapper still reads the terminal.
