@@ -314,7 +314,7 @@ fn ensure_checkout(gate: &Gate, checkout: &Path, commit: &str) -> Result<(), Str
     command
         .args(["-c", "core.hooksPath=/dev/null", "-C"])
         .arg(&gate.top)
-        .args(["worktree", "add", "--detach", "-q"])
+        .args(["worktree", "add", "--detach", "--force", "-q"])
         .arg(checkout)
         .arg(commit);
     for var in gitconfig::REPO_ENV {
@@ -523,7 +523,8 @@ fn tree_of(top: &Path, commit: &str) -> Result<String, String> {
 const ASK_AGAIN_AFTER_MS: i64 = 10 * 60_000;
 
 /// A request for `commit` made recently enough to stand: sykli is not asked
-/// for another run while it does.
+/// for another run while it does (one that could not be handed over too:
+/// tried again at most once in [`ASK_AGAIN_AFTER_MS`]).
 fn standing_request<'a>(requested: &'a [ValidationRef], commit: &str) -> Option<&'a ValidationRef> {
     let now = now_ms();
     requested
@@ -531,7 +532,6 @@ fn standing_request<'a>(requested: &'a [ValidationRef], commit: &str) -> Option<
         .filter(|v| {
             v.kind == ValidationKind::Integrated
                 && v.commit == commit
-                && v.not_dispatched.is_none()
                 && now - v.requested_ms < ASK_AGAIN_AFTER_MS
         })
         .max_by_key(|v| v.requested_ms)
@@ -545,10 +545,11 @@ fn asked_already(validation: &ValidationRef) -> String {
          receipt of it yet",
         sessions::clock(validation.requested_ms),
         validation.request,
-        validation
-            .run
-            .as_ref()
-            .map_or_else(String::new, |run| format!(", sykli run {run}"))
+        match (&validation.run, &validation.not_dispatched) {
+            (Some(run), _) => format!(", sykli run {run}"),
+            (None, Some(why)) => format!(", never handed to sykli: {why}"),
+            (None, None) => String::new(),
+        }
     )
 }
 
@@ -729,7 +730,8 @@ pub fn stale_at_push(common: &Path, branch: &str, pushed: &[(String, String)]) -
     let Ok(state) = crate::knowledge::state_home() else {
         return Vec::new();
     };
-    let Ok(log) = sessions::Reader::open(&sessions::store_path(&state.join("ohjaa"))) else {
+    // Never waited on: a log a writer holds now is not read.
+    let Ok(log) = sessions::Reader::open_now(&sessions::store_path(&state.join("ohjaa"))) else {
         return Vec::new();
     };
     let Ok((all, _)) = log.all() else {

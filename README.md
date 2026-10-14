@@ -877,11 +877,13 @@ session's record **before** sykli is asked (invariant A; at launch, with the
 entering record). Then ohjaa makes a checkout of exactly that commit outside
 the repository, `$XDG_STATE_HOME/ohjaa/integrated/<clone>-<hash>/<commit>`, a
 linked worktree of the clone (`git -c core.hooksPath=/dev/null worktree add
---detach`: ohjaa's own step runs no hook of the repository's; git keeps its
+--detach --force`, so a checkout deleted while still registered is made
+again; ohjaa's own step runs no hook of the repository's; git keeps its
 admin data in `<common>/worktrees/`, and no file, hook or config of the
 repository is written), and hands sykli the run there: `sykli run <gate>
 --detach --json`. Its run id is filled in, or, when the run could not be
-handed over, why (`not_dispatched`). Because the checkout is the clone's,
+handed over, why (`not_dispatched`; such a request stands ten minutes too,
+so a failing checkout is tried again at most that often). Because the checkout is the clone's,
 sykli's run and receipt are the clone's: `sykli status --commit` finds them
 from any checkout, and so do the marks. The checkouts are kept, since the
 receipt lives in one; they accumulate, one per integrated validation asked
@@ -903,7 +905,9 @@ Validation here (sykli's word, asked at launch; integrated: what is on the obser
 when the candidate was validated. When HEAD's newest validation saw it
 elsewhere than it is now, the briefing says "base moved since validation",
 and so does a push of that commit to any other branch than the observed one
-(read from files only: the log, read-only, and the clone's ref):
+(read from files only: the log, read-only and never waited on, and the
+clone's ref; a log a writer holds at that moment is not read, and nothing is
+said):
 
 ```
 ohjaa: base moved since validation: 9c0d1e2 (feat/parser) was validated when origin/main was at 0c9d3b1; it is at 4be01c2 now: its merge is a State no run has seen (flagged, never refused). It is pushed; validate the integrated State once it lands.
@@ -1047,19 +1051,27 @@ table (`ohjaa-judgement.v1`), holds:
 
 **Law 2.** Refused, and nothing recorded (exit 3):
 
-- an **Agent** session that made any commit of the Change: the log gives it
-  one, or, while it is still open, the rule leaving uses says so: a commit its
-  checkout's reflog shows created since it started, unless another session
-  launched in that checkout was there that second; one a branch of the clone
-  shows created then in another checkout, unless any other session in the
-  clone was there (two git processes). Two instances of one agent are
-  independent only procedurally, and the record says so;
+- an **Agent** session that made any commit of the Change. The log's
+  records say what each ended session made (never the clock: sessions start
+  and end in whole seconds); while the reviewer is still open, its own
+  checkout's reflog showing a commit created since it started makes it the
+  reviewer's, even with another open session sharing that checkout (who made
+  it cannot be shown, and the refusal says with whom); a branch of the clone
+  showing one created then in another checkout makes it the reviewer's unless
+  another session was in the clone: an open one at that second, or an ended
+  one that saw it made beside it (two git processes). Two instances of one
+  agent are independent only procedurally, and the record says so;
 - a **Person** whose identity is on a commit of the Change, as author or
   committer, that no agent session's record holds. Commits an agent session
   made under their identity (agents commit as the person they work for) are
   said, not refused: the log says the session made them.
 
-A session that has ended, or that the log does not hold, cannot judge.
+A session that has ended, or that the log does not hold, cannot judge. Law 2
+is checked over every commit of the Change, however long; the record keeps
+the newest 200. Commits no ended session's record holds are said in the
+Judgement's basis, with the sessions open in the clone. What reflogs do not
+show is not seen: a commit made with `commit-tree` and `update-ref`, with
+`core.logAllRefUpdates` off, or on a detached HEAD in another worktree.
 
 **Answers.** `ohjaa judge respond <judgement> <text>` records an answer in
 its own table (`judgement_responses`, `ohjaa-judgement-response.v1`), linked
@@ -1094,8 +1106,14 @@ entry's to say, in its `repo.toml` (ohjaa asks no forge):
 The note of an entry that is not private holds no name, email, finding's
 words, uncertainty or path: only the Judgement's id, the Change's hashes, the
 verdict, severity and blocking, counts, session and Intent ids, sykli's run
-ids and receipt digests. `--push` for an entry that does not share is refused
-before anything is recorded (exit 3). sykli, tapio and false-agent-protocol
+ids and receipt digests. An Intent id must be one (`in-<ms>-<pid>`): free
+text is refused. `--push` for an entry that does not share is refused before
+anything is recorded (exit 3); for an entry that is not private, it is also
+refused while the notes ref holds any line that is not redacted and origin
+does not already have (a note written while the entry was private): the
+Judgement stays recorded on this machine, and the exit is 1. A note that
+could not be attached is not pushed without it (exit 1). What `ohjaa
+judgements` prints from a note has every control character shown as `?`. sykli, tapio and false-agent-protocol
 are public.
 
 **Reading.** `ohjaa judgements <commit>` lists every Judgement whose Change
@@ -1116,7 +1134,8 @@ own; a fetch's or push's transport is git's): `ohjaa judge` five for a person
 (the clone's config, the identity, the Change's ends, its commits, the note)
 and six for an agent session (no identity; its checkout's reflog and the
 clone's branches), one more (`merge-base`) when the base is not named, and
-three more with `--push` (fetch, merge, push); `ohjaa judge respond` three;
+three more with `--push` (fetch, merge, push), plus at most three to read the
+notes first for an entry that is not private; `ohjaa judge respond` three;
 `ohjaa judgements` three, four with `--fetch`.
 
 ## What it will never do

@@ -343,7 +343,8 @@ pub fn logged() -> Result<(Vec<Judgement>, Vec<Response>)> {
 
 fn git(top: &Path, args: &[&str], input: Option<&[u8]>) -> Result<process::Output, String> {
     let mut command = Command::new("git");
-    command.arg("-C").arg(top).args(args);
+    // git's own words, whatever the locale: some are read (`fetch`).
+    command.arg("-C").arg(top).args(args).env("LC_ALL", "C");
     for var in gitconfig::REPO_ENV {
         command.env_remove(var);
     }
@@ -499,6 +500,26 @@ fn canonical_json(value: &Value) -> Value {
     }
 }
 
+/// `in-<ms>-<pid>`, as ohjaa mints an Intent id: nothing else is one.
+fn intent_id_shaped(id: &str) -> bool {
+    id.strip_prefix("in-")
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(ms, pid)| {
+            !ms.is_empty()
+                && !pid.is_empty()
+                && ms.chars().all(|c| c.is_ascii_digit())
+                && pid.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
+/// What a person may safely see of a text from a note or the log: every
+/// control character (a terminal escape among them) as `?`.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// The agent's program name, never the path it was run by.
 fn program(agent: &str) -> String {
     Path::new(agent).file_name().map_or_else(
@@ -531,7 +552,7 @@ pub fn note_line(judgement: &Judgement, names: bool) -> String {
         "verdict": judgement.verdict,
         "blocking": judgement.blocking,
         "severity": judgement.severity,
-        "intent_id": judgement.intent_id,
+        "intent_id": judgement.intent_id.as_deref().filter(|id| intent_id_shaped(id)),
         "at": rfc3339(judgement.at_ms.div_euclid(1000)),
         "evidence": evidence,
         "independence": {
@@ -603,9 +624,33 @@ fn attach(top: &Path, head: &str, line: &str) -> Result<(), String> {
 
 /// Push [`NOTES_REF`] to origin, and nothing else: origin's notes are
 /// fetched first ([`FETCHED_REF`]) and merged line by line, so none is lost.
-fn push(top: &Path, common: &Path) -> Result<String, String> {
+fn push(top: &Path, common: &Path, names: bool) -> Result<String, String> {
     fetch(top)?;
-    if gitconfig::read_ref(common, FETCHED_REF).is_some() {
+    let fetched = gitconfig::read_ref(common, FETCHED_REF).is_some();
+    // An entry that is not private never publishes a note that names
+    // anyone: one written while it was private, or one not ohjaa's. Origin's
+    // own are already there.
+    if !names {
+        let theirs: BTreeSet<String> = if fetched {
+            all_note_lines(top, FETCHED_REF)?.into_iter().collect()
+        } else {
+            BTreeSet::new()
+        };
+        let named = all_note_lines(top, NOTES_REF)?
+            .into_iter()
+            .filter(|line| !theirs.contains(line))
+            .filter(|line| {
+                serde_json::from_str::<Value>(line).map_or(true, |note| note["redacted"] != true)
+            })
+            .count();
+        if named > 0 {
+            return Err(format!(
+                "{named} note line(s) under {NOTES_REF} are not redacted (written while its entry \
+                 was private, or not ohjaa's), and may name people: they stay on this machine"
+            ));
+        }
+    }
+    if fetched {
         git_ok(
             top,
             &[
@@ -629,6 +674,59 @@ fn push(top: &Path, common: &Path) -> Result<String, String> {
     )
     .map_err(|why| format!("git push origin {NOTES_REF} failed: {why}"))?;
     Ok(format!("pushed {NOTES_REF} to origin"))
+}
+
+/// Every non-empty line of every note under `reference` (none when the ref
+/// does not exist): `git notes list`, then the notes in one `cat-file
+/// --batch`.
+fn all_note_lines(top: &Path, reference: &str) -> Result<Vec<String>, String> {
+    let listed = git(top, &["notes", "--ref", reference, "list"], None)?;
+    if !listed.status.success() {
+        return Ok(Vec::new());
+    }
+    let blobs: Vec<String> = listed
+        .stdout_text()
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+        .collect();
+    if blobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let asked = format!("{}\n", blobs.join("\n"));
+    let output = git(top, &["cat-file", "--batch"], Some(asked.as_bytes()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "the notes under {reference} cannot be read: {}",
+            output.failure_detail()
+        ));
+    }
+    // `<oid> blob <size>\n<content>\n`, one after another.
+    let bytes = &output.stdout;
+    let mut lines = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let Some(end) = bytes[at..].iter().position(|b| *b == b'\n') else {
+            break;
+        };
+        let header = String::from_utf8_lossy(&bytes[at..at + end]).into_owned();
+        at += end + 1;
+        let size: usize = header
+            .split_whitespace()
+            .nth(2)
+            .and_then(|size| size.parse().ok())
+            .ok_or_else(|| format!("the notes under {reference} cannot be read: {header}"))?;
+        let content = bytes
+            .get(at..at + size)
+            .ok_or_else(|| format!("the notes under {reference} were cut short"))?;
+        lines.extend(
+            String::from_utf8_lossy(content)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(str::to_owned),
+        );
+        at += size + 1;
+    }
+    Ok(lines)
 }
 
 /// Fetch origin's shared notes into [`FETCHED_REF`] (one git process).
@@ -729,14 +827,13 @@ fn ends(here: &Here, range: &str) -> Result<(String, String, String), String> {
     Ok((base_oid, head_oid, tree))
 }
 
-/// The commits of `base..head`, newest first, at most [`MAX_COMMITS`] (one
-/// git process).
-fn commits(top: &Path, base: &str, head: &str) -> Result<(Vec<ChangeCommit>, bool), String> {
+/// Every commit of `base..head`, newest first (one git process): law 2 is
+/// checked over all of them; the record keeps [`MAX_COMMITS`].
+fn commits(top: &Path, base: &str, head: &str) -> Result<Vec<ChangeCommit>, String> {
     let text = git_ok(
         top,
         &[
             "log",
-            &format!("--max-count={}", MAX_COMMITS + 1),
             "--format=%H%x1f%T%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%ct%x1f%s",
             &format!("{base}..{head}"),
             "--",
@@ -765,9 +862,7 @@ fn commits(top: &Path, base: &str, head: &str) -> Result<(Vec<ChangeCommit>, boo
             session: None,
         });
     }
-    let truncated = out.len() > MAX_COMMITS;
-    out.truncate(MAX_COMMITS);
-    Ok((out, truncated))
+    Ok(out)
 }
 
 /// Every phase commit an ended session's record holds, to its session.
@@ -1271,6 +1366,14 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
         );
         return Ok(REFUSED);
     }
+    // An Intent id is an id (`in-<ms>-<pid>`): never free text, which a
+    // note would carry where no name may go.
+    if let Some(id) = args.intent_id {
+        if !intent_id_shaped(id) {
+            eprintln!("ohjaa judge: {id:?} is not an intent id (`in-…`)");
+            return Ok(CANNOT);
+        }
+    }
     let logged = read_log()?;
     let reviewer = match reviewer(&here.top, &logged.sessions) {
         Ok(reviewer) => reviewer,
@@ -1286,7 +1389,7 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
             return Ok(CANNOT);
         }
     };
-    let (commits, truncated) = match commits(&here.top, &base, &head) {
+    let commits = match commits(&here.top, &base, &head) {
         Ok(found) => found,
         Err(why) => {
             eprintln!("ohjaa judge: the Change's commits cannot be read: {why}");
@@ -1301,12 +1404,13 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
         );
         return Ok(CANNOT);
     }
+    // Every commit of the Change is checked; the record keeps the newest.
     let mut change = Change {
         base,
         head,
         state,
         commits,
-        truncated,
+        truncated: false,
     };
     let clone = lifecycle::layout_checkouts(&here.common);
     let (authors, intent) = authors_of(&mut change, &logged.sessions, &clone);
@@ -1347,6 +1451,24 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
             }
         }
     };
+    let mut basis = basis;
+    if authors.unattributed > 0 {
+        basis.push(format!(
+            "{} of the Change's commit(s) no ended session's record holds (made outside ohjaa, \
+             or by a session still open{}): who made those is not shown by the log, only that \
+             the reviewer's own checkout and identity do not hold them",
+            authors.unattributed,
+            if authors.open.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", authors.open.join(", "))
+            }
+        ));
+    }
+    if change.commits.len() > MAX_COMMITS {
+        change.commits.truncate(MAX_COMMITS);
+        change.truncated = true;
+    }
     let evidence = evidence_for(&here, &change.head);
     let at_ms = now_ms();
     let judgement = Judgement {
@@ -1418,15 +1540,24 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
                 " (ids, hashes and the verdict only)"
             }
         ),
-        Err(why) => eprintln!(
-            "ohjaa judge: the note could not be attached ({why}); the log holds the Judgement"
-        ),
+        Err(why) => {
+            eprintln!(
+                "ohjaa judge: the note could not be attached ({why}); the log holds the \
+                 Judgement"
+            );
+            // Pushing now would share the notes without this one, and say
+            // it was shared.
+            if args.push || sharing.push {
+                eprintln!("ohjaa judge: not shared: its note is not attached");
+                return Ok(1);
+            }
+        }
     }
     if args.push || sharing.push {
-        match push(&here.top, &here.common) {
+        match push(&here.top, &here.common, sharing.names) {
             Ok(said) => println!("ohjaa judge: {said}"),
             Err(why) => {
-                eprintln!("ohjaa judge: not shared: {why}; it is recorded, and pushed with the next --push");
+                eprintln!("ohjaa judge: not shared: {why}; it is recorded on this machine");
                 return Ok(1);
             }
         }
@@ -1634,7 +1765,13 @@ pub fn list(commit: &str, json_out: bool, fetch_first: bool) -> Result<i32> {
         println!("{}", serde_json::to_string_pretty(&document)?);
         return Ok(0);
     }
-    print!("{}", render_list(&sha, &judgements, &responses));
+    // Notes may come from any clone: no terminal escape of theirs reaches
+    // the person.
+    let shown = render_list(&sha, &judgements, &responses);
+    print!(
+        "{}",
+        shown.lines().map(printable).collect::<Vec<_>>().join("\n") + "\n"
+    );
     Ok(0)
 }
 
@@ -2323,6 +2460,27 @@ mod tests {
             unattributed: 0,
             open: Vec::new(),
         }
+    }
+
+    /// An Intent id is what ohjaa mints, never free text a note would carry;
+    /// a note's text reaches a terminal with no escape of its own.
+    #[test]
+    fn ids_are_ids_and_shown_text_has_no_escapes() {
+        assert!(intent_id_shaped("in-1791944000000-123"));
+        for text in [
+            "secret-project",
+            "in-",
+            "in-12",
+            "in-a-1",
+            "in-1-",
+            "oh-1-2",
+        ] {
+            assert!(!intent_id_shaped(text), "{text}");
+        }
+        let mut redacted = judgement();
+        redacted.intent_id = Some("secret-project".to_owned());
+        assert!(!note_line(&redacted, false).contains("secret"));
+        assert_eq!(printable("ok\u{1b}[2Jgone\u{7}"), "ok?[2Jgone?");
     }
 
     #[test]

@@ -747,6 +747,12 @@ impl Reader {
         retrying(|| Self::open_once(path))
     }
 
+    /// Without waiting: [`StoreError::Locked`] at once while a writer holds
+    /// the log. For a push a person waits on.
+    pub fn open_now(path: &Path) -> Result<Reader, StoreError> {
+        Self::open_once(path)
+    }
+
     fn open_once(path: &Path) -> Result<Reader, StoreError> {
         let broken = |why: String| StoreError::Broken {
             path: path.to_path_buf(),
