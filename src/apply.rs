@@ -78,6 +78,12 @@ fn read_record(home: &Path) -> Result<Record> {
     Ok(record)
 }
 
+/// The sykli the pre-push dispatchers hand pushes to, as `apply` recorded
+/// it; `None` before apply has found one.
+pub fn recorded_sykli(home: &Path) -> Result<Option<PathBuf>> {
+    Ok(read_record(home)?.get("sykli").map(PathBuf::from))
+}
+
 fn write_record(home: &Path, record: &Record) -> Result<()> {
     let mut text = format!(
         "# What `ohjaa apply` changed outside the home, so that `ohjaa apply --undo`\n\
