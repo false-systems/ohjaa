@@ -88,13 +88,11 @@ exit 4
 "#;
 
 /// Never the real sykli. `verify --help` names `--commit` only with
-/// OHJAA_STUB_SYKLI_COMMIT set. `verify <receipt> --contract <c> --commit
-/// <sha>` checks, in sykli's order and words: the contract the receipt was
-/// made under, that it ran exactly that commit's tree, cleanly, and then its
-/// outcome. With OHJAA_STUB_SYKLI_COMMIT=1 it is sykli#67 as it stands: after
-/// the commit checks it also compares the checkout on disk (its HEAD's tree,
-/// and nothing uncommitted beside it). With `new` it takes everything from the
-/// commit, as sykli#67 is being changed to.
+/// OHJAA_STUB_SYKLI_COMMIT set, and no sentence ohjaa could lean on.
+/// `verify <receipt> --contract <c> --commit <sha>` judges the commit alone,
+/// as every sykli with `--commit` does (sykli#67 as merged), checking in
+/// sykli's order and words: the contract the receipt was made under, that it
+/// ran exactly that commit's tree, cleanly, and then its outcome.
 const SYKLI_STUB: &str = r#"#!/bin/sh
 printf '%s|%s\n' "$PWD" "$*" >> "${OHJAA_STUB_SYKLI_CALLS:-/dev/null}"
 if [ "$1" = verify ] && [ "$2" = --help ]; then
@@ -102,10 +100,6 @@ if [ "$1" = verify ] && [ "$2" = --help ]; then
   echo "      --contract <CONTRACT>  Path to sykli.rs or a sykli-contract.v1 JSON file"
   if [ -n "${OHJAA_STUB_SYKLI_COMMIT:-}" ]; then
     echo "      --commit <REV>  Also require a clean run of this commit"
-  fi
-  if [ "${OHJAA_STUB_SYKLI_COMMIT:-}" = new ]; then
-    echo "With --commit the subject is the commit, and nothing is read from the"
-    echo "checkout; REV is resolved in the repository around the current directory."
   fi
   exit 0
 fi
@@ -122,12 +116,6 @@ tree=$(git rev-parse "$sha^{tree}") || exit 2
 ran=$(sed -n 's/.*"tree_oid":"\([0-9a-f]*\)".*/\1/p' "$receipt" | head -1)
 [ "$ran" = "$tree" ] || { echo "refused: commit expected $tree (the tree of commit $sha) but got $ran" >&2; exit 3; }
 grep -q '"dirty":false' "$receipt" || { echo "refused: clean expected a clean run but got dirty true" >&2; exit 3; }
-if [ "${OHJAA_STUB_SYKLI_COMMIT:-}" != new ]; then
-  live=$(git rev-parse 'HEAD^{tree}')
-  if [ "$live" != "$tree" ] || [ -n "$(git status --porcelain -- . ':(exclude).sykli')" ]; then
-    echo "refused: tree expected $live but got $tree" >&2; exit 3
-  fi
-fi
 grep -q '"outcome":"passed"' "$receipt" || { echo "refused: outcome expected passed or cached with complete task records but got failed with 0 task records" >&2; exit 1; }
 exit 0
 "#;
@@ -3204,17 +3192,18 @@ fn the_pull_request_head_is_verified_by_sykli_never_by_the_receipts_word() {
     let fixture = Fixture::new("pr-head");
     let repo = fixture.make_git_repo("work");
 
-    // The receipt says passed; sykli refuses it. The record says what sykli said.
+    // The receipt says passed; sykli refuses it (it ran under another
+    // contract). The record says what sykli said.
     let (record, head) = pull_request_session(&fixture, &repo, "forged", "passed forged", true);
     let finished = finished_line(&record);
     assert!(
         finished.contains("https://github.com/o/r/pull/7 (open)")
             && finished.contains(&format!("head {}", &head[..7]))
-            && finished
-                .contains("FAILED sykli verify: refused: contract expected c but got forged"),
+            && finished.contains("unproven: ")
+            && finished.contains("(refused: contract expected c but got forged)"),
         "{finished}"
     );
-    assert!(!finished.contains("passed"), "{finished}");
+    assert!(!finished.contains("verified: passed"), "{finished}");
     let calls = fs::read_to_string(fixture.dir.join("sykli-calls.txt")).unwrap();
     assert!(
         calls.contains(&format!("--contract sykli.json --commit {head}")),
@@ -3354,7 +3343,7 @@ fn a_refusal_says_when_not_every_receipt_of_the_tree_was_asked() {
           receipt passed forged && mv .sykli/receipts/rcpt_$(git rev-parse HEAD^{tree}).json .sykli/receipts/run_$n.json
         done
         git push -q origin HEAD:main",
-        "new",
+        "1",
     );
     assert!(
         landed_lines(&record)
@@ -3385,7 +3374,7 @@ fn a_commit_passes_when_any_receipt_of_its_tree_verifies() {
         sleep 1
         receipt passed forged
         git push -q origin HEAD:main",
-        "new",
+        "1",
     );
     assert!(
         landed_lines(&record).concat().contains(&format!(
@@ -3406,7 +3395,7 @@ fn a_commit_passes_when_any_receipt_of_its_tree_verifies() {
         sleep 1
         receipt failed
         git push -q origin HEAD:main",
-        "new",
+        "1",
     );
     assert!(
         landed_lines(&record)
@@ -3468,7 +3457,7 @@ fn a_push_to_main_with_no_sykli_run_where_there_is_a_contract_warns() {
         "unchecked",
         "echo '{}' > sykli.json && git add sykli.json && git commit -q -m 'no run'
         git push -q origin HEAD:main",
-        "new",
+        "1",
     );
     let warning = format!(
         "origin/main at {} in work has no passing evidence — check before building on it",
@@ -3495,7 +3484,7 @@ fn a_push_to_main_with_no_sykli_run_where_there_is_a_contract_warns() {
         "no-contract",
         "git pull -q origin main && git rm -q sykli.json && git commit -q -m 'drop the contract'
         git push -q origin HEAD:main",
-        "new",
+        "1",
     );
     assert!(
         landed_lines(&record)
@@ -3553,7 +3542,7 @@ fn a_broken_main_pushed_from_a_shared_clone_warns_whoever_pushed_it() {
                 script,
             ])
             .env("OHJAA_STUB_RUN_AGENT", "1")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .current_dir(&repo)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -3608,9 +3597,8 @@ fn what_sykli_could_not_check_is_recorded_and_never_flagged() {
             "{record}"
         );
     };
-    // A stray file beside the commit: sykli#67 as it stands checks the
-    // checkout, not the commit.
-    let (record, wt) = worktree_push_session(
+    // A stray file beside the commit: sykli judges the commit alone.
+    let (record, _) = worktree_push_session(
         &fixture,
         &repo,
         "stray",
@@ -3621,10 +3609,7 @@ fn what_sykli_could_not_check_is_recorded_and_never_flagged() {
         "1",
     );
     assert!(
-        landed_lines(&record).concat().contains(&format!(
-            "{} reached origin/main: stale: sykli checked the checkout, not the commit",
-            short_of(&wt, "HEAD")
-        )),
+        landed_lines(&record).concat().contains("verified: passed"),
         "{record}"
     );
     quiet(&record);
@@ -3648,21 +3633,6 @@ fn what_sykli_could_not_check_is_recorded_and_never_flagged() {
     // And nothing of it opens the next briefing.
     let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
     assert!(!stdout.contains("WARNING"), "{stdout}");
-    // The commit-based sykli passes the stray-file case.
-    let (record, _) = worktree_push_session(
-        &fixture,
-        &repo,
-        "stray-new",
-        "git pull -q origin main && echo w > w.txt && git add w.txt && git commit -q -m w
-        receipt passed
-        git push -q origin HEAD:main
-        echo scratch > notes.txt",
-        "new",
-    );
-    assert!(
-        landed_lines(&record).concat().contains("verified: passed"),
-        "{record}"
-    );
     fixture.cleanup();
 }
 
@@ -4138,7 +4108,7 @@ fn a_push_from_a_worktree_removed_since_is_never_shouted_for_its_lost_receipt() 
                     &script,
                 ])
                 .env("OHJAA_STUB_RUN_AGENT", "1")
-                .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "1")
                 .current_dir(&repo),
         );
         assert_eq!(code, Some(0), "{stderr}");
@@ -4256,7 +4226,7 @@ fn a_squash_merged_pull_request_is_found_by_its_commit_once_every_ref_is_pruned(
                 &script,
             ])
             .env("OHJAA_STUB_RUN_AGENT", "1")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .env("OHJAA_STUB_GH_PR_SEARCH_FILE", &mark)
             .current_dir(&repo),
     );
@@ -4549,7 +4519,7 @@ fn report_fixture(fixture: &Fixture) -> (PathBuf, String) {
                 &script,
             ])
             .env("OHJAA_STUB_RUN_AGENT", "1")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .current_dir(&repo),
     );
     assert_eq!(code, Some(0), "{stderr}");
@@ -4587,7 +4557,7 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
             .arg("--root")
             .arg(&fixture.dir)
             .arg("report")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
             .current_dir(&repo);
         if json {
@@ -4666,7 +4636,7 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
             .arg(&fixture.dir)
             .args(["intake", "--source", "report", "--drafter"])
             .arg(&drafter)
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
             .current_dir(&repo),
     );
@@ -4737,7 +4707,7 @@ fn what_vessa_could_not_read_or_date_leaves_the_report_incomplete() {
                 .arg("--root")
                 .arg(&fixture.dir)
                 .arg("report")
-                .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "1")
                 .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
                 .current_dir(&repo),
         )
@@ -4804,7 +4774,7 @@ fn a_window_with_more_commits_than_a_report_judges_says_so() {
             .arg("--root")
             .arg(&fixture.dir)
             .arg("report")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .current_dir(&repo),
     );
     assert_eq!(code, Some(4), "{stdout}");
@@ -4867,7 +4837,7 @@ fn the_weekly_report_is_said_after_the_record_at_a_terminal_and_never_briefed() 
             .args(["run", "sh", "--intent", intent, "--", "-c", "exit 0"])
             .env("OHJAA_STUB_RUN_AGENT", "1")
             .current_dir(&repo);
-        command.env("OHJAA_STUB_SYKLI_COMMIT", "new");
+        command.env("OHJAA_STUB_SYKLI_COMMIT", "1");
         if !complete {
             command.env("OHJAA_STUB_VESSA_JSON", &gappy);
         }
@@ -4926,7 +4896,7 @@ fn the_weekly_report_is_said_after_the_record_at_a_terminal_and_never_briefed() 
             .ohjaa()
             .args(["run", "sh", "--intent", "four", "--", "-c", "exit 0"])
             .env("OHJAA_STUB_RUN_AGENT", "1")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .current_dir(&repo),
     );
     assert_eq!(code, Some(0), "{stderr}");
@@ -5004,7 +4974,7 @@ fn commands_that_only_read_the_session_log_never_write_it() {
             fixture
                 .ohjaa()
                 .args(args)
-                .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "1")
                 .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
                 .current_dir(&repo),
         );
@@ -5070,7 +5040,7 @@ fn report_json_is_ohjaa_marks_v1_and_writes_nothing() {
         .arg("--root")
         .arg(&fixture.dir)
         .args(["report", "--json"])
-        .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+        .env("OHJAA_STUB_SYKLI_COMMIT", "1")
         .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
         .current_dir(&repo);
     let (stdout, stderr, code) = output_of(&mut command);
@@ -5114,7 +5084,7 @@ fn report_json_is_ohjaa_marks_v1_and_writes_nothing() {
         .arg("--root")
         .arg(&fixture.dir)
         .args(["report", "--json", "--marks"])
-        .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+        .env("OHJAA_STUB_SYKLI_COMMIT", "1")
         .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
         .current_dir(&repo);
     let (stdout, stderr, code) = output_of(&mut marks_only);
@@ -5145,7 +5115,7 @@ fn report_json_is_ohjaa_marks_v1_and_writes_nothing() {
             .arg("--root")
             .arg(&fixture.dir)
             .arg("report")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
             .current_dir(&repo);
         let said = under_a_terminal(&human).unwrap();

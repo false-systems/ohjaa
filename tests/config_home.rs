@@ -25,7 +25,11 @@ use std::process::{Command, Output};
 /// accepted one says so on stderr. `run` passes unless `$SANDBOX/fail-gate`
 /// exists, and its receipt names the tree in `$SANDBOX/tree`; `verify` passes
 /// a receipt that says passed (or cached, as sykli does), and refuses one made under `other-contract`
-/// as a contract mismatch (exit 4). `run` writes its receipt as sykli does,
+/// as a contract mismatch (exit 4). Its `verify --help` names `--commit` and
+/// no sentence ohjaa could lean on; with `$SANDBOX/verify-json` it also names
+/// `--json`, and answers it with a `sykli-verify.v1` verdict (in the schema
+/// and with the established tiers `$SANDBOX/verify-schema` and
+/// `$SANDBOX/verify-established` hold, when they exist). `run` writes its receipt as sykli does,
 /// also as `.sykli/receipts/rcpt_<sha256>.json`: one task, passed (with
 /// `$SANDBOX/with-cached` a second one reused from the cache; with
 /// `$SANDBOX/all-cached` both reused, the run `cached`). With STUB_SYKLI_D3 it is the
@@ -165,15 +169,33 @@ case "$1" in
     if [ "$2" = --help ]; then
       echo "Usage: sykli verify [OPTIONS] <RECEIPT>"
       echo "      --commit <REV>  judge the receipt as evidence for this commit"
-      echo "With --commit the subject is the commit, and nothing is read from the checkout."
+      [ -f "$SANDBOX/verify-json" ] && echo "      --json          print the verdict as one document"
       facts; exit 0
     fi
+    json=""; rev=""; prev=""
+    for arg in "$@"; do
+      [ "$arg" = --json ] && json=1
+      [ "$prev" = --commit ] && rev=$arg
+      prev=$arg
+    done
+    # With --json, the verdict as sykli-verify.v1 (verified, exit), in the
+    # schema and with the tiers $SANDBOX/verify-schema and
+    # $SANDBOX/verify-established say, when they do.
+    verdict() {
+      [ -n "$json" ] || return 0
+      schema=$(cat "$SANDBOX/verify-schema" 2>/dev/null || echo sykli-verify.v1)
+      tiers=$(cat "$SANDBOX/verify-established" 2>/dev/null \
+        || echo '"schema","contract","source","consistency","outcome"')
+      printf '{"schema":"%s","subject":{"kind":"commit","rev":"%s"},"verified":%s,"exit":%s,"trust":{"established":[%s],"not_established":["provenance","producer","execution"]}}\n' \
+        "$schema" "$rev" "$1" "$2" "$tiers"
+    }
     if grep -q other-contract "$2"; then
-      echo "refused: contract expected 1111 but got 2222" >&2; exit 4
+      verdict false 4; echo "refused: contract expected 1111 but got 2222" >&2; exit 4
     fi
     # passed, or cached (every task reused): sykli verify accepts both.
     grep -q passed "$2" || { grep -q '"outcome":"cached"' "$2" && ! grep -q failed "$2"; } \
-      || { echo "refused: outcome expected passed or cached" >&2; exit 1; }
+      || { verdict false 1; echo "refused: outcome expected passed or cached" >&2; exit 1; }
+    verdict true 0
     exit 0;;
 esac
 exit 2
@@ -1810,6 +1832,88 @@ impl Sandbox {
     }
 }
 
+/// The review of #45 against sykli main: what `sykli verify --help` says is
+/// read for its flags, never its sentences (sykli#79 reworded the one ohjaa
+/// matched, and every proven commit became "sykli could not say"). A sykli
+/// that names `--commit` judges the commit alone, whatever else it says; one
+/// that also names `--json` is asked for its `sykli-verify.v1` verdict, and
+/// a commit is proven only where that verified the commit and established
+/// every tier a proof stands on: the schema, the contract, the source (the
+/// commit's tree and inputs), the records' consistency and the outcome.
+#[test]
+fn a_commit_is_proven_by_sykli_verifys_flags_and_its_json_verdict() {
+    let mut sandbox = Sandbox::new("verify-flags");
+    sandbox.stub_contract = "fast";
+    let (repo, _) = sandbox.repo("acme", "widget", &[]);
+    sandbox.entry("acme", "widget", Some("{}\n"));
+    sandbox.apply();
+    let c1 = sandbox.commit(&repo, "one");
+    let t1 = sandbox.tree(&repo, "HEAD");
+    receipt(
+        &repo.join(".git/sykli/receipts/rcpt_1.json"),
+        &t1,
+        "passed",
+        1_000,
+    );
+    let output = sandbox.git_out(&repo, &["push", "origin", "main"]);
+    assert!(output.status.success(), "{}", text(&output).1);
+    let proven = format!(
+        "- acme/widget main (origin/main as of a push at <time>): ✓ {}\n",
+        short(&c1)
+    );
+    let verify_calls = |sandbox: &Sandbox| -> Vec<String> {
+        sandbox
+            .read("sykli-calls")
+            .lines()
+            .filter(|line| line.contains("|verify ") && line.contains("--commit"))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    // Its exit code says: no --json.
+    let report = sandbox.report(&repo);
+    assert!(report.contains(&proven), "{report}");
+    assert!(
+        verify_calls(&sandbox)
+            .iter()
+            .all(|call| !call.contains("--json")),
+        "{:?}",
+        verify_calls(&sandbox)
+    );
+
+    // Its verdict says: asked with --json.
+    fs::write(sandbox.dir.join("verify-json"), "").unwrap();
+    let report = sandbox.report(&repo);
+    assert!(report.contains(&proven), "{report}");
+    let last = verify_calls(&sandbox).pop().unwrap();
+    assert!(last.ends_with(&format!("--commit {c1} --json")), "{last}");
+
+    // Verified, but without the source: not proven, and said why.
+    fs::write(
+        sandbox.dir.join("verify-established"),
+        r#""schema","contract","consistency","outcome""#,
+    )
+    .unwrap();
+    let json = sandbox.report_json(&repo);
+    let commit = &json["entries"][0]["commits"][0];
+    assert_eq!(commit["code"], "could_not_say", "{json:#}");
+    assert!(
+        commit["why"].as_str().unwrap().contains("source"),
+        "{json:#}"
+    );
+
+    // A verdict in a schema this ohjaa does not read proves nothing.
+    fs::remove_file(sandbox.dir.join("verify-established")).unwrap();
+    fs::write(sandbox.dir.join("verify-schema"), "sykli-verify.v9").unwrap();
+    let json = sandbox.report_json(&repo);
+    let commit = &json["entries"][0]["commits"][0];
+    assert_eq!(commit["code"], "could_not_say", "{json:#}");
+    assert!(
+        commit["why"].as_str().unwrap().contains("sykli-verify.v9"),
+        "{json:#}"
+    );
+}
+
 /// The marks: ✓ where a receipt of the commit's tree verifies, ✗ where one is
 /// there and did not pass, ? where none is; tip first, down to the first
 /// proven commit; sykli asked only where a receipt says it passed. A merge
@@ -2909,6 +3013,28 @@ fn real_sykli_an_unproven_push_lands_flagged_and_a_proven_one_is_quiet() {
     );
 }
 
+/// The review of #45: sykli main (5acdf91 and on) reworded `verify --help`
+/// and answers `verify --json`. A commit `ohjaa gate` proved is ✓, never
+/// "sykli could not say".
+#[test]
+#[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
+fn real_sykli_a_commit_ohjaa_gate_proved_is_marked_proven() {
+    let (sandbox, repo, _) = Sandbox::with_real_sykli("real-proven");
+    let head = sandbox.state(&repo, "ok, proven", "proven");
+    let (code, said) = sandbox.gate(&repo);
+    assert_eq!(code, Some(0), "{said}");
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+    let json = sandbox.report_json(&repo);
+    let tip = &json["entries"][0]["commits"][0];
+    assert_eq!(tip["sha"], head.as_str(), "{json:#}");
+    assert_eq!(tip["mark"], "proven", "{json:#}");
+    let report = sandbox.report(&repo);
+    assert!(
+        report.contains(&format!("): ✓ {}\n", short(&head))) && !report.contains("could not say"),
+        "{report}"
+    );
+}
+
 #[test]
 #[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
 fn real_sykli_marks_proven_failed_unproven_and_a_forge_merge() {
@@ -3033,10 +3159,10 @@ fn real_sykli_the_briefing_flags_first_and_ohjaa_gate_flips_the_tip() {
     );
 }
 
-/// D4 with today's sykli (no durable runs): `ohjaa gate` inside a session
-/// records its request, then the receipt sykli kept of the run, under the
-/// name that is its sha256, and the lock sykli read. No run id: this sykli
-/// gives none.
+/// D4 with a real sykli: `ohjaa gate` inside a session records its request,
+/// then the receipt sykli kept of the run, under the name that is its
+/// sha256, and the lock sykli read; and the run's id exactly when this sykli
+/// has durable runs (`sykli status --help` lists `--run`, KATANA D3).
 #[test]
 #[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
 fn real_sykli_a_gate_in_a_session_records_the_receipt_sykli_kept() {
@@ -3050,7 +3176,20 @@ fn real_sykli_a_gate_in_a_session_records_the_receipt_sykli_kept() {
     let found = &refs[0];
     assert_eq!(found["kind"], "candidate");
     assert_eq!(found["commit"], head.as_str());
-    assert!(found.get("run").is_none(), "{found:#}");
+    let status_help = sandbox
+        .command("sykli", &repo)
+        .args(["status", "--help"])
+        .output()
+        .unwrap();
+    let durable = text(&status_help)
+        .0
+        .lines()
+        .any(|line| line.trim_start().starts_with("--run "));
+    assert_eq!(
+        found["run"].as_str().is_some_and(|run| !run.is_empty()),
+        durable,
+        "{found:#}"
+    );
     let lock: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(sandbox.config().join("repos/acme/widget/sykli.lock")).unwrap(),
     )
