@@ -848,34 +848,37 @@ fn authors_of(
 
 // ---- law 2 ---------------------------------------------------------------------
 
-/// A session's time in a checkout, from the log.
-struct Window<'a> {
-    session: &'a Session,
-    from_ms: i64,
-    to_ms: i64,
+/// A commit of the Change an open reviewing session may have made, and why
+/// it is the session's to answer for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Made {
+    pub commit: String,
+    /// Open sessions launched in the reviewer's checkout that were there
+    /// too when it was made: who made it cannot be shown.
+    pub shared_with: Vec<String>,
 }
 
-impl Window<'_> {
-    fn live_at(&self, at: i64) -> bool {
-        self.from_ms <= at * 1000 + 999 && self.to_ms >= at * 1000
-    }
-}
-
-/// The commits of the Change an open reviewing `session` made, by the rule
-/// leaving attributes commits with: one its checkout's reflog shows created
-/// while it ran is its own unless another session launched in that checkout
-/// was there that second; one a branch of the clone shows created while it
-/// ran, in another checkout, is its own unless any other session in the
-/// clone was there. A commit the log already gives to another session is
-/// that session's. Two git processes: its checkout's reflog and the
-/// branches'.
-fn made_by_reviewer(
+/// The commits of the Change an open reviewing `session` made, from the
+/// reflogs (`own`: its checkout's HEAD; `branches`: the clone's branches),
+/// newest first as git lists them. A commit the log gives to another
+/// session is that session's: an ended session's record is the authority on
+/// what it made, never the clock (sessions start and end in whole seconds).
+/// Otherwise:
+/// - one its own checkout shows created since it started is its own: a
+///   reviewer must be shown not to have made a commit, and in a checkout it
+///   shared with another open session that cannot be shown (said, with whom);
+/// - one a branch shows created since it started, in another checkout, is
+///   its own unless another session in the clone was there that second: an
+///   open one by the clock, an ended one by its record (it saw the commit
+///   made beside it, `observed`).
+pub fn reviewer_made(
     session: &Session,
     change: &Change,
     all: &[Session],
-    top: &Path,
     clone: &[PathBuf],
-) -> Result<Vec<String>, String> {
+    own: &[lifecycle::Move],
+    branches: &[lifecycle::Move],
+) -> Vec<Made> {
     let wanted: HashMap<&str, Option<&str>> = change
         .commits
         .iter()
@@ -883,34 +886,84 @@ fn made_by_reviewer(
         .collect();
     let since = session.started_ms.div_euclid(1000);
     let own_checkout = canonical(Path::new(&session.repo));
+    let in_clone = |s: &&Session| clone.iter().any(|c| Path::new(&s.repo) == c);
+    let others: Vec<&Session> = all.iter().filter(|s| s.id != session.id).collect();
+    // Open sessions' time so far: their records do not say yet.
     let now = now_ms() + 999;
-    let windows: Vec<Window> = all
+    let open: Vec<&Session> = others
         .iter()
-        .filter(|s| s.id != session.id)
-        .filter(|s| clone.iter().any(|c| Path::new(&s.repo) == c))
-        .map(|s| Window {
-            session: s,
-            from_ms: s.started_ms,
-            to_ms: s.left.as_ref().map_or(now, |left| left.ended_ms + 999),
-        })
+        .copied()
+        .filter(|s| s.left.is_none())
+        .filter(in_clone)
         .collect();
-    let mut made = Vec::new();
+    let live = |s: &Session, at: i64| s.started_ms <= at * 1000 + 999 && now >= at * 1000;
+    // What ended sessions saw made beside them, and could not credit.
+    let seen_beside: BTreeSet<&str> = others
+        .iter()
+        .filter_map(|s| s.left.as_ref())
+        .flat_map(|left| {
+            left.observed
+                .iter()
+                .chain(left.scoped.iter().flat_map(|scoped| scoped.observed.iter()))
+        })
+        .map(|phase| phase.commit.as_str())
+        .collect();
+    let mut made: Vec<Made> = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut consider = |commit: String, at: i64, in_own: bool, made: &mut Vec<String>| {
-        let Some(attributed) = wanted.get(commit.as_str()) else {
+    let mut consider = |entry: &lifecycle::Move, in_own: bool| {
+        if entry.at < since || !lifecycle::created_here(&entry.subject) {
+            return;
+        }
+        let Some(attributed) = wanted.get(entry.commit.as_str()) else {
             return;
         };
-        if attributed.is_some_and(|id| id != session.id) || !seen.insert(commit.clone()) {
+        if attributed.is_some_and(|id| id != session.id) || !seen.insert(entry.commit.clone()) {
             return;
         }
-        let contested = windows.iter().any(|w| {
-            w.live_at(at) && (!in_own || canonical(Path::new(&w.session.repo)) == own_checkout)
-        });
+        if in_own {
+            let shared_with = open
+                .iter()
+                .filter(|s| canonical(Path::new(&s.repo)) == own_checkout && live(s, entry.at))
+                .map(|s| s.id.clone())
+                .collect();
+            made.push(Made {
+                commit: entry.commit.clone(),
+                shared_with,
+            });
+            return;
+        }
+        let contested =
+            seen_beside.contains(entry.commit.as_str()) || open.iter().any(|s| live(s, entry.at));
         if !contested {
-            made.push(commit);
+            made.push(Made {
+                commit: entry.commit.clone(),
+                shared_with: Vec::new(),
+            });
         }
     };
-    let head_moves = lifecycle::reflog(
+    for entry in own {
+        consider(entry, true);
+    }
+    for entry in branches
+        .iter()
+        .filter(|e| e.reference.starts_with("refs/heads/"))
+    {
+        consider(entry, false);
+    }
+    made
+}
+
+/// [`reviewer_made`], with the reflogs read: two git processes (the
+/// reviewer's checkout's HEAD, and every branch of the clone).
+fn made_by_reviewer(
+    session: &Session,
+    change: &Change,
+    all: &[Session],
+    top: &Path,
+    clone: &[PathBuf],
+) -> Result<Vec<Made>, String> {
+    let own_checkout = canonical(Path::new(&session.repo));
+    let own = lifecycle::reflog(
         &own_checkout,
         &[
             "log",
@@ -921,12 +974,7 @@ fn made_by_reviewer(
         ],
     )
     .ok_or_else(|| format!("the reflog of {} cannot be read", own_checkout.display()))?;
-    for entry in head_moves {
-        if entry.at >= since && lifecycle::created_here(&entry.subject) {
-            consider(entry.commit, entry.at, true, &mut made);
-        }
-    }
-    let branch_moves = lifecycle::reflog(
+    let branches = lifecycle::reflog(
         top,
         &[
             "reflog",
@@ -937,15 +985,7 @@ fn made_by_reviewer(
         ],
     )
     .ok_or_else(|| "the clone's branch reflogs cannot be read".to_owned())?;
-    for entry in branch_moves {
-        if entry.reference.starts_with("refs/heads/")
-            && entry.at >= since
-            && lifecycle::created_here(&entry.subject)
-        {
-            consider(entry.commit, entry.at, false, &mut made);
-        }
-    }
-    Ok(made)
+    Ok(reviewer_made(session, change, all, clone, &own, &branches))
 }
 
 /// Law 2, for a Person: refused when their identity is on a commit of the
@@ -991,22 +1031,29 @@ fn person_independence(person: &Identity, change: &Change) -> Result<Vec<String>
 }
 
 /// Law 2, for an Agent session: refused when it made any commit of the
-/// Change (`made`, see [`made_by_reviewer`]), or the log gives one to it.
+/// Change (`made`, see [`reviewer_made`]), or the log gives one to it.
 fn agent_independence(
     session: &Session,
     change: &Change,
-    made: &[String],
+    made: &[Made],
     authors: &Authors,
 ) -> Result<Vec<String>, String> {
     let theirs: Vec<&str> = change
         .commits
         .iter()
-        .filter(|c| c.session.as_deref() == Some(session.id.as_str()) || made.contains(&c.commit))
+        .filter(|c| {
+            c.session.as_deref() == Some(session.id.as_str())
+                || made.iter().any(|m| m.commit == c.commit)
+        })
         .map(|c| short(&c.commit))
         .collect();
     if !theirs.is_empty() {
+        let shared: BTreeSet<&str> = made
+            .iter()
+            .flat_map(|m| m.shared_with.iter().map(String::as_str))
+            .collect();
         return Err(format!(
-            "{} of the Change ({}) {} made by this session, {}: the Agent never judges its own \
+            "{} of the Change ({}) {} made by this session, {}{}: the Agent never judges its own \
              Change",
             if theirs.len() == 1 {
                 "a commit"
@@ -1015,7 +1062,15 @@ fn agent_independence(
             },
             theirs.join(", "),
             if theirs.len() == 1 { "was" } else { "were" },
-            session.id
+            session.id,
+            if shared.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", or in its checkout while {} shared it (who made it cannot be shown)",
+                    shared.into_iter().collect::<Vec<_>>().join(", ")
+                )
+            }
         ));
     }
     let mut basis = vec![format!(
@@ -2121,6 +2176,153 @@ mod tests {
         assert!(unknown.why.contains("visibility = \"private\""));
         let none = sharing_of(None);
         assert!(!none.shared && !none.names);
+    }
+
+    fn session(id: &str, repo: &str, started_s: i64, left: Option<Value>) -> Session {
+        let mut value = json!({
+            "id": id, "agent": "sh", "repo": repo, "intent": "x",
+            "started_ms": started_s * 1000, "delivered": [],
+        });
+        if let Some(left) = left {
+            value["left"] = left;
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn left(ended_s: i64, phases: &[&str], observed: &[&str]) -> Value {
+        let phase = |c: &&str| json!({"commit": c, "subject": "s"});
+        json!({
+            "ended_ms": ended_s * 1000,
+            "exit": {"how": "code", "code": 0},
+            "phases": phases.iter().map(phase).collect::<Vec<_>>(),
+            "observed": observed.iter().map(phase).collect::<Vec<_>>(),
+            "finished": {"kind": "no_pull_request"},
+        })
+    }
+
+    fn made_at(reference: &str, commit: &str, at: i64) -> lifecycle::Move {
+        lifecycle::Move {
+            reference: reference.to_owned(),
+            at,
+            commit: commit.to_owned(),
+            subject: "commit: s".to_owned(),
+        }
+    }
+
+    fn change_of(commits: &[(&str, Option<&str>)]) -> Change {
+        let ann = identity("Ann", "ann@x");
+        change(
+            commits
+                .iter()
+                .map(|(sha, session)| commit(sha, &ann, *session))
+                .collect(),
+        )
+    }
+
+    /// Law 2 for an agent session, as the demo with sykli main found it: a
+    /// session that commits and judges in the second another session here
+    /// ended is the one that made the commit. An ended session's record says
+    /// what it made; the clock does not.
+    #[test]
+    fn a_reviewer_that_committed_in_the_second_another_ended_made_it() {
+        let here = "/c/widget";
+        let clone = vec![PathBuf::from(here), PathBuf::from("/c/widget-b")];
+        let reviewer = session("oh-2-1", here, 100, None);
+        let author = session("oh-1-1", here, 90, Some(left(100, &["a1"], &[])));
+        let all = vec![author, reviewer.clone()];
+        // Its own checkout shows c1 made in its first second: its own, even
+        // with the other session ending in that second.
+        let own = [made_at("HEAD", "c1", 100), made_at("HEAD", "a1", 99)];
+        let change = change_of(&[("c1", None), ("a1", Some("oh-1-1"))]);
+        let made = reviewer_made(&reviewer, &change, &all, &clone, &own, &[]);
+        assert_eq!(
+            made,
+            vec![Made {
+                commit: "c1".to_owned(),
+                shared_with: Vec::new()
+            }]
+        );
+        assert!(agent_independence(&reviewer, &change, &made, &authors_none()).is_err());
+        // What the log gives the other session is never the reviewer's.
+        let theirs = change_of(&[("a1", Some("oh-1-1"))]);
+        let late = [made_at("HEAD", "a1", 100)];
+        assert!(reviewer_made(&reviewer, &theirs, &all, &clone, &late, &[]).is_empty());
+        // Made before it started: not considered.
+        let before = change_of(&[("b0", None)]);
+        let early = [made_at("HEAD", "b0", 99)];
+        assert!(reviewer_made(&reviewer, &before, &all, &clone, &early, &[]).is_empty());
+    }
+
+    /// In another checkout, a commit is the reviewer's unless another
+    /// session was in the clone then: an open one by the clock, an ended one
+    /// by its record (it saw it made beside it). In its own checkout, one an
+    /// open session shared with it is its to answer for, said with whom.
+    #[test]
+    fn who_else_was_there_decides_only_beside_the_reviewer_checkout() {
+        let here = "/c/widget";
+        let other = "/c/widget-b";
+        let clone = vec![PathBuf::from(here), PathBuf::from(other)];
+        let reviewer = session("oh-2-1", here, 100, None);
+        let branch = [made_at("refs/heads/feat", "c2", 105)];
+        let change = change_of(&[("c2", None)]);
+        // Nobody else: its own.
+        let alone = vec![reviewer.clone()];
+        assert_eq!(
+            reviewer_made(&reviewer, &change, &alone, &clone, &[], &branch).len(),
+            1
+        );
+        // An open session in the other checkout: contested.
+        let open = session("oh-3-1", other, 101, None);
+        let with_open = vec![reviewer.clone(), open.clone()];
+        assert!(reviewer_made(&reviewer, &change, &with_open, &clone, &[], &branch).is_empty());
+        // An ended one that saw it made beside it: contested; one that did
+        // not see it: not, whatever its times.
+        let saw = session("oh-4-1", other, 101, Some(left(110, &[], &["c2"])));
+        assert!(reviewer_made(
+            &reviewer,
+            &change,
+            &[reviewer.clone(), saw],
+            &clone,
+            &[],
+            &branch
+        )
+        .is_empty());
+        let missed = session("oh-5-1", other, 101, Some(left(110, &[], &[])));
+        assert_eq!(
+            reviewer_made(
+                &reviewer,
+                &change,
+                &[reviewer.clone(), missed],
+                &clone,
+                &[],
+                &branch
+            )
+            .len(),
+            1
+        );
+        // Its own checkout, shared with an open session: its to answer for.
+        let sharing = session("oh-6-1", here, 101, None);
+        let own = [made_at("HEAD", "c2", 105)];
+        let made = reviewer_made(
+            &reviewer,
+            &change,
+            &[reviewer.clone(), sharing],
+            &clone,
+            &own,
+            &[],
+        );
+        assert_eq!(made[0].shared_with, vec!["oh-6-1".to_owned()]);
+        let refused = agent_independence(&reviewer, &change, &made, &authors_none()).unwrap_err();
+        assert!(refused.contains("while oh-6-1 shared it"), "{refused}");
+    }
+
+    fn authors_none() -> Authors {
+        Authors {
+            people: Vec::new(),
+            sessions: Vec::new(),
+            unattributed: 0,
+            open: Vec::new(),
+        }
     }
 
     #[test]
