@@ -1097,36 +1097,36 @@ test binaries among them):
 "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
 ```
 
-A task is given only the line of a place it does not already say, and what
-it says is never overridden. It says the target dir by naming
-`CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR`, and the build dir by naming
-`CARGO_BUILD_BUILD_DIR`: in its `env`, in its `inherit`, or by setting or
-unsetting one in its command where sh does, for every cargo it runs (before
-that command word, or through `env`, or an earlier `export` or `unset`). A
-word that only looks like an assignment says nothing (`echo
-CARGO_TARGET_DIR=x; cargo test` gets both lines), nor does an assignment
-before one cargo of the next (`CARGO_TARGET_DIR=t cargo build; cargo test`),
-and a command inside quotes (`sh -c '…'`) is not read. A line given where
-the command sets the variable itself is overridden by the command's own
-setting wherever that applies. A task that inherits one of
-the two leaves that one to whoever runs the gate, and is given the other, so
-`inherit: ["CARGO_BUILD_BUILD_DIR"]` alone no longer keeps
-`~/.cargo/config.toml`'s shared target dir. A task that runs no cargo
-(rebar3, make, mise) is never touched. Only the entry's copy changes; the
-repository's own `sykli.json` stays as it is, and agents' own cargo commands
-keep the shared directory.
+A task that explicitly chooses its target directory gets **neither** line:
+Cargo's build directory defaults under that target, so its layout stays intact.
+This includes `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` in `env` or
+`inherit`, a certain assignment on every direct Cargo invocation, or
+`--target-dir` / `--config build.target-dir=…` on every invocation.
+A task that chooses only `CARGO_BUILD_BUILD_DIR` (including
+`--config build.build-dir=…`) gets only the target-directory line.
+
+Command detection is deliberately conservative, not a shell interpreter.
+A leading unconditional `export NAME=value`, separated by semicolons or
+newlines and followed by direct Cargo commands, counts. Conditional exports,
+subshells, comments, heredocs, unsets, wrappers and dynamically evaluated
+commands do not establish that every Cargo invocation receives the setting.
+Uncertain cases get the defaults; a command's own assignment still overrides
+them when it actually runs. An assignment before one Cargo invocation says
+nothing about the next. Explicit `env` and `inherit` remain the way to declare
+settings for complex commands. Tasks with no Cargo word are untouched.
+Only the entry's copy changes, never the repository's contract or an agent's
+own Cargo commands.
 
 A gate that came with a `sykli.lock` is locked again (`sykli lock
-<entry>/sykli.json`), and only when that lock pins the gate as copied, which
+<entry>/sykli.json`), and only when sykli validates the copied contract and lock, which
 adopt asks first (`sykli validate <entry>/sykli.json`). Both run in the
 repository, handed `--repo-root` and `--git-common-dir` when sykli takes them,
-so they start no git. A copied lock that does not pin its gate means the
-repository changed `sykli.json` without `sykli lock`, and every gate run
-refuses it: adopt never locks what the repository did not, so it keeps the
-gate as copied, without the lines, and warns that the repository's own lock
-is out of date (when sykli names that lock as the one the gate differs
-from; a gate sykli refuses for another reason is kept as copied too, with
-sykli's reason).
+so they start no git. If validation fails, adopt keeps the gate as copied
+and prints sykli's diagnostic
+without guessing the cause from its wording. Validate and lock the contract
+in the repository, land both on its observed branch, then adopt again.
+A successful validation is reported as `sykli validate accepts its sykli.lock`,
+not as an independent claim that Ohjaa verified every lock entry.
 
 Only when every sykli that runs the gate expands the placeholder: the one on
 PATH and the one the pre-push dispatcher runs (as `apply` recorded it). A
