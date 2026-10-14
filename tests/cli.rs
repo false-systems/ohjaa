@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const STUB: &str = r#"#!/bin/sh
+# The window between the spawn and the record: ohjaa killed at once.
+if [ -n "${OHJAA_STUB_KILL_PARENT:-}" ] && [ "$1" = run ]; then kill -9 "$PPID"; fi
 printf '%s|%s\n' "$PWD" "$*" >> "$OHJAA_STUB_CALLS"
 if [ "$1" = run ]; then printf '%s\n' "$@" > "$OHJAA_STUB_ARGV"; fi
 case "$PWD" in
@@ -86,13 +88,11 @@ exit 4
 "#;
 
 /// Never the real sykli. `verify --help` names `--commit` only with
-/// OHJAA_STUB_SYKLI_COMMIT set. `verify <receipt> --contract <c> --commit
-/// <sha>` checks, in sykli's order and words: the contract the receipt was
-/// made under, that it ran exactly that commit's tree, cleanly, and then its
-/// outcome. With OHJAA_STUB_SYKLI_COMMIT=1 it is sykli#67 as it stands: after
-/// the commit checks it also compares the checkout on disk (its HEAD's tree,
-/// and nothing uncommitted beside it). With `new` it takes everything from the
-/// commit, as sykli#67 is being changed to.
+/// OHJAA_STUB_SYKLI_COMMIT set, and no sentence ohjaa could lean on.
+/// `verify <receipt> --contract <c> --commit <sha>` judges the commit alone,
+/// as every sykli with `--commit` does (sykli#67 as merged), checking in
+/// sykli's order and words: the contract the receipt was made under, that it
+/// ran exactly that commit's tree, cleanly, and then its outcome.
 const SYKLI_STUB: &str = r#"#!/bin/sh
 printf '%s|%s\n' "$PWD" "$*" >> "${OHJAA_STUB_SYKLI_CALLS:-/dev/null}"
 if [ "$1" = verify ] && [ "$2" = --help ]; then
@@ -100,10 +100,6 @@ if [ "$1" = verify ] && [ "$2" = --help ]; then
   echo "      --contract <CONTRACT>  Path to sykli.rs or a sykli-contract.v1 JSON file"
   if [ -n "${OHJAA_STUB_SYKLI_COMMIT:-}" ]; then
     echo "      --commit <REV>  Also require a clean run of this commit"
-  fi
-  if [ "${OHJAA_STUB_SYKLI_COMMIT:-}" = new ]; then
-    echo "With --commit the subject is the commit, and nothing is read from the"
-    echo "checkout; REV is resolved in the repository around the current directory."
   fi
   exit 0
 fi
@@ -120,12 +116,6 @@ tree=$(git rev-parse "$sha^{tree}") || exit 2
 ran=$(sed -n 's/.*"tree_oid":"\([0-9a-f]*\)".*/\1/p' "$receipt" | head -1)
 [ "$ran" = "$tree" ] || { echo "refused: commit expected $tree (the tree of commit $sha) but got $ran" >&2; exit 3; }
 grep -q '"dirty":false' "$receipt" || { echo "refused: clean expected a clean run but got dirty true" >&2; exit 3; }
-if [ "${OHJAA_STUB_SYKLI_COMMIT:-}" != new ]; then
-  live=$(git rev-parse 'HEAD^{tree}')
-  if [ "$live" != "$tree" ] || [ -n "$(git status --porcelain -- . ':(exclude).sykli')" ]; then
-    echo "refused: tree expected $live but got $tree" >&2; exit 3
-  fi
-fi
 grep -q '"outcome":"passed"' "$receipt" || { echo "refused: outcome expected passed or cached with complete task records but got failed with 0 task records" >&2; exit 1; }
 exit 0
 "#;
@@ -2332,14 +2322,26 @@ fn sigterm_to_ohjaa_reaches_the_session_and_leaving_still_runs() {
     fixture.cleanup();
 }
 
+/// Without a terminal nothing but ohjaa can bring the session an interrupt
+/// (it runs in a process group of its own): SIGINT sent to ohjaa reaches the
+/// session's group once, never twice, and the session decides what it means.
+/// With the terminal, Ctrl-C reaches the session directly (tests/terminal.rs).
 #[test]
-fn sigint_aimed_at_ohjaa_alone_does_not_cut_the_session_short() {
+fn sigint_to_ohjaa_without_a_terminal_reaches_the_session_once() {
     if !git_available() {
         return;
     }
     let fixture = Fixture::new("sigint");
     let repo = fixture.make_git_repo("work");
-    let child = spawn_session(&fixture, &repo, "sleep 1; exit 4");
+    let interrupts = fixture.dir.join("interrupts");
+    let child = spawn_session(
+        &fixture,
+        &repo,
+        &format!(
+            "trap 'echo int >> \"{}\"' INT; sleep 2; exit 4",
+            interrupts.display()
+        ),
+    );
     std::thread::sleep(std::time::Duration::from_millis(300));
     signal(child.id(), "INT");
     let output = child.wait_with_output().unwrap();
@@ -2347,9 +2349,14 @@ fn sigint_aimed_at_ohjaa_alone_does_not_cut_the_session_short() {
     assert_eq!(
         output.status.code(),
         Some(4),
-        "ohjaa waited for the session: {stderr}"
+        "the session handled it, and ohjaa waited for its end: {stderr}"
     );
     assert!(stderr.contains("ended: exit 4"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&interrupts).unwrap_or_default(),
+        "int\n",
+        "the session got the interrupt, once"
+    );
     fixture.cleanup();
 }
 
@@ -3185,17 +3192,18 @@ fn the_pull_request_head_is_verified_by_sykli_never_by_the_receipts_word() {
     let fixture = Fixture::new("pr-head");
     let repo = fixture.make_git_repo("work");
 
-    // The receipt says passed; sykli refuses it. The record says what sykli said.
+    // The receipt says passed; sykli refuses it (it ran under another
+    // contract). The record says what sykli said.
     let (record, head) = pull_request_session(&fixture, &repo, "forged", "passed forged", true);
     let finished = finished_line(&record);
     assert!(
         finished.contains("https://github.com/o/r/pull/7 (open)")
             && finished.contains(&format!("head {}", &head[..7]))
-            && finished
-                .contains("FAILED sykli verify: refused: contract expected c but got forged"),
+            && finished.contains("unproven: ")
+            && finished.contains("(refused: contract expected c but got forged)"),
         "{finished}"
     );
-    assert!(!finished.contains("passed"), "{finished}");
+    assert!(!finished.contains("verified: passed"), "{finished}");
     let calls = fs::read_to_string(fixture.dir.join("sykli-calls.txt")).unwrap();
     assert!(
         calls.contains(&format!("--contract sykli.json --commit {head}")),
@@ -3335,7 +3343,7 @@ fn a_refusal_says_when_not_every_receipt_of_the_tree_was_asked() {
           receipt passed forged && mv .sykli/receipts/rcpt_$(git rev-parse HEAD^{tree}).json .sykli/receipts/run_$n.json
         done
         git push -q origin HEAD:main",
-        "new",
+        "1",
     );
     assert!(
         landed_lines(&record)
@@ -3366,7 +3374,7 @@ fn a_commit_passes_when_any_receipt_of_its_tree_verifies() {
         sleep 1
         receipt passed forged
         git push -q origin HEAD:main",
-        "new",
+        "1",
     );
     assert!(
         landed_lines(&record).concat().contains(&format!(
@@ -3387,7 +3395,7 @@ fn a_commit_passes_when_any_receipt_of_its_tree_verifies() {
         sleep 1
         receipt failed
         git push -q origin HEAD:main",
-        "new",
+        "1",
     );
     assert!(
         landed_lines(&record)
@@ -3449,7 +3457,7 @@ fn a_push_to_main_with_no_sykli_run_where_there_is_a_contract_warns() {
         "unchecked",
         "echo '{}' > sykli.json && git add sykli.json && git commit -q -m 'no run'
         git push -q origin HEAD:main",
-        "new",
+        "1",
     );
     let warning = format!(
         "origin/main at {} in work has no passing evidence — check before building on it",
@@ -3476,7 +3484,7 @@ fn a_push_to_main_with_no_sykli_run_where_there_is_a_contract_warns() {
         "no-contract",
         "git pull -q origin main && git rm -q sykli.json && git commit -q -m 'drop the contract'
         git push -q origin HEAD:main",
-        "new",
+        "1",
     );
     assert!(
         landed_lines(&record)
@@ -3534,7 +3542,7 @@ fn a_broken_main_pushed_from_a_shared_clone_warns_whoever_pushed_it() {
                 script,
             ])
             .env("OHJAA_STUB_RUN_AGENT", "1")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .current_dir(&repo)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -3589,9 +3597,8 @@ fn what_sykli_could_not_check_is_recorded_and_never_flagged() {
             "{record}"
         );
     };
-    // A stray file beside the commit: sykli#67 as it stands checks the
-    // checkout, not the commit.
-    let (record, wt) = worktree_push_session(
+    // A stray file beside the commit: sykli judges the commit alone.
+    let (record, _) = worktree_push_session(
         &fixture,
         &repo,
         "stray",
@@ -3602,10 +3609,7 @@ fn what_sykli_could_not_check_is_recorded_and_never_flagged() {
         "1",
     );
     assert!(
-        landed_lines(&record).concat().contains(&format!(
-            "{} reached origin/main: stale: sykli checked the checkout, not the commit",
-            short_of(&wt, "HEAD")
-        )),
+        landed_lines(&record).concat().contains("verified: passed"),
         "{record}"
     );
     quiet(&record);
@@ -3629,21 +3633,6 @@ fn what_sykli_could_not_check_is_recorded_and_never_flagged() {
     // And nothing of it opens the next briefing.
     let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
     assert!(!stdout.contains("WARNING"), "{stdout}");
-    // The commit-based sykli passes the stray-file case.
-    let (record, _) = worktree_push_session(
-        &fixture,
-        &repo,
-        "stray-new",
-        "git pull -q origin main && echo w > w.txt && git add w.txt && git commit -q -m w
-        receipt passed
-        git push -q origin HEAD:main
-        echo scratch > notes.txt",
-        "new",
-    );
-    assert!(
-        landed_lines(&record).concat().contains("verified: passed"),
-        "{record}"
-    );
     fixture.cleanup();
 }
 
@@ -3741,7 +3730,11 @@ fn a_session_whose_ohjaa_was_killed_is_closed_as_orphaned_at_the_next_launch() {
     let mut child = spawn_session(
         &fixture,
         &repo,
-        &format!("echo $$ > '{}'; exec sleep 30", agent_pid.display()),
+        // Written whole, then moved into place: never read half written.
+        &format!(
+            "echo $$ > '{0}.new'; mv '{0}.new' '{0}'; exec sleep 30",
+            agent_pid.display()
+        ),
     );
     signal(child.id(), "KILL");
     let _ = child.wait();
@@ -4115,7 +4108,7 @@ fn a_push_from_a_worktree_removed_since_is_never_shouted_for_its_lost_receipt() 
                     &script,
                 ])
                 .env("OHJAA_STUB_RUN_AGENT", "1")
-                .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "1")
                 .current_dir(&repo),
         );
         assert_eq!(code, Some(0), "{stderr}");
@@ -4233,7 +4226,7 @@ fn a_squash_merged_pull_request_is_found_by_its_commit_once_every_ref_is_pruned(
                 &script,
             ])
             .env("OHJAA_STUB_RUN_AGENT", "1")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .env("OHJAA_STUB_GH_PR_SEARCH_FILE", &mark)
             .current_dir(&repo),
     );
@@ -4526,7 +4519,7 @@ fn report_fixture(fixture: &Fixture) -> (PathBuf, String) {
                 &script,
             ])
             .env("OHJAA_STUB_RUN_AGENT", "1")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .current_dir(&repo),
     );
     assert_eq!(code, Some(0), "{stderr}");
@@ -4564,7 +4557,7 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
             .arg("--root")
             .arg(&fixture.dir)
             .arg("report")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
             .current_dir(&repo);
         if json {
@@ -4643,7 +4636,7 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
             .arg(&fixture.dir)
             .args(["intake", "--source", "report", "--drafter"])
             .arg(&drafter)
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
             .current_dir(&repo),
     );
@@ -4714,7 +4707,7 @@ fn what_vessa_could_not_read_or_date_leaves_the_report_incomplete() {
                 .arg("--root")
                 .arg(&fixture.dir)
                 .arg("report")
-                .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "1")
                 .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
                 .current_dir(&repo),
         )
@@ -4781,7 +4774,7 @@ fn a_window_with_more_commits_than_a_report_judges_says_so() {
             .arg("--root")
             .arg(&fixture.dir)
             .arg("report")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .current_dir(&repo),
     );
     assert_eq!(code, Some(4), "{stdout}");
@@ -4844,7 +4837,7 @@ fn the_weekly_report_is_said_after_the_record_at_a_terminal_and_never_briefed() 
             .args(["run", "sh", "--intent", intent, "--", "-c", "exit 0"])
             .env("OHJAA_STUB_RUN_AGENT", "1")
             .current_dir(&repo);
-        command.env("OHJAA_STUB_SYKLI_COMMIT", "new");
+        command.env("OHJAA_STUB_SYKLI_COMMIT", "1");
         if !complete {
             command.env("OHJAA_STUB_VESSA_JSON", &gappy);
         }
@@ -4903,7 +4896,7 @@ fn the_weekly_report_is_said_after_the_record_at_a_terminal_and_never_briefed() 
             .ohjaa()
             .args(["run", "sh", "--intent", "four", "--", "-c", "exit 0"])
             .env("OHJAA_STUB_RUN_AGENT", "1")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .current_dir(&repo),
     );
     assert_eq!(code, Some(0), "{stderr}");
@@ -4981,7 +4974,7 @@ fn commands_that_only_read_the_session_log_never_write_it() {
             fixture
                 .ohjaa()
                 .args(args)
-                .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+                .env("OHJAA_STUB_SYKLI_COMMIT", "1")
                 .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
                 .current_dir(&repo),
         );
@@ -5047,7 +5040,7 @@ fn report_json_is_ohjaa_marks_v1_and_writes_nothing() {
         .arg("--root")
         .arg(&fixture.dir)
         .args(["report", "--json"])
-        .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+        .env("OHJAA_STUB_SYKLI_COMMIT", "1")
         .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
         .current_dir(&repo);
     let (stdout, stderr, code) = output_of(&mut command);
@@ -5091,7 +5084,7 @@ fn report_json_is_ohjaa_marks_v1_and_writes_nothing() {
         .arg("--root")
         .arg(&fixture.dir)
         .args(["report", "--json", "--marks"])
-        .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+        .env("OHJAA_STUB_SYKLI_COMMIT", "1")
         .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
         .current_dir(&repo);
     let (stdout, stderr, code) = output_of(&mut marks_only);
@@ -5122,7 +5115,7 @@ fn report_json_is_ohjaa_marks_v1_and_writes_nothing() {
             .arg("--root")
             .arg(&fixture.dir)
             .arg("report")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "new")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
             .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
             .current_dir(&repo);
         let said = under_a_terminal(&human).unwrap();
@@ -5197,5 +5190,472 @@ fn a_command_that_only_reads_says_a_held_log_is_busy_and_never_waits_on_it() {
     assert_eq!(code, Some(0), "{stderr}");
     let export: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(export["sessions"].as_array().unwrap().len(), 1, "{stdout}");
+    fixture.cleanup();
+}
+
+// ---- KATANA D4 ----------------------------------------------------------------
+
+/// `ohjaa usage export` (ohjaa-sessions.v1) from `repo`.
+fn export_of(fixture: &Fixture, repo: &Path) -> serde_json::Value {
+    let (stdout, stderr, code) =
+        output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(repo));
+    assert_eq!(code, Some(0), "{stderr}");
+    serde_json::from_str(&stdout).unwrap()
+}
+
+/// D4: an Intent has an id of its own, apart from every session's id; a
+/// later session continues it with `--intent-id`, and `--task` is recorded.
+#[test]
+fn an_intent_has_an_id_that_a_later_session_continues() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intent-id");
+    let repo = fixture.make_git_repo("work");
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "fix the parser",
+                "--task",
+                "start with the lexer",
+                "--",
+                "-c",
+                "exit 0",
+            ])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let briefing = fixture.argv().join("\n");
+    let first = export_of(&fixture, &repo)["sessions"][0].clone();
+    let id = first["id"].as_str().unwrap().to_owned();
+    let intent = first["intent_id"]
+        .as_str()
+        .expect("an intent id")
+        .to_owned();
+    assert!(intent.starts_with("in-") && intent != id, "{intent} {id}");
+    assert_eq!(first["task"], "start with the lexer");
+    assert!(
+        briefing.contains(&format!(
+            "This session is {id}; its intent is {intent}, new. Continue it in a later \
+             session with: ohjaa run <agent> --intent-id {intent}"
+        )),
+        "{briefing}"
+    );
+
+    // Continued: a new session, the same intent, and its text comes with it.
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent-id", &intent, "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let export = export_of(&fixture, &repo);
+    let second = export["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] != id.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(second["intent_id"], intent.as_str());
+    assert_eq!(second["intent"], "fix the parser");
+    assert!(second.get("task").is_none(), "no task given: {second:#}");
+    let argv = fixture.argv();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--intent" && pair[1] == "fix the parser"),
+        "toimija gets the intent's text: {argv:?}"
+    );
+    let briefing = argv.join("\n");
+    assert!(
+        briefing.contains(&format!(
+            "its intent is {intent}, continued from session {id}"
+        )),
+        "{briefing}"
+    );
+    // `brief` names the last session's intent by its id.
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(
+        stdout.contains(&format!("- intent: fix the parser (intent {intent})")),
+        "{stdout}"
+    );
+
+    // Continued in another repository: an Intent may span them, and where it
+    // was last worked on is said, on the terminal and in the briefing.
+    let other = fixture.make_git_repo("other");
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent-id", &intent, "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&other),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let work = fs::canonicalize(&repo).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "ohjaa: intent {intent} was last worked on in {} (session ",
+            work.display()
+        )) && stderr.contains("); it is continued here"),
+        "{stderr}"
+    );
+    let briefing = fixture.argv().join("\n");
+    assert!(
+        briefing.contains(&format!("which worked on it in {}.", work.display())),
+        "{briefing}"
+    );
+
+    // An intent no session carries is refused before anything starts.
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent-id", "in-1-1", "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        stderr.contains("no session in the log carries intent in-1-1"),
+        "{stderr}"
+    );
+    assert_eq!(
+        export_of(&fixture, &repo)["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3,
+        "the refused launch recorded nothing"
+    );
+    // Neither an intent nor an intent id: nothing to launch for.
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--", "-c", "exit 0"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    fixture.cleanup();
+}
+
+/// Whether any process is left in process group `pgid`.
+fn group_alive(pgid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", "--", &format!("-{pgid}")])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// D4, audit finding 5: the session runs in a process group of its own,
+/// which its entering record names. A session whose ohjaa was killed while
+/// its agent runs on is still running, not orphaned; once the agent is gone
+/// too, it is closed as orphaned.
+#[test]
+fn a_session_whose_agent_outlives_its_killed_ohjaa_is_still_running_not_orphaned() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("still-running");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let agent_pid = fixture.dir.join("agent.pid");
+    let mut child = spawn_session(
+        &fixture,
+        &repo,
+        // Written whole, then moved into place: never read half written.
+        &format!(
+            "echo $$ > '{0}.new'; mv '{0}.new' '{0}'; exec sleep 60",
+            agent_pid.display()
+        ),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !agent_pid.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let agent: u32 = fs::read_to_string(&agent_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The group is recorded just after the spawn: wait for that write.
+    let entering = loop {
+        let entering = export_of(&fixture, &repo)["sessions"][0].clone();
+        if entering.get("pgid").is_some() || std::time::Instant::now() > deadline {
+            break entering;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let id = entering["id"].as_str().unwrap().to_owned();
+    let pgid = entering["pgid"]
+        .as_u64()
+        .expect("the group, in the entering record") as u32;
+    assert_eq!(
+        pgid, agent,
+        "the agent leads its own group (toimija execs it)"
+    );
+    signal(child.id(), "KILL");
+    let _ = child.wait();
+    assert!(group_alive(pgid), "the agent outlives its ohjaa");
+
+    // The next launch sees the agent still at work: still running, not orphaned.
+    let launch = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["run", "sh", "--intent", "next", "--", "-c", "exit 0"])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .current_dir(&repo),
+        )
+    };
+    let (_, stderr, code) = launch();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!("ohjaa: session {id} (sh, started "))
+            && stderr.contains(&format!(
+                "is still running in process group {pgid}, but the ohjaa that started it is \
+                 gone; it is left open"
+            )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("closed as orphaned"), "{stderr}");
+    let briefing = fixture.argv().join("\n");
+    assert!(
+        briefing.contains(&format!("STILL RUNNING: session {id} (sh, long)")),
+        "{briefing}"
+    );
+    let export = export_of(&fixture, &repo);
+    let first = export["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id.as_str())
+        .unwrap()
+        .clone();
+    assert!(first.get("left").is_none(), "still open: {first:#}");
+    // The report says the same, as its own state.
+    let (stdout, _, _) = output_of(
+        fixture
+            .ohjaa()
+            .arg("--root")
+            .arg(&fixture.dir)
+            .args(["report", "--json", "--marks"])
+            .current_dir(&repo),
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let state = report["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id.as_str())
+        .map(|s| s["state"].clone());
+    assert_eq!(state, Some(serde_json::json!("ohjaa_gone")), "{report:#}");
+
+    // The agent ends too: now it is an orphan.
+    signal(agent, "KILL");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while group_alive(pgid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (_, stderr, code) = launch();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!("ohjaa: session {id} (sh, started "))
+            && stderr.contains("was left open by an ohjaa that is gone; closed as orphaned"),
+        "{stderr}"
+    );
+    let export = export_of(&fixture, &repo);
+    let first = export["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(first["left"]["orphaned"], true, "{first:#}");
+    fixture.cleanup();
+}
+
+/// Nit 1 of the review of #45: a process the agent left behind in the
+/// session's group (a background shell, a server) does not keep a session
+/// running whose ohjaa and agent are gone: the group's leader decides.
+#[test]
+fn a_process_left_in_the_group_does_not_keep_a_dead_session_running() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("stray");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let (pids, stray) = (fixture.dir.join("agent.pid"), fixture.dir.join("stray.pid"));
+    let mut child = spawn_session(
+        &fixture,
+        &repo,
+        // Written whole, then moved into place: never read half written.
+        &format!(
+            "sleep 60 & echo $! > '{1}.new'; mv '{1}.new' '{1}'; \
+             echo $$ > '{0}.new'; mv '{0}.new' '{0}'; exec sleep 60",
+            pids.display(),
+            stray.display()
+        ),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !pids.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let read = |path: &Path| -> u32 { fs::read_to_string(path).unwrap().trim().parse().unwrap() };
+    let (agent, left_behind) = (read(&pids), read(&stray));
+    let entering = loop {
+        let entering = export_of(&fixture, &repo)["sessions"][0].clone();
+        if entering.get("pgid").is_some() || std::time::Instant::now() > deadline {
+            break entering;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let id = entering["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        entering["pgid"].as_u64(),
+        Some(u64::from(agent)),
+        "{entering:#}"
+    );
+    signal(child.id(), "KILL");
+    let _ = child.wait();
+    signal(agent, "KILL");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while Command::new("kill")
+        .args(["-0", &agent.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        group_alive(agent),
+        "what the agent left behind is still in its group"
+    );
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent", "next", "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    signal(left_behind, "KILL");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!("ohjaa: session {id} (sh, started "))
+            && stderr.contains("was left open by an ohjaa that is gone; closed as orphaned"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("still running"), "{stderr}");
+    fixture.cleanup();
+}
+
+/// Nit 2 of the review of #45: the session's group is in its entering record
+/// before toimija runs at all, so an ohjaa killed the moment toimija starts
+/// still leaves a record that names the group: the next launch sees the
+/// agent still running, never an orphan.
+#[test]
+fn the_group_is_recorded_before_toimija_runs() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("window");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    let pids = fixture.dir.join("agent.pid");
+    let mut ohjaa = fixture
+        .ohjaa()
+        .args([
+            "run",
+            "sh",
+            "--intent",
+            "window",
+            "--no-briefing",
+            "--",
+            "-c",
+        ])
+        .arg(format!(
+            "echo $$ > '{0}.new'; mv '{0}.new' '{0}'; exec sleep 60",
+            pids.display()
+        ))
+        .env("OHJAA_STUB_RUN_AGENT", "1")
+        .env("OHJAA_STUB_KILL_PARENT", "1")
+        .current_dir(&repo)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = ohjaa.wait();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !pids.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let agent: u32 = fs::read_to_string(&pids).unwrap().trim().parse().unwrap();
+    let entering = export_of(&fixture, &repo)["sessions"][0].clone();
+    assert_eq!(
+        entering["pgid"].as_u64(),
+        Some(u64::from(agent)),
+        "the group, recorded before toimija ran: {entering:#}"
+    );
+    let (_, stderr, _) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "sh", "--intent", "next", "--", "-c", "exit 0"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    signal(agent, "KILL");
+    assert!(
+        stderr.contains("is still running in process group"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("closed as orphaned"), "{stderr}");
+    fixture.cleanup();
+}
+
+/// D4, audit finding 3: a phase whose receipt reused tasks from sykli's
+/// cache is said so in the record and the next briefing; cached is never
+/// folded into passed.
+#[test]
+fn a_receipt_that_reused_cached_tasks_is_said_so() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("cached-phase");
+    let repo = fixture.make_git_repo("work");
+    let script = r#"set -e
+        echo one > one; git add one; git commit -q -m one
+        tree=$(git rev-parse 'HEAD^{tree}')
+        mkdir -p .sykli/receipts
+        printf '{"schema":"sykli-receipt.v1","outcome":"passed","started_at_ms":%s000,"subject":{"tree_oid":"%s","head_tree_oid":"%s","dirty":false},"tasks":[{"name":"a","outcome":"passed"},{"name":"b","outcome":"cached"}]}' "$(date +%s)" "$tree" "$tree" > .sykli/receipts/rcpt_one.json
+        echo two > two; git add two; git commit -q -m two
+        tree=$(git rev-parse 'HEAD^{tree}')
+        printf '{"schema":"sykli-receipt.v1","outcome":"cached","started_at_ms":%s000,"subject":{"tree_oid":"%s","head_tree_oid":"%s","dirty":false},"tasks":[{"name":"a","outcome":"cached"},{"name":"b","outcome":"cached"}]}' "$(date +%s)" "$tree" "$tree" > .sykli/receipts/rcpt_two.json"#;
+    let (_, stderr, code) = run_session(&fixture, &repo, script);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("receipt: passed (1 of 2 tasks cached)")
+            && stderr.contains("receipt: cached (all 2 tasks cached)"),
+        "{stderr}"
+    );
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("brief").current_dir(&repo));
+    assert!(
+        stdout.contains(
+            "- work: 2 commit(s), 1 whose sykli receipt says passed (1 reusing cached tasks), \
+             1 whose receipt says cached (no task run)"
+        ),
+        "{stdout}"
+    );
     fixture.cleanup();
 }

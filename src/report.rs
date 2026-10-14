@@ -51,7 +51,11 @@ pub struct Untold {
     pub no_readback: bool,
     pub no_handover: bool,
     /// Its ohjaa was gone before leaving: it could testify to nothing after.
+    /// For a session still open, its ohjaa and its process group are gone
+    /// now (the next launch closes it as orphaned).
     pub orphaned: bool,
+    /// Still open: its ohjaa is gone, but its own process group still runs.
+    pub ohjaa_gone: bool,
 }
 
 /// A commit on a default branch without passing evidence.
@@ -67,6 +71,9 @@ pub struct Judged {
     pub repos: usize,
     pub commits: usize,
     pub verified: usize,
+    /// Of the verified, those whose receipt reused tasks from sykli's cache:
+    /// said apart, never folded into a run that passed.
+    pub verified_reusing_cache: usize,
     pub no_contract: usize,
     /// Made in a checkout that is gone, with its receipts, and none kept.
     pub gone: usize,
@@ -231,7 +238,7 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
         }
     }
     let proposals = waiting(dirs);
-    let open = open_sessions(&logged, since_ms, now_ms);
+    let open = open_sessions(&logged, since_ms, now_ms, sessions::observe_open);
     let natives = if window {
         native_sessions(since_ms, now_ms, &mut gaps).map(|listed| {
             let (judgeable, mut natives) = listed;
@@ -288,24 +295,38 @@ fn waiting(dirs: &Dirs) -> Result<Vec<Waiting>, String> {
         .collect())
 }
 
-/// Sessions in the log that never ended, and those closed as orphaned
-/// (their ohjaa was gone) that started in the window, oldest first.
-pub fn open_sessions(logged: &[Session], since_ms: i64, now_ms: i64) -> Vec<Untold> {
+/// Sessions in the log that never ended, each as `observe` finds it now (its
+/// ohjaa running, gone while its process group runs on, or both gone), and
+/// those closed as orphaned (their ohjaa was gone) that started in the
+/// window, oldest first.
+pub fn open_sessions(
+    logged: &[Session],
+    since_ms: i64,
+    now_ms: i64,
+    observe: impl Fn(&Session) -> sessions::Open,
+) -> Vec<Untold> {
     let mut open: Vec<Untold> = logged
         .iter()
         .filter(|s| match &s.left {
             None => true,
             Some(left) => left.orphaned && s.started_ms > since_ms && s.started_ms <= now_ms,
         })
-        .map(|s| Untold {
-            id: s.id.clone(),
-            agent: s.agent.clone(),
-            repo: s.repo.clone(),
-            intent: s.intent.clone(),
-            started_ms: s.started_ms,
-            no_readback: s.readback.is_none(),
-            no_handover: s.handover.is_none(),
-            orphaned: s.left.as_ref().is_some_and(|left| left.orphaned),
+        .map(|s| {
+            let now = match s.left {
+                None => observe(s),
+                Some(_) => sessions::Open::Orphaned,
+            };
+            Untold {
+                id: s.id.clone(),
+                agent: s.agent.clone(),
+                repo: s.repo.clone(),
+                intent: s.intent.clone(),
+                started_ms: s.started_ms,
+                no_readback: s.readback.is_none(),
+                no_handover: s.handover.is_none(),
+                orphaned: now == sessions::Open::Orphaned,
+                ohjaa_gone: now == sessions::Open::OhjaaGone,
+            }
         })
         .collect();
     open.sort_by_key(|s| s.started_ms);
@@ -359,7 +380,15 @@ fn default_branches(
         for on in commits {
             judged.commits += 1;
             match &on.check {
-                Check::Passed => judged.verified += 1,
+                Check::Passed => {
+                    judged.verified += 1;
+                    if sykli
+                        .proof(&on.commit)
+                        .is_some_and(|proof| proof.cached > 0)
+                    {
+                        judged.verified_reusing_cache += 1;
+                    }
+                }
                 Check::Failed { .. } | Check::Unchecked | Check::OtherContract { .. } => unproven
                     .push(Unproven {
                         repo: repo.to_string_lossy().into_owned(),
@@ -429,6 +458,7 @@ pub fn untold(logged: &[Session], since_ms: i64, now_ms: i64) -> Vec<Untold> {
             no_readback: s.readback.is_none(),
             no_handover: s.handover.is_none(),
             orphaned: s.left.as_ref().is_some_and(|left| left.orphaned),
+            ohjaa_gone: false,
         })
         .collect()
 }
@@ -685,7 +715,14 @@ fn missing(u: &Untold) -> String {
 
 /// What was read of the default branches and not listed, by why.
 fn not_judged(j: &Judged) -> String {
-    let mut parts = vec![format!("{} verified", j.verified)];
+    let mut parts = vec![if j.verified_reusing_cache > 0 {
+        format!(
+            "{} verified, {} of them reusing cached tasks",
+            j.verified, j.verified_reusing_cache
+        )
+    } else {
+        format!("{} verified", j.verified)
+    }];
     if j.no_contract > 0 {
         parts.push(format!("{} without a sykli contract", j.no_contract));
     }
@@ -878,6 +915,10 @@ pub fn to_json(report: &Report) -> Value {
                     "mark": mark::word(&walked.check),
                     "code": mark::code(&walked.check),
                     "why": mark::why(&walked.check),
+                    // For a proven commit, the accepted receipt's tasks and
+                    // how many of them it reused from sykli's cache.
+                    "tasks": walked.proof.as_ref().map(|proof| proof.tasks),
+                    "cached": walked.proof.as_ref().map(|proof| proof.cached),
                     "author": walked.author,
                     "authored": rfc(walked.authored * 1000),
                     "subject": walked.subject,
@@ -906,7 +947,13 @@ pub fn to_json(report: &Report) -> Value {
             "repo": s.repo,
             "intent": s.intent,
             "started": rfc(s.started_ms),
-            "state": if s.orphaned { "orphaned" } else { "open" },
+            "state": if s.orphaned {
+                "orphaned"
+            } else if s.ohjaa_gone {
+                "ohjaa_gone"
+            } else {
+                "open"
+            },
         })
     };
     json!({
@@ -968,6 +1015,7 @@ fn report_json(report: &Report) -> Value {
             "repositories": j.repos,
             "commits": j.commits,
             "verified": j.verified,
+            "verified_reusing_cache": j.verified_reusing_cache,
             "no_contract": j.no_contract,
             "checkout_gone": j.gone,
             "checkout_gone_merges": j.gone_merges,
@@ -1387,6 +1435,7 @@ mod tests {
             no_readback,
             no_handover: true,
             orphaned: false,
+            ohjaa_gone: false,
         };
         Report {
             since_ms: 0,
@@ -1426,6 +1475,7 @@ mod tests {
             authored: 60,
             subject: format!("subject {sha}"),
             check,
+            proof: None,
         };
         let mut report = sample(Err("vessa is not on PATH".to_owned()));
         report.marks = vec![
@@ -1445,7 +1495,16 @@ mod tests {
                                 why: "refused: outcome".to_owned(),
                             },
                         ),
-                        walked("c1", Check::Passed),
+                        mark::Walked {
+                            // Proven by a receipt that reused one of its two tasks.
+                            proof: Some(crate::sessions::Evidence {
+                                outcome: "passed".to_owned(),
+                                dirty: false,
+                                tasks: 2,
+                                cached: 1,
+                            }),
+                            ..walked("c1", Check::Passed)
+                        },
                     ],
                     ended: mark::Ended::Proven,
                 }),
@@ -1471,6 +1530,7 @@ mod tests {
             no_readback: true,
             no_handover: true,
             orphaned: true,
+            ohjaa_gone: false,
         }];
         let json = to_json(&report);
         let keys = |value: &Value| {
@@ -1504,7 +1564,20 @@ mod tests {
         let commit = &entry["commits"][1];
         assert_eq!(
             keys(commit),
-            "author,authored,code,mark,sha,subject,tree,why"
+            "author,authored,cached,code,mark,sha,subject,tasks,tree,why"
+        );
+        // Additive: the accepted receipt's tasks and how many it reused from
+        // the cache, for a proven commit only.
+        assert_eq!(
+            (&commit["tasks"], &commit["cached"]),
+            (&Value::Null, &Value::Null)
+        );
+        assert_eq!(
+            (
+                &entry["commits"][2]["tasks"],
+                &entry["commits"][2]["cached"]
+            ),
+            (&json!(2), &json!(1))
         );
         assert_eq!(commit["sha"], "c2");
         assert_eq!(commit["tree"], "tree-c2");
@@ -1538,6 +1611,12 @@ mod tests {
             "agent,id,intent,repo,started,state"
         );
         assert_eq!(json["sessions"][0]["state"], "orphaned");
+        // Open, its ohjaa gone while its process group runs on: its own state.
+        report.open[0].orphaned = false;
+        report.open[0].ohjaa_gone = true;
+        assert_eq!(to_json(&report)["sessions"][0]["state"], "ohjaa_gone");
+        report.open[0].ohjaa_gone = false;
+        assert_eq!(to_json(&report)["sessions"][0]["state"], "open");
         assert_eq!(json["report"]["schema"], "ohjaa-report.v1");
         assert_eq!(json["complete"], false, "vessa could not be read");
         // The marks alone: the same keys, no window.

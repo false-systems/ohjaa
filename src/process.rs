@@ -213,6 +213,84 @@ pub fn ohjaa_alive(pid: u32, started_ms: i64) -> Option<bool> {
     }
 }
 
+/// Whether the session's process group `pgid`, made at `started_ms`, still
+/// runs: its leader (`toimija run`, whose pid is the group's id) does. The
+/// agent stays in toimija's group and toimija waits for it, so the leader
+/// outlives the agent; a process the agent left behind in the group (a
+/// background shell, a server) does not keep the session running. A leader
+/// that has exited and not been reaped yet (a zombie) is gone, and a process
+/// with that pid in another group, or one that started after `started_ms`
+/// (a couple of seconds of slack for the clock tick), is another process,
+/// the id reused. `None` when that cannot be told: a group is never
+/// declared gone on a guess.
+pub fn group_alive(pgid: u32, started_ms: i64) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        let leader = libc::pid_t::try_from(pgid).ok().filter(|pgid| *pgid > 1)?;
+        // SAFETY: signal 0 sends nothing; kill(2) only says whether the pid
+        // exists (EPERM: it does, as another user's).
+        let exists = unsafe { libc::kill(leader, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !exists {
+            return Some(false);
+        }
+        let output = run(
+            Command::new("ps").args([
+                "-o",
+                "pid=",
+                "-o",
+                "pgid=",
+                "-o",
+                "etime=",
+                "-o",
+                "stat=",
+                "-p",
+                &pgid.to_string(),
+            ]),
+            None,
+            LOCAL,
+        )
+        .ok()?;
+        if !output.status.success() && output.stdout.is_empty() {
+            // ps ran and found no such process: gone between kill(2) and ps.
+            return Some(false);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        Some(leads(&output.stdout_text(), pgid, started_ms, now))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pgid, started_ms);
+        None
+    }
+}
+
+/// From `ps -o pid= -o pgid= -o etime= -o stat= -p <pgid>` at `now` (unix
+/// seconds): whether the process `pgid` still leads its group, made at
+/// `started_ms`: it runs (not a zombie), in that group, and started no later
+/// than the group was made.
+#[cfg(unix)]
+fn leads(listing: &str, pgid: u32, started_ms: i64, now: i64) -> bool {
+    listing.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(group), Some(elapsed), Some(stat)) = (
+            fields.next().and_then(|pid| pid.parse::<u32>().ok()),
+            fields.next().and_then(|group| group.parse::<u32>().ok()),
+            fields.next().and_then(elapsed_seconds),
+            fields.next(),
+        ) else {
+            return false;
+        };
+        pid == pgid
+            && group == pgid
+            && !stat.starts_with('Z')
+            && now - elapsed <= started_ms.div_euclid(1000) + 2
+    })
+}
+
 /// `ps`'s elapsed time, `[[dd-]hh:]mm:ss`, in seconds.
 fn elapsed_seconds(text: &str) -> Option<i64> {
     let (days, clock) = match text.split_once('-') {
@@ -226,9 +304,48 @@ fn elapsed_seconds(text: &str) -> Option<i64> {
     Some(days * 86_400 + seconds)
 }
 
+/// Whether `help` (a program's `--help`) lists the option `flag`: a line
+/// that begins with it, as clap lists one (`--commit <REV>`, `-c, --commit`).
+/// What its sentences say is never read: they change with any rewording
+/// (sykli#79 reworded the one ohjaa matched), and a sentence that names a
+/// flag is not the flag.
+pub fn names_flag(help: &str, flag: &str) -> bool {
+    help.lines().any(|line| {
+        let line = line.trim_start();
+        let line = match line.as_bytes() {
+            [b'-', short, b',', b' ', ..] if *short != b'-' => line[4..].trim_start(),
+            _ => line,
+        };
+        line.strip_prefix(flag).is_some_and(|rest| {
+            rest.chars()
+                .next()
+                .is_none_or(|next| next.is_whitespace() || matches!(next, '=' | '<' | '['))
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flag_is_named_by_the_line_that_lists_it_never_by_a_sentence() {
+        let help = "Usage: sykli verify [OPTIONS] <RECEIPT>\n\nOptions:\n      \
+                    --commit <REV>  Judge the receipt as evidence for this commit\n      \
+                    --json          Print the verdict as one JSON document\n  \
+                    -h, --help      Print help\n      \
+                    --repo-root=<DIR>\n\n\
+                    With --commit the subject is the commit; --branch is no flag here.\n";
+        for flag in ["--commit", "--json", "--help", "--repo-root"] {
+            assert!(names_flag(help, flag), "{flag}");
+        }
+        // Named in a sentence only, the start of a longer flag, or not at all.
+        for flag in ["--branch", "--comm", "--run"] {
+            assert!(!names_flag(help, flag), "{flag}");
+        }
+        assert!(names_flag("  --run <ID>", "--run"));
+        assert!(!names_flag("  --run-id <ID>", "--run"));
+    }
 
     #[test]
     fn elapsed_times_read_as_ps_writes_them() {
@@ -250,6 +367,55 @@ mod tests {
         let gone = child.id();
         child.wait().unwrap();
         assert_eq!(ohjaa_alive(gone, now), Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_runs_while_its_leader_does_and_is_never_another_group_of_its_id() {
+        let now = 10_000;
+        let leader = "  501   501    01:00 Ss\n";
+        // Its leader started 60 s ago, as the group did.
+        assert!(leads(leader, 501, (now - 60) * 1000, now));
+        // Its leader started 55 s after the group was made: the id was reused.
+        assert!(!leads(leader, 501, (now - 115) * 1000, now));
+        // An exited leader not reaped yet is gone.
+        assert!(!leads(
+            "  501   501    01:00 Z\n",
+            501,
+            (now - 60) * 1000,
+            now
+        ));
+        // That pid, in another group now: another process.
+        assert!(!leads(
+            "  501   777    01:00 S\n",
+            501,
+            (now - 60) * 1000,
+            now
+        ));
+        // No such process listed.
+        assert!(!leads("", 501, 0, now));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_group_is_alive_and_an_ended_one_is_not() {
+        use std::os::unix::process::CommandExt as _;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id();
+        assert_eq!(group_alive(pgid, now), Some(true));
+        // A group recorded long before its leader started is another one.
+        assert_eq!(group_alive(pgid, now - 3_600_000), Some(false));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(group_alive(pgid, now), Some(false));
     }
 
     #[test]

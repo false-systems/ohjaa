@@ -269,7 +269,7 @@ fn sykli_help(sykli: &Path) -> std::result::Result<String, String> {
 fn cannot_judge(help: &str) -> Option<String> {
     let lacking: Vec<&str> = ["--contract", "--branch"]
         .into_iter()
-        .filter(|flag| !help.contains(flag))
+        .filter(|flag| !process::names_flag(help, flag))
         .collect();
     (!lacking.is_empty()).then(|| {
         format!(
@@ -284,12 +284,17 @@ fn cannot_judge(help: &str) -> Option<String> {
 /// for them again, when this sykli has them.
 pub fn facts_for_sykli(help: &str, top: Option<&Path>, common: &Path) -> Vec<OsString> {
     match top {
-        Some(top) if help.contains("--repo-root") && help.contains("--git-common-dir") => vec![
-            "--repo-root".into(),
-            top.as_os_str().to_owned(),
-            "--git-common-dir".into(),
-            common.as_os_str().to_owned(),
-        ],
+        Some(top)
+            if process::names_flag(help, "--repo-root")
+                && process::names_flag(help, "--git-common-dir") =>
+        {
+            vec![
+                "--repo-root".into(),
+                top.as_os_str().to_owned(),
+                "--git-common-dir".into(),
+                common.as_os_str().to_owned(),
+            ]
+        }
         _ => Vec::new(),
     }
 }
@@ -679,10 +684,15 @@ mod tests {
             facts_for_sykli(both, None, common).is_empty(),
             "a bare repository"
         );
-        assert_eq!(cannot_judge("--contract --branch"), None);
-        assert!(cannot_judge("--contract")
-            .unwrap()
-            .contains("names no --branch"));
+        assert_eq!(
+            cannot_judge("  --contract <CONTRACT>\n  --branch <BRANCH>\n"),
+            None
+        );
+        assert!(
+            cannot_judge("  --contract <CONTRACT>  with --branch, exactly that one\n")
+                .unwrap()
+                .contains("names no --branch")
+        );
     }
 
     #[test]

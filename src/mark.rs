@@ -94,6 +94,9 @@ pub struct Walked {
     pub authored: i64,
     pub subject: String,
     pub check: Check,
+    /// For a proven commit, what the receipt sykli accepted says of its run:
+    /// how many tasks it records, and how many it reused from the cache.
+    pub proof: Option<sessions::Evidence>,
 }
 
 /// Why a walk stopped where it did.
@@ -293,6 +296,7 @@ pub fn walk(gate: &Gate, sykli: &Sykli, receipts: &Receipts) -> Result<Marks, St
         }
         let check = sykli.check_gated(gate, commit, tree, receipts, true);
         let proven = check == Check::Passed;
+        let proof = proven.then(|| sykli.proof(commit)).flatten();
         commits.push(Walked {
             commit: commit.to_owned(),
             tree: tree.to_owned(),
@@ -300,6 +304,7 @@ pub fn walk(gate: &Gate, sykli: &Sykli, receipts: &Receipts) -> Result<Marks, St
             authored: authored.parse().unwrap_or(0),
             subject: subject.to_owned(),
             check,
+            proof,
         });
         if proven {
             ended = Some(Ended::Proven);
@@ -400,7 +405,18 @@ pub fn line(marks: &Marks) -> String {
         as_of(marks)
     );
     for walked in &marks.commits {
-        let _ = write!(out, " {} {}", symbol(&walked.check), short(&walked.commit));
+        let _ = write!(
+            out,
+            " {} {}{}",
+            symbol(&walked.check),
+            short(&walked.commit),
+            // A proof that reused sykli's cache is said as one.
+            walked
+                .proof
+                .as_ref()
+                .map(sessions::describe_cached)
+                .unwrap_or_default()
+        );
     }
     match marks.ended {
         Ended::Proven => {}
@@ -521,6 +537,7 @@ mod tests {
                     authored: 0,
                     subject: String::new(),
                     check: check.clone(),
+                    proof: None,
                 })
                 .collect(),
             ended,

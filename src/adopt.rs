@@ -80,7 +80,9 @@ fn sykli_init_takes_a_contract() -> bool {
         .args(["init", "--help"])
         .stdin(std::process::Stdio::null())
         .output()
-        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("--contract"))
+        .is_ok_and(|output| {
+            process::names_flag(&String::from_utf8_lossy(&output.stdout), "--contract")
+        })
 }
 
 pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
