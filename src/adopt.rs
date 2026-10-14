@@ -542,7 +542,23 @@ fn names_set_in(run: &str) -> Vec<String> {
     let mut remaining = run.trim_start();
     let mut exported = Vec::new();
     let mut prefix = 0;
-    while let Some(end) = remaining.find([';', '\n']) {
+    let mut quote = None;
+    // Separators inside quoted values are data, not another export. The
+    // early check above excludes escapes and command substitutions.
+    while let Some(end) = remaining.char_indices().find_map(|(index, c)| {
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            }
+        } else {
+            match c {
+                '\'' | '"' => quote = Some(c),
+                ';' | '\n' => return Some(index),
+                _ => {}
+            }
+        }
+        None
+    }) {
         let line = &remaining[..end];
         if line.contains(['&', '|', '<', '>']) {
             break;
@@ -1176,7 +1192,7 @@ mod tests {
 
     /// More commands, beyond the review's: what certainly says where every
     /// cargo builds, and what only nearly does.
-    const MORE: [(&str, &[&str]); 33] = [
+    const MORE: [(&str, &[&str]); 39] = [
         // Certain, for every cargo.
         ("cargo test --target-dir t", NOTHING),
         (
@@ -1237,6 +1253,30 @@ mod tests {
         ("\"CARGO_TARGET_DIR\"=t cargo test", BOTH),
         ("cargo test 2>&1 | CARGO_TARGET_DIR=t tee log", BOTH),
         ("CARGO_TARGET_DIR=t sh -c 'cargo test'", BOTH),
+        (
+            "export NOTE='example; export CARGO_TARGET_DIR=chosen'; cargo test",
+            BOTH,
+        ),
+        (
+            "export NOTE=\"example; export CARGO_TARGET_DIR=chosen\"; cargo test",
+            BOTH,
+        ),
+        (
+            "export NOTE='example\nexport CARGO_TARGET_DIR=chosen'\ncargo test",
+            BOTH,
+        ),
+        (
+            "export NOTE=\"example\nexport CARGO_TARGET_DIR=chosen\"\ncargo test",
+            BOTH,
+        ),
+        (
+            "export CARGO_TARGET_DIR='chosen;directory'; cargo test",
+            NOTHING,
+        ),
+        (
+            "export CARGO_TARGET_DIR=\"chosen\ndirectory\"\ncargo test",
+            NOTHING,
+        ),
     ];
 
     #[test]
