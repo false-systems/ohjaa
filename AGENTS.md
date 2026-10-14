@@ -30,7 +30,7 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   scope directories plus proposals waiting for a person, is the truth and lives
   in git. The **session log**, in redb at `$XDG_STATE_HOME/ohjaa/sessions.redb`,
   is machine-local history of what each session was briefed, read back,
-  committed, finished and handed over, plus explicitly attributed usage receipts and references to the validations `ohjaa gate` requested (sykli's run ids and receipts, never outcomes) — deleting it loses no knowledge, it never
+  committed, finished and handed over, plus explicitly attributed usage receipts, references to the validations `ohjaa gate` and ohjaa itself requested (sykli's run ids and receipts, never outcomes), and the Judgements `ohjaa judge` recorded with their answers (each written once, never changed) — deleting it loses no knowledge, it never
   blocks a launch, and a broken log is reported, never replaced. Everything
   else — fleet, perimeter, coverage, marks — is derived now and stored never. No
   knowledge index, no cache, no daemon.
@@ -45,14 +45,20 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   a marked block in git's global excludes file and one line of `~/.zshrc`,
   records each before making it, and `apply --undo` puts them back; `ohjaa
   adopt` writes only in the home. Nothing is installed on or written into a
-  repository, and the dispatcher always runs a repository's own hooks after
-  observing.
+  repository but two things git keeps beside it: a Judgement's note, a data
+  ref (`refs/notes/ohjaa/judgements`), pushed only when asked; and a
+  checkout of a landed commit to validate, a linked worktree kept in ohjaa's
+  state directory. No file, hook or config of a repository is written, and
+  the dispatcher always runs a repository's own hooks after observing.
 - **Observe, mark and flag; never refuse for the workflow.** A push to an
   entry's branch is handed to sykli and, when sykli does not prove it,
   pushed and flagged, never stopped; only a repository's own hooks refuse.
   Each commit on that branch is marked proven, failed or unproven from the
   receipts on disk, and a briefing opens with the flag while the branch is
-  not proven at its tip.
+  not proven at its tip. A landing on it whose tree sykli has no current
+  receipt of is validated as the integrated State (a durable sykli run,
+  recorded before it is asked for), and a candidate validated on a base the
+  branch has moved from since is flagged, never refused.
 - **`ohjaa run` stays the parent of the session until it ends**, so leaving
   always writes its record, whatever the exit. Session states are observed, not
   declared: the agent's lifecycle testimony is its read-back (`ohjaa oriented`)
@@ -67,10 +73,13 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   Knowledge is not a message — it carries its time, its why and whose it is. A
   session's handover is a record for whoever comes next, shown in the next
   briefing, never a message to a particular agent.
-- **Network only through `gh` and the drafter** — in `ohjaa intake` (review
-  comments, drafting) and when a session leaves (its branch's pull request,
-  bounded, recorded as unknown when gh cannot say). Every other command works
-  from the filesystem and local CLIs.
+- **Network only through `gh`, the drafter and the Judgements' notes ref** —
+  in `ohjaa intake` (review comments, drafting), when a session leaves (its
+  branch's pull request, bounded, recorded as unknown when gh cannot say), and
+  `git push` or `git fetch` of `refs/notes/ohjaa/judgements` only when asked
+  (`ohjaa judge --push` or an entry's `push_judgements`, for an entry that
+  shares them; `ohjaa judgements --fetch`). Every other command works from the
+  filesystem and local CLIs.
 - Failed coverage is never rendered as an empty result. If a scan could not
   look, it says so and exits non-zero.
 
@@ -82,6 +91,9 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 - Inside an `ohjaa run` session: read back with `ohjaa oriented` before your
   first change, and write the handover with `ohjaa handover` before you finish.
   Never write another session's testimony.
+- Never judge a Change you made, and never work around `ohjaa judge`'s law-2
+  refusal (another identity, another session's id). Answer a Judgement with
+  `ohjaa judge respond`; never edit or remove one.
 - Never edit `vendor/faija-knowledge/`; refresh it with
   `scripts/vendor-faija-knowledge.sh`. The format belongs to faija.
 - Tests must never read or write the person's real knowledge: the CLI tests
