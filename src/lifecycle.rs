@@ -3786,47 +3786,107 @@ mod tests {
     }
 
     #[test]
-    fn a_json_verdict_proves_only_the_commit_it_judged_on_every_tier() {
+    fn a_json_verdict_proves_the_receipts_identity_for_the_commit_and_its_claimed_outcome() {
         let commit = "c0ffee";
-        let document = |schema: &str, kind: &str, verified: bool, tiers: &str| {
+        let identity = r#""schema","contract","source","consistency""#;
+        let today = r#""schema","contract","source","consistency","outcome""#;
+        let outcome = |claimed: &str, ok: bool| {
             format!(
-                r#"{{"schema":"{schema}","subject":{{"kind":"{kind}","rev":"{commit}"}},"verified":{verified},"exit":0,"trust":{{"established":[{tiers}],"not_established":["provenance","producer","execution"]}}}}"#
+                r#"{{"name":"outcome","ok":{ok},"expected":"passed or cached with complete task records","actual":"{claimed} with 2 task records"}}"#
             )
         };
-        let all = r#""schema","contract","source","consistency","outcome""#;
-        assert_eq!(
-            proves(
-                document("sykli-verify.v1", "commit", true, all).as_bytes(),
-                commit
-            ),
-            Ok(())
-        );
-        let without_source = r#""schema","contract","consistency","outcome""#;
+        // schema, subject kind, verified, established, not established, checks.
+        let document = |schema: &str,
+                        kind: &str,
+                        verified: bool,
+                        tiers: &str,
+                        not: &str,
+                        checks: &str| {
+            format!(
+                r#"{{"schema":"{schema}","subject":{{"kind":"{kind}","rev":"{commit}"}},"verified":{verified},"exit":0,"checks":[{checks}],"trust":{{"established":[{tiers}],"not_established":[{not}]}}}}"#
+            )
+        };
+        let unsigned = r#""provenance","producer","execution""#;
+        let claim = r#""outcome","provenance","producer","execution""#;
+        let passed = outcome("passed", true);
+        // sykli main today lists the outcome as established; sykli as it is
+        // moving to does not: it is the receipt's claim. Both prove it, as
+        // claimed, passed or cached.
+        for (tiers, not, checks) in [
+            (today, unsigned, passed.clone()),
+            (identity, claim, passed.clone()),
+            (identity, claim, outcome("cached", true)),
+        ] {
+            let verdict = document("sykli-verify.v1", "commit", true, tiers, not, &checks);
+            assert_eq!(proves(verdict.as_bytes(), commit), Ok(()), "{verdict}");
+        }
         let refused = [
             (
-                document("sykli-verify.v2", "commit", true, all),
+                document("sykli-verify.v2", "commit", true, today, unsigned, &passed),
                 "sykli-verify.v2",
             ),
             (
-                document("sykli-verify.v1", "checkout", true, all),
+                document(
+                    "sykli-verify.v1",
+                    "checkout",
+                    true,
+                    today,
+                    unsigned,
+                    &passed,
+                ),
                 "not the commit",
             ),
             (
-                document("sykli-verify.v1", "commit", false, all),
+                document("sykli-verify.v1", "commit", false, today, unsigned, &passed),
                 "verified",
             ),
+            // An identity tier missing, whatever is said of the outcome.
             (
-                document("sykli-verify.v1", "commit", true, without_source),
+                document(
+                    "sykli-verify.v1",
+                    "commit",
+                    true,
+                    r#""schema","contract","consistency","outcome""#,
+                    unsigned,
+                    &passed,
+                ),
                 "source",
+            ),
+            (
+                document(
+                    "sykli-verify.v1",
+                    "commit",
+                    true,
+                    r#""schema","source","consistency""#,
+                    claim,
+                    &passed,
+                ),
+                "contract",
+            ),
+            // No claimed outcome, or one that is not a pass.
+            (
+                document("sykli-verify.v1", "commit", true, identity, claim, ""),
+                "outcome",
+            ),
+            (
+                document(
+                    "sykli-verify.v1",
+                    "commit",
+                    true,
+                    identity,
+                    claim,
+                    &outcome("failed", false),
+                ),
+                "failed",
             ),
             ("not json".to_owned(), "no verdict"),
         ];
-        for (document, said) in refused {
-            let why = proves(document.as_bytes(), commit).unwrap_err();
-            assert!(why.contains(said), "{why}");
+        for (verdict, said) in refused {
+            let why = proves(verdict.as_bytes(), commit).unwrap_err();
+            assert!(why.contains(said), "{said}: {why}");
         }
         // Another commit's verdict proves nothing of this one.
-        let other = document("sykli-verify.v1", "commit", true, all);
+        let other = document("sykli-verify.v1", "commit", true, today, unsigned, &passed);
         assert!(proves(other.as_bytes(), "beef").is_err());
     }
 

@@ -27,9 +27,10 @@ use std::process::{Command, Output};
 /// a receipt that says passed (or cached, as sykli does), and refuses one made under `other-contract`
 /// as a contract mismatch (exit 4). Its `verify --help` names `--commit` and
 /// no sentence ohjaa could lean on; with `$SANDBOX/verify-json` it also names
-/// `--json`, and answers it with a `sykli-verify.v1` verdict (in the schema
-/// and with the established tiers `$SANDBOX/verify-schema` and
-/// `$SANDBOX/verify-established` hold, when they exist). `run` writes its receipt as sykli does,
+/// `--json`, and answers it with a `sykli-verify.v1` verdict (in the schema,
+/// and with the tiers established and not, that `$SANDBOX/verify-schema`,
+/// `$SANDBOX/verify-established` and `$SANDBOX/verify-not-established` hold,
+/// when they exist). `run` writes its receipt as sykli does,
 /// also as `.sykli/receipts/rcpt_<sha256>.json`: one task, passed (with
 /// `$SANDBOX/with-cached` a second one reused from the cache; with
 /// `$SANDBOX/all-cached` both reused, the run `cached`). With STUB_SYKLI_D3 it is the
@@ -172,22 +173,28 @@ case "$1" in
       [ -f "$SANDBOX/verify-json" ] && echo "      --json          print the verdict as one document"
       facts; exit 0
     fi
-    json=""; rev=""; prev=""
+    json=""; rev=""; prev=""; rcpt=$2
     for arg in "$@"; do
       [ "$arg" = --json ] && json=1
       [ "$prev" = --commit ] && rev=$arg
       prev=$arg
     done
-    # With --json, the verdict as sykli-verify.v1 (verified, exit), in the
-    # schema and with the tiers $SANDBOX/verify-schema and
-    # $SANDBOX/verify-established say, when they do.
+    # With --json, the verdict as sykli-verify.v1 (verified, exit, the
+    # receipt's claimed outcome as its `outcome` check), in the schema and
+    # with the tiers $SANDBOX/verify-schema, $SANDBOX/verify-established and
+    # $SANDBOX/verify-not-established say, when they do.
     verdict() {
       [ -n "$json" ] || return 0
       schema=$(cat "$SANDBOX/verify-schema" 2>/dev/null || echo sykli-verify.v1)
       tiers=$(cat "$SANDBOX/verify-established" 2>/dev/null \
         || echo '"schema","contract","source","consistency","outcome"')
-      printf '{"schema":"%s","subject":{"kind":"commit","rev":"%s"},"verified":%s,"exit":%s,"trust":{"established":[%s],"not_established":["provenance","producer","execution"]}}\n' \
-        "$schema" "$rev" "$1" "$2" "$tiers"
+      not=$(cat "$SANDBOX/verify-not-established" 2>/dev/null \
+        || echo '"provenance","producer","execution"')
+      claimed=passed
+      grep -q '"outcome":"cached"' "$rcpt" && claimed=cached
+      grep -q failed "$rcpt" && claimed=failed
+      printf '{"schema":"%s","subject":{"kind":"commit","rev":"%s"},"verified":%s,"exit":%s,"checks":[{"name":"outcome","ok":%s,"expected":"passed or cached with complete task records","actual":"%s with 1 task records"}],"trust":{"established":[%s],"not_established":[%s]}}\n' \
+        "$schema" "$rev" "$1" "$2" "$1" "$claimed" "$tiers" "$not"
     }
     if grep -q other-contract "$2"; then
       verdict false 4; echo "refused: contract expected 1111 but got 2222" >&2; exit 4
@@ -1838,8 +1845,11 @@ impl Sandbox {
 /// that names `--commit` judges the commit alone, whatever else it says; one
 /// that also names `--json` is asked for its `sykli-verify.v1` verdict, and
 /// a commit is proven only where that verified the commit and established
-/// every tier a proof stands on: the schema, the contract, the source (the
-/// commit's tree and inputs), the records' consistency and the outcome.
+/// the receipt's identity: the schema, the contract, the source (the
+/// commit's tree and inputs) and the records' consistency. Its outcome is
+/// the receipt's claim (receipts are unsigned), read from the verdict as
+/// claimed, whether sykli lists the outcome as established (sykli main
+/// today) or not (as sykli is moving to).
 #[test]
 fn a_commit_is_proven_by_sykli_verifys_flags_and_its_json_verdict() {
     let mut sandbox = Sandbox::new("verify-flags");
@@ -1887,6 +1897,36 @@ fn a_commit_is_proven_by_sykli_verifys_flags_and_its_json_verdict() {
     assert!(report.contains(&proven), "{report}");
     let last = verify_calls(&sandbox).pop().unwrap();
     assert!(last.ends_with(&format!("--commit {c1} --json")), "{last}");
+
+    // sykli as it is moving to: the outcome is not established, it is the
+    // receipt's claim. Proven all the same, as claimed.
+    fs::write(
+        sandbox.dir.join("verify-established"),
+        r#""schema","contract","source","consistency""#,
+    )
+    .unwrap();
+    fs::write(
+        sandbox.dir.join("verify-not-established"),
+        r#""outcome","provenance","producer","execution""#,
+    )
+    .unwrap();
+    let report = sandbox.report(&repo);
+    assert!(report.contains(&proven), "{report}");
+
+    // Without the contract, either way: not proven, and said why.
+    fs::write(
+        sandbox.dir.join("verify-established"),
+        r#""schema","source","consistency""#,
+    )
+    .unwrap();
+    let json = sandbox.report_json(&repo);
+    let commit = &json["entries"][0]["commits"][0];
+    assert_eq!(commit["code"], "could_not_say", "{json:#}");
+    assert!(
+        commit["why"].as_str().unwrap().contains("contract"),
+        "{json:#}"
+    );
+    fs::remove_file(sandbox.dir.join("verify-not-established")).unwrap();
 
     // Verified, but without the source: not proven, and said why.
     fs::write(
