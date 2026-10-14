@@ -6,6 +6,7 @@
 //! config in one, its common directory from the layout.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::Result;
 
@@ -14,7 +15,8 @@ use crate::apply::{
 };
 use crate::gitconfig;
 use crate::home::{self, absolute};
-use crate::hook::{dispatcher_target, HOOK_NAMES};
+use crate::hook::{dispatcher_target, facts_for_sykli, HOOK_NAMES};
+use crate::process;
 
 /// Something differs from what `apply` would make it.
 const DRIFT: i32 = 4;
@@ -132,10 +134,13 @@ fn check_dispatchers(
     }
 }
 
-/// KATANA D10: an entry's gate whose cargo tasks say nothing of where cargo
-/// builds lets one worktree's gate run what another built in a shared target
+/// KATANA D10: an entry's gate whose cargo tasks leave a setting unsaid lets
+/// one worktree's gate run what another built in a shared target or build
 /// dir. Drift while the syklis that run it expand `${worktree_cache}` (adopt
-/// would add the lines), a note while one does not.
+/// would add the lines), a note while one does not. And whenever a task names
+/// the placeholder, drift while any sykli that runs the gate does not expand
+/// it: that sykli passes it on as written, and cargo builds in a
+/// `${worktree_cache}/` folder inside the work tree.
 fn check_worktree_cache(
     found: &mut Findings,
     slug: &str,
@@ -152,25 +157,93 @@ fn check_worktree_cache(
             return;
         }
     };
+    let mut expanded = || {
+        expands
+            .get_or_insert_with(|| crate::adopt::sykli_expands_worktree_cache(home))
+            .clone()
+    };
+    let mut passed_on = false;
+    if !tasks.placeholder.is_empty() {
+        if let Err(why) = expanded() {
+            passed_on = true;
+            found.drift(format!(
+                "{slug}: {} name ${{worktree_cache}}, but {why}: it passes the placeholder on as \
+                 written, so cargo builds in a `${{worktree_cache}}/` folder inside the work tree \
+                 (update it; ohjaa adopt --force <its clone> drops the lines meanwhile)",
+                tasks.placeholder.join(", ")
+            ));
+        }
+    }
     if tasks.cargo.is_empty() {
         return;
     }
     if tasks.missing.is_empty() {
-        found.ok(format!(
-            "{slug}: every cargo task declares where it builds (${{worktree_cache}} or its own)"
-        ));
+        if !passed_on {
+            found.ok(format!(
+                "{slug}: every cargo task declares where it builds (${{worktree_cache}} or its \
+                 own)"
+            ));
+        }
         return;
     }
     let lacking = format!(
         "{slug}: {} run cargo without ${{worktree_cache}}: gate runs may share a target dir \
          across worktrees",
-        tasks.missing.join(", ")
+        tasks.lacking()
     );
-    match expands.get_or_insert_with(|| crate::adopt::sykli_expands_worktree_cache(home)) {
+    match expanded() {
         Ok(()) => found.drift(format!("{lacking} (ohjaa adopt --force <its clone>)")),
         Err(why) => found.note(format!(
             "{lacking}, and {why} (update it, then ohjaa adopt --force)"
         )),
+    }
+}
+
+/// An entry's gate against the `sykli.lock` beside it, as sykli judges it
+/// (`sykli validate`). A lock that no longer pins its gate (an adopt cut
+/// short between writing the two, or a hand edit) makes every gate run and
+/// push of the entry refuse it. sykli is run from the entry's clone and
+/// handed its facts when one is under the roots, so it asks git nothing;
+/// else from the entry, where it asks git once.
+fn check_lock(
+    found: &mut Findings,
+    slug: &str,
+    contract: &Path,
+    clone: Option<&(PathBuf, PathBuf)>,
+    help: &mut Option<String>,
+) {
+    if !contract.with_file_name("sykli.lock").is_file() {
+        return;
+    }
+    let mut validate = Command::new("sykli");
+    validate.arg("validate").arg(contract);
+    match clone {
+        Some((top, common)) => {
+            let help = help.get_or_insert_with(|| crate::gate::sykli_help("validate"));
+            validate
+                .args(facts_for_sykli(help, Some(top), common))
+                .current_dir(top);
+        }
+        None => {
+            validate.current_dir(contract.parent().unwrap_or(Path::new("/")));
+        }
+    }
+    let unknown =
+        |why: String| format!("{slug}: whether its sykli.lock pins its gate is unknown: {why}");
+    match process::run(&mut validate, None, process::LOCAL) {
+        Ok(output) if output.status.success() => {
+            found.ok(format!("{slug}: its sykli.lock pins its gate"));
+        }
+        Ok(output) if output.status.code() == Some(1) => found.drift(format!(
+            "{slug}: its gate does not validate against its sykli.lock ({}): every gate run and \
+             push of it is refused (ohjaa adopt --force <its clone>)",
+            output.failure_detail()
+        )),
+        Ok(output) => found.note(unknown(format!(
+            "sykli validate {}",
+            output.failure_detail()
+        ))),
+        Err(error) => found.note(unknown(format!("{error:#}"))),
     }
 }
 
@@ -362,14 +435,31 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
     println!("entries ({}):", home.join("repos").display());
     let mut readable = 0;
     // Whether the syklis that run the gates expand ${worktree_cache}: asked
-    // once, and only when a gate has a cargo task that lacks the lines.
+    // once, and only when a gate has a cargo task that lacks the lines or a
+    // task that names the placeholder.
     let mut expands: Option<std::result::Result<(), String>> = None;
+    // `sykli validate --help`, asked once, when a gate with a lock has a
+    // clone to hand sykli the facts of.
+    let mut validate_help: Option<String> = None;
     for entry in &entries {
         let slug = format!("{}/{}", entry.owner, entry.name);
         match home::read_entry(&entry.dir) {
             Ok(Some(read)) if read.has_contract() => {
                 readable += 1;
                 found.ok(format!("{slug}: observes {}", read.branch));
+                // The entry's clone under the roots, its facts read from its
+                // layout.
+                let clone = gated
+                    .iter()
+                    .find(|clone| clone.entries.contains(&entry.dir))
+                    .and_then(|clone| gitconfig::repo_at(&clone.path).ok());
+                check_lock(
+                    &mut found,
+                    &slug,
+                    &read.contract(),
+                    clone.as_ref(),
+                    &mut validate_help,
+                );
                 check_worktree_cache(&mut found, &slug, &read.contract(), &home, &mut expands);
             }
             Ok(Some(read)) => found.drift(format!(

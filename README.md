@@ -706,7 +706,9 @@ receipts does it start one (the commit's tree) and one `sykli verify`.
 more (HEAD, its tree and the branch tip, for the request); asking sykli about
 a pending run starts none;
 `doctor` two for the machine (`git --version`, the global config with
-includes) and one per clone (its config, with `insteadOf` applied in Rust).
+includes) and one per clone (its config, with `insteadOf` applied in Rust);
+the `sykli validate` it asks of each entry's lock, and the `sykli validate`
+and `sykli lock` of adopt, are handed the clone's facts and start none.
 The briefing's flag costs at most three (the clone's config, which the drift
 warnings share, and one `git log` for the walk) and one `sykli verify`; the
 report's marks, and `report --json --marks`, two per entry (its clone's
@@ -1085,20 +1087,46 @@ git's global config, and takes no lock in the repository.
 (`~/.cargo/config.toml`'s `build.target-dir`, or a build-dir) lets a gate in
 one worktree run a binary another worktree built, and a receipt then claims a
 pass for code that never ran. So `adopt` gives each task of the entry's gate
-whose command runs cargo (a word of it is `cargo`) both of these, in its
-`env`, as sykli's README recommends:
+whose command runs cargo (a word of it is `cargo`) these, in its `env`, as
+sykli's README recommends, one for each of the two places cargo builds in
+(the target dir, and the build dir that holds its intermediate artifacts,
+test binaries among them):
 
 ```json
 "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
 "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
 ```
 
-and, when the gate came with a `sykli.lock`, locks it again (`sykli lock
-<entry>/sykli.json`, in the repository). A task that already names either
-variable (in `env`, in `inherit`, or assigned in its command) is kept as it
-declares it, and a task that runs no cargo (rebar3, make, mise) is never
-touched. Only the entry's copy changes; the repository's own `sykli.json`
-stays as it is, and agents' own cargo commands keep the shared directory.
+A task is given only the line of a place it does not already say, and what
+it says is never overridden. It says the target dir by naming
+`CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR`, and the build dir by naming
+`CARGO_BUILD_BUILD_DIR`: in its `env`, in its `inherit`, or by setting or
+unsetting one in its command where sh does, for every cargo it runs (before
+that command word, or through `env`, or an earlier `export` or `unset`). A
+word that only looks like an assignment says nothing (`echo
+CARGO_TARGET_DIR=x; cargo test` gets both lines), nor does an assignment
+before one cargo of the next (`CARGO_TARGET_DIR=t cargo build; cargo test`),
+and a command inside quotes (`sh -c '…'`) is not read. A line given where
+the command sets the variable itself is overridden by the command's own
+setting wherever that applies. A task that inherits one of
+the two leaves that one to whoever runs the gate, and is given the other, so
+`inherit: ["CARGO_BUILD_BUILD_DIR"]` alone no longer keeps
+`~/.cargo/config.toml`'s shared target dir. A task that runs no cargo
+(rebar3, make, mise) is never touched. Only the entry's copy changes; the
+repository's own `sykli.json` stays as it is, and agents' own cargo commands
+keep the shared directory.
+
+A gate that came with a `sykli.lock` is locked again (`sykli lock
+<entry>/sykli.json`), and only when that lock pins the gate as copied, which
+adopt asks first (`sykli validate <entry>/sykli.json`). Both run in the
+repository, handed `--repo-root` and `--git-common-dir` when sykli takes them,
+so they start no git. A copied lock that does not pin its gate means the
+repository changed `sykli.json` without `sykli lock`, and every gate run
+refuses it: adopt never locks what the repository did not, so it keeps the
+gate as copied, without the lines, and warns that the repository's own lock
+is out of date (when sykli names that lock as the one the gate differs
+from; a gate sykli refuses for another reason is kept as copied too, with
+sykli's reason).
 
 Only when every sykli that runs the gate expands the placeholder: the one on
 PATH and the one the pre-push dispatcher runs (as `apply` recorded it). A
@@ -1107,10 +1135,16 @@ that token, never as a sentence. An older one passes it on as written, and
 cargo would build in a `${worktree_cache}/` folder inside the work tree, so
 then adopt adds nothing and says so. When `sykli lock` fails, the gate is
 kept as copied, with a warning. `ohjaa doctor` flags (drift) a gate whose
-cargo tasks lack the lines while every sykli knows them ("gate runs may share
-a target dir across worktrees"; `ohjaa adopt --force` adds them), and notes it
-while one does not. Adding the lines changes the gate's digest, so receipts
-from before read as another contract's.
+cargo tasks lack a line while every sykli knows them ("gate runs may share a
+target dir across worktrees"; `ohjaa adopt --force` adds them), and notes it
+while one does not. Whenever a task names `${worktree_cache}`, it flags
+(drift) each sykli that runs the gate and does not expand it, by its path: a
+sykli downgraded after adopt builds in the work tree. And it flags an entry
+whose `sykli.lock` does not pin its gate (`sykli validate`, from the entry's
+clone and handed its facts when one is under the roots, else from the entry,
+where sykli asks git once), which an adopt cut short between writing the two
+leaves behind. Adding the lines changes the gate's digest, so receipts from
+before read as another contract's.
 
 ## Independent Judgement
 
