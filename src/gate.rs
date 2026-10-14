@@ -353,7 +353,7 @@ pub fn gate_here(print_only: bool, wait: Duration) -> Result<i32> {
     let request = Request::record(&top, &common, &gate);
     // A sykli with durable runs gets the run detached, and is asked about it
     // by its id.
-    let status_help = if run_help.contains("--detach") {
+    let status_help = if process::names_flag(&run_help, "--detach") {
         lifecycle::sykli_status_help()
     } else {
         lifecycle::StatusHelp::default()

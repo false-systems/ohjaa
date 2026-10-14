@@ -304,9 +304,48 @@ fn elapsed_seconds(text: &str) -> Option<i64> {
     Some(days * 86_400 + seconds)
 }
 
+/// Whether `help` (a program's `--help`) lists the option `flag`: a line
+/// that begins with it, as clap lists one (`--commit <REV>`, `-c, --commit`).
+/// What its sentences say is never read: they change with any rewording
+/// (sykli#79 reworded the one ohjaa matched), and a sentence that names a
+/// flag is not the flag.
+pub fn names_flag(help: &str, flag: &str) -> bool {
+    help.lines().any(|line| {
+        let line = line.trim_start();
+        let line = match line.as_bytes() {
+            [b'-', short, b',', b' ', ..] if *short != b'-' => line[4..].trim_start(),
+            _ => line,
+        };
+        line.strip_prefix(flag).is_some_and(|rest| {
+            rest.chars()
+                .next()
+                .is_none_or(|next| next.is_whitespace() || matches!(next, '=' | '<' | '['))
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flag_is_named_by_the_line_that_lists_it_never_by_a_sentence() {
+        let help = "Usage: sykli verify [OPTIONS] <RECEIPT>\n\nOptions:\n      \
+                    --commit <REV>  Judge the receipt as evidence for this commit\n      \
+                    --json          Print the verdict as one JSON document\n  \
+                    -h, --help      Print help\n      \
+                    --repo-root=<DIR>\n\n\
+                    With --commit the subject is the commit; --branch is no flag here.\n";
+        for flag in ["--commit", "--json", "--help", "--repo-root"] {
+            assert!(names_flag(help, flag), "{flag}");
+        }
+        // Named in a sentence only, the start of a longer flag, or not at all.
+        for flag in ["--branch", "--comm", "--run"] {
+            assert!(!names_flag(help, flag), "{flag}");
+        }
+        assert!(names_flag("  --run <ID>", "--run"));
+        assert!(!names_flag("  --run-id <ID>", "--run"));
+    }
 
     #[test]
     fn elapsed_times_read_as_ps_writes_them() {

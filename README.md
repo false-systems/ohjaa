@@ -311,17 +311,21 @@ landing), which is what a pre-push Boundary gates; and about the commit
 whoever pushed. The commits before a tip are shown as their receipts' word.
 Leaving runs `sykli verify <receipt> --contract sykli.json --commit <sha>` in a
 checkout at that commit with nothing beside it, when there is one, else where
-the receipt is:
+the receipt is. What sykli can do is read from the flags `sykli verify --help`
+lists, never from its sentences: one that lists `--commit` judges the commit
+alone, nothing from the checkout (sykli#67 as merged), and one that also lists
+`--json` is asked for its `sykli-verify.v1` verdict, whose trust tiers say what
+it established:
 
 | sykli says | the record says | flag |
 |---|---|---|
-| exit 0 | `verified: passed` | no |
-| refused the commit's own run (another tree, a dirty run, a failed outcome, contradictory records) | `FAILED sykli verify: …` | **yes** |
-| exit 1, 3 or 4, by a sykli that reads everything from the commit (sykli#67 as merged; its help says "nothing is read from the checkout") | `FAILED sykli verify: …` | **yes** |
-| refused the tree, inputs or contract on disk, by an older sykli in a checkout that is not the commit | `stale: sykli checked the checkout, not the commit` | no |
+| exit 0; with `--json`, a verdict that judged the commit, verified it and established its schema, contract, source, consistency and outcome | `verified: passed` | no |
+| exit 0 with `--json`, but a verdict that does not prove it (another schema, another subject, a tier not established) | `unverified: …` | no |
+| exit 1 or 3: refused the commit (another tree, a dirty run, an input the commit does not have, a failed outcome, contradictory records) | `FAILED sykli verify: …` | **yes** |
+| exit 4: it passed under another contract or lock than the one it is judged by now | `unproven: it passed under another contract than the gate's (…)` | **yes** where it is `origin/<default>`'s tip; otherwise no |
 | exit 2: it could not verify (a bad revision, arguments, not a receipt) | `unverified: sykli verify could not verify: …` | no |
 | any other end: a crash, a kill, no answer in time | `unverified: …` | no |
-| no `--commit` (`sykli verify --help` does not name it) | `unverified: sykli has no --commit` | no |
+| no `--commit` (`sykli verify --help` lists no such flag) | `unverified: sykli has no --commit` | no |
 | — the commit has no sykli contract | `unverified: no sykli contract …` | no |
 | — no receipt names the commit's tree (the commit has a contract) | `unchecked` | **yes** where it is `origin/<default>`'s tip; otherwise no |
 | — no receipt, and the checkout it was made in is gone with its `.sykli/` | `unchecked: … the checkout it was made in is gone` | no: it cannot be observed |

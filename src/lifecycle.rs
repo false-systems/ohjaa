@@ -1713,7 +1713,7 @@ pub fn sykli_with_entries() -> Sykli {
 /// Whether this sykli can bind a receipt to a commit, and why not when it
 /// cannot: for a report to say what it could not check.
 pub fn sykli_cannot_bind(sykli: &Sykli) -> Option<String> {
-    sykli.binds_commits().err()
+    sykli.answer().err()
 }
 
 /// The default branch's references: the remote one first, then the local
@@ -2236,18 +2236,77 @@ pub struct Gate {
     pub common: PathBuf,
 }
 
-/// This machine's sykli, asked at most once per leaving whether it can bind
-/// a receipt to a commit (`sykli verify --commit`).
+/// How a sykli's `verify --commit` gives its verdict, from the flags
+/// `sykli verify --help` lists, never its sentences. Every sykli that has
+/// `--commit` judges the commit alone, nothing from the checkout (sykli#67
+/// as merged; the one that also compared the checkout lived only on that
+/// pull request's branch, and only a sentence told it apart).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// `--json`: a `sykli-verify.v1` document, read by [`proves`].
+    Document,
+    /// Its exit code alone.
+    Exit,
+}
+
+/// The tiers of a `sykli-verify.v1` verdict a proof stands on: the
+/// receipt's schema, the contract it ran under, the source (the commit's
+/// tree and every declared input the run read), its records' consistency,
+/// and the outcome. sykli establishes no provenance, producer or execution
+/// (receipts are unsigned), and a proof here claims none.
+const PROOF_TIERS: [&str; 5] = ["schema", "contract", "source", "consistency", "outcome"];
+
+/// Whether what `sykli verify <receipt> --commit <commit> --json` printed,
+/// exiting 0, proves `commit`: a `sykli-verify.v1` document that judged
+/// that commit, verified it and established every one of [`PROOF_TIERS`].
+/// Else why not, for "sykli could not say".
+fn proves(document: &[u8], commit: &str) -> Result<(), String> {
+    let document: Value = serde_json::from_slice(document)
+        .map_err(|error| format!("sykli verify --json printed no verdict ({error})"))?;
+    let schema = document["schema"].as_str().unwrap_or("no schema");
+    if schema != "sykli-verify.v1" {
+        return Err(format!(
+            "sykli verify answered in {schema}, which this ohjaa does not read; update ohjaa"
+        ));
+    }
+    let subject = &document["subject"];
+    if subject["kind"] != "commit" || subject["rev"].as_str().is_some_and(|rev| rev != commit) {
+        return Err(format!(
+            "sykli verify judged {subject}, not the commit {commit}"
+        ));
+    }
+    if document["verified"] != true {
+        return Err("sykli verify exited 0 without saying verified".to_owned());
+    }
+    let established: Vec<&str> = document["trust"]["established"]
+        .as_array()
+        .map(|tiers| tiers.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let missing: Vec<&str> = PROOF_TIERS
+        .into_iter()
+        .filter(|tier| !established.contains(tier))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "sykli verified it without establishing its {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// This machine's sykli, asked at most once per leaving how it binds a
+/// receipt to a commit (`sykli verify --commit`).
 ///
 /// Made [`Sykli::with_home`], a repository whose origin names an entry in
 /// that workflow home is judged by the entry's gate, not by a contract in the
 /// commit; a commit judged once against a gate is not asked about again.
 #[derive(Debug, Default)]
 pub struct Sykli {
-    /// `Ok(true)`: `--commit` reads everything from the commit (sykli#67 as
-    /// merged); `Ok(false)`: it also checks the checkout on disk.
-    binds_commits: std::cell::OnceCell<Result<bool, String>>,
-    /// `sykli verify --help` names `--repo-root` and `--git-common-dir`.
+    /// How `verify --commit` answers; `Err` when this sykli has none.
+    answer: std::cell::OnceCell<Result<Answer, String>>,
+    /// `sykli verify --help` lists `--repo-root` and `--git-common-dir`.
     takes_facts: std::cell::OnceCell<bool>,
     /// Where entries are looked up; `None` judges every repository by its
     /// own contract.
@@ -2335,10 +2394,11 @@ impl Sykli {
         gate
     }
 
-    /// Ask sykli once whether it can bind a receipt to a commit, and
-    /// whether it takes the repository's facts.
-    fn binds_commits(&self) -> Result<bool, String> {
-        self.binds_commits
+    /// Ask sykli once, by the flags `sykli verify --help` lists, how it
+    /// binds a receipt to a commit, and whether it takes the repository's
+    /// facts.
+    fn answer(&self) -> Result<Answer, String> {
+        self.answer
             .get_or_init(|| {
                 let output = process::run(
                     self.command().args(["verify", "--help"]),
@@ -2351,16 +2411,53 @@ impl Sykli {
                     output.stdout_text(),
                     String::from_utf8_lossy(&output.stderr)
                 );
+                let names = |flag| process::names_flag(&help, flag);
                 let _ = self
                     .takes_facts
-                    .set(help.contains("--repo-root") && help.contains("--git-common-dir"));
-                if help.contains("--commit") {
-                    Ok(help.contains("nothing is read from the"))
-                } else {
-                    Err("sykli has no --commit".to_owned())
+                    .set(names("--repo-root") && names("--git-common-dir"));
+                match (names("--commit"), names("--json")) {
+                    (false, _) => Err("sykli has no --commit".to_owned()),
+                    (true, true) => Ok(Answer::Document),
+                    (true, false) => Ok(Answer::Exit),
                 }
             })
             .clone()
+    }
+
+    /// One `sykli verify <receipt> … --commit <commit>` (`command`, all but
+    /// `--json`): `Passed`, with the proof kept, when sykli proves `commit`
+    /// (by its exit code, or with `--json` its document, see [`proves`]);
+    /// else what it said, as [`verdict`] reads it.
+    fn verify(
+        &self,
+        answer: Answer,
+        mut command: Command,
+        commit: &str,
+        receipt: &Receipt,
+    ) -> Check {
+        if answer == Answer::Document {
+            command.arg("--json");
+        }
+        self.verified.set(self.verified.get() + 1);
+        match process::run(&mut command, None, self.timeout()) {
+            Err(error) => Check::Unverified {
+                why: format!("sykli verify could not run: {error:#}"),
+            },
+            Ok(output) if output.status.success() => {
+                let proven = match answer {
+                    Answer::Exit => Ok(()),
+                    Answer::Document => proves(&output.stdout, commit),
+                };
+                match proven {
+                    Ok(()) => {
+                        self.proved(commit, receipt);
+                        Check::Passed
+                    }
+                    Err(why) => Check::Unverified { why },
+                }
+            }
+            Ok(output) => verdict(output.status.code(), output.failure_detail()),
+        }
     }
 
     /// What the entry's gate says of `commit` (whose tree is `tree`):
@@ -2424,16 +2521,10 @@ impl Sykli {
                 ),
             };
         }
-        match self.binds_commits() {
-            Ok(true) => {}
-            Ok(false) => {
-                return Check::Unverified {
-                    why: "this sykli's verify --commit reads the checkout too; update sykli"
-                        .to_owned(),
-                }
-            }
+        let answer = match self.answer() {
+            Ok(answer) => answer,
             Err(why) => return Check::Unverified { why },
-        }
+        };
         let facts: Vec<&std::ffi::OsStr> = if self.takes_facts.get().copied().unwrap_or(false) {
             vec![
                 "--repo-root".as_ref(),
@@ -2457,34 +2548,18 @@ impl Sykli {
                 }
                 break;
             }
-            self.verified.set(self.verified.get() + 1);
-            let output = process::run(
-                self.command()
-                    .arg("verify")
-                    .arg(&receipt.path)
-                    .arg("--contract")
-                    .arg(&gate.contract)
-                    .args(&facts)
-                    .args(["--commit", commit])
-                    .current_dir(&gate.top),
-                None,
-                self.timeout(),
-            );
-            match output {
-                Err(error) => verdicts.push((
-                    receipt.at,
-                    Check::Unverified {
-                        why: format!("sykli verify could not run: {error:#}"),
-                    },
-                )),
-                Ok(output) if output.status.success() => {
-                    self.proved(commit, receipt);
-                    return Check::Passed;
-                }
-                Ok(output) => verdicts.push((
-                    receipt.at,
-                    verdict(true, true, output.status.code(), output.failure_detail()),
-                )),
+            let mut command = self.command();
+            command
+                .arg("verify")
+                .arg(&receipt.path)
+                .arg("--contract")
+                .arg(&gate.contract)
+                .args(&facts)
+                .args(["--commit", commit])
+                .current_dir(&gate.top);
+            match self.verify(answer, command, commit, receipt) {
+                Check::Passed => return Check::Passed,
+                check => verdicts.push((receipt.at, check)),
             }
         }
         // The runs that failed are their receipts' word, unasked.
@@ -2519,15 +2594,13 @@ impl Sykli {
     }
 
     /// What sykli says about `commit` (whose tree is `tree`) in `repo`:
-    /// `sykli verify <receipt> --contract <contract> --commit <commit>`. It
-    /// runs in a checkout at the commit with nothing beside it when there is
-    /// one (`checkouts`), else in the checkout the receipt is in.
+    /// `sykli verify <receipt> --contract <contract> --commit <commit>`, the
+    /// contract the commit has. It runs in a checkout at the commit with
+    /// nothing beside it when there is one (`checkouts`), else in the
+    /// checkout the receipt is in: there it only resolves the commit.
     ///
-    /// Exit 0 passes it. A refusal of the commit's own run (another tree, a
-    /// dirty run, a failed outcome, contradictory records) fails it, in
-    /// sykli's words. A refusal on the tree, inputs or contract on disk fails
-    /// it only where the checkout is the commit; elsewhere it is stale: a
-    /// sykli that checks the checkout, not the commit. A receipt's own
+    /// sykli proves it (see [`Sykli::verify`]), or refuses it in its own
+    /// words, judging the commit alone ([`verdict`]). A receipt's own
     /// `outcome` is never read as a pass, a sykli that cannot bind a commit
     /// never passes anything, and a commit with no contract cannot be checked.
     /// With no receipt, `alive` says whether the checkout it was made in, and
@@ -2548,13 +2621,13 @@ impl Sykli {
             return self.check_gated(&gate, commit, tree, receipts, alive);
         }
         let candidates = receipts.of(tree);
+        let contract = ["sykli.json", "sykli.rs"]
+            .into_iter()
+            .find(|name| git(repo, &["cat-file", "-e", &format!("{commit}:{name}")]).is_some());
         if candidates.is_empty() {
-            let has_contract = ["sykli.json", "sykli.rs"]
-                .iter()
-                .any(|name| git(repo, &["cat-file", "-e", &format!("{commit}:{name}")]).is_some());
-            return if has_contract && alive {
+            return if contract.is_some() && alive {
                 Check::Unchecked
-            } else if has_contract {
+            } else if contract.is_some() {
                 Check::UncheckedGone
             } else {
                 Check::Unverified {
@@ -2562,9 +2635,14 @@ impl Sykli {
                 }
             };
         }
-        let from_the_commit = match self.binds_commits() {
-            Ok(from_the_commit) => from_the_commit,
+        let answer = match self.answer() {
+            Ok(answer) => answer,
             Err(why) => return Check::Unverified { why },
+        };
+        let Some(contract) = contract else {
+            return Check::Unverified {
+                why: "no sykli contract (sykli.json or sykli.rs) in this commit".to_owned(),
+            };
         };
         let at_commit = checkouts
             .iter()
@@ -2575,58 +2653,16 @@ impl Sykli {
         // of it under another contract, or a failing one, never hides a pass.
         let mut verdicts = Vec::new();
         for receipt in candidates.iter().take(MAX_ASKED) {
-            let (checkout, is_the_commit) = match at_commit {
-                Some(path) => (path, true),
-                None => (receipt.checkout.as_path(), false),
-            };
-            // A sykli that reads everything from the commit takes the contract
-            // from it too; an older one from the checkout on disk.
-            let Some(contract) = ["sykli.json", "sykli.rs"].into_iter().find(|name| {
-                if from_the_commit {
-                    git(repo, &["cat-file", "-e", &format!("{commit}:{name}")]).is_some()
-                } else {
-                    checkout.join(name).is_file()
-                }
-            }) else {
-                verdicts.push((
-                    receipt.at,
-                    Check::Unverified {
-                        why: format!(
-                            "no sykli contract (sykli.json or sykli.rs) in {}",
-                            checkout.display()
-                        ),
-                    },
-                ));
-                continue;
-            };
-            self.verified.set(self.verified.get() + 1);
-            let output = process::run(
-                self.command()
-                    .arg("verify")
-                    .arg(&receipt.path)
-                    .args(["--contract", contract, "--commit", commit])
-                    .current_dir(checkout),
-                None,
-                self.timeout(),
-            );
-            verdicts.push((
-                receipt.at,
-                match output {
-                    Err(error) => Check::Unverified {
-                        why: format!("sykli verify could not run: {error:#}"),
-                    },
-                    Ok(output) if output.status.success() => {
-                        self.proved(commit, receipt);
-                        return Check::Passed;
-                    }
-                    Ok(output) => verdict(
-                        from_the_commit,
-                        is_the_commit,
-                        output.status.code(),
-                        output.failure_detail(),
-                    ),
-                },
-            ));
+            let mut command = self.command();
+            command
+                .arg("verify")
+                .arg(&receipt.path)
+                .args(["--contract", contract, "--commit", commit])
+                .current_dir(at_commit.unwrap_or(&receipt.checkout));
+            match self.verify(answer, command, commit, receipt) {
+                Check::Passed => return Check::Passed,
+                check => verdicts.push((receipt.at, check)),
+            }
         }
         let mut check = settle(verdicts);
         // Said when the cap left receipts unasked: one of them might pass.
@@ -2661,42 +2697,22 @@ fn settle(mut verdicts: Vec<(i64, Check)>) -> Check {
         .map_or(Check::Unchecked, |(_, check)| check)
 }
 
-/// What a non-zero `sykli verify --commit` means. A sykli that reads
-/// everything from the commit (`from_the_commit`) refuses only the commit
-/// itself (exit 1 or 3, the first failing check on stderr), and exit 4 says
-/// the receipt passed under another contract or lock than the one it is
-/// judged by now: not proven, never failed. Exit 2 is that it could not
-/// verify (a bad revision, arguments, not a receipt), and any other end (a
-/// crash, a kill) says nothing about the commit either. One that
-/// still compares the checkout on disk refuses the commit on its own run
-/// (`commit`, `clean`, `submodules`, `outcome`, `records`), but on the tree,
-/// inputs or contract on disk only where the checkout is the commit
-/// (`is_the_commit`): elsewhere that is stale, not the commit's failure.
-fn verdict(from_the_commit: bool, is_the_commit: bool, exit: Option<i32>, why: String) -> Check {
-    if exit == Some(2) {
-        return Check::Unverified {
+/// What a non-zero `sykli verify --commit` means. sykli judges the commit
+/// alone, so it refuses only the commit itself (exit 1 or 3, the first
+/// failing check on stderr), and exit 4 says the receipt passed under
+/// another contract or lock than the one it is judged by now: not proven,
+/// never failed. Exit 2 is that it could not verify (a bad revision,
+/// arguments, not a receipt), and any other end (a crash, a kill) says
+/// nothing about the commit either.
+fn verdict(exit: Option<i32>, why: String) -> Check {
+    match exit {
+        Some(1 | 3) => Check::Failed { why },
+        Some(4) => Check::OtherContract { why },
+        Some(2) => Check::Unverified {
             why: format!("sykli verify could not verify: {why}"),
-        };
-    }
-    if from_the_commit {
-        return match exit {
-            Some(1 | 3) => Check::Failed { why },
-            Some(4) => Check::OtherContract { why },
-            // A crash, a kill or an exit sykli does not document says nothing
-            // about the commit.
-            _ => Check::Unverified {
-                why: format!("sykli verify could not say: {why}"),
-            },
-        };
-    }
-    // sykli names the first check that failed: `refused: <check> expected …`.
-    let refused = why
-        .strip_prefix("refused: ")
-        .and_then(|rest| rest.split_whitespace().next());
-    match refused {
-        Some("commit" | "clean" | "submodules" | "outcome" | "records") => Check::Failed { why },
-        Some("tree" | "inputs" | "contract") if is_the_commit => Check::Failed { why },
-        Some("tree" | "inputs" | "contract") => Check::Stale { why },
+        },
+        // A crash, a kill or an exit sykli does not document says nothing
+        // about the commit.
         _ => Check::Unverified {
             why: format!("sykli verify could not say: {why}"),
         },
@@ -2817,8 +2833,9 @@ pub fn sykli_status_help() -> StatusHelp {
     })
     .unwrap_or_default();
     StatusHelp {
-        runs: help.contains("--run"),
-        facts: help.contains("--repo-root") && help.contains("--git-common-dir"),
+        runs: process::names_flag(&help, "--run"),
+        facts: process::names_flag(&help, "--repo-root")
+            && process::names_flag(&help, "--git-common-dir"),
     }
 }
 
@@ -3736,13 +3753,10 @@ mod tests {
     #[test]
     fn a_refusal_fails_the_commit_only_when_it_is_about_the_commit() {
         let why = |check: &str| format!("refused: {check} expected a but got b");
-        // sykli#67 as merged reads everything from the commit.
+        // sykli judges the commit alone: a refusal is of the commit.
         for (exit, check) in [(1, "outcome"), (3, "commit"), (3, "submodules")] {
             assert!(
-                matches!(
-                    verdict(true, false, Some(exit), why(check)),
-                    Check::Failed { .. }
-                ),
+                matches!(verdict(Some(exit), why(check)), Check::Failed { .. }),
                 "{check}"
             );
         }
@@ -3750,42 +3764,70 @@ mod tests {
         // against this one, and never failed.
         for check in ["contract", "lock"] {
             assert_eq!(
-                verdict(true, true, Some(4), why(check)),
+                verdict(Some(4), why(check)),
                 Check::OtherContract { why: why(check) },
                 "{check}"
             );
         }
         assert!(matches!(
-            verdict(true, true, Some(2), "fatal: bad revision".to_owned()),
+            verdict(Some(2), "fatal: bad revision".to_owned()),
             Check::Unverified { .. }
         ));
         // A sykli that crashed or was killed said nothing about the commit.
         for exit in [None, Some(101), Some(127)] {
             assert!(
                 matches!(
-                    verdict(true, true, exit, "thread 'main' panicked".to_owned()),
+                    verdict(exit, "thread 'main' panicked".to_owned()),
                     Check::Unverified { .. }
                 ),
                 "{exit:?}"
             );
         }
-        // One that still checks the checkout on disk.
-        assert!(matches!(
-            verdict(false, false, Some(3), why("clean")),
-            Check::Failed { .. }
-        ));
-        assert!(matches!(
-            verdict(false, false, Some(3), why("tree")),
-            Check::Stale { .. }
-        ));
-        assert!(matches!(
-            verdict(false, true, Some(3), why("tree")),
-            Check::Failed { .. }
-        ));
-        assert!(matches!(
-            verdict(false, false, Some(4), why("contract")),
-            Check::Stale { .. }
-        ));
+    }
+
+    #[test]
+    fn a_json_verdict_proves_only_the_commit_it_judged_on_every_tier() {
+        let commit = "c0ffee";
+        let document = |schema: &str, kind: &str, verified: bool, tiers: &str| {
+            format!(
+                r#"{{"schema":"{schema}","subject":{{"kind":"{kind}","rev":"{commit}"}},"verified":{verified},"exit":0,"trust":{{"established":[{tiers}],"not_established":["provenance","producer","execution"]}}}}"#
+            )
+        };
+        let all = r#""schema","contract","source","consistency","outcome""#;
+        assert_eq!(
+            proves(
+                document("sykli-verify.v1", "commit", true, all).as_bytes(),
+                commit
+            ),
+            Ok(())
+        );
+        let without_source = r#""schema","contract","consistency","outcome""#;
+        let refused = [
+            (
+                document("sykli-verify.v2", "commit", true, all),
+                "sykli-verify.v2",
+            ),
+            (
+                document("sykli-verify.v1", "checkout", true, all),
+                "not the commit",
+            ),
+            (
+                document("sykli-verify.v1", "commit", false, all),
+                "verified",
+            ),
+            (
+                document("sykli-verify.v1", "commit", true, without_source),
+                "source",
+            ),
+            ("not json".to_owned(), "no verdict"),
+        ];
+        for (document, said) in refused {
+            let why = proves(document.as_bytes(), commit).unwrap_err();
+            assert!(why.contains(said), "{why}");
+        }
+        // Another commit's verdict proves nothing of this one.
+        let other = document("sykli-verify.v1", "commit", true, all);
+        assert!(proves(other.as_bytes(), "beef").is_err());
     }
 
     #[test]
