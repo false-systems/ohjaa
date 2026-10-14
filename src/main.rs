@@ -405,17 +405,22 @@ enum Cmd {
         1  recorded, but not shared: --push did not reach origin\n  \
         2  nothing to judge: the range cannot be resolved, or holds no commit\n  \
         3  refused, nothing recorded: the reviewer made a commit of the Change\n     \
-           (law 2), OHJAA_SESSION names no live session in the log, or --push\n     \
-           for a repository whose Judgements are not shared\n  \
+           (law 2; a process a session left behind is that session); an author\n     \
+           is not ruled out where ohjaa cannot see (it fails closed);\n     \
+           OHJAA_SESSION names no live session in the log; or --push for a\n     \
+           repository whose Judgements are not shared\n  \
         4  not recorded: the session log could not be read or written (busy\n     \
            past 20s, or broken), or the repository or its entry cannot be read\n\n\
         The judge's procedural independence is `established` only when every\n\
         commit of the Change is held by an ended session's record, none the\n\
-        reviewer's; this process runs inside no live session but the reviewer's\n\
-        own; and OHJAA_SESSION is unset (a person, whose git identity is on no\n\
-        commit of the Change) or names that session. Otherwise it is recorded,\n\
-        with `established: false` and each reason: ohjaa cannot tell a person\n\
-        from an agent, and a reflog is the agent's own testimony.\n\n\
+        reviewer's; this process runs inside no session, live or ended, but the\n\
+        reviewer's own live one (the kernel's word on its process group and its\n\
+        ancestors'); and OHJAA_SESSION is unset (a person at a controlling\n\
+        terminal, whose git identity is on no commit of the Change) or names\n\
+        that session. Otherwise it is recorded, with `established: false` and\n\
+        each reason. `established` means no sign of an author, never proof of a\n\
+        person: an agent's process that left every recorded group and took a\n\
+        terminal looks like one, and a reflog is the agent's own testimony.\n\n\
         RANGE is base..head, or a head alone: its base is then where it leaves\n\
         origin's copy of the entry's branch. The evidence considered is what\n\
         `sykli status --commit <head> --contract <gate> --json` names (runs and\n\

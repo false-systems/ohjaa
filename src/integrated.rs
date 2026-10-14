@@ -368,47 +368,73 @@ fn git_ok_in(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// The clone's validation checkout, at exactly `commit` and clean: made
-/// when missing (`git worktree add --detach --force`, so a folder deleted
-/// while still registered is made again); else reset (`checkout -f
-/// --detach`, then `clean -ffdx` of everything but `.sykli/`, where sykli
-/// keeps its receipts), and made again from nothing when the reset fails.
-/// Then verified: HEAD is the commit, and `git status` (untracked and
-/// ignored files too, `.sykli/` aside) says nothing. A run never starts in
-/// another run's leftovers.
+/// The clone's validation checkout, at exactly `commit` and clean. A
+/// checkout there is reset ([`reset_checkout`]) and verified
+/// ([`verify_checkout`]); when either fails, it is made again from nothing
+/// (`git worktree remove --force`, then `git worktree add --detach --force`)
+/// and verified again. A run never starts in another run's leftovers, and a
+/// leftover never blocks validation for good.
 fn ensure_checkout(gate: &Gate, clone: &CloneDir, commit: &str) -> Result<(), String> {
     let checkout = clone.checkout();
-    let mut reset = checkout.join(".git").exists();
-    if reset {
-        let done = git_ok_in(&checkout, &["checkout", "-q", "-f", "--detach", commit])
-            .and_then(|_| git_ok_in(&checkout, &["clean", "-q", "-ffdx", "-e", ".sykli"]));
-        if done.is_err() {
-            reset = false;
-        }
+    if checkout.join(".git").exists()
+        && reset_checkout(&checkout, commit)
+            .and_then(|()| verify_checkout(&checkout, commit))
+            .is_ok()
+    {
+        return Ok(());
     }
-    if !reset {
-        if checkout.exists() {
+    if checkout.exists() {
+        let path = checkout.to_string_lossy().into_owned();
+        let removed = git_ok_in(
+            &gate.top,
+            &["worktree", "remove", "--force", "--force", &path],
+        );
+        if removed.is_err() && checkout.exists() {
             std::fs::remove_dir_all(&checkout)
                 .map_err(|error| format!("cannot remove {}: {error}", checkout.display()))?;
         }
-        std::fs::create_dir_all(&clone.dir)
-            .map_err(|error| format!("cannot create {}: {error}", clone.dir.display()))?;
-        let checkout = checkout.to_string_lossy().into_owned();
-        git_ok_in(
-            &gate.top,
-            &[
-                "worktree", "add", "--detach", "--force", "-q", &checkout, commit,
-            ],
-        )
-        .map_err(|why| format!("git worktree add failed: {why}"))?;
     }
+    std::fs::create_dir_all(&clone.dir)
+        .map_err(|error| format!("cannot create {}: {error}", clone.dir.display()))?;
+    let path = checkout.to_string_lossy().into_owned();
+    git_ok_in(
+        &gate.top,
+        &[
+            "worktree", "add", "--detach", "--force", "-q", &path, commit,
+        ],
+    )
+    .map_err(|why| format!("git worktree add failed: {why}"))?;
+    verify_checkout(&checkout, commit)
+}
+
+/// Reset the checkout to `commit`: `checkout -f --detach`; every submodule
+/// a run initialised taken out again (`submodule deinit -f --all`: its work
+/// tree emptied, ignored files and changes with it, as in a fresh checkout,
+/// and no network: the gate initialises what it needs); then `clean -ffdx`
+/// of everything but sykli's own folder at the top (`/.sykli`, anchored: a
+/// `.sykli` deeper down is a run's leftover like any other).
+fn reset_checkout(checkout: &Path, commit: &str) -> Result<(), String> {
+    git_ok_in(checkout, &["checkout", "-q", "-f", "--detach", commit])?;
+    if checkout.join(".gitmodules").exists() {
+        git_ok_in(checkout, &["submodule", "deinit", "-q", "-f", "--all"])?;
+    }
+    git_ok_in(checkout, &["clean", "-q", "-ffdx", "-e", "/.sykli"])?;
+    Ok(())
+}
+
+/// The checkout is exactly `commit`: HEAD is it; `git status` (untracked and
+/// ignored files too, and changes inside submodules) says nothing but
+/// sykli's folder at the top; and no submodule is populated (`submodule
+/// foreach --recursive`, where there are submodules).
+fn verify_checkout(checkout: &Path, commit: &str) -> Result<(), String> {
     let left = git_ok_in(
-        &checkout,
+        checkout,
         &[
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
             "--ignored",
+            "--ignore-submodules=none",
             "--",
             ".",
             ":(exclude).sykli",
@@ -422,7 +448,21 @@ fn ensure_checkout(gate: &Gate, clone: &CloneDir, commit: &str) -> Result<(), St
             left.lines().next().unwrap_or_default()
         ));
     }
-    match checkout_head(&checkout) {
+    if checkout.join(".gitmodules").exists() {
+        let populated = git_ok_in(
+            checkout,
+            &["submodule", "foreach", "--quiet", "--recursive", "pwd"],
+        )
+        .map_err(|why| format!("its checkout's submodules cannot be read: {why}"))?;
+        if !populated.trim().is_empty() {
+            return Err(format!(
+                "its checkout {} still holds a populated submodule: {}",
+                checkout.display(),
+                populated.lines().next().unwrap_or_default()
+            ));
+        }
+    }
+    match checkout_head(checkout) {
         Some(head) if head == commit => Ok(()),
         head => Err(format!(
             "its checkout {} is at {}, not {commit}",
@@ -699,17 +739,70 @@ fn unconfirmed(requested: &Requested) -> String {
 enum Previous {
     /// Nothing runs there: the checkout may be reset.
     Free(Option<String>),
-    /// sykli says a run there is requested or running: `(run, commit)`.
-    Busy(String, String),
+    /// A run there may still be going: `(run, commit, why)`.
+    Busy(String, String, String),
+}
+
+/// Why sykli's word on a run (`sykli-run-status.v1`) leaves its checkout
+/// busy: the run requested or running; any task still running or any
+/// attempt not finished (a run sykli calls `lost`, its coordinator gone,
+/// may still have one); or any attempt's process group still alive (a task
+/// that left a process behind). `None`: every task and attempt has ended,
+/// and none of their groups is left.
+fn still_going(status: &Value, group_exists: &dyn Fn(u32) -> Option<bool>) -> Option<String> {
+    let state = status["state"].as_str().unwrap_or("unknown");
+    if matches!(state, "requested" | "running") {
+        return Some(format!("sykli says it is {state}"));
+    }
+    for task in status["tasks"].as_array().map_or(&[][..], Vec::as_slice) {
+        let name = task["name"].as_str().unwrap_or("?");
+        if task["state"] == "running" {
+            return Some(format!(
+                "sykli says the run is {state}, its task {name} still running"
+            ));
+        }
+        for attempt in task["attempts"].as_array().map_or(&[][..], Vec::as_slice) {
+            if attempt.is_object() && attempt["outcome"].is_null() {
+                return Some(format!(
+                    "sykli says the run is {state}, an attempt of its task {name} not finished"
+                ));
+            }
+            let Some(group) = attempt["process_group"].as_u64() else {
+                continue;
+            };
+            let Ok(group) = u32::try_from(group) else {
+                continue;
+            };
+            match group_exists(group) {
+                Some(false) => {}
+                Some(true) => {
+                    return Some(format!(
+                        "process group {group} of its task {name} still runs (sykli says the run \
+                         is {state})"
+                    ))
+                }
+                None => {
+                    return Some(format!(
+                        "whether process group {group} of its task {name} still runs cannot be \
+                         told"
+                    ))
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Before the checkout is reset for another run: the newest run handed to
-/// sykli there. Running: the checkout is busy, and nothing is reset under
-/// it. Done: its receipt (which lives in the checkout's `.sykli/`, kept
-/// across resets, until sykli prunes it) is copied into ohjaa's state,
+/// sykli there. While it may still be going, the checkout is busy and
+/// nothing is reset under it (see [`still_going`]); so too while sykli
+/// cannot say what became of it, or cannot be asked. Ended: its receipt
+/// (which lives in the checkout's `.sykli/`, kept across resets, until
+/// sykli prunes it) is copied into ohjaa's state,
 /// `<clone>/receipts/<request>.json`, and recorded with its digest in that
 /// request's `ValidationRef`, so no evidence goes with a checkout. One
-/// `sykli status --run`, only while a run there has no receipt recorded.
+/// `sykli status --run`, only while a run there has no receipt recorded. A
+/// checkout a person removed holds nothing to reset under.
 fn previous_run(log: &Path, clone: &CloneDir, requested: &[Requested], caps: &Caps) -> Previous {
     let checkout = clone.checkout().to_string_lossy().into_owned();
     let Some(last) = requested
@@ -720,20 +813,22 @@ fn previous_run(log: &Path, clone: &CloneDir, requested: &[Requested], caps: &Ca
         return Previous::Free(None);
     };
     let run = last.validation.run.clone().unwrap_or_default();
-    if last.validation.receipt.is_some() || !caps.status.runs {
+    if last.validation.receipt.is_some() || !clone.checkout().exists() {
         return Previous::Free(None);
+    }
+    let busy = |why: String| Previous::Busy(run.clone(), last.validation.commit.clone(), why);
+    if !caps.status.runs {
+        return busy(
+            "this sykli cannot be asked what became of it (no `sykli status --run`)".to_owned(),
+        );
     }
     let common = last.validation.common.as_deref().map(Path::new);
     let status = match lifecycle::sykli_run_status(&clone.checkout(), common, caps.status, &run) {
         Ok(status) => status,
-        Err(why) => {
-            return Previous::Free(Some(format!(
-                "sykli could not say what became of run {run}, the last in it ({why})"
-            )))
-        }
+        Err(why) => return busy(format!("sykli cannot say what became of it ({why})")),
     };
-    if matches!(status["state"].as_str(), Some("requested" | "running")) {
-        return Previous::Busy(run, last.validation.commit.clone());
+    if let Some(why) = still_going(&status, &process::group_exists) {
+        return busy(why);
     }
     let Some(receipt) = lifecycle::receipt_of_status(&status, &clone.checkout()) else {
         return Previous::Free(None);
@@ -815,11 +910,13 @@ fn decide(log: &Path, state: &Path, gate: &Gate, commit: &str, tree: &str, caps:
         Stands::Nothing => {}
     }
     match previous_run(log, &clone, &requested, caps) {
-        Previous::Busy(run, of) => {
+        Previous::Busy(run, of, why) => {
             return Decided::Not(format!(
-                "{said}; the validation checkout is busy with sykli run {run} (of {}), so none \
-                 is asked for now: a later launch asks",
-                short(&of)
+                "{said}; the validation checkout is busy with sykli run {run} (of {}: {why}), so \
+                 none is asked for now and nothing is reset under it: a later launch asks (if \
+                 that run is gone for good, removing {} lets the next launch start afresh)",
+                short(&of),
+                clone.checkout().display()
             ))
         }
         Previous::Free(Some(note)) => said.push_str(&format!("; {note}")),
@@ -1243,6 +1340,38 @@ mod tests {
             ended: true,
             validation,
         }
+    }
+
+    /// A run whose tasks have not all ended, or whose process groups live
+    /// on, keeps its checkout busy, whatever sykli calls the run.
+    #[test]
+    fn a_run_that_may_still_be_going_keeps_its_checkout_busy() {
+        let gone = |_: u32| Some(false);
+        let done = serde_json::json!({"state": "completed", "tasks": [{"name": "t",
+            "state": "passed", "attempts": [{"outcome": "passed", "process_group": 4242}]}]});
+        assert_eq!(still_going(&done, &gone), None);
+        let lost = serde_json::json!({"state": "lost", "tasks": [{"name": "ok",
+            "state": "running", "attempts": [{"outcome": null, "process_group": null}]}]});
+        assert!(still_going(&lost, &gone)
+            .unwrap()
+            .contains("its task ok still running"));
+        let unfinished = serde_json::json!({"state": "lost", "tasks": [{"name": "ok",
+            "state": "lost", "attempts": [{"outcome": null}]}]});
+        assert!(still_going(&unfinished, &gone)
+            .unwrap()
+            .contains("not finished"));
+        let ended = serde_json::json!({"state": "lost", "tasks": [{"name": "ok",
+            "state": "lost", "attempts": [{"outcome": "lost", "process_group": 4242}]}]});
+        assert_eq!(still_going(&ended, &gone), None);
+        let alive = |group: u32| Some(group == 4242);
+        assert!(still_going(&ended, &alive)
+            .unwrap()
+            .contains("process group 4242 of its task ok still runs"));
+        assert!(still_going(&done, &|_| None)
+            .unwrap()
+            .contains("cannot be told"));
+        let running = serde_json::json!({"state": "running", "tasks": []});
+        assert!(still_going(&running, &gone).is_some());
     }
 
     /// The newest request of a commit decides: handed to sykli, or failed

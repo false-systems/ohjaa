@@ -278,11 +278,15 @@ pub struct Provenance {
     /// `OHJAA_SESSION` as the judging process was given it: testimony.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_env: Option<String>,
-    /// The live sessions the judging process was observed to run inside
-    /// (its process group, or an ancestor's, or their ohjaa an ancestor of
-    /// it), innermost first.
+    /// The sessions, live or ended, the judging process was observed to run
+    /// inside (its process group, or an ancestor's, or their ohjaa an
+    /// ancestor of it), innermost first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inside: Vec<String>,
+    /// The judging process had a controlling terminal: without one, a
+    /// person is claimed, not shown.
+    #[serde(default)]
+    pub controlling_terminal: bool,
 }
 
 /// A Judgement of a Change and its exact State.
@@ -709,8 +713,12 @@ fn notes_lock(common: &Path) -> Result<process::FileLock, String> {
     )
 }
 
-/// Notes by the object they annotate: each note's non-empty lines.
-type Notes = BTreeMap<String, Vec<String>>;
+/// One line of a note, as git keeps it: its bytes, never re-encoded (a line
+/// that is not UTF-8 is kept byte for byte, and `\r` stays).
+type Line = Vec<u8>;
+
+/// Notes by the object they annotate: each note's non-blank lines.
+type Notes = BTreeMap<String, Vec<Line>>;
 
 /// Each `refs`' notes (none for a ref that does not exist): `git notes list`
 /// per ref, then every note in one `cat-file --batch`.
@@ -748,12 +756,21 @@ fn notes_of(top: &Path, refs: &[&str]) -> Result<Vec<Notes>, String> {
         .collect())
 }
 
-/// The non-empty lines of each blob asked for, by its id (one `cat-file
+/// The non-blank lines of `bytes`, split at `\n` only, each kept as it is.
+fn split_lines(bytes: &[u8]) -> Vec<Line> {
+    bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// The non-blank lines of each blob asked for, by its id (one `cat-file
 /// --batch`); none for one that is missing or not a blob.
 fn blobs<'a>(
     top: &Path,
     oids: impl Iterator<Item = &'a str>,
-) -> Result<HashMap<String, Vec<String>>, String> {
+) -> Result<HashMap<String, Vec<Line>>, String> {
     let asked: Vec<&str> = oids.collect();
     if asked.is_empty() {
         return Ok(HashMap::new());
@@ -787,14 +804,7 @@ fn blobs<'a>(
             .get(at..at + size)
             .ok_or_else(|| "the notes were cut short".to_owned())?;
         if kind == "blob" {
-            read.insert(
-                oid.to_owned(),
-                String::from_utf8_lossy(content)
-                    .lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-            );
+            read.insert(oid.to_owned(), split_lines(content));
         }
         at += size + 1;
     }
@@ -807,9 +817,10 @@ fn object_id(text: &str) -> bool {
 }
 
 /// Write `notes` as one notes commit by [`NEUTRAL`] on [`NOTES_REF`] (one
-/// `git fast-import`): exactly these notes, with `parents` (none: a new
-/// history; `force` then lets it replace the ref's). Notes are written as
-/// paths, so a note on a commit this clone has not fetched is kept as it is.
+/// `git fast-import`): exactly these notes, each line byte for byte, with
+/// `parents` (none: a new history; `force` then lets it replace the ref's).
+/// Notes are written as paths, so a note on a commit this clone has not
+/// fetched is kept as it is.
 fn write_notes(
     top: &Path,
     notes: &Notes,
@@ -834,12 +845,11 @@ fn write_notes(
         if !object_id(object) || lines.is_empty() {
             continue;
         }
-        let text = format!("{}\n", lines.join("\n"));
-        let _ = write!(
-            stream,
-            "M 100644 inline {object}\ndata {}\n{text}\n",
-            text.len()
-        );
+        let mut text: Vec<u8> = lines.join(&b'\n');
+        text.push(b'\n');
+        let _ = write!(stream, "M 100644 inline {object}\ndata {}\n", text.len());
+        stream.extend_from_slice(&text);
+        stream.push(b'\n');
     }
     stream.extend_from_slice(b"done\n");
     let mut args = vec!["fast-import", "--quiet", "--done"];
@@ -863,7 +873,7 @@ fn tidy(notes: &Notes) -> Notes {
     notes
         .iter()
         .filter_map(|(object, lines)| {
-            let lines: BTreeSet<&String> = lines.iter().collect();
+            let lines: BTreeSet<&Line> = lines.iter().collect();
             (!lines.is_empty()).then(|| (object.clone(), lines.into_iter().cloned().collect()))
         })
         .collect()
@@ -872,7 +882,7 @@ fn tidy(notes: &Notes) -> Notes {
 /// The union of `sides`, line by line, per object: no line of any side is
 /// dropped, and two different lines are both kept, whatever they claim.
 fn union(sides: &[&Notes]) -> Notes {
-    let mut all: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut all: BTreeMap<String, BTreeSet<Line>> = BTreeMap::new();
     for side in sides {
         for (object, lines) in side.iter() {
             all.entry(object.clone())
@@ -884,6 +894,11 @@ fn union(sides: &[&Notes]) -> Notes {
         .filter(|(_, lines)| !lines.is_empty())
         .map(|(object, lines)| (object, lines.into_iter().collect()))
         .collect()
+}
+
+/// How many lines `notes` holds.
+fn count(notes: &Notes) -> usize {
+    notes.values().map(Vec::len).sum()
 }
 
 /// The note lines this machine's log holds for the clone whose common dir
@@ -902,28 +917,77 @@ fn logged_lines(logged: &Logged, common: &Path, names: bool) -> Notes {
         notes
             .entry(judgement.change.head.clone())
             .or_default()
-            .push(note_line(judgement, names));
+            .push(note_line(judgement, names).into_bytes());
     }
     for response in &logged.responses {
         if here.iter().any(|j| j.id == response.judgement) {
             notes
                 .entry(response.head.clone())
                 .or_default()
-                .push(response_line(response, names));
+                .push(response_line(response, names).into_bytes());
         }
     }
     tidy(&notes)
+}
+
+/// The most times a push is tried while origin moves under it, and the
+/// longest it waits between two tries.
+const PUSH_TRIES: u32 = 8;
+const PUSH_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Wait before try `n` (from 1) of a push origin rejected: doubling from
+/// 50 ms, capped, with up to half again as jitter, so clones racing at one
+/// origin spread out.
+fn backoff(n: u32) {
+    let base = std::time::Duration::from_millis(50u64 << n.min(6)).min(PUSH_BACKOFF_CAP);
+    let jitter = u64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos())
+            ^ std::process::id().rotate_left(n),
+    ) % (base.as_millis() as u64 / 2 + 1);
+    std::thread::sleep(base + std::time::Duration::from_millis(jitter));
+}
+
+/// Whether origin refused a push because its ref moved: what `git push
+/// --porcelain` prints for the ref (`!\t<src>:<dst>\t[rejected] …`), or
+/// anything git said of it on stderr. The line that says so, to show.
+fn rejection(output: &process::Output) -> Option<String> {
+    rejection_in(
+        &output.stdout_text(),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// [`rejection`], from what git printed: every line, never only the last
+/// (which is a `hint:`).
+fn rejection_in(stdout: &str, stderr: &str) -> Option<String> {
+    stdout
+        .lines()
+        .chain(stderr.lines())
+        .find(|line| {
+            line.starts_with('!')
+                && (line.contains("rejected")
+                    || line.contains("non-fast-forward")
+                    || line.contains("fetch first")
+                    || line.contains("stale info"))
+                || line.contains("[rejected]")
+        })
+        .map(|line| line.trim().replace('\t', " "))
 }
 
 /// Push [`NOTES_REF`] to origin, and nothing else, as the union of this
 /// clone's notes, origin's (fetched into [`FETCHED_REF`] first) and this
 /// machine's log: no line here or in the log is ever dropped, whatever git's
 /// three-way notes merge would choose (a line changed on one side only wins
-/// there); two lines claiming one id are both kept, and shown as a conflict
-/// by `ohjaa judgements`. The commit pushed has origin's as a parent, so the
-/// push never rewrites origin's. For an entry that is not private, nothing
-/// that is not redacted is published, at the tip or anywhere in the history
-/// the push would send ([`public_check`]). The caller holds the notes lock.
+/// there), and every line is kept byte for byte; two lines claiming one id
+/// are both kept, and shown as a conflict by `ohjaa judgements`. The commit
+/// pushed has origin's as a parent, so the push never rewrites origin's;
+/// when origin moved in between (`git push --porcelain` says rejected), it
+/// is tried again, up to [`PUSH_TRIES`] times with backoff. For an entry
+/// that is not private, nothing that names anyone is published, at origin
+/// already or in what this push would send ([`public_check`]). The caller
+/// holds the notes lock.
 fn push(here: &Here, names: bool, logged: &Logged) -> Result<String, String> {
     let mut tries = 0;
     loop {
@@ -934,18 +998,16 @@ fn push(here: &Here, names: bool, logged: &Logged) -> Result<String, String> {
         let read = notes_of(&here.top, &[NOTES_REF, FETCHED_REF])?;
         let (local, fetched) = (tidy(&read[0]), tidy(&read[1]));
         let ours = logged_lines(logged, &here.common, names);
-        let on_origin: BTreeSet<&str> = fetched.values().flatten().map(String::as_str).collect();
         if !names {
             public_check(
                 &here.top,
                 local_tip.as_deref(),
                 fetched_tip.as_deref(),
                 &[&local, &ours],
-                &on_origin,
+                &fetched,
             )?;
         }
         let merged = union(&[&local, &fetched, &ours]);
-        let count = |notes: &Notes| notes.values().map(Vec::len).sum::<usize>();
         let from_origin = count(&merged) - count(&union(&[&local, &ours]));
         let from_log = count(&union(&[&local, &ours])) - count(&local);
         let behind = match (&local_tip, &fetched_tip) {
@@ -981,32 +1043,52 @@ fn push(here: &Here, names: bool, logged: &Logged) -> Result<String, String> {
         }
         let output = git(
             &here.top,
-            &["push", "-q", "origin", &format!("{NOTES_REF}:{NOTES_REF}")],
+            &[
+                "push",
+                "--porcelain",
+                "origin",
+                &format!("{NOTES_REF}:{NOTES_REF}"),
+            ],
             None,
         )?;
         if output.status.success() {
-            let lines = count(&merged);
             return Ok(format!(
-                "pushed {NOTES_REF} to origin: {lines} line(s) on {} commit(s), the union of \
-                 this clone's, origin's ({from_origin} new here) and the session log's \
-                 ({from_log} re-attached); none dropped",
-                merged.len()
+                "pushed {NOTES_REF} to origin: {} line(s) on {} commit(s), the union of this \
+                 clone's, origin's ({from_origin} new here) and the session log's ({from_log} \
+                 re-attached); none dropped{}",
+                count(&merged),
+                merged.len(),
+                if tries > 1 {
+                    format!(" (origin moved under it; pushed at try {tries})")
+                } else {
+                    String::new()
+                }
             ));
         }
-        let detail = output.failure_detail();
-        // Origin moved between the fetch and the push: once more.
-        if tries < 2 && (detail.contains("rejected") || detail.contains("fetch first")) {
-            continue;
+        match rejection(&output) {
+            // Origin moved between the fetch and the push: again.
+            Some(_) if tries < PUSH_TRIES => backoff(tries),
+            Some(why) => {
+                return Err(format!(
+                    "git push origin {NOTES_REF} was rejected {tries} times, origin moving under \
+                     it each time: {why}"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "git push origin {NOTES_REF} failed: {}",
+                    output.failure_detail()
+                ))
+            }
         }
-        return Err(format!("git push origin {NOTES_REF} failed: {detail}"));
     }
 }
 
 /// Whether a note line may be published for an entry that is not private:
 /// exactly what [`note_line`] or [`response_line`] write without names, and
 /// nothing more. A line that only says `"redacted": true` is not enough.
-pub fn publishable(line: &str) -> bool {
-    let Ok(Value::Object(note)) = serde_json::from_str::<Value>(line) else {
+pub fn publishable(line: &[u8]) -> bool {
+    let Ok(Value::Object(note)) = serde_json::from_slice::<Value>(line) else {
         return false;
     };
     let only = |value: &Value, keys: &[&str]| {
@@ -1148,80 +1230,138 @@ pub fn publishable(line: &str) -> bool {
     }
 }
 
-/// Before a push of an entry that is not private: nothing it would publish
-/// names anyone. Every line of `tips` (this clone's notes, and the lines the
-/// log re-attaches) must be [`publishable`] or on origin already; and so
-/// must every line of every note in the history the push would send (each
-/// notes commit reachable from this clone's tip and not from origin's), each
-/// of those commits by [`NEUTRAL`]. A note removed with `git notes remove`
-/// is still in that history. Two git processes (`log --raw`, `cat-file`).
+/// The notes commits `git log --raw` lists for `range`: how many are not by
+/// [`NEUTRAL`] in `+0000`, and every blob they introduce (a note's every
+/// version, a removed one's too). One git process.
+fn history(top: &Path, range: &[&str]) -> Result<(usize, BTreeSet<String>), String> {
+    let mut args = vec![
+        "log",
+        "--format=%x1e%H%x1f%an%x1f%ae%x1f%ad%x1f%cn%x1f%ce%x1f%cd",
+        "--date=raw",
+        "--raw",
+        "--no-abbrev",
+        "--no-renames",
+        "-m",
+        "--root",
+    ];
+    args.extend_from_slice(range);
+    let text = git_ok(top, &args, None)
+        .map_err(|why| format!("the history of {NOTES_REF} cannot be read: {why}"))?;
+    let mut people = 0;
+    let mut introduced = BTreeSet::new();
+    for line in text.lines() {
+        if let Some(header) = line.strip_prefix('\u{1e}') {
+            let fields: Vec<&str> = header.split('\u{1f}').collect();
+            let neutral = fields.len() == 7
+                && fields[1] == "ohjaa"
+                && fields[2] == "ohjaa@invalid"
+                && fields[3].ends_with(" +0000")
+                && fields[4] == "ohjaa"
+                && fields[5] == "ohjaa@invalid"
+                && fields[6].ends_with(" +0000");
+            if !neutral {
+                people += 1;
+            }
+        } else if let Some(raw) = line.strip_prefix(':') {
+            // `:<mode> <mode> <old> <new> <status>\t<path>`
+            if let Some(new) = raw.split_whitespace().nth(3) {
+                if !new.chars().all(|c| c == '0') {
+                    introduced.insert(new.to_owned());
+                }
+            }
+        }
+    }
+    Ok((people, introduced))
+}
+
+/// Before a push of an entry that is not private: nothing that names anyone
+/// is published, and nothing named already published is republished.
+/// - **Origin first**: every line of its notes at its tip (`fetched`) and in
+///   its whole history, and every notes commit in it, as fetched. Anything
+///   not [`publishable`], or a commit not by [`NEUTRAL`], refuses the push:
+///   a push would publish it again (its union, and a history that holds it),
+///   and only rewriting origin's ref removes it, which is a person's
+///   decision and a force push; the refusal prints the commands, and ohjaa
+///   never runs them.
+/// - **Then this clone**: every line of `tips` (its notes, and the lines the
+///   log re-attaches) must be [`publishable`], and so must every line of
+///   every note in the history the push would send (each notes commit
+///   reachable from this clone's tip and not from origin's), each of those
+///   commits by [`NEUTRAL`]. A note removed with `git notes remove` is still
+///   in that history.
+///
+/// Three git processes: origin's history, the history to send (`log --raw`
+/// each), and their notes (`cat-file`).
 fn public_check(
     top: &Path,
     local_tip: Option<&str>,
     fetched_tip: Option<&str>,
     tips: &[&Notes],
-    on_origin: &BTreeSet<&str>,
+    fetched: &Notes,
 ) -> Result<(), String> {
-    let named = |line: &&String| !on_origin.contains(line.as_str()) && !publishable(line);
+    let (origin_people, origin_blobs) = match fetched_tip {
+        Some(tip) => history(top, &[tip])?,
+        None => (0, BTreeSet::new()),
+    };
+    let (our_people, our_blobs) = match (local_tip, fetched_tip) {
+        (Some(tip), Some(origin)) => history(top, &[tip, "--not", origin])?,
+        (Some(tip), None) => history(top, &[tip])?,
+        (None, _) => (0, BTreeSet::new()),
+    };
+    let read = blobs(
+        top,
+        origin_blobs
+            .iter()
+            .chain(our_blobs.iter())
+            .map(String::as_str),
+    )?;
+    let named_in = |blobs: &BTreeSet<String>| -> BTreeSet<Line> {
+        blobs
+            .iter()
+            .filter_map(|blob| read.get(blob))
+            .flatten()
+            .filter(|line| !publishable(line))
+            .cloned()
+            .collect()
+    };
+    let mut on_origin = named_in(&origin_blobs);
+    on_origin.extend(
+        fetched
+            .values()
+            .flatten()
+            .filter(|line| !publishable(line))
+            .cloned(),
+    );
+    if !on_origin.is_empty() || origin_people > 0 {
+        return Err(format!(
+            "origin already publishes {} note line(s) that are not redacted and {origin_people} \
+             notes commit(s) by people in {NOTES_REF} (pushed while the entry was private, or not \
+             by ohjaa): a push from here would publish them again, so nothing was pushed. Only \
+             rewriting origin's ref removes them; that is a person's decision and a force push, \
+             which ohjaa never makes. From this clone a person would run:\n  \
+             git fetch origin +{NOTES_REF}:{FETCHED_REF}\n  \
+             ohjaa judgements --rebuild-public\n  \
+             git push --force origin {NOTES_REF}:{NOTES_REF}\n\
+             (--rebuild-public keeps every redacted line of this clone and of origin's, and this \
+             machine's Judgements, redacted.) Other clones keep their own copies until each \
+             rebuilds too, and a forge may keep the old commits reachable by id until it \
+             collects them",
+            on_origin.len()
+        ));
+    }
     let at_tip = tips
         .iter()
         .flat_map(|notes| notes.values().flatten())
-        .filter(named)
+        .filter(|line| !publishable(line))
         .count();
-    let (mut in_history, mut by_people) = (0, 0);
-    if let Some(local_tip) = local_tip {
-        let mut args = vec![
-            "log",
-            "--format=%x1e%H%x1f%an%x1f%ae%x1f%ad%x1f%cn%x1f%ce%x1f%cd",
-            "--date=raw",
-            "--raw",
-            "--no-abbrev",
-            "--no-renames",
-            "-m",
-            "--root",
-            local_tip,
-        ];
-        if let Some(fetched_tip) = fetched_tip {
-            args.extend(["--not", fetched_tip]);
-        }
-        let text = git_ok(top, &args, None)
-            .map_err(|why| format!("the history of {NOTES_REF} cannot be read: {why}"))?;
-        let mut introduced: BTreeSet<String> = BTreeSet::new();
-        for line in text.lines() {
-            if let Some(header) = line.strip_prefix('\u{1e}') {
-                let fields: Vec<&str> = header.split('\u{1f}').collect();
-                let neutral = fields.len() == 7
-                    && fields[1] == "ohjaa"
-                    && fields[2] == "ohjaa@invalid"
-                    && fields[3].ends_with(" +0000")
-                    && fields[4] == "ohjaa"
-                    && fields[5] == "ohjaa@invalid"
-                    && fields[6].ends_with(" +0000");
-                if !neutral {
-                    by_people += 1;
-                }
-            } else if let Some(raw) = line.strip_prefix(':') {
-                // `:<mode> <mode> <old> <new> <status>\t<path>`
-                if let Some(new) = raw.split_whitespace().nth(3) {
-                    if !new.chars().all(|c| c == '0') {
-                        introduced.insert(new.to_owned());
-                    }
-                }
-            }
-        }
-        in_history = blobs(top, introduced.iter().map(String::as_str))?
-            .values()
-            .flatten()
-            .filter(named)
-            .count();
-    }
-    if at_tip + in_history + by_people == 0 {
+    let in_history = named_in(&our_blobs).len();
+    if at_tip + in_history + our_people == 0 {
         return Ok(());
     }
     Err(format!(
         "{NOTES_REF} may name people, so it stays on this machine: {at_tip} line(s) at its tip \
          and {in_history} in the history a push would publish are not redacted, and \
-         {by_people} of its commit(s) carry a person's name or time zone (written while the \
+         {our_people} of its commit(s) carry a person's name or time zone (written while the \
          entry was private, by git itself, or not by ohjaa). A note removed with `git notes \
          remove` is still in that history. `ohjaa judgements --rebuild-public` rewrites this \
          clone's notes ref as one commit of redacted lines with no history; the session log \
@@ -1253,14 +1393,11 @@ fn fetch(top: &Path) -> Result<(), String> {
 }
 
 /// The non-empty lines of `commit`'s note under `reference`, as written.
-fn note_lines(top: &Path, reference: &str, commit: &str) -> Vec<String> {
-    let Ok(text) = git_ok(top, &["notes", "--ref", reference, "show", commit], None) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(str::to_owned)
-        .collect()
+fn note_lines(top: &Path, reference: &str, commit: &str) -> Vec<Line> {
+    match git(top, &["notes", "--ref", reference, "show", commit], None) {
+        Ok(output) if output.status.success() => split_lines(&output.stdout),
+        _ => Vec::new(),
+    }
 }
 
 // ---- the Change ----------------------------------------------------------------
@@ -1616,36 +1753,65 @@ impl<'a> Reflogs<'a> {
     }
 }
 
-/// The live sessions (open in the log) that the process `chain` (this one
-/// and its ancestors, nearest first, from the process table `table`) runs
-/// inside, innermost first: one whose recorded process group holds a
-/// process of the chain, or whose ohjaa (the pid in its id) is one of them.
-/// A group or pid the table shows started after the session did is another
-/// process, the id reused (two seconds of slack for the clock tick).
+/// How much later than a session's record says its process group (or its
+/// ohjaa) began a process may have started, and still be it. The kernel's
+/// start times are exact to the microsecond on macOS and to the clock tick
+/// on Linux, and ohjaa records a group just after its leader is forked: a
+/// process id reused a second later is another process.
+const START_SLACK_MS: i64 = 500;
+
+/// The sessions, open **or ended**, that the process `chain` (this one and
+/// its ancestors, nearest first, as the kernel says them) runs inside,
+/// innermost first:
+/// - one whose recorded process group holds a process of the chain (as its
+///   group, or as its session): while the group's leader still exists
+///   (`leader`, asked of the kernel), only if it began no later than the
+///   group was recorded (else the id was reused). With its leader gone, a
+///   group id cannot have been reused while a member lived on, so an open
+///   session's counts; an ended session's counts when the oldest process of
+///   the chain in it began before the session ended: a process its agent
+///   left behind (a background job, a double fork), which is still its;
+/// - or one whose ohjaa (the pid in its id) is in the chain, begun no later
+///   than the session.
+///
+/// A start time the kernel tells only a process's owner is unknown, and
+/// counts toward the session: what cannot be ruled out is not ruled out.
 pub fn sessions_around<'a>(
     all: &'a [Session],
-    table: &[process::Proc],
     chain: &[process::Proc],
-    now_s: i64,
+    leader: &dyn Fn(u32) -> Option<process::Proc>,
 ) -> Vec<&'a Session> {
-    let began_by = |p: &process::Proc, at_ms: i64| now_s - p.elapsed <= at_ms.div_euclid(1000) + 2;
+    let began_by = |started: Option<i64>, by: i64| started.is_none_or(|at| at <= by);
     let mut found: Vec<(usize, &Session)> = Vec::new();
-    for session in all.iter().filter(|s| s.left.is_none()) {
-        let by_group = session
-            .pgid
-            .filter(|group| {
-                table.iter().find(|p| p.pid == *group).is_none_or(|leader| {
-                    began_by(
-                        leader,
-                        session.group_started_ms.unwrap_or(session.started_ms),
-                    )
-                })
-            })
-            .and_then(|group| chain.iter().position(|p| p.pgid == group));
-        let by_ohjaa = sessions::pid_of(&session.id).and_then(|pid| {
-            chain
+    for session in all {
+        let by_group = session.pgid.filter(|group| *group > 1).and_then(|group| {
+            let members: Vec<usize> = chain
                 .iter()
-                .position(|p| p.pid == pid && began_by(p, session.started_ms))
+                .enumerate()
+                .filter(|(_, p)| p.pgid == group || p.sid == group)
+                .map(|(at, _)| at)
+                .collect();
+            let first = *members.first()?;
+            let recorded = session
+                .group_started_ms
+                .unwrap_or(session.started_ms + 1000);
+            match leader(group) {
+                Some(lead) => began_by(lead.started_ms, recorded + START_SLACK_MS).then_some(first),
+                None => match &session.left {
+                    None => Some(first),
+                    Some(left) => members
+                        .iter()
+                        .any(|at| {
+                            began_by(chain[*at].started_ms, left.ended_ms + 1000 + START_SLACK_MS)
+                        })
+                        .then_some(first),
+                },
+            }
+        });
+        let by_ohjaa = sessions::pid_of(&session.id).and_then(|pid| {
+            chain.iter().position(|p| {
+                p.pid == pid && began_by(p.started_ms, session.started_ms + 1000 + START_SLACK_MS)
+            })
         });
         if let Some(at) = by_group.into_iter().chain(by_ohjaa).min() {
             found.push((at, session));
@@ -1656,21 +1822,27 @@ pub fn sessions_around<'a>(
 }
 
 /// Who judges, as observed. The process, not its environment, decides: a
-/// process inside a live session's process group (or below its ohjaa) is
-/// that session's, whatever `OHJAA_SESSION` says or omits; outside every
-/// one, `OHJAA_SESSION` names the session it claims (not shown), and without
-/// it the reviewer is the person git names here. ohjaa cannot tell a person
-/// from an agent running outside every ohjaa session.
+/// process inside a session's process group (or below its ohjaa) is that
+/// session's, whatever `OHJAA_SESSION` says or omits, and so is one an
+/// ended session left behind in its group; outside every one,
+/// `OHJAA_SESSION` names the session it claims (not shown), and without it
+/// the reviewer is the person git names here, shown only as far as this
+/// process has a controlling terminal. ohjaa cannot prove a person is not
+/// an agent: an agent's process that left every recorded group and has a
+/// terminal looks like one.
 struct Observed {
     reviewer: Reviewer,
-    /// Every live session the process runs inside, innermost first.
+    /// Every session the process runs inside, live or ended, innermost
+    /// first.
     inside: Vec<Session>,
     /// `OHJAA_SESSION`, as given.
     claimed: Option<String>,
     /// The session `OHJAA_SESSION` names, when it is not the reviewer.
     claimed_other: Option<Session>,
-    /// Why where the process runs could not be seen.
+    /// Why the process's ancestry could not be read whole.
     unseen: Option<String>,
+    /// The process has a controlling terminal.
+    terminal: bool,
 }
 
 enum Reviewer {
@@ -1682,9 +1854,9 @@ enum Reviewer {
     Person(Identity),
 }
 
-/// Observe who judges: `ps` once, then the log's live sessions. Err: a
-/// refusal (an `OHJAA_SESSION` that names no live session in the log, or no
-/// identity git can name).
+/// Observe who judges, from the kernel: this process's ancestry, then every
+/// session in the log, open or ended. Err: a refusal (an `OHJAA_SESSION`
+/// that names no live session in the log, or no identity git can name).
 fn observe(top: &Path, all: &[Session]) -> Result<Observed, String> {
     let claimed = std::env::var(sessions::SESSION_ENV).ok();
     let claimed_session = match &claimed {
@@ -1708,14 +1880,12 @@ fn observe(top: &Path, all: &[Session]) -> Result<Observed, String> {
         }
         None => None,
     };
-    let (inside, unseen) = match process::table() {
-        Ok(table) => {
-            let chain = process::ancestry(&table);
-            let around = sessions_around(all, &table, &chain, now_ms().div_euclid(1000));
-            (around.into_iter().cloned().collect::<Vec<Session>>(), None)
-        }
-        Err(why) => (Vec::new(), Some(why)),
-    };
+    let (chain, unseen) = process::ancestry();
+    let leader = |pgid: u32| process::proc_of(pgid).ok().flatten();
+    let inside: Vec<Session> = sessions_around(all, &chain, &leader)
+        .into_iter()
+        .cloned()
+        .collect();
     let reviewer = match (inside.first(), &claimed_session) {
         (Some(innermost), _) => Reviewer::Agent {
             session: Box::new(innermost.clone()),
@@ -1739,12 +1909,54 @@ fn observe(top: &Path, all: &[Session]) -> Result<Observed, String> {
         claimed,
         claimed_other,
         unseen,
+        terminal: process::controlling_terminal(),
     })
 }
 
+/// Law 2 where what was observed cannot rule an author out, so ohjaa fails
+/// closed: refused when the process's ancestry could not be read whole and
+/// a session made commits of the Change (or one is open in the clone, which
+/// may have made those no record holds); and when a person is not shown (no
+/// controlling terminal) while the Change holds commits no ended session's
+/// record holds and a session is open in the clone. `open`: the sessions
+/// open in the clone now.
+fn refuse_unshown(observed: &Observed, authors: &Authors, open: &[String]) -> Result<(), String> {
+    let plausible: Vec<&str> = authors
+        .sessions
+        .iter()
+        .map(|s| s.session.as_str())
+        .chain(open.iter().map(String::as_str))
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
+        .collect();
+    if let Some(why) = &observed.unseen {
+        if !plausible.is_empty() {
+            return Err(format!(
+                "where this process runs could not be read whole ({why}), and session(s) {} made \
+                 or may have made the Change: an author's own process is not ruled out",
+                plausible.join(", ")
+            ));
+        }
+    }
+    if let Reviewer::Person(person) = &observed.reviewer {
+        if !observed.terminal && authors.unattributed > 0 && !open.is_empty() {
+            return Err(format!(
+                "this process has no controlling terminal, so {} is claimed, not shown, and {} of \
+                 the Change's commits no ended session's record holds while session(s) {} are open \
+                 in this clone: one of them may be judging its own Change",
+                person.shown(),
+                authors.unattributed,
+                open.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Law 2, for every session the judging process is observed or claims to
-/// be: refused when one of them made a commit of the Change (`made`, see
-/// [`reviewer_made`]), or the log gives one to it. Ok when none did.
+/// be: refused when one of them made a commit of the Change (the log gives
+/// one to it; for a session still open, also `made`, see
+/// [`reviewer_made`]). Ok when none did.
 fn refuse_own_change(
     observed: &Observed,
     change: &Change,
@@ -1767,9 +1979,19 @@ fn refuse_own_change(
         if !seen.insert(session.id.clone()) {
             continue;
         }
-        let made = reflogs
-            .made(session, change, all, clone)
-            .map_err(|why| format!("what {} made cannot be read: {why}", session.id))?;
+        // An ended session's record says what it made; its checkout's
+        // reflog since then is others' work.
+        let (made, which) = if session.left.is_some() {
+            (
+                Vec::new(),
+                "a session that has ended and left this process behind",
+            )
+        } else {
+            let made = reflogs
+                .made(session, change, all, clone)
+                .map_err(|why| format!("what {} made cannot be read: {why}", session.id))?;
+            (made, which)
+        };
         if let Some(why) = made_refusal(session, which, change, &made) {
             return Err(why);
         }
@@ -1926,9 +2148,24 @@ fn judge_independence(
             }
             if observed.unseen.is_none() {
                 basis.push(
-                    "this process runs inside no live ohjaa session (no process group or ohjaa \
-                     of one among it and its ancestors, observed with ps), and OHJAA_SESSION is \
-                     not set"
+                    "this process runs inside no ohjaa session, live or ended (no process group \
+                     or ohjaa of one among it and its ancestors, as the kernel says them), and \
+                     OHJAA_SESSION is not set"
+                        .to_owned(),
+                );
+            }
+            if observed.terminal {
+                basis.push(
+                    "this process has a controlling terminal: no sign of an author, not proof of \
+                     a person (an agent's process that left every recorded process group and \
+                     took a terminal looks the same)"
+                        .to_owned(),
+                );
+            } else {
+                not.push(
+                    "this process has no controlling terminal: the person git names is claimed, \
+                     not shown (a process an agent left behind, or one started in the \
+                     background, looks the same)"
                         .to_owned(),
                 );
             }
@@ -1947,7 +2184,15 @@ fn judge_independence(
                 .filter(|s| s.id != session.id)
                 .map(|s| s.id.as_str())
                 .collect();
+            if session.left.is_some() {
+                not.push(format!(
+                    "this process was left behind by session {}, which has ended (it runs in that \
+                     session's process group): a leftover of its agent, never a live reviewer",
+                    session.id
+                ));
+            }
             match (&observed.claimed, *shown) {
+                (None, true) if session.left.is_some() => {}
                 (None, true) => not.push(format!(
                     "OHJAA_SESSION is not set, yet this process runs inside live session {}'s \
                      process group: that session's agent, not shown to be a person",
@@ -1959,7 +2204,7 @@ fn judge_independence(
                     session.id
                 )),
                 (_, false) => not.push(format!(
-                    "this process is not shown to run in session {}: it is in none of the live \
+                    "this process is not shown to run in session {}: it is in none of the \
                      sessions' process groups, nor below their ohjaa",
                     session.id
                 )),
@@ -1967,8 +2212,8 @@ fn judge_independence(
                     if others.is_empty() {
                         basis.push(format!(
                             "this process runs inside session {}'s process group, as \
-                             OHJAA_SESSION says, and inside no other live session's (observed \
-                             with ps)",
+                             OHJAA_SESSION says, and inside no other session's, live or ended (as \
+                             the kernel says it)",
                             session.id
                         ));
                     }
@@ -1976,7 +2221,7 @@ fn judge_independence(
             }
             if !others.is_empty() {
                 not.push(format!(
-                    "this process also runs inside live session(s) {} (a session started inside \
+                    "this process also runs inside session(s) {} (a session started inside \
                      another): what those made is the reviewer's to answer for",
                     others.join(", ")
                 ));
@@ -2259,6 +2504,15 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
             return refused(why);
         }
     }
+    let open_here: Vec<String> = logged
+        .sessions
+        .iter()
+        .filter(|s| s.left.is_none() && clone.iter().any(|c| Path::new(&s.repo) == c))
+        .map(|s| s.id.clone())
+        .collect();
+    if let Err(why) = refuse_unshown(&observed, &authors, &open_here) {
+        return refused(why);
+    }
     let mut reflogs = Reflogs::new(&here.top);
     if let Err(why) = refuse_own_change(&observed, &change, &logged.sessions, &mut reflogs, &clone)
     {
@@ -2333,6 +2587,7 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
             },
             session_env: observed.claimed.clone(),
             inside: inside_ids(&observed),
+            controlling_terminal: observed.terminal,
         },
         change,
     };
@@ -2526,33 +2781,37 @@ pub fn respond(judgement: &str, text: &str) -> Result<i32> {
 
 /// `ohjaa judgements --rebuild-public`: this clone's notes ref rewritten as
 /// one commit by [`NEUTRAL`], with no history, holding only redacted lines:
-/// every line of its notes that is [`publishable`], and this machine's
-/// Judgements of the clone (and their answers) in their redacted form. Every
-/// other line is dropped from the ref (the session log keeps this
-/// machine's); the old history is no longer reachable from the ref, so a
-/// push never publishes it (git's reflog keeps it on this machine). Nothing
-/// is pushed.
+/// every line of its notes and of origin's (as last fetched) that is
+/// [`publishable`], and this machine's Judgements of the clone (and their
+/// answers) in their redacted form. Every other line is dropped from the
+/// ref (the session log keeps this machine's); the old history is no
+/// longer reachable from the ref (git's reflog keeps it on this machine).
+/// Nothing is pushed, and origin is not changed: when origin's own ref
+/// names people, only a force push replaces it, and a person decides that.
 pub fn rebuild_public() -> Result<i32> {
     let here = here()?;
     let _lock = notes_lock(&here.common).map_err(|why| anyhow::anyhow!("{why}"))?;
     let logged = read_log_patiently().context(
         "the session log cannot be read, so its Judgements could not be kept: nothing was rebuilt",
     )?;
-    let read = notes_of(&here.top, &[NOTES_REF]).map_err(|why| anyhow::anyhow!("{why}"))?;
-    let local = tidy(&read[0]);
-    let count = |notes: &Notes| notes.values().map(Vec::len).sum::<usize>();
-    let kept: Notes = local
-        .iter()
-        .map(|(object, lines)| {
-            (
-                object.clone(),
-                lines.iter().filter(|l| publishable(l)).cloned().collect(),
-            )
-        })
-        .collect();
+    let read =
+        notes_of(&here.top, &[NOTES_REF, FETCHED_REF]).map_err(|why| anyhow::anyhow!("{why}"))?;
+    let (local, fetched) = (tidy(&read[0]), tidy(&read[1]));
+    let redacted = |notes: &Notes| -> Notes {
+        notes
+            .iter()
+            .map(|(object, lines)| {
+                (
+                    object.clone(),
+                    lines.iter().filter(|l| publishable(l)).cloned().collect(),
+                )
+            })
+            .collect()
+    };
+    let (kept, theirs) = (redacted(&local), redacted(&fetched));
     let dropped = count(&local) - count(&kept);
     let ours = logged_lines(&logged, &here.common, false);
-    let rebuilt = union(&[&kept, &ours]);
+    let rebuilt = union(&[&kept, &theirs, &ours]);
     let added = count(&rebuilt) - count(&union(&[&kept]));
     if rebuilt.is_empty() && gitconfig::read_ref(&here.common, NOTES_REF).is_none() {
         println!("ohjaa judgements: {NOTES_REF} does not exist here, and the log holds no Judgement of this clone: nothing to rebuild");
@@ -2568,11 +2827,13 @@ pub fn rebuild_public() -> Result<i32> {
     .map_err(|why| anyhow::anyhow!("{why}"))?;
     println!(
         "ohjaa judgements: rebuilt {NOTES_REF} as one commit by ohjaa <ohjaa@invalid> with no \
-         history: {} redacted line(s) on {} commit(s) ({added} from this machine's session log); \
-         {dropped} line(s) that were not redacted were dropped from the ref (this machine's \
-         Judgements stay in its session log). The old history is no longer on the ref, so no \
-         push publishes it (git's reflog keeps it on this machine only). Nothing was pushed: \
-         the next `ohjaa judge … --push` pushes it",
+         history: {} redacted line(s) on {} commit(s) ({added} from origin's notes as fetched \
+         and this machine's session log); {dropped} line(s) of this clone that were not \
+         redacted were dropped from the ref (this machine's Judgements stay in its session \
+         log). The old history is no longer on the ref (git's reflog keeps it on this machine \
+         only). Nothing was pushed, and origin is unchanged: if origin's own ref names anyone, \
+         `ohjaa judge … --push` keeps refusing until a person replaces it (git push --force \
+         origin {NOTES_REF}:{NOTES_REF}); otherwise the next `ohjaa judge … --push` pushes this",
         count(&rebuilt),
         rebuilt.len()
     );
@@ -2636,7 +2897,7 @@ fn agree(a: &Value, b: &Value) -> bool {
 struct Listed {
     value: Value,
     /// The note lines that are this record (a log record: both its forms).
-    lines: Vec<String>,
+    lines: Vec<Line>,
     /// `log`, `note` (this clone's ref, a line written from this machine's
     /// log), `merged` (this clone's ref, a line not from this machine's log:
     /// origin's, merged in by a push, or written another way), `fetched`
@@ -2644,6 +2905,14 @@ struct Listed {
     sources: BTreeSet<&'static str>,
     /// From this machine's log: authoritative here. Any other is a claim.
     log: bool,
+}
+
+/// A note line that is no Judgement and no answer: not UTF-8, not JSON (or
+/// cut short), or of a schema ohjaa does not read. Shown, never dropped.
+struct Invalid {
+    line: Line,
+    why: &'static str,
+    sources: BTreeSet<&'static str>,
 }
 
 /// Where a note line read under `reference` came from, given whether this
@@ -2658,17 +2927,34 @@ fn source_of(fetched: bool, from_log: bool) -> &'static str {
 
 /// Add a note line read under a ref to `list`: to the record that is the
 /// same line, else as a record of its own.
-fn add_line(list: &mut Vec<Listed>, line: &str, value: Value, fetched: bool) {
+fn add_line(list: &mut Vec<Listed>, line: &[u8], value: Value, fetched: bool) {
     if let Some(known) = list.iter_mut().find(|l| l.lines.iter().any(|x| x == line)) {
         known.sources.insert(source_of(fetched, known.log));
         return;
     }
     list.push(Listed {
         value,
-        lines: vec![line.to_owned()],
+        lines: vec![line.to_vec()],
         sources: BTreeSet::from([source_of(fetched, false)]),
         log: false,
     });
+}
+
+/// A note line as a Judgement or an answer (its value), or why it is
+/// neither: not UTF-8, not JSON (or cut short), or another schema.
+fn read_line(line: &[u8]) -> Result<Value, &'static str> {
+    let text = std::str::from_utf8(line).map_err(|_| "not UTF-8")?;
+    let value: Value = serde_json::from_str(text).map_err(|error| {
+        if error.is_eof() {
+            "JSON cut short"
+        } else {
+            "not JSON"
+        }
+    })?;
+    match value["schema"].as_str() {
+        Some(NOTE_SCHEMA | RESPONSE_NOTE_SCHEMA) => Ok(value),
+        _ => Err("not a Judgement or an answer ohjaa reads"),
+    }
 }
 
 /// The records as listed: each with where it was read, whether this
@@ -2686,7 +2972,7 @@ fn listed_values(list: &[Listed]) -> Vec<Value> {
                 record
                     .lines
                     .first()
-                    .and_then(|line| serde_json::from_str(line).ok())
+                    .and_then(|line| serde_json::from_slice(line).ok())
                     .unwrap_or(Value::Null)
             };
             let mine = note_of(record);
@@ -2706,7 +2992,8 @@ fn listed_values(list: &[Listed]) -> Vec<Value> {
 /// `ohjaa judgements <commit>`: every Judgement of it, from the log and the
 /// notes (this clone's, and those fetched from origin), each marked with
 /// where it was read, whether it is authoritative here, and whether another
-/// record of the same id says otherwise.
+/// record of the same id says otherwise; and every note line on it that is
+/// none (invalid), shown, never dropped.
 pub fn list(commit: &str, json_out: bool, fetch_first: bool) -> Result<i32> {
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let (top, common) = gitconfig::repo_at(&cwd)?;
@@ -2748,12 +3035,16 @@ pub fn list(commit: &str, json_out: bool, fetch_first: bool) -> Result<i32> {
     };
     let mut found: Vec<Listed> = Vec::new();
     let mut answers: Vec<Listed> = Vec::new();
+    let mut invalid: Vec<Invalid> = Vec::new();
     for judgement in &logged.judgements {
         if judgement.change.head == sha || judgement.change.commits.iter().any(|c| c.commit == sha)
         {
             found.push(Listed {
                 value: serde_json::to_value(judgement)?,
-                lines: vec![note_line(judgement, true), note_line(judgement, false)],
+                lines: vec![
+                    note_line(judgement, true).into_bytes(),
+                    note_line(judgement, false).into_bytes(),
+                ],
                 sources: BTreeSet::from(["log"]),
                 log: true,
             });
@@ -2767,8 +3058,8 @@ pub fn list(commit: &str, json_out: bool, fetch_first: bool) -> Result<i32> {
             answers.push(Listed {
                 value: serde_json::to_value(response)?,
                 lines: vec![
-                    response_line(response, true),
-                    response_line(response, false),
+                    response_line(response, true).into_bytes(),
+                    response_line(response, false).into_bytes(),
                 ],
                 sources: BTreeSet::from(["log"]),
                 log: true,
@@ -2783,24 +3074,52 @@ pub fn list(commit: &str, json_out: bool, fetch_first: bool) -> Result<i32> {
     };
     for (reference, fetched) in sources {
         for line in note_lines(&top, reference, &sha) {
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            match value["schema"].as_str() {
-                Some(NOTE_SCHEMA) => add_line(&mut found, &line, value, *fetched),
-                Some(RESPONSE_NOTE_SCHEMA) => add_line(&mut answers, &line, value, *fetched),
-                _ => {}
+            match read_line(&line) {
+                Ok(value) if value["schema"] == NOTE_SCHEMA => {
+                    add_line(&mut found, &line, value, *fetched)
+                }
+                Ok(value) => add_line(&mut answers, &line, value, *fetched),
+                Err(why) => {
+                    let source = source_of(*fetched, false);
+                    match invalid.iter_mut().find(|known| known.line == line) {
+                        Some(known) => {
+                            known.sources.insert(source);
+                        }
+                        None => invalid.push(Invalid {
+                            line,
+                            why,
+                            sources: BTreeSet::from([source]),
+                        }),
+                    }
+                }
             }
         }
     }
     let judgements = listed_values(&found);
     let responses = listed_values(&answers);
+    let invalid: Vec<Value> = invalid
+        .iter()
+        .map(|bad| {
+            let sources: Vec<&str> = ["note", "merged", "fetched"]
+                .into_iter()
+                .filter(|s| bad.sources.contains(s))
+                .collect();
+            json!({
+                "line": String::from_utf8_lossy(&bad.line),
+                "bytes": bad.line.len(),
+                "why": bad.why,
+                "sources": sources,
+                "trust": "foreign",
+            })
+        })
+        .collect();
     if json_out {
         let document = json!({
             "schema": LIST_SCHEMA,
             "commit": sha,
             "judgements": judgements,
             "responses": responses,
+            "invalid": invalid,
             "unreadable": logged.unreadable,
         });
         println!("{}", serde_json::to_string_pretty(&document)?);
@@ -2808,7 +3127,24 @@ pub fn list(commit: &str, json_out: bool, fetch_first: bool) -> Result<i32> {
     }
     // Notes may come from any clone: no terminal escape of theirs reaches
     // the person.
-    let shown = render_list(&sha, &judgements, &responses);
+    let mut shown = render_list(&sha, &judgements, &responses);
+    for bad in &invalid {
+        let line = bad["line"].as_str().unwrap_or_default();
+        let _ = writeln!(
+            shown,
+            "- INVALID note line ({}, {} byte(s)) [{}]: {}",
+            bad["why"].as_str().unwrap_or("?"),
+            bad["bytes"],
+            bad["sources"]
+                .as_array()
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            line.chars().take(200).collect::<String>()
+        );
+    }
     print!(
         "{}",
         shown.lines().map(printable).collect::<Vec<_>>().join("\n") + "\n"
@@ -3293,6 +3629,7 @@ mod tests {
                 terminal: false,
                 session_env: None,
                 inside: Vec::new(),
+                controlling_terminal: false,
             },
         }
     }
@@ -3367,6 +3704,7 @@ mod tests {
             claimed: None,
             claimed_other: None,
             unseen: None,
+            terminal: true,
         }
     }
 
@@ -3456,6 +3794,7 @@ mod tests {
             claimed: claimed.map(str::to_owned),
             claimed_other: None,
             unseen: None,
+            terminal: false,
         };
         let honest = judge_independence(
             &agent(vec![reviewer.clone()], Some("oh-2-1"), true),
@@ -3504,7 +3843,7 @@ mod tests {
             None,
         );
         assert!(!nested.established);
-        assert!(nested.not_established[0].contains("also runs inside live session(s) oh-3-1"));
+        assert!(nested.not_established[0].contains("also runs inside session(s) oh-3-1"));
         // A commit no ended record holds, under the agent's identity.
         let unattributed = change_of(&[("u1", None)]);
         let ann = identity("Ann", "ann@x");
@@ -3518,60 +3857,86 @@ mod tests {
         assert!(said.not_established[1].contains("the git identity the reviewer acts under"));
     }
 
-    /// Who judges is observed: the live session whose process group holds
-    /// the process or an ancestor, or whose ohjaa is an ancestor, innermost
-    /// first; never an ended one, nor a group id reused since.
+    /// Who judges is observed from the kernel: every session, live or ended,
+    /// whose process group holds the process or an ancestor (its leader,
+    /// while it exists, begun no later than the group was recorded), or
+    /// whose ohjaa is an ancestor, innermost first. A process an ended
+    /// session left behind in its group is that session's; a group id reused
+    /// since, even a second later, is not.
     #[test]
     fn the_sessions_a_process_runs_inside_are_observed_not_claimed() {
-        let proc = |pid, ppid, pgid, elapsed| process::Proc {
+        let ms = |s: i64| s * 1000;
+        let proc = |pid, ppid, pgid, started_s: i64| process::Proc {
             pid,
             ppid,
             pgid,
-            elapsed,
+            sid: 1,
+            started_ms: Some(started_s * 1000),
+            zombie: false,
         };
         let now = 10_000;
         // judge (500) < shell (400, group 300) < toimija (300, leads 300)
         // < ohjaa run (200, group 100, the outer session's) < ohjaa (100).
-        let table = vec![
-            proc(500, 400, 300, 1),
-            proc(400, 300, 300, 5),
-            proc(300, 200, 300, 9),
-            proc(200, 150, 100, 10),
-            proc(150, 100, 100, 50),
-            proc(100, 1, 100, 60),
+        let chain = vec![
+            proc(500, 400, 300, now - 1),
+            proc(400, 300, 300, now - 5),
+            proc(300, 200, 300, now - 10),
+            proc(200, 150, 100, now - 10),
+            proc(150, 100, 100, now - 50),
+            proc(100, 1, 100, now - 60),
         ];
-        let chain = table.clone();
+        let leaders = chain.clone();
+        let leader = |pgid: u32| leaders.iter().find(|p| p.pid == pgid).copied();
         let mut inner = session("oh-9990000-200", "/c/widget", now - 10, None);
         inner.pgid = Some(300);
-        inner.group_started_ms = Some((now - 10) * 1000);
+        inner.group_started_ms = Some(ms(now - 10) + 5);
         let mut outer = session("oh-9940000-90", "/c/widget", now - 60, None);
         outer.pgid = Some(100);
-        let ended = {
-            let mut s = session(
-                "oh-1-1",
-                "/c/widget",
-                now - 60,
-                Some(left(now - 30, &[], &[])),
-            );
-            s.pgid = Some(300);
-            s
-        };
-        let all = vec![ended, outer.clone(), inner.clone()];
-        let around: Vec<&str> = sessions_around(&all, &table, &chain, now)
+        outer.group_started_ms = Some(ms(now - 60) + 5);
+        let all = vec![outer.clone(), inner.clone()];
+        let around: Vec<&str> = sessions_around(&all, &chain, &leader)
             .iter()
             .map(|s| s.id.as_str())
             .collect();
         assert_eq!(around, vec![inner.id.as_str(), outer.id.as_str()]);
-        // A group id recorded before its leader started: reused, not it.
+        // A group id the session recorded a second before its leader began:
+        // reused, not it.
         let mut reused = inner.clone();
-        reused.group_started_ms = Some((now - 3600) * 1000);
-        reused.started_ms = (now - 3600) * 1000;
+        reused.group_started_ms = Some(ms(now - 11));
         reused.id = "oh-1-77".to_owned();
-        assert!(sessions_around(&[reused], &table, &chain, now).is_empty());
+        assert!(sessions_around(&[reused], &chain, &leader).is_empty());
         // Its ohjaa an ancestor (its group not recorded yet): inside.
         let mut early = session("oh-9990000-200", "/c/widget", now - 10, None);
         early.pgid = None;
-        assert_eq!(sessions_around(&[early], &table, &chain, now).len(), 1);
+        assert_eq!(sessions_around(&[early], &chain, &leader).len(), 1);
+        // A process an ended session left behind: a double fork,
+        // re-parented to pid 1, still in the session's group, its leader
+        // gone. Still that session's.
+        let gone = |_: u32| None;
+        let mut author = session(
+            "oh-9970000-299",
+            "/c/widget",
+            now - 30,
+            Some(left(now - 15, &["c1"], &[])),
+        );
+        author.pgid = Some(300);
+        author.group_started_ms = Some(ms(now - 30) + 5);
+        let leftover = vec![proc(700, 600, 300, now), proc(600, 1, 300, now - 20)];
+        assert_eq!(
+            sessions_around(std::slice::from_ref(&author), &leftover, &gone).len(),
+            1
+        );
+        // A group of that id formed after the session ended (none of its
+        // members began while the session ran): another group.
+        let later = vec![proc(800, 50, 300, now), proc(50, 1, 50, now - 5000)];
+        assert!(sessions_around(std::slice::from_ref(&author), &later, &gone).is_empty());
+        // A process whose session id is the session's group: inside too.
+        let mut by_sid = proc(900, 1, 900, now - 20);
+        by_sid.sid = 300;
+        assert_eq!(
+            sessions_around(std::slice::from_ref(&author), &[by_sid], &gone).len(),
+            1
+        );
     }
 
     /// What a public note may hold: exactly what ohjaa writes without
@@ -3579,8 +3944,8 @@ mod tests {
     #[test]
     fn only_a_truly_redacted_line_is_publishable() {
         let judged = judgement();
-        assert!(publishable(&note_line(&judged, false)));
-        assert!(!publishable(&note_line(&judged, true)));
+        assert!(publishable(note_line(&judged, false).as_bytes()));
+        assert!(!publishable(note_line(&judged, true).as_bytes()));
         let response = Response {
             schema: RESPONSE_SCHEMA.to_owned(),
             id: "rs-1-2".to_owned(),
@@ -3594,18 +3959,18 @@ mod tests {
             text: "secret".to_owned(),
             at_ms: 1,
         };
-        assert!(publishable(&response_line(&response, false)));
-        assert!(!publishable(&response_line(&response, true)));
+        assert!(publishable(response_line(&response, false).as_bytes()));
+        assert!(!publishable(response_line(&response, true).as_bytes()));
         let mut forged: Value = serde_json::from_str(&note_line(&judged, false)).unwrap();
         forged["reviewer"] = json!({"kind": "person", "name": "Yair"});
-        assert!(!publishable(&forged.to_string()));
+        assert!(!publishable(forged.to_string().as_bytes()));
         let mut forged: Value = serde_json::from_str(&note_line(&judged, false)).unwrap();
         forged["findings"] = json!(["acme-bank"]);
-        assert!(!publishable(&forged.to_string()));
+        assert!(!publishable(forged.to_string().as_bytes()));
         let mut forged: Value = serde_json::from_str(&note_line(&judged, false)).unwrap();
         forged["redacted"] = json!(false);
-        assert!(!publishable(&forged.to_string()));
-        assert!(!publishable("not json"));
+        assert!(!publishable(forged.to_string().as_bytes()));
+        assert!(!publishable(b"not json"));
         // A named line and its redacted form say the same; another verdict
         // does not.
         let named: Value = serde_json::from_str(&note_line(&judged, true)).unwrap();
@@ -3629,7 +3994,7 @@ mod tests {
                 .map(|(object, lines)| {
                     (
                         (*object).to_owned(),
-                        lines.iter().map(|l| (*l).to_owned()).collect(),
+                        lines.iter().map(|l| l.as_bytes().to_vec()).collect(),
                     )
                 })
                 .collect()
@@ -3644,6 +4009,107 @@ mod tests {
             tidy(&notes(&[("a", &["2", "1", "2"]), ("e", &[])])),
             notes(&[("a", &["1", "2"])])
         );
+    }
+
+    /// Law 2 fails closed where ohjaa cannot see: an ancestry it could not
+    /// read whole refuses while a session made, or may have made, the
+    /// Change; a person with no controlling terminal is claimed, not shown,
+    /// and refused while a session open here may have made a commit no
+    /// record holds. Otherwise recorded, never established.
+    #[test]
+    fn law_two_fails_closed_where_ohjaa_cannot_see() {
+        let rae = identity("Rae Reviewer", "rae@x");
+        let open = vec!["oh-2-2".to_owned()];
+        let mut unseen = person(&rae);
+        unseen.unseen = Some("the kernel would not say".to_owned());
+        assert!(refuse_unshown(&unseen, &authors_by(&["oh-1-1"], 0), &[]).is_err());
+        assert!(refuse_unshown(&unseen, &authors_by(&[], 1), &open).is_err());
+        assert!(refuse_unshown(&unseen, &authors_by(&[], 1), &[]).is_ok());
+        let mut headless = person(&rae);
+        headless.terminal = false;
+        let refused = refuse_unshown(&headless, &authors_by(&[], 1), &open).unwrap_err();
+        assert!(refused.contains("no controlling terminal"), "{refused}");
+        // Every commit held by an ended session's record: recorded, not
+        // established.
+        assert!(refuse_unshown(&headless, &authors_by(&["oh-1-1"], 0), &open).is_ok());
+        let theirs = change(vec![commit(
+            &"a".repeat(40),
+            &identity("Ann", "ann@x"),
+            Some("oh-1-1"),
+        )]);
+        let said = judge_independence(&headless, &theirs, &authors_by(&["oh-1-1"], 0), Some(&rae));
+        assert!(!said.established);
+        assert!(
+            said.not_established[0].contains("no controlling terminal"),
+            "{said:?}"
+        );
+    }
+
+    /// A process an ended session left behind is that session's, never a
+    /// live reviewer: its Judgement, when that session made nothing of the
+    /// Change, is never established.
+    #[test]
+    fn a_process_an_ended_session_left_behind_is_never_established() {
+        let theirs = change_of(&[("a1", Some("oh-1-1"))]);
+        let ended = session("oh-3-1", "/c/widget", 90, Some(left(95, &[], &[])));
+        let observed = Observed {
+            reviewer: Reviewer::Agent {
+                session: Box::new(ended.clone()),
+                shown: true,
+            },
+            inside: vec![ended],
+            claimed: None,
+            claimed_other: None,
+            unseen: None,
+            terminal: false,
+        };
+        let said = judge_independence(&observed, &theirs, &authors_by(&["oh-1-1"], 0), None);
+        assert!(!said.established);
+        assert!(
+            said.not_established[0].contains("left behind by session oh-3-1, which has ended"),
+            "{said:?}"
+        );
+    }
+
+    /// Origin refused a push because another moved its ref first: told from
+    /// `git push --porcelain` or any line of stderr, never only the last.
+    #[test]
+    fn a_rejected_push_is_told_from_any_other_failure() {
+        let rejected = "To /r/widget.git\n!\trefs/notes/ohjaa/judgements:refs/notes/ohjaa/judgements\t[rejected] (fetch first)\nDone\n";
+        let said = rejection_in(
+            rejected,
+            "hint: Updates were rejected\nerror: failed to push some refs\n",
+        )
+        .unwrap();
+        assert!(said.contains("[rejected] (fetch first)"), "{said}");
+        assert!(rejection_in(
+            "",
+            " ! [rejected]        x -> x (non-fast-forward)\nhint: See …\n"
+        )
+        .is_some());
+        assert_eq!(
+            rejection_in("", "fatal: could not read from remote\n"),
+            None
+        );
+    }
+
+    /// Note lines are bytes: split at `\n` only, blank ones left out, every
+    /// other kept as it is (not UTF-8, or ending in `\r`).
+    #[test]
+    fn note_lines_are_kept_byte_for_byte() {
+        let lines = split_lines(b"one\r\n\n  \n\xff\xfe\ntwo");
+        assert_eq!(
+            lines,
+            vec![b"one\r".to_vec(), b"\xff\xfe".to_vec(), b"two".to_vec()]
+        );
+        assert_eq!(read_line(b"\xff\xfe"), Err("not UTF-8"));
+        assert_eq!(read_line(b"{\"schema\":"), Err("JSON cut short"));
+        assert_eq!(read_line(b"not json"), Err("not JSON"));
+        assert_eq!(
+            read_line(b"{\"schema\":\"other\"}"),
+            Err("not a Judgement or an answer ohjaa reads")
+        );
+        assert!(read_line(b"{\"schema\":\"ohjaa-judgement-note.v1\"}\r").is_ok());
     }
 
     /// The sharing table of D8 point 3.

@@ -30,5 +30,7 @@ serde_yaml = "0.9"
 
 # Signal dispositions (unix only): `ohjaa run` must outlive the signals that
 # would cut the leaving record short, and forward stop signals to the session.
+# And the kernel's word on processes (`ohjaa judge`: who runs where, from
+# proc_pidinfo or /proc, never a `ps` on PATH), and flock(2) for the locks.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
