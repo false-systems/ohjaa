@@ -42,8 +42,13 @@ use std::process::{Command, Output};
 /// --json` answers `sykli-run-status.v1` (a run is held `running` while
 /// `$SANDBOX/hold-runs` exists). With STUB_SYKLI_CAPTURE, `run` first saves
 /// the session's record as it stands (`ohjaa usage export`) in
-/// `$SANDBOX/at-dispatch.json`. It runs no git, so a trace2 count is ohjaa's
-/// own.
+/// `$SANDBOX/at-dispatch.json` (and, dispatched by ohjaa itself outside a
+/// session, the whole log in `$SANDBOX/at-dispatch-all.json`). With
+/// STUB_SYKLI_STATUS_COMMIT it also has `status --commit <rev> --contract
+/// <c> --json` (`sykli-commit-status.v1`): `$SANDBOX/commit-status/<rev>`
+/// when a test wrote one, else the verdict in `$SANDBOX/commit-verdict`
+/// (default `none`), each ask noted in `$SANDBOX/commit-asks`. It runs no
+/// git, so a trace2 count is ohjaa's own.
 const SYKLI_STUB: &str = r#"#!/bin/sh
 printf '%s|%s\n' "$PWD" "$*" >> "$SANDBOX/sykli-calls"
 # Who asks about runs: the caller a test names, so a straggler is never counted.
@@ -122,6 +127,9 @@ case "$1" in
     fi
     if [ -n "${STUB_SYKLI_CAPTURE:-}" ] && [ -n "${OHJAA_SESSION:-}" ]; then
       ohjaa usage export --session "$OHJAA_SESSION" > "$SANDBOX/at-dispatch.json" 2>&1
+    elif [ -n "${STUB_SYKLI_CAPTURE:-}" ]; then
+      # Dispatched by ohjaa itself (an integrated validation): the whole log.
+      ohjaa usage export > "$SANDBOX/at-dispatch-all.json" 2>&1
     fi
     detach=""
     for arg in "$@"; do [ "$arg" = --detach ] && detach=1; done
@@ -145,7 +153,21 @@ case "$1" in
     if [ "$2" = --help ]; then
       echo "Usage: sykli status [OPTIONS] [ID]"
       [ -n "${STUB_SYKLI_D3:-}" ] && echo "      --run <ID>  a validation run"
+      if [ -n "${STUB_SYKLI_STATUS_COMMIT:-}" ]; then
+        echo "      --commit <REV>        receipts and runs that apply to this commit"
+        echo "      --contract <CONTRACT> with --commit: the contract to judge by"
+      fi
       facts; exit 0
+    fi
+    # sykli-commit-status.v1: $SANDBOX/commit-status/<rev> when a test wrote
+    # one, else a verdict of $SANDBOX/commit-verdict (default none).
+    if [ -n "${STUB_SYKLI_STATUS_COMMIT:-}" ] && [ "$2" = --commit ]; then
+      rev=$3
+      printf '%s|%s\n' "$PWD" "$*" >> "$SANDBOX/commit-asks"
+      if [ -f "$SANDBOX/commit-status/$rev" ]; then cat "$SANDBOX/commit-status/$rev"; exit 0; fi
+      verdict=$(cat "$SANDBOX/commit-verdict" 2>/dev/null || echo none)
+      printf '{"schema":"sykli-commit-status.v1","commit":"%s","tree":"","contract":{"path":"x","hash":"c0ffee"},"verdict":"%s","current":[],"historical":[],"runs":[]}\n' "$rev" "$verdict"
+      exit 0
     fi
     [ -n "${STUB_SYKLI_D3:-}" ] && [ "$2" = --run ] || { echo "error: no such production" >&2; exit 2; }
     run=$3
@@ -217,12 +239,18 @@ esac
 exit 2
 "#;
 
-/// Never the real toimija: no live sessions, so `ohjaa run --dry-run` gets
-/// as far as its warnings; `run` runs the agent command after `--`, as
-/// toimija does, and keeps its argv in `$SANDBOX/toimija-argv`.
+/// Never the real toimija: no live sessions (unless a test writes a
+/// checkout's `sessions --json` into `$SANDBOX/toimija-sessions/<its folder
+/// name>`), so `ohjaa run --dry-run` gets as far as its warnings; `run` runs
+/// the agent command after `--`, as toimija does, and keeps its argv in
+/// `$SANDBOX/toimija-argv`.
 const TOIMIJA_STUB: &str = r#"#!/bin/sh
 case "$1" in
-  sessions) echo '{"sessions":[],"warnings":[],"coverage":{"status":"available"}}';;
+  sessions)
+    # A checkout's sessions: $SANDBOX/toimija-sessions/<its folder name>, else none.
+    listed="$SANDBOX/toimija-sessions/$(basename "$PWD")"
+    if [ -f "$listed" ]; then cat "$listed"
+    else echo '{"sessions":[],"warnings":[],"coverage":{"status":"available"}}'; fi;;
   context) echo '{}';;
   run)
     printf '%s\n' "$@" > "$SANDBOX/toimija-argv"
@@ -277,6 +305,8 @@ struct Sandbox {
     stub_contract: &'static str,
     /// STUB_SYKLI_D3: a sykli with durable runs (KATANA D3).
     stub_d3: bool,
+    /// STUB_SYKLI_STATUS_COMMIT: a sykli with `status --commit` (KATANA D3).
+    stub_status_commit: bool,
 }
 
 impl Sandbox {
@@ -316,6 +346,7 @@ impl Sandbox {
             path,
             stub_contract: "",
             stub_d3: false,
+            stub_status_commit: false,
         }
     }
 
@@ -373,6 +404,9 @@ impl Sandbox {
         }
         if self.stub_d3 {
             command.env("STUB_SYKLI_D3", "1");
+        }
+        if self.stub_status_commit {
+            command.env("STUB_SYKLI_STATUS_COMMIT", "1");
         }
         command
     }
@@ -4462,4 +4496,1458 @@ fn an_older_ignore_block_is_upgraded_in_place_and_undo_is_exact() {
     let output = sandbox.ohjaa(&["apply", "--undo"]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
     assert_eq!(sandbox.read("config/git/ignore"), "*.swp\n");
+}
+
+// ---- KATANA Stage 5: Judgement, integrated-state validation, stale base, ----
+// ---- and the sessions of every worktree of a clone ------------------------
+
+/// The ref Judgements are shared under, as git notes on the head they judge.
+const JUDGEMENTS_REF: &str = "refs/notes/ohjaa/judgements";
+
+/// Ann, who wrote the Change, and Rae, who reviews it: each as a person's git
+/// identity for every git command they run.
+const ANN: [(&str, &str); 4] = [
+    ("GIT_AUTHOR_NAME", "Ann Author"),
+    ("GIT_AUTHOR_EMAIL", "ann@example.invalid"),
+    ("GIT_COMMITTER_NAME", "Ann Author"),
+    ("GIT_COMMITTER_EMAIL", "ann@example.invalid"),
+];
+const RAE: [(&str, &str); 4] = [
+    ("GIT_AUTHOR_NAME", "Rae Reviewer"),
+    ("GIT_AUTHOR_EMAIL", "rae@example.invalid"),
+    ("GIT_COMMITTER_NAME", "Rae Reviewer"),
+    ("GIT_COMMITTER_EMAIL", "rae@example.invalid"),
+];
+
+impl Sandbox {
+    /// A sandbox for Stage 5: a durable-run sykli (D3) that also answers
+    /// `status --commit`, and `acme/widget` with an entry whose lock pins its
+    /// gate and whose `visibility` is as given (none: the entry does not say).
+    fn stage5(tag: &str, visibility: Option<&str>) -> (Sandbox, PathBuf, PathBuf) {
+        let mut sandbox = Sandbox::new(tag);
+        sandbox.stub_contract = "fast";
+        sandbox.stub_d3 = true;
+        sandbox.stub_status_commit = true;
+        let (repo, bare) = sandbox.repo("acme", "widget", &[]);
+        sandbox.locked_entry("acme", "widget", "c0ffee");
+        sandbox.entry_says(
+            "acme",
+            "widget",
+            visibility.map(|v| format!("visibility = \"{v}\"")),
+        );
+        sandbox.apply();
+        let tree = sandbox.tree(&repo, "HEAD");
+        fs::write(sandbox.dir.join("tree"), &tree).unwrap();
+        (sandbox, repo, bare)
+    }
+
+    /// Rewrite an entry's `repo.toml`: its branch, and the line given.
+    fn entry_says(&self, owner: &str, name: &str, line: Option<String>) {
+        let toml = self
+            .config()
+            .join("repos")
+            .join(owner)
+            .join(name)
+            .join("repo.toml");
+        let mut text = "branch = \"main\"\n".to_owned();
+        if let Some(line) = line {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        fs::write(toml, text).unwrap();
+    }
+
+    /// `ohjaa run sh` in `cwd` whose agent runs `script`, briefed (the
+    /// briefing toimija was handed is in `$SANDBOX/toimija-argv`), with
+    /// `env` beside the sandbox's: its output.
+    fn session_with(&self, cwd: &Path, intent: &str, script: &str, env: &[(&str, &str)]) -> Output {
+        let mut command = self.command("ohjaa", cwd);
+        command
+            .args(["run", "sh", "--intent", intent, "--", "-c", script])
+            .env("STUB_SYKLI_CAPTURE", "1");
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command.output().unwrap()
+    }
+
+    /// The briefing the last `ohjaa run` handed toimija.
+    fn last_briefing(&self) -> String {
+        let argv = self.read("toimija-argv");
+        let lines: Vec<&str> = argv.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| *line == "--briefing")
+            .unwrap_or_else(|| panic!("no --briefing in {argv}"));
+        // The briefing is one argument; toimija-argv holds one per line, so
+        // it runs until the next flag toimija was handed.
+        lines[at + 1..]
+            .iter()
+            .take_while(|line| !line.starts_with("--"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The id of the session whose intent is `intent`.
+    fn session_id(&self, cwd: &Path, intent: &str) -> String {
+        self.export(cwd)["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["intent"] == intent)
+            .and_then(|s| s["id"].as_str())
+            .unwrap_or_else(|| panic!("no session {intent:?}"))
+            .to_owned()
+    }
+
+    /// The record of the session whose intent is `intent`.
+    fn session_record(&self, cwd: &Path, intent: &str) -> serde_json::Value {
+        self.export(cwd)["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["intent"] == intent)
+            .cloned()
+            .unwrap_or_else(|| panic!("no session {intent:?}"))
+    }
+
+    /// Ann's work, made in an ohjaa session on `branch` (two commits, then
+    /// back to main): the session's id and the branch's head.
+    fn authored(&self, repo: &Path, branch: &str) -> (String, String) {
+        let intent = format!("write {branch}");
+        let script = format!(
+            "git checkout -q -b {branch} && echo a > {0}-a && git add {0}-a && git commit -qm 'parse a' \
+             && echo b > {0}-b && git add {0}-b && git commit -qm 'parse b' && git checkout -q main",
+            branch.replace('/', "-")
+        );
+        let output = self.session_with(repo, &intent, &script, &ANN);
+        assert!(output.status.success(), "{}", text(&output).1);
+        let head = self.git(repo, &["rev-parse", branch]);
+        (self.session_id(repo, &intent), head)
+    }
+
+    /// `ohjaa judge <args>` in `cwd` as a person with identity `who`,
+    /// outside any session.
+    fn judge_as(&self, cwd: &Path, who: &[(&str, &str)], args: &[&str]) -> Output {
+        let mut command = self.command("ohjaa", cwd);
+        command.arg("judge").args(args);
+        for (key, value) in who {
+            command.env(key, value);
+        }
+        command.output().unwrap()
+    }
+
+    /// `ohjaa judgements <commit> --json <extra>` in `cwd`.
+    fn judgements(&self, cwd: &Path, commit: &str, extra: &[&str]) -> serde_json::Value {
+        let output = self
+            .command("ohjaa", cwd)
+            .args(["judgements", commit, "--json"])
+            .args(extra)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = text(&output);
+        assert!(output.status.success(), "{stdout}{stderr}");
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}{stderr}"))
+    }
+
+    /// The Judgements note on `commit` in `repo`, its lines (empty: none).
+    fn note_lines(&self, repo: &Path, commit: &str) -> Vec<String> {
+        let output = self.git_out(repo, &["notes", "--ref", JUDGEMENTS_REF, "show", commit]);
+        if !output.status.success() {
+            return Vec::new();
+        }
+        text(&output)
+            .0
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// What sykli says of `commit` (`status --commit`): `verdict`, with one
+    /// current receipt of `tree` made by run `run` when `run` is given.
+    fn commit_status(
+        &self,
+        commit: &str,
+        tree: &str,
+        verdict: &str,
+        run: Option<(&str, &str, &str)>,
+    ) {
+        let dir = self.dir.join("commit-status");
+        fs::create_dir_all(&dir).unwrap();
+        let (current, runs) = match run {
+            Some((run, path, digest)) => (
+                format!(
+                    "[{{\"receipt\":\"{path}\",\"digest\":\"{digest}\",\"run\":\"{run}\",\
+                     \"started_at_ms\":1,\"outcome\":\"{verdict}\",\"judgement\":\"verified\",\
+                     \"stage\":null,\"refusal\":null}}]"
+                ),
+                format!(
+                    "[{{\"run\":\"{run}\",\"state\":\"completed\",\"outcome\":\"{verdict}\",\
+                     \"dirty\":false,\"receipt\":{{\"path\":\"{path}\",\"digest\":\"{digest}\"}},\
+                     \"tasks\":[]}}]"
+                ),
+            ),
+            None => ("[]".to_owned(), "[]".to_owned()),
+        };
+        fs::write(
+            dir.join(commit),
+            format!(
+                "{{\"schema\":\"sykli-commit-status.v1\",\"commit\":\"{commit}\",\"tree\":\"{tree}\",\
+                 \"contract\":{{\"path\":\"x\",\"hash\":\"c0ffee\"}},\"verdict\":\"{verdict}\",\
+                 \"current\":{current},\"historical\":[],\"runs\":{runs}}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Another clone of `bare` (`projects/<name>`) that pushes one commit to
+    /// main: origin/main moves on elsewhere. Its new tip.
+    fn pushed_elsewhere(&self, bare: &Path, name: &str, file: &str) -> String {
+        let other = self.dir.join("projects").join(name);
+        self.git(
+            &self.dir,
+            &[
+                "clone",
+                "-q",
+                &bare.to_string_lossy(),
+                &other.to_string_lossy(),
+            ],
+        );
+        let tip = self.commit(&other, file);
+        self.git(&other, &["push", "-q", "origin", "main"]);
+        tip
+    }
+}
+
+/// BRIEF §12 and D5: `ohjaa judge` records a Judgement of a Change and its
+/// exact State in ohjaa's log: who made the Change (its commits' authors, and
+/// the ohjaa sessions the log attributes them to), the reviewer, the Intent,
+/// the evidence considered as sykli's references (never a verdict copied
+/// from sykli), the verdict, findings, severity, uncertainty, time and
+/// provenance; and two independence facts, kept apart: the judge's
+/// (procedural) and the evidence's (not established).
+#[test]
+fn ohjaa_judge_records_the_change_its_authors_the_reviewer_and_evidence_references() {
+    let (sandbox, repo, _) = Sandbox::stage5("judge", Some("private"));
+    let base = sandbox.git(&repo, &["rev-parse", "main"]);
+    let (author, head) = sandbox.authored(&repo, "feat/parser");
+    let tree = sandbox.tree(&repo, &head);
+    let digest = "ab".repeat(32);
+    sandbox.commit_status(
+        &head,
+        &tree,
+        "passed",
+        Some(("run-77", "/kept/rcpt_ab.json", &digest)),
+    );
+    let output = sandbox.session_with(
+        &repo,
+        "review the parser",
+        "ohjaa judge main..feat/parser --verdict request-changes \
+         --finding 'the parser drops the last line' --severity major --blocking \
+         --uncertainty 'the fuzz corpus was not run'",
+        &RAE,
+    );
+    let (stdout, stderr) = text(&output);
+    assert!(output.status.success(), "{stdout}{stderr}");
+    let reviewer = sandbox.session_id(&repo, "review the parser");
+    let author_intent = sandbox.session_record(&repo, "write feat/parser")["intent_id"].clone();
+
+    let json = sandbox.judgements(&repo, &head, &[]);
+    assert_eq!(json["schema"], "ohjaa-judgements.v1", "{json:#}");
+    let judgements = json["judgements"].as_array().unwrap();
+    assert_eq!(judgements.len(), 1, "{json:#}");
+    let judgement = &judgements[0];
+    assert!(
+        judgement["id"].as_str().unwrap().starts_with("jd-"),
+        "{json:#}"
+    );
+    // The Change and its exact State.
+    assert_eq!(judgement["change"]["base"], base.as_str(), "{json:#}");
+    assert_eq!(judgement["change"]["head"], head.as_str(), "{json:#}");
+    assert_eq!(judgement["change"]["state"], tree.as_str(), "{json:#}");
+    let commits = judgement["change"]["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 2, "{json:#}");
+    assert_eq!(commits[0]["commit"], head.as_str());
+    assert_eq!(
+        commits[0]["session"],
+        author.as_str(),
+        "attributed by the log"
+    );
+    // Who made it: the commits' authors, and the session that made them.
+    assert_eq!(
+        judgement["authors"]["people"],
+        serde_json::json!(["Ann Author <ann@example.invalid>"]),
+        "{json:#}"
+    );
+    assert_eq!(
+        judgement["authors"]["sessions"][0]["session"],
+        author.as_str()
+    );
+    assert_eq!(judgement["authors"]["sessions"][0]["agent"], "sh");
+    assert_eq!(judgement["authors"]["unattributed"], 0);
+    // The reviewer, the Intent.
+    assert_eq!(
+        judgement["reviewer"],
+        serde_json::json!({"kind": "agent", "session": reviewer, "agent": "sh"}),
+        "{json:#}"
+    );
+    assert_eq!(judgement["intent_id"], author_intent, "{json:#}");
+    // The evidence considered: sykli's references, asked of sykli; never its
+    // verdict.
+    let evidence = &judgement["evidence"];
+    assert_eq!(
+        evidence["refs"],
+        serde_json::json!([{"run": "run-77", "receipt": {"path": "/kept/rcpt_ab.json", "digest": digest}}]),
+        "{json:#}"
+    );
+    for word in ["passed", "verified", "verdict", "outcome"] {
+        assert!(
+            !evidence.to_string().contains(word),
+            "a copied verdict ({word}) in {evidence:#}"
+        );
+    }
+    let contract = sandbox.config().join("repos/acme/widget/sykli.json");
+    assert!(
+        sandbox.read("commit-asks").contains(&format!(
+            "status --commit {head} --contract {}",
+            contract.display()
+        )),
+        "{}",
+        sandbox.read("commit-asks")
+    );
+    // The Judgement itself.
+    assert_eq!(judgement["verdict"], "request_changes");
+    assert_eq!(
+        judgement["findings"],
+        serde_json::json!(["the parser drops the last line"])
+    );
+    assert_eq!(judgement["severity"], "major");
+    assert_eq!(judgement["blocking"], true);
+    assert_eq!(judgement["uncertainty"], "the fuzz corpus was not run");
+    assert!(judgement["at_ms"].as_i64().unwrap() > 0);
+    assert_eq!(
+        judgement["provenance"]["recorded_by"],
+        format!("ohjaa {}", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(judgement["provenance"]["session"], reviewer.as_str());
+    // Two independence facts, apart: the judge's, procedural and
+    // established; the evidence's, not established, and said so.
+    assert_eq!(
+        judgement["independence"]["judge"]["established"], true,
+        "{json:#}"
+    );
+    assert_eq!(
+        judgement["independence"]["evidence"]["established"], false,
+        "{json:#}"
+    );
+    assert!(
+        judgement["independence"]["evidence"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("not established"),
+        "{json:#}"
+    );
+    // Where it was read from: the log, and the note on its head.
+    assert_eq!(
+        judgement["sources"],
+        serde_json::json!(["log", "note"]),
+        "{json:#}"
+    );
+    // And for a person.
+    let shown = sandbox.ohjaa_in(&repo, &["judgements", &head]);
+    let (stdout, _) = text(&shown);
+    assert!(stdout.contains("request changes"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("by agent session {reviewer} (sh)")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("evidence not independently produced (not established"),
+        "{stdout}"
+    );
+}
+
+/// Law 2: the Agent never judges its own Change. A reviewer who made any
+/// commit of the Change is refused, and nothing is recorded: an agent
+/// session that made one (seen in its checkout's reflog), and a person whose
+/// identity is on a commit no agent session made. A person may judge an agent
+/// session's work made under their identity: the log says who made it.
+#[test]
+fn law_two_no_reviewer_judges_a_change_it_made() {
+    let (sandbox, repo, _) = Sandbox::stage5("law2", Some("private"));
+
+    // An agent session that made a commit of the Change, judging it.
+    let output = sandbox.session_with(
+        &repo,
+        "judge my own",
+        "git checkout -q -b feat/own && echo x > own && git add own && git commit -qm own \
+         && ohjaa judge main..feat/own --verdict approve; echo JUDGE-EXIT=$?; git checkout -q main",
+        &ANN,
+    );
+    let (stdout, stderr) = text(&output);
+    assert!(stdout.contains("JUDGE-EXIT=3"), "{stdout}{stderr}");
+    let said = format!("{stdout}{stderr}");
+    assert!(said.contains("refused (law 2"), "{said}");
+    assert!(said.contains("made by this session"), "{said}");
+    let own = sandbox.git(&repo, &["rev-parse", "feat/own"]);
+    assert_eq!(
+        sandbox.judgements(&repo, &own, &[])["judgements"],
+        serde_json::json!([])
+    );
+    assert!(
+        sandbox.note_lines(&repo, &own).is_empty(),
+        "no note for a refusal"
+    );
+
+    // A person whose identity is on a commit no session made.
+    sandbox.git(&repo, &["checkout", "-q", "-b", "feat/rae"]);
+    let mut commit = sandbox.command("git", &repo);
+    commit.args(["commit", "-q", "--allow-empty", "-m", "rae's own"]);
+    for (key, value) in RAE {
+        commit.env(key, value);
+    }
+    assert!(commit.output().unwrap().status.success());
+    sandbox.git(&repo, &["checkout", "-q", "main"]);
+    let output = sandbox.judge_as(&repo, &RAE, &["main..feat/rae", "--verdict", "approve"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(3), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("refused (law 2") && stderr.contains("Rae Reviewer <rae@example.invalid>"),
+        "{stderr}"
+    );
+
+    // Rae judging Ann's session work: recorded, Rae the reviewer.
+    let (_, head) = sandbox.authored(&repo, "feat/ann");
+    let output = sandbox.judge_as(&repo, &RAE, &["main..feat/ann", "--verdict", "approve"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let json = sandbox.judgements(&repo, &head, &[]);
+    assert_eq!(
+        json["judgements"][0]["reviewer"],
+        serde_json::json!({"kind": "person", "name": "Rae Reviewer", "email": "rae@example.invalid"}),
+        "{json:#}"
+    );
+
+    // Ann judging the work an agent session made under her identity: the
+    // log says the session made it, and the Judgement says so.
+    let output = sandbox.judge_as(&repo, &ANN, &["main..feat/ann", "--verdict", "approve"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let json = sandbox.judgements(&repo, &head, &[]);
+    let ann = json["judgements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["reviewer"]["name"] == "Ann Author")
+        .cloned()
+        .unwrap_or_else(|| panic!("{json:#}"));
+    let basis = ann["independence"]["judge"]["basis"].to_string();
+    assert!(
+        basis.contains("under the reviewer's git identity, made by agent session"),
+        "{basis}"
+    );
+}
+
+/// D5: authors may answer a Judgement, never change or remove it. A
+/// response is its own record, linked to the Judgement; a second Judgement
+/// is a new one beside the first.
+#[test]
+fn an_author_answers_beside_a_judgement_and_never_changes_it() {
+    let (sandbox, repo, _) = Sandbox::stage5("respond", Some("private"));
+    let (_, head) = sandbox.authored(&repo, "feat/x");
+    let output = sandbox.judge_as(
+        &repo,
+        &RAE,
+        &[
+            "main..feat/x",
+            "--verdict",
+            "reject",
+            "--finding",
+            "no tests",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    let before = sandbox.judgements(&repo, &head, &[])["judgements"][0].clone();
+    let id = before["id"].as_str().unwrap().to_owned();
+
+    let mut respond = sandbox.command("ohjaa", &repo);
+    respond.args(["judge", "respond", &id, "tests are in the next commit"]);
+    for (key, value) in ANN {
+        respond.env(key, value);
+    }
+    let output = respond.output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+
+    let json = sandbox.judgements(&repo, &head, &[]);
+    assert_eq!(json["judgements"][0], before, "the Judgement is unchanged");
+    let responses = json["responses"].as_array().unwrap();
+    assert_eq!(responses.len(), 1, "{json:#}");
+    assert!(responses[0]["id"].as_str().unwrap().starts_with("rs-"));
+    assert_eq!(responses[0]["judgement"], id.as_str());
+    assert_eq!(responses[0]["text"], "tests are in the next commit");
+    assert_eq!(
+        responses[0]["author"], true,
+        "Ann's identity is on its commits"
+    );
+    assert_eq!(responses[0]["by"]["kind"], "person");
+    // The note carries the answer too, as a line of its own.
+    let lines = sandbox.note_lines(&repo, &head);
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    assert!(lines
+        .iter()
+        .any(|line| line.contains("ohjaa-judgement-response-note.v1")));
+
+    // A second Judgement is a new record; the first stays as it was.
+    let output = sandbox.judge_as(&repo, &RAE, &["main..feat/x", "--verdict", "approve"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    let json = sandbox.judgements(&repo, &head, &[]);
+    assert_eq!(json["judgements"].as_array().unwrap().len(), 2, "{json:#}");
+    assert!(json["judgements"].as_array().unwrap().contains(&before));
+
+    // An answer to a Judgement that does not exist is refused.
+    let output = sandbox.ohjaa_in(&repo, &["judge", "respond", "jd-1-1", "hello"]);
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output).1);
+    assert!(
+        text(&output).1.contains("no Judgement jd-1-1"),
+        "{}",
+        text(&output).1
+    );
+}
+
+/// D8 point 3: a Judgement is attached to its head as a git note under
+/// refs/notes/ohjaa/judgements, one compact canonical JSON line, and nothing
+/// else in the repository changes: no file, hook or config. It is pushed
+/// only when asked (`--push`), with the notes ref alone; another clone on
+/// another machine fetches it (`--fetch`) and reads it as shared. Notes made
+/// in two clones merge, line by line, and none is lost.
+#[test]
+fn a_judgement_is_a_git_note_on_its_head_and_nothing_in_the_repository_changes() {
+    let (sandbox, repo, bare) = Sandbox::stage5("notes", Some("private"));
+    let (_, head) = sandbox.authored(&repo, "feat/x");
+    let tree = sandbox.tree(&repo, &head);
+    let refs = |dir: &Path| {
+        sandbox
+            .git(dir, &["for-each-ref", "--format=%(refname) %(objectname)"])
+            .lines()
+            .filter(|line| !line.starts_with("refs/notes/"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let config = fs::read(repo.join(".git/config")).unwrap();
+    let (status, hooks, before) = (
+        sandbox.status(&repo),
+        names_in(&repo.join(".git/hooks")),
+        refs(&repo),
+    );
+
+    let output = sandbox.judge_as(&repo, &RAE, &["main..feat/x", "--verdict", "approve"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("not pushed"), "{stdout}");
+
+    assert_eq!(
+        sandbox.status(&repo),
+        status,
+        "no file in the repository changed"
+    );
+    assert_eq!(
+        fs::read(repo.join(".git/config")).unwrap(),
+        config,
+        "nor its config"
+    );
+    assert_eq!(names_in(&repo.join(".git/hooks")), hooks, "nor its hooks");
+    assert_eq!(refs(&repo), before, "no ref but the notes ref");
+    let lines = sandbox.note_lines(&repo, &head);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    let note: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(
+        serde_json::to_string(&note).unwrap(),
+        lines[0],
+        "compact and canonical"
+    );
+    assert_eq!(note["schema"], "ohjaa-judgement-note.v1");
+    assert_eq!(note["head"], head.as_str());
+    assert_eq!(note["state"], tree.as_str());
+    assert_eq!(note["verdict"], "approve");
+    assert_eq!(
+        note["reviewer"]["name"], "Rae Reviewer",
+        "a private repository names people"
+    );
+    // Not pushed unless asked.
+    assert_eq!(sandbox.git(&bare, &["for-each-ref", "refs/notes/"]), "");
+
+    // Pushed when asked: the notes ref alone.
+    let output = sandbox.judge_as(
+        &repo,
+        &RAE,
+        &["main..feat/x", "--verdict", "approve", "--push"],
+    );
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains(&format!("pushed {JUDGEMENTS_REF} to origin")),
+        "{stdout}"
+    );
+    assert_eq!(sandbox.note_lines(&bare, &head).len(), 2);
+    assert_eq!(
+        sandbox.git(
+            &bare,
+            &["for-each-ref", "--format=%(refname)", "refs/notes/"]
+        ),
+        JUDGEMENTS_REF
+    );
+
+    // Another clone, on another machine (a log of its own), once the branch
+    // is pushed for review: fetched, and read as shared, not as its own.
+    sandbox.git(&repo, &["push", "-q", "origin", "feat/x"]);
+    let other = sandbox.dir.join("projects/widget-b");
+    sandbox.git(
+        &sandbox.dir,
+        &[
+            "clone",
+            "-q",
+            &bare.to_string_lossy(),
+            &other.to_string_lossy(),
+        ],
+    );
+    let state_b = sandbox.dir.join("state-b");
+    let read_b = |extra: &[&str]| {
+        let output = sandbox
+            .command("ohjaa", &other)
+            .args(["judgements", &head, "--json"])
+            .args(extra)
+            .env("XDG_STATE_HOME", &state_b)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = text(&output);
+        assert!(output.status.success(), "{stdout}{stderr}");
+        serde_json::from_str::<serde_json::Value>(&stdout).unwrap()
+    };
+    let json = read_b(&["--fetch"]);
+    let shared = json["judgements"].as_array().unwrap();
+    assert_eq!(shared.len(), 2, "{json:#}");
+    for judgement in shared {
+        assert_eq!(
+            judgement["sources"],
+            serde_json::json!(["fetched"]),
+            "{json:#}"
+        );
+    }
+
+    // The other clone judges too and pushes; this one pushes again: the
+    // notes merge line by line, and none is lost.
+    let mut judge_b = sandbox.command("ohjaa", &other);
+    judge_b
+        .args([
+            "judge",
+            &format!("{}..{head}", sandbox.git(&repo, &["rev-parse", "main"])),
+            "--verdict",
+            "reject",
+            "--push",
+        ])
+        .env("XDG_STATE_HOME", &state_b)
+        .env("GIT_COMMITTER_NAME", "Bo Reviewer")
+        .env("GIT_COMMITTER_EMAIL", "bo@example.invalid")
+        .env("GIT_AUTHOR_NAME", "Bo Reviewer")
+        .env("GIT_AUTHOR_EMAIL", "bo@example.invalid");
+    let output = judge_b.output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    let output = sandbox.judge_as(
+        &repo,
+        &RAE,
+        &["main..feat/x", "--verdict", "approve", "--push"],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    assert_eq!(
+        sandbox.note_lines(&bare, &head).len(),
+        4,
+        "{:#?}",
+        sandbox.note_lines(&bare, &head)
+    );
+}
+
+/// D8 point 3: a public repository's Judgements stay on this machine unless
+/// its entry opts in (`share_judgements = true`), and even then its note
+/// holds only ids, hashes and the verdict: no person's name or email, no
+/// finding's words, no path. An entry that does not say whether it is
+/// public is treated as public.
+#[test]
+fn a_public_repository_shares_no_judgement_unless_its_entry_opts_in_and_never_a_name() {
+    let (sandbox, repo, bare) = Sandbox::stage5("public", Some("public"));
+    let (_, head) = sandbox.authored(&repo, "feat/x");
+    let output = sandbox.judge_as(
+        &repo,
+        &RAE,
+        &[
+            "main..feat/x",
+            "--verdict",
+            "approve",
+            "--finding",
+            "secret-project is slow",
+        ],
+    );
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("local only"), "{stdout}");
+    let private_words = [
+        "Rae",
+        "rae@",
+        "Ann",
+        "ann@",
+        "secret-project",
+        &sandbox.dir.to_string_lossy().into_owned(),
+    ];
+    let check = |lines: &[String]| {
+        assert!(!lines.is_empty());
+        for line in lines {
+            for word in &private_words {
+                assert!(!line.contains(word), "{word:?} in a public note: {line}");
+            }
+            let note: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(note["head"], head.as_str(), "{line}");
+            assert!(note["id"].as_str().unwrap().starts_with("jd-"), "{line}");
+            assert_eq!(note["redacted"], true, "{line}");
+        }
+    };
+    check(&sandbox.note_lines(&repo, &head));
+
+    // Asked to push: refused, and nothing recorded.
+    let output = sandbox.judge_as(
+        &repo,
+        &RAE,
+        &["main..feat/x", "--verdict", "approve", "--push"],
+    );
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(3), "{stdout}{stderr}");
+    assert!(stderr.contains("share_judgements = true"), "{stderr}");
+    assert_eq!(sandbox.git(&bare, &["for-each-ref", "refs/notes/"]), "");
+    assert_eq!(
+        sandbox.judgements(&repo, &head, &[])["judgements"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Its entry opts in: pushed, and still names nothing private.
+    sandbox.entry_says(
+        "acme",
+        "widget",
+        Some("visibility = \"public\"\nshare_judgements = true".to_owned()),
+    );
+    let output = sandbox.judge_as(
+        &repo,
+        &RAE,
+        &["main..feat/x", "--verdict", "approve", "--push"],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    let pushed = sandbox.note_lines(&bare, &head);
+    assert_eq!(pushed.len(), 2, "{pushed:#?}");
+    check(&pushed);
+
+    // An entry that does not say: public, as far as sharing goes.
+    sandbox.entry_says("acme", "widget", None);
+    let output = sandbox.judge_as(
+        &repo,
+        &RAE,
+        &["main..feat/x", "--verdict", "approve", "--push"],
+    );
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output).1);
+    assert!(
+        text(&output).1.contains("visibility = \"private\""),
+        "{}",
+        text(&output).1
+    );
+}
+
+/// D5, BRIEF §5: when a landing reaches the observed branch, ohjaa asks sykli
+/// to validate the integrated State, the landed commit's own tree: a durable
+/// run of kind `integrated`, recorded before it is dispatched (invariant A),
+/// in a checkout of exactly that commit; never when sykli already has a
+/// current receipt of it. A candidate's pass is never the integrated
+/// State's unless the trees are the same.
+#[test]
+fn a_landing_on_the_observed_branch_is_validated_as_the_integrated_state() {
+    let (sandbox, repo, bare) = Sandbox::stage5("integrated", None);
+    // A candidate, proven on its branch by a receipt of its tree.
+    sandbox.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    let candidate = sandbox.commit(&repo, "feature");
+    let candidate_tree = sandbox.tree(&repo, "HEAD");
+    receipt(
+        &repo.join(".sykli/receipts/rcpt_feat.json"),
+        &candidate_tree,
+        "passed",
+        1_000,
+    );
+    sandbox.git(&repo, &["checkout", "-q", "main"]);
+    // Meanwhile origin/main moves on elsewhere.
+    sandbox.pushed_elsewhere(&bare, "widget-elsewhere", "elsewhere");
+    // The session merges the candidate onto it and pushes: a State no run
+    // has seen. The run is held, so sykli has not said yet.
+    fs::write(sandbox.dir.join("hold-runs"), "").unwrap();
+    let output = sandbox.session_with(
+        &repo,
+        "land the feature",
+        "git fetch -q origin && git merge -q --ff-only origin/main && \
+         git merge -q --no-ff feat -m 'land the feature' && git push -q origin main",
+        &[],
+    );
+    let (stdout, stderr) = text(&output);
+    assert!(output.status.success(), "{stdout}{stderr}");
+    let landed = sandbox.git(&repo, &["rev-parse", "main"]);
+    let landed_tree = sandbox.tree(&repo, "main");
+    assert_ne!(landed_tree, candidate_tree);
+    assert_ne!(landed, candidate);
+
+    // Recorded in the leaving session, as an integrated validation.
+    let record = sandbox.session_record(&repo, "land the feature");
+    let refs = record["validations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(refs.len(), 1, "{record:#}");
+    let integrated = &refs[0];
+    assert_eq!(integrated["kind"], "integrated", "{record:#}");
+    assert_eq!(integrated["commit"], landed.as_str());
+    assert_eq!(integrated["tree"], landed_tree.as_str());
+    let run = integrated["run"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{record:#}"));
+    // Before it was dispatched (invariant A): the record sykli found.
+    let at_dispatch: serde_json::Value =
+        serde_json::from_str(&sandbox.read("at-dispatch-all.json")).unwrap();
+    let then = at_dispatch["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["intent"] == "land the feature")
+        .unwrap_or_else(|| panic!("{at_dispatch:#}"));
+    assert_eq!(
+        then["validations"][0]["request"], integrated["request"],
+        "{then:#}"
+    );
+    assert_eq!(
+        then["validations"][0]["run"],
+        serde_json::Value::Null,
+        "{then:#}"
+    );
+    // Run in a checkout of exactly that commit, outside the repository.
+    let checkout = PathBuf::from(integrated["repo"].as_str().unwrap());
+    assert!(
+        checkout.starts_with(sandbox.dir.join("state/ohjaa/integrated")),
+        "{}",
+        checkout.display()
+    );
+    assert_eq!(sandbox.git(&checkout, &["rev-parse", "HEAD"]), landed);
+    assert_eq!(
+        sandbox.git(
+            &checkout,
+            &["status", "--porcelain", "--", ".", ":(exclude).sykli"]
+        ),
+        "",
+        "a clean checkout of the landed commit"
+    );
+    assert_eq!(
+        sandbox.read(&format!("runs/{run}/cwd")).trim(),
+        checkout.to_string_lossy()
+    );
+    assert!(
+        sandbox
+            .read("commit-asks")
+            .contains(&format!("status --commit {landed}")),
+        "sykli was asked first: {}",
+        sandbox.read("commit-asks")
+    );
+    // The leaving record names it.
+    assert!(
+        stderr.contains(&format!(
+            "validation {} (integrated, {} tree {}",
+            integrated["request"].as_str().unwrap(),
+            short(&landed),
+            short(&landed_tree)
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "ohjaa: integrated unverified: {} on origin/main has no current sykli receipt; \
+             ohjaa asked sykli to validate it",
+            short(&landed)
+        )),
+        "{stderr}"
+    );
+
+    // The candidate's pass is not the landing's: integrated unverified,
+    // with the request named, until sykli says.
+    let marks = |sandbox: &Sandbox| {
+        let output = sandbox.ohjaa_in(
+            &repo,
+            &["report", "--json", "--marks", "--root", &sandbox.projects()],
+        );
+        let (stdout, stderr) = text(&output);
+        serde_json::from_str::<serde_json::Value>(&stdout)
+            .unwrap_or_else(|e| panic!("{e}: {stdout}{stderr}"))
+    };
+    let json = marks(&sandbox);
+    let entry = &json["entries"][0];
+    assert_eq!(entry["tip"], landed.as_str(), "{json:#}");
+    assert_eq!(entry["commits"][0]["integrated"], "unverified", "{json:#}");
+    assert_eq!(entry["integrated"]["status"], "unverified", "{json:#}");
+    assert_eq!(
+        entry["integrated"]["requested"][0]["request"], integrated["request"],
+        "{json:#}"
+    );
+    assert_eq!(entry["integrated"]["requested"][0]["run"], run, "{json:#}");
+
+    // sykli ran the landed tree and it passed: integrated passed.
+    fs::remove_file(sandbox.dir.join("hold-runs")).unwrap();
+    fs::write(sandbox.dir.join("tree"), &landed_tree).unwrap();
+    let _ = sandbox.brief(&repo); // asks sykli about the pending run
+    let json = marks(&sandbox);
+    assert_eq!(
+        json["entries"][0]["commits"][0]["integrated"], "passed",
+        "{json:#}"
+    );
+    assert_eq!(
+        json["entries"][0]["integrated"]["status"], "passed",
+        "{json:#}"
+    );
+
+    // A candidate landed as it is (a fast-forward) has the same tree: sykli
+    // has a current receipt of it, so no run is asked for, and it is said.
+    sandbox.git(&repo, &["checkout", "-q", "-b", "feat2"]);
+    let same = sandbox.commit(&repo, "feature-two");
+    sandbox.commit_status(&same, &sandbox.tree(&repo, "HEAD"), "passed", None);
+    sandbox.git(&repo, &["checkout", "-q", "main"]);
+    let output = sandbox.session_with(
+        &repo,
+        "land as it is",
+        "git merge -q --ff-only feat2 && git push -q origin main",
+        &[],
+    );
+    let (stdout, stderr) = text(&output);
+    assert!(output.status.success(), "{stdout}{stderr}");
+    let record = sandbox.session_record(&repo, "land as it is");
+    assert_eq!(
+        record["validations"],
+        serde_json::Value::Null,
+        "no run asked for: {record:#}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "integrated passed: {} on origin/main",
+            short(&same)
+        )),
+        "{stderr}"
+    );
+}
+
+/// D5: the briefing shows what sykli says of the integrated State (the
+/// observed branch's tip) and of the candidate here (HEAD): passed, failed
+/// or unverified, each named. A launch asks sykli to validate an unverified
+/// tip once, recorded before it is dispatched; a dry run only says it would.
+#[test]
+fn the_briefing_shows_candidate_and_integrated_states_and_asks_once_for_an_unverified_tip() {
+    let (sandbox, repo, _) = Sandbox::stage5("brief5", None);
+    let tip = sandbox.commit(&repo, "unproven");
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+    fs::write(sandbox.dir.join("hold-runs"), "").unwrap();
+
+    // A dry run says it would ask, and dispatches nothing.
+    let output = sandbox.ohjaa_in(&repo, &["run", "claude", "--intent", "look", "--dry-run"]);
+    let (_, stderr) = text(&output);
+    assert!(
+        stderr.contains(&format!(
+            "integrated unverified: main of acme/widget at {}",
+            short(&tip)
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("would ask sykli to validate it"),
+        "{stderr}"
+    );
+    assert!(
+        names_in(&sandbox.dir.join("runs")).is_empty(),
+        "nothing dispatched"
+    );
+
+    // A launch asks, once: recorded, then dispatched.
+    let output = sandbox.session_with(&repo, "first look", "true", &[]);
+    assert!(output.status.success(), "{}", text(&output).1);
+    let briefing = sandbox.last_briefing();
+    assert!(
+        briefing.contains(&format!(
+            "integrated unverified: main of acme/widget at {}",
+            short(&tip)
+        )),
+        "{briefing}"
+    );
+    let record = sandbox.session_record(&repo, "first look");
+    let refs = record["validations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(refs.len(), 1, "{record:#}");
+    assert_eq!(refs[0]["kind"], "integrated");
+    assert_eq!(refs[0]["commit"], tip.as_str());
+    assert!(refs[0]["run"].is_string(), "{record:#}");
+    assert!(
+        briefing.contains(&format!(
+            "ohjaa asked sykli to validate it: request {}",
+            refs[0]["request"].as_str().unwrap()
+        )),
+        "{briefing}"
+    );
+    let at_dispatch: serde_json::Value =
+        serde_json::from_str(&sandbox.read("at-dispatch-all.json")).unwrap();
+    let then = at_dispatch["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["intent"] == "first look")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        then["validations"][0]["run"],
+        serde_json::Value::Null,
+        "recorded before dispatch: {then:#}"
+    );
+
+    // While it runs, sykli says pending: not asked again.
+    sandbox.commit_status(&tip, "", "pending", None);
+    let output = sandbox.session_with(&repo, "second look", "true", &[]);
+    assert!(output.status.success(), "{}", text(&output).1);
+    let briefing = sandbox.last_briefing();
+    assert!(
+        briefing.contains("integrated unverified") && briefing.contains("a run of it is pending"),
+        "{briefing}"
+    );
+    assert_eq!(
+        sandbox.session_record(&repo, "second look")["validations"],
+        serde_json::Value::Null
+    );
+
+    // Passed, then failed.
+    sandbox.commit_status(&tip, "", "passed", None);
+    assert!(sandbox.brief(&repo).contains(&format!(
+        "integrated passed: main of acme/widget at {}",
+        short(&tip)
+    )));
+    sandbox.commit_status(&tip, "", "failed", None);
+    assert!(sandbox.brief(&repo).contains(&format!(
+        "integrated failed: main of acme/widget at {}",
+        short(&tip)
+    )));
+
+    // The candidate here: HEAD on a branch ahead of the tip.
+    sandbox.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    let head = sandbox.commit(&repo, "candidate");
+    sandbox.commit_status(&head, "", "passed", None);
+    let brief = sandbox.brief(&repo);
+    assert!(
+        brief.contains(&format!("candidate passed: HEAD {} (feat)", short(&head))),
+        "{brief}"
+    );
+    sandbox.commit_status(&head, "", "failed", None);
+    let brief = sandbox.brief(&repo);
+    assert!(
+        brief.contains(&format!("candidate failed: HEAD {} (feat)", short(&head))),
+        "{brief}"
+    );
+}
+
+/// BRIEF §5 and D5, observe-mark-flag: a branch validated when the observed
+/// branch was at B, pushed after it moved on, is pushed and flagged "base
+/// moved since validation", and the briefing in its checkout says so too.
+/// Never refused. A branch validated on the current base is not flagged.
+#[test]
+fn a_base_that_moved_since_validation_is_flagged_at_push_and_in_the_briefing_never_refused() {
+    let (sandbox, repo, bare) = Sandbox::stage5("stale", None);
+    let base = sandbox.git(&repo, &["rev-parse", "origin/main"]);
+    sandbox.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    let candidate = sandbox.commit(&repo, "feature");
+    fs::write(sandbox.dir.join("tree"), sandbox.tree(&repo, "HEAD")).unwrap();
+    let output = sandbox.session_with(&repo, "validate the feature", "ohjaa gate", &[]);
+    assert!(output.status.success(), "{}", text(&output).1);
+    // origin/main moves on, and this clone sees it.
+    let moved = sandbox.pushed_elsewhere(&bare, "widget-elsewhere", "elsewhere");
+    sandbox.git(&repo, &["fetch", "-q", "origin"]);
+
+    let output = sandbox.git_out(&repo, &["push", "-q", "origin", "feat"]);
+    let (_, stderr) = text(&output);
+    assert!(output.status.success(), "never refused: {stderr}");
+    assert_eq!(
+        sandbox.git(&bare, &["rev-parse", "feat"]),
+        candidate,
+        "pushed"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "ohjaa: base moved since validation: {} (feat) was validated when origin/main was at {}; it is at {} now",
+            short(&candidate),
+            short(&base),
+            short(&moved)
+        )),
+        "{stderr}"
+    );
+    let brief = sandbox.brief(&repo);
+    assert!(
+        brief.contains(&format!(
+            "base moved since validation: HEAD {} was validated when origin/main was at {}; it is at {} now",
+            short(&candidate),
+            short(&base),
+            short(&moved)
+        )),
+        "{brief}"
+    );
+
+    // Validated on the current base: no flag.
+    sandbox.git(&repo, &["checkout", "-q", "-b", "feat2", "origin/main"]);
+    sandbox.commit(&repo, "feature-two");
+    fs::write(sandbox.dir.join("tree"), sandbox.tree(&repo, "HEAD")).unwrap();
+    let output = sandbox.session_with(&repo, "validate feature two", "ohjaa gate", &[]);
+    assert!(output.status.success(), "{}", text(&output).1);
+    let output = sandbox.git_out(&repo, &["push", "-q", "origin", "feat2"]);
+    let (_, stderr) = text(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("base moved"), "{stderr}");
+    assert!(!sandbox.brief(&repo).contains("base moved"));
+}
+
+/// D5, audit finding 9: concurrent sessions are counted across every
+/// worktree of a clone, not only the checkout a session is launched in, and
+/// the briefing names them.
+#[test]
+fn sessions_in_every_worktree_of_the_clone_are_counted_and_named_at_launch() {
+    let sandbox = Sandbox::new("clone-sessions");
+    let (repo, _) = sandbox.repo("acme", "widget", &[]);
+    let sibling = sandbox.dir.join("projects/widget-lexer");
+    sandbox.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "lexer",
+            &sibling.to_string_lossy(),
+        ],
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let listed = sandbox.dir.join("toimija-sessions");
+    fs::create_dir_all(&listed).unwrap();
+    fs::write(
+        listed.join("widget-lexer"),
+        format!(
+            "{{\"sessions\":[{{\"id\":\"1790-42\",\"agent\":[\"codex\"],\"worktree\":\"{}\",\
+             \"branch\":\"lexer\",\"intent\":\"rework the lexer\",\"scope\":[],\
+             \"liveness\":\"active\",\"pid_check\":\"alive\",\"last_seen_at\":{now}}}],\
+             \"warnings\":[],\"coverage\":{{\"status\":\"available\"}}}}",
+            sibling.display()
+        ),
+    )
+    .unwrap();
+    let output = sandbox.ohjaa_in(&repo, &["run", "claude", "--intent", "x", "--dry-run"]);
+    let (_, stderr) = text(&output);
+    assert!(
+        stderr.contains("ohjaa: 0 sibling session(s) in this checkout at launch"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("ohjaa: 1 more session(s) in other worktrees of this clone at launch: 1790-42 (codex, widget-lexer)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Sessions in this clone's other worktrees at launch")
+            && stderr.contains("1790-42 (codex) in ")
+            && stderr.contains("on lexer")
+            && stderr.contains("rework the lexer"),
+        "named in the briefing: {stderr}"
+    );
+}
+
+/// "We don't want to run git git git", Stage 5: the Judgement and its notes,
+/// and the stale-base check on the hook path, each measured as git's trace2
+/// counts it, with a positive control that it did what it says.
+#[test]
+fn judgements_and_the_stale_base_check_stay_within_their_git_budget() {
+    let (sandbox, repo, bare) = Sandbox::stage5("budget5", Some("private"));
+    let (_, head) = sandbox.authored(&repo, "feat/x");
+    let mut report = Vec::new();
+    let mut budget = |what: &str, starts: usize, at_most: usize| {
+        eprintln!("{what:<52} {starts} git processes (budget {at_most})");
+        report.push((what.to_owned(), starts, at_most));
+    };
+    let with = |command: &mut Command, who: &[(&str, &str)]| {
+        for (key, value) in who {
+            command.env(key, value);
+        }
+    };
+
+    // A person's Judgement: the clone's config, the identity, the Change
+    // (its ends, its commits) and the note.
+    let mut judge = sandbox.command("ohjaa", &repo);
+    judge.args(["judge", "main..feat/x", "--verdict", "approve"]);
+    with(&mut judge, &RAE);
+    let (starts, output) = sandbox.git_starts(&mut judge);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    assert_eq!(
+        sandbox.note_lines(&repo, &head).len(),
+        1,
+        "the note was written"
+    );
+    assert!(started(&starts, "notes"), "{starts:#?}");
+    budget("ohjaa judge (a person)", starts.len(), 6);
+
+    // Inside a session: also the reviewer's own commits (its checkout's
+    // reflog and the clone's branches).
+    let started_flag = sandbox.dir.join("reviewer-started");
+    let stop = sandbox.dir.join("reviewer-stop");
+    let mut session = std::os::unix::process::CommandExt::process_group(
+        sandbox
+            .command("ohjaa", &repo)
+            .args([
+                "run",
+                "sh",
+                "--intent",
+                "hold a review",
+                "--no-briefing",
+                "--",
+                "-c",
+                &format!(
+                    "touch '{}'; while [ ! -f '{}' ]; do sleep 0.05; done",
+                    started_flag.display(),
+                    stop.display()
+                ),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        0,
+    )
+    .spawn()
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !started_flag.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the session never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let reviewer = sandbox.session_id(&repo, "hold a review");
+    let mut judge = sandbox.command("ohjaa", &repo);
+    judge
+        .args(["judge", "main..feat/x", "--verdict", "approve"])
+        .env("OHJAA_SESSION", &reviewer);
+    let (starts, output) = sandbox.git_starts(&mut judge);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    assert_eq!(sandbox.note_lines(&repo, &head).len(), 2);
+    assert!(
+        started(&starts, "--walk-reflogs"),
+        "its checkout's reflog: {starts:#?}"
+    );
+    budget("ohjaa judge (inside a session)", starts.len(), 6);
+    fs::write(&stop, "").unwrap();
+    session.wait().unwrap();
+
+    // Pushed: the remote's notes fetched, merged, and the ref pushed.
+    let mut judge = sandbox.command("ohjaa", &repo);
+    judge.args(["judge", "main..feat/x", "--verdict", "approve", "--push"]);
+    with(&mut judge, &RAE);
+    let (starts, output) = sandbox.git_starts(&mut judge);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    assert_eq!(sandbox.note_lines(&bare, &head).len(), 3, "pushed");
+    budget("ohjaa judge --push", starts.len(), 9);
+
+    // An answer: the identity and the note.
+    let id = sandbox.judgements(&repo, &head, &[])["judgements"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut respond = sandbox.command("ohjaa", &repo);
+    respond.args(["judge", "respond", &id, "thanks"]);
+    with(&mut respond, &ANN);
+    let (starts, output) = sandbox.git_starts(&mut respond);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    assert_eq!(
+        sandbox.note_lines(&repo, &head).len(),
+        4,
+        "the answer's note"
+    );
+    budget("ohjaa judge respond", starts.len(), 3);
+
+    // Reading: the commit, and the notes of each source.
+    let (starts, output) =
+        sandbox.git_starts(sandbox.command("ohjaa", &repo).args(["judgements", &head]));
+    assert!(text(&output).0.contains(&id), "{}", text(&output).0);
+    budget("ohjaa judgements <commit>", starts.len(), 3);
+    let (starts, output) =
+        sandbox.git_starts(
+            sandbox
+                .command("ohjaa", &repo)
+                .args(["judgements", &head, "--fetch"]),
+        );
+    assert!(text(&output).0.contains(&id), "{}", text(&output).0);
+    assert!(started(&starts, "fetch"), "{starts:#?}");
+    budget("ohjaa judgements <commit> --fetch", starts.len(), 4);
+
+    // The hook path: a push of a branch validated on a base that moved since
+    // starts no git process beyond the push itself, and says so.
+    sandbox.git(&repo, &["checkout", "-q", "-b", "feat/stale"]);
+    sandbox.commit(&repo, "stale");
+    fs::write(sandbox.dir.join("tree"), sandbox.tree(&repo, "HEAD")).unwrap();
+    let output = sandbox.session_with(&repo, "validate stale", "ohjaa gate", &[]);
+    assert!(output.status.success(), "{}", text(&output).1);
+    sandbox.git(&repo, &["checkout", "-q", "main"]);
+    sandbox.pushed_elsewhere(&bare, "widget-moved", "moved");
+    sandbox.git(&repo, &["fetch", "-q", "origin"]);
+    let (through, output) = sandbox.git_starts(sandbox.command("git", &repo).args([
+        "push",
+        "-q",
+        "origin",
+        "feat/stale",
+    ]));
+    assert!(output.status.success(), "{}", text(&output).1);
+    assert!(
+        text(&output)
+            .1
+            .contains("ohjaa: base moved since validation"),
+        "{}",
+        text(&output).1
+    );
+    sandbox.git(&repo, &["branch", "-q", "plain", "feat/stale"]);
+    let (direct, output) = sandbox.git_starts(sandbox.command("git", &repo).args([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "-q",
+        "origin",
+        "plain",
+    ]));
+    assert!(output.status.success(), "{}", text(&output).1);
+    budget(
+        "ohjaa hook pre-push (a base that moved)",
+        through.len().saturating_sub(direct.len()),
+        0,
+    );
+
+    let over: Vec<_> = report
+        .iter()
+        .filter(|(_, starts, at_most)| starts > at_most)
+        .collect();
+    assert!(over.is_empty(), "over budget: {over:?}");
+}
+
+/// D5 against sykli's main: a landing is validated as the integrated State,
+/// in a checkout of exactly the landed commit, and the marks then prove it;
+/// the candidate's own pass never did, its tree being another.
+#[test]
+#[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
+fn real_sykli_a_landing_is_validated_as_the_integrated_state() {
+    let (sandbox, repo, bare) = Sandbox::with_real_sykli("real-integrated");
+    sandbox.entry_says(
+        "acme",
+        "widget",
+        Some("visibility = \"private\"".to_owned()),
+    );
+    sandbox.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    let candidate = sandbox.state(&repo, "ok, the feature", "feature");
+    let (code, said) = sandbox.gate(&repo);
+    assert_eq!(code, Some(0), "{said}");
+    sandbox.git(&repo, &["checkout", "-q", "main"]);
+    sandbox.pushed_elsewhere(&bare, "widget-elsewhere", "elsewhere");
+    let output = sandbox.session_with(
+        &repo,
+        "land the feature",
+        "git fetch -q origin && git merge -q --ff-only origin/main && \
+         git merge -q --no-ff feat -m 'land the feature' && git push -q origin main",
+        &[],
+    );
+    let (stdout, stderr) = text(&output);
+    assert!(output.status.success(), "{stdout}{stderr}");
+    let landed = sandbox.git(&repo, &["rev-parse", "main"]);
+    assert_ne!(
+        sandbox.tree(&repo, &landed),
+        sandbox.tree(&repo, &candidate)
+    );
+    let record = sandbox.session_record(&repo, "land the feature");
+    let integrated = record["validations"][0].clone();
+    assert_eq!(integrated["kind"], "integrated", "{record:#}");
+    assert_eq!(integrated["commit"], landed.as_str(), "{record:#}");
+    assert!(integrated["run"].is_string(), "{record:#}");
+    // sykli's own word on the landed commit, once the run is done.
+    let contract = sandbox.config().join("repos/acme/widget/sykli.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let verdict = loop {
+        let output = sandbox
+            .command("sykli", &repo)
+            .args(["status", "--commit", &landed, "--contract"])
+            .arg(&contract)
+            .arg("--json")
+            .output()
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+        let verdict = status["verdict"].as_str().unwrap_or("").to_owned();
+        if verdict != "pending" && verdict != "none" || std::time::Instant::now() > deadline {
+            break verdict;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert_eq!(verdict, "passed");
+    let json = sandbox.report_json(&repo);
+    let tip = &json["entries"][0]["commits"][0];
+    assert_eq!(tip["sha"], landed.as_str(), "{json:#}");
+    assert_eq!(tip["mark"], "proven", "{json:#}");
+    assert_eq!(tip["integrated"], "passed", "{json:#}");
+}
+
+/// D5 against sykli's main: the evidence a Judgement considered is sykli's
+/// references (its run and receipt), read from `sykli status --commit`, and
+/// sykli still answers for that run.
+#[test]
+#[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
+fn real_sykli_a_judgement_references_the_run_sykli_keeps() {
+    let (sandbox, repo, _) = Sandbox::with_real_sykli("real-judge");
+    sandbox.entry_says(
+        "acme",
+        "widget",
+        Some("visibility = \"private\"".to_owned()),
+    );
+    sandbox.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    let mut commit = sandbox.command("git", &repo);
+    fs::write(repo.join("state.txt"), "ok, Ann's\n").unwrap();
+    commit.args(["commit", "-q", "-am", "ann's change"]);
+    for (key, value) in ANN {
+        commit.env(key, value);
+    }
+    assert!(commit.output().unwrap().status.success());
+    let head = sandbox.git(&repo, &["rev-parse", "HEAD"]);
+    let (code, said) = sandbox.gate(&repo);
+    assert_eq!(code, Some(0), "{said}");
+    let output = sandbox.judge_as(&repo, &RAE, &["main..feat", "--verdict", "approve"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    let json = sandbox.judgements(&repo, &head, &[]);
+    let refs = json["judgements"][0]["evidence"]["refs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let run = refs
+        .iter()
+        .find_map(|r| r["run"].as_str())
+        .unwrap_or_else(|| panic!("no run among the evidence: {json:#}"))
+        .to_owned();
+    let output = sandbox
+        .command("sykli", &repo)
+        .args(["status", "--run", &run, "--json"])
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["state"], "completed", "{status:#}");
+    assert_eq!(sandbox.note_lines(&repo, &head).len(), 1);
 }
