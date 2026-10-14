@@ -240,16 +240,8 @@ fn write_entry(top: &Path, id: &RepoId, dir: &Path, branch: &str, force: bool) -
             }
         )
     };
-    // What a person wrote about sharing Judgements is kept: only they write it.
-    let sharing = home::read_entry(dir)
-        .ok()
-        .flatten()
-        .map(|entry| entry.sharing)
-        .unwrap_or_default();
-    home::write_file(
-        &dir.join("repo.toml"),
-        &home::repo_toml(id, branch, &sharing),
-        None,
-    )?;
+    // Only repo.toml: what a person wrote about sharing Judgements
+    // (sharing.toml beside it) is theirs, and never touched here.
+    home::write_file(&dir.join("repo.toml"), &home::repo_toml(id, branch), None)?;
     Ok(source)
 }

@@ -1642,9 +1642,17 @@ pub fn render_validations(
             ValidationKind::Integrated => "integrated",
         };
         let answer = match (&validation.run, &validation.receipt) {
-            (None, None) => match &validation.not_dispatched {
-                Some(why) => format!("recorded, never handed to sykli: {why}"),
-                None => "no sykli run id; no receipt recorded".to_owned(),
+            (None, None) => match (&validation.not_dispatched, validation.kind) {
+                (Some(why), _) => format!("recorded, never handed to sykli: {why}"),
+                // ohjaa records an integrated request, then dispatches it
+                // and fills in what became of it, in one go: nothing filled
+                // in is an ohjaa that stopped in between.
+                (None, ValidationKind::Integrated) => {
+                    crate::integrated::NEVER_DISPATCHED.to_owned()
+                }
+                (None, ValidationKind::Candidate) => {
+                    "no sykli run id; no receipt recorded".to_owned()
+                }
             },
             (None, Some(receipt)) => format!("no sykli run id{}", describe_receipt(receipt)),
             (Some(run), Some(receipt)) => format!("sykli run {run}{}", describe_receipt(receipt)),

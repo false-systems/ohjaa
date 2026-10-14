@@ -391,28 +391,40 @@ enum Cmd {
         wait: u64,
     },
     /// Record an independent Judgement of a Change (base..head) and its
-    /// exact State: the reviewer is the ohjaa session this runs inside, else
-    /// the person git names here. Refused when the reviewer made any commit
-    /// of the Change (law 2). Kept in the session log, and attached to the
-    /// head as a git note under refs/notes/ohjaa/judgements.
+    /// exact State. The reviewer is observed: the live ohjaa session whose
+    /// process group holds this process (or an ancestor), whatever
+    /// OHJAA_SESSION says; outside every one, the person git names here.
+    /// Refused when the reviewer made any commit of the Change (law 2). Kept
+    /// in the session log, and attached to the head as a git note under
+    /// refs/notes/ohjaa/judgements.
     #[command(
         args_conflicts_with_subcommands = true,
         subcommand_negates_reqs = true,
         after_help = "Exit codes:\n  \
         0  recorded\n  \
-        1  recorded, but --push did not reach origin\n  \
+        1  recorded, but not shared: --push did not reach origin\n  \
         2  nothing to judge: the range cannot be resolved, or holds no commit\n  \
-        3  refused: the reviewer made a commit of the Change (law 2), the\n     \
-           reviewing session is not live in the log, or --push for a repository\n     \
-           whose Judgements are not shared (nothing is recorded then)\n\n\
+        3  refused, nothing recorded: the reviewer made a commit of the Change\n     \
+           (law 2), OHJAA_SESSION names no live session in the log, or --push\n     \
+           for a repository whose Judgements are not shared\n  \
+        4  not recorded: the session log could not be read or written (busy\n     \
+           past 20s, or broken), or the repository or its entry cannot be read\n\n\
+        The judge's procedural independence is `established` only when every\n\
+        commit of the Change is held by an ended session's record, none the\n\
+        reviewer's; this process runs inside no live session but the reviewer's\n\
+        own; and OHJAA_SESSION is unset (a person, whose git identity is on no\n\
+        commit of the Change) or names that session. Otherwise it is recorded,\n\
+        with `established: false` and each reason: ohjaa cannot tell a person\n\
+        from an agent, and a reflog is the agent's own testimony.\n\n\
         RANGE is base..head, or a head alone: its base is then where it leaves\n\
         origin's copy of the entry's branch. The evidence considered is what\n\
         `sykli status --commit <head> --contract <gate> --json` names (runs and\n\
         receipts, by reference). Judgements of a private repository (its entry's\n\
-        visibility = \"private\") are shared when asked; of any other, only with\n\
-        share_judgements = true in its entry, and their notes hold ids, hashes and\n\
-        the verdict only. --push (or push_judgements = true) pushes the notes ref\n\
-        to origin, after merging origin's: git push origin refs/notes/ohjaa/judgements."
+        sharing.toml says visibility = \"private\") are shared when asked; of any\n\
+        other, only with share_judgements = true there, and their notes hold ids,\n\
+        hashes and the verdict only. --push (or push_judgements = true) pushes\n\
+        refs/notes/ohjaa/judgements to origin as the union of this clone's lines,\n\
+        origin's and the session log's: no line is dropped, and none is replaced."
     )]
     Judge {
         #[command(subcommand)]
@@ -441,16 +453,33 @@ enum Cmd {
         push: bool,
     },
     /// Every Judgement of a commit (and the answers to them), from this
-    /// machine's log and the notes, each marked with where it was read.
+    /// machine's log and the notes, each marked with where it was read
+    /// (log, note, merged, fetched), whether it is authoritative here, and
+    /// whether another record of its id says otherwise (a conflict).
+    #[command(
+        after_help = "--rebuild-public rewrites this clone's refs/notes/ohjaa/judgements as one\n\
+        commit by ohjaa <ohjaa@invalid> with no history, holding only redacted lines:\n\
+        every redacted line of its notes, and this machine's Judgements of the clone\n\
+        in their redacted form. Every other line is dropped from the ref (the session\n\
+        log keeps this machine's Judgements), and the old history is no longer\n\
+        reachable from it, so no push publishes it; git's reflog keeps it on this\n\
+        machine only. Nothing is pushed. For an entry made public after it was\n\
+        private: a note removed with `git notes remove` is still in the history."
+    )]
     Judgements {
         /// The commit (default HEAD).
         #[arg(default_value = "HEAD")]
         commit: String,
         #[arg(long)]
         json: bool,
-        /// First fetch origin's shared notes (refs/notes/ohjaa/judgements).
+        /// First fetch origin's shared notes (refs/notes/ohjaa/judgements)
+        /// into refs/notes/ohjaa/fetched/judgements.
         #[arg(long)]
         fetch: bool,
+        /// Rewrite this clone's notes ref with redacted lines only, and no
+        /// history (see below).
+        #[arg(long, conflicts_with_all = ["json", "fetch"])]
+        rebuild_public: bool,
     },
     /// Print the shell functions that route `claude` and `codex` through
     /// `ohjaa run`. Load them with: eval "$(ohjaa shell-init zsh)"
@@ -955,9 +984,10 @@ fn cmd_brief(
                     marks,
                     head.as_ref()
                         .map(|(commit, branch)| (commit.as_str(), branch.as_deref())),
-                    &integrated::recorded_in(&all, &marks.gate.common),
+                    &all,
                     integrated::Mode::Brief,
                     &dirs.state,
+                    &sessions::store_path(&dirs.state),
                     &caps,
                 );
                 let text = view.briefing();
@@ -2400,7 +2430,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // What sykli says of the observed branch's tip (the integrated State)
     // and of HEAD (a candidate), with a stale base flagged; a launch asks
     // for a run of an unverified tip, recorded with this session first.
-    let (validation, integrated_caps) = match (&launch_marks.marks, no_briefing) {
+    let (mut validation, integrated_caps) = match (&launch_marks.marks, no_briefing) {
         (Some(marks), false) => {
             let caps = integrated::Caps::ask(true);
             let head = gitconfig::read_head(&root, &marks.gate.common);
@@ -2412,13 +2442,14 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 marks,
                 head.as_ref()
                     .map(|(commit, branch)| (commit.as_str(), branch.as_deref())),
-                &integrated::recorded_in(&all, &marks.gate.common),
+                &all,
                 if dry_run {
                     integrated::Mode::DryRun
                 } else {
                     integrated::Mode::Launch
                 },
                 &dirs.state,
+                &sessions::store_path(&dirs.state),
                 &caps,
             );
             for line in &view.lines {
@@ -2624,7 +2655,14 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     {
         if entered {
             let log = sessions::store_path(&dirs.state);
-            match integrated::dispatch_recorded(&log, &session_id, &marks.gate, request, caps) {
+            match integrated::dispatch_recorded(
+                &log,
+                &dirs.state,
+                &session_id,
+                &marks.gate,
+                request,
+                caps,
+            ) {
                 integrated::Asked::Recorded { request: id, run } => match run {
                     Ok(run) => eprintln!(
                         "ohjaa: integrated validation {id}: sykli run {run}, in {}",
@@ -2647,6 +2685,8 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             }
         }
     }
+    // Handed over (or not to be): another launch in this clone may decide.
+    drop(validation.lock.take());
 
     // Stay the parent: leaving must run when the session ends, however it ends.
     // The session leads a process group of its own (holding the terminal when
@@ -2958,7 +2998,6 @@ fn integrated_at_leaving(
         .map(|scoped| (scoped.repo.as_str(), &scoped.landed[..]));
     let log = sessions::store_path(&dirs.state);
     let mut caps = None;
-    let mut all = None;
     let mut lines = Vec::new();
     for (repo, landed) in launch.into_iter().chain(scoped) {
         let Some(gate) = sykli.gate_for(Path::new(repo)) else {
@@ -2967,20 +3006,14 @@ fn integrated_at_leaving(
         let onto = format!("origin/{}", gate.branch);
         for landed in landed.iter().filter(|l| l.at_tip && l.onto == onto) {
             let caps = caps.get_or_insert_with(|| integrated::Caps::ask(true));
-            // What the log's sessions already asked sykli for here.
-            let all: &Vec<sessions::Session> = all.get_or_insert_with(|| {
-                session_reader(dirs)
-                    .and_then(|log| log.all().ok())
-                    .map(|(all, _)| all)
-                    .unwrap_or_default()
-            });
+            // The log is read again under the clone's lock: another ohjaa may
+            // have asked already.
             lines.push(integrated::at_landing(
                 &log,
                 &dirs.state,
                 &session.id,
                 &gate,
                 &landed.commit,
-                &integrated::recorded_in(all, &gate.common),
                 caps,
             ));
         }
@@ -3542,9 +3575,14 @@ fn main() {
             None => Err(anyhow::anyhow!("--verdict is required")),
         },
         Cmd::Judgements {
+            rebuild_public: true,
+            ..
+        } => judgement::rebuild_public(),
+        Cmd::Judgements {
             commit,
             json,
             fetch,
+            ..
         } => judgement::list(commit, *json, *fetch),
         Cmd::Intake {
             since,

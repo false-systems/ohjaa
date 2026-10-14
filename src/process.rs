@@ -291,6 +291,138 @@ fn leads(listing: &str, pgid: u32, started_ms: i64, now: i64) -> bool {
     })
 }
 
+/// One process as `ps` lists it: its id, its parent's, its group's, and how
+/// long it has run, in seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Proc {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
+    pub elapsed: i64,
+}
+
+/// The process table: one `ps -A -o pid= -o ppid= -o pgid= -o etime=`.
+pub fn table() -> Result<Vec<Proc>, String> {
+    let output = run(
+        Command::new("ps").args([
+            "-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "etime=",
+        ]),
+        None,
+        LOCAL,
+    )
+    .map_err(|error| format!("ps could not be run: {error:#}"))?;
+    if !output.status.success() {
+        return Err(format!("ps failed: {}", output.failure_detail()));
+    }
+    let listed = parse_table(&output.stdout_text());
+    if listed.is_empty() {
+        return Err("ps listed no process".to_owned());
+    }
+    Ok(listed)
+}
+
+/// `ps -o pid= -o ppid= -o pgid= -o etime=` lines, those that read whole.
+fn parse_table(text: &str) -> Vec<Proc> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some(Proc {
+                pid: fields.next()?.parse().ok()?,
+                ppid: fields.next()?.parse().ok()?,
+                pgid: fields.next()?.parse().ok()?,
+                elapsed: elapsed_seconds(fields.next()?)?,
+            })
+        })
+        .collect()
+}
+
+/// This process and its ancestors, nearest first, as `table` lists them:
+/// this process itself first (its group from the kernel, whether or not the
+/// table holds it yet), then each parent up to the first the table does not
+/// hold, or the root.
+pub fn ancestry(table: &[Proc]) -> Vec<Proc> {
+    let me = std::process::id();
+    let first = table.iter().find(|p| p.pid == me).copied().or_else(|| {
+        #[cfg(unix)]
+        {
+            // SAFETY: getppid(2) and getpgrp(2) cannot fail.
+            let (ppid, pgid) = unsafe { (libc::getppid(), libc::getpgrp()) };
+            Some(Proc {
+                pid: me,
+                ppid: u32::try_from(ppid).ok()?,
+                pgid: u32::try_from(pgid).ok()?,
+                elapsed: 0,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    });
+    let mut chain: Vec<Proc> = first.into_iter().collect();
+    while let Some(last) = chain.last().copied() {
+        if last.ppid <= 1 || chain.len() > 64 {
+            break;
+        }
+        match table.iter().find(|p| p.pid == last.ppid) {
+            Some(parent) if !chain.iter().any(|p| p.pid == parent.pid) => chain.push(*parent),
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// An exclusive lock on a file, held until it is dropped: flock(2), so it
+/// goes with the process however that ends, and a crash never leaves one
+/// behind.
+#[derive(Debug)]
+pub struct FileLock {
+    _file: std::fs::File,
+}
+
+/// Take the lock on `path` (made, with its folder, when missing), waiting
+/// at most `wait` while another process holds it.
+pub fn lock_file(path: &std::path::Path, wait: Duration) -> Result<FileLock, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        let deadline = Instant::now() + wait;
+        loop {
+            // SAFETY: flock(2) on a descriptor this function owns.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(FileLock { _file: file });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(format!("cannot lock {}: {error}", path.display()));
+            }
+            if Instant::now() >= deadline || cancelled() {
+                return Err(format!(
+                    "{} is held by another ohjaa (waited {}s)",
+                    path.display(),
+                    wait.as_secs()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = wait;
+        Ok(FileLock { _file: file })
+    }
+}
+
 /// `ps`'s elapsed time, `[[dd-]hh:]mm:ss`, in seconds.
 fn elapsed_seconds(text: &str) -> Option<i64> {
     let (days, clock) = match text.split_once('-') {
@@ -345,6 +477,53 @@ mod tests {
         }
         assert!(names_flag("  --run <ID>", "--run"));
         assert!(!names_flag("  --run-id <ID>", "--run"));
+    }
+
+    #[test]
+    fn the_process_table_reads_as_ps_writes_it_and_this_process_has_ancestors() {
+        let listed = parse_table("    1     0     1 05-23:04:02\n  332     1   332 00:07\nbad\n");
+        assert_eq!(
+            listed,
+            vec![
+                Proc {
+                    pid: 1,
+                    ppid: 0,
+                    pgid: 1,
+                    elapsed: 5 * 86_400 + 23 * 3600 + 4 * 60 + 2
+                },
+                Proc {
+                    pid: 332,
+                    ppid: 1,
+                    pgid: 332,
+                    elapsed: 7
+                }
+            ]
+        );
+        let table = table().unwrap();
+        let chain = ancestry(&table);
+        assert_eq!(chain[0].pid, std::process::id());
+        assert!(chain.len() > 1, "{chain:?}");
+        for pair in chain.windows(2) {
+            assert_eq!(pair[0].ppid, pair[1].pid);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_lock_is_one_holder_at_a_time_and_goes_with_its_holder() {
+        let dir = std::env::temp_dir().join(format!("ohjaa-lock-{}", std::process::id()));
+        let path = dir.join("sub").join("lock");
+        let held = lock_file(&path, Duration::ZERO).unwrap();
+        // flock(2) locks an open file, not a process: a second open of it
+        // waits like another process would, and gives up when told.
+        let started = Instant::now();
+        let refused = lock_file(&path, Duration::from_millis(150)).unwrap_err();
+        assert!(refused.contains("held by another ohjaa"), "{refused}");
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        drop(held);
+        let again = lock_file(&path, Duration::from_millis(200)).unwrap();
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

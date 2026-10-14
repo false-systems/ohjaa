@@ -7,29 +7,39 @@
 //!
 //! - who made the Change: its commits' authors (name and email), and the
 //!   ohjaa sessions the log attributes them to;
-//! - the reviewer: a Person (git identity), or the Agent session it runs in;
+//! - the reviewer, as observed: the live session whose process group holds
+//!   the judging process (or its ancestors), whatever its environment says;
+//!   outside every one, the person git names here;
 //! - the Intent, the evidence considered (sykli's run and receipt references
 //!   from `sykli status --commit`, never a verdict copied from sykli), the
 //!   verdict, findings, severity, blocking, uncertainty, time and provenance;
-//! - two independence facts, kept apart: the judge's, procedural (the
-//!   reviewer made no commit of the Change), and the evidence's, which is not
-//!   established today and is said so.
+//! - two independence facts, kept apart: the judge's, procedural, which is
+//!   established only under the rule [`JudgeIndependence`] states (and said
+//!   not to be, with each reason, otherwise), and the evidence's, which is
+//!   not established today and is said so.
 //!
-//! A reviewer that made any commit of the Change is refused, and nothing is
-//! recorded. A Judgement is never changed or removed; an answer (`ohjaa
-//! judge respond`) is a record of its own beside it.
+//! A reviewer shown to have made a commit of the Change is refused, and
+//! nothing is recorded. Any other is recorded, and never claims more than
+//! was shown: ohjaa cannot tell a person from an agent, and a reflog is the
+//! agent's own testimony. A Judgement is never changed or removed; an answer
+//! (`ohjaa judge respond`) is a record of its own beside it.
 //!
 //! After recording, the Judgement is attached to its head as a git note under
-//! `refs/notes/ohjaa/judgements`: one compact, canonical JSON line (git's
-//! `cat_sort_uniq` merge then joins two clones' notes line by line). Notes
-//! are refs, never files, hooks or config. They leave the machine only with
-//! `--push` (or the entry's `push_judgements = true`), only for an entry that
-//! shares them: a private one by default, a public one (or one that does not
-//! say) only with `share_judgements = true`; and the note of any entry not
-//! private names no one: ids, hashes and the verdict only.
+//! `refs/notes/ohjaa/judgements`: one compact, canonical JSON line, in a
+//! notes commit by `ohjaa <ohjaa@invalid>` with no time. Notes are append-
+//! only: a push publishes the union of this clone's lines, origin's and the
+//! session log's, never what git's notes merge would choose, and two lines
+//! claiming one id are a conflict `ohjaa judgements` shows. Notes are refs,
+//! never files, hooks or config. They leave the machine only with `--push`
+//! (or the entry's `push_judgements = true`), only for an entry that shares
+//! them (its `sharing.toml`): a private one by default, a public one (or one
+//! that does not say) only with `share_judgements = true`; and the notes of
+//! any entry not private name no one, at the tip or anywhere in the history
+//! a push would publish.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -56,8 +66,31 @@ pub const LIST_SCHEMA: &str = "ohjaa-judgements.v1";
 
 /// The most commits a Change records; a longer one says it was cut.
 const MAX_COMMITS: usize = 200;
-const REFUSED: i32 = 3;
+/// Recorded, but not shared: `--push` did not reach origin.
+const NOT_SHARED: i32 = 1;
 const CANNOT: i32 = 2;
+const REFUSED: i32 = 3;
+/// Not recorded: the session log could not be read or written (busy, or
+/// broken). Never 1, which says it was recorded.
+const NOT_RECORDED: i32 = 4;
+
+/// How long `ohjaa judge` waits for a busy session log, and for this clone's
+/// notes, while other ohjaa write them: a person is waiting, and the
+/// Judgement must not be lost to a moment's contention.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The identity of every notes commit ohjaa writes: no person's name, email
+/// or time zone, and no time (the line itself carries its own). A notes
+/// commit is published with the ref, whatever the line says.
+const NEUTRAL: [(&str, &str); 6] = [
+    ("GIT_AUTHOR_NAME", "ohjaa"),
+    ("GIT_AUTHOR_EMAIL", "ohjaa@invalid"),
+    ("GIT_AUTHOR_DATE", "946684800 +0000"),
+    ("GIT_COMMITTER_NAME", "ohjaa"),
+    ("GIT_COMMITTER_EMAIL", "ohjaa@invalid"),
+    ("GIT_COMMITTER_DATE", "946684800 +0000"),
+];
+const NEUTRAL_IDENT: &str = "ohjaa <ohjaa@invalid> 946684800 +0000";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -200,12 +233,23 @@ pub struct Evidence {
     pub not_asked: Option<String>,
 }
 
-/// The judge's independence of the authors: procedural.
+/// The judge's independence of the authors: procedural. `established` only
+/// when every commit of the Change is held by an ended session's record,
+/// none of them the reviewer's; the judging process runs inside no live
+/// session but the reviewer's own (its process group and its ancestors');
+/// and `OHJAA_SESSION` is unset (a person, whose git identity is on no
+/// commit of the Change) or names the reviewer's own session. Otherwise not,
+/// with each reason: ohjaa cannot tell a person from an agent, and a reflog
+/// is the agent's own testimony, so it never claims more.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JudgeIndependence {
     pub established: bool,
     pub kind: String,
+    /// What was shown.
     pub basis: Vec<String>,
+    /// Why it is not established; empty when it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_established: Vec<String>,
 }
 
 /// Whether the evidence was produced independently of the authors: not
@@ -231,6 +275,14 @@ pub struct Provenance {
     pub session: Option<String>,
     /// stdin and stdout were a terminal.
     pub terminal: bool,
+    /// `OHJAA_SESSION` as the judging process was given it: testimony.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_env: Option<String>,
+    /// The live sessions the judging process was observed to run inside
+    /// (its process group, or an ancestor's, or their ohjaa an ancestor of
+    /// it), innermost first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inside: Vec<String>,
 }
 
 /// A Judgement of a Change and its exact State.
@@ -342,11 +394,24 @@ pub fn logged() -> Result<(Vec<Judgement>, Vec<Response>)> {
 // ---- git -----------------------------------------------------------------------
 
 fn git(top: &Path, args: &[&str], input: Option<&[u8]>) -> Result<process::Output, String> {
+    git_with(top, args, input, &[])
+}
+
+/// [`git`], with `env` set: [`NEUTRAL`] for a notes commit.
+fn git_with(
+    top: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+    env: &[(&str, &str)],
+) -> Result<process::Output, String> {
     let mut command = Command::new("git");
     // git's own words, whatever the locale: some are read (`fetch`).
     command.arg("-C").arg(top).args(args).env("LC_ALL", "C");
     for var in gitconfig::REPO_ENV {
         command.env_remove(var);
+    }
+    for (key, value) in env {
+        command.env(key, value);
     }
     process::run(&mut command, input, process::LOCAL).map_err(|error| format!("{error:#}"))
 }
@@ -612,97 +677,98 @@ pub fn response_line(response: &Response, names: bool) -> String {
     canonical_json(&note).to_string()
 }
 
-/// Attach `line` to `head`'s note under [`NOTES_REF`] (one git process).
+/// Attach `line` to `head`'s note under [`NOTES_REF`] (one git process), as
+/// a notes commit by [`NEUTRAL`]. The caller holds this clone's notes lock
+/// (see [`notes_lock`]): two writers never lose each other's line.
 fn attach(top: &Path, head: &str, line: &str) -> Result<(), String> {
-    git_ok(
+    let output = git_with(
         top,
         &["notes", "--ref", NOTES_REF, "append", "-F", "-", head],
         Some(format!("{line}\n").as_bytes()),
-    )
-    .map(|_| ())
+        &NEUTRAL,
+    )?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(output.failure_detail())
+    }
 }
 
-/// Push [`NOTES_REF`] to origin, and nothing else: origin's notes are
-/// fetched first ([`FETCHED_REF`]) and merged line by line, so none is lost.
-fn push(top: &Path, common: &Path, names: bool) -> Result<String, String> {
-    fetch(top)?;
-    let fetched = gitconfig::read_ref(common, FETCHED_REF).is_some();
-    // An entry that is not private never publishes a note that names
-    // anyone: one written while it was private, or one not ohjaa's. Origin's
-    // own are already there.
-    if !names {
-        let theirs: BTreeSet<String> = if fetched {
-            all_note_lines(top, FETCHED_REF)?.into_iter().collect()
+/// This clone's lock on its notes ref (`$XDG_STATE_HOME/ohjaa/notes/
+/// <clone>.lock`): every write of ohjaa's to the ref, and every push of it,
+/// holds it. Outside the repository, like everything else ohjaa keeps.
+fn notes_lock(common: &Path) -> Result<process::FileLock, String> {
+    let state = crate::knowledge::state_home()
+        .map_err(|error| format!("{error:#}"))?
+        .join("ohjaa");
+    process::lock_file(
+        &state
+            .join("notes")
+            .join(format!("{}.lock", crate::integrated::clone_id(common))),
+        PATIENCE,
+    )
+}
+
+/// Notes by the object they annotate: each note's non-empty lines.
+type Notes = BTreeMap<String, Vec<String>>;
+
+/// Each `refs`' notes (none for a ref that does not exist): `git notes list`
+/// per ref, then every note in one `cat-file --batch`.
+fn notes_of(top: &Path, refs: &[&str]) -> Result<Vec<Notes>, String> {
+    let mut listed: Vec<Vec<(String, String)>> = Vec::new();
+    for reference in refs {
+        let output = git(top, &["notes", "--ref", reference, "list"], None)?;
+        listed.push(if output.status.success() {
+            output
+                .stdout_text()
+                .lines()
+                .filter_map(|line| {
+                    let (blob, object) = line.split_once(' ')?;
+                    Some((blob.to_owned(), object.trim().to_owned()))
+                })
+                .collect()
         } else {
-            BTreeSet::new()
-        };
-        let named = all_note_lines(top, NOTES_REF)?
-            .into_iter()
-            .filter(|line| !theirs.contains(line))
-            .filter(|line| {
-                serde_json::from_str::<Value>(line).map_or(true, |note| note["redacted"] != true)
-            })
-            .count();
-        if named > 0 {
-            return Err(format!(
-                "{named} note line(s) under {NOTES_REF} are not redacted (written while its entry \
-                 was private, or not ohjaa's), and may name people: they stay on this machine"
-            ));
-        }
+            Vec::new()
+        });
     }
-    if fetched {
-        git_ok(
-            top,
-            &[
-                "notes",
-                "--ref",
-                NOTES_REF,
-                "merge",
-                "-q",
-                "-s",
-                "cat_sort_uniq",
-                FETCHED_REF,
-            ],
-            None,
-        )
-        .map_err(|why| format!("origin's notes could not be merged: {why}"))?;
-    }
-    git_ok(
-        top,
-        &["push", "-q", "origin", &format!("{NOTES_REF}:{NOTES_REF}")],
-        None,
-    )
-    .map_err(|why| format!("git push origin {NOTES_REF} failed: {why}"))?;
-    Ok(format!("pushed {NOTES_REF} to origin"))
+    let wanted: BTreeSet<&str> = listed
+        .iter()
+        .flatten()
+        .map(|(blob, _)| blob.as_str())
+        .collect();
+    let read = blobs(top, wanted.into_iter())?;
+    Ok(listed
+        .into_iter()
+        .map(|notes| {
+            notes
+                .into_iter()
+                .map(|(blob, object)| (object, read.get(&blob).cloned().unwrap_or_default()))
+                .collect()
+        })
+        .collect())
 }
 
-/// Every non-empty line of every note under `reference` (none when the ref
-/// does not exist): `git notes list`, then the notes in one `cat-file
-/// --batch`.
-fn all_note_lines(top: &Path, reference: &str) -> Result<Vec<String>, String> {
-    let listed = git(top, &["notes", "--ref", reference, "list"], None)?;
-    if !listed.status.success() {
-        return Ok(Vec::new());
+/// The non-empty lines of each blob asked for, by its id (one `cat-file
+/// --batch`); none for one that is missing or not a blob.
+fn blobs<'a>(
+    top: &Path,
+    oids: impl Iterator<Item = &'a str>,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let asked: Vec<&str> = oids.collect();
+    if asked.is_empty() {
+        return Ok(HashMap::new());
     }
-    let blobs: Vec<String> = listed
-        .stdout_text()
-        .lines()
-        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
-        .collect();
-    if blobs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let asked = format!("{}\n", blobs.join("\n"));
-    let output = git(top, &["cat-file", "--batch"], Some(asked.as_bytes()))?;
+    let input = format!("{}\n", asked.join("\n"));
+    let output = git(top, &["cat-file", "--batch"], Some(input.as_bytes()))?;
     if !output.status.success() {
         return Err(format!(
-            "the notes under {reference} cannot be read: {}",
+            "the notes cannot be read: {}",
             output.failure_detail()
         ));
     }
-    // `<oid> blob <size>\n<content>\n`, one after another.
+    // `<oid> <type> <size>\n<content>\n`, or `<oid> missing\n`.
     let bytes = &output.stdout;
-    let mut lines = Vec::new();
+    let mut read = HashMap::new();
     let mut at = 0;
     while at < bytes.len() {
         let Some(end) = bytes[at..].iter().position(|b| *b == b'\n') else {
@@ -710,23 +776,457 @@ fn all_note_lines(top: &Path, reference: &str) -> Result<Vec<String>, String> {
         };
         let header = String::from_utf8_lossy(&bytes[at..at + end]).into_owned();
         at += end + 1;
-        let size: usize = header
-            .split_whitespace()
-            .nth(2)
-            .and_then(|size| size.parse().ok())
-            .ok_or_else(|| format!("the notes under {reference} cannot be read: {header}"))?;
+        let fields: Vec<&str> = header.split_whitespace().collect();
+        let [oid, kind, size] = fields[..] else {
+            continue;
+        };
+        let size: usize = size
+            .parse()
+            .map_err(|_| format!("the notes cannot be read: {header}"))?;
         let content = bytes
             .get(at..at + size)
-            .ok_or_else(|| format!("the notes under {reference} were cut short"))?;
-        lines.extend(
-            String::from_utf8_lossy(content)
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .map(str::to_owned),
-        );
+            .ok_or_else(|| "the notes were cut short".to_owned())?;
+        if kind == "blob" {
+            read.insert(
+                oid.to_owned(),
+                String::from_utf8_lossy(content)
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            );
+        }
         at += size + 1;
     }
-    Ok(lines)
+    Ok(read)
+}
+
+/// A full object id: what a notes tree may be keyed by here.
+fn object_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Write `notes` as one notes commit by [`NEUTRAL`] on [`NOTES_REF`] (one
+/// `git fast-import`): exactly these notes, with `parents` (none: a new
+/// history; `force` then lets it replace the ref's). Notes are written as
+/// paths, so a note on a commit this clone has not fetched is kept as it is.
+fn write_notes(
+    top: &Path,
+    notes: &Notes,
+    parents: &[&str],
+    force: bool,
+    message: &str,
+) -> Result<(), String> {
+    let mut stream: Vec<u8> = Vec::new();
+    let _ = write!(
+        stream,
+        "commit {NOTES_REF}\ncommitter {NEUTRAL_IDENT}\ndata {}\n{message}\n",
+        message.len() + 1
+    );
+    for (n, parent) in parents.iter().enumerate() {
+        if !object_id(parent) {
+            return Err(format!("{parent} is not a commit id"));
+        }
+        let _ = writeln!(stream, "{} {parent}", if n == 0 { "from" } else { "merge" });
+    }
+    stream.extend_from_slice(b"deleteall\n");
+    for (object, lines) in notes {
+        if !object_id(object) || lines.is_empty() {
+            continue;
+        }
+        let text = format!("{}\n", lines.join("\n"));
+        let _ = write!(
+            stream,
+            "M 100644 inline {object}\ndata {}\n{text}\n",
+            text.len()
+        );
+    }
+    stream.extend_from_slice(b"done\n");
+    let mut args = vec!["fast-import", "--quiet", "--done"];
+    if force {
+        args.push("--force");
+    }
+    let output = git(top, &args, Some(&stream))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the notes could not be written: {}",
+            output.failure_detail()
+        ))
+    }
+}
+
+/// Every line in `notes`, sorted, each once per object: the order git's
+/// `cat_sort_uniq` keeps.
+fn tidy(notes: &Notes) -> Notes {
+    notes
+        .iter()
+        .filter_map(|(object, lines)| {
+            let lines: BTreeSet<&String> = lines.iter().collect();
+            (!lines.is_empty()).then(|| (object.clone(), lines.into_iter().cloned().collect()))
+        })
+        .collect()
+}
+
+/// The union of `sides`, line by line, per object: no line of any side is
+/// dropped, and two different lines are both kept, whatever they claim.
+fn union(sides: &[&Notes]) -> Notes {
+    let mut all: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for side in sides {
+        for (object, lines) in side.iter() {
+            all.entry(object.clone())
+                .or_default()
+                .extend(lines.iter().cloned());
+        }
+    }
+    all.into_iter()
+        .filter(|(_, lines)| !lines.is_empty())
+        .map(|(object, lines)| (object, lines.into_iter().collect()))
+        .collect()
+}
+
+/// The note lines this machine's log holds for the clone whose common dir
+/// is `common` (`names`: as a private entry's notes say them), by the head
+/// each is attached to: every Judgement recorded there, and every answer to
+/// one of them.
+fn logged_lines(logged: &Logged, common: &Path, names: bool) -> Notes {
+    let common = common.to_string_lossy();
+    let mut notes = Notes::new();
+    let here: Vec<&Judgement> = logged
+        .judgements
+        .iter()
+        .filter(|j| j.common.as_deref() == Some(&*common))
+        .collect();
+    for judgement in &here {
+        notes
+            .entry(judgement.change.head.clone())
+            .or_default()
+            .push(note_line(judgement, names));
+    }
+    for response in &logged.responses {
+        if here.iter().any(|j| j.id == response.judgement) {
+            notes
+                .entry(response.head.clone())
+                .or_default()
+                .push(response_line(response, names));
+        }
+    }
+    tidy(&notes)
+}
+
+/// Push [`NOTES_REF`] to origin, and nothing else, as the union of this
+/// clone's notes, origin's (fetched into [`FETCHED_REF`] first) and this
+/// machine's log: no line here or in the log is ever dropped, whatever git's
+/// three-way notes merge would choose (a line changed on one side only wins
+/// there); two lines claiming one id are both kept, and shown as a conflict
+/// by `ohjaa judgements`. The commit pushed has origin's as a parent, so the
+/// push never rewrites origin's. For an entry that is not private, nothing
+/// that is not redacted is published, at the tip or anywhere in the history
+/// the push would send ([`public_check`]). The caller holds the notes lock.
+fn push(here: &Here, names: bool, logged: &Logged) -> Result<String, String> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        fetch(&here.top)?;
+        let local_tip = gitconfig::read_ref(&here.common, NOTES_REF);
+        let fetched_tip = gitconfig::read_ref(&here.common, FETCHED_REF);
+        let read = notes_of(&here.top, &[NOTES_REF, FETCHED_REF])?;
+        let (local, fetched) = (tidy(&read[0]), tidy(&read[1]));
+        let ours = logged_lines(logged, &here.common, names);
+        let on_origin: BTreeSet<&str> = fetched.values().flatten().map(String::as_str).collect();
+        if !names {
+            public_check(
+                &here.top,
+                local_tip.as_deref(),
+                fetched_tip.as_deref(),
+                &[&local, &ours],
+                &on_origin,
+            )?;
+        }
+        let merged = union(&[&local, &fetched, &ours]);
+        let count = |notes: &Notes| notes.values().map(Vec::len).sum::<usize>();
+        let from_origin = count(&merged) - count(&union(&[&local, &ours]));
+        let from_log = count(&union(&[&local, &ours])) - count(&local);
+        let behind = match (&local_tip, &fetched_tip) {
+            (_, None) => false,
+            (Some(local), Some(fetched)) if local == fetched => false,
+            (Some(local), Some(fetched)) => !git(
+                &here.top,
+                &["merge-base", "--is-ancestor", fetched, local],
+                None,
+            )?
+            .status
+            .success(),
+            (None, Some(_)) => true,
+        };
+        if merged != local || behind {
+            let mut parents: Vec<&str> = local_tip.iter().map(String::as_str).collect();
+            if behind {
+                parents.extend(fetched_tip.as_deref());
+            }
+            write_notes(
+                &here.top,
+                &merged,
+                &parents,
+                false,
+                "ohjaa: Judgements, the union of this clone's notes, origin's and the session log",
+            )?;
+        }
+        let tip = gitconfig::read_ref(&here.common, NOTES_REF);
+        if tip.is_none() || tip == fetched_tip {
+            return Ok(format!(
+                "origin already holds every line of {NOTES_REF}: nothing to push"
+            ));
+        }
+        let output = git(
+            &here.top,
+            &["push", "-q", "origin", &format!("{NOTES_REF}:{NOTES_REF}")],
+            None,
+        )?;
+        if output.status.success() {
+            let lines = count(&merged);
+            return Ok(format!(
+                "pushed {NOTES_REF} to origin: {lines} line(s) on {} commit(s), the union of \
+                 this clone's, origin's ({from_origin} new here) and the session log's \
+                 ({from_log} re-attached); none dropped",
+                merged.len()
+            ));
+        }
+        let detail = output.failure_detail();
+        // Origin moved between the fetch and the push: once more.
+        if tries < 2 && (detail.contains("rejected") || detail.contains("fetch first")) {
+            continue;
+        }
+        return Err(format!("git push origin {NOTES_REF} failed: {detail}"));
+    }
+}
+
+/// Whether a note line may be published for an entry that is not private:
+/// exactly what [`note_line`] or [`response_line`] write without names, and
+/// nothing more. A line that only says `"redacted": true` is not enough.
+pub fn publishable(line: &str) -> bool {
+    let Ok(Value::Object(note)) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    let only = |value: &Value, keys: &[&str]| {
+        value
+            .as_object()
+            .is_some_and(|map| map.keys().all(|key| keys.contains(&key.as_str())))
+    };
+    let hex = |value: &Value| {
+        value
+            .as_str()
+            .is_some_and(|text| !text.is_empty() && text.chars().all(|c| c.is_ascii_hexdigit()))
+    };
+    let token = |value: &Value| {
+        value.as_str().is_some_and(|text| {
+            !text.is_empty()
+                && text.len() <= 128
+                && text
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+    };
+    let id = |value: &Value, prefix: &str| {
+        value.as_str().is_some_and(|text| {
+            text.strip_prefix(prefix)
+                .and_then(|rest| rest.split_once('-'))
+                .is_some_and(|(a, b)| {
+                    !a.is_empty()
+                        && !b.is_empty()
+                        && a.chars().all(|c| c.is_ascii_digit())
+                        && b.chars().all(|c| c.is_ascii_digit())
+                })
+        })
+    };
+    let at = |value: &Value| {
+        value.as_str().is_some_and(|text| {
+            text.len() <= 32
+                && text
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '-' | ':' | 'T' | 'Z'))
+        })
+    };
+    let actor = |value: &Value| match value["kind"].as_str() {
+        Some("person") => only(value, &["kind"]),
+        Some("agent") => {
+            only(value, &["kind", "session"])
+                && sessions::is_valid_id(value["session"].as_str().unwrap_or(""))
+        }
+        _ => false,
+    };
+    let note = Value::Object(note);
+    if note["redacted"] != true {
+        return false;
+    }
+    match note["schema"].as_str() {
+        Some(NOTE_SCHEMA) => {
+            only(
+                &note,
+                &[
+                    "at",
+                    "authors",
+                    "base",
+                    "blocking",
+                    "evidence",
+                    "findings",
+                    "head",
+                    "id",
+                    "independence",
+                    "intent_id",
+                    "redacted",
+                    "reviewer",
+                    "schema",
+                    "severity",
+                    "state",
+                    "verdict",
+                ],
+            ) && id(&note["id"], "jd-")
+                && hex(&note["base"])
+                && hex(&note["head"])
+                && hex(&note["state"])
+                && at(&note["at"])
+                && note["blocking"].is_boolean()
+                && matches!(
+                    note["verdict"].as_str(),
+                    Some("approve" | "request_changes" | "reject")
+                )
+                && (note["severity"].is_null()
+                    || matches!(
+                        note["severity"].as_str(),
+                        Some("info" | "minor" | "major" | "critical")
+                    ))
+                && (note["intent_id"].is_null()
+                    || note["intent_id"].as_str().is_some_and(intent_id_shaped))
+                && note["findings"].is_u64()
+                && actor(&note["reviewer"])
+                && only(&note["authors"], &["people", "sessions"])
+                && note["authors"]["people"].is_u64()
+                && note["authors"]["sessions"].as_array().is_some_and(|ids| {
+                    ids.iter()
+                        .all(|id| id.as_str().is_some_and(sessions::is_valid_id))
+                })
+                && note["evidence"].as_array().is_some_and(|refs| {
+                    refs.iter().all(|r| {
+                        only(r, &["run", "digest"])
+                            && (r["run"].is_null() || token(&r["run"]))
+                            && (r["digest"].is_null() || hex(&r["digest"]))
+                    })
+                })
+                && only(&note["independence"], &["judge", "evidence"])
+                && matches!(
+                    note["independence"]["judge"].as_str(),
+                    Some("procedural" | "not_established")
+                )
+                && matches!(
+                    note["independence"]["evidence"].as_str(),
+                    Some("established" | "not_established")
+                )
+        }
+        Some(RESPONSE_NOTE_SCHEMA) => {
+            only(
+                &note,
+                &[
+                    "at",
+                    "author",
+                    "by",
+                    "head",
+                    "id",
+                    "judgement",
+                    "redacted",
+                    "schema",
+                ],
+            ) && id(&note["id"], "rs-")
+                && id(&note["judgement"], "jd-")
+                && hex(&note["head"])
+                && at(&note["at"])
+                && note["author"].is_boolean()
+                && actor(&note["by"])
+        }
+        _ => false,
+    }
+}
+
+/// Before a push of an entry that is not private: nothing it would publish
+/// names anyone. Every line of `tips` (this clone's notes, and the lines the
+/// log re-attaches) must be [`publishable`] or on origin already; and so
+/// must every line of every note in the history the push would send (each
+/// notes commit reachable from this clone's tip and not from origin's), each
+/// of those commits by [`NEUTRAL`]. A note removed with `git notes remove`
+/// is still in that history. Two git processes (`log --raw`, `cat-file`).
+fn public_check(
+    top: &Path,
+    local_tip: Option<&str>,
+    fetched_tip: Option<&str>,
+    tips: &[&Notes],
+    on_origin: &BTreeSet<&str>,
+) -> Result<(), String> {
+    let named = |line: &&String| !on_origin.contains(line.as_str()) && !publishable(line);
+    let at_tip = tips
+        .iter()
+        .flat_map(|notes| notes.values().flatten())
+        .filter(named)
+        .count();
+    let (mut in_history, mut by_people) = (0, 0);
+    if let Some(local_tip) = local_tip {
+        let mut args = vec![
+            "log",
+            "--format=%x1e%H%x1f%an%x1f%ae%x1f%ad%x1f%cn%x1f%ce%x1f%cd",
+            "--date=raw",
+            "--raw",
+            "--no-abbrev",
+            "--no-renames",
+            "-m",
+            "--root",
+            local_tip,
+        ];
+        if let Some(fetched_tip) = fetched_tip {
+            args.extend(["--not", fetched_tip]);
+        }
+        let text = git_ok(top, &args, None)
+            .map_err(|why| format!("the history of {NOTES_REF} cannot be read: {why}"))?;
+        let mut introduced: BTreeSet<String> = BTreeSet::new();
+        for line in text.lines() {
+            if let Some(header) = line.strip_prefix('\u{1e}') {
+                let fields: Vec<&str> = header.split('\u{1f}').collect();
+                let neutral = fields.len() == 7
+                    && fields[1] == "ohjaa"
+                    && fields[2] == "ohjaa@invalid"
+                    && fields[3].ends_with(" +0000")
+                    && fields[4] == "ohjaa"
+                    && fields[5] == "ohjaa@invalid"
+                    && fields[6].ends_with(" +0000");
+                if !neutral {
+                    by_people += 1;
+                }
+            } else if let Some(raw) = line.strip_prefix(':') {
+                // `:<mode> <mode> <old> <new> <status>\t<path>`
+                if let Some(new) = raw.split_whitespace().nth(3) {
+                    if !new.chars().all(|c| c == '0') {
+                        introduced.insert(new.to_owned());
+                    }
+                }
+            }
+        }
+        in_history = blobs(top, introduced.iter().map(String::as_str))?
+            .values()
+            .flatten()
+            .filter(named)
+            .count();
+    }
+    if at_tip + in_history + by_people == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "{NOTES_REF} may name people, so it stays on this machine: {at_tip} line(s) at its tip \
+         and {in_history} in the history a push would publish are not redacted, and \
+         {by_people} of its commit(s) carry a person's name or time zone (written while the \
+         entry was private, by git itself, or not by ohjaa). A note removed with `git notes \
+         remove` is still in that history. `ohjaa judgements --rebuild-public` rewrites this \
+         clone's notes ref as one commit of redacted lines with no history; the session log \
+         keeps every Judgement"
+    ))
 }
 
 /// Fetch origin's shared notes into [`FETCHED_REF`] (one git process).
@@ -752,14 +1252,14 @@ fn fetch(top: &Path) -> Result<(), String> {
     Err(format!("git fetch origin {NOTES_REF} failed: {detail}"))
 }
 
-/// The lines of `commit`'s note under `reference`, each a JSON object.
-fn note_values(top: &Path, reference: &str, commit: &str) -> Vec<Value> {
+/// The non-empty lines of `commit`'s note under `reference`, as written.
+fn note_lines(top: &Path, reference: &str, commit: &str) -> Vec<String> {
     let Ok(text) = git_ok(top, &["notes", "--ref", reference, "show", commit], None) else {
         return Vec::new();
     };
     text.lines()
         .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str(line).ok())
+        .map(str::to_owned)
         .collect()
 }
 
@@ -1048,91 +1548,239 @@ pub fn reviewer_made(
     made
 }
 
-/// [`reviewer_made`], with the reflogs read: two git processes (the
-/// reviewer's checkout's HEAD, and every branch of the clone).
-fn made_by_reviewer(
-    session: &Session,
+/// The reflogs [`reviewer_made`] reads, each once: every branch of the
+/// clone, and each session's checkout's HEAD.
+struct Reflogs<'a> {
+    top: &'a Path,
+    branches: Option<Vec<lifecycle::Move>>,
+    own: HashMap<PathBuf, Vec<lifecycle::Move>>,
+}
+
+impl<'a> Reflogs<'a> {
+    fn new(top: &'a Path) -> Self {
+        Reflogs {
+            top,
+            branches: None,
+            own: HashMap::new(),
+        }
+    }
+
+    /// [`reviewer_made`] for `session`, its reflogs read: two git processes
+    /// the first time (its checkout's HEAD, and every branch of the clone),
+    /// one for another session's checkout after.
+    fn made(
+        &mut self,
+        session: &Session,
+        change: &Change,
+        all: &[Session],
+        clone: &[PathBuf],
+    ) -> Result<Vec<Made>, String> {
+        let own_checkout = canonical(Path::new(&session.repo));
+        if !self.own.contains_key(&own_checkout) {
+            let own = lifecycle::reflog(
+                &own_checkout,
+                &[
+                    "log",
+                    "--walk-reflogs",
+                    "--date=unix",
+                    lifecycle::REFLOG_FORMAT,
+                    "HEAD",
+                ],
+            )
+            .ok_or_else(|| format!("the reflog of {} cannot be read", own_checkout.display()))?;
+            self.own.insert(own_checkout.clone(), own);
+        }
+        if self.branches.is_none() {
+            self.branches = Some(
+                lifecycle::reflog(
+                    self.top,
+                    &[
+                        "reflog",
+                        "show",
+                        "--all",
+                        "--date=unix",
+                        lifecycle::REFLOG_FORMAT,
+                    ],
+                )
+                .ok_or_else(|| "the clone's branch reflogs cannot be read".to_owned())?,
+            );
+        }
+        Ok(reviewer_made(
+            session,
+            change,
+            all,
+            clone,
+            &self.own[&own_checkout],
+            self.branches.as_deref().unwrap_or_default(),
+        ))
+    }
+}
+
+/// The live sessions (open in the log) that the process `chain` (this one
+/// and its ancestors, nearest first, from the process table `table`) runs
+/// inside, innermost first: one whose recorded process group holds a
+/// process of the chain, or whose ohjaa (the pid in its id) is one of them.
+/// A group or pid the table shows started after the session did is another
+/// process, the id reused (two seconds of slack for the clock tick).
+pub fn sessions_around<'a>(
+    all: &'a [Session],
+    table: &[process::Proc],
+    chain: &[process::Proc],
+    now_s: i64,
+) -> Vec<&'a Session> {
+    let began_by = |p: &process::Proc, at_ms: i64| now_s - p.elapsed <= at_ms.div_euclid(1000) + 2;
+    let mut found: Vec<(usize, &Session)> = Vec::new();
+    for session in all.iter().filter(|s| s.left.is_none()) {
+        let by_group = session
+            .pgid
+            .filter(|group| {
+                table.iter().find(|p| p.pid == *group).is_none_or(|leader| {
+                    began_by(
+                        leader,
+                        session.group_started_ms.unwrap_or(session.started_ms),
+                    )
+                })
+            })
+            .and_then(|group| chain.iter().position(|p| p.pgid == group));
+        let by_ohjaa = sessions::pid_of(&session.id).and_then(|pid| {
+            chain
+                .iter()
+                .position(|p| p.pid == pid && began_by(p, session.started_ms))
+        });
+        if let Some(at) = by_group.into_iter().chain(by_ohjaa).min() {
+            found.push((at, session));
+        }
+    }
+    found.sort_by_key(|(at, session)| (*at, std::cmp::Reverse(session.started_ms)));
+    found.into_iter().map(|(_, session)| session).collect()
+}
+
+/// Who judges, as observed. The process, not its environment, decides: a
+/// process inside a live session's process group (or below its ohjaa) is
+/// that session's, whatever `OHJAA_SESSION` says or omits; outside every
+/// one, `OHJAA_SESSION` names the session it claims (not shown), and without
+/// it the reviewer is the person git names here. ohjaa cannot tell a person
+/// from an agent running outside every ohjaa session.
+struct Observed {
+    reviewer: Reviewer,
+    /// Every live session the process runs inside, innermost first.
+    inside: Vec<Session>,
+    /// `OHJAA_SESSION`, as given.
+    claimed: Option<String>,
+    /// The session `OHJAA_SESSION` names, when it is not the reviewer.
+    claimed_other: Option<Session>,
+    /// Why where the process runs could not be seen.
+    unseen: Option<String>,
+}
+
+enum Reviewer {
+    /// `shown`: the process runs inside its process group.
+    Agent {
+        session: Box<Session>,
+        shown: bool,
+    },
+    Person(Identity),
+}
+
+/// Observe who judges: `ps` once, then the log's live sessions. Err: a
+/// refusal (an `OHJAA_SESSION` that names no live session in the log, or no
+/// identity git can name).
+fn observe(top: &Path, all: &[Session]) -> Result<Observed, String> {
+    let claimed = std::env::var(sessions::SESSION_ENV).ok();
+    let claimed_session = match &claimed {
+        Some(id) => {
+            if !sessions::is_valid_id(id) {
+                return Err(format!(
+                    "{} is not a session id: `{id}`",
+                    sessions::SESSION_ENV
+                ));
+            }
+            let session = all.iter().find(|s| &s.id == id).cloned().ok_or_else(|| {
+                format!("session {id} is not in the session log, so what it made cannot be shown")
+            })?;
+            if session.left.is_some() {
+                return Err(format!(
+                    "session {id} has ended; a Judgement is recorded from a live session (or by a \
+                     person, outside one)"
+                ));
+            }
+            Some(session)
+        }
+        None => None,
+    };
+    let (inside, unseen) = match process::table() {
+        Ok(table) => {
+            let chain = process::ancestry(&table);
+            let around = sessions_around(all, &table, &chain, now_ms().div_euclid(1000));
+            (around.into_iter().cloned().collect::<Vec<Session>>(), None)
+        }
+        Err(why) => (Vec::new(), Some(why)),
+    };
+    let reviewer = match (inside.first(), &claimed_session) {
+        (Some(innermost), _) => Reviewer::Agent {
+            session: Box::new(innermost.clone()),
+            shown: true,
+        },
+        (None, Some(session)) => Reviewer::Agent {
+            session: Box::new(session.clone()),
+            shown: false,
+        },
+        (None, None) => Reviewer::Person(identity_here(top)?),
+    };
+    let claimed_other = match (&reviewer, claimed_session) {
+        (Reviewer::Agent { session, .. }, Some(claimed)) if claimed.id != session.id => {
+            Some(claimed)
+        }
+        _ => None,
+    };
+    Ok(Observed {
+        reviewer,
+        inside,
+        claimed,
+        claimed_other,
+        unseen,
+    })
+}
+
+/// Law 2, for every session the judging process is observed or claims to
+/// be: refused when one of them made a commit of the Change (`made`, see
+/// [`reviewer_made`]), or the log gives one to it. Ok when none did.
+fn refuse_own_change(
+    observed: &Observed,
     change: &Change,
     all: &[Session],
-    top: &Path,
+    reflogs: &mut Reflogs<'_>,
     clone: &[PathBuf],
-) -> Result<Vec<Made>, String> {
-    let own_checkout = canonical(Path::new(&session.repo));
-    let own = lifecycle::reflog(
-        &own_checkout,
-        &[
-            "log",
-            "--walk-reflogs",
-            "--date=unix",
-            lifecycle::REFLOG_FORMAT,
-            "HEAD",
-        ],
-    )
-    .ok_or_else(|| format!("the reflog of {} cannot be read", own_checkout.display()))?;
-    let branches = lifecycle::reflog(
-        top,
-        &[
-            "reflog",
-            "show",
-            "--all",
-            "--date=unix",
-            lifecycle::REFLOG_FORMAT,
-        ],
-    )
-    .ok_or_else(|| "the clone's branch reflogs cannot be read".to_owned())?;
-    Ok(reviewer_made(session, change, all, clone, &own, &branches))
+) -> Result<(), String> {
+    let mut asked: Vec<(&Session, &'static str)> = Vec::new();
+    if let Reviewer::Agent { session, .. } = &observed.reviewer {
+        asked.push((session, "this session"));
+    }
+    for session in &observed.inside {
+        asked.push((session, "a session this process runs inside"));
+    }
+    if let Some(session) = &observed.claimed_other {
+        asked.push((session, "the session OHJAA_SESSION names"));
+    }
+    let mut seen = BTreeSet::new();
+    for (session, which) in asked {
+        if !seen.insert(session.id.clone()) {
+            continue;
+        }
+        let made = reflogs
+            .made(session, change, all, clone)
+            .map_err(|why| format!("what {} made cannot be read: {why}", session.id))?;
+        if let Some(why) = made_refusal(session, which, change, &made) {
+            return Err(why);
+        }
+    }
+    Ok(())
 }
 
-/// Law 2, for a Person: refused when their identity is on a commit of the
-/// Change (as author or committer) that no agent session's record holds.
-/// Commits an agent session made under their identity are said, not
-/// refused: the log says who made them. Ok: the basis of independence.
-fn person_independence(person: &Identity, change: &Change) -> Result<Vec<String>, String> {
-    let mine: Vec<&ChangeCommit> = change
-        .commits
-        .iter()
-        .filter(|c| c.author.same(person) || c.committer.same(person))
-        .collect();
-    let own: Vec<&&ChangeCommit> = mine.iter().filter(|c| c.session.is_none()).collect();
-    if !own.is_empty() {
-        let listed: Vec<&str> = own.iter().map(|c| short(&c.commit)).collect();
-        return Err(format!(
-            "{} made {} of the Change ({}): no reviewer judges a Change they made",
-            person.shown(),
-            if own.len() == 1 {
-                "a commit"
-            } else {
-                "commits"
-            },
-            listed.join(", ")
-        ));
-    }
-    let mut basis = vec![format!(
-        "the reviewer, {}, is on none of the Change's {} commit(s) as author or committer",
-        person.shown(),
-        change.commits.len()
-    )];
-    if !mine.is_empty() {
-        let by: BTreeSet<&str> = mine.iter().filter_map(|c| c.session.as_deref()).collect();
-        basis[0] = format!(
-            "{} of the Change's {} commit(s) are under the reviewer's git identity, made by agent \
-             session(s) {} (the session log): the reviewer made none of them",
-            mine.len(),
-            change.commits.len(),
-            by.into_iter().collect::<Vec<_>>().join(", ")
-        );
-    }
-    Ok(basis)
-}
-
-/// Law 2, for an Agent session: refused when it made any commit of the
-/// Change (`made`, see [`reviewer_made`]), or the log gives one to it.
-fn agent_independence(
-    session: &Session,
-    change: &Change,
-    made: &[Made],
-    authors: &Authors,
-) -> Result<Vec<String>, String> {
+/// Why `session` (`which` it is, to the judging process) may not judge the
+/// Change: the commits of it the log gives to it, or it made (`made`, see
+/// [`reviewer_made`]). `None` when there are none.
+fn made_refusal(session: &Session, which: &str, change: &Change, made: &[Made]) -> Option<String> {
     let theirs: Vec<&str> = change
         .commits
         .iter()
@@ -1142,53 +1790,219 @@ fn agent_independence(
         })
         .map(|c| short(&c.commit))
         .collect();
-    if !theirs.is_empty() {
-        let shared: BTreeSet<&str> = made
+    if theirs.is_empty() {
+        return None;
+    }
+    let shared: BTreeSet<&str> = made
+        .iter()
+        .flat_map(|m| m.shared_with.iter().map(String::as_str))
+        .collect();
+    Some(format!(
+        "{} of the Change ({}) {} made by {which}, {}{}: the Agent never judges its own Change",
+        if theirs.len() == 1 {
+            "a commit"
+        } else {
+            "commits"
+        },
+        theirs.join(", "),
+        if theirs.len() == 1 { "was" } else { "were" },
+        session.id,
+        if shared.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", or in its checkout while {} shared it (who made it cannot be shown)",
+                shared.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        }
+    ))
+}
+
+/// Law 2, for a Person: refused when their identity is on a commit of the
+/// Change (as author or committer) that no ended session's record holds.
+fn refuse_persons_own(person: &Identity, change: &Change) -> Result<(), String> {
+    let own: Vec<&str> = change
+        .commits
+        .iter()
+        .filter(|c| c.session.is_none() && (c.author.same(person) || c.committer.same(person)))
+        .map(|c| short(&c.commit))
+        .collect();
+    if own.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} made {} of the Change ({}): no reviewer judges a Change they made",
+        person.shown(),
+        if own.len() == 1 {
+            "a commit"
+        } else {
+            "commits"
+        },
+        own.join(", ")
+    ))
+}
+
+/// The judge's procedural independence (see [`JudgeIndependence`]): what
+/// was shown, and each reason it is not established. `identity`: the git
+/// identity the reviewer acts under (a person's, or the agent's own).
+fn judge_independence(
+    observed: &Observed,
+    change: &Change,
+    authors: &Authors,
+    identity: Option<&Identity>,
+) -> JudgeIndependence {
+    let mut basis = Vec::new();
+    let mut not = Vec::new();
+    let n = change.commits.len();
+    // Who made it: the log's records of ended sessions, and nothing else.
+    if authors.unattributed == 0 {
+        let by: Vec<&str> = authors
+            .sessions
             .iter()
-            .flat_map(|m| m.shared_with.iter().map(String::as_str))
+            .map(|s| s.session.as_str())
             .collect();
-        return Err(format!(
-            "{} of the Change ({}) {} made by this session, {}{}: the Agent never judges its own \
-             Change",
-            if theirs.len() == 1 {
-                "a commit"
-            } else {
-                "commits"
-            },
-            theirs.join(", "),
-            if theirs.len() == 1 { "was" } else { "were" },
-            session.id,
-            if shared.is_empty() {
+        basis.push(format!(
+            "every one of the Change's {n} commit(s) is held by the record of an ended session \
+             ({}), none of them the reviewer",
+            by.join(", ")
+        ));
+    } else {
+        not.push(format!(
+            "{} of the Change's {n} commit(s) no ended session's record holds (made outside \
+             ohjaa, in another clone, or by a session still open{}): who made them is not shown",
+            authors.unattributed,
+            if authors.open.is_empty() {
                 String::new()
             } else {
-                format!(
-                    ", or in its checkout while {} shared it (who made it cannot be shown)",
-                    shared.into_iter().collect::<Vec<_>>().join(", ")
-                )
+                format!(": {}", authors.open.join(", "))
             }
         ));
+        if let Some(identity) = identity {
+            let theirs = change
+                .commits
+                .iter()
+                .filter(|c| {
+                    c.session.is_none() && (c.author.same(identity) || c.committer.same(identity))
+                })
+                .count();
+            if theirs > 0 {
+                not.push(format!(
+                    "{theirs} of those carry the git identity the reviewer acts under, {}",
+                    identity.shown()
+                ));
+            }
+        }
     }
-    let mut basis = vec![format!(
-        "the reviewing session {} made none of the Change's {} commit(s): its checkout's reflog \
-         and the clone's branches show none created by it, and the session log gives none to it",
-        session.id,
-        change.commits.len()
-    )];
-    let agent = program(&session.agent);
-    let same: Vec<&str> = authors
-        .sessions
-        .iter()
-        .filter(|s| s.agent == agent)
-        .map(|s| s.session.as_str())
-        .collect();
-    if !same.is_empty() {
-        basis.push(format!(
-            "the reviewer runs the same agent ({agent}) as authoring session(s) {}: two \
-             instances of one agent are independent only procedurally",
-            same.join(", ")
+    if let Some(why) = &observed.unseen {
+        not.push(format!(
+            "whether this process runs inside a live ohjaa session could not be seen ({why})"
         ));
     }
-    Ok(basis)
+    match &observed.reviewer {
+        Reviewer::Person(person) => {
+            let under: Vec<&ChangeCommit> = change
+                .commits
+                .iter()
+                .filter(|c| c.author.same(person) || c.committer.same(person))
+                .collect();
+            if under.is_empty() {
+                basis.push(format!(
+                    "the reviewer is the person git names here, {}, on none of the Change's \
+                     commits; ohjaa cannot tell a person from an agent running under that \
+                     identity outside every ohjaa session",
+                    person.shown()
+                ));
+            } else {
+                let by: BTreeSet<&str> =
+                    under.iter().filter_map(|c| c.session.as_deref()).collect();
+                not.push(format!(
+                    "{} of the Change's {n} commit(s) carry the reviewer's git identity, {} (made \
+                     by agent session(s) {}, the log says): ohjaa cannot tell this person from \
+                     an agent running under that identity",
+                    under.len(),
+                    person.shown(),
+                    by.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            if observed.unseen.is_none() {
+                basis.push(
+                    "this process runs inside no live ohjaa session (no process group or ohjaa \
+                     of one among it and its ancestors, observed with ps), and OHJAA_SESSION is \
+                     not set"
+                        .to_owned(),
+                );
+            }
+        }
+        Reviewer::Agent { session, shown } => {
+            basis.push(format!(
+                "the reviewing session {} made none of the Change's {n} commit(s): its \
+                 checkout's reflog and the clone's branches show none created by it, and the \
+                 session log gives none to it (a reflog is the session's own record, which it \
+                 can rewrite or expire)",
+                session.id
+            ));
+            let others: Vec<&str> = observed
+                .inside
+                .iter()
+                .filter(|s| s.id != session.id)
+                .map(|s| s.id.as_str())
+                .collect();
+            match (&observed.claimed, *shown) {
+                (None, true) => not.push(format!(
+                    "OHJAA_SESSION is not set, yet this process runs inside live session {}'s \
+                     process group: that session's agent, not shown to be a person",
+                    session.id
+                )),
+                (Some(claimed), true) if *claimed != session.id => not.push(format!(
+                    "OHJAA_SESSION names {claimed}, but this process runs inside session {}'s \
+                     process group",
+                    session.id
+                )),
+                (_, false) => not.push(format!(
+                    "this process is not shown to run in session {}: it is in none of the live \
+                     sessions' process groups, nor below their ohjaa",
+                    session.id
+                )),
+                _ => {
+                    if others.is_empty() {
+                        basis.push(format!(
+                            "this process runs inside session {}'s process group, as \
+                             OHJAA_SESSION says, and inside no other live session's (observed \
+                             with ps)",
+                            session.id
+                        ));
+                    }
+                }
+            }
+            if !others.is_empty() {
+                not.push(format!(
+                    "this process also runs inside live session(s) {} (a session started inside \
+                     another): what those made is the reviewer's to answer for",
+                    others.join(", ")
+                ));
+            }
+            let agent = program(&session.agent);
+            let same: Vec<&str> = authors
+                .sessions
+                .iter()
+                .filter(|s| s.agent == agent)
+                .map(|s| s.session.as_str())
+                .collect();
+            if !same.is_empty() {
+                basis.push(format!(
+                    "the reviewer runs the same agent ({agent}) as authoring session(s) {}: two \
+                     instances of one agent are independent only procedurally",
+                    same.join(", ")
+                ));
+            }
+        }
+    }
+    JudgeIndependence {
+        established: not.is_empty(),
+        kind: "procedural".to_owned(),
+        basis,
+        not_established: not,
+    }
 }
 
 /// Why the evidence is not shown to be independent of the authors.
@@ -1322,47 +2136,63 @@ pub struct JudgeArgs<'a> {
     pub push: bool,
 }
 
-/// The reviewer: the open session this runs inside (`OHJAA_SESSION`), else
-/// the person git names here.
-enum Reviewer {
-    Agent(Box<Session>),
-    Person(Identity),
-}
-
-fn reviewer(top: &Path, all: &[Session]) -> Result<Reviewer, String> {
-    match std::env::var(sessions::SESSION_ENV) {
-        Ok(id) => {
-            if !sessions::is_valid_id(&id) {
-                return Err(format!(
-                    "{} is not a session id: `{id}`",
-                    sessions::SESSION_ENV
-                ));
+/// [`read_log`], waiting up to [`PATIENCE`] while writers hold the log.
+fn read_log_patiently() -> Result<Logged> {
+    let started = std::time::Instant::now();
+    loop {
+        match read_log() {
+            Err(error) if error.to_string().contains("busy") && started.elapsed() < PATIENCE => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            let session = all.iter().find(|s| s.id == id).cloned().ok_or_else(|| {
-                format!("session {id} is not in the session log, so what it made cannot be shown")
-            })?;
-            if session.left.is_some() {
-                return Err(format!(
-                    "session {id} has ended; a Judgement is recorded from a live session (or by a \
-                     person, outside one)"
-                ));
-            }
-            Ok(Reviewer::Agent(Box::new(session)))
+            other => return other,
         }
-        Err(_) => identity_here(top).map(Reviewer::Person),
     }
 }
 
+/// Write a new row, waiting up to [`PATIENCE`] while writers hold the log
+/// (each open already retries briefly).
+fn insert_patiently(
+    table: redb::TableDefinition<&str, &[u8]>,
+    id: &str,
+    bytes: &[u8],
+    answers: Option<(redb::TableDefinition<&str, &[u8]>, &str)>,
+) -> Result<(), sessions::StoreError> {
+    let path = log_path().map_err(|error| sessions::StoreError::Other(format!("{error:#}")))?;
+    let started = std::time::Instant::now();
+    loop {
+        match sessions::Store::open(&path) {
+            Ok(store) => return store.insert_new(table, id, bytes, answers),
+            Err(sessions::StoreError::Locked) if started.elapsed() < PATIENCE => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The ids the process was observed inside, for the provenance.
+fn inside_ids(observed: &Observed) -> Vec<String> {
+    observed.inside.iter().map(|s| s.id.clone()).collect()
+}
+
 /// `ohjaa judge`: record a Judgement, attach its note, and push it when
-/// asked. 0 recorded; 3 refused (law 2, or sharing); 2 nothing to judge.
+/// asked. 0 recorded; 1 recorded, not shared; 2 nothing to judge; 3
+/// refused (law 2, a session that is not live, or sharing); 4 not recorded.
 pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
-    let here = here()?;
+    let here = match here() {
+        Ok(here) => here,
+        Err(error) => {
+            eprintln!("ohjaa judge: not recorded: {error:#}");
+            return Ok(NOT_RECORDED);
+        }
+    };
     let sharing = sharing_of(here.entry.as_ref());
     if args.push && !sharing.shared {
         eprintln!(
             "ohjaa judge: refused to share: {}. Nothing was recorded; judge without --push to \
-             keep it on this machine, or set share_judgements = true in the entry's repo.toml",
-            sharing.why
+             keep it on this machine, or set share_judgements = true in the entry's {}",
+            sharing.why,
+            home::SHARING_TOML
         );
         return Ok(REFUSED);
     }
@@ -1374,9 +2204,15 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
             return Ok(CANNOT);
         }
     }
-    let logged = read_log()?;
-    let reviewer = match reviewer(&here.top, &logged.sessions) {
-        Ok(reviewer) => reviewer,
+    let logged = match read_log_patiently() {
+        Ok(logged) => logged,
+        Err(error) => {
+            eprintln!("ohjaa judge: not recorded: the session log cannot be read ({error:#})");
+            return Ok(NOT_RECORDED);
+        }
+    };
+    let observed = match observe(&here.top, &logged.sessions) {
+        Ok(observed) => observed,
         Err(why) => {
             eprintln!("ohjaa judge: refused: {why}");
             return Ok(REFUSED);
@@ -1418,53 +2254,41 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
         eprintln!("ohjaa judge: refused (law 2: the Agent never judges its own Change): {why}. Nothing was recorded.");
         Ok(REFUSED)
     };
-    let (actor, basis, session) = match &reviewer {
-        Reviewer::Person(person) => match person_independence(person, &change) {
-            Ok(basis) => (
-                Actor::Person {
-                    name: person.name.clone(),
-                    email: person.email.clone(),
-                },
-                basis,
-                None,
-            ),
-            Err(why) => return refused(why),
-        },
-        Reviewer::Agent(session) => {
-            let made = match made_by_reviewer(session, &change, &logged.sessions, &here.top, &clone)
-            {
-                Ok(made) => made,
-                Err(why) => {
-                    return refused(format!("what this session made cannot be read: {why}"))
-                }
-            };
-            match agent_independence(session, &change, &made, &authors) {
-                Ok(basis) => (
-                    Actor::Agent {
-                        session: session.id.clone(),
-                        agent: program(&session.agent),
-                    },
-                    basis,
-                    Some(session.id.clone()),
-                ),
-                Err(why) => return refused(why),
-            }
+    if let Reviewer::Person(person) = &observed.reviewer {
+        if let Err(why) = refuse_persons_own(person, &change) {
+            return refused(why);
         }
-    };
-    let mut basis = basis;
-    if authors.unattributed > 0 {
-        basis.push(format!(
-            "{} of the Change's commit(s) no ended session's record holds (made outside ohjaa, \
-             or by a session still open{}): who made those is not shown by the log, only that \
-             the reviewer's own checkout and identity do not hold them",
-            authors.unattributed,
-            if authors.open.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", authors.open.join(", "))
-            }
-        ));
     }
+    let mut reflogs = Reflogs::new(&here.top);
+    if let Err(why) = refuse_own_change(&observed, &change, &logged.sessions, &mut reflogs, &clone)
+    {
+        return refused(why);
+    }
+    let (actor, session) = match &observed.reviewer {
+        Reviewer::Person(person) => (
+            Actor::Person {
+                name: person.name.clone(),
+                email: person.email.clone(),
+            },
+            None,
+        ),
+        Reviewer::Agent { session, .. } => (
+            Actor::Agent {
+                session: session.id.clone(),
+                agent: program(&session.agent),
+            },
+            Some(session.id.clone()),
+        ),
+    };
+    // The git identity the reviewer acts under, when it matters: a
+    // person's is who they are; an agent's is asked only when some commit
+    // no record holds might carry it.
+    let identity = match &observed.reviewer {
+        Reviewer::Person(person) => Some(person.clone()),
+        Reviewer::Agent { .. } if authors.unattributed > 0 => identity_here(&here.top).ok(),
+        Reviewer::Agent { .. } => None,
+    };
+    let independence = judge_independence(&observed, &change, &authors, identity.as_ref());
     if change.commits.len() > MAX_COMMITS {
         change.commits.truncate(MAX_COMMITS);
         change.truncated = true;
@@ -1481,11 +2305,7 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
         authors,
         reviewer: actor,
         independence: Independence {
-            judge: JudgeIndependence {
-                established: true,
-                kind: "procedural".to_owned(),
-                basis,
-            },
+            judge: independence,
             evidence: evidence_independence(&evidence),
         },
         evidence,
@@ -1511,13 +2331,16 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
                 use std::io::IsTerminal;
                 std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
             },
+            session_env: observed.claimed.clone(),
+            inside: inside_ids(&observed),
         },
         change,
     };
     let bytes = serde_json::to_vec(&judgement)?;
-    sessions::Store::open(&log_path()?)
-        .and_then(|store| store.insert_new(sessions::JUDGEMENTS, &judgement.id, &bytes, None))
-        .map_err(|error| anyhow::anyhow!("the Judgement could not be recorded: {error}"))?;
+    if let Err(error) = insert_patiently(sessions::JUDGEMENTS, &judgement.id, &bytes, None) {
+        eprintln!("ohjaa judge: not recorded: the Judgement could not be recorded: {error}");
+        return Ok(NOT_RECORDED);
+    }
     println!(
         "ohjaa judge: recorded {} ({}) of {}..{} by {}",
         judgement.id,
@@ -1526,39 +2349,61 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
         short(&judgement.change.head),
         judgement.reviewer.shown()
     );
-    match attach(
-        &here.top,
-        &judgement.change.head,
-        &note_line(&judgement, sharing.names),
-    ) {
-        Ok(()) => println!(
-            "ohjaa judge: attached to {} as a note under {NOTES_REF}{}",
-            short(&judgement.change.head),
-            if sharing.names {
-                ""
-            } else {
-                " (ids, hashes and the verdict only)"
-            }
-        ),
+    let judge = &judgement.independence.judge;
+    if judge.established {
+        println!("ohjaa judge: the judge's independence of the authors: procedural, established");
+    } else {
+        println!(
+            "ohjaa judge: the judge's independence of the authors is not established: {}",
+            judge.not_established.join("; ")
+        );
+    }
+    let pushing = args.push || sharing.push;
+    // Every write of the notes ref, and its push, under this clone's lock.
+    let lock = match notes_lock(&here.common) {
+        Ok(lock) => Some(lock),
         Err(why) => {
             eprintln!(
                 "ohjaa judge: the note could not be attached ({why}); the log holds the \
-                 Judgement"
+                 Judgement, and a push re-attaches it"
             );
-            // Pushing now would share the notes without this one, and say
-            // it was shared.
-            if args.push || sharing.push {
-                eprintln!("ohjaa judge: not shared: its note is not attached");
-                return Ok(1);
-            }
+            None
+        }
+    };
+    if lock.is_some() {
+        match attach(
+            &here.top,
+            &judgement.change.head,
+            &note_line(&judgement, sharing.names),
+        ) {
+            Ok(()) => println!(
+                "ohjaa judge: attached to {} as a note under {NOTES_REF}{}",
+                short(&judgement.change.head),
+                if sharing.names {
+                    ""
+                } else {
+                    " (ids, hashes and the verdict only)"
+                }
+            ),
+            Err(why) => eprintln!(
+                "ohjaa judge: the note could not be attached ({why}); the log holds the \
+                 Judgement, and a push re-attaches it"
+            ),
         }
     }
-    if args.push || sharing.push {
-        match push(&here.top, &here.common, sharing.names) {
+    if pushing {
+        if lock.is_none() {
+            eprintln!("ohjaa judge: not shared: this clone's notes are held by another ohjaa; it is recorded on this machine");
+            return Ok(NOT_SHARED);
+        }
+        // The log as it is now: this Judgement in it.
+        let mut logged = logged;
+        logged.judgements.push(judgement.clone());
+        match push(&here, sharing.names, &logged) {
             Ok(said) => println!("ohjaa judge: {said}"),
             Err(why) => {
                 eprintln!("ohjaa judge: not shared: {why}; it is recorded on this machine");
-                return Ok(1);
+                return Ok(NOT_SHARED);
             }
         }
     } else if sharing.shared {
@@ -1569,6 +2414,7 @@ pub fn judge(args: &JudgeArgs<'_>) -> Result<i32> {
     } else {
         println!("ohjaa judge: local only: {}", sharing.why);
     }
+    drop(lock);
     Ok(0)
 }
 
@@ -1579,14 +2425,35 @@ pub fn respond(judgement: &str, text: &str) -> Result<i32> {
     if text.is_empty() {
         bail!("say what you answer");
     }
-    let here = here()?;
-    let logged = read_log()?;
+    let here = match here() {
+        Ok(here) => here,
+        Err(error) => {
+            eprintln!("ohjaa judge respond: not recorded: {error:#}");
+            return Ok(NOT_RECORDED);
+        }
+    };
+    let logged = match read_log_patiently() {
+        Ok(logged) => logged,
+        Err(error) => {
+            eprintln!(
+                "ohjaa judge respond: not recorded: the session log cannot be read ({error:#})"
+            );
+            return Ok(NOT_RECORDED);
+        }
+    };
     let Some(judged) = logged.judgements.iter().find(|j| j.id == judgement) else {
         eprintln!("ohjaa judge respond: no Judgement {judgement} in this machine's session log");
         return Ok(CANNOT);
     };
-    let (by, author) = match reviewer(&here.top, &logged.sessions) {
-        Ok(Reviewer::Agent(session)) => {
+    let observed = match observe(&here.top, &logged.sessions) {
+        Ok(observed) => observed,
+        Err(why) => {
+            eprintln!("ohjaa judge respond: refused: {why}");
+            return Ok(REFUSED);
+        }
+    };
+    let (by, author) = match &observed.reviewer {
+        Reviewer::Agent { session, .. } => {
             let author = judged
                 .authors
                 .sessions
@@ -1600,23 +2467,19 @@ pub fn respond(judgement: &str, text: &str) -> Result<i32> {
                 author,
             )
         }
-        Ok(Reviewer::Person(person)) => {
+        Reviewer::Person(person) => {
             let author = judged
                 .change
                 .commits
                 .iter()
-                .any(|c| c.author.same(&person) || c.committer.same(&person));
+                .any(|c| c.author.same(person) || c.committer.same(person));
             (
                 Actor::Person {
-                    name: person.name,
-                    email: person.email,
+                    name: person.name.clone(),
+                    email: person.email.clone(),
                 },
                 author,
             )
-        }
-        Err(why) => {
-            eprintln!("ohjaa judge respond: refused: {why}");
-            return Ok(REFUSED);
         }
     };
     let at_ms = now_ms();
@@ -1631,34 +2494,219 @@ pub fn respond(judgement: &str, text: &str) -> Result<i32> {
         at_ms,
     };
     let bytes = serde_json::to_vec(&response)?;
-    sessions::Store::open(&log_path()?)
-        .and_then(|store| {
-            store.insert_new(
-                sessions::RESPONSES,
-                &response.id,
-                &bytes,
-                Some((sessions::JUDGEMENTS, &response.judgement)),
-            )
-        })
-        .map_err(|error| anyhow::anyhow!("the answer could not be recorded: {error}"))?;
+    if let Err(error) = insert_patiently(
+        sessions::RESPONSES,
+        &response.id,
+        &bytes,
+        Some((sessions::JUDGEMENTS, &response.judgement)),
+    ) {
+        eprintln!("ohjaa judge respond: not recorded: the answer could not be recorded: {error}");
+        return Ok(NOT_RECORDED);
+    }
     println!(
         "ohjaa judge respond: recorded {} beside {}; the Judgement is unchanged",
         response.id, response.judgement
     );
     let sharing = sharing_of(here.entry.as_ref());
-    if let Err(why) = attach(
-        &here.top,
-        &response.head,
-        &response_line(&response, sharing.names),
-    ) {
-        eprintln!("ohjaa judge respond: the note could not be attached ({why}); the log holds it");
+    let attached = notes_lock(&here.common).and_then(|_lock| {
+        attach(
+            &here.top,
+            &response.head,
+            &response_line(&response, sharing.names),
+        )
+    });
+    if let Err(why) = attached {
+        eprintln!(
+            "ohjaa judge respond: the note could not be attached ({why}); the log holds it, and \
+             a push re-attaches it"
+        );
     }
     Ok(0)
 }
 
+/// `ohjaa judgements --rebuild-public`: this clone's notes ref rewritten as
+/// one commit by [`NEUTRAL`], with no history, holding only redacted lines:
+/// every line of its notes that is [`publishable`], and this machine's
+/// Judgements of the clone (and their answers) in their redacted form. Every
+/// other line is dropped from the ref (the session log keeps this
+/// machine's); the old history is no longer reachable from the ref, so a
+/// push never publishes it (git's reflog keeps it on this machine). Nothing
+/// is pushed.
+pub fn rebuild_public() -> Result<i32> {
+    let here = here()?;
+    let _lock = notes_lock(&here.common).map_err(|why| anyhow::anyhow!("{why}"))?;
+    let logged = read_log_patiently().context(
+        "the session log cannot be read, so its Judgements could not be kept: nothing was rebuilt",
+    )?;
+    let read = notes_of(&here.top, &[NOTES_REF]).map_err(|why| anyhow::anyhow!("{why}"))?;
+    let local = tidy(&read[0]);
+    let count = |notes: &Notes| notes.values().map(Vec::len).sum::<usize>();
+    let kept: Notes = local
+        .iter()
+        .map(|(object, lines)| {
+            (
+                object.clone(),
+                lines.iter().filter(|l| publishable(l)).cloned().collect(),
+            )
+        })
+        .collect();
+    let dropped = count(&local) - count(&kept);
+    let ours = logged_lines(&logged, &here.common, false);
+    let rebuilt = union(&[&kept, &ours]);
+    let added = count(&rebuilt) - count(&union(&[&kept]));
+    if rebuilt.is_empty() && gitconfig::read_ref(&here.common, NOTES_REF).is_none() {
+        println!("ohjaa judgements: {NOTES_REF} does not exist here, and the log holds no Judgement of this clone: nothing to rebuild");
+        return Ok(0);
+    }
+    write_notes(
+        &here.top,
+        &rebuilt,
+        &[],
+        true,
+        "ohjaa: Judgements, redacted, rebuilt with no history",
+    )
+    .map_err(|why| anyhow::anyhow!("{why}"))?;
+    println!(
+        "ohjaa judgements: rebuilt {NOTES_REF} as one commit by ohjaa <ohjaa@invalid> with no \
+         history: {} redacted line(s) on {} commit(s) ({added} from this machine's session log); \
+         {dropped} line(s) that were not redacted were dropped from the ref (this machine's \
+         Judgements stay in its session log). The old history is no longer on the ref, so no \
+         push publishes it (git's reflog keeps it on this machine only). Nothing was pushed: \
+         the next `ohjaa judge … --push` pushes it",
+        count(&rebuilt),
+        rebuilt.len()
+    );
+    if sharing_of(here.entry.as_ref()).names {
+        println!(
+            "ohjaa judgements: this entry is private: its next push re-attaches its Judgements \
+             with names"
+        );
+    }
+    Ok(0)
+}
+
+/// A note line as a Judgement would read redacted: its names, words and
+/// paths taken out, as [`note_line`] writes one without names.
+fn redacted_form(value: &Value) -> Value {
+    let mut note = value.clone();
+    if note["redacted"] == true {
+        return note;
+    }
+    let Some(map) = note.as_object_mut() else {
+        return note;
+    };
+    let reviewer = match map.get("reviewer") {
+        Some(r) if r["kind"] == "agent" => json!({"kind": "agent", "session": r["session"]}),
+        Some(r) if r["kind"] == "person" => json!({"kind": "person"}),
+        other => other.cloned().unwrap_or(Value::Null),
+    };
+    map.insert("reviewer".to_owned(), reviewer);
+    if let Some(by) = map.get("by").cloned() {
+        let by = match by["kind"].as_str() {
+            Some("agent") => json!({"kind": "agent", "session": by["session"]}),
+            _ => json!({"kind": "person"}),
+        };
+        map.insert("by".to_owned(), by);
+    }
+    if let Some(people) = map.get("authors").and_then(|a| a["people"].as_array()) {
+        let sessions = map["authors"]["sessions"].clone();
+        map.insert(
+            "authors".to_owned(),
+            json!({"people": people.len(), "sessions": sessions}),
+        );
+    }
+    if let Some(findings) = map.get("findings").and_then(Value::as_array) {
+        map.insert("findings".to_owned(), json!(findings.len()));
+    }
+    for key in ["uncertainty", "slug", "text"] {
+        map.remove(key);
+    }
+    map.insert("redacted".to_owned(), json!(true));
+    canonical_json(&note)
+}
+
+/// Two note lines say the same: the same bytes, or one is the other with
+/// its names taken out.
+fn agree(a: &Value, b: &Value) -> bool {
+    a == b
+        || redacted_form(a) == redacted_form(b) && (a["redacted"] == true || b["redacted"] == true)
+}
+
+/// One record of a Judgement or an answer, as `ohjaa judgements` lists it.
+struct Listed {
+    value: Value,
+    /// The note lines that are this record (a log record: both its forms).
+    lines: Vec<String>,
+    /// `log`, `note` (this clone's ref, a line written from this machine's
+    /// log), `merged` (this clone's ref, a line not from this machine's log:
+    /// origin's, merged in by a push, or written another way), `fetched`
+    /// (origin's notes as last fetched).
+    sources: BTreeSet<&'static str>,
+    /// From this machine's log: authoritative here. Any other is a claim.
+    log: bool,
+}
+
+/// Where a note line read under `reference` came from, given whether this
+/// machine's log holds it.
+fn source_of(fetched: bool, from_log: bool) -> &'static str {
+    match (fetched, from_log) {
+        (true, _) => "fetched",
+        (false, true) => "note",
+        (false, false) => "merged",
+    }
+}
+
+/// Add a note line read under a ref to `list`: to the record that is the
+/// same line, else as a record of its own.
+fn add_line(list: &mut Vec<Listed>, line: &str, value: Value, fetched: bool) {
+    if let Some(known) = list.iter_mut().find(|l| l.lines.iter().any(|x| x == line)) {
+        known.sources.insert(source_of(fetched, known.log));
+        return;
+    }
+    list.push(Listed {
+        value,
+        lines: vec![line.to_owned()],
+        sources: BTreeSet::from([source_of(fetched, false)]),
+        log: false,
+    });
+}
+
+/// The records as listed: each with where it was read, whether this
+/// machine's log is its authority (`trust`: `log` or `foreign`), and whether
+/// another record claims the same id and says something else (`conflict`).
+fn listed_values(list: &[Listed]) -> Vec<Value> {
+    list.iter()
+        .map(|record| {
+            let mut value = record.value.clone();
+            let ordered: Vec<&str> = ["log", "note", "merged", "fetched"]
+                .into_iter()
+                .filter(|s| record.sources.contains(s))
+                .collect();
+            let note_of = |record: &Listed| -> Value {
+                record
+                    .lines
+                    .first()
+                    .and_then(|line| serde_json::from_str(line).ok())
+                    .unwrap_or(Value::Null)
+            };
+            let mine = note_of(record);
+            let conflict = list.iter().any(|other| {
+                !std::ptr::eq(other, record)
+                    && other.value["id"] == record.value["id"]
+                    && !agree(&note_of(other), &mine)
+            });
+            value["sources"] = json!(ordered);
+            value["trust"] = json!(if record.log { "log" } else { "foreign" });
+            value["conflict"] = json!(conflict);
+            value
+        })
+        .collect()
+}
+
 /// `ohjaa judgements <commit>`: every Judgement of it, from the log and the
 /// notes (this clone's, and those fetched from origin), each marked with
-/// where it was read.
+/// where it was read, whether it is authoritative here, and whether another
+/// record of the same id says otherwise.
 pub fn list(commit: &str, json_out: bool, fetch_first: bool) -> Result<i32> {
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let (top, common) = gitconfig::repo_at(&cwd)?;
@@ -1687,7 +2735,8 @@ pub fn list(commit: &str, json_out: bool, fetch_first: bool) -> Result<i32> {
         Ok(logged) => logged,
         Err(error) => {
             eprintln!(
-                "ohjaa judgements: the session log cannot be read ({error:#}); the notes only"
+                "ohjaa judgements: the session log cannot be read ({error:#}); the notes only, \
+                 none of them authoritative"
             );
             Logged {
                 sessions: Vec::new(),
@@ -1697,63 +2746,55 @@ pub fn list(commit: &str, json_out: bool, fetch_first: bool) -> Result<i32> {
             }
         }
     };
-    let mut found: Vec<(Value, BTreeSet<&'static str>)> = Vec::new();
-    let mut answers: Vec<(Value, BTreeSet<&'static str>)> = Vec::new();
-    let add =
-        |list: &mut Vec<(Value, BTreeSet<&'static str>)>, value: Value, source: &'static str| {
-            let id = value["id"].clone();
-            match list.iter_mut().find(|(known, _)| known["id"] == id) {
-                Some((_, sources)) => {
-                    sources.insert(source);
-                }
-                None => list.push((value, BTreeSet::from([source]))),
-            }
-        };
+    let mut found: Vec<Listed> = Vec::new();
+    let mut answers: Vec<Listed> = Vec::new();
     for judgement in &logged.judgements {
         if judgement.change.head == sha || judgement.change.commits.iter().any(|c| c.commit == sha)
         {
-            add(&mut found, serde_json::to_value(judgement)?, "log");
+            found.push(Listed {
+                value: serde_json::to_value(judgement)?,
+                lines: vec![note_line(judgement, true), note_line(judgement, false)],
+                sources: BTreeSet::from(["log"]),
+                log: true,
+            });
         }
     }
-    let listed: Vec<String> = found
-        .iter()
-        .filter_map(|(v, _)| v["id"].as_str().map(str::to_owned))
-        .collect();
     for response in &logged.responses {
-        if listed.contains(&response.judgement) {
-            add(&mut answers, serde_json::to_value(response)?, "log");
+        if found
+            .iter()
+            .any(|j| j.value["id"].as_str() == Some(&response.judgement))
+        {
+            answers.push(Listed {
+                value: serde_json::to_value(response)?,
+                lines: vec![
+                    response_line(response, true),
+                    response_line(response, false),
+                ],
+                sources: BTreeSet::from(["log"]),
+                log: true,
+            });
         }
     }
     let fetched_ref = gitconfig::read_ref(&common, FETCHED_REF).is_some();
-    let sources: &[(&str, &'static str)] = if fetched_ref {
-        &[(NOTES_REF, "note"), (FETCHED_REF, "fetched")]
+    let sources: &[(&str, bool)] = if fetched_ref {
+        &[(NOTES_REF, false), (FETCHED_REF, true)]
     } else {
-        &[(NOTES_REF, "note")]
+        &[(NOTES_REF, false)]
     };
-    for (reference, source) in sources {
-        for value in note_values(&top, reference, &sha) {
+    for (reference, fetched) in sources {
+        for line in note_lines(&top, reference, &sha) {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             match value["schema"].as_str() {
-                Some(NOTE_SCHEMA) => add(&mut found, value, source),
-                Some(RESPONSE_NOTE_SCHEMA) => add(&mut answers, value, source),
+                Some(NOTE_SCHEMA) => add_line(&mut found, &line, value, *fetched),
+                Some(RESPONSE_NOTE_SCHEMA) => add_line(&mut answers, &line, value, *fetched),
                 _ => {}
             }
         }
     }
-    let with_sources = |list: Vec<(Value, BTreeSet<&'static str>)>| -> Vec<Value> {
-        list.into_iter()
-            .map(|(mut value, sources)| {
-                // Fixed order: log, note, fetched.
-                let ordered: Vec<&str> = ["log", "note", "fetched"]
-                    .into_iter()
-                    .filter(|s| sources.contains(s))
-                    .collect();
-                value["sources"] = json!(ordered);
-                value
-            })
-            .collect()
-    };
-    let judgements = with_sources(found);
-    let responses = with_sources(answers);
+    let judgements = listed_values(&found);
+    let responses = listed_values(&answers);
     if json_out {
         let document = json!({
             "schema": LIST_SCHEMA,
@@ -1794,14 +2835,16 @@ fn render_list(sha: &str, judgements: &[Value], responses: &[Value]) -> String {
             .iter()
             .filter_map(Value::as_str)
             .collect();
+        let foreign = judgement["trust"] != "log";
         let verdict = match judgement["verdict"].as_str() {
             Some("request_changes") => "request changes",
             Some(other) => other,
             None => "?",
         };
+        let claimed = if foreign { "(claimed) " } else { "" };
         let reviewer = match judgement["reviewer"]["kind"].as_str() {
             Some("agent") => format!(
-                "agent session {}{}",
+                "{claimed}agent session {}{}",
                 judgement["reviewer"]["session"].as_str().unwrap_or("?"),
                 judgement["reviewer"]["agent"]
                     .as_str()
@@ -1811,7 +2854,7 @@ fn render_list(sha: &str, judgements: &[Value], responses: &[Value]) -> String {
                 judgement["reviewer"]["name"].as_str(),
                 judgement["reviewer"]["email"].as_str(),
             ) {
-                (Some(name), Some(email)) => format!("person {name} <{email}>"),
+                (Some(name), Some(email)) => format!("{claimed}person {name} <{email}>"),
                 _ => "a person (not named: a shared note of a repository that is not private)"
                     .to_owned(),
             },
@@ -1834,12 +2877,29 @@ fn render_list(sha: &str, judgements: &[Value], responses: &[Value]) -> String {
             .unwrap_or_default();
         let _ = writeln!(
             out,
-            "- {} {verdict} of {}..{} by {reviewer}, {at} [{}]",
+            "- {} {verdict} of {}..{} by {reviewer}, {at} [{}] ({})",
             judgement["id"].as_str().unwrap_or("?"),
             short(base),
             short(head),
-            sources.join(", ")
+            sources.join(", "),
+            if foreign {
+                "foreign: a shared note's claim, not verified here"
+            } else {
+                "this machine's session log: authoritative here"
+            }
         );
+        if judgement["conflict"] == true {
+            let _ = writeln!(
+                out,
+                "  CONFLICT: another record claims {} and says otherwise{}",
+                judgement["id"].as_str().unwrap_or("?"),
+                if foreign {
+                    ""
+                } else {
+                    "; this one, from this machine's session log, is authoritative here"
+                }
+            );
+        }
         if let Some(findings) = judgement["findings"].as_array() {
             for finding in findings.iter().filter_map(Value::as_str) {
                 let _ = writeln!(out, "  finding: {finding}");
@@ -1898,18 +2958,28 @@ fn render_list(sha: &str, judgements: &[Value], responses: &[Value]) -> String {
         if let Some(why) = judgement["evidence"]["not_asked"].as_str() {
             let _ = writeln!(out, "  evidence considered: none ({why})");
         }
-        let judge = judgement["independence"]["judge"]["established"] == true
-            || judgement["independence"]["judge"] == "procedural";
+        let judge = &judgement["independence"]["judge"];
+        let established = judge["established"] == true || *judge == "procedural";
         let evidence_why = judgement["independence"]["evidence"]["why"]
             .as_str()
             .unwrap_or("not established");
         let _ = writeln!(
             out,
             "  independence: {}; evidence not independently produced ({evidence_why})",
-            if judge {
-                "judge independent of the authors (procedural)"
+            if established {
+                "judge independent of the authors (procedural)".to_owned()
             } else {
-                "judge's independence not established"
+                let why: Vec<&str> = judge["not_established"]
+                    .as_array()
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect();
+                if why.is_empty() {
+                    "judge's independence not established".to_owned()
+                } else {
+                    format!("judge's independence not established ({})", why.join("; "))
+                }
             }
         );
         for response in responses
@@ -1927,13 +2997,18 @@ fn render_list(sha: &str, judgements: &[Value], responses: &[Value]) -> String {
             };
             let _ = writeln!(
                 out,
-                "  answered by {by}{}: {}",
+                "  answered by {by}{}: {}{}",
                 if response["author"] == true {
                     " (an author)"
                 } else {
                     ""
                 },
-                response["text"].as_str().unwrap_or("(not shared)")
+                response["text"].as_str().unwrap_or("(not shared)"),
+                if response["trust"] == "log" {
+                    ""
+                } else {
+                    " (foreign: a shared note's claim)"
+                }
             );
         }
     }
@@ -2018,7 +3093,9 @@ pub fn briefing(
         .take(5)
         .collect();
     if !mine.is_empty() {
-        out.push_str("Judgements here (ohjaa's log; the judge's independence is procedural, the evidence's is not established):\n");
+        out.push_str(
+            "Judgements here (ohjaa's log; the evidence's independence is not established):\n",
+        );
         for judgement in mine {
             let answered = responses
                 .iter()
@@ -2026,7 +3103,7 @@ pub fn briefing(
                 .count();
             let _ = writeln!(
                 out,
-                "- {} {} of {}..{} by {}, {}{}{}{}",
+                "- {} {} of {}..{} by {}, {}{}{}{}; {}",
                 judgement.id,
                 judgement.verdict.words(),
                 short(&judgement.change.base),
@@ -2043,6 +3120,11 @@ pub fn briefing(
                     format!("; {answered} answer(s)")
                 } else {
                     String::new()
+                },
+                if judgement.independence.judge.established {
+                    "the judge's independence: procedural, established"
+                } else {
+                    "the judge's independence is not established (ohjaa judgements says why)"
                 }
             );
         }
@@ -2148,7 +3230,7 @@ mod tests {
         Change {
             base: "b".repeat(40),
             head: commits[0].commit.clone(),
-            state: "t".repeat(40),
+            state: "e".repeat(40),
             commits,
             truncated: false,
         }
@@ -2201,6 +3283,7 @@ mod tests {
                     established: true,
                     kind: "procedural".to_owned(),
                     basis: vec!["x".to_owned()],
+                    not_established: Vec::new(),
                 },
                 evidence: evidence_independence(&Evidence::default()),
             },
@@ -2208,6 +3291,8 @@ mod tests {
                 recorded_by: "ohjaa 0".to_owned(),
                 session: None,
                 terminal: false,
+                session_env: None,
+                inside: Vec::new(),
             },
         }
     }
@@ -2258,14 +3343,58 @@ mod tests {
         assert_eq!(value["evidence"][0]["digest"], "ab".repeat(32));
     }
 
-    /// Law 2 for a person: refused on their own commit; an agent session's
-    /// commit under their identity is said, not refused.
+    fn authors_by(sessions: &[&str], unattributed: usize) -> Authors {
+        Authors {
+            people: Vec::new(),
+            sessions: sessions
+                .iter()
+                .map(|id| AuthorSession {
+                    session: (*id).to_owned(),
+                    agent: "claude".to_owned(),
+                    intent_id: None,
+                    commits: 1,
+                })
+                .collect(),
+            unattributed,
+            open: Vec::new(),
+        }
+    }
+
+    fn person(who: &Identity) -> Observed {
+        Observed {
+            reviewer: Reviewer::Person(who.clone()),
+            inside: Vec::new(),
+            claimed: None,
+            claimed_other: None,
+            unseen: None,
+        }
+    }
+
+    /// Law 2 for a person: refused on their own commit, one no ended
+    /// session's record holds (as author or committer). Their agent's work
+    /// under their identity is recorded, never claimed independent: ohjaa
+    /// cannot tell the person from an agent with that identity.
     #[test]
     fn law_two_for_a_person() {
         let rae = identity("Rae Reviewer", "RAE@example.invalid");
         let ann = identity("Ann Author", "ann@example.invalid");
-        let theirs = change(vec![commit(&"a".repeat(40), &ann, None)]);
-        assert!(person_independence(&rae, &theirs).is_ok());
+        let theirs = change(vec![commit(&"a".repeat(40), &ann, Some("oh-1-1"))]);
+        assert!(refuse_persons_own(&rae, &theirs).is_ok());
+        let independent = judge_independence(
+            &person(&rae),
+            &theirs,
+            &authors_by(&["oh-1-1"], 0),
+            Some(&rae),
+        );
+        assert!(independent.established, "{independent:?}");
+        assert!(independent.not_established.is_empty());
+        assert!(
+            independent
+                .basis
+                .iter()
+                .any(|b| b.contains("cannot tell a person from an agent")),
+            "{independent:?}"
+        );
         let own = change(vec![
             commit(&"a".repeat(40), &ann, None),
             commit(
@@ -2274,17 +3403,246 @@ mod tests {
                 None,
             ),
         ]);
-        let refused = person_independence(&rae, &own).unwrap_err();
+        let refused = refuse_persons_own(&rae, &own).unwrap_err();
         assert!(refused.contains("bbbbbbb"), "{refused}");
         // Committed (not authored) by the reviewer counts too.
         let mut committed = commit(&"d".repeat(40), &ann, None);
         committed.committer = rae.clone();
-        assert!(person_independence(&rae, &change(vec![committed])).is_err());
+        assert!(refuse_persons_own(&rae, &change(vec![committed])).is_err());
+        // An agent session's work under the reviewer's identity: not
+        // refused, and not established.
         let by_agent = change(vec![commit(&"e".repeat(40), &rae, Some("oh-5-5"))]);
-        let basis = person_independence(&rae, &by_agent).unwrap();
+        assert!(refuse_persons_own(&rae, &by_agent).is_ok());
+        let said = judge_independence(
+            &person(&rae),
+            &by_agent,
+            &authors_by(&["oh-5-5"], 0),
+            Some(&rae),
+        );
+        assert!(!said.established, "{said:?}");
         assert!(
-            basis[0].contains("made by agent session(s) oh-5-5"),
-            "{basis:?}"
+            said.not_established[0].contains("carry the reviewer's git identity")
+                && said.not_established[0].contains("oh-5-5"),
+            "{said:?}"
+        );
+        // A commit no ended session's record holds: never established.
+        let open = change(vec![commit(&"f".repeat(40), &ann, None)]);
+        let said = judge_independence(&person(&rae), &open, &authors_by(&[], 1), Some(&rae));
+        assert!(!said.established);
+        assert!(said.not_established[0].contains("no ended session's record holds"));
+        // Where the process runs could not be seen: never established.
+        let mut unseen = person(&rae);
+        unseen.unseen = Some("ps failed".to_owned());
+        assert!(
+            !judge_independence(&unseen, &theirs, &authors_by(&["oh-1-1"], 0), Some(&rae))
+                .established
+        );
+    }
+
+    /// The independence rule for an Agent reviewer: established only in its
+    /// own session's process group, as OHJAA_SESSION says, and in no other.
+    #[test]
+    fn an_agent_is_independent_only_in_its_own_session_and_as_it_says() {
+        let author = "oh-1-1";
+        let theirs = change_of(&[("a1", Some(author))]);
+        let authors = authors_by(&[author], 0);
+        let reviewer = session("oh-2-1", "/c/widget", 100, None);
+        let agent = |inside: Vec<Session>, claimed: Option<&str>, shown: bool| Observed {
+            reviewer: Reviewer::Agent {
+                session: Box::new(reviewer.clone()),
+                shown,
+            },
+            inside,
+            claimed: claimed.map(str::to_owned),
+            claimed_other: None,
+            unseen: None,
+        };
+        let honest = judge_independence(
+            &agent(vec![reviewer.clone()], Some("oh-2-1"), true),
+            &theirs,
+            &authors,
+            None,
+        );
+        assert!(honest.established, "{honest:?}");
+        // OHJAA_SESSION dropped, inside the session's group: an agent
+        // presenting as a person.
+        let hidden = judge_independence(
+            &agent(vec![reviewer.clone()], None, true),
+            &theirs,
+            &authors,
+            None,
+        );
+        assert!(!hidden.established);
+        assert!(
+            hidden.not_established[0].contains("OHJAA_SESSION is not set"),
+            "{hidden:?}"
+        );
+        // Another session's id claimed.
+        let borrowed = judge_independence(
+            &agent(vec![reviewer.clone()], Some("oh-9-9"), true),
+            &theirs,
+            &authors,
+            None,
+        );
+        assert!(!borrowed.established);
+        assert!(borrowed.not_established[0].contains("OHJAA_SESSION names oh-9-9"));
+        // Not shown to run in the session it claims.
+        let claimed = judge_independence(
+            &agent(Vec::new(), Some("oh-2-1"), false),
+            &theirs,
+            &authors,
+            None,
+        );
+        assert!(!claimed.established);
+        assert!(claimed.not_established[0].contains("not shown to run in session oh-2-1"));
+        // A session started inside another.
+        let outer = session("oh-3-1", "/c/widget", 90, None);
+        let nested = judge_independence(
+            &agent(vec![reviewer.clone(), outer], Some("oh-2-1"), true),
+            &theirs,
+            &authors,
+            None,
+        );
+        assert!(!nested.established);
+        assert!(nested.not_established[0].contains("also runs inside live session(s) oh-3-1"));
+        // A commit no ended record holds, under the agent's identity.
+        let unattributed = change_of(&[("u1", None)]);
+        let ann = identity("Ann", "ann@x");
+        let said = judge_independence(
+            &agent(vec![reviewer.clone()], Some("oh-2-1"), true),
+            &unattributed,
+            &authors_by(&[], 1),
+            Some(&ann),
+        );
+        assert!(!said.established);
+        assert!(said.not_established[1].contains("the git identity the reviewer acts under"));
+    }
+
+    /// Who judges is observed: the live session whose process group holds
+    /// the process or an ancestor, or whose ohjaa is an ancestor, innermost
+    /// first; never an ended one, nor a group id reused since.
+    #[test]
+    fn the_sessions_a_process_runs_inside_are_observed_not_claimed() {
+        let proc = |pid, ppid, pgid, elapsed| process::Proc {
+            pid,
+            ppid,
+            pgid,
+            elapsed,
+        };
+        let now = 10_000;
+        // judge (500) < shell (400, group 300) < toimija (300, leads 300)
+        // < ohjaa run (200, group 100, the outer session's) < ohjaa (100).
+        let table = vec![
+            proc(500, 400, 300, 1),
+            proc(400, 300, 300, 5),
+            proc(300, 200, 300, 9),
+            proc(200, 150, 100, 10),
+            proc(150, 100, 100, 50),
+            proc(100, 1, 100, 60),
+        ];
+        let chain = table.clone();
+        let mut inner = session("oh-9990000-200", "/c/widget", now - 10, None);
+        inner.pgid = Some(300);
+        inner.group_started_ms = Some((now - 10) * 1000);
+        let mut outer = session("oh-9940000-90", "/c/widget", now - 60, None);
+        outer.pgid = Some(100);
+        let ended = {
+            let mut s = session(
+                "oh-1-1",
+                "/c/widget",
+                now - 60,
+                Some(left(now - 30, &[], &[])),
+            );
+            s.pgid = Some(300);
+            s
+        };
+        let all = vec![ended, outer.clone(), inner.clone()];
+        let around: Vec<&str> = sessions_around(&all, &table, &chain, now)
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(around, vec![inner.id.as_str(), outer.id.as_str()]);
+        // A group id recorded before its leader started: reused, not it.
+        let mut reused = inner.clone();
+        reused.group_started_ms = Some((now - 3600) * 1000);
+        reused.started_ms = (now - 3600) * 1000;
+        reused.id = "oh-1-77".to_owned();
+        assert!(sessions_around(&[reused], &table, &chain, now).is_empty());
+        // Its ohjaa an ancestor (its group not recorded yet): inside.
+        let mut early = session("oh-9990000-200", "/c/widget", now - 10, None);
+        early.pgid = None;
+        assert_eq!(sessions_around(&[early], &table, &chain, now).len(), 1);
+    }
+
+    /// What a public note may hold: exactly what ohjaa writes without
+    /// names. A line that only says it is redacted is not.
+    #[test]
+    fn only_a_truly_redacted_line_is_publishable() {
+        let judged = judgement();
+        assert!(publishable(&note_line(&judged, false)));
+        assert!(!publishable(&note_line(&judged, true)));
+        let response = Response {
+            schema: RESPONSE_SCHEMA.to_owned(),
+            id: "rs-1-2".to_owned(),
+            judgement: "jd-1-2".to_owned(),
+            head: "c".repeat(40),
+            by: Actor::Person {
+                name: "Ann".to_owned(),
+                email: "ann@x".to_owned(),
+            },
+            author: true,
+            text: "secret".to_owned(),
+            at_ms: 1,
+        };
+        assert!(publishable(&response_line(&response, false)));
+        assert!(!publishable(&response_line(&response, true)));
+        let mut forged: Value = serde_json::from_str(&note_line(&judged, false)).unwrap();
+        forged["reviewer"] = json!({"kind": "person", "name": "Yair"});
+        assert!(!publishable(&forged.to_string()));
+        let mut forged: Value = serde_json::from_str(&note_line(&judged, false)).unwrap();
+        forged["findings"] = json!(["acme-bank"]);
+        assert!(!publishable(&forged.to_string()));
+        let mut forged: Value = serde_json::from_str(&note_line(&judged, false)).unwrap();
+        forged["redacted"] = json!(false);
+        assert!(!publishable(&forged.to_string()));
+        assert!(!publishable("not json"));
+        // A named line and its redacted form say the same; another verdict
+        // does not.
+        let named: Value = serde_json::from_str(&note_line(&judged, true)).unwrap();
+        let redacted: Value = serde_json::from_str(&note_line(&judged, false)).unwrap();
+        assert!(agree(&named, &redacted));
+        let mut other = redacted.clone();
+        other["verdict"] = json!("approve");
+        assert!(!agree(&named, &other));
+        let mut renamed = named.clone();
+        renamed["reviewer"]["name"] = json!("Yair");
+        assert!(!agree(&named, &renamed));
+    }
+
+    /// Notes are a union: no line of any side is lost, two different lines
+    /// of one id are both kept, and the order is git's cat_sort_uniq's.
+    #[test]
+    fn the_union_of_notes_keeps_every_line() {
+        let notes = |pairs: &[(&str, &[&str])]| -> Notes {
+            pairs
+                .iter()
+                .map(|(object, lines)| {
+                    (
+                        (*object).to_owned(),
+                        lines.iter().map(|l| (*l).to_owned()).collect(),
+                    )
+                })
+                .collect()
+        };
+        let mine = notes(&[("a", &["2", "1"]), ("b", &["x"])]);
+        let theirs = notes(&[("a", &["3"]), ("c", &["y"])]);
+        assert_eq!(
+            union(&[&mine, &theirs]),
+            notes(&[("a", &["1", "2", "3"]), ("b", &["x"]), ("c", &["y"])])
+        );
+        assert_eq!(
+            tidy(&notes(&[("a", &["2", "1", "2"]), ("e", &[])])),
+            notes(&[("a", &["1", "2"])])
         );
     }
 
@@ -2379,7 +3737,7 @@ mod tests {
                 shared_with: Vec::new()
             }]
         );
-        assert!(agent_independence(&reviewer, &change, &made, &authors_none()).is_err());
+        assert!(made_refusal(&reviewer, "this session", &change, &made).is_some());
         // What the log gives the other session is never the reviewer's.
         let theirs = change_of(&[("a1", Some("oh-1-1"))]);
         let late = [made_at("HEAD", "a1", 100)];
@@ -2449,17 +3807,8 @@ mod tests {
             &[],
         );
         assert_eq!(made[0].shared_with, vec!["oh-6-1".to_owned()]);
-        let refused = agent_independence(&reviewer, &change, &made, &authors_none()).unwrap_err();
+        let refused = made_refusal(&reviewer, "this session", &change, &made).unwrap();
         assert!(refused.contains("while oh-6-1 shared it"), "{refused}");
-    }
-
-    fn authors_none() -> Authors {
-        Authors {
-            people: Vec::new(),
-            sessions: Vec::new(),
-            unattributed: 0,
-            open: Vec::new(),
-        }
     }
 
     /// An Intent id is what ohjaa mints, never free text a note would carry;

@@ -9,18 +9,21 @@
 //! - When a landing reaches the observed branch (seen at leaving, or by a
 //!   launch's marks walk) and sykli has no current receipt of its tree under
 //!   the entry's gate, ohjaa asks sykli for a durable run of exactly that
-//!   tree. A `ValidationRef` of kind `integrated` is written into the
-//!   session's record first (invariant A); then `sykli run --detach` runs in
-//!   a checkout of the landed commit that ohjaa makes for it outside the
-//!   repository (`$XDG_STATE_HOME/ohjaa/integrated/<clone>/<commit>`, a
-//!   linked worktree of the clone, so its run and receipt are the clone's).
-//!   ohjaa keeps the reference; what became of the run is sykli's to say.
+//!   tree. Under the clone's lock, a `ValidationRef` of kind `integrated` is
+//!   written into the session's record first (invariant A); then `sykli run
+//!   --detach` runs in the clone's one rolling validation checkout
+//!   (`$XDG_STATE_HOME/ohjaa/integrated/<clone>/checkout`, a linked worktree
+//!   of the clone, reset to exactly the landed commit and verified clean
+//!   first), whose cargo builds go to a target dir of its own. ohjaa keeps
+//!   the reference, and a copy of the receipt once the run is done; what
+//!   became of the run is sykli's to say.
 //! - A candidate validated when `origin/<branch>` was at B, seen when it is
 //!   elsewhere, is flagged "base moved since validation": at a push and in a
 //!   briefing. Never refused (observe, mark and flag).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -28,8 +31,8 @@ use crate::gitconfig;
 use crate::hook::facts_for_sykli;
 use crate::lifecycle::{self, Gate, StatusHelp};
 use crate::mark::{self, Marks};
-use crate::process;
-use crate::sessions::{self, Check, ObservedBranch, ValidationKind, ValidationRef};
+use crate::process::{self, FileLock};
+use crate::sessions::{self, Check, ObservedBranch, ReceiptRef, ValidationKind, ValidationRef};
 
 /// What this machine's sykli can do here, asked once: `sykli status --help`
 /// and, only where a run may be asked for, `sykli run --help`.
@@ -207,24 +210,18 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// FNV-1a, 64 bits: a stable name for a clone's folder of validation
-/// checkouts (no hashing crate is a dependency here, and nothing here needs
-/// one that resists collisions on purpose).
+/// FNV-1a, 64 bits: a stable name for a clone's folders in ohjaa's state (no
+/// hashing crate is a dependency here, and nothing here needs one that
+/// resists collisions on purpose).
 fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
 
-/// Where ohjaa's validation checkouts live: `integrated/` in its state
-/// directory (`$XDG_STATE_HOME/ohjaa`, beside the session log).
-pub fn checkouts_root(state: &Path) -> PathBuf {
-    state.join("integrated")
-}
-
-/// The checkout an integrated validation of `commit` runs in, for the clone
-/// whose common git dir is `common`.
-pub fn checkout_for(state: &Path, common: &Path, commit: &str) -> PathBuf {
+/// A clone's name in ohjaa's state: its main checkout's folder name and a
+/// hash of its common git dir (`widget-0123456789abcdef`).
+pub fn clone_id(common: &Path) -> String {
     let common = canonical(common);
     let name = common
         .parent()
@@ -233,12 +230,66 @@ pub fn checkout_for(state: &Path, common: &Path, commit: &str) -> PathBuf {
             || "clone".to_owned(),
             |name| name.to_string_lossy().into_owned(),
         );
-    checkouts_root(state)
-        .join(format!(
-            "{name}-{:016x}",
-            fnv(common.to_string_lossy().as_bytes())
-        ))
-        .join(commit)
+    format!("{name}-{:016x}", fnv(common.to_string_lossy().as_bytes()))
+}
+
+/// Where ohjaa's validation folders live: `integrated/` in its state
+/// directory (`$XDG_STATE_HOME/ohjaa`, beside the session log).
+pub fn checkouts_root(state: &Path) -> PathBuf {
+    state.join("integrated")
+}
+
+/// How long a launch or a leaving waits for another ohjaa that is asking
+/// sykli to validate the same clone.
+const LOCK_WAIT: Duration = Duration::from_secs(20);
+
+/// A clone's folder of integrated validation, `integrated/<clone>/` in
+/// ohjaa's state: its one rolling checkout, the cargo config and target dir
+/// that checkout builds with, the receipts kept of its runs, and its lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneDir {
+    pub dir: PathBuf,
+}
+
+impl CloneDir {
+    /// The folder for the clone whose common git dir is `common`.
+    pub fn of(state: &Path, common: &Path) -> CloneDir {
+        CloneDir {
+            dir: checkouts_root(state).join(clone_id(common)),
+        }
+    }
+
+    /// The rolling validation checkout: a linked worktree of the clone,
+    /// reset to the commit before each run.
+    pub fn checkout(&self) -> PathBuf {
+        self.dir.join("checkout")
+    }
+
+    /// Where cargo builds what runs in the checkout: never a target dir
+    /// another checkout shares (`~/.cargo/config.toml`'s `build.target-dir`,
+    /// say), whose newer artifacts of another tree cargo would take as fresh.
+    pub fn target(&self) -> PathBuf {
+        self.dir.join("target")
+    }
+
+    /// `.cargo/config.toml` in the folder above the checkout: cargo reads
+    /// the config of every folder above the one it runs in, and a deeper
+    /// one wins over `$CARGO_HOME/config.toml`. Nothing is written into the
+    /// checkout.
+    pub fn cargo_config(&self) -> PathBuf {
+        self.dir.join(".cargo").join("config.toml")
+    }
+
+    /// Copies of the receipts the checkout's runs made, by request.
+    pub fn receipts(&self) -> PathBuf {
+        self.dir.join("receipts")
+    }
+
+    /// Held from deciding to ask sykli to the run handed over: one ohjaa at
+    /// a time records a request and dispatches it in this clone.
+    pub fn lock(&self) -> Result<FileLock, String> {
+        process::lock_file(&self.dir.join("lock"), LOCK_WAIT)
+    }
 }
 
 /// A request for an integrated validation, before it is recorded.
@@ -246,13 +297,16 @@ pub fn checkout_for(state: &Path, common: &Path, commit: &str) -> PathBuf {
 pub struct Request {
     pub validation: ValidationRef,
     pub checkout: PathBuf,
+    /// An earlier request of the same commit that was recorded and never
+    /// handed to sykli (its ohjaa stopped first): `(session, request)`.
+    pub supersedes: Option<(String, String)>,
 }
 
 /// The request for an integrated validation of `commit` (whose tree is
 /// `tree`), the observed branch's tip, under `gate`.
 pub fn plan(gate: &Gate, commit: &str, tree: &str, state: &Path) -> Request {
     let at = now_ms();
-    let checkout = checkout_for(state, &gate.common, commit);
+    let checkout = CloneDir::of(state, &gate.common).checkout();
     let validation = ValidationRef {
         request: sessions::new_request_id(at),
         run: None,
@@ -277,6 +331,7 @@ pub fn plan(gate: &Gate, commit: &str, tree: &str, state: &Path) -> Request {
     Request {
         validation,
         checkout,
+        supersedes: None,
     }
 }
 
@@ -288,55 +343,132 @@ fn checkout_head(checkout: &Path) -> Option<String> {
     Some(head.trim().to_owned())
 }
 
-/// A checkout of exactly `commit` at `checkout`: a linked worktree of the
-/// gate's clone, detached, made without running the repository's hooks
-/// (ohjaa's own step, not the person's checkout). One made for this commit
-/// before is used again, while it still sits there.
-fn ensure_checkout(gate: &Gate, checkout: &Path, commit: &str) -> Result<(), String> {
-    if checkout.join(".git").exists() {
-        return match checkout_head(checkout) {
-            Some(head) if head == commit => Ok(()),
-            Some(head) => Err(format!(
-                "its checkout {} is at {head}, not {commit}",
-                checkout.display()
-            )),
-            None => Err(format!(
-                "its checkout {} cannot be read",
-                checkout.display()
-            )),
-        };
-    }
-    if let Some(parent) = checkout.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-    }
+/// `git <args>`, run where `dir` says, as ohjaa's own step: no hook of the
+/// repository's runs, and no repository named by a hook's environment.
+fn git_in(dir: &Path, args: &[&str]) -> Result<process::Output, String> {
     let mut command = Command::new("git");
     command
         .args(["-c", "core.hooksPath=/dev/null", "-C"])
-        .arg(&gate.top)
-        .args(["worktree", "add", "--detach", "--force", "-q"])
-        .arg(checkout)
-        .arg(commit);
+        .arg(dir)
+        .args(args)
+        .env("LC_ALL", "C");
     for var in gitconfig::REPO_ENV {
         command.env_remove(var);
     }
-    match process::run(&mut command, None, process::LOCAL) {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => Err(format!(
-            "git worktree add failed: {}",
-            output.failure_detail()
-        )),
-        Err(error) => Err(format!("git could not be asked: {error:#}")),
+    process::run(&mut command, None, process::LOCAL)
+        .map_err(|error| format!("git could not be asked: {error:#}"))
+}
+
+fn git_ok_in(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let output = git_in(dir, args)?;
+    if output.status.success() {
+        Ok(output.stdout_text())
+    } else {
+        Err(output.failure_detail())
     }
 }
 
-/// Hand a recorded request to sykli: its checkout, then `sykli run
-/// <gate> --detach --json` there. sykli's run id, or why not.
-pub fn dispatch(gate: &Gate, request: &Request, caps: &Caps) -> Result<String, String> {
+/// The clone's validation checkout, at exactly `commit` and clean: made
+/// when missing (`git worktree add --detach --force`, so a folder deleted
+/// while still registered is made again); else reset (`checkout -f
+/// --detach`, then `clean -ffdx` of everything but `.sykli/`, where sykli
+/// keeps its receipts), and made again from nothing when the reset fails.
+/// Then verified: HEAD is the commit, and `git status` (untracked and
+/// ignored files too, `.sykli/` aside) says nothing. A run never starts in
+/// another run's leftovers.
+fn ensure_checkout(gate: &Gate, clone: &CloneDir, commit: &str) -> Result<(), String> {
+    let checkout = clone.checkout();
+    let mut reset = checkout.join(".git").exists();
+    if reset {
+        let done = git_ok_in(&checkout, &["checkout", "-q", "-f", "--detach", commit])
+            .and_then(|_| git_ok_in(&checkout, &["clean", "-q", "-ffdx", "-e", ".sykli"]));
+        if done.is_err() {
+            reset = false;
+        }
+    }
+    if !reset {
+        if checkout.exists() {
+            std::fs::remove_dir_all(&checkout)
+                .map_err(|error| format!("cannot remove {}: {error}", checkout.display()))?;
+        }
+        std::fs::create_dir_all(&clone.dir)
+            .map_err(|error| format!("cannot create {}: {error}", clone.dir.display()))?;
+        let checkout = checkout.to_string_lossy().into_owned();
+        git_ok_in(
+            &gate.top,
+            &[
+                "worktree", "add", "--detach", "--force", "-q", &checkout, commit,
+            ],
+        )
+        .map_err(|why| format!("git worktree add failed: {why}"))?;
+    }
+    let left = git_ok_in(
+        &checkout,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored",
+            "--",
+            ".",
+            ":(exclude).sykli",
+        ],
+    )
+    .map_err(|why| format!("its checkout's state cannot be read: {why}"))?;
+    if !left.trim().is_empty() {
+        return Err(format!(
+            "its checkout {} is not clean after its reset: {}",
+            checkout.display(),
+            left.lines().next().unwrap_or_default()
+        ));
+    }
+    match checkout_head(&checkout) {
+        Some(head) if head == commit => Ok(()),
+        head => Err(format!(
+            "its checkout {} is at {}, not {commit}",
+            checkout.display(),
+            head.unwrap_or_else(|| "an unreadable HEAD".to_owned())
+        )),
+    }
+}
+
+/// `<clone>/.cargo/config.toml`, naming `<clone>/target`: written when it
+/// does not say so already.
+fn ensure_cargo_config(clone: &CloneDir) -> Result<(), String> {
+    let text = format!(
+        "# Written by ohjaa. cargo, run in ohjaa's validation checkout of this clone (checkout/\n\
+         # below), builds here, never in a target dir another checkout shares: cargo would take\n\
+         # another tree's newer artifacts there as fresh.\n\
+         [build]\n\
+         target-dir = {}\n",
+        crate::flat_toml::quote(&clone.target().to_string_lossy())
+    );
+    let path = clone.cargo_config();
+    if std::fs::read_to_string(&path).is_ok_and(|said| said == text) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    std::fs::write(&path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+/// Hand a recorded request to sykli: the clone's checkout, reset to the
+/// commit and verified clean, then `sykli run <gate> --detach --json` there.
+/// sykli's run id, or why not. The caller holds the clone's lock.
+pub fn dispatch(
+    gate: &Gate,
+    request: &Request,
+    caps: &Caps,
+    state: &Path,
+) -> Result<String, String> {
     if !caps.detach {
         return Err("this sykli cannot run it detached (no `sykli run --detach`)".to_owned());
     }
-    ensure_checkout(gate, &request.checkout, &request.validation.commit)?;
+    let clone = CloneDir::of(state, &gate.common);
+    ensure_cargo_config(&clone)?;
+    ensure_checkout(gate, &clone, &request.validation.commit)?;
     let facts = facts_for_sykli(&caps.run_help, Some(&request.checkout), &gate.common);
     let mut command = Command::new("sykli");
     command
@@ -395,31 +527,44 @@ fn fill(log: &Path, session: &str, request: &str, change: impl FnOnce(&mut Valid
         })
     });
     if let Err(error) = written {
-        eprintln!("ohjaa: {error}: what sykli gave for request {request} is not recorded");
+        eprintln!("ohjaa: {error}: what became of request {request} is not recorded");
     }
 }
 
 /// Dispatch a request already written into `session`'s record (invariant
-/// A: the caller wrote it before), and fill in sykli's run id, or why not.
+/// A: the caller wrote it before, holding the clone's lock), and fill in
+/// sykli's run id, or why not; and, for a request that supersedes one never
+/// dispatched, say so in that one's record.
 pub fn dispatch_recorded(
     log: &Path,
+    state: &Path,
     session: &str,
     gate: &Gate,
     request: &Request,
     caps: &Caps,
 ) -> Asked {
     let id = request.validation.request.clone();
-    let run = dispatch(gate, request, caps);
+    let run = dispatch(gate, request, caps, state);
     fill(log, session, &id, |validation| match &run {
         Ok(run) => validation.run = Some(run.clone()),
         Err(why) => validation.not_dispatched = Some(why.clone()),
     });
+    if let Some((old_session, old_request)) = &request.supersedes {
+        let why = format!("{STOPPED}; asked again as request {id} by session {session}");
+        fill(log, old_session, old_request, |validation| {
+            if validation.run.is_none() && validation.not_dispatched.is_none() {
+                validation.not_dispatched = Some(why);
+            }
+        });
+    }
     Asked::Recorded { request: id, run }
 }
 
-/// Record `request` in `session`'s record, then dispatch it.
+/// Record `request` in `session`'s record, then dispatch it. The caller
+/// holds the clone's lock.
 pub fn request_in_session(
     log: &Path,
+    state: &Path,
     session: &str,
     gate: &Gate,
     request: &Request,
@@ -429,92 +574,47 @@ pub fn request_in_session(
     let written = sessions::Store::open(log)
         .and_then(|store| store.update(session, |s| s.validations.push(validation)));
     match written {
-        Ok(Some(_)) => dispatch_recorded(log, session, gate, request, caps),
+        Ok(Some(_)) => dispatch_recorded(log, state, session, gate, request, caps),
         Ok(None) => Asked::NotRecorded(format!("session {session} is not in the session log")),
         Err(error) => Asked::NotRecorded(error.to_string()),
     }
 }
 
-/// At leaving: a commit this session saw land on `gate`'s observed branch,
-/// which the branch still sits at. sykli is asked what applies to it; with
-/// no current receipt of its tree and no run of it, an integrated
-/// validation is recorded in the session, then dispatched. The line to say.
-pub fn at_landing(
-    log: &Path,
-    state: &Path,
-    session: &str,
-    gate: &Gate,
-    commit: &str,
-    recorded: &[ValidationRef],
-    caps: &Caps,
-) -> String {
-    let onto = format!("origin/{}", gate.branch);
-    let said = ask(gate, caps, commit);
-    let head = format!(
-        "{}: {} on {onto}",
-        standing(ValidationKind::Integrated, &said),
-        short(commit)
-    );
-    if said != Said::None {
-        return format!("{head} ({})", said.why());
-    }
-    if let Some(asked) = standing_request(recorded, commit) {
-        return format!(
-            "{head} has no current sykli receipt{}",
-            asked_already(asked)
-        );
-    }
-    if !caps.detach {
-        return format!(
-            "{head} has no current sykli receipt; this sykli cannot run it detached (no `sykli \
-             run --detach`), so no run was asked for"
-        );
-    }
-    let tree = match tree_of(&gate.top, commit) {
-        Ok(tree) => tree,
-        Err(why) => {
-            return format!("{head} has no current sykli receipt; its tree cannot be read ({why})")
-        }
-    };
-    let request = plan(gate, commit, &tree, state);
-    match request_in_session(log, session, gate, &request, caps) {
-        Asked::Recorded {
-            request,
-            run: Ok(run),
-        } => format!(
-            "{head} has no current sykli receipt; ohjaa asked sykli to validate it (request \
-             {request}, sykli run {run}, in {})",
-            checkout_for(state, &gate.common, commit).display()
-        ),
-        Asked::Recorded {
-            request,
-            run: Err(why),
-        } => format!(
-            "{head} has no current sykli receipt; ohjaa recorded request {request}, and could \
-             not hand it to sykli: {why}"
-        ),
-        Asked::NotRecorded(why) => format!(
-            "{head} has no current sykli receipt; no run was asked for, since the request could \
-             not be recorded first ({why})"
-        ),
-    }
+/// Why a request was recorded and never handed to sykli, when nothing
+/// says otherwise: its ohjaa stopped in between.
+pub const STOPPED: &str = "ohjaa stopped before asking sykli";
+/// What a request recorded and never handed to sykli is.
+pub const NEVER_DISPATCHED: &str =
+    "requested, never dispatched (ohjaa stopped before asking sykli)";
+
+/// An integrated validation a session recorded, with the session.
+#[derive(Debug, Clone)]
+pub struct Requested {
+    pub session: String,
+    pub started_ms: i64,
+    /// The session's record is closed (it left, or was closed as orphaned).
+    pub ended: bool,
+    pub validation: ValidationRef,
 }
 
-/// A commit's tree: one git process.
-fn tree_of(top: &Path, commit: &str) -> Result<String, String> {
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(top)
-        .args(["rev-parse", "--verify", "-q", &format!("{commit}^{{tree}}")]);
-    for var in gitconfig::REPO_ENV {
-        command.env_remove(var);
+/// The integrated validations recorded in the clone whose common git dir is
+/// `common`, from every session in the log.
+pub fn requested_in(all: &[sessions::Session], common: &Path) -> Vec<Requested> {
+    let common = canonical(common).to_string_lossy().into_owned();
+    let mut out = Vec::new();
+    for session in all {
+        for validation in session.validations.iter().filter(|v| {
+            v.kind == ValidationKind::Integrated && v.common.as_deref() == Some(common.as_str())
+        }) {
+            out.push(Requested {
+                session: session.id.clone(),
+                started_ms: session.started_ms,
+                ended: session.left.is_some(),
+                validation: validation.clone(),
+            });
+        }
     }
-    match process::run(&mut command, None, process::LOCAL) {
-        Ok(output) if output.status.success() => Ok(output.stdout_text().trim().to_owned()),
-        Ok(output) => Err(output.failure_detail()),
-        Err(error) => Err(format!("{error:#}")),
-    }
+    out
 }
 
 /// How long a request stands before sykli is asked for another run of the
@@ -522,19 +622,36 @@ fn tree_of(top: &Path, commit: &str) -> Result<String, String> {
 /// was lost or interrupted ends with none).
 const ASK_AGAIN_AFTER_MS: i64 = 10 * 60_000;
 
-/// A request for `commit` made recently enough to stand: sykli is not asked
-/// for another run while it does (one that could not be handed over too:
-/// tried again at most once in [`ASK_AGAIN_AFTER_MS`]).
-fn standing_request<'a>(requested: &'a [ValidationRef], commit: &str) -> Option<&'a ValidationRef> {
-    let now = now_ms();
-    requested
+/// What stands of the requests for a commit: its newest one.
+#[derive(Debug, Clone)]
+enum Stands<'a> {
+    /// Handed to sykli (a run id) in the last ten minutes: not asked again.
+    Asked(&'a Requested),
+    /// Recorded, and could not be handed to sykli, in the last ten minutes:
+    /// tried again at most that often.
+    Failed(&'a Requested),
+    /// Recorded, and nothing since: never handed to sykli unless the ohjaa
+    /// that recorded it is handing it over now. Under the clone's lock that
+    /// cannot be, and it is asked again at once, however old.
+    Unconfirmed(&'a Requested),
+    Nothing,
+}
+
+fn stands<'a>(requested: &'a [Requested], commit: &str, now: i64) -> Stands<'a> {
+    let Some(newest) = requested
         .iter()
-        .filter(|v| {
-            v.kind == ValidationKind::Integrated
-                && v.commit == commit
-                && now - v.requested_ms < ASK_AGAIN_AFTER_MS
-        })
-        .max_by_key(|v| v.requested_ms)
+        .filter(|r| r.validation.commit == commit)
+        .max_by_key(|r| r.validation.requested_ms)
+    else {
+        return Stands::Nothing;
+    };
+    let fresh = now - newest.validation.requested_ms < ASK_AGAIN_AFTER_MS;
+    match (&newest.validation.run, &newest.validation.not_dispatched) {
+        (Some(_), _) if fresh => Stands::Asked(newest),
+        (None, Some(_)) if fresh => Stands::Failed(newest),
+        (None, None) => Stands::Unconfirmed(newest),
+        _ => Stands::Nothing,
+    }
 }
 
 /// `; ohjaa asked sykli to validate it at <time> (request …, sykli run …):
@@ -553,6 +670,239 @@ fn asked_already(validation: &ValidationRef) -> String {
     )
 }
 
+/// The words for a request recorded and never confirmed handed to sykli,
+/// seen without the clone's lock: never dispatched, unless the session that
+/// recorded it is live and its ohjaa still runs (handing it over now).
+fn unconfirmed(requested: &Requested) -> String {
+    let handing = !requested.ended
+        && sessions::pid_of(&requested.session)
+            .is_some_and(|pid| process::ohjaa_alive(pid, requested.started_ms) != Some(false));
+    if handing {
+        format!(
+            "; request {} was recorded at {} by session {}, whose ohjaa is handing it to sykli now",
+            requested.validation.request,
+            sessions::clock(requested.validation.requested_ms),
+            requested.session
+        )
+    } else {
+        format!(
+            "; request {} was recorded at {} by session {}: {NEVER_DISPATCHED}; the next launch \
+             asks again",
+            requested.validation.request,
+            sessions::clock(requested.validation.requested_ms),
+            requested.session
+        )
+    }
+}
+
+/// What a run already in the clone's checkout leaves for the next one.
+enum Previous {
+    /// Nothing runs there: the checkout may be reset.
+    Free(Option<String>),
+    /// sykli says a run there is requested or running: `(run, commit)`.
+    Busy(String, String),
+}
+
+/// Before the checkout is reset for another run: the newest run handed to
+/// sykli there. Running: the checkout is busy, and nothing is reset under
+/// it. Done: its receipt (which lives in the checkout's `.sykli/`, kept
+/// across resets, until sykli prunes it) is copied into ohjaa's state,
+/// `<clone>/receipts/<request>.json`, and recorded with its digest in that
+/// request's `ValidationRef`, so no evidence goes with a checkout. One
+/// `sykli status --run`, only while a run there has no receipt recorded.
+fn previous_run(log: &Path, clone: &CloneDir, requested: &[Requested], caps: &Caps) -> Previous {
+    let checkout = clone.checkout().to_string_lossy().into_owned();
+    let Some(last) = requested
+        .iter()
+        .filter(|r| r.validation.repo == checkout && r.validation.run.is_some())
+        .max_by_key(|r| r.validation.requested_ms)
+    else {
+        return Previous::Free(None);
+    };
+    let run = last.validation.run.clone().unwrap_or_default();
+    if last.validation.receipt.is_some() || !caps.status.runs {
+        return Previous::Free(None);
+    }
+    let common = last.validation.common.as_deref().map(Path::new);
+    let status = match lifecycle::sykli_run_status(&clone.checkout(), common, caps.status, &run) {
+        Ok(status) => status,
+        Err(why) => {
+            return Previous::Free(Some(format!(
+                "sykli could not say what became of run {run}, the last in it ({why})"
+            )))
+        }
+    };
+    if matches!(status["state"].as_str(), Some("requested" | "running")) {
+        return Previous::Busy(run, last.validation.commit.clone());
+    }
+    let Some(receipt) = lifecycle::receipt_of_status(&status, &clone.checkout()) else {
+        return Previous::Free(None);
+    };
+    let kept = clone
+        .receipts()
+        .join(format!("{}.json", last.validation.request));
+    let copied = std::fs::create_dir_all(clone.receipts())
+        .and_then(|()| std::fs::copy(&receipt.path, &kept));
+    let (path, said) = match copied {
+        Ok(_) => (kept.to_string_lossy().into_owned(), None),
+        Err(error) => (
+            receipt.path.clone(),
+            Some(format!(
+                "the receipt of run {run} could not be copied into ohjaa's state ({error})"
+            )),
+        ),
+    };
+    let ran = lifecycle::ran_of_status(&status);
+    let digest = receipt.digest.clone();
+    fill(log, &last.session, &last.validation.request, |validation| {
+        validation.receipt = Some(ReceiptRef { path, digest });
+        if validation.ran.is_none() {
+            validation.ran = ran;
+        }
+    });
+    Previous::Free(said)
+}
+
+/// What a launch or a leaving does about an unverified commit (sykli has
+/// no current receipt of its tree, and can run one detached).
+enum Decided {
+    /// Not asked now: the words why.
+    Not(String),
+    /// Asked: the request to record, then dispatch, holding the lock until
+    /// it is handed over; and the words.
+    Ask(Box<Request>, FileLock, String),
+}
+
+/// Under the clone's lock, with the log read again (another ohjaa may have
+/// asked while this one waited): a request of the commit that stands is
+/// said, never repeated; one recorded and never dispatched is asked again
+/// at once; a checkout busy with a run is not reset under it.
+fn decide(log: &Path, state: &Path, gate: &Gate, commit: &str, tree: &str, caps: &Caps) -> Decided {
+    let clone = CloneDir::of(state, &gate.common);
+    let lock = match clone.lock() {
+        Ok(lock) => lock,
+        Err(why) => {
+            return Decided::Not(format!(
+                "; not asked: another ohjaa is asking sykli to validate this clone now ({why})"
+            ))
+        }
+    };
+    let all = match sessions::Reader::open(log).and_then(|reader| reader.all()) {
+        Ok((all, _)) => all,
+        Err(error) => {
+            return Decided::Not(format!(
+                "; not asked: the session log cannot be read, so no request can be recorded \
+                 first ({error})"
+            ))
+        }
+    };
+    let requested = requested_in(&all, &gate.common);
+    let mut said = String::new();
+    let mut supersedes = None;
+    match stands(&requested, commit, now_ms()) {
+        Stands::Asked(r) | Stands::Failed(r) => {
+            return Decided::Not(asked_already(&r.validation));
+        }
+        Stands::Unconfirmed(r) => {
+            said = format!(
+                "; request {} was recorded at {} by session {}: {NEVER_DISPATCHED}",
+                r.validation.request,
+                sessions::clock(r.validation.requested_ms),
+                r.session
+            );
+            supersedes = Some((r.session.clone(), r.validation.request.clone()));
+        }
+        Stands::Nothing => {}
+    }
+    match previous_run(log, &clone, &requested, caps) {
+        Previous::Busy(run, of) => {
+            return Decided::Not(format!(
+                "{said}; the validation checkout is busy with sykli run {run} (of {}), so none \
+                 is asked for now: a later launch asks",
+                short(&of)
+            ))
+        }
+        Previous::Free(Some(note)) => said.push_str(&format!("; {note}")),
+        Previous::Free(None) => {}
+    }
+    let mut request = plan(gate, commit, tree, state);
+    request.supersedes = supersedes;
+    Decided::Ask(Box::new(request), lock, said)
+}
+
+/// At leaving: a commit this session saw land on `gate`'s observed branch,
+/// which the branch still sits at. sykli is asked what applies to it; with
+/// no current receipt of its tree and no request of it standing, an
+/// integrated validation is recorded in the session, then dispatched, under
+/// the clone's lock. The line to say.
+pub fn at_landing(
+    log: &Path,
+    state: &Path,
+    session: &str,
+    gate: &Gate,
+    commit: &str,
+    caps: &Caps,
+) -> String {
+    let onto = format!("origin/{}", gate.branch);
+    let said = ask(gate, caps, commit);
+    let head = format!(
+        "{}: {} on {onto}",
+        standing(ValidationKind::Integrated, &said),
+        short(commit)
+    );
+    if said != Said::None {
+        return format!("{head} ({})", said.why());
+    }
+    if !caps.detach {
+        return format!(
+            "{head} has no current sykli receipt; this sykli cannot run it detached (no `sykli \
+             run --detach`), so no run was asked for"
+        );
+    }
+    let tree = match tree_of(&gate.top, commit) {
+        Ok(tree) => tree,
+        Err(why) => {
+            return format!("{head} has no current sykli receipt; its tree cannot be read ({why})")
+        }
+    };
+    let (request, lock, words) = match decide(log, state, gate, commit, &tree, caps) {
+        Decided::Not(words) => return format!("{head} has no current sykli receipt{words}"),
+        Decided::Ask(request, lock, words) => (request, lock, words),
+    };
+    let line = match request_in_session(log, state, session, gate, &request, caps) {
+        Asked::Recorded {
+            request: id,
+            run: Ok(run),
+        } => format!(
+            "{head} has no current sykli receipt{words}; ohjaa asked sykli to validate it \
+             (request {id}, sykli run {run}, in {})",
+            request.checkout.display()
+        ),
+        Asked::Recorded {
+            request: id,
+            run: Err(why),
+        } => format!(
+            "{head} has no current sykli receipt{words}; ohjaa recorded request {id}, and could \
+             not hand it to sykli: {why}"
+        ),
+        Asked::NotRecorded(why) => format!(
+            "{head} has no current sykli receipt{words}; no run was asked for, since the request \
+             could not be recorded first ({why})"
+        ),
+    };
+    drop(lock);
+    line
+}
+
+/// A commit's tree: one git process.
+fn tree_of(top: &Path, commit: &str) -> Result<String, String> {
+    git_ok_in(
+        top,
+        &["rev-parse", "--verify", "-q", &format!("{commit}^{{tree}}")],
+    )
+    .map(|tree| tree.trim().to_owned())
+}
+
 /// How a launch-time view is used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -565,11 +915,14 @@ pub enum Mode {
 }
 
 /// The validation lines of a briefing, and the request a launch records
-/// with its session, then dispatches.
+/// with its session, then dispatches, holding the clone's lock until then.
 #[derive(Debug, Default)]
 pub struct AtLaunch {
     pub lines: Vec<String>,
     pub request: Option<Request>,
+    /// The clone's lock, held from deciding to ask to the dispatch: drop it
+    /// once the request is handed over (or cannot be recorded).
+    pub lock: Option<FileLock>,
 }
 
 impl AtLaunch {
@@ -593,16 +946,19 @@ impl AtLaunch {
 
 /// What sykli says of the observed branch's tip (the integrated State) and
 /// of HEAD here when it is not the tip (a candidate), and whether HEAD was
-/// validated on a base the branch has moved from since (`candidates`: the
-/// validations this clone's sessions recorded). In `Mode::Launch`, a tip
-/// with no current receipt and no run of it gets a request (not yet
-/// recorded: the caller records it with the session, then dispatches).
+/// validated on a base the branch has moved from since (`all`: the log's
+/// sessions, read by the caller). In `Mode::Launch`, a tip with no current
+/// receipt and no request of it standing gets a request, decided under the
+/// clone's lock with the log (`log`) read again (not yet recorded: the
+/// caller records it with the session, then dispatches, then drops the
+/// lock).
 pub fn at_launch(
     marks: &Marks,
     head: Option<(&str, Option<&str>)>,
-    recorded: &[ValidationRef],
+    all: &[sessions::Session],
     mode: Mode,
     state: &Path,
+    log: &Path,
     caps: &Caps,
 ) -> AtLaunch {
     let mut view = AtLaunch::default();
@@ -623,28 +979,37 @@ pub fn at_launch(
         short(&tip.commit),
         said.why()
     );
-    let asked = standing_request(recorded, &tip.commit);
     if said == Said::None {
-        match mode {
-            _ if asked.is_some() => {
-                line.push_str(&asked_already(asked.expect("checked")));
+        let requested = requested_in(all, &gate.common);
+        match (mode, caps.detach) {
+            (Mode::Launch, true) => {
+                match decide(log, state, gate, &tip.commit, &tip.tree, caps) {
+                    Decided::Not(words) => line.push_str(&words),
+                    Decided::Ask(request, lock, words) => {
+                        line.push_str(&format!(
+                            "{words}; ohjaa asks sykli to validate it: request {}, recorded in \
+                             this session before sykli is asked",
+                            request.validation.request
+                        ));
+                        view.request = Some(*request);
+                        view.lock = Some(lock);
+                    }
+                }
             }
-            Mode::Launch if caps.detach => {
-                let request = plan(gate, &tip.commit, &tip.tree, state);
-                line.push_str(&format!(
-                    "; ohjaa asks sykli to validate it: request {}, recorded in this session \
-                     before sykli is asked",
-                    request.validation.request
-                ));
-                view.request = Some(request);
-            }
-            Mode::DryRun if caps.detach => {
-                line.push_str("; would ask sykli to validate it (a dry run asks for nothing)")
-            }
-            Mode::Launch | Mode::DryRun => line.push_str(
+            (Mode::Launch | Mode::DryRun, false) => line.push_str(
                 "; this sykli cannot run it detached (no `sykli run --detach`), so no run is asked for",
             ),
-            Mode::Brief => {}
+            (Mode::DryRun | Mode::Brief, _) => {
+                match stands(&requested, &tip.commit, now_ms()) {
+                    Stands::Asked(r) | Stands::Failed(r) => {
+                        line.push_str(&asked_already(&r.validation))
+                    }
+                    Stands::Unconfirmed(r) => line.push_str(&unconfirmed(r)),
+                    Stands::Nothing if mode == Mode::DryRun => line
+                        .push_str("; would ask sykli to validate it (a dry run asks for nothing)"),
+                    Stands::Nothing => {}
+                }
+            }
         }
     }
     view.lines.push(line);
@@ -666,7 +1031,12 @@ pub fn at_launch(
         short(head),
         candidate.why()
     ));
-    if let Some(line) = stale_base(recorded, head, &gate.branch, &tip.commit) {
+    if let Some(line) = stale_base(
+        &recorded_in(all, &gate.common),
+        head,
+        &gate.branch,
+        &tip.commit,
+    ) {
         view.lines
             .push(format!("base moved since validation: HEAD {line}"));
     }
@@ -829,19 +1199,77 @@ mod tests {
         );
     }
 
+    /// One rolling checkout per clone, whatever the commit: its folder
+    /// holds the checkout, cargo's config and target dir beside it (never
+    /// in it), the receipts kept, and the lock.
     #[test]
-    fn a_clone_has_one_folder_of_validation_checkouts() {
+    fn a_clone_has_one_folder_and_one_rolling_checkout() {
         let state = Path::new("/s");
-        let a = checkout_for(state, Path::new("/nowhere/widget/.git"), "c1");
-        let b = checkout_for(state, Path::new("/nowhere/widget/.git"), "c2");
-        let other = checkout_for(state, Path::new("/elsewhere/widget/.git"), "c1");
-        assert_eq!(a.parent(), b.parent());
-        assert_ne!(a.parent(), other.parent());
+        let a = CloneDir::of(state, Path::new("/nowhere/widget/.git"));
+        let again = CloneDir::of(state, Path::new("/nowhere/widget/.git"));
+        let other = CloneDir::of(state, Path::new("/elsewhere/widget/.git"));
+        assert_eq!(a, again);
+        assert_ne!(a, other);
         assert!(
-            a.to_string_lossy().starts_with("/s/integrated/widget-"),
+            a.dir.to_string_lossy().starts_with("/s/integrated/widget-"),
             "{}",
-            a.display()
+            a.dir.display()
         );
-        assert!(a.ends_with("c1"));
+        assert_eq!(a.checkout(), a.dir.join("checkout"));
+        assert_eq!(a.cargo_config(), a.dir.join(".cargo/config.toml"));
+        assert_eq!(a.target(), a.dir.join("target"));
+        assert!(!a.cargo_config().starts_with(a.checkout()));
+        let gate = Gate {
+            slug: "acme/widget".to_owned(),
+            branch: "main".to_owned(),
+            contract: PathBuf::from("/h/sykli.json"),
+            top: PathBuf::from("/nowhere/widget"),
+            common: PathBuf::from("/nowhere/widget/.git"),
+        };
+        let one = plan(&gate, "c1", "t1", state);
+        let two = plan(&gate, "c2", "t2", state);
+        assert_eq!(one.checkout, two.checkout, "one checkout, rolled");
+        assert_eq!(one.validation.repo, a.checkout().to_string_lossy());
+    }
+
+    fn requested(commit: &str, at: i64, run: Option<&str>, not: Option<&str>) -> Requested {
+        let mut validation = candidate(commit, "b", at);
+        validation.kind = ValidationKind::Integrated;
+        validation.run = run.map(str::to_owned);
+        validation.not_dispatched = not.map(str::to_owned);
+        Requested {
+            session: "oh-1-1".to_owned(),
+            started_ms: 0,
+            ended: true,
+            validation,
+        }
+    }
+
+    /// The newest request of a commit decides: handed to sykli, or failed
+    /// to be, stands ten minutes; recorded and never confirmed handed over
+    /// stands never (under the lock it was never dispatched).
+    #[test]
+    fn a_request_never_dispatched_is_asked_again_at_once() {
+        let now = 100 * 60_000;
+        let asked = [requested("c1", now - 60_000, Some("run-1"), None)];
+        assert!(matches!(stands(&asked, "c1", now), Stands::Asked(_)));
+        assert!(matches!(stands(&asked, "c2", now), Stands::Nothing));
+        let old = [requested("c1", now - 11 * 60_000, Some("run-1"), None)];
+        assert!(matches!(stands(&old, "c1", now), Stands::Nothing));
+        let failed = [requested("c1", now - 60_000, None, Some("no checkout"))];
+        assert!(matches!(stands(&failed, "c1", now), Stands::Failed(_)));
+        let lost = [
+            requested("c1", now - 120_000, Some("run-0"), None),
+            requested("c1", now - 60_000, None, None),
+        ];
+        assert!(matches!(stands(&lost, "c1", now), Stands::Unconfirmed(_)));
+        let ancient = [requested("c1", now - 99 * 60_000, None, None)];
+        assert!(matches!(
+            stands(&ancient, "c1", now),
+            Stands::Unconfirmed(_)
+        ));
+        // Seen without the lock, from a session that ended: never dispatched.
+        let said = unconfirmed(&ancient[0]);
+        assert!(said.contains(NEVER_DISPATCHED), "{said}");
     }
 }
