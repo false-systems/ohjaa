@@ -250,8 +250,10 @@ pub fn supervise() {
 /// its group, and there is nothing to hand over.
 #[cfg(unix)]
 mod terminal {
+    use std::io::Write as _;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::Mutex;
 
     /// No terminal; the terminal, with job control above; the terminal,
     /// without.
@@ -261,8 +263,33 @@ mod terminal {
     const SHARED: i32 = 3;
 
     static MODE: AtomicI32 = AtomicI32::new(NO_TERMINAL);
-    /// `/dev/tty`, opened for as long as the session runs in JOB or LEADER.
+    /// The controlling terminal, not stdout (which may be redirected).
     static TTY: AtomicI32 = AtomicI32::new(-1);
+    /// Saved only when the session first gets the foreground terminal. A
+    /// background launch must not save the shell's active line-editor modes.
+    static SETTINGS: Mutex<Option<libc::termios>> = Mutex::new(None);
+
+    fn remember(fd: libc::c_int) {
+        let mut saved = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+        if saved.is_some() {
+            return;
+        }
+        let mut settings = std::mem::MaybeUninit::uninit();
+        // SAFETY: tcgetattr initializes settings on success.
+        if unsafe { libc::tcgetattr(fd, settings.as_mut_ptr()) } == 0 {
+            *saved = Some(unsafe { settings.assume_init() });
+        } else {
+            eprintln!(
+                "ohjaa: cannot save terminal settings: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    /// Modes a terminal agent may leave enabled when it cannot run its own
+    /// cleanup. These go to /dev/tty only, never into redirected logs. Do not
+    /// clear scrollback or consume pending input to recover the terminal.
+    const RESET_REPORTING: &[u8] = b"\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[=0u\x1b[>4;0m\x1b[?2026l\x1b[?25h";
 
     /// Make the terminal's foreground group `pgid`. From a background group
     /// the call raises SIGTTOU, which is ignored for its length, as shells
@@ -325,10 +352,9 @@ mod terminal {
             } else {
                 SHARED
             };
-            if mode == SHARED {
-                libc::close(fd);
-            } else {
-                TTY.store(fd, Ordering::SeqCst);
+            TTY.store(fd, Ordering::SeqCst);
+            if foreground(fd) {
+                remember(fd);
             }
             mode
         }
@@ -484,6 +510,7 @@ mod terminal {
             libc::setpgid(child, child);
         }
         if let Some(fd) = tty().filter(|&fd| foreground(fd)) {
+            remember(fd);
             give(fd, child);
         }
     }
@@ -513,6 +540,7 @@ mod terminal {
         }
         if let Some(fd) = tty() {
             if foreground(fd) {
+                remember(fd);
                 give(fd, child);
                 // SAFETY: continuing our own child's group.
                 unsafe {
@@ -572,6 +600,7 @@ mod terminal {
     /// terminal when ohjaa is in the foreground.
     pub fn resume(child: libc::pid_t) {
         if let Some(fd) = tty().filter(|&fd| foreground(fd)) {
+            remember(fd);
             give(fd, child);
         }
         // SAFETY: continuing our own child's group.
@@ -580,13 +609,27 @@ mod terminal {
         }
     }
 
-    /// The session is over: the terminal is closed again.
+    /// The session is over: recover modes before the leaving record is
+    /// printed, but never change a terminal another foreground job now owns.
     pub fn done() {
         let fd = TTY.swap(-1, Ordering::SeqCst);
         if fd >= 0 {
-            // SAFETY: our own descriptor, no longer used.
-            unsafe {
-                libc::close(fd);
+            let saved = SETTINGS.lock().unwrap_or_else(|e| e.into_inner()).take();
+            // SAFETY: the descriptor was ours and has just been removed from
+            // TTY. File closes it even if restoring settings or writing fails.
+            let mut terminal = unsafe { std::fs::File::from_raw_fd(fd) };
+            if let Some(saved) = saved.filter(|_| foreground(fd)) {
+                // SAFETY: initialized settings from this same terminal.
+                // TCSANOW neither discards input nor waits for output to drain.
+                if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) } != 0 {
+                    eprintln!(
+                        "ohjaa: cannot restore terminal settings: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                if let Err(error) = terminal.write_all(RESET_REPORTING) {
+                    eprintln!("ohjaa: cannot reset terminal reporting: {error}");
+                }
             }
         }
     }
@@ -629,7 +672,11 @@ pub fn group_started(group: Group, child: Option<&Child>) -> Option<(u32, i64)> 
     #[cfg(unix)]
     {
         let recorded = group.handshake.and_then(terminal::Handshake::finish);
-        let child = child?;
+        let Some(child) = child else {
+            terminal::take_back(0);
+            terminal::done();
+            return None;
+        };
         let pid = libc::pid_t::try_from(child.id()).ok()?;
         terminal::spawned(pid);
         terminal::group(pid)?;

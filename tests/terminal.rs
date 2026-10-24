@@ -13,7 +13,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -383,6 +383,118 @@ impl Drop for Terminal {
 }
 
 const OHJAA_RUN: &str = "ohjaa run agent --intent tty --no-briefing";
+
+/// A Rust agent fixture, run only in a child copy of this test executable.
+/// It deliberately omits the cleanup an agent killed in raw mode cannot do.
+#[test]
+fn terminal_mode_agent() {
+    let Some(end) = std::env::var_os("OHJAA_TERMINAL_MODE_AGENT") else {
+        return;
+    };
+    fs::write(
+        std::env::var_os("AGENT_LOG").unwrap(),
+        format!("AGENT-START {} {}\n", std::process::id(), unsafe {
+            libc::getppid()
+        }),
+    )
+    .unwrap();
+    let mut terminal = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .unwrap();
+    let fd = terminal.as_raw_fd();
+    // SAFETY: this fixture has its own controlling pseudo-terminal.
+    let mut settings = unsafe { std::mem::zeroed::<libc::termios>() };
+    assert_eq!(unsafe { libc::tcgetattr(fd, &mut settings) }, 0);
+    assert_ne!(settings.c_oflag & libc::OPOST, 0);
+    unsafe {
+        libc::cfmakeraw(&mut settings);
+        assert_eq!(libc::tcsetattr(fd, libc::TCSANOW, &settings), 0);
+    }
+    terminal
+        .write_all(b"\x1b[?1003h\x1b[?1004h\x1b[>1uAGENT-RAW\n")
+        .unwrap();
+    terminal.flush().unwrap();
+    if end == "kill" {
+        // SAFETY: only this disposable fixture process is killed.
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        unreachable!();
+    }
+    std::process::exit(0);
+}
+
+fn reporting_enabled(output: &str, mode: &str) -> bool {
+    let on = output.rfind(&format!("\x1b[?{mode}h"));
+    let off = output.rfind(&format!("\x1b[?{mode}l"));
+    on.is_some() && on > off
+}
+
+fn terminal_modes_are_restored(end: &str, redirected: bool) {
+    let Some(mut tty) = Terminal::new(&format!("modes-{end}")) else {
+        return;
+    };
+    let executable = std::env::current_exe().unwrap();
+    let executable = executable.to_str().unwrap().replace('\'', "'\\''");
+    let redirect = if redirected {
+        " >agent-output 2>&1"
+    } else {
+        ""
+    };
+    tty.type_line(&format!(
+        "OHJAA_TERMINAL_MODE_AGENT={end} ohjaa run '{executable}' --intent tty --no-briefing -- --exact terminal_mode_agent --nocapture{redirect}; echo MODE-EXIT-$?"
+    ));
+    assert!(tty.expect("AGENT-RAW", 15), "{}", tty.report());
+    let code = if end == "kill" { 137 } else { 0 };
+    assert!(
+        tty.expect(&format!("MODE-EXIT-{code}"), 20),
+        "{}",
+        tty.report()
+    );
+    let output = tty.all();
+    let record = if redirected {
+        fs::read_to_string(tty.dir.join("work/agent-output")).unwrap()
+    } else {
+        output.clone()
+    };
+    assert!(record.contains("ohjaa: recorded; queued"), "{record}");
+    assert!(
+        !record.contains("\x1b[?1003l") || !redirected,
+        "terminal cleanup leaked into redirected output: {record}"
+    );
+    let before_record = output.split("\nsession oh-").next().unwrap();
+    assert!(
+        !reporting_enabled(before_record, "1003") && !reporting_enabled(before_record, "1004"),
+        "session reporting modes survived into the exit record: {}",
+        tty.report()
+    );
+    assert!(
+        output.rfind("\x1b[=0u") > output.rfind("\x1b[>1u"),
+        "extended keyboard reporting survived: {}",
+        tty.report()
+    );
+    assert!(
+        redirected || output.contains("\r\nsession oh-"),
+        "raw output modes survived into the exit record: {}",
+        tty.report()
+    );
+    assert!(tty.shell_answers(10), "{}", tty.report());
+}
+
+#[test]
+fn a_killed_session_restores_terminal_modes_before_the_exit_record() {
+    terminal_modes_are_restored("kill", false);
+}
+
+#[test]
+fn a_successful_session_cannot_leave_terminal_reporting_enabled() {
+    terminal_modes_are_restored("exit", false);
+}
+
+#[test]
+fn terminal_recovery_does_not_put_escape_codes_in_redirected_output() {
+    terminal_modes_are_restored("kill", true);
+}
 
 /// The control: in the foreground the agent reads the terminal, and Ctrl-C
 /// reaches it; the shell has its terminal back after.
