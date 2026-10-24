@@ -409,6 +409,13 @@ job-control shell does with a job's, at every moment, not only at the start:
   of these signals cuts leaving short (the tools still running are killed)
   and the record is still written, with what was known by then; the normal
   dispositions come back once it is saved.
+- **Before printing the exit record**, ohjaa restores the terminal settings
+  saved before the session first got the foreground, and disables mouse,
+  focus and extended-keyboard reporting left behind by an agent that did not
+  clean up. This also runs when the session was killed but ohjaa survived.
+  Recovery uses the controlling terminal, not redirected output, and never
+  clears scrollback, discards input or changes a terminal another foreground
+  job now owns.
 - **SIGKILL** cannot be caught: it loses the leaving. The session's group
   outlives it, and the next launch says whether it still runs (above).
 
