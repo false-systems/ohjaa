@@ -111,7 +111,7 @@ pub struct Walked {
     /// how many tasks it records, and how many it reused from the cache.
     pub proof: Option<sessions::Evidence>,
     /// For a proven commit, the contract that receipt ran under: the gate
-    /// derived from the commit, its own `sykli.json`, or the entry's copy.
+    /// derived from the commit, or its own `sykli.json`.
     pub under: Option<Under>,
 }
 

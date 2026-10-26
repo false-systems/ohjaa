@@ -1201,8 +1201,9 @@ pub fn to_json(report: &Report) -> Value {
                     "cached": walked.proof.as_ref().map(|proof| proof.cached),
                     // Additive (G1a): for a proven commit, the contract that
                     // receipt ran under: the gate derived from the commit
-                    // ("derived"), its own sykli.json ("own"), or the entry's
-                    // stored copy ("stored").
+                    // ("derived": from its own sykli.json, or what sykli init
+                    // writes for its tree), or its own sykli.json ("own").
+                    // "stored", an entry's copy, is no longer given.
                     "contract": walked.under.map(crate::derived::Under::word),
                     "author": walked.author,
                     "authored": rfc(walked.authored * 1000),

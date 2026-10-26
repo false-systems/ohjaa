@@ -445,9 +445,7 @@ fn observe(args: &[OsString], here: &Here) -> Observed {
     );
     let contract = match judge.gate_at(&gate, &sha) {
         Err(why) => Err(format!("its gate cannot be read: {why}")),
-        Ok(crate::derived::GateAt::Missing(why)) => Err(format!(
-            "its entry has no gate: {why} (ohjaa adopt --force)"
-        )),
+        Ok(crate::derived::GateAt::Missing(why)) => Err(format!("it has no gate: {why}")),
         Ok(at) => at
             .contract(judge.gates(), false)
             .map_err(|why| format!("its gate cannot be written: {why}")),

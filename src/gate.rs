@@ -36,6 +36,9 @@ struct Gate {
     branch: Option<String>,
     /// For `--print`: the derived gate is not kept there yet.
     unwritten: bool,
+    /// Derived from what `sykli init` writes for HEAD's tree: its run proves
+    /// HEAD only as committed.
+    inferred: bool,
 }
 
 /// What git said of this checkout, in one `git cat-file --batch`: HEAD, its
@@ -49,18 +52,23 @@ struct Read {
 }
 
 /// The gate of the repository at `top`: for an entry origin's push URL
-/// names, the gate of what this checkout runs, derived from its own
-/// `sykli.json` and `sykli.lock` (else the entry's stored gate); else the
-/// repository's own `sykli.json`; with whose it is. Read from the checkout's
-/// files, no git process: when they are HEAD's, it is exactly HEAD's gate,
-/// and when they are edited, the gate of the commit they will be, so its
-/// receipt proves that commit (a receipt binds the contract it ran under,
-/// and every commit is judged by the gate derived from the commit). Kept in
-/// ohjaa's state for a run (`keep`), else in a folder of this process's own.
+/// names, the gate of what this checkout runs; else the repository's own
+/// `sykli.json`; with whose it is. A checkout with a `sykli.json` has the
+/// gate derived from it and the `sykli.lock` beside it, read as files, no
+/// git process: when they are HEAD's, it is exactly HEAD's gate, and when
+/// they are edited, the gate of the commit they will be, so its receipt
+/// proves that commit (a receipt binds the contract it ran under, and every
+/// commit is judged by the gate derived from the commit). A checkout with
+/// none has HEAD's gate, derived as every commit's is: from HEAD's own
+/// `sykli.json`, else from what `sykli init` writes for HEAD's tree (read
+/// through the checkout's one git process, and asked of sykli in a scratch
+/// checkout of the tree unless a run kept it). Kept in ohjaa's state for a
+/// run (`keep`), else in a folder of this process's own.
 fn gate_of(
     top: &Path,
     common: &Path,
     listing: &Listing,
+    objects: &mut Option<Objects>,
     (gates, keep): (&Gates, bool),
 ) -> Result<Option<Gate>> {
     let home = absolute(home::ohjaa_home()?);
@@ -71,15 +79,19 @@ fn gate_of(
         if let Some(entry) = home::find_entry(&home, &id)? {
             let whose = format!("the entry for {} (branch {})", id.slug(), entry.branch);
             let gate = crate::mark::gate_for_entry(&id, &entry, top, common);
-            let at = match checkout_own(top).map_err(|why| anyhow::anyhow!(why))? {
-                Some(own) => GateAt::Derived(crate::derived::derive(&own, &gate.overlay)),
-                None if entry.has_stored() => GateAt::Stored(entry.stored()),
-                None => GateAt::Missing(format!(
-                    "this checkout has no sykli.json, and no stored gate ({} is missing)",
-                    entry.stored().display()
-                )),
+            let (at, from) = match checkout_own(top).map_err(|why| anyhow::anyhow!(why))? {
+                Some(own) => {
+                    let at = GateAt::Derived(Box::new(crate::derived::derive(&own, &gate.overlay)));
+                    let from = at.describe("in this checkout");
+                    (at, from)
+                }
+                None => {
+                    let at = head_gate(top, common, &gate.overlay, objects, gates);
+                    let from = at.describe("at HEAD");
+                    (at, from)
+                }
             };
-            let from = at.describe("in this checkout");
+            let inferred = matches!(&at, GateAt::Derived(derived) if derived.inferred.is_some());
             let no_gate = |why: String| {
                 anyhow::anyhow!(
                     "{} has an entry but no gate in this checkout: {why}",
@@ -88,18 +100,20 @@ fn gate_of(
             };
             // `--print` writes nothing: it names where the run keeps the
             // gate, and says when it is not written yet.
-            let (contract, unwritten) = match (&at, keep) {
-                (GateAt::Derived(derived), false) => match gates.kept_at(derived) {
-                    Some((path, there)) => (path, !there),
-                    None => (at.contract(gates, false).map_err(no_gate)?, false),
-                },
-                _ => (at.contract(gates, keep).map_err(no_gate)?, false),
+            let kept = match (&at, keep) {
+                (GateAt::Derived(derived), false) => gates.kept_at(derived),
+                _ => None,
+            };
+            let (contract, unwritten) = match kept {
+                Some((path, there)) => (path, !there),
+                None => (at.contract(gates, keep).map_err(no_gate)?, false),
             };
             return Ok(Some(Gate {
                 contract,
                 whose: format!("{whose}: {from}"),
                 branch: Some(entry.branch.clone()),
                 unwritten,
+                inferred,
             }));
         }
     }
@@ -109,7 +123,31 @@ fn gate_of(
         whose: "the repository's own sykli.json (no entry)".to_owned(),
         branch: None,
         unwritten: false,
+        inferred: false,
     }))
+}
+
+/// HEAD's gate, for a checkout with no `sykli.json`: derived as every
+/// commit's is, from what HEAD holds, through the checkout's one git
+/// process.
+fn head_gate(
+    top: &Path,
+    common: &Path,
+    overlay: &crate::derived::Overlay,
+    objects: &mut Option<Objects>,
+    gates: &Gates,
+) -> GateAt {
+    let holds = match opened(objects, top).and_then(|objects| objects.holds_at("HEAD")) {
+        Ok(holds) => holds,
+        Err(why) => {
+            return GateAt::Missing(format!(
+                "this checkout has no sykli.json, and HEAD's contract cannot be read ({why})"
+            ))
+        }
+    };
+    GateAt::of(overlay, "HEAD", holds, |tree| {
+        gates.inferred(common, tree, Path::new("sykli"), process::LOCAL)
+    })
 }
 
 /// The checkout's own `sykli.json` and the `sykli.lock` beside it, as files;
@@ -390,7 +428,7 @@ pub fn gate_here(print_only: bool, wait: Duration) -> Result<i32> {
     // (HEAD, its tree and the branch's tip), in one process.
     let mut objects = None;
     let gates = Gates::of_state();
-    let Some(gate) = gate_of(&top, &common, &listing, (&gates, !print_only))? else {
+    let Some(gate) = gate_of(&top, &common, &listing, &mut objects, (&gates, !print_only))? else {
         eprintln!(
             "ohjaa gate: {} has no gate: origin names no entry (ohjaa adopt), and there is \
              no sykli.json in the repository",
@@ -427,6 +465,12 @@ pub fn gate_here(print_only: bool, wait: Duration) -> Result<i32> {
         contract.display(),
         gate.whose
     );
+    if gate.inferred {
+        println!(
+            "ohjaa gate: it declares what HEAD's tree tracks, so it proves HEAD as committed: \
+             commit first (a run of changes beside HEAD runs another tree)"
+        );
+    }
     if gate.unwritten {
         println!(
             "ohjaa gate: it is not written yet: `ohjaa gate` writes it there when it runs \

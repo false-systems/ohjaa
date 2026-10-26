@@ -2368,21 +2368,13 @@ pub struct Gate {
     /// `owner/name`.
     pub slug: String,
     pub branch: String,
-    /// The entry's folder: the gates derived for its commits (outside the
-    /// repository: `sykli verify` reads one, and the lock beside it, from
-    /// their files), and its stored copy, if it keeps one.
+    /// The entry's folder, which names it (the gates derived for its
+    /// commits are written outside it, see [`crate::derived::Gates`]).
     pub entry: PathBuf,
     /// What each cargo task of a derived gate is given.
     pub overlay: crate::derived::Overlay,
     pub top: PathBuf,
     pub common: PathBuf,
-}
-
-impl Gate {
-    /// The gate of `commit`, whose own files are `own`.
-    pub fn at(&self, commit: &str, own: Option<crate::derived::Own>) -> crate::derived::GateAt {
-        crate::derived::GateAt::of(&self.entry, &self.overlay, commit, own)
-    }
 }
 
 /// How a sykli's `verify --commit` gives its verdict, from the flags
@@ -2555,8 +2547,7 @@ impl Sykli {
     }
 
     /// Which contract proved `commit`, once sykli verified a receipt of it
-    /// here: the gate derived from it, its own `sykli.json`, or the entry's
-    /// stored copy.
+    /// here: the gate derived from it, or its own `sykli.json`.
     pub fn proved_under(&self, commit: &str) -> Option<crate::derived::Under> {
         self.proved_under.borrow().get(commit).copied()
     }
@@ -2599,16 +2590,22 @@ impl Sykli {
         self.ask_objects(&gate.common, |objects| objects.commit(name))
     }
 
-    /// The gate `commit` is judged by: derived from its own `sykli.json`,
-    /// else the entry's copy; read from the commit once, in the clone's one
-    /// git process.
+    /// The gate `commit` is judged by, derived from the commit: from its own
+    /// `sykli.json`, else from what `sykli init` writes for its tree (as a
+    /// run kept it, else asked of this sykli in a scratch checkout of the
+    /// tree, two git processes more); read from the commit once, in the
+    /// clone's one git process.
     pub fn gate_at(&self, gate: &Gate, commit: &str) -> Result<crate::derived::GateAt, String> {
         let key = (gate.entry.clone(), commit.to_owned());
         if let Some(known) = self.gate_at.borrow().get(&key) {
             return Ok(known.clone());
         }
-        let own = self.ask_objects(&gate.common, |objects| objects.own_at(commit))?;
-        let at = gate.at(commit, own);
+        let holds = self.ask_objects(&gate.common, |objects| objects.holds_at(commit))?;
+        let program = self.program.as_deref().unwrap_or(Path::new("sykli"));
+        let at = crate::derived::GateAt::of(&gate.overlay, commit, holds, |tree| {
+            self.derived
+                .inferred(&gate.common, tree, program, self.timeout())
+        });
         self.gate_at.borrow_mut().insert(key, at.clone());
         Ok(at)
     }
@@ -2830,7 +2827,7 @@ impl Sykli {
             let (contract, under) = match own {
                 Some(_) => (PathBuf::from("sykli.json"), crate::derived::Under::Own),
                 None => match written.get_or_insert_with(|| at.contract(&self.derived, false)) {
-                    Ok(path) => (path.clone(), at.under()),
+                    Ok(path) => (path.clone(), crate::derived::Under::Derived),
                     Err(why) => {
                         verdicts.push((
                             receipt.at,

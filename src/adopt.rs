@@ -1,7 +1,7 @@
 //! `ohjaa adopt`: write a repository's entry into the home (`repo.toml`: the
-//! branch and `[cargo_env]`; a stored gate only for a repository with no
-//! `sykli.json` of its own, every other commit's gate being derived from the
-//! commit) and regenerate the home's git config. It never touches git's
+//! branch and `[cargo_env]`; no copy of a gate, every commit's gate being
+//! derived from the commit: from its own `sykli.json`, else from what `sykli
+//! init` writes for its tree) and regenerate the home's git config. It never touches git's
 //! global config, and never writes into a repository (it takes no lock there
 //! either: no `git status`).
 
@@ -133,11 +133,11 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
         Overlay::default()
     };
     let created = !dir.exists();
-    let result = write_entry(&top, (&id, &dir, &branch), force, &overlay, none.as_deref());
+    let result = write_entry(&top, (&id, &dir, &branch), &overlay, none.as_deref());
     if result.is_err() && created {
         let _ = std::fs::remove_dir_all(&dir);
     }
-    let (source, stored) = result?;
+    let source = result?;
     println!("ohjaa adopt: {} -> {}", id, dir.display());
     println!("  branch = {branch:?} (repo.toml)");
     println!("  {source}");
@@ -153,9 +153,6 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
                 .join(" and ")
         ),
         Some(why) => println!("  [cargo_env] (repo.toml): none: {why}"),
-    }
-    if stored {
-        declare_worktree_cache(&top, &common, &dir, &expands);
     }
     // The home's git config now names this repository too; git's global
     // config is not touched (it includes the home's file once, from apply).
@@ -187,17 +184,18 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
 }
 
 /// Write `repo.toml` into `dir` (the branch, and `overlay` as its
-/// `[cargo_env]`, `none` saying why it is empty), and a stored gate only for
-/// a repository with no `sykli.json` of its own, as `origin/<branch>` holds
-/// it (else `HEAD`), read in one `git cat-file --batch`. Says where the gate
-/// comes from, and whether a copy is stored.
+/// `[cargo_env]`, `none` saying why it is empty). No copy of a gate is
+/// kept: each commit's is derived from the commit, from its own
+/// `sykli.json`, else from what `sykli init` writes for its tree, and a copy
+/// an earlier adopt kept is removed. What `origin/<branch>` holds (else
+/// `HEAD`), read in one `git cat-file --batch`, says where its gate comes
+/// from.
 fn write_entry(
     top: &Path,
     (id, dir, branch): (&RepoId, &Path, &str),
-    force: bool,
     overlay: &Overlay,
     none: Option<&str>,
-) -> Result<(String, bool)> {
+) -> Result<String> {
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let revs = [format!("refs/remotes/origin/{branch}"), "HEAD".to_owned()];
     let files = ["sykli.json", "sykli.rs"];
@@ -222,37 +220,16 @@ fn write_entry(
         .map(|(oid, _)| short(oid).to_owned())
         .unwrap_or_default();
     let blob = |n: usize| found[at + 1 + n].as_ref().map(|(_, bytes)| bytes.clone());
-    let contract = dir.join("sykli.json");
-    let lock = dir.join("sykli.lock");
-    let (source, stored) = if blob(0).is_some() {
-        // Each commit's gate is derived from the commit: no copy is kept,
-        // and one an earlier adopt kept is dead.
-        let mut removed = Vec::new();
-        for stale in [&contract, &lock] {
-            if stale.exists() {
-                std::fs::remove_file(stale)
-                    .with_context(|| format!("cannot remove {}", stale.display()))?;
-                removed.push(stale.file_name().unwrap_or_default().to_string_lossy());
-            }
-        }
-        let removed = if removed.is_empty() {
-            String::new()
-        } else {
-            format!("; the copy kept before ({}) is removed", removed.join(", "))
-        };
-        (
-            format!(
-                "the gate of each commit is derived from its own sykli.json and sykli.lock \
-                 ({rev} {commit} has one), so no copy is kept{removed}"
-            ),
-            false,
+    let source = if blob(0).is_some() {
+        format!(
+            "the gate of each commit is derived from its own sykli.json and sykli.lock ({rev} \
+             {commit} has one)"
         )
     } else if blob(1).is_some() {
         bail!(
-            "{} gates with sykli.rs at {rev}; an entry holds a sykli.json contract, so write \
-             one (sykli init --contract {}) and adopt again",
-            id.slug(),
-            contract.display()
+            "{} gates with sykli.rs at {rev}; an entry is judged by a sykli.json contract, so \
+             write one (sykli init) into the repository and adopt again",
+            id.slug()
         );
     } else {
         if !sykli_init_takes_a_contract() {
@@ -263,39 +240,39 @@ fn write_entry(
                 id.slug()
             );
         }
-        let mut init = Command::new("sykli");
-        init.args(["init", "--contract"])
-            .arg(&contract)
-            .current_dir(top);
-        if force && contract.exists() {
-            init.arg("--force");
-        }
-        let output = process::run(&mut init, None, process::LOCAL).context("cannot run sykli")?;
-        if !output.status.success() {
-            bail!("sykli init failed: {}", output.failure_detail());
-        }
-        if !contract.is_file() {
-            bail!("sykli init did not write {}", contract.display());
-        }
-        (
-            format!(
-                "sykli.json written by sykli init --contract (no sykli.json at {rev}){}: the \
-                 gate of a commit with none of its own",
-                if lock.is_file() {
-                    ", with sykli.lock"
-                } else {
-                    ""
-                }
-            ),
-            true,
+        format!(
+            "{rev} {commit} has no sykli.json: the gate of a commit with none of its own is \
+             derived from what sykli init writes for its tree (asked when it is needed, and \
+             kept by tree in ohjaa's state once a run is judged by it), so a file added is \
+             declared with no adopt"
         )
+    };
+    // No copy is kept, and one an earlier adopt kept is dead.
+    let mut removed = Vec::new();
+    for stale in [dir.join("sykli.json"), dir.join("sykli.lock")] {
+        if stale.exists() {
+            std::fs::remove_file(&stale)
+                .with_context(|| format!("cannot remove {}", stale.display()))?;
+            removed.push(
+                stale
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    let removed = if removed.is_empty() {
+        String::new()
+    } else {
+        format!("; the copy kept before ({}) is removed", removed.join(", "))
     };
     home::write_file(
         &dir.join("repo.toml"),
         &home::repo_toml(id, branch, overlay, none),
         None,
     )?;
-    Ok((source, stored))
+    Ok(format!("{source}, so no copy is kept{removed}"))
 }
 
 // ---- KATANA D10: each worktree's gate builds in a directory of its own ----
@@ -790,63 +767,6 @@ pub struct CargoTasks {
     pub placeholder: Vec<String>,
 }
 
-impl CargoTasks {
-    /// The tasks that leave a setting unsaid, as adopt and doctor name them:
-    /// one that says the other names what it lacks (`own (no
-    /// CARGO_BUILD_BUILD_DIR)`).
-    pub fn lacking(&self) -> String {
-        self.missing
-            .iter()
-            .map(|unsaid| {
-                if unsaid.vars.len() == SETTINGS.len() {
-                    unsaid.task.clone()
-                } else {
-                    format!("{} (no {})", unsaid.task, unsaid.vars.join(", no "))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    /// What adopt gives them, the tasks given the same variables together:
-    /// `CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for fmt, test;
-    /// CARGO_TARGET_DIR for inherited`.
-    fn given(&self) -> String {
-        let mut groups: Vec<(&[&str], Vec<&str>)> = Vec::new();
-        for unsaid in &self.missing {
-            match groups
-                .iter_mut()
-                .find(|(vars, _)| *vars == unsaid.vars.as_slice())
-            {
-                Some((_, tasks)) => tasks.push(&unsaid.task),
-                None => groups.push((&unsaid.vars, vec![&unsaid.task])),
-            }
-        }
-        groups
-            .iter()
-            .enumerate()
-            .map(|(at, (vars, tasks))| {
-                format!(
-                    "{}{} for {}",
-                    vars.join(" and "),
-                    if at == 0 { " declared" } else { "" },
-                    tasks.join(", ")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
-
-    /// The cargo tasks that say both settings, kept as they say them.
-    fn kept(&self) -> Vec<&str> {
-        self.cargo
-            .iter()
-            .filter(|name| !self.missing.iter().any(|unsaid| &unsaid.task == *name))
-            .map(String::as_str)
-            .collect()
-    }
-}
-
 /// The contract and its cargo tasks, when it is a `sykli-contract.v1`
 /// contract ohjaa can read; why not, when it is not.
 fn read_contract(text: &str) -> std::result::Result<(Json, CargoTasks), String> {
@@ -885,15 +805,6 @@ fn read_contract(text: &str) -> std::result::Result<(Json, CargoTasks), String> 
         }
     }
     Ok((contract, found))
-}
-
-/// The cargo tasks of the contract at `path`, or why they cannot be read.
-pub fn cargo_tasks(path: &Path) -> std::result::Result<CargoTasks, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    read_contract(&text)
-        .map(|(_, tasks)| tasks)
-        .map_err(|why| format!("{} is {why}", path.display()))
 }
 
 /// KATANA D10's lines, a variable and its value for each of the two places
@@ -1056,160 +967,6 @@ pub fn sykli_expands_worktree_cache(home: &Path) -> std::result::Result<(), Stri
     } else {
         Err(not.join(", and "))
     }
-}
-
-/// `sykli <command> <contract>` (`validate`, `lock`), run in the repository
-/// the contract judges and handed its facts when that command takes them
-/// (`sykli <command> --help` names `--repo-root` and `--git-common-dir`), so
-/// sykli asks git nothing ohjaa already knows.
-fn sykli_on(
-    command: &str,
-    top: &Path,
-    common: &Path,
-    contract: &Path,
-) -> std::result::Result<process::Output, String> {
-    let help = crate::gate::sykli_help(command);
-    let mut sykli = Command::new("sykli");
-    sykli
-        .arg(command)
-        .arg(contract)
-        .args(crate::hook::facts_for_sykli(&help, Some(top), common))
-        .current_dir(top);
-    process::run(&mut sykli, None, process::LOCAL).map_err(|error| format!("{error:#}"))
-}
-
-/// KATANA D10: each cargo task of the entry's stored gate is given, under
-/// `${worktree_cache}`, the variable of each setting it leaves unsaid
-/// (`CARGO_TARGET_DIR`, `CARGO_BUILD_BUILD_DIR`), and a gate that had a lock
-/// is locked again. Only when every sykli that runs the gate expands the
-/// placeholder, and only when the copied lock pins the gate as copied: a
-/// lock that does not means the repository changed its gate without `sykli
-/// lock`, and adopt never locks what the repository did not. Says what it
-/// did; never fails the adoption: a gate it cannot change is kept as copied.
-fn declare_worktree_cache(
-    top: &Path,
-    common: &Path,
-    dir: &Path,
-    expands: &std::result::Result<(), String>,
-) {
-    let contract = dir.join("sykli.json");
-    let lock = dir.join("sykli.lock");
-    let text = match std::fs::read_to_string(&contract) {
-        Ok(text) => text,
-        Err(error) => {
-            eprintln!(
-                "ohjaa adopt: warning: cannot read {} ({error}), so nothing declares \
-                 {WORKTREE_CACHE}",
-                contract.display()
-            );
-            return;
-        }
-    };
-    let (mut json, tasks) = match read_contract(&text) {
-        Ok(read) => read,
-        Err(why) => {
-            println!(
-                "  {WORKTREE_CACHE}: nothing declared: {} is {why}",
-                contract.display()
-            );
-            return;
-        }
-    };
-    if tasks.missing.is_empty() {
-        return;
-    }
-    if let Err(why) = expands {
-        println!(
-            "  {WORKTREE_CACHE}: not declared for {}: {why}, and an older sykli passes it on as \
-             written, to build inside the work tree; gate runs may share a target dir across \
-             worktrees until it is updated (then: ohjaa adopt --force)",
-            tasks.lacking()
-        );
-        return;
-    }
-    let copied_lock = std::fs::read(&lock).ok();
-    if copied_lock.is_some() {
-        let kept = format!("the gate is kept as copied, without {WORKTREE_CACHE}");
-        let refused = match sykli_on("validate", top, common, &contract) {
-            Ok(output) if output.status.success() => None,
-            Ok(output) if output.status.code() == Some(1) => Some(format!(
-                "the repository's sykli.lock does not validate its sykli.json; {kept}. \
-                 Validate the contract and run sykli lock in the repository, land both on its \
-                 observed branch, then ohjaa adopt --force <its clone>. Sykli says: {}",
-                output.failure_detail()
-            )),
-            Ok(output) => Some(format!(
-                "sykli validate {} failed ({}), so {kept}",
-                contract.display(),
-                output.failure_detail()
-            )),
-            Err(why) => Some(format!(
-                "sykli validate {} could not run ({why}), so {kept}",
-                contract.display()
-            )),
-        };
-        if let Some(why) = refused {
-            eprintln!("ohjaa adopt: warning: {why}");
-            return;
-        }
-    }
-    declare_in(&mut json, &tasks.missing, &standard_lines());
-    let mut declared = match serde_json::to_string_pretty(&json) {
-        Ok(declared) => declared,
-        Err(error) => {
-            eprintln!("ohjaa adopt: warning: cannot write the gate back ({error})");
-            return;
-        }
-    };
-    if text.ends_with('\n') {
-        declared.push('\n');
-    }
-    let written =
-        home::write_file(&contract, &declared, None).map_err(|error| format!("{error:#}"));
-    let locked = match (&written, &copied_lock) {
-        (Err(why), _) => Err(why.clone()),
-        (Ok(()), Some(_)) => match sykli_on("lock", top, common, &contract) {
-            Ok(output) if output.status.success() => Ok(()),
-            Ok(output) => Err(output.failure_detail()),
-            Err(why) => Err(why),
-        }
-        .map_err(|why| format!("sykli lock {} failed ({why})", contract.display())),
-        (Ok(()), None) => Ok(()),
-    };
-    if let Err(why) = locked {
-        let mut restored =
-            home::write_file(&contract, &text, None).map_err(|error| format!("{error:#}"));
-        if let (Ok(()), Some(bytes)) = (&restored, &copied_lock) {
-            restored = std::fs::write(&lock, bytes)
-                .map_err(|error| format!("cannot write {}: {error}", lock.display()));
-        }
-        match restored {
-            Ok(()) => eprintln!(
-                "ohjaa adopt: warning: {why}, so the gate is kept as copied, without \
-                 {WORKTREE_CACHE}: gate runs may share a target dir across worktrees"
-            ),
-            Err(error) => eprintln!(
-                "ohjaa adopt: warning: {why}, and the gate as copied could not be put back \
-                 ({error}): adopt again with --force"
-            ),
-        }
-        return;
-    }
-    let kept = tasks.kept();
-    println!(
-        "  {WORKTREE_CACHE}: {}, {}{}",
-        tasks.given(),
-        if copied_lock.is_some() {
-            "and sykli.lock locked again"
-        } else {
-            "with no sykli.lock to lock again"
-        },
-        if kept.is_empty() {
-            String::new()
-        } else {
-            format!("; kept as they declare it: {}", kept.join(", "))
-        }
-    );
 }
 
 #[cfg(test)]
@@ -1588,10 +1345,17 @@ echo "target=${{target:-no}} build=${{build:-no}}" >> '{}'
     fn the_lines_go_where_sykli_puts_env_and_nothing_else_moves() {
         let text = r#"{"schema":"sykli-contract.v1","tasks":[{"inputs":["a"],"name":"t","run":"cargo test","outputs":["o"]},{"name":"u","run":"true"},{"name":"v","run":"cargo test","env":{"CARGO_BUILD_BUILD_DIR":"own"}},{"name":"w","run":"cargo test","env":{"CARGO_TARGET_DIR":"own"}}],"z":1.5}"#;
         let (mut contract, tasks) = read_contract(text).unwrap();
-        assert_eq!(tasks.lacking(), "t, v (no CARGO_TARGET_DIR)");
+        let missing: Vec<(&str, &[&str])> = tasks
+            .missing
+            .iter()
+            .map(|unsaid| (unsaid.task.as_str(), unsaid.vars.as_slice()))
+            .collect();
         assert_eq!(
-            tasks.given(),
-            "CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for t; CARGO_TARGET_DIR for v"
+            missing,
+            [
+                ("t", &["CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"][..]),
+                ("v", &["CARGO_TARGET_DIR"][..])
+            ]
         );
         declare_in(&mut contract, &tasks.missing, &standard_lines());
         assert_eq!(
@@ -1607,6 +1371,7 @@ echo "target=${{target:-no}} build=${{build:-no}}" >> '{}'
         )
         .unwrap();
         assert_eq!(tasks.placeholder, ["a", "b"]);
-        assert_eq!(tasks.lacking(), "c");
+        assert_eq!(tasks.missing.len(), 1);
+        assert_eq!(tasks.missing[0].task, "c");
     }
 }
