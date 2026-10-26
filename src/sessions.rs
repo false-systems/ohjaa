@@ -17,10 +17,10 @@
 //! ending. The two things an agent writes — the read-back and the handover —
 //! are kept, and shown, as its testimony.
 //!
-//! Beside the sessions, two tables hold the Judgements `ohjaa judge`
-//! recorded and the answers to them (see `judgement`): each row written once,
-//! never changed or removed. A log an older ohjaa wrote has neither; it is
-//! read as it was, and gains them at its next writable open.
+//! A log an ohjaa with `ohjaa judge` wrote also holds that command's two
+//! tables (`judgements`, `judgement_responses`). This ohjaa never opens them:
+//! such a log is read and written as any other, and the tables stay as they
+//! were.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -38,12 +38,6 @@ use crate::intake::rfc3339;
 const SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
 /// Repository path → the id of its most recent session.
 const LATEST: TableDefinition<&str, &str> = TableDefinition::new("latest");
-/// Judgement id → the Judgement (`ohjaa judge`), as JSON. Written once, and
-/// never changed or removed: an answer is a record of its own.
-pub const JUDGEMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("judgements");
-/// Response id → an answer to a Judgement (`ohjaa judge respond`), as JSON,
-/// naming the Judgement it answers. Written once, like a Judgement.
-pub const RESPONSES: TableDefinition<&str, &[u8]> = TableDefinition::new("judgement_responses");
 
 /// The environment variable that names the session to the agent inside it.
 pub const SESSION_ENV: &str = "OHJAA_SESSION";
@@ -625,49 +619,8 @@ impl Store {
         let tx = store.db.begin_write().map_err(other)?;
         tx.open_table(SESSIONS).map_err(other)?;
         tx.open_table(LATEST).map_err(other)?;
-        tx.open_table(JUDGEMENTS).map_err(other)?;
-        tx.open_table(RESPONSES).map_err(other)?;
         tx.commit().map_err(other)?;
         Ok(store)
-    }
-
-    /// Write `bytes` as the new row `id` of `table`, in one transaction:
-    /// refused when `id` is there already (a row of these tables is written
-    /// once, never replaced), and, with `answers`, unless that row exists in
-    /// the table named with it (an answer to a Judgement needs the Judgement).
-    pub fn insert_new(
-        &self,
-        table: TableDefinition<&str, &[u8]>,
-        id: &str,
-        bytes: &[u8],
-        answers: Option<(TableDefinition<&str, &[u8]>, &str)>,
-    ) -> Result<(), StoreError> {
-        let tx = self.db.begin_write().map_err(other)?;
-        {
-            if let Some((parent, parent_id)) = answers {
-                let parent_table = tx.open_table(parent).map_err(other)?;
-                if parent_table.get(parent_id).map_err(other)?.is_none() {
-                    return Err(StoreError::Other(format!("no {parent_id} in the log")));
-                }
-            }
-            let mut rows = tx.open_table(table).map_err(other)?;
-            if rows.get(id).map_err(other)?.is_some() {
-                return Err(StoreError::Other(format!(
-                    "{id} is already recorded, and a record here is never replaced"
-                )));
-            }
-            rows.insert(id, bytes).map_err(other)?;
-        }
-        tx.commit().map_err(other)
-    }
-
-    /// Every row of `table`, by id. Readers use [`Reader::rows`].
-    #[cfg(test)]
-    pub fn rows(
-        &self,
-        table: TableDefinition<&str, &[u8]>,
-    ) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
-        rows_in(&self.db, table)
     }
 
     pub fn put(&self, session: &Session) -> Result<(), StoreError> {
@@ -813,16 +766,6 @@ impl Reader {
             .as_deref()
             .map_or_else(|| Ok((Vec::new(), Vec::new())), all_in)
     }
-
-    /// As [`Store::rows`]; none in a log an older ohjaa wrote.
-    pub fn rows(
-        &self,
-        table: TableDefinition<&str, &[u8]>,
-    ) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
-        self.db
-            .as_deref()
-            .map_or_else(|| Ok(Vec::new()), |db| rows_in(db, table))
-    }
 }
 
 /// A copy of the log that only this process reads, in the temporary
@@ -915,24 +858,6 @@ fn latest_in(db: &dyn ReadableDatabase, repo: &str) -> Result<Option<Session>, S
         }
     };
     get_in(db, &id)
-}
-
-/// Every row of `table`, by id; none where the table was never made (a log
-/// an older ohjaa wrote, opened only to read).
-fn rows_in(
-    db: &dyn ReadableDatabase,
-    table: TableDefinition<&str, &[u8]>,
-) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
-    let tx = db.begin_read().map_err(other)?;
-    let Some(rows) = read_table(&tx, table)? else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    for entry in rows.iter().map_err(other)? {
-        let (id, value) = entry.map_err(other)?;
-        out.push((id.value().to_owned(), value.value().to_vec()));
-    }
-    Ok(out)
 }
 
 fn all_in(db: &dyn ReadableDatabase) -> Result<(Vec<Session>, Vec<String>), StoreError> {
@@ -2189,13 +2114,17 @@ mod tests {
         session
     }
 
-    /// KATANA Stage 5: the Judgement tables are additive. A log an older
-    /// ohjaa wrote (sessions and latest only) is read as it was, with no
-    /// Judgement, opened only to read; the first writable open adds the
-    /// tables, and its sessions are untouched.
+    /// `ohjaa judge` is gone, but a log an ohjaa that had it wrote still
+    /// holds its tables (`judgements`, `judgement_responses`). Such a log
+    /// opens to read and to write as any other, its sessions are read as
+    /// they were, and the tables are left as they were: never read, never
+    /// migrated, never dropped.
     #[test]
-    fn a_log_from_before_judgements_still_reads_and_gains_the_tables() {
-        let dir = temp("oldlog");
+    fn a_log_that_holds_the_old_judgement_tables_still_opens_and_keeps_them() {
+        const OLD_JUDGEMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("judgements");
+        const OLD_RESPONSES: TableDefinition<&str, &[u8]> =
+            TableDefinition::new("judgement_responses");
+        let dir = temp("judgementlog");
         let path = store_path(&dir);
         {
             let db = Database::create(&path).unwrap();
@@ -2205,54 +2134,37 @@ mod tests {
                 let bytes = serde_json::to_vec(&session("oh-1-1", "/r/a", 1_000)).unwrap();
                 sessions.insert("oh-1-1", bytes.as_slice()).unwrap();
                 tx.open_table(LATEST).unwrap();
+                let mut judgements = tx.open_table(OLD_JUDGEMENTS).unwrap();
+                judgements
+                    .insert("jd-1-1", b"{\"v\":1}".as_slice())
+                    .unwrap();
+                let mut responses = tx.open_table(OLD_RESPONSES).unwrap();
+                responses.insert("rs-1-1", b"{}".as_slice()).unwrap();
             }
             tx.commit().unwrap();
         }
         let reader = Reader::open(&path).unwrap();
-        assert_eq!(reader.rows(JUDGEMENTS).unwrap(), Vec::new());
-        assert_eq!(reader.rows(RESPONSES).unwrap(), Vec::new());
         assert_eq!(reader.all().unwrap().0.len(), 1);
+        assert_eq!(reader.get("oh-1-1").unwrap().unwrap().repo, "/r/a");
         drop(reader);
         let store = Store::open(&path).unwrap();
-        store.insert_new(JUDGEMENTS, "jd-1-1", b"{}", None).unwrap();
+        store.put(&session("oh-2-2", "/r/b", 2_000)).unwrap();
         assert_eq!(store.get("oh-1-1").unwrap().unwrap().repo, "/r/a");
         drop(store);
-        let reader = Reader::open(&path).unwrap();
-        assert_eq!(reader.rows(JUDGEMENTS).unwrap().len(), 1);
-    }
-
-    /// D5: a Judgement is written once and never replaced; an answer is a
-    /// row of its own, refused for a Judgement the log does not hold.
-    #[test]
-    fn a_judgement_row_is_never_replaced_and_an_answer_needs_its_judgement() {
-        let dir = temp("judgementrows");
-        let store = Store::open(&store_path(&dir)).unwrap();
-        store
-            .insert_new(JUDGEMENTS, "jd-1-1", b"{\"v\":1}", None)
-            .unwrap();
-        let again = store
-            .insert_new(JUDGEMENTS, "jd-1-1", b"{\"v\":2}", None)
-            .unwrap_err()
-            .to_string();
-        assert!(again.contains("never replaced"), "{again}");
+        let db = Database::open(&path).unwrap();
+        let tx = db.begin_read().unwrap();
+        let judgements = tx.open_table(OLD_JUDGEMENTS).unwrap();
         assert_eq!(
-            store.rows(JUDGEMENTS).unwrap(),
-            vec![("jd-1-1".to_owned(), b"{\"v\":1}".to_vec())]
+            judgements.get("jd-1-1").unwrap().unwrap().value(),
+            b"{\"v\":1}".as_slice(),
+            "the old row is left as it was"
         );
-        let orphan = store
-            .insert_new(RESPONSES, "rs-1-1", b"{}", Some((JUDGEMENTS, "jd-9-9")))
-            .unwrap_err()
-            .to_string();
-        assert!(orphan.contains("no jd-9-9 in the log"), "{orphan}");
-        store
-            .insert_new(RESPONSES, "rs-1-1", b"{}", Some((JUDGEMENTS, "jd-1-1")))
-            .unwrap();
-        assert_eq!(store.rows(RESPONSES).unwrap().len(), 1);
-        assert_eq!(
-            store.rows(JUDGEMENTS).unwrap()[0].1,
-            b"{\"v\":1}".to_vec(),
-            "the Judgement is unchanged"
-        );
+        assert!(tx
+            .open_table(OLD_RESPONSES)
+            .unwrap()
+            .get("rs-1-1")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

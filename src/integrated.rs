@@ -114,7 +114,7 @@ pub fn standing(kind: ValidationKind, said: &Said) -> String {
 
 /// `sykli status --commit <rev> --contract <gate> --json`, from the gate's
 /// checkout, handed the clone's facts when sykli takes them.
-pub fn commit_status(gate: &Gate, help: StatusHelp, rev: &str) -> Result<Value, String> {
+fn commit_status(gate: &Gate, help: StatusHelp, rev: &str) -> Result<Value, String> {
     let mut command = Command::new("sykli");
     command
         .args(["status", "--commit", rev, "--contract"])
@@ -221,7 +221,7 @@ fn fnv(bytes: &[u8]) -> u64 {
 
 /// A clone's name in ohjaa's state: its main checkout's folder name and a
 /// hash of its common git dir (`widget-0123456789abcdef`).
-pub fn clone_id(common: &Path) -> String {
+fn clone_id(common: &Path) -> String {
     let common = canonical(common);
     let name = common
         .parent()

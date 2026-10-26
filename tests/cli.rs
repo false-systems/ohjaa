@@ -5069,17 +5069,12 @@ fn report_json_is_ohjaa_marks_v1_and_writes_nothing() {
             "complete",
             "entries",
             "generated",
-            "judgements",
             "proposals",
             "report",
             "schema",
             "sessions"
         ]
     );
-    // Additive (KATANA D5): the Judgements recorded and the Changes with
-    // none, read from the log without writing it.
-    assert_eq!(keys(&json["judgements"]), ["listed", "pending", "recorded"]);
-    assert_eq!(json["judgements"]["listed"], true);
     assert_eq!(json["entries"], serde_json::json!([]), "no entries here");
     assert_eq!(json["proposals"]["listed"], true);
     let waiting = &json["proposals"]["waiting"][0];

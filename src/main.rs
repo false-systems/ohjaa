@@ -16,7 +16,6 @@ mod home;
 mod hook;
 mod intake;
 mod integrated;
-mod judgement;
 mod knowledge;
 mod lifecycle;
 mod mark;
@@ -390,119 +389,11 @@ enum Cmd {
         #[arg(long, value_name = "SECONDS", default_value_t = 1800)]
         wait: u64,
     },
-    /// Record an independent Judgement of a Change (base..head) and its
-    /// exact State. The reviewer is observed: the live ohjaa session whose
-    /// process group holds this process (or an ancestor), whatever
-    /// OHJAA_SESSION says; outside every one, the person git names here.
-    /// Refused when the reviewer made any commit of the Change (law 2). Kept
-    /// in the session log, and attached to the head as a git note under
-    /// refs/notes/ohjaa/judgements.
-    #[command(
-        args_conflicts_with_subcommands = true,
-        subcommand_negates_reqs = true,
-        after_help = "Exit codes:\n  \
-        0  recorded\n  \
-        1  recorded, but not shared: --push did not reach origin\n  \
-        2  nothing to judge: the range cannot be resolved, or holds no commit\n  \
-        3  refused, nothing recorded: the reviewer made a commit of the Change\n     \
-           (law 2; a process a session left behind is that session); an author\n     \
-           is not ruled out where ohjaa cannot see (it fails closed);\n     \
-           OHJAA_SESSION names no live session in the log; or --push for a\n     \
-           repository whose Judgements are not shared\n  \
-        4  not recorded: the session log could not be read or written (busy\n     \
-           past 20s, or broken), or the repository or its entry cannot be read\n\n\
-        The judge's procedural independence is `established` only when every\n\
-        commit of the Change is held by an ended session's record, none the\n\
-        reviewer's; this process runs inside no session, live or ended, but the\n\
-        reviewer's own live one (the kernel's word on its process group and its\n\
-        ancestors'); and OHJAA_SESSION is unset (a person at a controlling\n\
-        terminal, whose git identity is on no commit of the Change) or names\n\
-        that session. Otherwise it is recorded, with `established: false` and\n\
-        each reason. `established` means no sign of an author, never proof of a\n\
-        person: an agent's process that left every recorded group and took a\n\
-        terminal looks like one, and a reflog is the agent's own testimony.\n\n\
-        RANGE is base..head, or a head alone: its base is then where it leaves\n\
-        origin's copy of the entry's branch. The evidence considered is what\n\
-        `sykli status --commit <head> --contract <gate> --json` names (runs and\n\
-        receipts, by reference). Judgements of a private repository (its entry's\n\
-        sharing.toml says visibility = \"private\") are shared when asked; of any\n\
-        other, only with share_judgements = true there, and their notes hold ids,\n\
-        hashes and the verdict only. --push (or push_judgements = true) pushes\n\
-        refs/notes/ohjaa/judgements to origin as the union of this clone's lines,\n\
-        origin's and the session log's: no line is dropped, and none is replaced."
-    )]
-    Judge {
-        #[command(subcommand)]
-        action: Option<JudgeCmd>,
-        /// base..head, or a head (default HEAD).
-        #[arg(default_value = "HEAD")]
-        range: String,
-        #[arg(long, value_enum, required = true)]
-        verdict: Option<judgement::Verdict>,
-        /// What was found (repeatable).
-        #[arg(long = "finding", value_name = "TEXT")]
-        findings: Vec<String>,
-        #[arg(long, value_enum)]
-        severity: Option<judgement::Severity>,
-        /// The findings block the Change.
-        #[arg(long)]
-        blocking: bool,
-        /// What the reviewer could not check, or is unsure of.
-        #[arg(long, value_name = "TEXT")]
-        uncertainty: Option<String>,
-        /// The Intent the Change serves, when its sessions do not say.
-        #[arg(long, value_name = "ID")]
-        intent_id: Option<String>,
-        /// Push the notes ref to origin once recorded (shared repositories).
-        #[arg(long)]
-        push: bool,
-    },
-    /// Every Judgement of a commit (and the answers to them), from this
-    /// machine's log and the notes, each marked with where it was read
-    /// (log, note, merged, fetched), whether it is authoritative here, and
-    /// whether another record of its id says otherwise (a conflict).
-    #[command(
-        after_help = "--rebuild-public rewrites this clone's refs/notes/ohjaa/judgements as one\n\
-        commit by ohjaa <ohjaa@invalid> with no history, holding only redacted lines:\n\
-        every redacted line of its notes, and this machine's Judgements of the clone\n\
-        in their redacted form. Every other line is dropped from the ref (the session\n\
-        log keeps this machine's Judgements), and the old history is no longer\n\
-        reachable from it, so no push publishes it; git's reflog keeps it on this\n\
-        machine only. Nothing is pushed. For an entry made public after it was\n\
-        private: a note removed with `git notes remove` is still in the history."
-    )]
-    Judgements {
-        /// The commit (default HEAD).
-        #[arg(default_value = "HEAD")]
-        commit: String,
-        #[arg(long)]
-        json: bool,
-        /// First fetch origin's shared notes (refs/notes/ohjaa/judgements)
-        /// into refs/notes/ohjaa/fetched/judgements.
-        #[arg(long)]
-        fetch: bool,
-        /// Rewrite this clone's notes ref with redacted lines only, and no
-        /// history (see below).
-        #[arg(long, conflicts_with_all = ["json", "fetch"])]
-        rebuild_public: bool,
-    },
     /// Print the shell functions that route `claude` and `codex` through
     /// `ohjaa run`. Load them with: eval "$(ohjaa shell-init zsh)"
     ShellInit {
         /// zsh is the only one.
         shell: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum JudgeCmd {
-    /// Answer a Judgement: a record of its own beside it, never a change to
-    /// it. From inside a session, or as the person git names here.
-    Respond {
-        /// The Judgement's id (`jd-…`).
-        judgement: String,
-        #[arg(required = true, num_args = 1..)]
-        text: Vec<String>,
     },
 }
 
@@ -1111,22 +1002,6 @@ fn last_session_here(
     };
     let latest_id = latest.as_ref().map(|s| s.id.clone());
     let pending = pending_here(&all, latest_id.as_deref(), repo, &here, runs);
-    // The Judgements of this clone, and its Changes with none (D5).
-    let judged = match judgement::logged() {
-        Ok((judgements, responses)) => {
-            let mut checkouts: Vec<String> = crate::gitconfig::common_dir(repo)
-                .map(|common| lifecycle::layout_checkouts(&common))
-                .unwrap_or_default()
-                .iter()
-                .map(|checkout| checkout.to_string_lossy().into_owned())
-                .collect();
-            if !checkouts.contains(&here) {
-                checkouts.push(here.clone());
-            }
-            judgement::briefing(&all, &judgements, &responses, &checkouts)
-        }
-        Err(error) => format!("Judgements here: the session log could not be read ({error:#})\n"),
-    };
     let mut earlier: Vec<sessions::Session> = all
         .into_iter()
         .filter(|s| Some(&s.id) != latest_id.as_ref() && sessions::observed_in(s, &here))
@@ -1142,12 +1017,6 @@ fn last_session_here(
         .map(|session| sessions::render_last_with(session, &here, &|v| runs.ask(v)))
         .unwrap_or_default();
     last.push_str(&pending);
-    if !judged.is_empty() {
-        if !last.is_empty() {
-            last.push('\n');
-        }
-        last.push_str(&judged);
-    }
     (!warnings.is_empty() || !last.is_empty()).then_some((warnings, last))
 }
 
@@ -3552,43 +3421,6 @@ fn main() {
         Cmd::Hook { name, args } => hook::run(name, args),
         Cmd::ShellInit { shell } => shell_init::shell_init(shell),
         Cmd::Gate { print, wait } => gate::gate_here(*print, std::time::Duration::from_secs(*wait)),
-        Cmd::Judge {
-            action: Some(JudgeCmd::Respond { judgement, text }),
-            ..
-        } => judgement::respond(judgement, &text.join(" ")),
-        Cmd::Judge {
-            action: None,
-            range,
-            verdict,
-            findings,
-            severity,
-            blocking,
-            uncertainty,
-            intent_id,
-            push,
-        } => match verdict {
-            Some(verdict) => judgement::judge(&judgement::JudgeArgs {
-                range,
-                verdict: *verdict,
-                findings,
-                severity: *severity,
-                blocking: *blocking,
-                uncertainty: uncertainty.as_deref(),
-                intent_id: intent_id.as_deref(),
-                push: *push,
-            }),
-            None => Err(anyhow::anyhow!("--verdict is required")),
-        },
-        Cmd::Judgements {
-            rebuild_public: true,
-            ..
-        } => judgement::rebuild_public(),
-        Cmd::Judgements {
-            commit,
-            json,
-            fetch,
-            ..
-        } => judgement::list(commit, *json, *fetch),
         Cmd::Intake {
             since,
             sources,
