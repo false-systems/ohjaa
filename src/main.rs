@@ -195,13 +195,17 @@ enum Cmd {
         #[arg(long)]
         strict: bool,
     },
-    /// Draft proposals from what people said: agent transcripts, pull request
-    /// comments and reverts.
+    /// Draft proposals from what people said: what they wrote in agent
+    /// sessions (through `vessa messages`), pull request comments and reverts.
     Intake {
         /// Start here (YYYY-MM-DD or RFC 3339). Default: where the last intake
         /// stopped, else fourteen days ago.
         #[arg(long)]
         since: Option<String>,
+        /// Send every message people wrote, not only those the local
+        /// pre-filter takes for a correction or a repeated instruction.
+        #[arg(long)]
+        no_prefilter: bool,
         /// transcripts, reviews, reverts or report (repeatable). Default: all four.
         #[arg(long = "source", value_name = "SOURCE")]
         sources: Vec<String>,
@@ -1688,6 +1692,7 @@ fn cmd_intake(
     max_batches: usize,
     dry_run: bool,
     retry_failed: bool,
+    prefilter: bool,
 ) -> Result<i32> {
     let dirs = dirs()?;
     // One intake at a time: two would send the same candidates and overwrite
@@ -1770,15 +1775,16 @@ fn cmd_intake(
         let roots = roots::load(roots, git_root().as_deref());
         roots::git_repos(&roots)
     };
-    // One source, from `from`.
+    // One source, from `from`, unfiltered: what vessa lists of what people
+    // wrote is pre-filtered in the pass below, not when read back for a
+    // retry, which takes only candidates already sent.
     let read = |source: &str, from: i64, warnings: &mut Vec<String>| -> Result<Vec<_>> {
         Ok(match source {
-            "transcripts" => {
-                let home = std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .context("HOME is not set")?;
-                intake::transcripts(&home, from, warnings)
-            }
+            "transcripts" => intake::transcripts(from, warnings)
+                .into_iter()
+                .filter(|said| !said.long)
+                .map(|said| said.candidate)
+                .collect(),
             "reviews" | "reverts" => {
                 let repos = git_repos()?;
                 if repos.is_empty() {
@@ -1817,13 +1823,24 @@ fn cmd_intake(
                 .map(|s| s.started_ms - 1)
                 .min()
                 .map_or(since, |earliest| earliest.min(since));
-            let read = read(source, from, &mut warnings)?;
+            let said = intake::transcripts(from, &mut warnings);
             transcripts_read_cleanly = warnings.len() == before;
-            let (new, older): (Vec<_>, Vec<_>) = read
+            // What was said after `since`, and before it in a queued
+            // session's window: only those are read, and pre-filtered.
+            let said: Vec<intake::Said> = said
                 .into_iter()
-                .partition(|candidate| candidate.at_ms > since);
-            candidates.extend(new);
-            candidates.extend(intake::within_sessions(older, &queued));
+                .filter(|said| {
+                    said.candidate.at_ms > since
+                        || intake::within_sessions(&said.candidate, &queued)
+                })
+                .collect();
+            let (kept, sifted) = intake::sift(said, prefilter);
+            // A vessa that listed nothing because it failed has said so; no
+            // count of nothing is shown for it.
+            if transcripts_read_cleanly || sifted.read > 0 {
+                eprintln!("ohjaa: intake: {}", sifted.said());
+            }
+            candidates.extend(kept);
         } else {
             candidates.extend(read(source, since, &mut warnings)?);
         }
@@ -1967,6 +1984,10 @@ fn cmd_intake(
         if let Some(error) = &drafted.stopped {
             eprintln!("ohjaa: intake stopped: {error:#}");
         }
+        eprintln!(
+            "ohjaa: intake: the drafter answered for {} candidate(s) in this run",
+            drafted.sent
+        );
     }
     handled.done_retrying();
     // A session is drafted from once every candidate of it is handled, in
@@ -3633,6 +3654,7 @@ fn main() {
         Cmd::Gate { print, wait } => gate::gate_here(*print, std::time::Duration::from_secs(*wait)),
         Cmd::Intake {
             since,
+            no_prefilter,
             sources,
             drafter,
             batch,
@@ -3648,6 +3670,7 @@ fn main() {
             *max_batches,
             *dry_run,
             *retry_failed,
+            !*no_prefilter,
         ),
     };
     match result {
