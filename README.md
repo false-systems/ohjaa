@@ -137,7 +137,9 @@ words). Every run makes progress, and a drafter that fails mid-run keeps what
 came before it. Repeated runs drain the queue: a run that leaves work for the
 next exits 4, and once nothing is left a run says `nothing new to draft from`
 and exits 0. The cursor (`intake-since`) moves only past what was actually
-drafted from, and never back.
+drafted from, and never back. A first run, with no cursor yet, keeps the
+start of its window (fourteen days back) as the cursor before it drafts, so
+the runs after it continue from there.
 
 ## The bypass report: what went around the workflow
 

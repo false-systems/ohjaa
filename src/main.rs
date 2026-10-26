@@ -1679,13 +1679,15 @@ fn cmd_intake(
 ) -> Result<i32> {
     let dirs = dirs()?;
     let started = intake::now_seconds() * 1000;
-    let since = match since {
-        Some(since) => intake::normalize_since(since)?,
-        None => match intake::read_cursor(&dirs)? {
-            Some(cursor) => cursor,
-            None => started - 14 * 86_400_000,
-        },
+    let explicit = since.map(intake::normalize_since).transpose()?;
+    let cursor = match explicit {
+        Some(_) => None,
+        None => intake::read_cursor(&dirs)?,
     };
+    let (since, keep) = intake::window_start(explicit, cursor, started, 14 * 86_400_000);
+    if let Some(since) = keep.filter(|_| !dry_run) {
+        intake::write_cursor(&dirs, since)?;
+    }
     let sources: Vec<&str> = if sources.is_empty() {
         vec!["transcripts", "reviews", "reverts", "report"]
     } else {
@@ -1865,14 +1867,12 @@ fn cmd_intake(
             })
             .collect()
     });
-    let settled = intake::settle(
-        &found,
-        &mut handled,
-        sessions.as_deref(),
+    let window = intake::Window {
         since,
         started,
-        warnings.is_empty(),
-    );
+        clean: warnings.is_empty(),
+    };
+    let settled = intake::settle(&found, &mut handled, sessions.as_deref(), window);
     if let Some(cursor) = settled.cursor {
         intake::write_cursor(&dirs, cursor)?;
     }

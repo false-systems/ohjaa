@@ -883,8 +883,39 @@ pub struct Settled {
     pub left: usize,
 }
 
-/// Settle a run that read from `since` (`clean`: every source read without a
-/// warning), and forget what no later run can find again.
+/// Where a run reads from: the person's `--since`, else the cursor, else
+/// `default_ms` back from `started`. A default window is also returned as the
+/// cursor to keep before anything is drafted, so that the next run's default
+/// does not slide past what this one did not reach, even if this one is
+/// killed.
+pub fn window_start(
+    explicit: Option<i64>,
+    cursor: Option<i64>,
+    started: i64,
+    default_ms: i64,
+) -> (i64, Option<i64>) {
+    match (explicit, cursor) {
+        (Some(since), _) => (since, None),
+        (None, Some(cursor)) => (cursor, None),
+        (None, None) => {
+            let since = started - default_ms;
+            (since, Some(since))
+        }
+    }
+}
+
+/// Where a run read from, and how.
+#[derive(Debug, Clone, Copy)]
+pub struct Window {
+    /// The start: the cursor or the person's `--since` (see `window_start`).
+    pub since: i64,
+    /// When the run started: the furthest the cursor can move.
+    pub started: i64,
+    /// Every source was read without a warning.
+    pub clean: bool,
+}
+
+/// Settle a run, and forget what no later run can find again.
 ///
 /// A queued session brings its own candidates back to every run until each
 /// is handled. Any other candidate comes back only while it lies after the
@@ -897,10 +928,13 @@ pub fn settle(
     found: &[Candidate],
     handled: &mut Handled,
     sessions: Option<&[Undrafted]>,
-    since: i64,
-    started: i64,
-    clean: bool,
+    window: Window,
 ) -> Settled {
+    let Window {
+        since,
+        started,
+        clean,
+    } = window;
     let returning: std::collections::HashSet<Key> = sessions
         .unwrap_or_default()
         .iter()
@@ -1351,7 +1385,12 @@ mod tests {
                            clean| {
             let mut handled = Handled::default();
             handled.0.extend(done.iter().map(|c| c.key()));
-            settle(found, &mut handled, sessions, since, 100, clean)
+            let window = Window {
+                since,
+                started: 100,
+                clean,
+            };
+            settle(found, &mut handled, sessions, window)
         };
         let found = [a.clone(), b.clone(), z.clone()];
         // The first candidate not handled holds it.
@@ -1386,6 +1425,11 @@ mod tests {
             settle_with(std::slice::from_ref(&a), &[&a], None, 200, true).cursor,
             None
         );
+        // Where a run reads from: `--since`, else the cursor, else the
+        // default window, which is kept as the cursor before drafting.
+        assert_eq!(window_start(Some(7), Some(9), 100, 50), (7, None));
+        assert_eq!(window_start(None, Some(9), 100, 50), (9, None));
+        assert_eq!(window_start(None, None, 100, 50), (50, Some(50)));
     }
 
     // ---- the model: random queues, caps and failure points ---------------------
@@ -1468,6 +1512,9 @@ mod tests {
     struct World {
         /// Where the first run's window starts.
         since: i64,
+        /// How far back a run with no cursor reads (fourteen days, for
+        /// `ohjaa intake`): the first run is at `since + window`.
+        window: i64,
         said: Vec<Candidate>,
         sessions: Vec<ModelSession>,
         /// What the report finds: each found by a run whose window holds the
@@ -1557,6 +1604,7 @@ mod tests {
             .unwrap_or(0);
         World {
             since,
+            window: 1 + rng.below(40_000) as i64,
             said: out,
             sessions,
             reported,
@@ -1608,7 +1656,10 @@ mod tests {
         plan: &Plan,
         kept: &mut HashSet<Key>,
     ) -> Ran {
-        let since = state.cursor.unwrap_or(world.since);
+        // With no cursor yet, the default window, which slides with time
+        // unless it is kept.
+        let (since, keep) = window_start(None, state.cursor, now, world.window);
+        state.cursor = state.cursor.max(keep);
         let undrafted: Vec<crate::sessions::Session> = world
             .sessions
             .iter()
@@ -1726,14 +1777,12 @@ mod tests {
                 whole: plan.whole,
             })
             .collect();
-        let settled = settle(
-            &found,
-            &mut handled,
-            Some(&sessions),
+        let window = Window {
             since,
-            now,
-            plan.clean,
-        );
+            started: now,
+            clean: plan.clean,
+        };
+        let settled = settle(&found, &mut handled, Some(&sessions), window);
         assert!(
             settled
                 .cursor
@@ -1765,11 +1814,10 @@ mod tests {
             let mut state = State::default();
             let mut kept = HashSet::new();
             let mut cursors = Vec::new();
-            let mut now = world.since;
+            let mut now = world.since + world.window;
             // While the world changes: runs at random times, with random caps,
             // warnings, drafter failures and kills.
-            while now < world.end {
-                now += 1 + rng.below(30_000) as i64;
+            loop {
                 // A transcript that cannot be read is a warning too.
                 let whole = !rng.chance(10);
                 let plan = Plan {
@@ -1788,6 +1836,10 @@ mod tests {
                     assert!(ran.sent >= 1, "seed {seed}: a run with work left made none");
                 }
                 cursors.push(state.cursor);
+                if now >= world.end {
+                    break;
+                }
+                now += 1 + rng.below(30_000) as i64;
             }
             // Then the world stands still: every run strictly reduces the work
             // left, until one reports that nothing is left.
@@ -1894,6 +1946,7 @@ mod tests {
         }
         let world = World {
             since: 99_999,
+            window: 100_002,
             said: out,
             sessions,
             reported: Vec::new(),
