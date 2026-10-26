@@ -1229,9 +1229,10 @@ fn secret(run: &str, after: Option<(&str, &str)>) -> Option<usize> {
     if found {
         return Some(head.len());
     }
-    // A key of a vendor not named here: long and random-looking, alone.
-    if random_looking(head) {
-        return Some(head.len());
+    // A key of a vendor not named here, alone: an id and a secret joined by
+    // a dot, or a long token mixing capitals, lower case and digits.
+    if dotted_key(run) || mixes_cases_and_digits(run) {
+        return Some(run.len());
     }
     let (word, between) = after?;
     let separated = (1..=4).contains(&between.len())
@@ -1244,48 +1245,40 @@ fn secret(run: &str, after: Option<(&str, &str)>) -> Option<usize> {
     (separated && names_a_secret(word) && long_and_mixed).then_some(run.len())
 }
 
-/// Long (32 or more), with digits, as varied as random text, a quarter or
-/// more of it capitals, and changing between lower case, capitals and
-/// digits at least every other character or so: what a key with no known
-/// prefix looks like. A git sha and a UUID have no capitals; a long name
-/// (`ProjectSettingsV2Controller`, `Base64EncodedSha256Digest`) has fewer,
-/// and changes case only between its words.
-fn random_looking(token: &str) -> bool {
-    let count = |kind: fn(&u8) -> bool| token.bytes().filter(kind).count();
-    let class = |b: u8| match b {
-        b'a'..=b'z' => 0,
-        b'A'..=b'Z' => 1,
-        b'0'..=b'9' => 2,
-        _ => 3,
-    };
-    let changes = token
-        .as_bytes()
-        .windows(2)
-        .filter(|pair| class(pair[0]) != class(pair[1]))
-        .count();
-    token.len() >= 32
-        && count(u8::is_ascii_lowercase) >= 2
-        && count(u8::is_ascii_digit) >= 2
-        && 4 * count(u8::is_ascii_uppercase) >= token.len()
-        && 10 * changes >= 4 * (token.len() - 1)
-        && entropy(token) >= 4.2
+/// `<hex, 24 or more>.<letters and digits, 12 or more>`: an id and a secret
+/// joined by a dot, as some providers issue keys.
+fn dotted_key(run: &str) -> bool {
+    let parts: Vec<&str> = run.split('.').collect();
+    parts.windows(2).any(|pair| {
+        pair[0].len() >= 24
+            && pair[0].bytes().all(|b| b.is_ascii_hexdigit())
+            && pair[1].len() >= 12
+            && pair[1].bytes().all(|b| b.is_ascii_alphanumeric())
+    })
 }
 
-/// Shannon entropy, in bits per character.
-fn entropy(token: &str) -> f64 {
-    let mut counts = [0usize; 256];
-    for byte in token.bytes() {
-        counts[usize::from(byte)] += 1;
+/// 32 or more characters with no space, two or more each of capitals, lower
+/// case letters and digits: what a key with no known prefix looks like. A
+/// hash or a UUID, in either case, is hex and is left alone. A path is
+/// judged by the pieces of its names (between `/`, `.`, `-` and `_`), so a
+/// long path, or a versioned or dated file name, made of short words is no
+/// key; a Codex rollout name has one capital besides. A long name with digits and
+/// capitals (`ProjectSettingsV2Controller3`) is redacted too: a cheap loss
+/// to the drafter.
+fn mixes_cases_and_digits(run: &str) -> bool {
+    let long_and_mixed = |part: &str| {
+        let count = |kind: fn(&u8) -> bool| part.bytes().filter(kind).count();
+        part.len() >= 32
+            && count(u8::is_ascii_uppercase) >= 2
+            && count(u8::is_ascii_lowercase) >= 2
+            && count(u8::is_ascii_digit) >= 2
+            && !part.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+    };
+    if run.starts_with(['/', '~', '.']) {
+        run.split(['/', '.', '-', '_']).any(long_and_mixed)
+    } else {
+        long_and_mixed(run)
     }
-    let n = token.len() as f64;
-    counts
-        .iter()
-        .filter(|c| **c > 0)
-        .map(|c| {
-            let p = *c as f64 / n;
-            -p * p.log2()
-        })
-        .sum()
 }
 
 /// `key`, `token`, `secret`, `password`, `passwd` or `bearer`, alone or
@@ -2657,13 +2650,35 @@ mod tests {
             assert_eq!(n, 1, "{text}: {scrubbed}");
             assert!(!scrubbed.contains(value), "{scrubbed}");
         }
-        // A long random-looking token alone, with no prefix and no name: a
-        // key of some vendor ohjaa knows nothing of.
-        let unnamed = fake(&["be3f", "Q9xT2mLk7RvA4nWp8ZcH1sYd6JgU3eBo5KfN0iMq2"]);
-        for text in [unnamed.clone(), format!("use this one: {unnamed}")] {
+        // A key of some vendor ohjaa knows nothing of, with no prefix and no
+        // name before it: a long token mixing capitals, lower case and
+        // digits, or an id and a secret joined by a dot (`<hex>.<alnum>`, as
+        // some providers issue them; synthetic, like every key here).
+        let unnamed = [
+            fake(&["be3f", "Q9xT2mLk7RvA4nWp8ZcH1sYd6JgU3eBo5KfN0iMq2"]),
+            fake(&[
+                "3f9a1c0b7e2d4f6a",
+                "8b1c3d5e7f9a0b2c",
+                ".",
+                "Xk9Qm2Lp7RtA4nWz",
+            ]),
+            fake(&["3f9a1c0b7e2d4f6a8b1c3d5e", ".", "k9qm2lp7rtaz"]),
+            fake(&["Ab3dE5gH7jK9mN1pQ3sT", "/", "5vW7yZ9bC1dF3hJ5kL7mN9p"]),
+        ];
+        for text in unnamed.iter().flat_map(|key| {
+            [
+                key.clone(),
+                format!("use this one: {key}."),
+                format!("({key})"),
+            ]
+        }) {
+            let unnamed = unnamed
+                .iter()
+                .find(|key| text.contains(key.as_str()))
+                .unwrap();
             let (scrubbed, n) = scrub(&text);
             assert_eq!(n, 1, "{scrubbed}");
-            assert!(!scrubbed.contains(&unnamed), "{scrubbed}");
+            assert!(!scrubbed.contains(unnamed.as_str()), "{scrubbed}");
         }
         // Two in one message are two.
         assert_eq!(scrub(&format!("{} and {}", cases[2].1, cases[7].1)).1, 2);
@@ -2687,13 +2702,20 @@ mod tests {
             "the AKIA prefix names an AWS key",
             "eyJ is how base64 JSON starts",
             "monkey Ab3dE5gH7jK9mN1pQ3sT",
-            // Long names and hashes people write, mixed or long as they are.
-            "see ProjectManagementDashboardSettingsV2Controller for it",
-            "test_the_cursor_moves_only_past_what_was_handled_and_never_back_2",
+            // Hashes and ids in either case, and long names and paths with no
+            // capital, digit or long segment that mixes them.
+            "1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F9A0B and 8C1F2E3A-4B5C-4D6E-8F70-123456789ABC",
             "sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-            "Base64EncodedSha256DigestOfTheTree is the field",
-            "AKIAIOSFODNN7EXAMPLE2026Q3RotationScheduleV2",
-            "MyS3BucketPolicyForEu1WestReplication2 x86_64AppleDarwin23NightlyToolchain2026",
+            "image sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "a 9f86d081884c7d659a2f.feaa0c55ad01 short id",
+            "test_the_cursor_moves_only_past_what_was_handled_and_never_back_2",
+            "/Users/yair/projects/_worktrees/ohjaa-intake-vessa/src/IntakeVessa2/main.rs",
+            "~/.codex/sessions/2026/10/26/rollout-2026-10-26T10-00-00-8c1f2e3a.jsonl",
+            "ProjectManagementDashboardSettingsController is long but has no digit",
+            // A path is judged by the pieces of its names: versioned and dated
+            // file names are made of short words.
+            "/Users/yair/Downloads/Ohjaa-1.2.3-macOS-arm64-applesilicon.zip",
+            "~/Desktop/2026-10-26T10-20-33Z_Screen-Recording-8c1f2e3a-Final.mov",
         ] {
             assert_eq!(scrub(text), (text.to_owned(), 0), "{text}");
         }
