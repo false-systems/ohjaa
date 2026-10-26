@@ -346,6 +346,11 @@ pub struct Left {
     /// was observed, not when it ended, and nothing it did was observed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub orphaned: bool,
+    /// The agent's own sessions it ran, found in the agent's transcripts at
+    /// leaving, or at the launch that closed it as orphaned (D7). Older
+    /// records have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<crate::usage::Native>,
 }
 
 impl Left {
@@ -365,6 +370,7 @@ impl Left {
             observed: Vec::new(),
             shared: Vec::new(),
             orphaned: true,
+            native: None,
         }
     }
 }
@@ -1080,6 +1086,28 @@ fn describe_landed(landed: &Landed) -> String {
     }
 }
 
+/// The agent's own sessions, as leaving found them, or why none is named.
+fn native_lines(native: &crate::usage::Native, out: &mut String) {
+    for found in &native.sessions {
+        let mut said = Vec::new();
+        if found.resumed {
+            said.push("resumed".to_owned());
+        }
+        if let Some(from) = &found.forked_from {
+            said.push(format!("a fork of {from}"));
+        }
+        let said = if said.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", said.join(", "))
+        };
+        let _ = writeln!(out, "native        {} {}{said}", found.agent, found.session_id);
+    }
+    if let Some(why) = &native.why {
+        let _ = writeln!(out, "native        {why}");
+    }
+}
+
 fn landed_lines(label: &str, landed: &[Landed], out: &mut String) {
     for landed in landed {
         let _ = writeln!(
@@ -1285,6 +1313,9 @@ pub fn render_record_with(
         }
         if let Some(toimija) = &left.toimija_session {
             let _ = writeln!(out, "toimija       {toimija}");
+        }
+        if let Some(native) = &left.native {
+            native_lines(native, &mut out);
         }
     }
     out.push_str(&render_validations(
@@ -2014,6 +2045,7 @@ mod tests {
             observed: Vec::new(),
             shared: Vec::new(),
             orphaned: false,
+            native: None,
         });
         session
     }
@@ -2064,6 +2096,7 @@ mod tests {
             observed: Vec::new(),
             shared: Vec::new(),
             orphaned: false,
+            native: None,
         });
         let record = render_record(&s);
         assert!(
@@ -2504,6 +2537,7 @@ mod tests {
             observed: Vec::new(),
             shared: Vec::new(),
             orphaned: false,
+            native: None,
         });
         let record = render_record(&s);
         let observed = record.find("─ observed").unwrap();
