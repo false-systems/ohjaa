@@ -385,11 +385,17 @@ fn time_of(value: &Value) -> Option<i64> {
 fn is_reply(agent: Agent, record: &Value) -> bool {
     match agent {
         Agent::Claude => record["type"] == "assistant",
+        // The model's own output, and what follows a call it made. Codex's
+        // own additions before the launch prompt (its tools, instructions)
+        // are not replies.
         Agent::Codex => {
             let payload = &record["payload"];
+            let kind = payload["type"].as_str().unwrap_or_default();
             record["type"] == "response_item"
-                && !(payload["type"] == "message"
-                    && matches!(payload["role"].as_str(), Some("user" | "developer")))
+                && (payload["role"] == "assistant"
+                    || matches!(kind, "reasoning" | "agent_message" | "compaction")
+                    || kind.ends_with("_call")
+                    || kind.ends_with("_call_output"))
         }
         Agent::Pi => {
             record["type"] == "message"
@@ -1273,6 +1279,11 @@ mod tests {
                 json!({"type": "session_meta", "timestamp": at(1_000), "payload": {
                     "id": id, "session_id": id, "timestamp": at(1_000),
                     "cwd": sandbox.cwd(), "source": "cli"}}),
+                json!({"type": "event_msg", "timestamp": at(1_050),
+                       "payload": {"type": "task_started"}}),
+                // Real rollouts give the tools before the instructions.
+                json!({"type": "response_item", "timestamp": at(1_060), "payload": {
+                    "type": "additional_tools", "role": "developer", "tools": []}}),
                 message("developer", 1_100, "You are Codex, a coding agent."),
                 message(
                     "developer",
