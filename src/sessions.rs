@@ -1101,7 +1101,11 @@ fn native_lines(native: &crate::usage::Native, out: &mut String) {
         } else {
             format!(" ({})", said.join(", "))
         };
-        let _ = writeln!(out, "native        {} {}{said}", found.agent, found.session_id);
+        let _ = writeln!(
+            out,
+            "native        {} {}{said}",
+            found.agent, found.session_id
+        );
     }
     if let Some(why) = &native.why {
         let _ = writeln!(out, "native        {why}");

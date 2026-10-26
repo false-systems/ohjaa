@@ -559,14 +559,15 @@ pub fn find_native(launch: &Launch, stores: &Stores) -> Native {
             "not looked for: opencode keeps its sessions in SQLite, which ohjaa does not read"
                 .to_owned()
         } else {
-            format!("not looked for: ohjaa reads the transcripts of claude, codex and pi, not {name}")
+            format!(
+                "not looked for: ohjaa reads the transcripts of claude, codex and pi, not {name}"
+            )
         });
     };
     let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
     let folder = canonical(launch.folder);
-    let within = |at: Option<i64>| {
-        at.is_some_and(|at| at >= launch.started_ms && at <= launch.until_ms)
-    };
+    let within =
+        |at: Option<i64>| at.is_some_and(|at| at >= launch.started_ms && at <= launch.until_ms);
     let (paths, mut problems) = stores.transcripts(agent, launch.started_ms);
     let (mut here, mut own, mut forks) = (0, Vec::new(), Vec::new());
     for path in paths {
@@ -653,7 +654,9 @@ pub fn find_native(launch: &Launch, stores: &Stores) -> Native {
     if launch.unbriefed {
         why.push_str("; it was launched with --no-briefing, so no launch prompt names it");
     } else if agent == Agent::Pi {
-        why.push_str("; toimija gives pi a launch prompt only where its `agents:` config names one");
+        why.push_str(
+            "; toimija gives pi a launch prompt only where its `agents:` config names one",
+        );
     }
     if let Some(unread) = unread {
         why.push_str("; ");
@@ -705,5 +708,354 @@ mod tests {
         std::fs::write(&path, RECEIPT).unwrap();
         assert!(Receipt::read(&path).is_ok());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- the agent's own sessions ------------------------------------------
+
+    use serde_json::json;
+
+    const OURS: &str = "oh-1790000000000-42";
+    const STARTED: i64 = 1_790_000_000_000;
+
+    /// A record's time, `ms` after the launch.
+    fn at(ms: i64) -> String {
+        let ms = STARTED + ms;
+        format!(
+            "{}.{:03}Z",
+            crate::intake::rfc3339(ms.div_euclid(1000)).trim_end_matches('Z'),
+            ms.rem_euclid(1000)
+        )
+    }
+
+    /// The launch prompt the briefing gives, naming `session`.
+    fn prompt(session: &str) -> String {
+        format!(
+            "## Before anything else\nHow this session works (ohjaa):\n{}; its intent is \
+             in-1, new.\n",
+            handshake(session)
+        )
+    }
+
+    /// Agents' stores and a launch folder in a sandbox of their own.
+    struct Sandbox {
+        dir: PathBuf,
+        folder: PathBuf,
+        stores: Stores,
+    }
+
+    impl Sandbox {
+        fn new(tag: &str) -> Sandbox {
+            let dir = std::env::temp_dir().join(format!(
+                "ohjaa-native-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let folder = dir.join("work");
+            std::fs::create_dir_all(&folder).unwrap();
+            let folder = std::fs::canonicalize(folder).unwrap();
+            let stores = Stores {
+                claude: Some(dir.join("claude")),
+                codex: Some(dir.join("codex")),
+                pi: Some(dir.join("pi")),
+            };
+            Sandbox {
+                dir,
+                folder,
+                stores,
+            }
+        }
+
+        fn cwd(&self) -> String {
+            self.folder.display().to_string()
+        }
+
+        fn write(&self, relative: &str, records: &[Value]) -> PathBuf {
+            let path = self.dir.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let lines: String = records.iter().map(|r| format!("{r}\n")).collect();
+            std::fs::write(&path, lines).unwrap();
+            path
+        }
+
+        fn find(&self, agent: &str) -> Native {
+            self.find_as(agent, OURS)
+        }
+
+        fn find_as(&self, agent: &str, session: &str) -> Native {
+            find_native(
+                &Launch {
+                    session,
+                    agent,
+                    folder: &self.folder,
+                    started_ms: STARTED,
+                    until_ms: STARTED + 3_600_000,
+                    unbriefed: false,
+                },
+                &self.stores,
+            )
+        }
+
+        /// A Claude transcript as Claude Code writes one: records with no
+        /// time first, then its start, then the launch prompt.
+        fn claude(&self, id: &str, began: i64, prompt_at: i64, text: &str) -> PathBuf {
+            self.write(
+                &format!("claude/projects/-work/{id}.jsonl"),
+                &[
+                    json!({"type": "mode", "sessionId": id}),
+                    json!({"type": "attachment", "sessionId": id, "cwd": self.cwd(),
+                           "timestamp": at(began), "isSidechain": false}),
+                    json!({"type": "user", "sessionId": id, "cwd": self.cwd(),
+                           "timestamp": at(prompt_at), "isSidechain": false,
+                           "message": {"role": "user", "content": text}}),
+                ],
+            )
+        }
+
+        fn ids(native: &Native) -> Vec<&str> {
+            native
+                .sessions
+                .iter()
+                .map(|s| s.session_id.as_str())
+                .collect()
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn the_briefing_names_its_session_once_and_never_a_longer_id() {
+        let said = prompt(OURS);
+        assert_eq!(named(&said), [OURS]);
+        assert!(named(&said.replace(OURS, &format!("{OURS}7"))) != [OURS]);
+        assert!(
+            named(&handshake(OURS)).is_empty(),
+            "without its semicolon it is not the briefing's"
+        );
+    }
+
+    #[test]
+    fn claude_names_the_transcript_holding_the_launch_prompt_and_never_a_subagent() {
+        let sandbox = Sandbox::new("claude");
+        let parent = "5e1976e4-71c3-407c-9533-0be05b7e1b70";
+        sandbox.claude(parent, 1_000, 1_200, &prompt(OURS));
+        // A subagent's transcript, below its parent's, is its parent's work:
+        // even holding the prompt, it names no session of its own.
+        sandbox.write(
+            &format!("claude/projects/-work/{parent}/subagents/agent-a1.jsonl"),
+            &[
+                json!({"type": "user", "sessionId": parent, "agentId": "a1", "cwd": sandbox.cwd(),
+                   "timestamp": at(5_000), "isSidechain": true,
+                   "message": {"role": "user", "content": prompt(OURS)}}),
+            ],
+        );
+        // Another session here that read this one's briefing in a tool's
+        // output: a quote, not its launch prompt.
+        let reader = "0110dda8-f629-4d09-afb6-0b86272ad560";
+        sandbox.write(
+            &format!("claude/projects/-work/{reader}.jsonl"),
+            &[
+                json!({"type": "user", "sessionId": reader, "cwd": sandbox.cwd(),
+                "timestamp": at(9_000), "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t", "content": prompt(OURS)}]}}),
+            ],
+        );
+        let native = sandbox.find("/usr/local/bin/claude");
+        assert_eq!(Sandbox::ids(&native), [parent], "{native:#?}");
+        let found = &native.sessions[0];
+        assert_eq!(found.agent, "claude");
+        assert!(!found.resumed && found.forked_from.is_none(), "{found:#?}");
+        assert!(found.source.ends_with(&format!("{parent}.jsonl")));
+        assert_eq!(native.why, None);
+    }
+
+    #[test]
+    fn codex_names_the_rollout_and_a_subagent_folds_into_its_root_thread() {
+        let sandbox = Sandbox::new("codex");
+        let root = "01a13f11-2653-7a82-8fc1-46bbc7669b3e";
+        let meta = |id: &str, source: Value| {
+            json!({"type": "session_meta", "timestamp": at(900), "payload": {
+                "id": id, "session_id": root, "timestamp": at(800), "cwd": sandbox.cwd(),
+                "source": source, "originator": "codex-tui"}})
+        };
+        let developer = |ms: i64| {
+            json!({"type": "response_item", "timestamp": at(ms), "payload": {
+                "type": "message", "role": "developer",
+                "content": [{"type": "input_text", "text": prompt(OURS)}]}})
+        };
+        sandbox.write(
+            &format!("codex/sessions/2026/09/21/rollout-2026-09-21T12-00-00-{root}.jsonl"),
+            &[meta(root, json!("cli")), developer(1_000)],
+        );
+        sandbox.write(
+            "codex/sessions/2026/09/21/rollout-2026-09-21T12-05-00-019a.jsonl",
+            &[
+                meta(
+                    "019a",
+                    json!({"subagent": {"thread_spawn": {"parent_thread_id": root, "depth": 1}}}),
+                ),
+                developer(300_000),
+            ],
+        );
+        let native = sandbox.find("codex");
+        assert_eq!(Sandbox::ids(&native), [root], "{native:#?}");
+    }
+
+    #[test]
+    fn pi_names_the_session_whose_first_message_is_the_launch_prompt() {
+        let sandbox = Sandbox::new("pi");
+        let id = "01a13c9b-12d8-76df-8f14-1dafced94cfe";
+        sandbox.write(
+            &format!("pi/sessions/--work--/2026-09-21T12-00-01-000Z_{id}.jsonl"),
+            &[
+                json!({"type": "session", "version": 3, "id": id, "timestamp": at(1_000),
+                       "cwd": sandbox.cwd()}),
+                json!({"type": "message", "id": "m1", "parentId": null, "timestamp": at(1_100),
+                       "message": {"role": "user", "content": [
+                           {"type": "text", "text": prompt(OURS)}]}}),
+            ],
+        );
+        assert_eq!(Sandbox::ids(&sandbox.find("pi")), [id]);
+        // Another launch names nothing here, and says why, with pi's limit.
+        let other = sandbox.find_as("pi", "oh-1790000000000-43");
+        assert!(other.sessions.is_empty());
+        let why = other.why.unwrap();
+        assert!(
+            why.starts_with("none found: none of the 1 pi transcript(s)")
+                && why.contains("toimija gives pi a launch prompt only where"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn two_sessions_that_each_hold_the_launch_prompt_name_neither() {
+        let sandbox = Sandbox::new("ambiguous");
+        sandbox.claude(
+            "aaaaaaaa-0000-0000-0000-000000000001",
+            1_000,
+            1_200,
+            &prompt(OURS),
+        );
+        sandbox.claude(
+            "aaaaaaaa-0000-0000-0000-000000000002",
+            2_000,
+            2_200,
+            &prompt(OURS),
+        );
+        let native = sandbox.find("claude");
+        assert!(native.sessions.is_empty(), "never picked: {native:#?}");
+        assert_eq!(
+            native.why.as_deref(),
+            Some(
+                "ambiguous: 2 claude sessions each hold its launch prompt \
+                 (aaaaaaaa-0000-0000-0000-000000000001, aaaaaaaa-0000-0000-0000-000000000002); \
+                 none is named"
+            )
+        );
+    }
+
+    #[test]
+    fn a_resumed_session_is_named_and_said_resumed() {
+        let sandbox = Sandbox::new("resumed");
+        let id = "b4e4122a-4154-41f2-b642-c1a5632a7f0d";
+        // Begun a day before the launch, under another ohjaa session, and
+        // resumed by this one: its prompt appended to the same transcript.
+        let path = sandbox.claude(id, -86_400_000, -86_399_000, &prompt("oh-1789913600000-7"));
+        let mut lines = std::fs::read_to_string(&path).unwrap();
+        lines.push_str(&format!(
+            "{}\n",
+            json!({"type": "user", "sessionId": id, "cwd": sandbox.cwd(),
+                   "timestamp": at(3_000), "message": {"role": "user", "content": prompt(OURS)}})
+        ));
+        std::fs::write(&path, lines).unwrap();
+        let native = sandbox.find("claude");
+        assert_eq!(Sandbox::ids(&native), [id], "{native:#?}");
+        assert!(native.sessions[0].resumed);
+    }
+
+    #[test]
+    fn a_fork_begun_in_the_session_is_named_beside_its_parent() {
+        let sandbox = Sandbox::new("fork");
+        let parent = "11e3a29a-fc6b-40a4-ab3e-3ecf8bb88566";
+        sandbox.claude(parent, 1_000, 1_200, &prompt(OURS));
+        // A fork copies its parent's records, the launch prompt with them,
+        // each marked with where it came from; then records of its own.
+        let fork = |id: &str, own_at: i64| {
+            let copied = json!({"sessionId": parent, "messageUuid": "u1"});
+            sandbox.write(
+                &format!("claude/projects/-work/{id}.jsonl"),
+                &[
+                    json!({"type": "user", "sessionId": id, "cwd": sandbox.cwd(),
+                           "timestamp": at(1_200), "forkedFrom": copied,
+                           "message": {"role": "user", "content": prompt(OURS)}}),
+                    json!({"type": "assistant", "sessionId": id, "cwd": sandbox.cwd(),
+                           "timestamp": at(own_at), "message": {"role": "assistant",
+                           "content": [{"type": "text", "text": "ok"}]}}),
+                ],
+            );
+        };
+        let child = "22e3a29a-fc6b-40a4-ab3e-3ecf8bb88566";
+        fork(child, 600_000);
+        // A fork begun after the session ended is another session's.
+        fork("33e3a29a-fc6b-40a4-ab3e-3ecf8bb88566", 7_200_000);
+        let native = sandbox.find("claude");
+        assert_eq!(Sandbox::ids(&native), [parent, child], "{native:#?}");
+        assert_eq!(native.sessions[1].forked_from.as_deref(), Some(parent));
+        assert!(!native.sessions[1].resumed);
+    }
+
+    #[test]
+    fn a_prompt_outside_the_launch_folder_or_its_time_names_nothing() {
+        let sandbox = Sandbox::new("elsewhere");
+        let id = "cccccccc-0000-0000-0000-000000000001";
+        // Its prompt, said before the launch: another launch's word.
+        sandbox.claude(id, -5_000, -4_000, &prompt(OURS));
+        // The same prompt in another folder.
+        let elsewhere = sandbox.dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        sandbox.write(
+            "claude/projects/-elsewhere/dddddddd-0000-0000-0000-000000000001.jsonl",
+            &[
+                json!({"type": "user", "sessionId": "dddddddd-0000-0000-0000-000000000001",
+                "cwd": elsewhere.display().to_string(), "timestamp": at(2_000),
+                "message": {"role": "user", "content": prompt(OURS)}}),
+            ],
+        );
+        let native = sandbox.find("claude");
+        assert!(native.sessions.is_empty(), "{native:#?}");
+        assert!(
+            native
+                .why
+                .unwrap()
+                .starts_with("none found: none of the 1 claude transcript(s) written"),
+            "only the one in its folder is counted"
+        );
+    }
+
+    #[test]
+    fn an_agent_whose_transcripts_ohjaa_does_not_read_is_said_not_looked_for() {
+        let sandbox = Sandbox::new("unread");
+        assert_eq!(
+            sandbox.find("opencode").why.as_deref(),
+            Some(
+                "not looked for: opencode keeps its sessions in SQLite, which ohjaa does not read"
+            )
+        );
+        assert_eq!(
+            sandbox.find("sh").why.as_deref(),
+            Some("not looked for: ohjaa reads the transcripts of claude, codex and pi, not sh")
+        );
+        // A store never written is no transcript, not a failure.
+        assert!(sandbox
+            .find("codex")
+            .why
+            .unwrap()
+            .starts_with("none found: none of the 0 codex transcript(s)"));
     }
 }
