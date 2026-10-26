@@ -5649,7 +5649,7 @@ fn every_command_stays_within_its_git_budget() {
     write_executable(
         &sandbox.dir.join("bin/vessa"),
         "#!/bin/sh\necho \"$*\" >> \"$SANDBOX/vessa-calls\"\n\
-         echo '{\"schema\":\"vessa-usage.v1\",\"warnings\":[],\"sessions\":[]}'\n",
+         echo '{\"schema\":\"vessa-session-headers.v1\",\"warnings\":[],\"sessions\":[]}'\n",
     );
     let (gated, bare) = sandbox.repo("acme", "gated", &[("sykli.json", "{}\n")]);
     let (own, _) = sandbox.repo("acme", "own", &[("sykli.json", "{}\n")]);
