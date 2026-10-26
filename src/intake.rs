@@ -816,13 +816,16 @@ pub struct Failing {
     pub why: String,
 }
 
-/// What earlier runs did with each candidate, kept until no later run can
-/// find it again: answered for, or failed alone (set aside once it has failed
-/// `MAX_ATTEMPTS` times).
+/// What earlier runs did with each candidate: answered for (kept until no
+/// later run can find it again), or failed alone (kept until the drafter
+/// answers for it; set aside once it has failed `MAX_ATTEMPTS` times).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Handled {
     answered: BTreeSet<Key>,
     failing: BTreeMap<Key, Failing>,
+    /// This run sends the set-aside candidates again (`--retry-failed`):
+    /// until it is done drafting, they are not done with. Never kept.
+    retrying: bool,
 }
 
 impl Handled {
@@ -833,10 +836,11 @@ impl Handled {
 
     fn has(&self, key: &Key) -> bool {
         self.answered.contains(key)
-            || self
-                .failing
-                .get(key)
-                .is_some_and(|f| f.attempts >= MAX_ATTEMPTS)
+            || (!self.retrying
+                && self
+                    .failing
+                    .get(key)
+                    .is_some_and(|f| f.attempts >= MAX_ATTEMPTS))
     }
 
     fn answer(&mut self, chunk: &[Candidate]) {
@@ -866,20 +870,26 @@ impl Handled {
             .filter(|(_, f)| f.attempts >= MAX_ATTEMPTS)
     }
 
-    /// Forget every failure, so those candidates are sent again; how many.
-    pub fn retry_failed(&mut self) -> usize {
-        let forgotten = self.failing.len();
-        self.failing.clear();
-        forgotten
+    /// Send the set-aside candidates again in this run, from their records,
+    /// which stay until the drafter answers for them.
+    pub fn retry_failed(&mut self) {
+        self.retrying = true;
+    }
+
+    /// Drafting is done: a set-aside candidate the drafter failed on again
+    /// is set aside again.
+    pub fn done_retrying(&mut self) {
+        self.retrying = false;
     }
 
     fn is_empty(&self) -> bool {
         self.answered.is_empty() && self.failing.is_empty()
     }
 
+    /// Forget answered keys that `keep` does not; a failure stays until the
+    /// drafter answers for it, so a retry can find it.
     fn retain(&mut self, keep: impl Fn(&Key) -> bool) {
         self.answered.retain(|key| keep(key));
-        self.failing.retain(|key, _| keep(key));
     }
 }
 
@@ -1101,7 +1111,7 @@ pub fn settle(
             s.whole
                 && s.members
                     .as_ref()
-                    .is_some_and(|members| members.iter().all(|key| handled.has(key)))
+                    .is_some_and(|members| members.iter().all(|key| handled.answered.contains(key)))
         })
         .map(|s| s.id.clone())
         .collect();
@@ -1960,6 +1970,10 @@ mod tests {
         /// Every transcript read: each session's whole window.
         whole: bool,
         fail: Fail,
+        /// `--retry-failed`.
+        retry: bool,
+        /// The drafter still refuses the world's poison candidates.
+        poisoned: bool,
     }
 
     struct Ran {
@@ -1980,7 +1994,7 @@ mod tests {
             .filter(|c| !handled.contains(c))
             .map(|c| {
                 let attempts = handled.failing.get(&c.key()).map_or(0, |f| f.attempts);
-                usize::from(MAX_ATTEMPTS + 1 - attempts)
+                usize::from((MAX_ATTEMPTS + 1).saturating_sub(attempts).max(1))
             })
             .sum()
     }
@@ -2035,12 +2049,43 @@ mod tests {
         );
         candidates.extend(handover_candidates(&queued));
         candidates.extend(observed_candidates(&queued));
+        // A retry reads back to the oldest candidate set aside, for those
+        // alone, as `cmd_intake` does.
+        let retry: HashSet<Key> = if plan.retry {
+            state.handled.set_aside().map(|(key, _)| *key).collect()
+        } else {
+            HashSet::new()
+        };
+        if let Some(floor) = retry
+            .iter()
+            .map(|key| key.at_ms - 1)
+            .min()
+            .filter(|floor| *floor < since)
+        {
+            candidates.extend(
+                visible()
+                    .filter(|c| c.at_ms > floor && retry.contains(&c.key()))
+                    .cloned(),
+            );
+            candidates.extend(
+                world
+                    .reported
+                    .iter()
+                    .filter(|(landed, c)| {
+                        *landed > floor && *landed <= now && retry.contains(&c.key())
+                    })
+                    .map(|(_, c)| c.clone()),
+            );
+        }
         let found = found(candidates);
 
-        let before = found.iter().filter(|c| !state.handled.contains(c)).count();
-        let work_before = work(&found, &state.handled);
         let mut handled = state.handled.clone();
-        let mut durable = state.handled.clone();
+        if plan.retry {
+            handled.retry_failed();
+        }
+        let before = found.iter().filter(|c| !handled.contains(c)).count();
+        let work_before = work(&found, &state.handled);
+        let mut durable = handled.clone();
         let (mut sends, mut keeps, mut killed) = (0, 0, false);
         let (kept, aside, alone) = (&seen.kept, &seen.aside, &mut seen.alone);
         let drafted = draft_pending(
@@ -2057,7 +2102,7 @@ mod tests {
                         c.text
                     );
                     assert!(
-                        !aside.contains(&c.key()),
+                        plan.retry || !aside.contains(&c.key()),
                         "`{}` sent after it was set aside",
                         c.text
                     );
@@ -2069,7 +2114,8 @@ mod tests {
                     Fail::Once(n) => n == sends,
                     Fail::Outage(n) => sends >= n,
                     _ => false,
-                } || chunk.iter().any(|c| world.poison.contains(&c.key()));
+                } || (plan.poisoned
+                    && chunk.iter().any(|c| world.poison.contains(&c.key())));
                 if refused {
                     if let [one] = chunk {
                         *alone.entry(one.key()).or_default() += 1;
@@ -2092,6 +2138,7 @@ mod tests {
         seen.aside.extend(durable.set_aside().map(|(key, _)| *key));
         if killed {
             // Only what was kept survives the kill.
+            durable.done_retrying();
             state.handled = durable;
             return Ran {
                 before,
@@ -2104,6 +2151,7 @@ mod tests {
             durable, handled,
             "every answer and every failure alone was kept before the next send"
         );
+        handled.done_retrying();
         let taken = before.min(plan.cap);
         let failed = drafted.failed.len();
         if matches!(plan.fail, Fail::None | Fail::Once(_)) {
@@ -2192,6 +2240,8 @@ mod tests {
                         4 | 5 => Fail::Killed(1 + rng.below(3) as usize),
                         _ => Fail::None,
                     },
+                    retry: false,
+                    poisoned: true,
                 };
                 run(&world, &mut state, now, &plan, &mut seen);
                 cursors.push(state.cursor);
@@ -2212,6 +2262,8 @@ mod tests {
                     complete: true,
                     whole: true,
                     fail: Fail::None,
+                    retry: false,
+                    poisoned: true,
                 };
                 let ran = run(&world, &mut state, now, &plan, &mut seen);
                 cursors.push(state.cursor);
@@ -2227,10 +2279,30 @@ mod tests {
                 cursors.windows(2).all(|pair| pair[0] <= pair[1]),
                 "seed {seed}: the cursor moved back: {cursors:?}"
             );
-            // Every session was drafted from, and every candidate there was
-            // to draft from was drafted from or set aside, never both: those
-            // said after the first window began, and every session's own.
-            assert_eq!(state.drafted.len(), world.sessions.len(), "seed {seed}");
+            // Every session was drafted from but those holding a candidate set
+            // aside, which stay queued so that a retry finds it; and every
+            // candidate there was to draft from was drafted from or set aside,
+            // never both: those said after the first window began, and every
+            // session's own.
+            let holding: HashSet<&str> = world
+                .sessions
+                .iter()
+                .filter(|s| {
+                    members(&s.at(world.end), &world.said)
+                        .iter()
+                        .any(|key| seen.aside.contains(key))
+                })
+                .map(|s| s.id.as_str())
+                .collect();
+            assert!(
+                holding.iter().all(|id| !state.drafted.contains(*id)),
+                "seed {seed}: drafted while holding one set aside"
+            );
+            assert_eq!(
+                state.drafted.len() + holding.len(),
+                world.sessions.len(),
+                "seed {seed}"
+            );
             let mut owed: HashSet<Key> = world
                 .said
                 .iter()
@@ -2276,7 +2348,48 @@ mod tests {
                 complete: true,
                 whole: true,
                 fail: Fail::None,
+                retry: false,
+                poisoned: true,
             };
+            let ran = run(&world, &mut state, now, &plan, &mut seen);
+            assert_eq!((ran.before, ran.sent), (0, 0), "seed {seed}");
+            // Kept: what is set aside, until the drafter answers, and what a
+            // session still queued may bring back (not before it started).
+            let floor = world
+                .sessions
+                .iter()
+                .filter(|s| holding.contains(s.id.as_str()))
+                .map(|s| s.started)
+                .min()
+                .unwrap_or(i64::MAX);
+            assert!(
+                state.handled.answered.iter().all(|key| key.at_ms >= floor),
+                "seed {seed}"
+            );
+            assert_eq!(state.handled.failing.len(), seen.aside.len(), "seed {seed}");
+            // Then the drafter takes them: one `--retry-failed` sends every one
+            // set aside again, however far the cursor has moved past it, and
+            // the sessions holding them are drafted from at last.
+            now += 1_000;
+            let retry = Plan {
+                cap: 10_000,
+                batch: 1 + rng.below(4) as usize,
+                complete: true,
+                whole: true,
+                fail: Fail::None,
+                retry: true,
+                poisoned: false,
+            };
+            let ran = run(&world, &mut state, now, &retry, &mut seen);
+            assert_eq!(
+                ran.sent,
+                seen.aside.len(),
+                "seed {seed}: not all sent again"
+            );
+            assert_eq!(state.handled.set_aside().count(), 0, "seed {seed}");
+            assert_eq!(state.drafted.len(), world.sessions.len(), "seed {seed}");
+            assert!(seen.aside.is_subset(&seen.kept), "seed {seed}");
+            now += 1_000;
             let ran = run(&world, &mut state, now, &plan, &mut seen);
             assert_eq!((ran.before, ran.sent), (0, 0), "seed {seed}");
             assert!(state.handled.is_empty(), "seed {seed}: {:?}", state.handled);
@@ -2333,6 +2446,8 @@ mod tests {
             complete: true,
             whole: true,
             fail: Fail::None,
+            retry: false,
+            poisoned: true,
         };
         let mut lefts = Vec::new();
         for run_number in 1..=5 {

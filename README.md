@@ -142,9 +142,12 @@ killed between an answer and that write sends that one batch again.
 **A refused batch is split.** When the drafter fails or answers no drafts, the
 batch is split in halves, down to the candidate it fails on. That candidate
 is tried again in later runs. After failing alone three times it is set
-aside, and said by its time and source in every run after; `--retry-failed`
-sends set-aside candidates again. A run stops when it gets no answer at all,
-or when two candidates fail alone in a row; what came before is kept.
+aside, and said by its time and source in every run after. Its record is kept
+until the drafter answers for it, and a session holding one stays queued.
+`--retry-failed` sends every set-aside candidate again: it reads back to the
+oldest one, however far the cursor has moved past it. One that fails again
+stays set aside. A run stops when it gets no answer at all, or when two
+candidates fail alone in a row; what came before is kept.
 
 **Every run makes progress while the drafter answers**, and repeated runs
 drain the queue. A run exits 4 when it leaves work for the next, sets a
@@ -155,9 +158,11 @@ intake runs at a time: a second says `intake already running` and exits 3.
 **One cursor covers every source** (`intake-since`). It moves only after a run
 that read all four sources, none with a warning, and then only past
 candidates that were handled, never back.
-- A run with `--source`, or with a warning, leaves the cursor where it was.
-  So a warning that recurs on every run keeps the window growing until it is
-  fixed.
+- A run with `--source`, or with a warning, leaves the cursor where it was,
+  and says so: where it stays, since when, and which source holds it. So a
+  warning that recurs on every run keeps the window growing until it is fixed.
+- With no repositories under the roots, reviews and reverts warn, and hold
+  the cursor: nothing read is not nothing there.
 - The report's own gaps are said, and do not hold the cursor.
 - A first run, with no cursor yet, keeps the start of its window (fourteen
   days back) as the cursor before it drafts.
@@ -407,9 +412,10 @@ what was said in its window, and what ohjaa observed going wrong in it (source
 request head (never what could not be checked, nor what is not shown to be the
 session's); a non-zero exit; a missing handover; an orphaned session. Those are
 facts, not anyone's words, and the drafter is told so. A session is marked
-drafted from once each of its candidates has been answered for or set aside,
-in however many runs that takes, and only by a run that read every
-transcript; until then it stays queued.
+drafted from once the drafter has answered for each of its candidates, in
+however many runs that takes, and only by a run that read every transcript;
+until then it stays queued (one set aside keeps it queued, so that a retry
+finds it).
 
 Signals and the terminal, while a session runs (unix). The session's process
 group is apart from ohjaa's, so ohjaa does with the terminal what a
