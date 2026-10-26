@@ -6028,12 +6028,28 @@ fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
     let fixture = Fixture::new("shared-checkout");
     let repo = fixture.make_git_repo("work");
     let mark = |name: &str| fixture.dir.join(name);
-    let agent = |me: &str, other: &str| {
+    // Both sessions are in the checkout while each makes a worktree and a
+    // commit there, one after the other (`after`: the mark it waits for).
+    // Never at once: two `git worktree add`s in one repository race in git
+    // itself, each reading the other's admin folder while it is written
+    // ("fatal: failed to read .git/worktrees/y/commondir"). An agent that
+    // stops early still says it is done, so the other one, and this test,
+    // never wait for it for ever: the test fails, with both records,
+    // instead of hanging.
+    let agent = |me: &str, other: &str, after: Option<&str>| {
+        let turn = after.map_or_else(String::new, |after| {
+            format!(
+                "while [ ! -e '{}' ]; do sleep 0.1; done",
+                mark(after).display()
+            )
+        });
         format!(
             "set -e
+            trap \"touch '{done}'\" EXIT
             touch '{started}'
             while [ ! -e '{their_start}' ]; do sleep 0.1; done
             sleep 1
+            {turn}
             git worktree add -q -b {me} '{wt}'
             cd '{wt}' && echo {me} > {me}.txt && git add {me}.txt && git commit -q -m {me}
             git rev-parse --short=7 HEAD > '{sha}'
@@ -6047,7 +6063,7 @@ fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
             their_done = mark(&format!("{other}-done")).display(),
         )
     };
-    let launch = |me: &str, other: &str| {
+    let launch = |me: &str, other: &str, after: Option<&str>| {
         fixture
             .ohjaa()
             .args([
@@ -6058,7 +6074,7 @@ fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
                 "--no-briefing",
                 "--",
                 "-c",
-                &agent(me, other),
+                &agent(me, other, after),
             ])
             .env("OHJAA_STUB_RUN_AGENT", "1")
             .current_dir(&repo)
@@ -6067,8 +6083,8 @@ fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
             .spawn()
             .unwrap()
     };
-    let x = launch("x", "y");
-    let y = launch("y", "x");
+    let x = launch("x", "y", None);
+    let y = launch("y", "x", Some("x-done"));
     let records: Vec<String> = [x, y]
         .into_iter()
         .map(|child| {
@@ -6077,7 +6093,9 @@ fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
         .collect();
     let sha = |me: &str| {
         fs::read_to_string(mark(&format!("{me}-sha")))
-            .unwrap()
+            .unwrap_or_else(|error| {
+                panic!("{me} made no commit ({error}):\n{}", records.join("\n"))
+            })
             .trim()
             .to_owned()
     };
