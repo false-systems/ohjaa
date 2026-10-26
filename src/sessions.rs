@@ -346,6 +346,11 @@ pub struct Left {
     /// was observed, not when it ended, and nothing it did was observed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub orphaned: bool,
+    /// The agent's own sessions it ran, found in the agent's transcripts at
+    /// leaving, or at the launch that closed it as orphaned (D7). Older
+    /// records have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<crate::usage::Native>,
 }
 
 impl Left {
@@ -365,6 +370,7 @@ impl Left {
             observed: Vec::new(),
             shared: Vec::new(),
             orphaned: true,
+            native: None,
         }
     }
 }
@@ -466,6 +472,23 @@ pub struct Session {
 }
 
 impl Session {
+    /// The last time its record shows it active: its start, its process
+    /// group's, its read-back, its handover, the validations it requested.
+    /// An orphan's end was never observed; this is as far as it was seen.
+    pub fn last_seen_ms(&self) -> i64 {
+        [
+            Some(self.started_ms),
+            self.group_started_ms,
+            self.readback.as_ref().map(|r| r.at_ms),
+            self.handover.as_ref().map(|h| h.at_ms),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.validations.iter().map(|v| v.requested_ms))
+        .max()
+        .unwrap_or(self.started_ms)
+    }
+
     /// When it ended, as far as that was observed, to rank the sessions in a
     /// place: `None` while it runs. An orphan's end was never observed, only
     /// that its ohjaa was gone at some later launch, so it ranks by its start:
@@ -1080,6 +1103,32 @@ fn describe_landed(landed: &Landed) -> String {
     }
 }
 
+/// The agent's own sessions, as leaving found them, or why none is named.
+fn native_lines(native: &crate::usage::Native, out: &mut String) {
+    for found in &native.sessions {
+        let mut said = Vec::new();
+        if found.resumed {
+            said.push("resumed".to_owned());
+        }
+        if let Some(from) = &found.forked_from {
+            said.push(format!("a fork of {from}"));
+        }
+        let said = if said.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", said.join(", "))
+        };
+        let _ = writeln!(
+            out,
+            "native        {} {}{said}",
+            found.agent, found.session_id
+        );
+    }
+    if let Some(why) = &native.why {
+        let _ = writeln!(out, "native        {why}");
+    }
+}
+
 fn landed_lines(label: &str, landed: &[Landed], out: &mut String) {
     for landed in landed {
         let _ = writeln!(
@@ -1285,6 +1334,9 @@ pub fn render_record_with(
         }
         if let Some(toimija) = &left.toimija_session {
             let _ = writeln!(out, "toimija       {toimija}");
+        }
+        if let Some(native) = &left.native {
+            native_lines(native, &mut out);
         }
     }
     out.push_str(&render_validations(
@@ -2014,6 +2066,7 @@ mod tests {
             observed: Vec::new(),
             shared: Vec::new(),
             orphaned: false,
+            native: None,
         });
         session
     }
@@ -2064,6 +2117,7 @@ mod tests {
             observed: Vec::new(),
             shared: Vec::new(),
             orphaned: false,
+            native: None,
         });
         let record = render_record(&s);
         assert!(
@@ -2196,6 +2250,24 @@ mod tests {
             "the one that ended last wins, wherever it was launched"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An orphan is seen as far as its record says: what it last did.
+    #[test]
+    fn an_orphan_was_last_seen_at_the_latest_time_its_record_shows() {
+        let mut s = session("oh-1", "/r/a", 1_000);
+        assert_eq!(s.last_seen_ms(), 1_000);
+        s.group_started_ms = Some(1_500);
+        s.readback = Some(Readback {
+            at_ms: 4_000,
+            text: "x".to_owned(),
+        });
+        assert_eq!(s.last_seen_ms(), 4_000);
+        s.handover = Some(Handover {
+            at_ms: 9_000,
+            ..Handover::default()
+        });
+        assert_eq!(s.last_seen_ms(), 9_000);
     }
 
     #[test]
@@ -2504,6 +2576,7 @@ mod tests {
             observed: Vec::new(),
             shared: Vec::new(),
             orphaned: false,
+            native: None,
         });
         let record = render_record(&s);
         let observed = record.find("─ observed").unwrap();

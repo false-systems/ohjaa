@@ -378,6 +378,10 @@ impl Fixture {
         );
         command
             .env("HOME", self.dir.join("home"))
+            // The agents' own stores, read at leaving, are the sandbox HOME's.
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CODEX_HOME")
+            .env_remove("PI_CODING_AGENT_DIR")
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
             .env("OHJAA_OURS", self.dir.join("ours"))
@@ -1721,6 +1725,129 @@ fn leaving_picks_up_a_fresh_receipt_without_changing_the_agent_exit() {
     );
     assert_eq!(code, Some(1));
     assert!(stderr.contains("already exists"), "{stderr}");
+    fixture.cleanup();
+}
+
+/// A stand-in `claude`: it keeps its launch prompt in its transcript, as
+/// Claude Code does, in the sandbox HOME. The real launch prompt is
+/// toimija's, with ohjaa's briefing in it; the stub toimija passes none, so
+/// this one says the briefing's handshake from `OHJAA_SESSION` itself. With
+/// OHJAA_FAKE_KILL_OHJAA set it then kills the ohjaa that launched it.
+const FAKE_CLAUDE: &str = r#"#!/bin/sh
+dir="$HOME/.claude/projects/-work"
+mkdir -p "$dir"
+now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+printf '{"type":"user","sessionId":"%s","cwd":"%s","timestamp":"%s","isSidechain":false,"message":{"role":"user","content":"How this session works (ohjaa):\\nThis session is %s; its intent is in-1, new."}}\n' \
+  "$OHJAA_FAKE_NATIVE" "$(pwd -P)" "$now" "$OHJAA_SESSION" >> "$dir/$OHJAA_FAKE_NATIVE.jsonl"
+if [ -n "${OHJAA_FAKE_KILL_OHJAA:-}" ]; then kill -9 "$PPID"; fi
+exit 0
+"#;
+
+fn fake_claude(fixture: &Fixture) {
+    let path = fixture.stub_dir.join("claude");
+    fs::write(&path, FAKE_CLAUDE).unwrap();
+    make_executable(&path);
+}
+
+/// D7: leaving names the agent's own session, found by the launch prompt in
+/// its transcript, in the record and in the export, as the receipts' are.
+#[test]
+fn leaving_names_the_agents_own_session_from_its_launch_prompt() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("native");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    fake_claude(&fixture);
+    let native = "5e1976e4-71c3-407c-9533-0be05b7e1b70";
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "claude", "--intent", "native"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_FAKE_NATIVE", native)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!("native        claude {native}\n")),
+        "{stderr}"
+    );
+    let session = &export_of(&fixture, &repo)["sessions"][0];
+    let found = &session["left"]["native"]["sessions"];
+    assert_eq!(found.as_array().map(Vec::len), Some(1), "{session:#}");
+    assert_eq!(found[0]["agent"], "claude");
+    assert_eq!(found[0]["session_id"], native);
+    assert!(
+        found[0]["source"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!(".claude/projects/-work/{native}.jsonl")),
+        "{session:#}"
+    );
+
+    // An agent ohjaa reads no transcripts of is said not looked for.
+    let (_, stderr, _) = run_session(&fixture, &repo, "exit 0");
+    assert!(
+        stderr.contains(
+            "native        not looked for: ohjaa reads the transcripts of claude, codex and \
+             pi, not sh"
+        ),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+/// D7: a session closed as orphaned has its agent's own session found too,
+/// by the launch that closes it.
+#[test]
+fn an_orphan_is_closed_with_its_agents_own_session_named() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("native-orphan");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    fake_claude(&fixture);
+    let native = "b4e4122a-4154-41f2-b642-c1a5632a7f0d";
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "claude", "--intent", "killed"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_FAKE_NATIVE", native)
+            .env("OHJAA_FAKE_KILL_OHJAA", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, None, "ohjaa was killed before leaving: {stderr}");
+    let orphan = export_of(&fixture, &repo)["sessions"][0].clone();
+    assert!(orphan["left"].is_null(), "never left: {orphan:#}");
+    let (_, stderr, code) = run_session(&fixture, &repo, "exit 0");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("closed as orphaned"), "{stderr}");
+    let sessions = export_of(&fixture, &repo)["sessions"].clone();
+    let closed = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == orphan["id"])
+        .unwrap();
+    assert_eq!(closed["left"]["orphaned"], true, "{closed:#}");
+    assert_eq!(
+        closed["left"]["native"]["sessions"][0]["session_id"], native,
+        "{closed:#}"
+    );
+    let (stdout, _, _) = output_of(
+        fixture
+            .ohjaa()
+            .args(["session", orphan["id"].as_str().unwrap()])
+            .current_dir(&repo),
+    );
+    assert!(
+        stdout.contains(&format!("native        claude {native}\n")),
+        "{stdout}"
+    );
     fixture.cleanup();
 }
 
