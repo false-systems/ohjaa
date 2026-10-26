@@ -4872,7 +4872,11 @@ fn real_sykli_the_briefing_flags_first_and_ohjaa_gate_flips_the_tip() {
     let output = sandbox.ohjaa_in(&repo, &["run", "claude", "--intent", "x", "--dry-run"]);
     let (_, stderr) = text(&output);
     assert!(
-        stderr.contains("--briefing 'FLAG: main of acme/widget has never been proven"),
+        // After the sentinel line, which only says where ohjaa's words begin.
+        stderr.contains(
+            "--briefing '<!-- ohjaa-briefing v1 -->\nFLAG: main of acme/widget has never been \
+             proven"
+        ),
         "{stderr}"
     );
 
