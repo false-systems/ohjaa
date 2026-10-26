@@ -313,6 +313,10 @@ impl Fixture {
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("CODEX_HOME")
             .env_remove("PI_CODING_AGENT_DIR")
+            // Nor the ids of the agent running these tests, if one is.
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("CODEX_THREAD_ID")
+            .env_remove("PI_SESSION_ID")
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
             .env("OHJAA_OURS", self.dir.join("ours"))
@@ -1665,14 +1669,29 @@ fn leaving_picks_up_a_fresh_receipt_without_changing_the_agent_exit() {
 /// A stand-in `claude`: it keeps its launch prompt in its transcript, as
 /// Claude Code does, in the sandbox HOME. The real launch prompt is
 /// toimija's, with ohjaa's briefing in it; the stub toimija passes none, so
-/// this one says the briefing's handshake from `OHJAA_SESSION` itself. With
-/// OHJAA_FAKE_KILL_OHJAA set it then kills the ohjaa that launched it.
+/// this one says the briefing's handshake from `OHJAA_SESSION` itself
+/// (with OHJAA_FAKE_NATIVE empty, it keeps no transcript). With
+/// OHJAA_FAKE_ORIENTED or OHJAA_FAKE_HANDED set it then reads back or hands
+/// over with `$OHJAA_FAKE_OHJAA`, from a shell whose CLAUDE_CODE_SESSION_ID is
+/// that, as Claude Code's tool shells have it (`-`: none); two ids are a
+/// `/clear` between them. With OHJAA_FAKE_KILL_OHJAA set it then kills the
+/// ohjaa that launched it.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 dir="$HOME/.claude/projects/-work"
 mkdir -p "$dir"
 now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+if [ -n "${OHJAA_FAKE_NATIVE:-}" ]; then
 printf '{"type":"user","sessionId":"%s","cwd":"%s","timestamp":"%s","isSidechain":false,"message":{"role":"user","content":"How this session works (ohjaa):\\nThis session is %s; its intent is in-1, new."}}\n' \
   "$OHJAA_FAKE_NATIVE" "$(pwd -P)" "$now" "$OHJAA_SESSION" >> "$dir/$OHJAA_FAKE_NATIVE.jsonl"
+fi
+if [ "${OHJAA_FAKE_ORIENTED:-}" = "-" ]; then
+  env -u CLAUDE_CODE_SESSION_ID "$OHJAA_FAKE_OHJAA" oriented 'goal: x; rules: y; nobody' || exit 9
+elif [ -n "${OHJAA_FAKE_ORIENTED:-}" ]; then
+  CLAUDE_CODE_SESSION_ID="$OHJAA_FAKE_ORIENTED" "$OHJAA_FAKE_OHJAA" oriented 'goal: x; rules: y; nobody' || exit 9
+fi
+if [ -n "${OHJAA_FAKE_HANDED:-}" ]; then
+  CLAUDE_CODE_SESSION_ID="$OHJAA_FAKE_HANDED" "$OHJAA_FAKE_OHJAA" handover --next 'z' || exit 9
+fi
 if [ -n "${OHJAA_FAKE_KILL_OHJAA:-}" ]; then kill -9 "$PPID"; fi
 exit 0
 "#;
@@ -1782,6 +1801,218 @@ fn an_orphan_is_closed_with_its_agents_own_session_named() {
         stdout.contains(&format!("native        claude {native}\n")),
         "{stdout}"
     );
+    fixture.cleanup();
+}
+
+/// `ohjaa run claude` with the stand-in claude, given these env settings:
+/// the session's export record and leaving's stderr.
+fn run_fake_claude(
+    fixture: &Fixture,
+    repo: &Path,
+    vars: &[(&str, &str)],
+) -> (serde_json::Value, String) {
+    let mut command = fixture.ohjaa();
+    command
+        .args(["run", "claude", "--intent", "native env"])
+        .env("OHJAA_STUB_RUN_AGENT", "1")
+        .env("OHJAA_FAKE_OHJAA", ohjaa_bin())
+        .current_dir(repo);
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    let (_, stderr, code) = output_of(&mut command);
+    assert_eq!(code, Some(0), "{stderr}");
+    let sessions = export_of(fixture, repo)["sessions"].clone();
+    let latest = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .max_by_key(|s| s["started_ms"].as_i64())
+        .unwrap()
+        .clone();
+    (latest, stderr)
+}
+
+/// D7 by the environment: `oriented` and `handover`, run from the agent's
+/// own shell, record the session its environment names. With the launch
+/// prompt's it is one session named both ways; after a `/clear` (another id
+/// at the handover) both are kept; with none in the environment nothing
+/// changes; and a launch prompt and an environment naming different ones are
+/// both kept, the disagreement said.
+#[test]
+fn oriented_and_handover_record_the_agents_own_session_from_its_environment() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("native-env");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    fake_claude(&fixture);
+    let first = "0a4b8c3e-0000-4000-8000-000000000001";
+    let cleared = "0a4b8c3e-0000-4000-8000-000000000002";
+
+    // Agreeing: one session, named by both.
+    let (session, stderr) = run_fake_claude(
+        &fixture,
+        &repo,
+        &[
+            ("OHJAA_FAKE_NATIVE", first),
+            ("OHJAA_FAKE_ORIENTED", first),
+            ("OHJAA_FAKE_HANDED", first),
+        ],
+    );
+    let found = session["left"]["native"]["sessions"].as_array().unwrap();
+    assert_eq!(found.len(), 1, "{session:#}");
+    assert_eq!(found[0]["session_id"], first);
+    assert_eq!(found[0]["env"], true);
+    assert!(found[0]["source"].as_str().unwrap().ends_with(".jsonl"));
+    assert!(session["left"]["native"]["disagreement"].is_null());
+    assert_eq!(session["native_env"].as_array().map(Vec::len), Some(1));
+    assert!(
+        stderr.contains(&format!(
+            "native        claude {first} (named by its launch prompt and its environment)\n"
+        )),
+        "{stderr}"
+    );
+
+    // A `/clear` between read-back and handover: the second is named by the
+    // environment alone, and nothing disagrees.
+    let (session, stderr) = run_fake_claude(
+        &fixture,
+        &repo,
+        &[
+            ("OHJAA_FAKE_NATIVE", first),
+            ("OHJAA_FAKE_ORIENTED", first),
+            ("OHJAA_FAKE_HANDED", cleared),
+        ],
+    );
+    let ids: Vec<(&str, &str)> = session["left"]["native"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["session_id"].as_str().unwrap(),
+                s["source"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(ids.len(), 2, "{session:#}");
+    assert_eq!(ids[0].0, first);
+    assert_eq!(ids[1], (cleared, "env"));
+    assert!(session["left"]["native"]["disagreement"].is_null());
+    assert!(
+        stderr.contains(&format!(
+            "native        claude {cleared} (named by its environment)\n"
+        )),
+        "{stderr}"
+    );
+
+    // No id in the environment: as before, by the launch prompt alone.
+    let (session, _) = run_fake_claude(
+        &fixture,
+        &repo,
+        &[("OHJAA_FAKE_NATIVE", first), ("OHJAA_FAKE_ORIENTED", "-")],
+    );
+    assert!(session["readback"].is_object(), "it read back: {session:#}");
+    assert!(session["native_env"].is_null(), "{session:#}");
+    let found = &session["left"]["native"]["sessions"][0];
+    assert_eq!(found["session_id"], first);
+    assert!(found["env"].is_null(), "{session:#}");
+
+    // Only the environment: a launch prompt never kept (late, or cleared
+    // before a transcript was written) still names the session.
+    let (session, _) = run_fake_claude(
+        &fixture,
+        &repo,
+        &[("OHJAA_FAKE_NATIVE", ""), ("OHJAA_FAKE_ORIENTED", cleared)],
+    );
+    let found = &session["left"]["native"]["sessions"];
+    assert_eq!(found.as_array().map(Vec::len), Some(1), "{session:#}");
+    assert_eq!(found[0]["source"], "env");
+    assert!(session["left"]["native"]["why"]
+        .as_str()
+        .unwrap()
+        .starts_with("none found"));
+
+    // Disagreeing: both kept, and said.
+    let (session, stderr) = run_fake_claude(
+        &fixture,
+        &repo,
+        &[("OHJAA_FAKE_NATIVE", first), ("OHJAA_FAKE_HANDED", cleared)],
+    );
+    assert_eq!(
+        session["left"]["native"]["sessions"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "{session:#}"
+    );
+    let said = format!(
+        "native        disagreement: its launch prompt named claude {first} and its own \
+         environment claude {cleared}: both are kept, neither is chosen\n"
+    );
+    assert!(stderr.contains(&said), "{stderr}");
+    fixture.cleanup();
+}
+
+/// An orphan's leaving, written by a later launch, has what its agent's
+/// environment named from inside it too.
+#[test]
+fn an_orphan_is_closed_with_what_its_agents_environment_named() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("native-env-orphan");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    fake_claude(&fixture);
+    let native = "0a4b8c3e-0000-4000-8000-0000000000aa";
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "claude", "--intent", "killed"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_FAKE_OHJAA", ohjaa_bin())
+            .env("OHJAA_FAKE_NATIVE", "")
+            .env("OHJAA_FAKE_ORIENTED", native)
+            .env("OHJAA_FAKE_KILL_OHJAA", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, None, "ohjaa was killed before leaving: {stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "recorded its claude session {native}, as the agent's environment names it"
+        )),
+        "{stdout}"
+    );
+    let orphan = export_of(&fixture, &repo)["sessions"][0].clone();
+    assert_eq!(orphan["native_env"][0]["session_id"], native, "{orphan:#}");
+    let (stdout, _, _) = output_of(
+        fixture
+            .ohjaa()
+            .args(["session", orphan["id"].as_str().unwrap()])
+            .current_dir(&repo),
+    );
+    assert!(
+        stdout.contains(&format!(
+            "native        claude {native} (named by its environment)\n"
+        )),
+        "still open, it says what its environment named: {stdout}"
+    );
+    let (_, stderr, code) = run_session(&fixture, &repo, "exit 0");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("closed as orphaned"), "{stderr}");
+    let sessions = export_of(&fixture, &repo)["sessions"].clone();
+    let closed = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == orphan["id"])
+        .unwrap();
+    let found = &closed["left"]["native"]["sessions"];
+    assert_eq!(found[0]["session_id"], native, "{closed:#}");
+    assert_eq!(found[0]["source"], "env", "{closed:#}");
     fixture.cleanup();
 }
 
@@ -5599,6 +5830,23 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
         "the launches through ohjaa, claude's and pi's, and a subagent are not bypasses; \
          a pi session started by hand is: {stdout}"
     );
+    // Launched with --no-briefing, they recorded no id of their own: each is
+    // matched by time and folder, and said so.
+    let mut matched: Vec<(&str, &str)> = json["bypasses"]["matched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["id"].as_str().unwrap(), m["by"].as_str().unwrap()))
+        .collect();
+    matched.sort_unstable();
+    assert_eq!(
+        matched,
+        [
+            ("pi-through", "time_and_folder"),
+            ("through", "time_and_folder")
+        ],
+        "{stdout}"
+    );
     let (text, _, code) = report(false);
     assert_eq!(code, Some(0));
     assert!(
@@ -5608,7 +5856,9 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
             && text.contains("Agent sessions a person started without ohjaa (2):")
             && text.contains("Not counted: 1 headless run(s)")
             && text.contains("- claude by-hand in /nonexistent/elsewhere")
-            && text.contains("- pi pi-by-hand in /nonexistent/elsewhere"),
+            && text.contains("- pi pi-by-hand in /nonexistent/elsewhere")
+            && text.contains("  Launched through ohjaa (2): 2 by time and folder alone\n")
+            && text.contains("  - claude through taken as oh-"),
         "{text}"
     );
     assert!(
