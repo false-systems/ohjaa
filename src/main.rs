@@ -47,6 +47,13 @@ const INCOMPLETE: i32 = 4;
 /// The most a briefing may be: it travels as one command-line argument, to
 /// toimija and on to the agent, and Linux caps one at 128 KiB.
 const MAX_BRIEFING: usize = 100 * 1024;
+/// The first line of the briefing every launched agent gets: one fixed line
+/// that says where ohjaa's words begin, so a reader of transcripts (vessa,
+/// cutting a launch's task from the briefing toimija appends after it) can
+/// key on it instead of on the sentences each part opens with. Others match
+/// it byte for byte: a change is a new version, never an edit. `ohjaa brief`
+/// prints its briefing without it, and `brief --write` never writes it.
+const BRIEFING_SENTINEL: &str = "<!-- ohjaa-briefing v1 -->";
 
 #[derive(Parser)]
 #[command(
@@ -189,13 +196,17 @@ enum Cmd {
         #[arg(long)]
         strict: bool,
     },
-    /// Draft proposals from what people said: agent transcripts, pull request
-    /// comments and reverts.
+    /// Draft proposals from what people said: what they wrote in agent
+    /// sessions (through `vessa messages`), pull request comments and reverts.
     Intake {
         /// Start here (YYYY-MM-DD or RFC 3339). Default: where the last intake
         /// stopped, else fourteen days ago.
         #[arg(long)]
         since: Option<String>,
+        /// Send every message people wrote, not only those the local
+        /// pre-filter takes for a correction or a repeated instruction.
+        #[arg(long)]
+        no_prefilter: bool,
         /// transcripts, reviews, reverts or report (repeatable). Default: all four.
         #[arg(long = "source", value_name = "SOURCE")]
         sources: Vec<String>,
@@ -1705,6 +1716,7 @@ fn cmd_intake(
     max_batches: usize,
     dry_run: bool,
     retry_failed: bool,
+    prefilter: bool,
 ) -> Result<i32> {
     let dirs = dirs()?;
     // One intake at a time: two would send the same candidates and overwrite
@@ -1779,6 +1791,8 @@ fn cmd_intake(
         .min()
         .filter(|floor| *floor < since);
     let mut warnings = Vec::new();
+    // Stores vessa knows of and does not read: said, and holding nothing.
+    let mut gaps: Vec<String> = Vec::new();
     // The sources that could not all be read: they hold the cursor.
     let mut warned: Vec<&str> = Vec::new();
     let mut transcripts_read_cleanly = false;
@@ -1787,15 +1801,20 @@ fn cmd_intake(
         let roots = roots::load(roots, git_root().as_deref());
         roots::git_repos(&roots)
     };
-    // One source, from `from`.
-    let read = |source: &str, from: i64, warnings: &mut Vec<String>| -> Result<Vec<_>> {
+    // One source, from `from`, unfiltered: what vessa lists of what people
+    // wrote is pre-filtered in the pass below, not when read back for a
+    // retry, which takes only candidates already sent.
+    let read = |source: &str,
+                from: i64,
+                warnings: &mut Vec<String>,
+                gaps: &mut Vec<String>|
+     -> Result<Vec<_>> {
         Ok(match source {
-            "transcripts" => {
-                let home = std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .context("HOME is not set")?;
-                intake::transcripts(&home, from, warnings)
-            }
+            "transcripts" => intake::transcripts(from, warnings, gaps)
+                .into_iter()
+                .filter(|said| !said.long)
+                .map(|said| said.candidate)
+                .collect(),
             "reviews" | "reverts" => {
                 let repos = git_repos()?;
                 if repos.is_empty() {
@@ -1834,15 +1853,26 @@ fn cmd_intake(
                 .map(|s| s.started_ms - 1)
                 .min()
                 .map_or(since, |earliest| earliest.min(since));
-            let read = read(source, from, &mut warnings)?;
+            let said = intake::transcripts(from, &mut warnings, &mut gaps);
             transcripts_read_cleanly = warnings.len() == before;
-            let (new, older): (Vec<_>, Vec<_>) = read
+            // What was said after `since`, and before it in a queued
+            // session's window: only those are read, and pre-filtered.
+            let said: Vec<intake::Said> = said
                 .into_iter()
-                .partition(|candidate| candidate.at_ms > since);
-            candidates.extend(new);
-            candidates.extend(intake::within_sessions(older, &queued));
+                .filter(|said| {
+                    said.candidate.at_ms > since
+                        || intake::within_sessions(&said.candidate, &queued)
+                })
+                .collect();
+            let (kept, sifted) = intake::sift(said, prefilter);
+            // A vessa that listed nothing because it failed has said so; no
+            // count of nothing is shown for it.
+            if transcripts_read_cleanly || sifted.read > 0 {
+                eprintln!("ohjaa: intake: {}", sifted.said());
+            }
+            candidates.extend(kept);
         } else {
-            candidates.extend(read(source, since, &mut warnings)?);
+            candidates.extend(read(source, since, &mut warnings, &mut gaps)?);
         }
         if warnings.len() > before {
             warned.push(source);
@@ -1853,7 +1883,7 @@ fn cmd_intake(
     if let Some(floor) = read_back {
         for source in &sources {
             let before = warnings.len();
-            let back = read(source, floor, &mut warnings)?;
+            let back = read(source, floor, &mut warnings, &mut gaps)?;
             candidates.extend(back.into_iter().filter(|c| retry.contains(&c.key())));
             if warnings.len() > before && !warned.contains(source) {
                 warned.push(source);
@@ -1870,6 +1900,15 @@ fn cmd_intake(
     }
     for warning in &warnings {
         eprintln!("ohjaa: intake: {warning}");
+    }
+    // Said on every run, once (a retry asks vessa twice); never a warning.
+    gaps.sort();
+    gaps.dedup();
+    for gap in &gaps {
+        eprintln!(
+            "ohjaa: intake: {gap} (a store vessa does not read: nothing in it is drafted \
+             from, and it does not hold the cursor)"
+        );
     }
     let found = intake::found(candidates);
     // What earlier runs handled is never sent again: a run takes the oldest
@@ -1898,8 +1937,14 @@ fn cmd_intake(
         found.len() - left,
     );
     // What could not be read is never rendered as nothing new.
-    let nothing = if warnings.is_empty() {
+    let nothing = if warnings.is_empty() && gaps.is_empty() {
         "nothing new to draft from".to_owned()
+    } else if warnings.is_empty() {
+        format!(
+            "nothing new to draft from in what vessa reads (it does not read {} store(s), \
+             said above)",
+            gaps.len()
+        )
     } else {
         format!(
             "nothing found to draft from in what could be read ({} warning(s) above)",
@@ -1919,16 +1964,18 @@ fn cmd_intake(
             .take(batch)
             .cloned()
             .collect();
-        println!("{}", intake::prompt(&loaded, &first));
+        let (prompt, redacted) = intake::prompt(&loaded, &first);
+        println!("{prompt}");
         eprintln!(
-            "ohjaa: dry-run; would send {} batch(es) to `{drafter}`",
+            "ohjaa: dry-run; would send {} batch(es) to `{drafter}`; {redacted} \
+             secret-looking token(s) redacted from the batch shown",
             taken.div_ceil(batch)
         );
         return Ok(0);
     }
 
     let today = knowledge::today();
-    let (mut proposed, mut refused) = (0, 0);
+    let (mut proposed, mut refused, mut redacted) = (0, 0, 0);
     let mut drafted = intake::Drafted::default();
     if left > 0 {
         let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
@@ -1941,7 +1988,10 @@ fn cmd_intake(
                 // Re-read each time, so a draft from an earlier batch counts
                 // as existing.
                 let loaded = knowledge::load(&dirs).map_err(intake::Failure::Silent)?;
-                for draft in intake::draft(&drafter, &intake::prompt(&loaded, chunk))? {
+                // Scrubbed of secrets, whatever the source or the filter.
+                let (prompt, scrubbed) = intake::prompt(&loaded, chunk);
+                redacted += scrubbed;
+                for draft in intake::draft(&drafter, &prompt)? {
                     let id = draft.id.clone();
                     let result = draft
                         .into_proposal()
@@ -1984,6 +2034,11 @@ fn cmd_intake(
         if let Some(error) = &drafted.stopped {
             eprintln!("ohjaa: intake stopped: {error:#}");
         }
+        eprintln!(
+            "ohjaa: intake: the drafter answered for {} candidate(s) in this run; {redacted} \
+             secret-looking token(s) were redacted from what it was sent",
+            drafted.sent
+        );
     }
     handled.done_retrying();
     // A session is drafted from once every candidate of it is handled, in
@@ -2592,6 +2647,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         let validated = validation.briefing();
         let siblings = clone_sessions_text(&clone_scans);
         let parts: Vec<&str> = [
+            BRIEFING_SENTINEL,
             flagged.as_str(),
             validated.as_str(),
             still.as_str(),
@@ -3710,6 +3766,7 @@ fn main() {
         Cmd::Gate { print, wait } => gate::gate_here(*print, std::time::Duration::from_secs(*wait)),
         Cmd::Intake {
             since,
+            no_prefilter,
             sources,
             drafter,
             batch,
@@ -3725,6 +3782,7 @@ fn main() {
             *max_batches,
             *dry_run,
             *retry_failed,
+            !*no_prefilter,
         ),
     };
     match result {

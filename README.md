@@ -109,15 +109,71 @@ line an honest agent does not cross, not a lock.
 ohjaa intake                                  # from where the last run stopped
 ohjaa intake --since 2026-04-01 --max-batches 50
 ohjaa intake --source transcripts --dry-run   # show the prompt, send nothing
+ohjaa intake --since 2026-10-01 --no-prefilter  # every message, not only likely corrections
 ```
 
 `ohjaa intake` reads four sources:
 
-- **Transcripts:** Claude Code and Codex sessions, keeping only what the person
-  typed.
+- **Transcripts:** what people wrote in agent sessions (Claude Code, Codex,
+  pi), through `vessa messages --since <cursor> --json`
+  (`vessa-messages.v1`). Vessa is the one reader of agent conversations:
+  intake parses no transcript itself, and has no fallback. Each message
+  travels with the agent's reply before it (its last 600 characters; marked
+  when that turn failed), how it was said (typed mid-turn, an answer to the
+  agent's question, a reason for refusing a tool call, a launch's task) and
+  its session. One longer than 1,500 characters is a pasted brief, and
+  counted, never sent.
 - **Reviews:** human comments on pull requests and issues, through `gh`.
 - **Reverts:** reverted commits.
 - **Report:** what the bypass report finds (see below).
+
+**A local pre-filter comes first** (no network). Most of what people write
+to agents is the work, not a correction. Of what vessa lists, only what looks
+like a correction or a repeated instruction is sent: the archived seula's
+rules, ported unchanged (`phrase-rules.v3`, and the same words said more than
+once among the messages a run reads), and every reason a person gave for
+refusing a tool call. On 2026-10-26 its precision was about 65% strict, 87%
+lenient, and its recall low, so it is never silent:
+- Every run says how many messages vessa listed, how many were briefs, and how
+  many the filter kept (by rule) and dropped (by agent), by counts, never the
+  words; then how many candidates the drafter answered for.
+- `--no-prefilter` sends every message.
+- A dropped message is not handled, and the filter's verdict is not kept. The
+  cursor passes it like any other, so it comes back only when a run reads it
+  again: a `--since` before the cursor, with `--no-prefilter` or with rules
+  changed since. A rule change does not reach back by itself; that would need
+  a record of every message read, not only of those sent.
+- PR comments, reverts, the report, handovers and observed failures are not
+  filtered.
+
+**Secret-looking tokens are redacted before the drafter: a best effort over
+known shapes, not a guarantee.** People paste credentials to agents. As each
+prompt is made, the candidate's words and the agent's words before them
+(not the place, the author or the session id) are scrubbed, from every source,
+with the filter on or off. A token in one of these shapes becomes `[redacted]`:
+- a known key prefix: `sk-`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`,
+  `github_pat_`, `xoxb-`/`xoxp-`/`xoxa-`/`xoxs-`, `AKIA`/`ASIA`, `glpat-`,
+  `AIza`;
+- a JWT, or a PEM private key block;
+- an id and a secret joined by a dot (`<hex, 24+>.<letters and digits,
+  12+>`), as some providers issue keys;
+- a token of 32 or more characters with two or more each of capitals, lower
+  case letters and digits, unless it is hex (a hash or a UUID, either case);
+  a path is judged by the pieces of its names;
+- a long mixed token right after a word that names a secret (`api_key=…`,
+  `GITHUB_TOKEN=…`, `password: …`, `Authorization: Bearer …`). That
+  includes a sha or a UUID after `key:` or `token:`.
+
+Anything else gets through: a short password, a key with no digits, or one in
+a shape not listed. Long random ids that are no secret (document ids, a
+base64 alphabet in code) are redacted too, at little cost to the drafter. On
+the 14 days of 2026-10-26, with `--no-prefilter`, 4 tokens were redacted in
+1,383 candidates: the credential the review of #56 found (no token of its
+shape reached the drafter) and, by a count per kind of token, document ids. The original is never said, logged or kept; each run says only how many
+were redacted, and a dry run shows the scrubbed prompt. Whether the drafter
+is a local model or `claude -p` is Yair's decision, and still open. Until it
+is made, the filter's default (on) also keeps most messages from leaving the
+machine at all.
 
 It sends them in batches to a **drafter**, an agent CLI that reads a prompt on
 stdin and prints a JSON array. The default is `claude -p`; override it with
@@ -137,7 +193,12 @@ for.
 its candidates go into `$XDG_STATE_HOME/ohjaa/intake-handled`. Each has a time
 and a digest, never the words, and the file has a version line and an end
 line. An empty or cut-short file is an error, never read as less. A run
-killed between an answer and that write sends that one batch again.
+killed between an answer and that write sends that one batch again. A
+message's digest is of vessa's text, which is the text intake's own reader
+gave (reminder blocks stripped, trimmed), so what that reader handled is not
+sent again. The exception is a Codex reply to the agent's question tool, which
+vessa gives as the person's own answers: those are sent once more (15 in the
+fourteen days measured on 2026-10-26; none passed the pre-filter).
 
 **A refused batch is split.** When the drafter fails or answers no drafts, the
 batch is split in halves, down to the candidate it fails on. That candidate
@@ -163,6 +224,19 @@ candidates that were handled, never back.
   warning that recurs on every run keeps the window growing until it is fixed.
 - With no repositories under the roots, reviews and reverts warn, and hold
   the cursor: nothing read is not nothing there.
+- vessa's exit 4 (a partial list) names two kinds of reason, which intake
+  treats apart. What it lists is drafted from either way.
+  - A source it could not read (`warnings`), what a transcript leaves unknown
+    (`limitations`), or a run it ended with an `error` is a warning: said,
+    and it holds the cursor. So is a vessa missing from PATH, one that cannot
+    list messages (older than `messages`: update it), or output intake cannot
+    read.
+  - A store vessa knows of and never reads (`coverage.gaps`; today
+    opencode's SQLite, named only when written in the window) is said on
+    every run and holds nothing: not the cursor, not a session, not the exit
+    code. Waiting cannot read it, and a hold would keep the window before
+    every later write, so it would never end. Once vessa reads the store,
+    `ohjaa intake --source transcripts --since <its first day>` reads it back.
 - The report's own gaps are said, and do not hold the cursor.
 - A first run, with no cursor yet, keeps the start of its window (fourteen
   days back) as the cursor before it drafts.
@@ -681,6 +755,12 @@ ohjaa run codex --intent "change the parser" -- --model o3
   Explicit tasks and other agents retain prompt delivery. Update Toimija before
   using this version of Ohjaa; older versions reject the new flag rather than
   silently dropping context.
+- The briefing `ohjaa run` hands toimija opens with the line
+  `<!-- ohjaa-briefing v1 -->`. It says where ohjaa's words begin, so a
+  reader of transcripts can tell a launch's task from the briefing toimija
+  appends after it (vessa cuts there). It is matched byte for byte: a change
+  is a new version, never an edit. `ohjaa brief` prints the same briefing
+  without it, and `brief --write` never writes it into a file.
 - `--dry-run` prints the exact command it would exec, without launching.
 - If toimija cannot fully read the sessions, or does not report its coverage,
   ohjaa refuses to launch blind.
@@ -1068,8 +1148,8 @@ Marks on each entry's branch, tip first (✓ proven · ✗ failed · ? unproven)
 ```
 
 **Flag.** When the entry's branch is not proven at its tip, the briefing of
-`ohjaa run` (and `ohjaa brief`) opens with it, before anything else, and the
-launch says it on stderr:
+`ohjaa run` (after its sentinel line) and of `ohjaa brief` opens with it,
+before anything else, and the launch says it on stderr:
 
 ```
 FLAG: main of false-systems/taso is unproven since 77a1f0e (2 commits: ? 4be01c2, ✗ 77a1f0e; origin/main as of a fetch at 2026-10-13 09:12 UTC). Start by running `ohjaa gate` on main and fix forward what fails.

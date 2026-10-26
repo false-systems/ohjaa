@@ -1,10 +1,12 @@
 //! Intake: turning what people actually said into proposed Knowledge (law 5).
 //!
 //! A correction a person has to repeat is Knowledge that failed to reach the
-//! agent. Intake reads the places corrections happen (agent transcripts, pull
-//! request comments, reverts), asks a drafter (an agent CLI such as
-//! `claude -p`) which of them carry durable Knowledge, and writes each draft as
-//! a *proposal*. Nothing becomes current until a person accepts it.
+//! agent. Intake reads the places corrections happen (what people wrote in
+//! agent sessions, through vessa; pull request comments; reverts), keeps
+//! locally what looks like a correction or a repeated instruction, asks a
+//! drafter (an agent CLI such as `claude -p`) which of them carry durable
+//! Knowledge, and writes each draft as a *proposal*. Nothing becomes current
+//! until a person accepts it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -24,20 +26,6 @@ use crate::process;
 const MAX_MESSAGE: usize = 1_500;
 /// How much of the agent's preceding words travel with a message.
 const CONTEXT_TAIL: usize = 600;
-const SKIP_PREFIXES: [&str; 12] = [
-    "<environment_context>",
-    "<user_instructions>",
-    "# AGENTS.md",
-    "<command-",
-    "<local-command",
-    "Caveat:",
-    "<system-reminder>",
-    "[Request interrupted",
-    "<task-notification>",
-    "<turn_aborted>",
-    "This session is being continued",
-    "<user_shell_command>",
-];
 
 /// Something a person said or did that may carry Knowledge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +50,12 @@ pub fn rfc3339(seconds: i64) -> String {
     let date = knowledge::date_from_day_number(seconds.div_euclid(86_400));
     let s = seconds.rem_euclid(86_400);
     format!("{date}T{:02}:{:02}:{:02}Z", s / 3600, s % 3600 / 60, s % 60)
+}
+
+/// An instant as RFC 3339 UTC with its milliseconds, as the cursor keeps it.
+pub fn rfc3339_ms(at_ms: i64) -> String {
+    let at = rfc3339(at_ms.div_euclid(1000));
+    format!("{}.{:03}Z", &at[..at.len() - 1], at_ms.rem_euclid(1000))
 }
 
 pub fn now_seconds() -> i64 {
@@ -130,9 +124,12 @@ pub fn normalize_since(text: &str) -> Result<i64> {
     parse_time(text).with_context(|| format!("`{}` is not a date or RFC 3339 time", text.trim()))
 }
 
-// ---- transcripts ------------------------------------------------------------
+// ---- what people said, through vessa ----------------------------------------
 
-fn clean(text: &str) -> Option<String> {
+/// The text without the `<system-reminder>` blocks a harness writes into it,
+/// trimmed: as vessa lists a message's text, so a candidate's words (and the
+/// digest it is kept by) are the same whichever reader found them.
+fn stripped(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("<system-reminder>") {
@@ -146,11 +143,14 @@ fn clean(text: &str) -> Option<String> {
         }
     }
     out.push_str(rest);
-    let out = out.trim();
-    let keep = !out.is_empty()
-        && out.chars().count() <= MAX_MESSAGE
-        && !SKIP_PREFIXES.iter().any(|prefix| out.starts_with(prefix));
-    keep.then(|| out.to_owned())
+    out.trim().to_owned()
+}
+
+/// Words that can be a candidate: something left once stripped, and not a
+/// pasted brief.
+fn clean(text: &str) -> Option<String> {
+    let out = stripped(text);
+    (!out.is_empty() && out.chars().count() <= MAX_MESSAGE).then_some(out)
 }
 
 fn tail(text: &str, chars: usize) -> String {
@@ -158,156 +158,658 @@ fn tail(text: &str, chars: usize) -> String {
     text.chars().skip(count.saturating_sub(chars)).collect()
 }
 
-fn texts(content: &Value, key: &str) -> Option<String> {
-    match content {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(blocks) => {
-            if blocks.iter().any(|b| b["type"] == "tool_result") {
-                return None;
-            }
-            let joined: Vec<&str> = blocks
-                .iter()
-                .filter_map(|block| block[key].as_str())
-                .collect();
-            (!joined.is_empty()).then(|| joined.join("\n"))
+/// The form of `vessa messages --json` intake reads.
+pub const VESSA_MESSAGES: &str = "vessa-messages.v1";
+
+/// How long vessa may take to list what people wrote: every transcript it
+/// knows of is read when the window is long (two months took 5 s on the
+/// machine this was written on).
+const VESSA_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The sources of what people wrote in agent sessions: the agents vessa
+/// reads, and `agent` for one it names that intake does not know yet.
+pub const SAID: [&str; 5] = ["claude", "codex", "pi", "opencode", "agent"];
+
+/// One message a person wrote in an agent session, as vessa lists it: the
+/// candidate it becomes, and what the pre-filter reads of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Said {
+    pub candidate: Candidate,
+    /// vessa's `kind`: `message`, `queued` (typed while the agent worked),
+    /// `answer` (to the agent's question, in the person's own words),
+    /// `rejection` (the reason for refusing a tool call) or `task` (typed
+    /// into a launch).
+    pub kind: String,
+    /// The agent's reply it follows. None when there was none, or when that
+    /// turn failed: then the message answers a failure, not the agent.
+    pub reply: Option<String>,
+    /// Longer than `MAX_MESSAGE`: a pasted brief, never a candidate.
+    pub long: bool,
+}
+
+#[derive(Deserialize)]
+struct VessaDocument {
+    schema: String,
+    messages: Vec<VessaMessage>,
+    /// Absent from a document vessa ended with an `error`.
+    #[serde(default)]
+    coverage: Option<VessaCoverage>,
+    #[serde(default)]
+    warnings: Vec<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VessaMessage {
+    agent: String,
+    session: String,
+    #[serde(default)]
+    kind: String,
+    at: Option<String>,
+    #[serde(default)]
+    cwd: String,
+    text: String,
+    #[serde(default)]
+    question: Option<String>,
+    #[serde(default)]
+    reply: Option<VessaReply>,
+}
+
+#[derive(Deserialize)]
+struct VessaReply {
+    text: String,
+    #[serde(default)]
+    failed: bool,
+}
+
+#[derive(Deserialize)]
+struct VessaCoverage {
+    #[serde(default)]
+    gaps: Vec<String>,
+    #[serde(default)]
+    limitations: Vec<String>,
+}
+
+/// What people wrote in agent sessions after `since_ms` (exclusive), as
+/// vessa, the one reader of agent conversations, lists it: `vessa messages
+/// --since <time> --json`. What vessa says it could not read is a warning
+/// here, which holds the cursor, and a store it does not read is a gap, said
+/// and holding nothing (see [`listed`]); a vessa that cannot list messages
+/// is said, and nothing reads the transcripts in its place.
+pub fn transcripts(since_ms: i64, warnings: &mut Vec<String>, gaps: &mut Vec<String>) -> Vec<Said> {
+    let since = rfc3339_ms(since_ms);
+    let output = process::run(
+        Command::new("vessa").args(["messages", "--since", &since, "--json"]),
+        None,
+        VESSA_TIMEOUT,
+    );
+    match output {
+        Ok(output) => {
+            // clap ends a usage error with a hint; its first `error:` line
+            // is what went wrong.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("error:"))
+                .map_or_else(|| output.failure_detail(), str::to_owned);
+            listed(
+                output.status.code(),
+                &output.stdout,
+                &detail,
+                since_ms,
+                warnings,
+                gaps,
+            )
         }
-        _ => None,
+        Err(error) => {
+            let text = format!("{error:#}");
+            warnings.push(
+                if text.contains("No such file") || text.contains("not found") {
+                    "vessa is not on PATH: install vessa, the one reader of agent conversations"
+                        .to_owned()
+                } else {
+                    format!("vessa could not list messages: {text}")
+                },
+            );
+            Vec::new()
+        }
     }
 }
 
-/// One Claude Code transcript (`~/.claude/projects/*/*.jsonl`).
-pub fn claude_transcript(text: &str, since_ms: i64, out: &mut Vec<Candidate>) {
-    let mut agent_said = String::new();
-    for line in text.lines() {
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if entry["isSidechain"] == true {
-            continue; // a subagent's prompt, not the person
+/// Read vessa's answer (`vessa-messages.v1`; its exit `code`, and `detail`,
+/// the last line it wrote to stderr). Exit 4 says the list is partial, for
+/// two kinds of reason, which vessa keeps apart:
+/// - a source it could not read (`warnings`), or what a transcript leaves
+///   unknown (`coverage.limitations`): each is a warning, which holds the
+///   cursor until vessa reads it;
+/// - a store it knows of and never reads (`coverage.gaps`; today opencode's
+///   SQLite, and only when written in the window): each goes to `gaps`, to
+///   be said on every run and hold nothing. Waiting cannot read it, and a
+///   hold would keep the window before every later write of the store, so
+///   it would never end; once vessa reads it, a `--since` reads it back.
+///
+/// A document vessa ended with an `error` keeps the messages listed before
+/// it, and warns. A vessa with no `messages` (one older than vessa#6) is told
+/// to be updated.
+pub fn listed(
+    code: Option<i32>,
+    stdout: &[u8],
+    detail: &str,
+    since_ms: i64,
+    warnings: &mut Vec<String>,
+    gaps: &mut Vec<String>,
+) -> Vec<Said> {
+    let exit = code.map_or("a signal".to_owned(), |code| code.to_string());
+    let document: VessaDocument = match serde_json::from_slice(stdout) {
+        Ok(document) => document,
+        Err(error) => {
+            warnings.push(
+                if code == Some(2) || detail.contains("unrecognized subcommand") {
+                    format!(
+                        "vessa does not list messages (exit {exit}: {detail}): update vessa; \
+                         intake reads what people wrote only through `vessa messages` \
+                         ({VESSA_MESSAGES})"
+                    )
+                } else if stdout.iter().all(u8::is_ascii_whitespace) {
+                    format!("vessa listed no messages (exit {exit}: {detail})")
+                } else {
+                    format!("vessa's messages are not {VESSA_MESSAGES} ({error}; exit {exit})")
+                },
+            );
+            return Vec::new();
         }
-        let content = &entry["message"]["content"];
-        match entry["type"].as_str() {
-            Some("assistant") => {
-                if let Some(said) = texts(content, "text") {
-                    agent_said = said;
-                }
-            }
-            Some("user") if entry["isMeta"] != true => {
-                // A message that cannot be placed in time cannot be windowed.
-                let Some(at_ms) = entry["timestamp"].as_str().and_then(parse_time) else {
-                    continue;
-                };
-                let Some(message) = texts(content, "text").and_then(|t| clean(&t)) else {
-                    continue;
-                };
-                if at_ms > since_ms {
-                    out.push(Candidate {
-                        source: "claude",
-                        at_ms,
-                        at: rfc3339(at_ms.div_euclid(1000)),
-                        place: entry["cwd"].as_str().unwrap_or("").to_owned(),
-                        who: "person".to_owned(),
-                        context: tail(&agent_said, CONTEXT_TAIL),
-                        text: message,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// One Codex session (`~/.codex/sessions/**/*.jsonl`). Subagent sessions,
-/// whose "user" is another agent, are skipped whole.
-pub fn codex_session(text: &str, since_ms: i64, out: &mut Vec<Candidate>) {
-    let mut place = String::new();
-    let mut agent_said = String::new();
-    for line in text.lines() {
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let payload = &entry["payload"];
-        if entry["type"] == "session_meta" {
-            if !payload["source"].is_string() {
-                return;
-            }
-            place = payload["cwd"].as_str().unwrap_or("").to_owned();
-            continue;
-        }
-        if payload["type"] != "message" {
-            continue;
-        }
-        let Some(said) = texts(&payload["content"], "text") else {
-            continue;
-        };
-        match payload["role"].as_str() {
-            Some("assistant") => agent_said = said,
-            Some("user") => {
-                let Some(at_ms) = entry["timestamp"].as_str().and_then(parse_time) else {
-                    continue;
-                };
-                if let Some(message) = clean(&said) {
-                    if at_ms > since_ms {
-                        out.push(Candidate {
-                            source: "codex",
-                            at_ms,
-                            at: rfc3339(at_ms.div_euclid(1000)),
-                            place: place.clone(),
-                            who: "person".to_owned(),
-                            context: tail(&agent_said, CONTEXT_TAIL),
-                            text: message,
-                        });
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn jsonl_files(dir: &Path, modified_after: i64, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            jsonl_files(&path, modified_after, out);
-        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-            let recent = entry
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .is_none_or(|age| age.as_secs() as i64 >= modified_after);
-            if recent {
-                out.push(path);
-            }
-        }
+    if document.schema != VESSA_MESSAGES {
+        warnings.push(format!(
+            "vessa wrote `{}`, and intake reads {VESSA_MESSAGES}: update vessa or ohjaa so \
+             they agree",
+            document.schema
+        ));
+        return Vec::new();
     }
-}
-
-/// A transcript that cannot be read is said out loud: skipping it silently
-/// would move the cursor past corrections nobody ever looked at.
-pub fn transcripts(home: &Path, since_ms: i64, warnings: &mut Vec<String>) -> Vec<Candidate> {
-    let floor = since_ms.div_euclid(1000);
+    let before = (warnings.len(), gaps.len());
+    let coverage = document.coverage.as_ref();
+    for warning in document
+        .warnings
+        .iter()
+        .chain(coverage.map(|c| &c.limitations).into_iter().flatten())
+    {
+        warnings.push(format!("vessa: {warning}"));
+    }
+    for gap in coverage.map(|c| &c.gaps).into_iter().flatten() {
+        gaps.push(format!("vessa: {gap}"));
+    }
+    if let Some(error) = &document.error {
+        warnings.push(format!(
+            "vessa failed after listing {} message(s) (exit {exit}): {error}",
+            document.messages.len()
+        ));
+    }
+    if code != Some(0) && (warnings.len(), gaps.len()) == before {
+        warnings.push(format!(
+            "vessa says its list is partial (exit {exit}: {detail})"
+        ));
+    }
+    let mut undated = 0;
     let mut out = Vec::new();
-    let mut files = Vec::new();
-    jsonl_files(&home.join(".claude").join("projects"), floor, &mut files);
-    for path in files.drain(..) {
-        match std::fs::read_to_string(&path) {
-            Ok(text) => claude_transcript(&text, since_ms, &mut out),
-            Err(error) => warnings.push(format!("cannot read {}: {error}", path.display())),
+    for message in document.messages {
+        // vessa's window is exclusive too; a message no time can place
+        // cannot be windowed at all.
+        let Some(at_ms) = message.at.as_deref().and_then(parse_time) else {
+            undated += 1;
+            continue;
+        };
+        if at_ms <= since_ms {
+            continue;
         }
+        let text = stripped(&message.text);
+        if text.is_empty() {
+            continue;
+        }
+        out.push(heard(message, at_ms, text));
     }
-    jsonl_files(&home.join(".codex").join("sessions"), floor, &mut files);
-    for path in files {
-        match std::fs::read_to_string(&path) {
-            Ok(text) => codex_session(&text, since_ms, &mut out),
-            Err(error) => warnings.push(format!("cannot read {}: {error}", path.display())),
-        }
+    if undated > 0 {
+        warnings.push(format!(
+            "vessa listed {undated} message(s) whose time intake cannot read"
+        ));
     }
     out
+}
+
+/// One of vessa's messages as a candidate: when, where (the folder it was
+/// said in), who (the person, how, and in which session), what the agent
+/// said before, and the words, exactly as vessa gives them.
+fn heard(message: VessaMessage, at_ms: i64, text: String) -> Said {
+    let source = SAID
+        .iter()
+        .find(|agent| **agent == message.agent)
+        .copied()
+        .unwrap_or("agent");
+    let how = match message.kind.as_str() {
+        "queued" => ", typed while the agent worked",
+        "answer" => ", answering the agent's question",
+        "rejection" => ", refusing a tool call",
+        "task" => ", the task given at launch",
+        _ => "",
+    };
+    let context = match (&message.question, &message.reply) {
+        (Some(question), _) if message.kind == "answer" => {
+            tail(&format!("asked: {question}"), CONTEXT_TAIL)
+        }
+        (_, Some(reply)) if reply.failed => format!(
+            "(the agent's turn failed) {}",
+            tail(&reply.text, CONTEXT_TAIL)
+        ),
+        (_, Some(reply)) => tail(&reply.text, CONTEXT_TAIL),
+        _ => String::new(),
+    };
+    let reply = message
+        .reply
+        .filter(|reply| !reply.failed)
+        .map(|reply| reply.text);
+    Said {
+        long: text.chars().count() > MAX_MESSAGE,
+        candidate: Candidate {
+            source,
+            at_ms,
+            at: rfc3339(at_ms.div_euclid(1000)),
+            place: message.cwd,
+            who: format!(
+                "person{how} ({} session {})",
+                message.agent, message.session
+            ),
+            context,
+            text,
+        },
+        kind: message.kind,
+        reply,
+    }
+}
+
+// ---- the pre-filter ---------------------------------------------------------
+//
+// Most of what people write to agents is the work itself, not a correction,
+// and each drafter call costs minutes and tokens. Before the drafter, intake
+// keeps, locally and with no network, only what looks like a correction or a
+// repeated instruction: the archived seula's rules, ported as they were
+// (`phrase-rules.v3`; repeats by `normalized-text.v1`), and a reason given for
+// refusing a tool call, which is a correction by what it is.
+//
+// Measured on 2026-10-26 its precision was about 65% strict and 87% lenient,
+// and its recall low: it drops corrections. So it is never silent. Every run
+// says how many messages it read, kept (by rule) and dropped (by agent);
+// `--no-prefilter` sends every message; and nothing it drops is kept as
+// handled. Its verdict is not stored either: a message it dropped becomes a
+// candidate again when a run reads it again, under that run's rules (a
+// `--since` before the cursor reads a stretch again, with `--no-prefilter` or
+// with rules changed since). A rule change does not reach back by itself:
+// that would need a record of every message read, not only of those sent.
+
+/// The correction rules, by the name seula reported them under.
+pub const PREFILTER: &str = "phrase-rules.v3";
+
+/// Why the pre-filter keeps each message: `correction` (a phrase rule),
+/// `repeat` (the same words more than once among those read), `rejection`
+/// (a reason for refusing a tool call); `None` when it drops it.
+pub fn prefilter(said: &[Said]) -> Vec<Option<&'static str>> {
+    let words: Vec<String> = said.iter().map(|s| normalized(&s.candidate.text)).collect();
+    let mut times: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for text in words.iter().filter(|t| (20..=2000).contains(&t.len())) {
+        *times.entry(text).or_default() += 1;
+    }
+    said.iter()
+        .zip(&words)
+        .map(|(said, text)| {
+            if said.kind == "rejection" {
+                Some("rejection")
+            } else if correction_signal(&said.candidate.text, said.reply.as_deref()).is_some() {
+                Some("correction")
+            } else if times.get(text.as_str()).is_some_and(|n| *n > 1) {
+                Some("repeat")
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// What the pre-filter did with one run's messages, said by counts only.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Sifted {
+    /// Messages read: in the window, or in a queued session's.
+    pub read: usize,
+    /// Of those, pasted briefs (longer than `MAX_MESSAGE`), never candidates.
+    pub long: usize,
+    /// The pre-filter ran (not `--no-prefilter`).
+    pub filtered: bool,
+    /// Kept as candidates, by the rule that kept each.
+    pub kept: BTreeMap<&'static str, usize>,
+    /// Dropped by the pre-filter, by source.
+    pub dropped: BTreeMap<&'static str, usize>,
+}
+
+/// The candidates among `said`: every message that is not a pasted brief,
+/// and, when `filter`, only those the pre-filter keeps.
+pub fn sift(said: Vec<Said>, filter: bool) -> (Vec<Candidate>, Sifted) {
+    let mut sifted = Sifted {
+        read: said.len(),
+        filtered: filter,
+        ..Sifted::default()
+    };
+    let (long, said): (Vec<Said>, Vec<Said>) = said.into_iter().partition(|s| s.long);
+    sifted.long = long.len();
+    let verdicts = if filter {
+        prefilter(&said)
+    } else {
+        vec![Some("unfiltered"); said.len()]
+    };
+    let mut kept = Vec::new();
+    for (said, verdict) in said.into_iter().zip(verdicts) {
+        match verdict {
+            Some(rule) => {
+                *sifted.kept.entry(rule).or_default() += 1;
+                kept.push(said.candidate);
+            }
+            None => *sifted.dropped.entry(said.candidate.source).or_default() += 1,
+        }
+    }
+    (kept, sifted)
+}
+
+fn counts(counts: &BTreeMap<&'static str, usize>) -> String {
+    counts
+        .iter()
+        .map(|(name, n)| format!("{name} {n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl Sifted {
+    /// One line for the person: read, left out as briefs, kept, dropped.
+    pub fn said(&self) -> String {
+        let kept: usize = self.kept.values().sum();
+        let mut line = format!("{} message(s) people wrote, listed by vessa", self.read);
+        if self.long > 0 {
+            let _ = write!(
+                line,
+                "; {} longer than {MAX_MESSAGE} characters left out as pasted briefs",
+                self.long
+            );
+        }
+        if !self.filtered {
+            let _ = write!(
+                line,
+                "; no pre-filter (--no-prefilter): {kept} candidate(s)"
+            );
+            return line;
+        }
+        let dropped: usize = self.dropped.values().sum();
+        let _ = write!(line, "; the pre-filter ({PREFILTER}) kept {kept}");
+        if kept > 0 {
+            let _ = write!(line, " ({})", counts(&self.kept));
+        }
+        let _ = write!(line, " and dropped {dropped}");
+        if dropped > 0 {
+            let _ = write!(
+                line,
+                " ({}), keeping none of them: `--no-prefilter` sends every message, and \
+                 `--since` reads a stretch again",
+                counts(&self.dropped)
+            );
+        }
+        line
+    }
+}
+
+/// `reply` is the agent's reply this message follows, if any (seula's
+/// `correction_signal`, unchanged).
+fn correction_signal(text: &str, reply: Option<&str>) -> Option<&'static str> {
+    let after_response = reply.is_some();
+    let asked = reply.is_some_and(asks);
+    if text.len() > 2000 {
+        return None;
+    }
+    let mut fence = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("```") || line.starts_with("~~~") {
+            let marker = &line[..3];
+            if fence == Some(marker) {
+                fence = None;
+            } else if fence.is_none() {
+                fence = Some(marker);
+            }
+            continue;
+        }
+        if fence.is_some() || line.starts_with('>') {
+            continue;
+        }
+        for clause in line.split(['.', '!', '?', ';']) {
+            // Quoted examples and inline code are not direct instructions. This
+            // deliberately misses mixed quote/prose clauses rather than guessing.
+            if clause.contains(['"', '`', '“', '”']) {
+                continue;
+            }
+            let clause = spelled(&normalized(clause).replace('’', "'"));
+            let contrast = clause.starts_with("but ");
+            let mut text = clause.as_str();
+            for prefix in ["but ", "no, ", "actually, ", "please "] {
+                text = text.strip_prefix(prefix).unwrap_or(text);
+            }
+            let starts = |phrase: &str| {
+                text.strip_prefix(phrase).is_some_and(|rest| {
+                    rest.is_empty() || rest.starts_with(|c: char| !c.is_alphanumeric() && c != '\'')
+                })
+            };
+            if [
+                "i already told you",
+                "i told you",
+                "that's not what",
+                "that is not what",
+                "you forgot",
+                "you missed",
+                "as i said",
+                "like i said",
+                "i already asked",
+                "i already said",
+            ]
+            .iter()
+            .any(|p| starts(p))
+            {
+                return Some("explicit reminder or mismatch");
+            }
+            if after_response {
+                if [
+                    "this is not enough",
+                    "that is not enough",
+                    "that's not enough",
+                    "this isn't enough",
+                    "something is missing",
+                    "this is still wrong",
+                    "that is still wrong",
+                    "we are still missing",
+                    "this doesn't address",
+                    "that doesn't address",
+                    "not what i asked",
+                ]
+                .iter()
+                .any(|p| starts(p))
+                {
+                    return Some("unmet expectation after assistant response");
+                }
+                if (contrast && starts("we need"))
+                    || [
+                        "stop asking",
+                        "do not use",
+                        "don't use",
+                        "instead",
+                        "we need more than",
+                        "let's do it better",
+                        "lets do it better",
+                        "try again",
+                    ]
+                    .iter()
+                    .any(|p| starts(p))
+                {
+                    return Some("requested redirection after assistant response");
+                }
+                if asked_again(text) {
+                    return Some("explicit reminder or mismatch");
+                }
+                // A "no" answering the assistant's question is an answer, unless
+                // the person says the assistant misunderstood.
+                if rejection(&clause) && (!asked || misunderstood(&clause)) {
+                    return Some("rejection after assistant response");
+                }
+                if challenge(text) {
+                    return Some("challenge to the assistant's action after response");
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Apostrophe-free spellings as people type them, so "dont use" reads as
+/// "don't use" and "thats not what" as "that's not what".
+fn spelled(text: &str) -> String {
+    text.split(' ')
+        .map(|word| {
+            let (stem, tail) = word.split_at(word.trim_end_matches([',', ':']).len());
+            let stem = match stem {
+                "dont" => "don't",
+                "doesnt" => "doesn't",
+                "didnt" => "didn't",
+                "isnt" => "isn't",
+                "cant" => "can't",
+                "thats" => "that's",
+                "lets" => "let's",
+                "its" => "it's",
+                "im" => "i'm",
+                "youre" => "you're",
+                other => other,
+            };
+            format!("{stem}{tail}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Words that follow "no" when it rejects the reply ("no i mean", "no we
+/// had", "no but"), unlike "no" as a determiner ("no target", "no files").
+const REJECTION_FOLLOWERS: [&str; 21] = [
+    "i", "i'm", "we", "you", "u", "it", "it's", "that", "that's", "this", "but", "let's", "just",
+    "wait", "actually", "not", "don't", "please", "stop", "why", "instead",
+];
+
+/// "no" as an interjection that rejects the assistant's reply: "no", "no no",
+/// "no, keep it", "no i mean ...", or a short "no redis man". Not a status
+/// such as "no target", "no files changed" or "no need to ...".
+fn rejection(clause: &str) -> bool {
+    if clause == "nope" || clause.starts_with("nope ") || clause.starts_with("nope,") {
+        return true;
+    }
+    let Some(rest) = clause.strip_prefix("no") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    if let Some(after) = rest.strip_prefix(',') {
+        return !matches!(
+            after.split_whitespace().next(),
+            Some("thanks" | "thank" | "worries" | "problem")
+        );
+    }
+    let Some(rest) = rest.strip_prefix(' ') else {
+        return false;
+    };
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    match words.as_slice() {
+        ["no", ..] => true,
+        [first, ..] if REJECTION_FOLLOWERS.contains(first) => true,
+        // "no redis man", but not the idiom "no way" (surprise, not refusal).
+        [middle, last] => {
+            !matches!(*middle, "way" | "problem" | "worries")
+                && matches!(*last, "man" | "dude" | "bro" | "mate" | "sis")
+        }
+        _ => false,
+    }
+}
+
+/// The assistant ended its reply with a question ("Want me to ...?").
+fn asks(reply: &str) -> bool {
+    reply
+        .lines()
+        .rev()
+        .map(|line| line.trim().trim_end_matches(['*', '_', '`', ')']))
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| line.ends_with('?'))
+}
+
+/// "no i mean ...": the person says the assistant got them wrong.
+fn misunderstood(clause: &str) -> bool {
+    ["i mean", "not what", "misunderstood", "misunderstand"]
+        .iter()
+        .any(|p| clause.contains(p))
+}
+
+/// "why do you merge without review?": questioning what the assistant did,
+/// not asking for its reasoning ("why do you think ...").
+fn challenge(text: &str) -> bool {
+    let words: Vec<&str> = text.split_whitespace().take(4).collect();
+    match words.as_slice() {
+        ["why", "do" | "did" | "are" | "were" | "would" | "does" | "is", "you" | "u", rest @ ..] => {
+            !matches!(
+                rest.first(),
+                Some(
+                    &"think"
+                        | &"recommend"
+                        | &"suggest"
+                        | &"prefer"
+                        | &"believe"
+                        | &"like"
+                        | &"mean"
+                )
+            )
+        }
+        _ => false,
+    }
+}
+
+/// "i asked you to ...", "i said no": restating an earlier request. Not a story
+/// such as "i asked the reviewer", "i asked that agent" or "i said hello", nor
+/// "i asked it", where "it" is as likely another agent or tool.
+fn asked_again(text: &str) -> bool {
+    let words: Vec<&str> = text.split_whitespace().take(3).collect();
+    matches!(
+        words.as_slice(),
+        [
+            "i",
+            "asked" | "said",
+            "you"
+                | "u"
+                | "for"
+                | "to"
+                | "twice"
+                | "again"
+                | "already"
+                | "before"
+                | "earlier"
+                | "not"
+                | "no"
+        ]
+    )
+}
+
+/// Whitespace collapsed, lowercase.
+fn normalized(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 // ---- pull requests and reverts ---------------------------------------------
@@ -553,15 +1055,9 @@ fn in_window(candidate: &Candidate, session: &crate::sessions::Session) -> bool 
         && Path::new(&candidate.place).starts_with(&session.repo)
 }
 
-/// The transcript candidates that fall inside one of these sessions.
-pub fn within_sessions(
-    window: Vec<Candidate>,
-    sessions: &[crate::sessions::Session],
-) -> Vec<Candidate> {
-    window
-        .into_iter()
-        .filter(|candidate| sessions.iter().any(|session| in_window(candidate, session)))
-        .collect()
+/// Whether what was said falls inside one of these sessions.
+pub fn within_sessions(candidate: &Candidate, sessions: &[crate::sessions::Session]) -> bool {
+    sessions.iter().any(|session| in_window(candidate, session))
 }
 
 /// Every candidate found that is this session's: what was said in its window
@@ -571,13 +1067,236 @@ pub fn members(session: &crate::sessions::Session, found: &[Candidate]) -> Vec<K
     let own = std::slice::from_ref(session);
     let said = found
         .iter()
-        .filter(|c| matches!(c.source, "claude" | "codex") && in_window(c, session));
+        .filter(|c| SAID.contains(&c.source) && in_window(c, session));
     handover_candidates(own)
         .iter()
         .chain(&observed_candidates(own))
         .chain(said)
         .map(Candidate::key)
         .collect()
+}
+
+// ---- secrets ----------------------------------------------------------------
+//
+// What people paste to agents includes credentials: the review of #56 found
+// what looks like a live key in one real message. Nothing that goes to the
+// drafter keeps one. Every candidate's words, and the agent's words before
+// them, are scrubbed as the prompt is made, from every source, with the
+// pre-filter on or off: a token that looks like a secret becomes
+// `[redacted]`. The original is never said, logged or kept; only how many
+// were redacted is said. The rules are few and local: known key prefixes,
+// JWTs, private key blocks, and a long mixed token right after a word that
+// names a secret.
+
+const REDACTED: &str = "[redacted]";
+
+/// `text` with every secret-looking token replaced by `[redacted]`, and how
+/// many were.
+pub fn scrub(text: &str) -> (String, usize) {
+    let (text, blocks) = scrub_private_keys(text);
+    let (text, tokens) = scrub_tokens(&text);
+    (text, blocks + tokens)
+}
+
+/// PEM private key blocks, whole: to their end line, else to the end.
+fn scrub_private_keys(text: &str) -> (String, usize) {
+    const BEGIN: &str = "-----BEGIN ";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut count = 0;
+    while let Some(begin) = rest.find(BEGIN) {
+        let Some(label) = rest[begin + BEGIN.len()..].find("-----") else {
+            break;
+        };
+        let header_end = begin + BEGIN.len() + label + "-----".len();
+        if !rest[begin..header_end].contains("PRIVATE KEY") {
+            out.push_str(&rest[..header_end]);
+            rest = &rest[header_end..];
+            continue;
+        }
+        out.push_str(&rest[..begin]);
+        out.push_str(REDACTED);
+        count += 1;
+        let after = &rest[header_end..];
+        rest = after
+            .find("-----END ")
+            .and_then(|end| {
+                let label = end + "-----END ".len();
+                after[label..]
+                    .find("-----")
+                    .map(|close| &after[label + close + "-----".len()..])
+            })
+            .unwrap_or("");
+    }
+    out.push_str(rest);
+    (out, count)
+}
+
+/// The bytes a token is made of (all ASCII, so a run of them always starts
+/// and ends on a character boundary).
+fn token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'/' | b'~')
+}
+
+/// Every run of token bytes that looks like a secret, on its own or after
+/// the word before it.
+fn scrub_tokens(text: &str) -> (String, usize) {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let (mut count, mut copied, mut i) = (0, 0, 0);
+    let mut previous: Option<(usize, usize)> = None;
+    while i < bytes.len() {
+        if !token_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && token_byte(bytes[i]) {
+            i += 1;
+        }
+        // Base64 padding is the token's, unless more of a token follows it
+        // (`key=value`).
+        let mut end = i;
+        while end < bytes.len() && bytes[end] == b'=' {
+            end += 1;
+        }
+        if end < bytes.len() && token_byte(bytes[end]) {
+            end = i;
+        }
+        i = end;
+        // A sentence's full stop is not the token's.
+        let mut stop = end;
+        while stop > start && bytes[stop - 1] == b'.' {
+            stop -= 1;
+        }
+        let run = &text[start..stop];
+        let after = previous.map(|(s, e)| (&text[s..e], &text[e..start]));
+        if let Some(len) = secret(run, after) {
+            out.push_str(&text[copied..start]);
+            out.push_str(REDACTED);
+            copied = start + len;
+            count += 1;
+        }
+        previous = Some((start, stop));
+    }
+    out.push_str(&text[copied..]);
+    (out, count)
+}
+
+/// How much of `run` is a secret, if any: a known key prefix, a JWT, or a
+/// long mixed token right after a word that names a secret (`after`: that
+/// word, and what stands between).
+fn secret(run: &str, after: Option<(&str, &str)>) -> Option<usize> {
+    let base64url = |part: &str| {
+        part.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    let parts: Vec<&str> = run.split('.').collect();
+    if run.starts_with("eyJ")
+        && parts.len() == 3
+        && parts.iter().all(|p| p.len() >= 10 && base64url(p))
+    {
+        return Some(run.len());
+    }
+    let head = &run[..run
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .unwrap_or(run.len())];
+    let mixed = |s: &str| {
+        s.bytes().any(|b| b.is_ascii_digit()) && s.bytes().any(|b| b.is_ascii_alphabetic())
+    };
+    let prefixed = |prefix: &str, least: usize, ok: &dyn Fn(&str) -> bool| {
+        head.strip_prefix(prefix)
+            .is_some_and(|rest| rest.len() >= least && ok(rest))
+    };
+    let alnum = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric());
+    let aws = |s: &str| {
+        s.len() == 16
+            && s.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    };
+    let found = prefixed("sk-", 20, &mixed)
+        || ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+            .iter()
+            .any(|p| prefixed(p, 30, &alnum))
+        || prefixed("github_pat_", 20, &mixed)
+        || ["xoxb-", "xoxp-", "xoxa-", "xoxs-"]
+            .iter()
+            .any(|p| prefixed(p, 10, &mixed))
+        || prefixed("AKIA", 16, &aws)
+        || prefixed("ASIA", 16, &aws)
+        || prefixed("glpat-", 20, &mixed)
+        || prefixed("AIza", 30, &|_| true);
+    if found {
+        return Some(head.len());
+    }
+    // A key of a vendor not named here, alone: an id and a secret joined by
+    // a dot, or a long token mixing capitals, lower case and digits.
+    if dotted_key(run) || mixes_cases_and_digits(run) {
+        return Some(run.len());
+    }
+    let (word, between) = after?;
+    let separated = (1..=4).contains(&between.len())
+        && between
+            .bytes()
+            .all(|b| matches!(b, b' ' | b'\t' | b':' | b'=' | b'"' | b'\''));
+    let distinct = run.bytes().collect::<BTreeSet<u8>>().len();
+    let long_and_mixed =
+        run.len() >= 16 && mixed(run) && distinct >= 8 && !run.starts_with(['/', '~', '.']);
+    (separated && names_a_secret(word) && long_and_mixed).then_some(run.len())
+}
+
+/// `<hex, 24 or more>.<letters and digits, 12 or more>`: an id and a secret
+/// joined by a dot, as some providers issue keys.
+fn dotted_key(run: &str) -> bool {
+    let parts: Vec<&str> = run.split('.').collect();
+    parts.windows(2).any(|pair| {
+        pair[0].len() >= 24
+            && pair[0].bytes().all(|b| b.is_ascii_hexdigit())
+            && pair[1].len() >= 12
+            && pair[1].bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+/// 32 or more characters with no space, two or more each of capitals, lower
+/// case letters and digits: what a key with no known prefix looks like. A
+/// hash or a UUID, in either case, is hex and is left alone. A path is
+/// judged by the pieces of its names (between `/`, `.`, `-` and `_`), so a
+/// long path, or a versioned or dated file name, made of short words is no
+/// key; a Codex rollout name has one capital besides. A long name with digits and
+/// capitals (`ProjectSettingsV2Controller3`) is redacted too: a cheap loss
+/// to the drafter.
+fn mixes_cases_and_digits(run: &str) -> bool {
+    let long_and_mixed = |part: &str| {
+        let count = |kind: fn(&u8) -> bool| part.bytes().filter(kind).count();
+        part.len() >= 32
+            && count(u8::is_ascii_uppercase) >= 2
+            && count(u8::is_ascii_lowercase) >= 2
+            && count(u8::is_ascii_digit) >= 2
+            && !part.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+    };
+    if run.starts_with(['/', '~', '.']) {
+        run.split(['/', '.', '-', '_']).any(long_and_mixed)
+    } else {
+        long_and_mixed(run)
+    }
+}
+
+/// `key`, `token`, `secret`, `password`, `passwd` or `bearer`, alone or
+/// ending a name (`api_key`, `GITHUB_TOKEN`, `apiKey`), never inside a word
+/// (`monkey`).
+fn names_a_secret(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    ["key", "token", "secret", "password", "passwd", "bearer"]
+        .iter()
+        .any(|name| {
+            lower.ends_with(name) && {
+                let cut = word.len() - name.len();
+                cut == 0
+                    || matches!(word.as_bytes()[cut - 1], b'_' | b'-' | b'.')
+                    || word.as_bytes()[cut].is_ascii_uppercase()
+                        && word.as_bytes()[cut - 1].is_ascii_lowercase()
+            }
+        })
 }
 
 // ---- drafting ---------------------------------------------------------------
@@ -621,9 +1340,12 @@ Output ONLY a JSON array, no prose, no code fence. Each element:
  \"refines\": \"existing-id or null\", \"supersedes\": []}
 ";
 
-/// The prompt for one batch of candidates.
-pub fn prompt(loaded: &Loaded, batch: &[Candidate]) -> String {
+/// The prompt for one batch of candidates, every candidate's words and the
+/// agent's words before them scrubbed of secrets (see [`scrub`]), and how
+/// many secret-looking tokens were redacted from it.
+pub fn prompt(loaded: &Loaded, batch: &[Candidate]) -> (String, usize) {
     let mut out = String::from(INSTRUCTIONS);
+    let mut redacted = 0;
     out.push_str("\nExisting knowledge:\n");
     if loaded.nodes.is_empty() {
         out.push_str("(none yet)\n");
@@ -652,11 +1374,15 @@ pub fn prompt(loaded: &Loaded, batch: &[Candidate]) -> String {
             candidate.who
         );
         if !candidate.context.is_empty() {
-            let _ = writeln!(out, "    before: {}", candidate.context.replace('\n', " "));
+            let (context, n) = scrub(&candidate.context);
+            redacted += n;
+            let _ = writeln!(out, "    before: {}", context.replace('\n', " "));
         }
-        let _ = writeln!(out, "    said: {}", candidate.text.replace('\n', " "));
+        let (text, n) = scrub(&candidate.text);
+        redacted += n;
+        let _ = writeln!(out, "    said: {}", text.replace('\n', " "));
     }
-    out
+    (out, redacted)
 }
 
 /// One node as the drafter proposes it.
@@ -759,10 +1485,8 @@ pub fn write_cursor(dirs: &Dirs, at_ms: i64) -> Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(&dirs.state)?;
-    let at = rfc3339(at_ms.div_euclid(1000));
     // Keep the millisecond, so a message in the same second is not re-read.
-    let text = format!("{}.{:03}Z\n", &at[..at.len() - 1], at_ms.rem_euclid(1000));
-    std::fs::write(cursor_path(dirs), text)?;
+    std::fs::write(cursor_path(dirs), format!("{}\n", rfc3339_ms(at_ms)))?;
     Ok(())
 }
 
@@ -1290,51 +2014,281 @@ fn replace_durably(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn claude_transcripts_keep_the_person_and_drop_everything_else() {
-        let lines = [
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I pushed to main."}]}}"#,
-            r#"{"type":"user","timestamp":"2026-09-20T10:00:00Z","cwd":"/p/x","message":{"content":"please dont merge PRs u open ok"}}"#,
-            r#"{"type":"user","timestamp":"2026-09-20T10:01:00Z","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
-            r#"{"type":"user","isSidechain":true,"timestamp":"2026-09-20T10:02:00Z","message":{"content":"a subagent prompt"}}"#,
-            r#"{"type":"user","isMeta":true,"timestamp":"2026-09-20T10:03:00Z","message":{"content":"meta"}}"#,
-            r#"{"type":"user","timestamp":"2026-09-20T10:04:00Z","message":{"content":"<system-reminder>x</system-reminder>"}}"#,
-            r#"{"type":"user","timestamp":"2026-09-01T10:00:00Z","message":{"content":"too old"}}"#,
-            "not json",
-        ];
-        let mut out = Vec::new();
-        claude_transcript(
-            &lines.join("\n"),
-            parse_time("2026-09-10").unwrap(),
-            &mut out,
-        );
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(out[0].text, "please dont merge PRs u open ok");
-        assert_eq!(out[0].context, "I pushed to main.");
-        assert_eq!(out[0].place, "/p/x");
+    /// One message as `vessa messages --json` writes it.
+    fn vessa_message(agent: &str, kind: &str, at: &str, text: &str, reply: Value) -> Value {
+        serde_json::json!({
+            "agent": agent, "session": format!("{agent}-s"), "parent": null, "kind": kind,
+            "id": null, "at": at, "cwd": "/p/work", "text": text, "question": null,
+            "reply": reply, "source": "/t/s.jsonl", "line": 4,
+        })
+    }
+
+    fn vessa_document(messages: Vec<Value>, gaps: &[&str], limitations: &[&str]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "vessa-messages.v1", "messages": messages, "sessions": [],
+            "coverage": {"human": messages.len(), "excluded": {}, "gaps": gaps,
+                         "limitations": limitations},
+            "warnings": [],
+        }))
+        .unwrap()
+    }
+
+    fn reply(text: &str, failed: bool) -> Value {
+        serde_json::json!({"text": text, "truncated": false, "failed": failed, "line": 3})
     }
 
     #[test]
-    fn codex_subagent_sessions_are_skipped_whole() {
-        let own = [
-            r#"{"type":"session_meta","payload":{"source":"cli","cwd":"/p/y"}}"#,
-            r#"{"timestamp":"2026-09-20T10:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>x</environment_context>"}]}}"#,
-            r#"{"timestamp":"2026-09-20T10:01:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Blocked on macOS."}]}}"#,
-            r#"{"timestamp":"2026-09-20T10:02:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"we have lima baba"}]}}"#,
-        ];
-        let mut out = Vec::new();
-        codex_session(&own.join("\n"), parse_time("2026-09-10").unwrap(), &mut out);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].text, "we have lima baba");
-        assert_eq!(out[0].context, "Blocked on macOS.");
-        assert_eq!(out[0].place, "/p/y");
+    fn vessas_messages_become_candidates_keyed_as_intake_kept_them() {
+        let since = parse_time("2026-09-10").unwrap();
+        let document = vessa_document(
+            vec![
+                vessa_message(
+                    "claude",
+                    "message",
+                    "2026-09-20T10:00:00Z",
+                    "please dont merge PRs u open ok",
+                    reply("I pushed to main.", false),
+                ),
+                vessa_message(
+                    "codex",
+                    "message",
+                    "2026-09-20T10:02:00.123Z",
+                    "we have lima baba",
+                    Value::Null,
+                ),
+                vessa_message(
+                    "pi",
+                    "queued",
+                    "2026-09-20T10:03:00+02:00",
+                    "x",
+                    reply("ran it", true),
+                ),
+                serde_json::json!({
+                    "agent": "claude", "session": "claude-s/agent-1", "parent": "claude-s",
+                    "kind": "answer", "id": "u9", "at": "2026-09-20T10:04:00Z", "cwd": "/p/work",
+                    "text": "neither, use lima", "question": "Docker or a VM?",
+                    "reply": reply("Which one?", false), "source": "/t/a.jsonl", "line": 9,
+                }),
+                vessa_message(
+                    "opencode2",
+                    "message",
+                    "2026-09-20T10:05:00Z",
+                    "y",
+                    Value::Null,
+                ),
+                // At or before the window's start: vessa's window is exclusive.
+                vessa_message(
+                    "claude",
+                    "message",
+                    "2026-09-10T00:00:00Z",
+                    "too old",
+                    Value::Null,
+                ),
+            ],
+            &[],
+            &[],
+        );
+        let mut warnings = Vec::new();
+        let said = listed(
+            Some(0),
+            &document,
+            "",
+            since,
+            &mut warnings,
+            &mut Vec::new(),
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(said.len(), 5, "{said:?}");
+        let first = &said[0].candidate;
+        assert_eq!(first.source, "claude");
+        assert_eq!(first.text, "please dont merge PRs u open ok");
+        assert_eq!(first.context, "I pushed to main.");
+        assert_eq!(first.place, "/p/work");
+        assert_eq!(first.who, "person (claude session claude-s)");
+        // The key #52's progress is kept by: the time, and a digest of the
+        // words exactly as vessa gives them, which are the words intake's own
+        // reader gave (reminders stripped, trimmed). Nothing handled before
+        // is sent again.
+        assert_eq!(
+            first.key(),
+            Key {
+                at_ms: parse_time("2026-09-20T10:00:00Z").unwrap(),
+                digest: fnv1a(b"please dont merge PRs u open ok"),
+            }
+        );
+        assert_eq!(said[0].reply.as_deref(), Some("I pushed to main."));
+        assert_eq!(said[1].candidate.source, "codex");
+        assert_eq!(said[1].candidate.at_ms % 1000, 123, "milliseconds kept");
+        assert_eq!(said[1].reply, None);
+        assert_eq!(said[1].candidate.context, "");
+        // A reply that failed is shown as such, and is no reply to the rules.
+        assert_eq!(said[2].candidate.source, "pi");
+        assert_eq!(said[2].candidate.at, "2026-09-20T08:03:00Z");
+        assert_eq!(said[2].reply, None);
+        assert_eq!(
+            said[2].candidate.context,
+            "(the agent's turn failed) ran it"
+        );
+        assert!(said[2]
+            .candidate
+            .who
+            .contains("typed while the agent worked"));
+        // An answer travels with its question.
+        assert_eq!(said[3].kind, "answer");
+        assert_eq!(said[3].candidate.context, "asked: Docker or a VM?");
+        assert!(said[3]
+            .candidate
+            .who
+            .contains("claude session claude-s/agent-1"));
+        assert_eq!(
+            said[4].candidate.source, "agent",
+            "an agent intake does not know"
+        );
+        assert!(said.iter().all(|s| SAID.contains(&s.candidate.source)));
+    }
 
-        let sub = own
-            .join("\n")
-            .replace(r#""source":"cli""#, r#""source":{"subagent":"review"}"#);
-        let mut out = Vec::new();
-        codex_session(&sub, parse_time("2026-09-10").unwrap(), &mut out);
-        assert!(out.is_empty(), "a subagent's user is another agent");
+    #[test]
+    fn what_vessa_could_not_read_is_a_warning_and_an_old_vessa_is_told_to_update() {
+        let since = parse_time("2026-09-10").unwrap();
+        let one = || {
+            vec![vessa_message(
+                "claude",
+                "message",
+                "2026-09-20T10:00:00Z",
+                "never python",
+                Value::Null,
+            )]
+        };
+        // Exit 4: a limitation (or a source warning) is a warning, which
+        // holds the cursor; a gap, a store vessa knows of and does not read,
+        // is handed back apart, to be said without holding anything. What
+        // was listed is kept either way.
+        let (mut warnings, mut gaps) = (Vec::new(), Vec::new());
+        let partial = vessa_document(
+            one(),
+            &["opencode: /h/.local/share/opencode/opencode.db not read"],
+            &["codex/f: Codex fork of p: parent transcript not read"],
+        );
+        let said = listed(
+            Some(4),
+            &partial,
+            "vessa: partial message list (exit 4)",
+            since,
+            &mut warnings,
+            &mut gaps,
+        );
+        assert_eq!(said.len(), 1);
+        assert_eq!(
+            warnings,
+            ["vessa: codex/f: Codex fork of p: parent transcript not read"]
+        );
+        assert_eq!(
+            gaps,
+            ["vessa: opencode: /h/.local/share/opencode/opencode.db not read"]
+        );
+        // Exit 4 for a gap alone is no warning.
+        let (mut warnings, mut gaps) = (Vec::new(), Vec::new());
+        let unread = vessa_document(one(), &["opencode: /h/opencode.db not read"], &[]);
+        listed(Some(4), &unread, "partial", since, &mut warnings, &mut gaps);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(gaps.len(), 1);
+        // A source warning is a warning.
+        let (mut warnings, mut gaps) = (Vec::new(), Vec::new());
+        let mut unreadable: Value =
+            serde_json::from_slice(&vessa_document(one(), &[], &[])).unwrap();
+        unreadable["warnings"] = serde_json::json!(["/h/r.jsonl: Permission denied"]);
+        let unreadable = serde_json::to_vec(&unreadable).unwrap();
+        listed(
+            Some(4),
+            &unreadable,
+            "partial",
+            since,
+            &mut warnings,
+            &mut gaps,
+        );
+        assert_eq!(warnings, ["vessa: /h/r.jsonl: Permission denied"]);
+        assert!(gaps.is_empty());
+        // Exit 4 with nothing named is still partial.
+        let (mut warnings, mut gaps) = (Vec::new(), Vec::new());
+        listed(
+            Some(4),
+            &vessa_document(one(), &[], &[]),
+            "partial",
+            since,
+            &mut warnings,
+            &mut gaps,
+        );
+        assert_eq!(
+            warnings,
+            ["vessa says its list is partial (exit 4: partial)"]
+        );
+        // A document vessa ended with an error keeps what it listed, and warns.
+        let mut warnings = Vec::new();
+        let failed = serde_json::to_vec(&serde_json::json!({
+            "schema": "vessa-messages.v1", "messages": one(), "error": "disk on fire",
+        }))
+        .unwrap();
+        assert_eq!(
+            listed(Some(1), &failed, "", since, &mut warnings, &mut Vec::new()).len(),
+            1
+        );
+        assert_eq!(
+            warnings,
+            ["vessa failed after listing 1 message(s) (exit 1): disk on fire"]
+        );
+        // A vessa older than `messages`: update it; nothing is read instead.
+        let mut warnings = Vec::new();
+        let old = listed(
+            Some(2),
+            b"",
+            "error: unrecognized subcommand 'messages'",
+            since,
+            &mut warnings,
+            &mut Vec::new(),
+        );
+        assert!(old.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("update vessa"), "{warnings:?}");
+        // Another form, or no JSON at all.
+        let mut warnings = Vec::new();
+        let other = serde_json::to_vec(&serde_json::json!({
+            "schema": "vessa-messages.v2", "messages": one(),
+        }))
+        .unwrap();
+        assert!(listed(Some(0), &other, "", since, &mut warnings, &mut Vec::new()).is_empty());
+        assert!(warnings[0].contains("`vessa-messages.v2`"), "{warnings:?}");
+        let mut warnings = Vec::new();
+        assert!(listed(Some(1), b"", "boom", since, &mut warnings, &mut Vec::new()).is_empty());
+        assert_eq!(warnings, ["vessa listed no messages (exit 1: boom)"]);
+        let mut warnings = Vec::new();
+        assert!(listed(
+            Some(0),
+            b"{\"schema\"",
+            "",
+            since,
+            &mut warnings,
+            &mut Vec::new()
+        )
+        .is_empty());
+        assert!(warnings[0].starts_with("vessa's messages are not vessa-messages.v1"));
+        // A message no time can place cannot be windowed: said, not dropped.
+        let mut warnings = Vec::new();
+        let undated = vessa_document(
+            vec![vessa_message(
+                "claude",
+                "message",
+                "yesterday",
+                "x",
+                Value::Null,
+            )],
+            &[],
+            &[],
+        );
+        assert!(listed(Some(0), &undated, "", since, &mut warnings, &mut Vec::new()).is_empty());
+        assert_eq!(
+            warnings,
+            ["vessa listed 1 message(s) whose time intake cannot read"]
+        );
     }
 
     #[test]
@@ -1345,6 +2299,455 @@ mod tests {
             clean("a <system-reminder>b</system-reminder> c"),
             Some("a  c".to_owned())
         );
+        // Words a person starts as a harness would are still a person's: the
+        // prefix skip-list is gone, and vessa's exact forms replace it.
+        assert_eq!(
+            clean("Caveat: it is lima"),
+            Some("Caveat: it is lima".to_owned())
+        );
+        let brief = "y".repeat(MAX_MESSAGE + 1);
+        let document = vessa_document(
+            vec![vessa_message(
+                "codex",
+                "task",
+                "2026-09-20T10:00:00Z",
+                &brief,
+                Value::Null,
+            )],
+            &[],
+            &[],
+        );
+        let said = listed(Some(0), &document, "", 0, &mut Vec::new(), &mut Vec::new());
+        assert!(said[0].long, "kept apart, to be counted");
+        let (candidates, sifted) = sift(said, false);
+        assert!(candidates.is_empty(), "never a candidate, filter or not");
+        assert_eq!((sifted.read, sifted.long), (1, 1));
+    }
+
+    #[test]
+    fn seulas_labelled_steering_cases_separate_feedback_from_tasks_and_quotes() {
+        // seula's labelled cases at e0a3016, unchanged: synthetic, not an
+        // accuracy estimate for real archives.
+        for (text, after_response, expected) in [
+            ("I already told you to check permissions.", false, true),
+            ("You forgot the migration check.", false, true),
+            ("No, that’s not what the request meant.", true, true),
+            ("This is not enough to review the result.", true, true),
+            (
+                "Something is missing from the proposed workflow.",
+                true,
+                true,
+            ),
+            (
+                "Please try again with the original constraints.",
+                true,
+                true,
+            ),
+            (
+                "But we need the result in the existing interface.",
+                true,
+                true,
+            ),
+            ("That doesn't address the failure mode.", true, true),
+            ("Actually, don't use a remote service.", true, true),
+            ("Let's do it better; retain the evidence.", true, true),
+            ("We need more than a count.", true, true),
+            ("Looks close. You missed the empty-input case.", true, true),
+            ("Don't use a database for this new task.", false, false),
+            ("Do not use network access.", false, false),
+            (
+                "Something is missing from a customer file; investigate it.",
+                false,
+                false,
+            ),
+            (
+                "This is not enough memory for a new workload.",
+                false,
+                false,
+            ),
+            ("We need the next feature now.", true, false),
+            ("Thanks, this is enough.", true, false),
+            ("The README says you forgot the flag.", true, false),
+            ("Explain the phrase \"I already told you\".", true, false),
+            ("\"This is not enough\" is the test input.", true, false),
+            ("`you forgot` is a fixture string.", true, false),
+            ("> You missed a field in this quoted example.", true, false),
+            ("```text\nYou forgot the flag.\n```", true, false),
+            ("~~~text\nI told you to retry.\n~~~", true, false),
+            ("You forgottheflag is an identifier.", true, false),
+            ("Try againlater is a command name.", true, false),
+        ] {
+            let reply = after_response.then_some("Here is the result.");
+            assert_eq!(
+                correction_signal(text, reply).is_some(),
+                expected,
+                "{text:?}; after_response={after_response}"
+            );
+        }
+    }
+
+    #[test]
+    fn seulas_lowercase_and_unpunctuated_steering_keeps_its_traps() {
+        // seula's second table at e0a3016, unchanged: lowercase, no
+        // apostrophes, no commas; paraphrased, none copied from a transcript.
+        let statement = Some("I updated the parser and ran its tests.");
+        let question = Some("I can also delete the old fixtures. Want me to do that?");
+        for (text, reply, expected) in [
+            ("no no no", statement, true),
+            ("no no no - read the design notes first", statement, true),
+            ("dont use docker, we can do this locally", statement, true),
+            (
+                "why do you push without running the tests?",
+                statement,
+                true,
+            ),
+            ("no kafka man", statement, true),
+            ("no i mean the other binary", statement, true),
+            ("No, keep the old interface.", statement, true),
+            ("No. Keep the old interface.", statement, true),
+            ("thats not what i asked", None, true),
+            ("why are u editing that file", statement, true),
+            ("this doesnt address the failure", statement, true),
+            ("as i said, run it locally", None, true),
+            ("i asked you to keep the old name", statement, true),
+            // A "no" that answers the assistant's question is an answer, unless
+            // the person says the assistant misunderstood.
+            ("no", question, false),
+            ("no but keep the tests", question, false),
+            ("no no, leave them", question, false),
+            ("no i mean the other fixtures", question, true),
+            ("no no no", None, false),
+            ("i asked you to keep the old name", None, false),
+            // "it" may be another agent or tool the person is talking about.
+            ("i asked it twice", statement, false),
+            ("i asked that other agent to use rust", statement, false),
+            ("no target dir", statement, false),
+            ("No files changed.", statement, false),
+            ("No new information.", statement, false),
+            ("no need to back anything up", statement, false),
+            ("No thanks, that is all.", statement, false),
+            ("no-config builds are fine", statement, false),
+            ("Why do you think the parser fails?", statement, false),
+            ("I asked the reviewer for a second pass.", statement, false),
+            ("I said hello to the team.", statement, false),
+            ("Wrong tab, ignore that.", statement, false),
+            ("Stop the staging box.", statement, false),
+            ("dont forget the changelog", statement, false),
+            ("Notes: no kafka needed here.", statement, false),
+            ("The fixture says \"no no no\".", statement, false),
+            ("no way dude", statement, false),
+        ] {
+            assert_eq!(
+                correction_signal(text, reply).is_some(),
+                expected,
+                "{text:?}; reply={reply:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_prefilter_keeps_corrections_repeats_and_refusals_and_counts_what_it_drops() {
+        let at = |minute: u32| format!("2026-09-20T10:{minute:02}:00Z");
+        let after = reply("Here is the result.", false);
+        let document = vessa_document(
+            vec![
+                vessa_message("claude", "message", &at(1), "no no no", after.clone()),
+                // The same words after a failed turn answer the failure: a
+                // retry, not a correction.
+                vessa_message(
+                    "claude",
+                    "message",
+                    &at(2),
+                    "try again",
+                    reply("API error", true),
+                ),
+                vessa_message("codex", "message", &at(3), "try again", after.clone()),
+                vessa_message(
+                    "codex",
+                    "message",
+                    &at(4),
+                    "we have lima baba",
+                    after.clone(),
+                ),
+                vessa_message(
+                    "codex",
+                    "message",
+                    &at(5),
+                    "Run the checks in the VM first",
+                    Value::Null,
+                ),
+                vessa_message(
+                    "pi",
+                    "message",
+                    &at(6),
+                    "run the checks  in the VM first",
+                    Value::Null,
+                ),
+                vessa_message(
+                    "claude",
+                    "rejection",
+                    &at(7),
+                    "use the existing helper",
+                    Value::Null,
+                ),
+                vessa_message("claude", "message", &at(8), "next", after.clone()),
+                vessa_message(
+                    "claude",
+                    "task",
+                    &at(9),
+                    &"z".repeat(MAX_MESSAGE + 1),
+                    Value::Null,
+                ),
+            ],
+            &[],
+            &[],
+        );
+        let said = listed(Some(0), &document, "", 0, &mut Vec::new(), &mut Vec::new());
+        let verdicts = prefilter(&said[..8]);
+        assert_eq!(
+            verdicts,
+            [
+                Some("correction"),
+                None,
+                Some("correction"),
+                None,
+                Some("repeat"),
+                Some("repeat"),
+                Some("rejection"),
+                None,
+            ]
+        );
+        let (kept, sifted) = sift(said.clone(), true);
+        assert_eq!(kept.len(), 5);
+        assert!(
+            kept.iter().all(|c| c.text != "we have lima baba"),
+            "low recall: dropped"
+        );
+        assert_eq!(
+            sifted,
+            Sifted {
+                read: 9,
+                long: 1,
+                filtered: true,
+                kept: BTreeMap::from([("correction", 2), ("repeat", 2), ("rejection", 1)]),
+                dropped: BTreeMap::from([("claude", 2), ("codex", 1)]),
+            }
+        );
+        assert_eq!(
+            sifted.said(),
+            "9 message(s) people wrote, listed by vessa; 1 longer than 1500 characters left \
+             out as pasted briefs; the pre-filter (phrase-rules.v3) kept 5 (correction 2, \
+             rejection 1, repeat 2) and dropped 3 (claude 2, codex 1), keeping none of them: \
+             `--no-prefilter` sends every message, and `--since` reads a stretch again"
+        );
+        // Without it, every message but the brief is a candidate.
+        let (all, sifted) = sift(said, false);
+        assert_eq!(all.len(), 8);
+        assert_eq!(
+            sifted.said(),
+            "9 message(s) people wrote, listed by vessa; 1 longer than 1500 characters left \
+             out as pasted briefs; no pre-filter (--no-prefilter): 8 candidate(s)"
+        );
+        // Nothing dropped is said as such.
+        let (_, sifted) = sift(Vec::new(), true);
+        assert_eq!(
+            sifted.said(),
+            "0 message(s) people wrote, listed by vessa; the pre-filter (phrase-rules.v3) \
+             kept 0 and dropped 0"
+        );
+    }
+
+    /// Secret-shaped strings, put together at run time so that none sits in
+    /// the source for a scanner to find. None is a real credential.
+    fn fake(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    #[test]
+    fn secret_looking_tokens_are_redacted_and_counted() {
+        let body = "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5kL7";
+        let cases = [
+            ("an OpenAI key", fake(&["s", "k-proj-", &body[..32]])),
+            (
+                "an Anthropic key",
+                fake(&["s", "k-ant-api03-", &body[..36]]),
+            ),
+            ("a GitHub token", fake(&["gh", "p_", &body[..36]])),
+            ("a GitHub OAuth token", fake(&["gh", "o_", &body[..36]])),
+            (
+                "a GitHub fine-grained token",
+                fake(&["github", "_pat_11", &body[..30]]),
+            ),
+            (
+                "a Slack token",
+                fake(&["xo", "xb-", "1234567890-", &body[..24]]),
+            ),
+            (
+                "a Slack user token",
+                fake(&["xo", "xp-", "1234567890-", &body[..24]]),
+            ),
+            ("an AWS key id", fake(&["AK", "IA", "Q3SWZ7YT2NB5XK4M"])),
+            (
+                "an AWS session key id",
+                fake(&["AS", "IA", "Q3SWZ7YT2NB5XK4M"]),
+            ),
+            ("a GitLab token", fake(&["gl", "pat-", &body[..20]])),
+            ("a Google API key", fake(&["AI", "za", "Sy", &body[..33]])),
+            (
+                "a JWT",
+                fake(&[
+                    "ey",
+                    "JhbGciOiJIUzI1NiJ9",
+                    ".",
+                    "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                    ".",
+                    &body[..28],
+                ]),
+            ),
+        ];
+        for (what, secret) in &cases {
+            for text in [
+                secret.clone(),
+                format!("use {secret} for it."),
+                format!("({secret}), then retry"),
+            ] {
+                let (scrubbed, n) = scrub(&text);
+                assert_eq!(n, 1, "{what}: {scrubbed}");
+                assert!(!scrubbed.contains(secret.as_str()), "{what}: {scrubbed}");
+                assert!(scrubbed.contains("[redacted]"), "{what}: {scrubbed}");
+            }
+        }
+        // A private key block, whole, with or without its end.
+        let pem = fake(&[
+            "-----BEGIN RSA PRIV",
+            "ATE KEY-----\n",
+            body,
+            "\n",
+            body,
+            "\n-----END RSA PRIV",
+            "ATE KEY-----",
+        ]);
+        let (scrubbed, n) = scrub(&format!("here:\n{pem}\nthanks"));
+        assert_eq!((scrubbed.as_str(), n), ("here:\n[redacted]\nthanks", 1));
+        let open = fake(&["-----BEGIN OPENSSH PRIV", "ATE KEY-----\n", body]);
+        assert_eq!(scrub(&format!("x {open}")), ("x [redacted]".to_owned(), 1));
+        // A certificate is no secret.
+        let cert = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
+        assert_eq!(scrub(cert), (cert.to_owned(), 0));
+        // A long, mixed token right after a word that names a secret.
+        let value = &body[..24];
+        for text in [
+            format!("api_key={value}"),
+            format!("API_KEY: {value}"),
+            format!("apiKey = '{value}'"),
+            format!("\"access_token\": \"{value}\""),
+            format!("client_secret {value}"),
+            format!("password: {value}"),
+            format!("Authorization: Bearer {value}"),
+            format!("export GITHUB_TOKEN={value}=="),
+        ] {
+            let (scrubbed, n) = scrub(&text);
+            assert_eq!(n, 1, "{text}: {scrubbed}");
+            assert!(!scrubbed.contains(value), "{scrubbed}");
+        }
+        // A key of some vendor ohjaa knows nothing of, with no prefix and no
+        // name before it: a long token mixing capitals, lower case and
+        // digits, or an id and a secret joined by a dot (`<hex>.<alnum>`, as
+        // some providers issue them; synthetic, like every key here).
+        let unnamed = [
+            fake(&["be3f", "Q9xT2mLk7RvA4nWp8ZcH1sYd6JgU3eBo5KfN0iMq2"]),
+            fake(&[
+                "3f9a1c0b7e2d4f6a",
+                "8b1c3d5e7f9a0b2c",
+                ".",
+                "Xk9Qm2Lp7RtA4nWz",
+            ]),
+            fake(&["3f9a1c0b7e2d4f6a8b1c3d5e", ".", "k9qm2lp7rtaz"]),
+            fake(&["Ab3dE5gH7jK9mN1pQ3sT", "/", "5vW7yZ9bC1dF3hJ5kL7mN9p"]),
+        ];
+        for text in unnamed.iter().flat_map(|key| {
+            [
+                key.clone(),
+                format!("use this one: {key}."),
+                format!("({key})"),
+            ]
+        }) {
+            let unnamed = unnamed
+                .iter()
+                .find(|key| text.contains(key.as_str()))
+                .unwrap();
+            let (scrubbed, n) = scrub(&text);
+            assert_eq!(n, 1, "{scrubbed}");
+            assert!(!scrubbed.contains(unnamed.as_str()), "{scrubbed}");
+        }
+        // Two in one message are two.
+        assert_eq!(scrub(&format!("{} and {}", cases[2].1, cases[7].1)).1, 2);
+    }
+
+    #[test]
+    fn what_only_looks_long_is_not_redacted() {
+        for text in [
+            // A git sha, a UUID, alone or after ordinary words.
+            "commit 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b is on main",
+            "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+            "session 8c1f2e3a-4b5c-4d6e-8f70-123456789abc ended",
+            "8c1f2e3a-4b5c-4d6e-8f70-123456789abc",
+            // Words that name a secret, followed by no secret.
+            "the key thing is to keep the token budget small",
+            "password: hunter2",
+            "the token count was 1234",
+            "key /Users/yair/.ssh/id_ed25519_github_2026",
+            // Prefixes inside ordinary words, or too short to be keys.
+            "use sk-learn, or task-1234567890abcdefghij",
+            "the AKIA prefix names an AWS key",
+            "eyJ is how base64 JSON starts",
+            "monkey Ab3dE5gH7jK9mN1pQ3sT",
+            // Hashes and ids in either case, and long names and paths with no
+            // capital, digit or long segment that mixes them.
+            "1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F9A0B and 8C1F2E3A-4B5C-4D6E-8F70-123456789ABC",
+            "sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "image sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "a 9f86d081884c7d659a2f.feaa0c55ad01 short id",
+            "test_the_cursor_moves_only_past_what_was_handled_and_never_back_2",
+            "/Users/yair/projects/_worktrees/ohjaa-intake-vessa/src/IntakeVessa2/main.rs",
+            "~/.codex/sessions/2026/10/26/rollout-2026-10-26T10-00-00-8c1f2e3a.jsonl",
+            "ProjectManagementDashboardSettingsController is long but has no digit",
+            // A path is judged by the pieces of its names: versioned and dated
+            // file names are made of short words.
+            "/Users/yair/Downloads/Ohjaa-1.2.3-macOS-arm64-applesilicon.zip",
+            "~/Desktop/2026-10-26T10-20-33Z_Screen-Recording-8c1f2e3a-Final.mov",
+        ] {
+            assert_eq!(scrub(text), (text.to_owned(), 0), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_carries_no_secret_from_any_candidate() {
+        let key = fake(&["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"]);
+        let candidate = |source: &'static str, text: String, context: String| Candidate {
+            source,
+            at_ms: 0,
+            at: rfc3339(0),
+            place: "/p/work".to_owned(),
+            who: "person".to_owned(),
+            context,
+            text,
+        };
+        let batch = [
+            candidate(
+                "claude",
+                format!("use {key} please"),
+                format!("I need {key}"),
+            ),
+            candidate("review", format!("token={key}"), String::new()),
+            candidate("handover", "next: nothing secret".to_owned(), String::new()),
+        ];
+        let (prompt, redacted) = prompt(&Loaded::default(), &batch);
+        assert!(!prompt.contains(&key), "{prompt}");
+        assert_eq!(redacted, 3);
+        assert!(prompt.contains("said: use [redacted] please"), "{prompt}");
+        assert!(prompt.contains("before: I need [redacted]"), "{prompt}");
+        assert!(prompt.contains("said: next: nothing secret"), "{prompt}");
     }
 
     #[test]
@@ -2036,7 +3439,7 @@ mod tests {
             .cloned()
             .partition(|c| c.at_ms > since);
         let mut candidates = new;
-        candidates.extend(within_sessions(older, &queued));
+        candidates.extend(older.into_iter().filter(|c| within_sessions(c, &queued)));
         candidates.extend(
             visible()
                 .filter(|c| c.source == "review" && c.at_ms > since)
