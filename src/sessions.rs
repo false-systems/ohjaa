@@ -472,6 +472,23 @@ pub struct Session {
 }
 
 impl Session {
+    /// The last time its record shows it active: its start, its process
+    /// group's, its read-back, its handover, the validations it requested.
+    /// An orphan's end was never observed; this is as far as it was seen.
+    pub fn last_seen_ms(&self) -> i64 {
+        [
+            Some(self.started_ms),
+            self.group_started_ms,
+            self.readback.as_ref().map(|r| r.at_ms),
+            self.handover.as_ref().map(|h| h.at_ms),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.validations.iter().map(|v| v.requested_ms))
+        .max()
+        .unwrap_or(self.started_ms)
+    }
+
     /// When it ended, as far as that was observed, to rank the sessions in a
     /// place: `None` while it runs. An orphan's end was never observed, only
     /// that its ohjaa was gone at some later launch, so it ranks by its start:
@@ -2233,6 +2250,24 @@ mod tests {
             "the one that ended last wins, wherever it was launched"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An orphan is seen as far as its record says: what it last did.
+    #[test]
+    fn an_orphan_was_last_seen_at_the_latest_time_its_record_shows() {
+        let mut s = session("oh-1", "/r/a", 1_000);
+        assert_eq!(s.last_seen_ms(), 1_000);
+        s.group_started_ms = Some(1_500);
+        s.readback = Some(Readback {
+            at_ms: 4_000,
+            text: "x".to_owned(),
+        });
+        assert_eq!(s.last_seen_ms(), 4_000);
+        s.handover = Some(Handover {
+            at_ms: 9_000,
+            ..Handover::default()
+        });
+        assert_eq!(s.last_seen_ms(), 9_000);
     }
 
     #[test]

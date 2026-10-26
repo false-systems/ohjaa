@@ -2845,7 +2845,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 folder: &folder,
                 started_ms,
                 // To the end of this second: times here are whole seconds.
-                until_ms: (intake::now_seconds() + 1) * 1000,
+                last_seen_ms: (intake::now_seconds() + 1) * 1000,
                 unbriefed: briefing.is_none(),
             },
             &usage::Stores::from_env(),
@@ -3132,13 +3132,10 @@ fn integrated_at_leaving(
 /// entering record names it) still runs: its agent outlived its ohjaa, and
 /// it is returned apart, as still running.
 fn close_orphans(dirs: &Dirs, write: bool) -> (Vec<sessions::Session>, Vec<sessions::Session>) {
-    // A dry run only says what it would close: it opens the log to read.
-    // Either way the log is let go before any transcript is read.
-    let all = if write {
-        session_store(dirs).map(|store| store.all())
-    } else {
-        session_reader(dirs).map(|log| log.all())
-    };
+    // Read only to find them (a dry run only says what it would close), and
+    // let go before any transcript is read. It is opened to write only for the
+    // writes.
+    let all = session_reader(dirs).map(|log| log.all());
     let Some(Ok((all, _))) = all else {
         return (Vec::new(), Vec::new());
     };
@@ -3156,8 +3153,8 @@ fn close_orphans(dirs: &Dirs, write: bool) -> (Vec<sessions::Session>, Vec<sessi
     if orphans.is_empty() {
         return (orphans, still_running);
     }
-    // Its agent's own sessions are found as at leaving: its launch prompt,
-    // said between its start and now.
+    // Its agent's own sessions are found as at leaving, by its launch
+    // prompt; a fork only if begun before it was last seen.
     let stores = usage::Stores::from_env();
     let left_of = |session: &sessions::Session| sessions::Left {
         native: Some(usage::find_native(
@@ -3166,7 +3163,8 @@ fn close_orphans(dirs: &Dirs, write: bool) -> (Vec<sessions::Session>, Vec<sessi
                 agent: &session.agent,
                 folder: Path::new(&session.repo),
                 started_ms: session.started_ms,
-                until_ms: now_ms + 1000,
+                // Not now: a fork made after it was last seen is not its.
+                last_seen_ms: session.last_seen_ms(),
                 unbriefed: false,
             },
             &stores,

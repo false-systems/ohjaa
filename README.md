@@ -532,25 +532,36 @@ agent's transcripts written since the launch, never writing them: Claude
 Code's `projects/<folder>/<id>.jsonl` (`$CLAUDE_CONFIG_DIR`, else
 `~/.claude`), Codex's `sessions/…/rollout-….jsonl` (`$CODEX_HOME`, else
 `~/.codex`) and pi's `sessions/<folder>/….jsonl` (`$PI_CODING_AGENT_DIR`,
-else `~/.pi/agent`). A native session is named only when its transcript
-holds the launch prompt that names this session: the briefing's `This
-session is <id>;`, which toimija gives the agent as its launch prompt. The
-prompt must be a user message (for Codex, a developer message too), never a
-tool's output, and it must be said in the launch folder between the launch
-and leaving. Time and folder alone name nothing.
+else `~/.pi/agent`). A transcript whose header names another folder (Codex's
+and pi's first record, Claude's first record with a folder and a time) is
+read no further.
+
+A native session is named only when its transcript was given the launch
+prompt that names this session: the briefing's `This session is <id>;`,
+which toimija gives the agent as its launch prompt. That is the first
+message naming a session before the agent's first reply: a user message
+(for Codex, a developer message too), behind whatever the agent's own
+records put first. It is never a later message, a compaction summary, a
+command's or a shell's output (`<local-command-…>`, `<bash-…>`), a tool's
+output or a paste. Time and folder alone name nothing.
 
 - A resumed native session (its transcript began before the launch) is
-  named with `resumed: true`. Every session it ran in names it, so its usage
-  must not be added once per session.
-- A fork holds a copy of its parent's launch prompt. Claude marks each copy
-  `forkedFrom`. Codex copies its parent's records into a fork restamped and
-  unmarked, so every prompt in a Codex (or pi) fork is taken as a copy. A
-  fork begun during the session is named too, with `forked_from`, unless a
-  prompt of its own names another session.
+  named, with `resumed: true`, when its launch prompt naming this session
+  was said within a minute of the launch. A message into an older session
+  later resumes nothing. Every session a native session ran in names it, so
+  its usage must not be added once per session.
+- A fork is named, with `forked_from`, when its parent is named for this
+  session and it began before the session was last seen. That is now at
+  leaving, and at an orphan close the latest time the orphan's record
+  shows. A fork another launch made is that launch's: Claude marks each copy
+  in a fork `forkedFrom`, so a fork's own launch prompt names its launch.
+  Codex copies its parent's records into a fork restamped and unmarked, so
+  a Codex (or pi) fork in which any prompt names another session is never
+  named here.
 - A subagent's work is its parent's. Claude's subagent transcripts are never
   read, and a Codex subagent's rollout names its root thread.
-- Two native sessions that each hold the prompt itself name neither: the
-  record says `ambiguous`, with their ids.
+- Two native sessions each given the launch prompt name neither: the record
+  says `ambiguous`, with their ids.
 - Otherwise the record says why none is named: `not looked for` (opencode
   keeps its sessions in SQLite; other commands keep no transcripts ohjaa
   knows), or `none found`, with how many transcripts in the folder it read.

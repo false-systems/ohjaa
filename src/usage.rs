@@ -342,8 +342,12 @@ fn walk(
     }
 }
 
-/// What one transcript says of itself, and the launch prompts in it that
-/// name an ohjaa session.
+/// How long after the launch a resumed transcript's launch prompt may be
+/// said. The agent submits its launch prompt as it starts, so this is
+/// seconds; a message into an older session later is no resume.
+const RESUME_SLACK_MS: i64 = 60_000;
+
+/// What one transcript says of itself and of the launch it was given.
 #[derive(Debug, Default)]
 struct Transcript {
     id: Option<String>,
@@ -351,18 +355,21 @@ struct Transcript {
     /// Its own first record: a fork's copies of its parent's are not its.
     began_ms: Option<i64>,
     forked_from: Option<String>,
-    prompts: Vec<Prompt>,
+    /// The session its launch prompt names.
+    launched: Option<String>,
+    /// For a Codex or pi fork, every session a prompt in it names. Codex
+    /// copies a parent's records into a fork restamped and unmarked, so no
+    /// prompt in such a fork can be told to be its own launch prompt.
+    fork_names: Vec<String>,
 }
 
-#[derive(Debug)]
-struct Prompt {
-    session: String,
-    at_ms: Option<i64>,
-    /// A fork's copy of its parent's record. Claude marks each copy
-    /// `forkedFrom`. Codex copies its parent's records into a fork restamped
-    /// and unmarked, so in a Codex (or pi) fork every prompt is taken as a
-    /// copy: a fork is never named as holding a prompt itself.
-    copied: bool,
+/// What a search read, to keep it bounded.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Reads {
+    /// Transcripts opened: every one written since the launch.
+    opened: usize,
+    /// Lines read, across them all.
+    lines: usize,
 }
 
 fn text_of(value: &Value) -> Option<String> {
@@ -373,13 +380,60 @@ fn time_of(value: &Value) -> Option<i64> {
     value.as_str().and_then(crate::intake::parse_time)
 }
 
-/// Read a transcript line by line: whole, since a resumed session's launch
-/// prompt can be anywhere in it, but parsing only the lines that say what
-/// it is and those that name a session.
-fn read_transcript(agent: Agent, path: &Path) -> std::io::Result<Transcript> {
+/// Whether a record is the agent answering: the end of what it was given at
+/// its launch.
+fn is_reply(agent: Agent, record: &Value) -> bool {
+    match agent {
+        Agent::Claude => record["type"] == "assistant",
+        Agent::Codex => {
+            let payload = &record["payload"];
+            record["type"] == "response_item"
+                && !(payload["type"] == "message"
+                    && matches!(payload["role"].as_str(), Some("user" | "developer")))
+        }
+        Agent::Pi => {
+            record["type"] == "message"
+                && matches!(
+                    record["message"]["role"].as_str(),
+                    Some("assistant" | "toolResult")
+                )
+        }
+    }
+}
+
+/// Read a transcript only as far as it must be read:
+///
+/// - Its header first: Codex's and pi's first record, Claude's first records
+///   with a folder and a time. A header naming another folder ends the read.
+/// - Begun at or after the launch: from its start to the agent's first reply.
+///   Its launch prompt is the first record before that reply that names a
+///   session.
+/// - Begun before the launch, it can only have been resumed by it. Only the
+///   lines naming this session are parsed, and the launch prompt must be said
+///   within [`RESUME_SLACK_MS`] of the launch.
+/// - A Codex or pi fork is read through, for every session it names.
+///
+/// `Ok(None)`: the transcript is another folder's.
+fn read_transcript(
+    agent: Agent,
+    path: &Path,
+    launch: &Launch,
+    here: &dyn Fn(&str) -> bool,
+    reads: &mut Reads,
+) -> std::io::Result<Option<Transcript>> {
     use std::io::BufRead;
+    #[derive(PartialEq)]
+    enum Mode {
+        Header,
+        Launch,
+        Resumed,
+        Fork,
+    }
     let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    reads.opened += 1;
+    let ours = format!("{};", handshake(launch.session));
     let mut transcript = Transcript::default();
+    let mut mode = Mode::Header;
     let mut bytes = Vec::new();
     let mut first = true;
     loop {
@@ -387,84 +441,136 @@ fn read_transcript(agent: Agent, path: &Path) -> std::io::Result<Transcript> {
         if reader.read_until(b'\n', &mut bytes)? == 0 {
             break;
         }
+        reads.lines += 1;
         let header = std::mem::take(&mut first);
         let Ok(line) = std::str::from_utf8(&bytes) else {
             continue;
         };
-        let names = line.contains(HANDSHAKE);
-        let wanted = match agent {
-            // Claude has no header: each record carries the session, and the
-            // first with a time and a folder says where and when it began.
-            Agent::Claude => {
-                let copy = line.contains("\"forkedFrom\":{");
-                transcript.id.is_none()
+        let wanted = match mode {
+            // Claude marks a fork's copies: they say nothing of the fork's
+            // own launch, only where it came from.
+            Mode::Header | Mode::Launch if agent == Agent::Claude => {
+                !line.contains("\"forkedFrom\":{")
                     || transcript.cwd.is_none()
-                    || (copy && transcript.forked_from.is_none())
-                    || (!copy && transcript.began_ms.is_none())
+                    || transcript.forked_from.is_none()
             }
-            // Codex and pi open with a header record.
-            Agent::Codex | Agent::Pi => header,
+            Mode::Header | Mode::Launch => true,
+            Mode::Resumed => line.contains(&ours),
+            Mode::Fork => line.contains(HANDSHAKE),
         };
-        if !names && !wanted {
+        if !wanted {
             continue;
         }
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let copied = match agent {
-            Agent::Claude => {
-                let copied = !record["forkedFrom"].is_null();
-                transcript.id = transcript.id.take().or(text_of(&record["sessionId"]));
-                transcript.cwd = transcript.cwd.take().or(text_of(&record["cwd"]));
-                if copied {
-                    let from = text_of(&record["forkedFrom"]["sessionId"]);
-                    transcript.forked_from = transcript.forked_from.take().or(from);
-                } else {
-                    let at = time_of(&record["timestamp"]);
-                    transcript.began_ms = transcript.began_ms.or(at);
+        let copied = agent == Agent::Claude && !record["forkedFrom"].is_null();
+        if mode == Mode::Header {
+            match agent {
+                Agent::Claude => {
+                    transcript.id = transcript.id.take().or(text_of(&record["sessionId"]));
+                    transcript.cwd = transcript.cwd.take().or(text_of(&record["cwd"]));
+                    if copied {
+                        let from = text_of(&record["forkedFrom"]["sessionId"]);
+                        transcript.forked_from = transcript.forked_from.take().or(from);
+                    } else {
+                        let at = time_of(&record["timestamp"]);
+                        transcript.began_ms = transcript.began_ms.or(at);
+                    }
                 }
-                copied
+                Agent::Codex if header && record["type"] == "session_meta" => {
+                    let meta = &record["payload"];
+                    // A subagent's work is its parent's: its root thread.
+                    let subagent = !meta["source"]["subagent"].is_null();
+                    transcript.id = text_of(&meta[if subagent { "session_id" } else { "id" }]);
+                    transcript.cwd = text_of(&meta["cwd"]);
+                    transcript.began_ms =
+                        time_of(&meta["timestamp"]).or_else(|| time_of(&record["timestamp"]));
+                    transcript.forked_from = text_of(&meta["forked_from_id"]);
+                }
+                Agent::Pi if header && record["type"] == "session" => {
+                    transcript.id = text_of(&record["id"]);
+                    transcript.cwd = text_of(&record["cwd"]);
+                    transcript.began_ms = time_of(&record["timestamp"]);
+                    transcript.forked_from = text_of(&record["parentSession"]);
+                }
+                // A Codex or pi transcript that does not open with its header
+                // is not one ohjaa can read.
+                Agent::Codex | Agent::Pi => return Ok(None),
             }
-            Agent::Codex if header && record["type"] == "session_meta" => {
-                let meta = &record["payload"];
-                // A subagent's work is its parent's: its root thread.
-                let subagent = !meta["source"]["subagent"].is_null();
-                transcript.id = text_of(&meta[if subagent { "session_id" } else { "id" }]);
-                transcript.cwd = text_of(&meta["cwd"]);
-                transcript.began_ms =
-                    time_of(&meta["timestamp"]).or_else(|| time_of(&record["timestamp"]));
-                transcript.forked_from = text_of(&meta["forked_from_id"]);
-                false
+            if let Some(cwd) = &transcript.cwd {
+                if !here(cwd) {
+                    return Ok(None);
+                }
             }
-            Agent::Pi if header && record["type"] == "session" => {
-                transcript.id = text_of(&record["id"]);
-                transcript.cwd = text_of(&record["cwd"]);
-                transcript.began_ms = time_of(&record["timestamp"]);
-                transcript.forked_from = text_of(&record["parentSession"]);
-                false
+            let known = transcript.id.is_some()
+                && transcript.cwd.is_some()
+                && (agent != Agent::Claude || transcript.began_ms.is_some());
+            if !known {
+                continue;
             }
-            Agent::Codex | Agent::Pi => transcript.forked_from.is_some(),
-        };
-        if !names {
-            continue;
+            mode = if agent != Agent::Claude && transcript.forked_from.is_some() {
+                Mode::Fork
+            } else if transcript
+                .began_ms
+                .is_some_and(|began| began < launch.started_ms)
+            {
+                Mode::Resumed
+            } else {
+                Mode::Launch
+            };
+            if agent != Agent::Claude {
+                // Codex's and pi's header is no message.
+                continue;
+            }
         }
-        let Some(text) = launch_prompt(agent, &record) else {
-            continue;
+        let names = || {
+            launch_prompt(agent, &record)
+                .map(|text| named(&text))
+                .unwrap_or_default()
         };
-        for session in named(&text) {
-            transcript.prompts.push(Prompt {
-                session,
-                at_ms: time_of(&record["timestamp"]),
-                copied,
-            });
+        match mode {
+            Mode::Header => {}
+            Mode::Launch if copied => {}
+            Mode::Launch => {
+                if is_reply(agent, &record) {
+                    break;
+                }
+                if let Some(first) = names().into_iter().next() {
+                    transcript.launched = Some(first);
+                    break;
+                }
+            }
+            Mode::Resumed => {
+                let at = time_of(&record["timestamp"]);
+                let resumed = at.is_some_and(|at| {
+                    at >= launch.started_ms && at <= launch.started_ms + RESUME_SLACK_MS
+                });
+                if !copied && resumed && names().iter().any(|s| s == launch.session) {
+                    transcript.launched = Some(launch.session.to_owned());
+                    break;
+                }
+            }
+            Mode::Fork => {
+                for session in names() {
+                    if !transcript.fork_names.contains(&session) {
+                        transcript.fork_names.push(session);
+                    }
+                }
+            }
         }
     }
-    Ok(transcript)
+    Ok(Some(transcript))
 }
+
+/// What the agent's harness writes as a person's message, and is not one: a
+/// local command's output, a shell's, a slash command's echo.
+const HARNESS: &[&str] = &["<local-command-", "<bash-", "<command-"];
 
 /// The words of a record that can be a launch prompt: what the person (or
 /// the launcher, for them) gave the agent. Never a tool's output, which can
-/// quote anything, another session's briefing included.
+/// quote anything, another session's briefing included, nor what the harness
+/// writes in the person's place: a compaction summary, a command's output.
 fn launch_prompt(agent: Agent, record: &Value) -> Option<String> {
     let joined = |content: &Value, kinds: &[&str]| match content {
         Value::String(text) => Some(text.clone()),
@@ -480,11 +586,12 @@ fn launch_prompt(agent: Agent, record: &Value) -> Option<String> {
         }
         _ => None,
     };
-    match agent {
+    let text = match agent {
         Agent::Claude => {
             let person = record["type"] == "user"
                 && record["isMeta"] != true
-                && record["isSidechain"] != true;
+                && record["isSidechain"] != true
+                && record["isCompactSummary"] != true;
             person
                 .then(|| joined(&record["message"]["content"], &["text"]))
                 .flatten()
@@ -504,7 +611,9 @@ fn launch_prompt(agent: Agent, record: &Value) -> Option<String> {
                 .then(|| joined(&record["message"]["content"], &["text"]))
                 .flatten()
         }
-    }
+    }?;
+    let start = text.trim_start();
+    (!HARNESS.iter().any(|tag| start.starts_with(tag))).then_some(text)
 }
 
 /// The ohjaa sessions a launch prompt names: `This session is <id>;`.
@@ -522,7 +631,7 @@ fn named(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// One launch, as leaving knows it.
+/// One launch, as leaving (or the launch closing it as orphaned) knows it.
 pub struct Launch<'a> {
     /// The ohjaa session.
     pub session: &'a str,
@@ -531,84 +640,82 @@ pub struct Launch<'a> {
     /// The folder it was launched in.
     pub folder: &'a Path,
     pub started_ms: i64,
-    /// When leaving looked: a launch prompt after it is not this session's.
-    pub until_ms: i64,
+    /// The last time it was seen active: at leaving, now; at an orphan close,
+    /// the latest time its record shows. A fork begun after it is not its.
+    pub last_seen_ms: i64,
     /// Launched with `--no-briefing`: no launch prompt names it.
     pub unbriefed: bool,
 }
 
 /// The agent's own sessions this launch ran. A native session is this
-/// launch's when its transcript, written since the launch, holds the launch
-/// prompt naming it: a user (for Codex, also a developer) message, never a
-/// tool's output, said in the launch folder between the launch and now. The
-/// launch mints the session's id and hands it to that one agent only, so the
-/// prompt shows the transcript was written by the launched process.
+/// launch's when its transcript, in the launch folder and written since the
+/// launch, was given a launch prompt that names this session: the first
+/// person's (for Codex, also developer) message naming a session before the
+/// agent's first reply. Never a tool's output, a compaction summary, a
+/// command's output or a later message. The launch mints the session's id and
+/// hands it to that one agent only, so its launch prompt shows the
+/// transcript was written by the launched process.
 ///
-/// - Resumed: the transcript began before the launch; named, and said so.
-/// - Forked: a fork holds a copy of the prompt. A fork begun in this session
-///   that names no other session in a prompt of its own is named too.
+/// - Resumed: the transcript began before the launch, and the launch prompt
+///   naming this session was said at the launch. Named, and said so.
+/// - Forked: a fork of a native session named here, begun before the session
+///   was last seen, whose own launch names no other session. A fork another
+///   launch made is that launch's.
 /// - Subagents are their parent's: one id.
-/// - Two native sessions that each hold the prompt itself: neither is named.
+/// - Two native sessions whose launch prompts name it: neither is named.
 pub fn find_native(launch: &Launch, stores: &Stores) -> Native {
+    search(launch, stores).0
+}
+
+fn search(launch: &Launch, stores: &Stores) -> (Native, Reads) {
+    let mut reads = Reads::default();
     let Some(agent) = Agent::of(launch.agent) else {
         let name = Path::new(launch.agent)
             .file_name()
             .map_or_else(|| launch.agent.into(), |name| name.to_string_lossy());
-        return Native::none(if name == "opencode" {
+        let why = if name == "opencode" {
             "not looked for: opencode keeps its sessions in SQLite, which ohjaa does not read"
                 .to_owned()
         } else {
             format!(
                 "not looked for: ohjaa reads the transcripts of claude, codex and pi, not {name}"
             )
-        });
+        };
+        return (Native::none(why), reads);
     };
     let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
     let folder = canonical(launch.folder);
-    let within =
-        |at: Option<i64>| at.is_some_and(|at| at >= launch.started_ms && at <= launch.until_ms);
+    let here = |cwd: &str| canonical(Path::new(cwd)) == folder;
     let (paths, mut problems) = stores.transcripts(agent, launch.started_ms);
-    let (mut here, mut own, mut forks) = (0, Vec::new(), Vec::new());
+    let mut read = Vec::new();
     for path in paths {
-        let transcript = match read_transcript(agent, &path) {
-            Ok(transcript) => transcript,
-            Err(error) => {
-                problems.push(format!("{}: {error}", path.display()));
-                continue;
+        match read_transcript(agent, &path, launch, &here, &mut reads) {
+            Ok(Some(transcript)) => {
+                if transcript.id.as_ref().is_some_and(|id| !id.is_empty()) {
+                    read.push((path, transcript));
+                }
             }
-        };
-        let (Some(id), Some(cwd)) = (&transcript.id, &transcript.cwd) else {
-            continue;
-        };
-        if id.is_empty() || canonical(Path::new(cwd)) != folder {
-            continue;
+            Ok(None) => {}
+            Err(error) => problems.push(format!("{}: {error}", path.display())),
         }
-        here += 1;
-        let ours = |copied: bool| {
-            transcript
-                .prompts
-                .iter()
-                .any(|p| p.session == launch.session && p.copied == copied && within(p.at_ms))
-        };
-        let another = transcript
-            .prompts
-            .iter()
-            .any(|p| p.session != launch.session && !p.copied);
-        let native = NativeSession {
-            agent: agent.name().to_owned(),
-            session_id: id.clone(),
-            source: path.display().to_string(),
-            resumed: transcript.began_ms.is_some_and(|b| b < launch.started_ms),
-            forked_from: transcript.forked_from.clone(),
-        };
-        if ours(false) {
-            own.push((transcript.began_ms, native));
-        } else if ours(true)
-            && !another
-            && native.forked_from.is_some()
-            && within(transcript.began_ms)
-        {
-            forks.push((transcript.began_ms, native));
+    }
+    let native_of = |path: &Path, t: &Transcript| NativeSession {
+        agent: agent.name().to_owned(),
+        session_id: t.id.clone().unwrap_or_default(),
+        source: path.display().to_string(),
+        resumed: t.began_ms.is_some_and(|b| b < launch.started_ms),
+        forked_from: t.forked_from.clone(),
+    };
+    let mut sessions: Vec<NativeSession> = Vec::new();
+    let mut own: Vec<(Option<i64>, NativeSession)> = read
+        .iter()
+        .filter(|(_, t)| t.launched.as_deref() == Some(launch.session))
+        .map(|(path, t)| (t.began_ms, native_of(path, t)))
+        .collect();
+    own.sort_by_key(|(began, _)| *began);
+    for (_, native) in own {
+        if !sessions.iter().any(|s| s.session_id == native.session_id) {
+            sessions.push(native);
         }
     }
     let unread = (!problems.is_empty()).then(|| {
@@ -620,34 +727,50 @@ pub fn find_native(launch: &Launch, stores: &Stores) -> Native {
             if problems.len() > 3 { "; …" } else { "" }
         )
     });
-    let mut ids: Vec<&str> = own.iter().map(|(_, n)| n.session_id.as_str()).collect();
-    ids.sort_unstable();
-    ids.dedup();
-    if ids.len() > 1 {
-        return Native::none(format!(
-            "ambiguous: {} {} sessions each hold its launch prompt ({}); none is named",
+    if sessions.len() > 1 {
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        let why = format!(
+            "ambiguous: {} {} sessions were each given its launch prompt ({}); none is named",
             ids.len(),
             agent.name(),
             ids.join(", ")
-        ));
+        );
+        return (Native::none(why), reads);
     }
-    let mut found: Vec<(Option<i64>, NativeSession)> = own.into_iter().chain(forks).collect();
-    found.sort_by_key(|(began, _)| *began);
-    let mut sessions: Vec<NativeSession> = Vec::new();
-    for (_, native) in found {
-        if !sessions.iter().any(|s| s.session_id == native.session_id) {
-            sessions.push(native);
+    // Forks of what is named here, oldest first, so a fork of a fork follows.
+    let mut forks: Vec<&(PathBuf, Transcript)> = read
+        .iter()
+        .filter(|(_, t)| {
+            let began = t
+                .began_ms
+                .is_some_and(|b| b >= launch.started_ms && b <= launch.last_seen_ms);
+            let theirs = t.launched.is_some() || t.fork_names.iter().any(|s| s != launch.session);
+            t.forked_from.is_some() && began && !theirs
+        })
+        .collect();
+    forks.sort_by_key(|(_, t)| t.began_ms);
+    for (path, t) in forks {
+        let parent = t.forked_from.as_deref().unwrap_or_default();
+        let id = t.id.as_deref().unwrap_or_default();
+        if sessions.iter().any(|s| s.session_id == parent)
+            && !sessions.iter().any(|s| s.session_id == id)
+        {
+            sessions.push(native_of(path, t));
         }
     }
     if !sessions.is_empty() {
-        return Native {
-            sessions,
-            why: unread,
-        };
+        return (
+            Native {
+                sessions,
+                why: unread,
+            },
+            reads,
+        );
     }
     let mut why = format!(
-        "none found: none of the {here} {} transcript(s) written in its folder since its \
-         launch holds its launch prompt",
+        "none found: none of the {} {} transcript(s) written in its folder since its \
+         launch was given its launch prompt",
+        read.len(),
         agent.name()
     );
     if launch.unbriefed {
@@ -661,7 +784,7 @@ pub fn find_native(launch: &Launch, stores: &Stores) -> Native {
         why.push_str("; ");
         why.push_str(&unread);
     }
-    Native::none(why)
+    (Native::none(why), reads)
 }
 
 #[cfg(test)]
@@ -790,7 +913,7 @@ mod tests {
                     agent,
                     folder: &self.folder,
                     started_ms: STARTED,
-                    until_ms: STARTED + 3_600_000,
+                    last_seen_ms: STARTED + 3_600_000,
                     unbriefed: false,
                 },
                 &self.stores,
@@ -952,7 +1075,7 @@ mod tests {
         assert_eq!(
             native.why.as_deref(),
             Some(
-                "ambiguous: 2 claude sessions each hold its launch prompt \
+                "ambiguous: 2 claude sessions were each given its launch prompt \
                  (aaaaaaaa-0000-0000-0000-000000000001, aaaaaaaa-0000-0000-0000-000000000002); \
                  none is named"
             )
@@ -1219,6 +1342,160 @@ mod tests {
         );
         let native = sandbox.find("codex");
         assert_eq!(Sandbox::ids(&native), [parent], "{native:#?}");
+    }
+
+    /// Review of #55, finding 3: a Claude fork made by another launch is
+    /// that launch's, named there with where it came from, never here.
+    #[test]
+    fn a_claude_fork_another_launch_made_is_its_own_never_this_ones() {
+        let sandbox = Sandbox::new("claude-other-fork");
+        let parent = "44e3a29a-fc6b-40a4-ab3e-3ecf8bb88566";
+        sandbox.claude(parent, 1_000, 1_200, &prompt(OURS));
+        let fork = "55e3a29a-fc6b-40a4-ab3e-3ecf8bb88566";
+        let other = "oh-1790000600000-5";
+        sandbox.write(
+            &format!("claude/projects/-work/{fork}.jsonl"),
+            &[
+                json!({"type": "user", "sessionId": fork, "cwd": sandbox.cwd(),
+                       "timestamp": at(1_200), "forkedFrom": {"sessionId": parent,
+                       "messageUuid": "u1"},
+                       "message": {"role": "user", "content": prompt(OURS)}}),
+                json!({"type": "user", "sessionId": fork, "cwd": sandbox.cwd(),
+                       "timestamp": at(600_000),
+                       "message": {"role": "user", "content": prompt(other)}}),
+            ],
+        );
+        assert_eq!(Sandbox::ids(&sandbox.find("claude")), [parent]);
+        let theirs = sandbox.find_as("claude", other);
+        assert_eq!(Sandbox::ids(&theirs), [fork], "{theirs:#?}");
+        assert_eq!(theirs.sessions[0].forked_from.as_deref(), Some(parent));
+    }
+
+    /// Review of #55, finding 3: an orphan's end was never observed, so its
+    /// window ends when its record last shows it active, not at the launch
+    /// that closes it: a fork begun after that is not its.
+    #[test]
+    fn an_orphan_names_no_fork_begun_after_it_was_last_seen() {
+        let sandbox = Sandbox::new("orphan-fork");
+        let parent = "66e3a29a-fc6b-40a4-ab3e-3ecf8bb88566";
+        sandbox.claude(parent, 1_000, 1_200, &prompt(OURS));
+        let fork = "77e3a29a-fc6b-40a4-ab3e-3ecf8bb88566";
+        sandbox.write(
+            &format!("claude/projects/-work/{fork}.jsonl"),
+            &[
+                json!({"type": "user", "sessionId": fork, "cwd": sandbox.cwd(),
+                       "timestamp": at(1_200), "forkedFrom": {"sessionId": parent,
+                       "messageUuid": "u1"},
+                       "message": {"role": "user", "content": prompt(OURS)}}),
+                json!({"type": "assistant", "sessionId": fork, "cwd": sandbox.cwd(),
+                       "timestamp": at(5 * 3_600_000), "message": {"role": "assistant",
+                       "content": [{"type": "text", "text": "ok"}]}}),
+            ],
+        );
+        let seen = |last_seen_ms: i64| {
+            find_native(
+                &Launch {
+                    session: OURS,
+                    agent: "claude",
+                    folder: &sandbox.folder,
+                    started_ms: STARTED,
+                    last_seen_ms,
+                    unbriefed: false,
+                },
+                &sandbox.stores,
+            )
+        };
+        // Last seen at its handover, an hour in: the fork is someone's later.
+        assert_eq!(Sandbox::ids(&seen(STARTED + 3_600_000)), [parent]);
+        // Seen still active after the fork began, it is its own fork.
+        assert_eq!(Sandbox::ids(&seen(STARTED + 6 * 3_600_000)), [parent, fork]);
+    }
+
+    /// Review of #55, finding 4: a transcript whose header names another
+    /// folder is read no further, so leaving reads what is in its folder.
+    #[test]
+    fn a_transcript_of_another_folder_is_read_no_further_than_its_header() {
+        let sandbox = Sandbox::new("bounded");
+        let elsewhere = sandbox.dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let elsewhere = elsewhere.display().to_string();
+        let filler = |n: usize, ms: i64| {
+            (0..n)
+                .map(|i| {
+                    json!({"type": "response_item", "timestamp": at(ms + i as i64), "payload": {
+                        "type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": prompt(OURS)}]}})
+                })
+                .collect::<Vec<_>>()
+        };
+        for n in 0..3 {
+            let id = format!("019a0000-0000-7000-8000-00000000ff0{n}");
+            let mut records = vec![json!({"type": "session_meta", "timestamp": at(1_000),
+                "payload": {"id": id, "session_id": id, "timestamp": at(1_000),
+                "cwd": elsewhere, "source": "cli"}})];
+            records.extend(filler(400, 2_000));
+            sandbox.write(
+                &format!("codex/sessions/2026/09/21/rollout-x-{id}.jsonl"),
+                &records,
+            );
+        }
+        let id = "019a0000-0000-7000-8000-00000000ff10";
+        sandbox.write(
+            &format!("codex/sessions/2026/09/21/rollout-y-{id}.jsonl"),
+            &[
+                json!({"type": "session_meta", "timestamp": at(1_000), "payload": {
+                    "id": id, "session_id": id, "timestamp": at(1_000), "cwd": sandbox.cwd(),
+                    "source": "cli"}}),
+                json!({"type": "response_item", "timestamp": at(1_100), "payload": {
+                    "type": "message", "role": "developer",
+                    "content": [{"type": "input_text", "text": prompt(OURS)}]}}),
+            ],
+        );
+        // Claude's header is its first records with a folder and a time.
+        for n in 0..2 {
+            let other = format!("ffffffff-0000-0000-0000-00000000000{n}");
+            let mut records = vec![
+                json!({"type": "mode", "sessionId": other}),
+                json!({"type": "attachment", "sessionId": other, "cwd": elsewhere,
+                       "timestamp": at(1_000)}),
+            ];
+            records.extend((0..400).map(|i| {
+                json!({"type": "user", "sessionId": other, "cwd": elsewhere,
+                       "timestamp": at(2_000 + i), "message": {"role": "user",
+                       "content": prompt(OURS)}})
+            }));
+            sandbox.write(
+                &format!("claude/projects/-elsewhere/{other}.jsonl"),
+                &records,
+            );
+        }
+        let launch = |agent| Launch {
+            session: OURS,
+            agent,
+            folder: &sandbox.folder,
+            started_ms: STARTED,
+            last_seen_ms: STARTED + 3_600_000,
+            unbriefed: false,
+        };
+        let (native, reads) = search(&launch("codex"), &sandbox.stores);
+        assert_eq!(Sandbox::ids(&native), [id]);
+        assert_eq!(
+            reads,
+            Reads {
+                opened: 4,
+                lines: 3 + 2
+            },
+            "one line of each other folder's rollout, and the two of this one"
+        );
+        let (native, reads) = search(&launch("claude"), &sandbox.stores);
+        assert!(native.sessions.is_empty());
+        assert_eq!(
+            reads,
+            Reads {
+                opened: 2,
+                lines: 2 * 2
+            }
+        );
     }
 
     #[test]
