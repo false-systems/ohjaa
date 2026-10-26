@@ -130,16 +130,39 @@ Every draft is validated like any proposal, and an invalid one is refused out
 loud.
 
 A run drafts from at most `--batch` × `--max-batches` candidates (400 by
-default), oldest first, and never from one an earlier run already sent. As
-soon as the drafter answers for a batch, its candidates are kept as handled
-(`$XDG_STATE_HOME/ohjaa/intake-handled`: a time and a digest each, never the
-words). Every run makes progress, and a drafter that fails mid-run keeps what
-came before it. Repeated runs drain the queue: a run that leaves work for the
-next exits 4, and once nothing is left a run says `nothing new to draft from`
-and exits 0. The cursor (`intake-since`) moves only past what was actually
-drafted from, and never back. A first run, with no cursor yet, keeps the
-start of its window (fourteen days back) as the cursor before it drafts, so
-the runs after it continue from there.
+default), oldest first, and never from one the drafter has already answered
+for.
+
+**Progress is kept as handled.** As soon as the drafter answers for a batch,
+its candidates go into `$XDG_STATE_HOME/ohjaa/intake-handled`. Each has a time
+and a digest, never the words, and the file has a version line and an end
+line. An empty or cut-short file is an error, never read as less. A run
+killed between an answer and that write sends that one batch again.
+
+**A refused batch is split.** When the drafter fails or answers no drafts, the
+batch is split in halves, down to the candidate it fails on. That candidate
+is tried again in later runs. After failing alone three times it is set
+aside, and said by its time and source in every run after; `--retry-failed`
+sends set-aside candidates again. A run stops when it gets no answer at all,
+or when two candidates fail alone in a row; what came before is kept.
+
+**Every run makes progress while the drafter answers**, and repeated runs
+drain the queue. A run exits 4 when it leaves work for the next, sets a
+candidate aside, or could not read a source. Once nothing is left and every
+source was read, a run says `nothing new to draft from` and exits 0. Only one
+intake runs at a time: a second says `intake already running` and exits 3.
+
+**One cursor covers every source** (`intake-since`). It moves only after a run
+that read all four sources, none with a warning, and then only past
+candidates that were handled, never back.
+- A run with `--source`, or with a warning, leaves the cursor where it was.
+  So a warning that recurs on every run keeps the window growing until it is
+  fixed.
+- The report's own gaps are said, and do not hold the cursor.
+- A first run, with no cursor yet, keeps the start of its window (fourteen
+  days back) as the cursor before it drafts.
+- A `--since` before the cursor reads that stretch again, and sends once more
+  what is no longer kept as handled.
 
 ## The bypass report: what went around the workflow
 
@@ -384,9 +407,9 @@ what was said in its window, and what ohjaa observed going wrong in it (source
 request head (never what could not be checked, nor what is not shown to be the
 session's); a non-zero exit; a missing handover; an orphaned session. Those are
 facts, not anyone's words, and the drafter is told so. A session is marked
-drafted from once each of its candidates has been handled, in however many
-runs that takes, and only by a run that read every transcript; until then it
-stays queued.
+drafted from once each of its candidates has been answered for or set aside,
+in however many runs that takes, and only by a run that read every
+transcript; until then it stays queued.
 
 Signals and the terminal, while a session runs (unix). The session's process
 group is apart from ohjaa's, so ohjaa does with the terminal what a
