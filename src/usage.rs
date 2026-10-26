@@ -1047,6 +1047,180 @@ mod tests {
         assert_eq!(native.sessions[1].forked_from.as_deref(), Some(parent));
     }
 
+    /// Review of #55, finding 2: only a transcript's launch prompt names its
+    /// session. Another session here holding this one's line anywhere else
+    /// (its compaction summary, a local command's or a shell's output, a
+    /// paste after its first reply) neither claims this session nor makes
+    /// it ambiguous.
+    #[test]
+    fn only_the_launch_prompt_names_a_claude_session_never_a_later_record() {
+        let sandbox = Sandbox::new("claude-later");
+        let ours = "aaaaaaaa-0000-0000-0000-0000000000aa";
+        sandbox.claude(ours, 1_000, 1_200, &prompt(OURS));
+        let line = prompt(OURS);
+        let later = [
+            json!({"type": "user", "isCompactSummary": true,
+                   "message": {"role": "user", "content": format!("Summary: {line}")}}),
+            json!({"type": "user", "message": {"role": "user",
+                   "content": format!("<local-command-stdout>{line}</local-command-stdout>")}}),
+            json!({"type": "user", "message": {"role": "user",
+                   "content": format!("<bash-stdout>{line}</bash-stdout><bash-stderr></bash-stderr>")}}),
+            json!({"type": "user", "message": {"role": "user",
+                   "content": format!("look at this: {line}")}}),
+        ];
+        for (n, record) in later.into_iter().enumerate() {
+            let id = format!("bbbbbbbb-0000-0000-0000-00000000000{n}");
+            let other = format!("oh-1790000001000-{n}");
+            let mut record = record;
+            for (key, value) in [
+                ("sessionId", json!(id)),
+                ("cwd", json!(sandbox.cwd())),
+                ("timestamp", json!(at(900_000))),
+            ] {
+                record[key] = value;
+            }
+            sandbox.write(
+                &format!("claude/projects/-work/{id}.jsonl"),
+                &[
+                    json!({"type": "user", "sessionId": id, "cwd": sandbox.cwd(),
+                           "timestamp": at(60_000), "message": {"role": "user",
+                           "content": prompt(&other)}}),
+                    json!({"type": "assistant", "sessionId": id, "cwd": sandbox.cwd(),
+                           "timestamp": at(61_000), "message": {"role": "assistant",
+                           "content": [{"type": "text", "text": "ok"}]}}),
+                    record,
+                ],
+            );
+            assert_eq!(
+                Sandbox::ids(&sandbox.find_as("claude", &other)),
+                [id.as_str()],
+                "each is its own launch's"
+            );
+        }
+        let native = sandbox.find("claude");
+        assert_eq!(Sandbox::ids(&native), [ours], "{native:#?}");
+    }
+
+    /// Review of #55, finding 2: this session wrote no rollout (quit before
+    /// a first turn), and another session's thread holds its line in a
+    /// later message. That thread is the other session's alone.
+    #[test]
+    fn a_paste_into_another_codex_thread_names_nothing_here() {
+        let sandbox = Sandbox::new("codex-paste");
+        let theirs = "019a0000-0000-7000-8000-0000000000bb";
+        let other = "oh-1790000001000-9";
+        let message = |role: &str, ms: i64, text: &str| {
+            json!({"type": "response_item", "timestamp": at(ms), "payload": {
+                "type": "message", "role": role,
+                "content": [{"type": if role == "assistant" { "output_text" } else { "input_text" },
+                             "text": text}]}})
+        };
+        sandbox.write(
+            &format!("codex/sessions/2026/09/21/rollout-c-{theirs}.jsonl"),
+            &[
+                json!({"type": "session_meta", "timestamp": at(60_000), "payload": {
+                    "id": theirs, "session_id": theirs, "timestamp": at(60_000),
+                    "cwd": sandbox.cwd(), "source": "cli"}}),
+                message("developer", 60_100, &prompt(other)),
+                message("user", 61_000, "go"),
+                message("assistant", 62_000, "ok"),
+                message("user", 63_000, &format!("this one too: {}", prompt(OURS))),
+            ],
+        );
+        let native = sandbox.find("codex");
+        assert!(native.sessions.is_empty(), "{native:#?}");
+        assert_eq!(Sandbox::ids(&sandbox.find_as("codex", other)), [theirs]);
+    }
+
+    /// Codex gives its own developer and user messages (instructions, the
+    /// sandbox's permissions, AGENTS.md, the environment) before the launch
+    /// prompt: the launch prompt may sit behind them.
+    #[test]
+    fn a_codex_launch_prompt_behind_codexs_own_messages_is_found() {
+        let sandbox = Sandbox::new("codex-behind");
+        let id = "019a0000-0000-7000-8000-0000000000cc";
+        let message = |role: &str, ms: i64, text: &str| {
+            json!({"type": "response_item", "timestamp": at(ms), "payload": {
+                "type": "message", "role": role,
+                "content": [{"type": "input_text", "text": text}]}})
+        };
+        sandbox.write(
+            &format!("codex/sessions/2026/09/21/rollout-d-{id}.jsonl"),
+            &[
+                json!({"type": "session_meta", "timestamp": at(1_000), "payload": {
+                    "id": id, "session_id": id, "timestamp": at(1_000),
+                    "cwd": sandbox.cwd(), "source": "cli"}}),
+                message("developer", 1_100, "You are Codex, a coding agent."),
+                message(
+                    "developer",
+                    1_101,
+                    "<permissions instructions>…</permissions instructions>",
+                ),
+                message(
+                    "user",
+                    1_102,
+                    "# AGENTS.md instructions for /work\n<environment_context>…",
+                ),
+                message("user", 1_103, &prompt(OURS)),
+            ],
+        );
+        assert_eq!(Sandbox::ids(&sandbox.find("codex")), [id]);
+    }
+
+    /// A transcript begun before the launch is this session's only when the
+    /// launch resumed it: its prompt said at the launch, not a message into
+    /// an older session long after.
+    #[test]
+    fn an_older_session_naming_this_one_long_after_its_launch_did_not_resume_it() {
+        let sandbox = Sandbox::new("not-resumed");
+        let id = "eeeeeeee-0000-0000-0000-000000000001";
+        let path = sandbox.claude(id, -86_400_000, -86_399_000, &prompt("oh-1789913600000-7"));
+        let mut lines = std::fs::read_to_string(&path).unwrap();
+        lines.push_str(&format!(
+            "{}\n",
+            json!({"type": "user", "sessionId": id, "cwd": sandbox.cwd(),
+                   "timestamp": at(600_000), "message": {"role": "user", "content": prompt(OURS)}})
+        ));
+        std::fs::write(&path, lines).unwrap();
+        let native = sandbox.find("claude");
+        assert!(native.sessions.is_empty(), "{native:#?}");
+    }
+
+    /// Review of #55, finding 3: a Codex fork made by another ohjaa launch
+    /// while this session ran holds this session's prompt, copied and
+    /// restamped, and the other launch's own. It is never named here.
+    #[test]
+    fn a_codex_fork_another_launch_made_is_never_named_here() {
+        let sandbox = Sandbox::new("codex-other-fork");
+        let parent = "019a0000-0000-7000-8000-0000000000d1";
+        let meta = |id: &str, began: i64, from: Option<&str>| {
+            json!({"type": "session_meta", "timestamp": at(began), "payload": {
+                "id": id, "session_id": id, "timestamp": at(began), "cwd": sandbox.cwd(),
+                "source": "cli", "forked_from_id": from}})
+        };
+        let developer = |ms: i64, session: &str| {
+            json!({"type": "response_item", "timestamp": at(ms), "payload": {
+                "type": "message", "role": "developer",
+                "content": [{"type": "input_text", "text": prompt(session)}]}})
+        };
+        sandbox.write(
+            &format!("codex/sessions/2026/09/21/rollout-e-{parent}.jsonl"),
+            &[meta(parent, 1_000, None), developer(1_100, OURS)],
+        );
+        let fork = "019a0000-0000-7000-8000-0000000000d2";
+        sandbox.write(
+            &format!("codex/sessions/2026/09/21/rollout-f-{fork}.jsonl"),
+            &[
+                meta(fork, 600_000, Some(parent)),
+                meta(parent, 600_001, None),
+                developer(600_002, OURS),
+                developer(600_003, "oh-1790000600000-5"),
+            ],
+        );
+        let native = sandbox.find("codex");
+        assert_eq!(Sandbox::ids(&native), [parent], "{native:#?}");
+    }
+
     #[test]
     fn a_prompt_outside_the_launch_folder_or_its_time_names_nothing() {
         let sandbox = Sandbox::new("elsewhere");
