@@ -1497,6 +1497,59 @@ fn a_failing_drafter_stops_intake_without_moving_the_cursor() {
 }
 
 #[test]
+fn a_repository_with_no_commits_yet_is_empty_and_does_not_hold_the_cursor() {
+    // Intake's first real run, 2026-10-27: `git log` refuses a repository
+    // with no commits yet, so the reverts of two such repositories counted
+    // as unread, and held the cursor 336 hours back and the sessions queued
+    // behind it.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakeempty");
+    let repo = fixture.make_git_repo("work");
+    let fresh = fixture.make_repo("fresh");
+    run_git(&fresh, &["init", "-q"]);
+    let cursor = fixture.dir.join("state/ohjaa/intake-since");
+
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--since", "2026-09-01", "--drafter", "exit 1"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "nothing to read is not a failure: {stderr}");
+    assert!(stdout.contains("nothing new to draft from"), "{stdout}");
+    assert!(
+        !stderr.contains("does not have any commits yet"),
+        "an empty repository is not a warning: {stderr}"
+    );
+    assert!(cursor.is_file(), "the cursor moves: {stderr}");
+    let moved = fs::read_to_string(&cursor).unwrap();
+
+    // A repository git cannot read at all still holds it, out loud.
+    let gone = fixture.make_folder("gone");
+    fs::write(
+        gone.join(".git"),
+        format!("gitdir: {}\n", fixture.dir.join("nowhere").display()),
+    )
+    .unwrap();
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--drafter", "exit 1"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(
+        stderr.contains("gone") && stderr.contains("not a git repository"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("the cursor stays"), "{stderr}");
+    assert_eq!(fs::read_to_string(&cursor).unwrap(), moved);
+    fixture.cleanup();
+}
+
+#[test]
 fn a_file_inside_a_repository_gets_only_shared_knowledge() {
     if !git_available() {
         return;

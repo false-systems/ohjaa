@@ -124,7 +124,7 @@ ohjaa intake --since 2026-10-01 --no-prefilter  # every message, not only likely
   its session. One longer than 1,500 characters is a pasted brief, and
   counted, never sent.
 - **Reviews:** human comments on pull requests and issues, through `gh`.
-- **Reverts:** reverted commits.
+- **Reverts:** reverted commits on each repository's current branch.
 - **Report:** what the bypass report finds (see below).
 
 **A local pre-filter comes first** (no network). Most of what people write
@@ -224,6 +224,10 @@ candidates that were handled, never back.
   warning that recurs on every run keeps the window growing until it is fixed.
 - With no repositories under the roots, reviews and reverts warn, and hold
   the cursor: nothing read is not nothing there.
+- A repository with no commits yet has nothing to read: it is empty, not
+  unread, and holds nothing (known from git's own refusal, at no git process
+  more). One git cannot read (its `.git` names nothing, or its current branch
+  is broken) warns, and holds the cursor.
 - vessa's exit 4 (a partial list) names two kinds of reason, which intake
   treats apart. What it lists is drafted from either way.
   - A source it could not read (`warnings`), what a transcript leaves unknown

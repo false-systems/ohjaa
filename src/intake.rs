@@ -829,16 +829,32 @@ pub fn github_slug(url: &str) -> Option<String> {
         .then(|| format!("{owner}/{name}"))
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<String> {
+/// What `git <args>` printed in `repo`, or `Ok(None)` when its current
+/// branch has no commits yet: a repository created and never committed to
+/// has no history to read, which is empty, not failed. That is known from
+/// git's own refusal (in the C locale, so it reads the same on every
+/// machine), at no process more; a branch git calls broken, or a repository
+/// it cannot read, is still an error.
+fn git(repo: &Path, args: &[&str]) -> Result<Option<String>> {
     let output = process::run(
-        Command::new("git").arg("-C").arg(repo).args(args),
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("LC_ALL", "C"),
         None,
         Duration::from_secs(30),
     )?;
     if !output.status.success() {
-        bail!("git {}: {}", args.join(" "), output.failure_detail());
+        let detail = output.failure_detail();
+        if detail.starts_with("fatal: your current branch '")
+            && detail.ends_with("' does not have any commits yet")
+        {
+            return Ok(None);
+        }
+        bail!("git {}: {detail}", args.join(" "));
     }
-    Ok(output.stdout_text())
+    Ok(Some(output.stdout_text()))
 }
 
 /// Human comments on pull requests and issues since `since`, through `gh`.
@@ -848,6 +864,7 @@ pub fn reviews(repos: &[PathBuf], since_ms: i64, warnings: &mut Vec<String>) -> 
     for repo in repos {
         let Some(slug) = git(repo, &["remote", "get-url", "origin"])
             .ok()
+            .flatten()
             .and_then(|url| github_slug(&url))
         else {
             continue;
@@ -924,7 +941,9 @@ pub fn reverts(repos: &[PathBuf], since_ms: i64, warnings: &mut Vec<String>) -> 
             ],
         );
         let log = match log {
-            Ok(log) => log,
+            Ok(Some(log)) => log,
+            // No commits yet: nothing to read, and nothing unread.
+            Ok(None) => continue,
             Err(error) => {
                 warnings.push(format!("{}: {error}", repo.display()));
                 continue;
