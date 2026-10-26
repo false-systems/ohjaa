@@ -2457,6 +2457,187 @@ fn intake_drafts_from_a_sessions_handover_once() {
     fixture.cleanup();
 }
 
+/// An ended session that said `count` corrections in its own window and
+/// repository (all in one second), then handed over: queued for intake, with
+/// `count + 1` candidates.
+fn session_that_said(fixture: &Fixture, repo: &Path, count: usize) {
+    let projects = fixture.dir.join("home/.claude/projects/-work");
+    fs::create_dir_all(&projects).unwrap();
+    let script = format!(
+        r#"sleep 1; here=$(pwd -P); at=$(date -u +%Y-%m-%dT%H:%M:%SZ); i=1
+while [ $i -le {count} ]; do
+  printf '{{"type":"user","timestamp":"%s","cwd":"%s","message":{{"content":"correction %s"}}}}\n' "$at" "$here" "$i" >> '{transcript}'
+  i=$((i+1))
+done
+{ohjaa} handover --surprised 'the queue never drained'"#,
+        transcript = projects.join("queued.jsonl").display(),
+        ohjaa = ohjaa_bin(),
+    );
+    let (_, stderr, code) = run_session(fixture, repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+/// Now, as the cursor writes it (milliseconds), from `date`.
+fn utc_now() -> String {
+    let output = Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%S.000Z"])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// The `said:` line of every candidate in each answered prompt, in order.
+fn said_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn intake_drains_a_queue_larger_than_one_run_and_never_moves_the_cursor_back() {
+    // The 2026-10-26 audit: queued sessions' old candidates outnumbered a
+    // run's cap, so every run drafted the same first ones, put the cursor
+    // before where the run began, never marked a session drafted and exited
+    // 4, forever.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakedrain");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 5);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // The window starts after the session: all six candidates are older.
+    let since = utc_now();
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ngrep '^    said: ' >> '{}'\necho '[]'\n",
+            sent.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let cursor_path = fixture.dir.join("state/ohjaa/intake-since");
+    let mut cursors: Vec<String> = Vec::new();
+    let mut runs = 0;
+    loop {
+        runs += 1;
+        assert!(runs <= 5, "intake never finished: {:?}", said_lines(&sent));
+        let before = said_lines(&sent).len();
+        let mut command = fixture.ohjaa();
+        command.args(["intake", "--source", "transcripts"]);
+        if runs == 1 {
+            command.args(["--since", &since]);
+        }
+        command
+            .args(["--batch", "1", "--max-batches", "2", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo);
+        let (stdout, stderr, code) = output_of(&mut command);
+        let sent_now = said_lines(&sent).len() - before;
+        assert!(sent_now <= 2, "a run takes at most its cap: {stderr}");
+        let cursor = fs::read_to_string(&cursor_path).unwrap_or_default();
+        let cursor = cursor.trim().to_owned();
+        assert!(
+            cursor.is_empty() || cursor >= since,
+            "run {runs}: the cursor {cursor} is before where the run began, {since}"
+        );
+        if let Some(last) = cursors.last() {
+            assert!(cursor >= *last, "run {runs}: the cursor moved back");
+        }
+        cursors.push(cursor);
+        if stdout.contains("nothing new") {
+            assert_eq!(code, Some(0), "{stderr}");
+            assert_eq!(sent_now, 0, "{stderr}");
+            assert!(
+                !stderr.contains("queued for drafting"),
+                "the session is drafted: {stderr}"
+            );
+            break;
+        }
+        assert!(sent_now >= 1, "run {runs} made no progress: {stderr}");
+        assert_eq!(code, Some(4), "work is left for the next run: {stderr}");
+    }
+    let mut lines = said_lines(&sent);
+    assert_eq!(lines.len(), 6, "each candidate once: {lines:?}");
+    lines.sort();
+    lines.dedup();
+    assert_eq!(lines.len(), 6, "no candidate twice: {lines:?}");
+    assert!(lines.iter().any(|l| l.contains("the queue never drained")));
+    assert_eq!(runs, 4, "three runs of two, then nothing left");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_drafter_failing_mid_run_keeps_what_was_drafted_and_the_next_run_retries_the_rest() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakeresume");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 5);
+    let (sent, failed, count) = (
+        fixture.dir.join("sent.txt"),
+        fixture.dir.join("failed.txt"),
+        fixture.dir.join("count"),
+    );
+    // Its second call fails; every other one answers that nothing is there.
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\nn=$(($(cat '{count}' 2>/dev/null || echo 0) + 1)); echo $n > '{count}'\n\
+             if [ $n -eq 2 ]; then grep '^    said: ' >> '{failed}'; echo boom >&2; exit 1; fi\n\
+             grep '^    said: ' >> '{sent}'\necho '[]'\n",
+            count = count.display(),
+            failed = failed.display(),
+            sent = sent.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--source", "transcripts", "--batch", "1"])
+                .args(["--max-batches", "3", "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(stderr.contains("intake stopped"), "{stderr}");
+    assert_eq!(said_lines(&sent).len(), 1, "the first batch was drafted");
+    let failed = said_lines(&failed);
+    assert_eq!(failed.len(), 1);
+
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    let lines = said_lines(&sent);
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(
+        lines[1], failed[0],
+        "the next run starts from what failed, not from the beginning"
+    );
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    let (stdout, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("nothing new"), "{stdout}");
+    let mut lines = said_lines(&sent);
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    lines.sort();
+    lines.dedup();
+    assert_eq!(lines.len(), 6, "nothing drafted twice: {lines:?}");
+    fixture.cleanup();
+}
+
 // ---- review fixes: each test failed before its fix -----------------------------
 
 /// A drafter that, while intake is drafting, checks the session log can be
