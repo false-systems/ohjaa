@@ -16,13 +16,17 @@
 //! commits, tip first. The commits, and the gate of each commit sykli is
 //! asked about, come from one git process (the clone's `git cat-file
 //! --batch`); receipts are
-//! read as files, from the layout: those sykli keeps for every push it
-//! accepted (`<common>/sykli/receipts`) and, in every worktree, those `sykli
-//! run` writes (`.sykli/receipts/`) and the one `ohjaa gate` saves
+//! read as files, from the layout: those sykli keeps under the clone's
+//! common dir, which outlive the worktree that ran them (the receipt of
+//! every push its hook accepted, `<common>/sykli/receipts`, and the receipt
+//! each run concluded with, in the run's own folder, `<common>/sykli/runs/
+//! <run>/`) and, in every worktree, those `sykli run` writes
+//! (`.sykli/receipts/`) and the one `ohjaa gate` saves
 //! (`.sykli/receipt.json`). sykli is asked only about a commit with a receipt
 //! of its tree that says it passed. A merge commit a forge made from an
 //! up-to-date pull request has the tree of the pull request's head, so a
-//! receipt of the head proves the merge.
+//! receipt of the head proves the merge, also once the worktree it was
+//! proven in is removed.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};

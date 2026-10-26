@@ -1018,13 +1018,13 @@ pub fn receipts_in<'a>(checkouts: impl IntoIterator<Item = &'a Path>) -> Receipt
 }
 
 /// The receipts in every checkout of `repo`'s clone, and those sykli keeps
-/// under the git common dir (`<common>/sykli/receipts`: a copy of the receipt
-/// that verified each push it accepted), which outlive a worktree removed
-/// with its `.sykli/`. Those are run from `repo`.
+/// under the git common dir ([`kept_by_sykli`]), which outlive a worktree
+/// removed with its `.sykli/`. Those are run from `repo`.
 pub fn receipts_of_clone(repo: &Path, checkouts: &[Worktree]) -> Receipts {
     let kept = crate::gitconfig::common_dir(repo)
         .ok()
-        .map(|common| common.join("sykli").join("receipts"));
+        .map(|common| kept_by_sykli(&common))
+        .unwrap_or_default();
     receipts_from(
         checkouts
             .iter()
@@ -1034,13 +1034,40 @@ pub fn receipts_of_clone(repo: &Path, checkouts: &[Worktree]) -> Receipts {
                     (w.path.join(".sykli").join("receipt.json"), w.path.as_path()),
                 ]
             })
-            .chain(kept.map(|dir| (dir, repo))),
+            .chain(kept.into_iter().map(|dir| (dir, repo))),
     )
 }
 
+/// Where sykli keeps receipts under a clone's common git dir, so they
+/// outlive the worktree that ran them: `<common>/sykli/receipts` (the
+/// receipt that verified each push its hook accepted) and the folder of each
+/// run it keeps, `<common>/sykli/runs/<run>/`, which holds the receipt the
+/// run concluded with (`rcpt_<sha256>.json`; `sykli status --run` names it,
+/// `verify --commit` judges it from any worktree of the clone). sykli keeps
+/// at most `SYKLI_RUN_BUDGET` runs per clone (100 by default), the oldest
+/// removed first. Files only.
+fn kept_by_sykli(common: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![common.join("sykli").join("receipts")];
+    if let Ok(runs) = std::fs::read_dir(common.join("sykli").join("runs")) {
+        let mut runs: Vec<PathBuf> = runs
+            .flatten()
+            .filter(|run| {
+                // A run's id is a digest; sykli's own leftovers start with a dot.
+                run.file_name()
+                    .to_str()
+                    .is_some_and(|name| !name.starts_with('.'))
+            })
+            .map(|run| run.path())
+            .collect();
+        runs.sort();
+        dirs.extend(runs);
+    }
+    dirs
+}
+
 /// The receipts of a clone found from its layout alone, without asking git:
-/// those sykli keeps under the common dir (`<common>/sykli/receipts`, the
-/// receipt that verified each push its hook accepted) and, in every worktree
+/// those sykli keeps under the common dir ([`kept_by_sykli`]: its pre-push
+/// hook's, and each run's, which outlive a worktree) and, in every worktree
 /// (the main one, and each `<common>/worktrees/*/gitdir` names), the ones
 /// `sykli run` writes (`.sykli/receipts/`) and the one `ohjaa gate` saves
 /// (`.sykli/receipt.json`).
@@ -1062,7 +1089,11 @@ pub fn receipts_of_layout(common: &Path) -> Receipts {
             ]
         })
         .collect();
-    dirs.push((common.join("sykli").join("receipts"), kept_in));
+    dirs.extend(
+        kept_by_sykli(common)
+            .into_iter()
+            .map(|dir| (dir, kept_in.clone())),
+    );
     receipts_from(
         dirs.iter()
             .map(|(dir, checkout)| (dir.clone(), checkout.as_path())),
@@ -1103,8 +1134,14 @@ pub fn layout_checkouts(common: &Path) -> Vec<PathBuf> {
 /// whichever checkout sykli ran. Every receipt of a tree is kept, best first: a
 /// passing run, then a clean one, then the newest. Read once per repository at leaving,
 /// and shared by its phases and its pull request.
+///
+/// sykli names a receipt it keeps by the SHA-256 of its bytes
+/// (`rcpt_<sha256>.json`), so one kept in several places (a worktree's
+/// `.sykli/receipts/` and its run's folder) is the same receipt: it is read
+/// once, where it is first found, and never asked about twice.
 fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Receipts {
     let mut found = Receipts::default();
+    let mut seen = std::collections::HashSet::new();
     for (dir, checkout) in dirs {
         // A folder of receipts, or one receipt file (`.sykli/receipt.json`).
         let paths: Vec<PathBuf> = if dir.is_file() {
@@ -1118,6 +1155,17 @@ fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Rec
         for path in paths {
             if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
+            }
+            let named = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("rcpt_")?.strip_suffix(".json"))
+                .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                .map(str::to_owned);
+            if let Some(named) = named {
+                if !seen.insert(named) {
+                    continue;
+                }
             }
             let Some(receipt) = std::fs::read(&path)
                 .ok()
@@ -3304,6 +3352,88 @@ mod tests {
         let bare = root.join("bare.git");
         write(bare.join("sykli/receipts/rcpt_d.json"), "bare", "passed");
         assert_eq!(receipts_of_layout(&bare)["bare"].checkout, bare);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// G1c: the receipt a run concluded with is kept in the run's own folder
+    /// under the common dir, `<common>/sykli/runs/<run>/rcpt_<sha256>.json`,
+    /// so it is found once the worktree that ran it is removed; and a
+    /// receipt kept in two places (the worktree's `.sykli/receipts/` and its
+    /// run's folder, both named by its digest) is one receipt, found once.
+    #[test]
+    fn a_receipt_sykli_kept_with_its_run_outlives_the_worktree_and_counts_once() {
+        let root = std::env::temp_dir().join(format!("ohjaa-layout-runs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let main = root.join("main");
+        let common = main.join(".git");
+        let gone = root.join("gone");
+        let admin = common.join("worktrees/gone");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", gone.join(".git").display()),
+        )
+        .unwrap();
+        let body = |tree: &str| {
+            format!(
+                r#"{{"schema":"sykli-receipt.v1","outcome":"passed","started_at_ms":1,"subject":{{"tree_oid":"{tree}","dirty":false}}}}"#
+            )
+        };
+        let named = |n: char| format!("rcpt_{}.json", n.to_string().repeat(64));
+        let put = |path: PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        // A run in a worktree that is gone since: only its run's copy is left.
+        put(
+            common.join("sykli/runs/run1").join(named('a')),
+            &body("landed"),
+        );
+        // One still here: the same receipt in the worktree and in its run.
+        put(main.join(".sykli/receipts").join(named('b')), &body("here"));
+        put(
+            common.join("sykli/runs/run2").join(named('b')),
+            &body("here"),
+        );
+        // sykli's own leftovers and journal files are no receipts.
+        put(
+            common.join("sykli/runs/.run3-aside").join(named('c')),
+            &body("aside"),
+        );
+        put(common.join("sykli/runs/run2/coordinator.log"), "");
+        let found = receipts_of_layout(&common);
+        let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
+        assert_eq!(
+            found["landed"].path,
+            common.join("sykli/runs/run1").join(named('a'))
+        );
+        assert_eq!(found["landed"].checkout, canonical(&main));
+        assert_eq!(found.of("here").len(), 1, "one receipt, found once");
+        assert_eq!(
+            found["here"].path,
+            canonical(&main).join(".sykli/receipts").join(named('b')),
+            "where it is first found: the worktree that ran it"
+        );
+        assert!(found.of("aside").is_empty());
+        let worktree = Worktree {
+            path: canonical(&main),
+            head: None,
+            branch: None,
+        };
+        let at_leaving = receipts_from(
+            [(
+                worktree.path.join(".sykli/receipts"),
+                worktree.path.as_path(),
+            )]
+            .into_iter()
+            .chain(
+                kept_by_sykli(&common)
+                    .into_iter()
+                    .map(|dir| (dir, main.as_path())),
+            ),
+        );
+        assert_eq!(at_leaving.of("landed").len(), 1);
+        assert_eq!(at_leaving.of("here").len(), 1);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

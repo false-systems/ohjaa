@@ -35,7 +35,9 @@ use std::process::{Command, Output};
 /// check's words do not). `run` writes its receipt as sykli does,
 /// also as `.sykli/receipts/rcpt_<sha256>.json`: one task, passed (with
 /// `$SANDBOX/with-cached` a second one reused from the cache; with
-/// `$SANDBOX/all-cached` both reused, the run `cached`). With STUB_SYKLI_D3 it is the
+/// `$SANDBOX/all-cached` both reused, the run `cached`; with `$SANDBOX/keep-runs`
+/// a copy in the run's own folder, `<common>/sykli/runs/<run>/`, as sykli keeps
+/// every run's, found from `.git`'s files). With STUB_SYKLI_D3 it is the
 /// durable-run sykli of KATANA D3, exactly as DECISIONS.md writes it: `run
 /// --json` names its `run`, `run --detach --json` answers `{schema:
 /// "sykli-run.v1", run}` once the run is recorded, and `status --run <id>
@@ -102,6 +104,15 @@ receipt() {
     "$run_field" "$top" "$(date +%s)000" "$ran" "$tree" "$dirty" "$t1" "$more" > .sykli/receipts/.new
   sum=$(digest .sykli/receipts/.new)
   mv .sykli/receipts/.new ".sykli/receipts/rcpt_$sum.json"
+  # With $SANDBOX/keep-runs, as sykli keeps every run: a copy in the run's own
+  # folder under the clone's common dir, found from .git's files (no git).
+  if [ -f "$SANDBOX/keep-runs" ]; then
+    if [ -d .git ]; then common=.git; else
+      gitdir=$(sed -n 's/^gitdir: //p' .git); common="$gitdir/$(cat "$gitdir/commondir")"
+    fi
+    mkdir -p "$common/sykli/runs/${2:-fg-$sum}"
+    cp ".sykli/receipts/rcpt_$sum.json" "$common/sykli/runs/${2:-fg-$sum}/"
+  fi
   echo "$PWD/.sykli/receipts/rcpt_$sum.json"
 }
 case "$1" in
@@ -4056,6 +4067,94 @@ fn a_commit_proven_in_another_worktree_is_a_quiet_push() {
         ),
         "proven nowhere: flagged: {stderr}"
     );
+}
+
+/// G1c: the proof `ohjaa gate` leaves outlives the worktree it ran in. A
+/// pull request proven in a linked worktree and merged on the forge (a merge
+/// with its head's tree) stays ✓ once the worktree is removed, as it is
+/// after every merge: sykli keeps the receipt a run concluded with in the
+/// run's own folder under the clone's common dir, and the marks read it
+/// there. Without that copy, the proof went with the worktree.
+#[test]
+fn a_proof_outlives_the_worktree_ohjaa_gate_ran_in() {
+    let mut sandbox = Sandbox::new("durable");
+    sandbox.stub_contract = "1";
+    fs::write(sandbox.dir.join("keep-runs"), "").unwrap();
+    let (repo, bare) = sandbox.repo("acme", "widget", &[("sykli.json", "{}\n")]);
+    sandbox.apply();
+    sandbox.adopt(&repo);
+    let linked = sandbox.dir.join("pr");
+    sandbox.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "pr",
+            &linked.to_string_lossy(),
+            "main",
+        ],
+    );
+    let head = sandbox.commit(&linked, "feature");
+    fs::write(sandbox.dir.join("tree"), sandbox.tree(&linked, "HEAD")).unwrap();
+    let (code, said) = sandbox.gate(&linked);
+    assert_eq!(code, Some(0), "{said}");
+    let quiet = ["-c", "core.hooksPath=/dev/null", "push", "-q", "origin"];
+    sandbox.git(&linked, &[&quiet[..], &["pr"]].concat());
+    // Merged on the forge: a merge commit with the pull request's tree.
+    sandbox.git(
+        &sandbox.dir,
+        &["clone", "-q", &bare.to_string_lossy(), "forge"],
+    );
+    let forge = sandbox.dir.join("forge");
+    sandbox.git(
+        &forge,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge pull request #1",
+            "origin/pr",
+        ],
+    );
+    sandbox.git(&forge, &[&quiet[..], &["main"]].concat());
+    sandbox.git(&repo, &["fetch", "-q", "origin"]);
+    let merge = sandbox.git(&repo, &["rev-parse", "origin/main"]);
+    assert_ne!(merge, head);
+    assert_eq!(sandbox.tree(&repo, &merge), sandbox.tree(&linked, "HEAD"));
+    let tip = |sandbox: &Sandbox| sandbox.report_json(&repo)["entries"][0]["commits"][0].clone();
+    assert_eq!(tip(&sandbox)["mark"], "proven", "{:#}", tip(&sandbox));
+
+    // The worktree removed, as after every merge: still proven, by the
+    // receipt sykli kept with its run.
+    sandbox.git(
+        &repo,
+        &["worktree", "remove", "--force", &linked.to_string_lossy()],
+    );
+    assert!(!linked.exists());
+    let after = tip(&sandbox);
+    assert_eq!(after["sha"], merge.as_str(), "{after:#}");
+    assert_eq!(after["mark"], "proven", "{after:#}");
+    let runs = repo.join(".git/sykli/runs");
+    let verified = sandbox
+        .read("sykli-calls")
+        .lines()
+        .rev()
+        .find(|line| line.contains("|verify ") && line.contains(&merge))
+        .map(str::to_owned)
+        .unwrap_or_default();
+    assert!(
+        verified.contains(&format!("|verify {}/", runs.display())),
+        "the receipt kept with its run: {verified}"
+    );
+
+    // That copy is what proves it: without it, nothing is left of the run.
+    fs::remove_dir_all(&runs).unwrap();
+    let gone = tip(&sandbox);
+    assert_eq!(gone["mark"], "unproven", "{gone:#}");
+    assert_eq!(gone["code"], "no_receipt", "{gone:#}");
 }
 
 // ---- KATANA D4: validation references ----------------------------------------
