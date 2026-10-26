@@ -37,8 +37,10 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   (`integrated/<clone>/`: the clone's one rolling validation checkout, the
   cargo target dir that checkout builds in, and copies of its runs'
   receipts), the lock that lets one ohjaa at a time ask for a clone's
-  validation, and the gates derived from commits that a run outliving its
-  ohjaa names (`derived/<digest>/`). It also holds intake's cursor
+  validation, the gates derived from commits that a run outliving its ohjaa
+  names (`derived/<digest>/`) and, for a commit with no contract of its own,
+  what `sykli init` wrote for its tree once a run was judged by it
+  (`inferred/<tree>/`, so sykli is asked once per tree). It also holds intake's cursor
   (`intake-since`), intake's progress (`intake-handled`: a version line; per
   candidate the drafter answered for or failed on, its time and a digest of
   its words, never the words, and for a failure how often and why in ohjaa's
@@ -51,9 +53,9 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 - **The workflow lives in the home, outside every repository.**
   `~/.config/ohjaa` holds each repository's entry (`repos/<owner>/<repo>/`:
   `repo.toml`, the branch ohjaa observes and the env its gate gives cargo
-  tasks, the gate of each commit being derived from the commit's own
-  `sykli.json`; a stored gate only for a repository with none; plus its
-  generated hooks folder and `gated.config`), the generated `git/`
+  tasks, the gate of each commit being derived from the commit: its own
+  `sykli.json`, else what `sykli init` writes for its tree; no stored gate;
+  plus its generated hooks folder and `gated.config`), the generated `git/`
   config and `roots`. Only
   repositories whose remote names an entry run ohjaa's hooks, and only the
   hooks that entry needs; no other git command anywhere starts ohjaa, and

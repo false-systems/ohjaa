@@ -2680,9 +2680,30 @@ fn report_json_and_gate_print_write_nothing_even_with_a_read_only_config_home() 
             "main",
         ],
     );
+    // G1c: and one with no sykli.json of its own, judged by what sykli init
+    // writes for its tree.
+    let (plain, _) = sandbox.repo("acme", "plain", &[]);
+    sandbox.adopt(&plain);
+    let plain_head = sandbox.commit(&plain, "proven");
+    fs::write(sandbox.dir.join("tree"), sandbox.tree(&plain, "HEAD")).unwrap();
+    let (code, said) = sandbox.gate(&plain);
+    assert_eq!(code, Some(0), "{said}");
+    sandbox.git(
+        &plain,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "-q",
+            "origin",
+            "main",
+        ],
+    );
     // The receipt's gate is not kept here (another machine's run, or a
-    // state wiped since): the report must write it to read it.
+    // state wiped since): the report must write it to read it, and ask
+    // sykli init again for the tree with no contract of its own.
     fs::remove_dir_all(sandbox.dir.join("state/ohjaa/derived")).unwrap();
+    fs::remove_dir_all(sandbox.dir.join("state/ohjaa/inferred")).unwrap();
     let config = sandbox.config();
     let state = sandbox.dir.join("state");
     let before = (files_under(&config), files_under(&state));
@@ -2695,10 +2716,25 @@ fn report_json_and_gate_print_write_nothing_even_with_a_read_only_config_home() 
     let (stdout, stderr) = text(&output);
     let json: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}{stderr}"));
-    let tip = &json["entries"][0]["commits"][0];
-    assert_eq!(tip["sha"], head.as_str(), "{json:#}");
-    assert_eq!(tip["mark"], "proven", "{json:#}");
-    assert_eq!(tip["contract"], "derived", "{json:#}");
+    let tip_of = |repo: &str| {
+        json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["repo"] == repo)
+            .map(|entry| entry["commits"][0].clone())
+            .unwrap_or_default()
+    };
+    for (repo, head) in [("acme/rusty", &head), ("acme/plain", &plain_head)] {
+        let tip = tip_of(repo);
+        assert_eq!(tip["sha"], head.as_str(), "{json:#}");
+        assert_eq!(tip["mark"], "proven", "{json:#}");
+        assert_eq!(tip["contract"], "derived", "{json:#}");
+    }
+    assert!(
+        !plain.join(".git/worktrees").exists(),
+        "sykli init is asked in a scratch checkout, never a worktree of the clone"
+    );
     let verified = sandbox
         .read("sykli-calls")
         .lines()
@@ -2714,13 +2750,15 @@ fn report_json_and_gate_print_write_nothing_even_with_a_read_only_config_home() 
         "read from a folder of the report's own: {verified}"
     );
 
-    let output = sandbox.ohjaa_in(&repo, &["gate", "--print"]);
-    let (stdout, stderr) = text(&output);
-    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
-    assert!(
-        stdout.contains("ohjaa gate: it is not written yet"),
-        "{stdout}"
-    );
+    for repo in [&repo, &plain] {
+        let output = sandbox.ohjaa_in(repo, &["gate", "--print"]);
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("ohjaa gate: it is not written yet"),
+            "{stdout}"
+        );
+    }
 
     writable(&config, true);
     assert_eq!(

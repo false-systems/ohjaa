@@ -1,7 +1,8 @@
 //! `ohjaa gate`: run the gate a push is judged by for the repository here,
 //! and leave the receipt that proves HEAD: the push finds it, and so do the
-//! marks (`.sykli/receipt.json`, and the copy `sykli run` keeps under
-//! `.sykli/receipts/`).
+//! marks (`.sykli/receipt.json`, the copy `sykli run` keeps under
+//! `.sykli/receipts/`, and the one sykli keeps in the run's own folder under
+//! the clone's common dir, which outlives the worktree).
 //!
 //! Inside an `ohjaa run` session (`OHJAA_SESSION`), the request is written
 //! into the session's record before sykli is asked (a `ValidationRef`), and
@@ -418,8 +419,10 @@ fn kept_receipt(top: &Path, printed: &Value, since_ms: i64) -> Option<ReceiptRef
 
 /// `ohjaa gate`: run the gate for the repository here, the way a push is
 /// judged, and leave the receipt that proves HEAD. One git process (the
-/// repository's config), and inside a session one more (HEAD and its tree,
-/// for the request); the rest is sykli's.
+/// repository's config), and inside a session, or in a checkout with no
+/// `sykli.json`, one more (HEAD and its tree); for a tree whose gate sykli
+/// init writes and no run kept yet, two more (its scratch checkout); the
+/// rest is sykli's.
 pub fn gate_here(print_only: bool, wait: Duration) -> Result<i32> {
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let (top, common) = repo_at(&cwd)?;
