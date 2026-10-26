@@ -139,9 +139,6 @@ pub struct Report {
     /// The integrated validations sessions asked sykli for (KATANA D5),
     /// each with the session that recorded it: references, never verdicts.
     pub integrated: Vec<(String, sessions::ValidationRef)>,
-    /// The Judgements recorded in the window and the Changes with none, as
-    /// `ohjaa-marks.v1` says them (`judgement::report_json`).
-    pub judgements: Value,
 }
 
 /// A proposal, or a proposed node, waiting for a person's decision.
@@ -262,8 +259,8 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
             ));
         }
     }
-    // The integrated validations sessions asked for, and the Judgements:
-    // from the log, read once above (and the Judgement tables of it).
+    // The integrated validations sessions asked for: from the log, read
+    // once above.
     let integrated = logged
         .iter()
         .flat_map(|session| {
@@ -274,7 +271,6 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
                 .map(|v| (session.id.clone(), v.clone()))
         })
         .collect();
-    let judgements = crate::judgement::report_json(&logged, since_ms);
     Report {
         since_ms,
         until_ms: now_ms,
@@ -288,7 +284,6 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
         gaps,
         window,
         integrated,
-        judgements,
     }
 }
 
@@ -1021,9 +1016,6 @@ pub fn to_json(report: &Report) -> Value {
             Err(why) => json!({"listed": false, "why": why, "waiting": []}),
         },
         "sessions": report.open.iter().map(session).collect::<Vec<_>>(),
-        // Additive (KATANA D5): the Judgements recorded in the window, and
-        // the Changes of ended sessions that no Judgement covers.
-        "judgements": report.judgements,
         "report": if report.window { report_json(report) } else { Value::Null },
     })
 }
@@ -1516,7 +1508,6 @@ mod tests {
             gaps: Vec::new(),
             window: true,
             integrated: Vec::new(),
-            judgements: json!({"listed": true, "recorded": [], "pending": []}),
         }
     }
 
@@ -1630,7 +1621,7 @@ mod tests {
         assert_eq!(json["schema"], "ohjaa-marks.v1");
         assert_eq!(
             keys(&json),
-            "complete,entries,generated,judgements,proposals,report,schema,sessions"
+            "complete,entries,generated,proposals,report,schema,sessions"
         );
         let entry = &json["entries"][0];
         assert_eq!(
@@ -1664,7 +1655,6 @@ mod tests {
             .map(|c| c["integrated"].as_str().unwrap())
             .collect();
         assert_eq!(integrated, ["unverified", "failed", "passed"]);
-        assert_eq!(keys(&json["judgements"]), "listed,pending,recorded");
         assert_eq!(entry["repo"], "acme/widget");
         assert_eq!(entry["ref"], "origin/main");
         assert_eq!(entry["tip"], "c3");

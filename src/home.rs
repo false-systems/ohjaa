@@ -8,8 +8,6 @@
 //! ~/.config/ohjaa/
 //!   repos/<owner>/<repo>/            lower case
 //!     repo.toml    branch = "main"   the branch ohjaa observes, and nothing else
-//!     sharing.toml                   written by a person, when they say: visibility,
-//!                                    share_judgements, push_judgements
 //!     sykli.json   the gate (a sykli contract), inputs repo-relative
 //!     sykli.lock
 //!     hooks/<name>                   exec <ohjaa> hook <name> "$@", for pre-push
@@ -113,58 +111,12 @@ impl RepoId {
     }
 }
 
-/// Whether a repository is public or private, as its entry says. ohjaa asks
-/// no forge (it has no network for this), so only the entry knows; an entry
-/// that does not say is treated as public: nothing that may name private
-/// things leaves this machine on a guess.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Visibility {
-    Private,
-    Public,
-    /// The entry does not say.
-    Unknown,
-}
-
-impl Visibility {
-    pub fn word(self) -> &'static str {
-        match self {
-            Visibility::Private => "private",
-            Visibility::Public => "public",
-            Visibility::Unknown => "unknown",
-        }
-    }
-}
-
-/// What an entry's `sharing.toml` says about sharing Judgements (all
-/// defaults without one).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Sharing {
-    /// `visibility = "private" | "public"`.
-    pub visibility: Visibility,
-    /// `share_judgements = true | false`, when the entry says.
-    pub share_judgements: Option<bool>,
-    /// `push_judgements = true`: `ohjaa judge` pushes the notes ref itself.
-    pub push_judgements: bool,
-}
-
-impl Default for Sharing {
-    fn default() -> Self {
-        Sharing {
-            visibility: Visibility::Unknown,
-            share_judgements: None,
-            push_judgements: false,
-        }
-    }
-}
-
 /// A repository's entry: where the workflow keeps its gate.
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub dir: PathBuf,
     /// The branch ohjaa observes, judged by the gate.
     pub branch: String,
-    /// Whether its Judgements are shared, and how (see [`Sharing`]).
-    pub sharing: Sharing,
 }
 
 impl Entry {
@@ -185,42 +137,22 @@ pub fn entry_dir(home: &Path, id: &RepoId) -> PathBuf {
         .join(id.name.to_ascii_lowercase())
 }
 
-/// What `repo.toml` holds: the branch, and nothing else. How the entry's
-/// Judgements are shared is a file of its own, `sharing.toml`, which only a
-/// person writes (and `adopt --force` never touches), and which an ohjaa from
-/// before Judgements never reads: its `repo.toml` stays one it can read.
+/// What `repo.toml` holds: the branch, and nothing else.
 pub fn repo_toml(id: &RepoId, branch: &str) -> String {
     format!(
         "# ohjaa's entry for {}, written by `ohjaa adopt`. ohjaa observes this branch,\n\
-         # judged by the gate beside it (sykli.json). How its Judgements are shared is\n\
-         # sharing.toml beside it, written by a person.\n\
+         # judged by the gate beside it (sykli.json).\n\
          branch = {}\n",
         id.slug(),
         flat_toml::quote(branch)
     )
 }
 
-/// The file beside `repo.toml` that says how an entry's Judgements are
-/// shared: `visibility`, `share_judgements`, `push_judgements`.
-pub const SHARING_TOML: &str = "sharing.toml";
-
-/// The keys `sharing.toml` may hold.
-const SHARING_KEYS: [&str; 3] = ["visibility", "share_judgements", "push_judgements"];
-
 fn parse_repo_toml(text: &str) -> std::result::Result<String, String> {
     let tables = flat_toml::parse(text)?;
     if let Some(table) = tables.keys().find(|name| !name.is_empty()) {
         return Err(format!(
             "unknown table [{table}]; repo.toml holds only branch"
-        ));
-    }
-    if let Some(key) = tables[""]
-        .keys()
-        .find(|key| SHARING_KEYS.contains(&key.as_str()))
-    {
-        return Err(format!(
-            "{key} belongs in {SHARING_TOML} beside repo.toml, which holds only branch (an \
-             older ohjaa reads repo.toml and refuses keys it does not know)"
         ));
     }
     flat_toml::only_keys(&tables, "", &["branch"])?;
@@ -237,42 +169,6 @@ fn parse_repo_toml(text: &str) -> std::result::Result<String, String> {
         .to_owned())
 }
 
-/// What `sharing.toml` says; an empty one says nothing (the defaults).
-fn parse_sharing_toml(text: &str) -> std::result::Result<Sharing, String> {
-    let tables = flat_toml::parse(text)?;
-    if let Some(table) = tables.keys().find(|name| !name.is_empty()) {
-        return Err(format!(
-            "unknown table [{table}]; {SHARING_TOML} holds only {}",
-            SHARING_KEYS.join(", ")
-        ));
-    }
-    flat_toml::only_keys(&tables, "", &SHARING_KEYS)?;
-    let top = &tables[""];
-    let flag = |key: &str| -> std::result::Result<Option<bool>, String> {
-        match top.get(key).map(String::as_str) {
-            None => Ok(None),
-            Some("true") => Ok(Some(true)),
-            Some("false") => Ok(Some(false)),
-            Some(other) => Err(format!("{key} is true or false, not {other:?}")),
-        }
-    };
-    let visibility = match top.get("visibility").map(String::as_str) {
-        None => Visibility::Unknown,
-        Some("private") => Visibility::Private,
-        Some("public") => Visibility::Public,
-        Some(other) => {
-            return Err(format!(
-                "visibility is \"private\" or \"public\", not {other:?}"
-            ))
-        }
-    };
-    Ok(Sharing {
-        visibility,
-        share_judgements: flag("share_judgements")?,
-        push_judgements: flag("push_judgements")?.unwrap_or(false),
-    })
-}
-
 /// The entry at `dir`, `Ok(None)` when there is none. A directory with files
 /// but no readable `repo.toml` is an error, never "no entry": the gate it
 /// holds must not be skipped because its branch cannot be read.
@@ -282,19 +178,9 @@ pub fn read_entry(dir: &Path) -> Result<Option<Entry>> {
         Ok(text) => {
             let branch = parse_repo_toml(&text)
                 .map_err(|why| anyhow::anyhow!("{}: {why}", path.display()))?;
-            let shared = dir.join(SHARING_TOML);
-            let sharing = match std::fs::read_to_string(&shared) {
-                Ok(text) => parse_sharing_toml(&text)
-                    .map_err(|why| anyhow::anyhow!("{}: {why}", shared.display()))?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Sharing::default(),
-                Err(error) => {
-                    return Err(error).with_context(|| format!("cannot read {}", shared.display()))
-                }
-            };
             Ok(Some(Entry {
                 dir: dir.to_path_buf(),
                 branch,
-                sharing,
             }))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -578,76 +464,22 @@ mod tests {
             ),
             ("[gate]\nbranch = \"main\"", "unknown table"),
             ("branch = main", "only \"text\" values"),
-            // How Judgements are shared is never in repo.toml: an older
-            // ohjaa reads it, and refuses a key it does not know.
-            (
-                "branch = \"main\"\nvisibility = \"private\"",
-                "visibility belongs in sharing.toml",
-            ),
-            (
-                "branch = \"main\"\nshare_judgements = true",
-                "share_judgements belongs in sharing.toml",
-            ),
         ] {
             let error = parse_repo_toml(text).unwrap_err();
             assert!(error.contains(why), "{text:?}: {error}");
         }
     }
 
-    /// KATANA D8 point 3: sharing.toml says how an entry's Judgements are
-    /// shared; none, or an empty one, says nothing.
+    /// `sharing.toml` said how `ohjaa judge` shared its notes; with the
+    /// command gone, one left in an entry is never read, whatever it holds.
     #[test]
-    fn sharing_toml_says_how_judgements_are_shared() {
-        assert_eq!(parse_sharing_toml("").unwrap(), Sharing::default());
-        assert_eq!(
-            parse_sharing_toml(
-                "visibility = \"public\"\nshare_judgements = true\npush_judgements = true\n"
-            )
-            .unwrap(),
-            Sharing {
-                visibility: Visibility::Public,
-                share_judgements: Some(true),
-                push_judgements: true,
-            }
-        );
-        assert_eq!(
-            parse_sharing_toml("visibility = \"private\"\n")
-                .unwrap()
-                .visibility,
-            Visibility::Private
-        );
-        for (text, why) in [
-            (
-                "visibility = \"internal\"",
-                "visibility is \"private\" or \"public\"",
-            ),
-            (
-                "share_judgements = \"yes\"",
-                "share_judgements is true or false",
-            ),
-            ("branch = \"main\"", "unknown key branch"),
-            ("[x]\nvisibility = \"public\"", "unknown table"),
-        ] {
-            let error = parse_sharing_toml(text).unwrap_err();
-            assert!(error.contains(why), "{text:?}: {error}");
-        }
-        // Read beside repo.toml.
+    fn a_sharing_toml_left_beside_repo_toml_is_never_read() {
         let dir = std::env::temp_dir().join(format!("ohjaa-sharing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("repo.toml"), "branch = \"main\"\n").unwrap();
-        assert_eq!(
-            read_entry(&dir).unwrap().unwrap().sharing,
-            Sharing::default()
-        );
-        std::fs::write(dir.join(SHARING_TOML), "visibility = \"private\"\n").unwrap();
-        assert_eq!(
-            read_entry(&dir).unwrap().unwrap().sharing.visibility,
-            Visibility::Private
-        );
-        std::fs::write(dir.join(SHARING_TOML), "visibility = 1\n").unwrap();
-        let error = read_entry(&dir).unwrap_err().to_string();
-        assert!(error.contains("sharing.toml"), "{error}");
+        std::fs::write(dir.join("sharing.toml"), "visibility = 1\n").unwrap();
+        assert_eq!(read_entry(&dir).unwrap().unwrap().branch, "main");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

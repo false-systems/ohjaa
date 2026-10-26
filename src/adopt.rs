@@ -241,8 +241,6 @@ fn write_entry(top: &Path, id: &RepoId, dir: &Path, branch: &str, force: bool) -
             }
         )
     };
-    // Only repo.toml: what a person wrote about sharing Judgements
-    // (sharing.toml beside it) is theirs, and never touched here.
     home::write_file(&dir.join("repo.toml"), &home::repo_toml(id, branch), None)?;
     Ok(source)
 }

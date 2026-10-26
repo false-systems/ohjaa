@@ -1176,18 +1176,18 @@ fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Rec
 const MAX_PHASES: usize = 50;
 
 /// One reflog entry: `reference` moved to `commit`, at `at` (unix seconds).
-pub(crate) struct Move {
-    pub(crate) reference: String,
-    pub(crate) at: i64,
-    pub(crate) commit: String,
-    pub(crate) subject: String,
+struct Move {
+    reference: String,
+    at: i64,
+    commit: String,
+    subject: String,
 }
 
-pub(crate) const REFLOG_FORMAT: &str = "--format=%gD%x1f%H%x1f%gs";
+const REFLOG_FORMAT: &str = "--format=%gD%x1f%H%x1f%gs";
 
 /// Reflog entries, newest first per reference, from `git <args>` run with
 /// `--date=unix` and [`REFLOG_FORMAT`].
-pub(crate) fn reflog(dir: &Path, args: &[&str]) -> Option<Vec<Move>> {
+fn reflog(dir: &Path, args: &[&str]) -> Option<Vec<Move>> {
     let log = git(dir, args)?;
     Some(
         log.lines()
@@ -2107,7 +2107,7 @@ fn existing(repo: &Path, commits: &[String]) -> Option<Vec<String>> {
 /// reset, a fast-forward, a rebase's start or finish). Judged by git's own
 /// wording, `<action>: <message>`. The action carries the command's
 /// arguments (`pull -q --rebase (pick)`), so replays match by their suffix.
-pub(crate) fn created_here(subject: &str) -> bool {
+fn created_here(subject: &str) -> bool {
     const REPLAYED: [&str; 7] = [
         "(pick)",
         "(reword)",
