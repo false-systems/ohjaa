@@ -1269,4 +1269,538 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn handled_candidates_are_kept_by_digest_and_unreadable_progress_is_an_error() {
+        let root = std::env::temp_dir().join(format!("ohjaa-handled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dirs = Dirs {
+            ours_checkout: None,
+            repo_root: None,
+            mine: root.join("mine"),
+            machine: root.join("machine"),
+            proposals: root.join("proposals"),
+            state: root.clone(),
+        };
+        assert_eq!(read_handled(&dirs).unwrap(), Handled::default());
+        let said = |at_ms: i64, text: &str| Candidate {
+            source: "claude",
+            at_ms,
+            at: rfc3339(at_ms.div_euclid(1000)),
+            place: "/p".to_owned(),
+            who: "person".to_owned(),
+            context: String::new(),
+            text: text.to_owned(),
+        };
+        let mut handled = Handled::default();
+        handled.0.insert(said(-5, "never python").key());
+        handled.0.insert(said(7, "we have lima").key());
+        write_handled(&dirs, &handled).unwrap();
+        let kept = std::fs::read_to_string(root.join("intake-handled")).unwrap();
+        assert!(
+            !kept.contains("python") && !kept.contains("lima"),
+            "digests, never the words: {kept}"
+        );
+        assert_eq!(read_handled(&dirs).unwrap(), handled);
+        assert!(read_handled(&dirs)
+            .unwrap()
+            .contains(&said(7, "we have lima")));
+        assert!(!read_handled(&dirs)
+            .unwrap()
+            .contains(&said(8, "we have lima")));
+        std::fs::write(root.join("intake-handled"), "7 nothex\n").unwrap();
+        assert!(read_handled(&dirs).is_err(), "never a silent start over");
+        write_handled(&dirs, &Handled::default()).unwrap();
+        assert!(
+            !root.join("intake-handled").exists(),
+            "nothing handled, no file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- the model: random queues, caps and failure points ---------------------
+
+    use std::collections::HashSet;
+
+    /// SplitMix64: a small deterministic generator, so a failing seed replays.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        /// In `0..n`.
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    struct ModelSession {
+        id: String,
+        repo: String,
+        started: i64,
+        ended: i64,
+        hands_over: bool,
+    }
+
+    impl ModelSession {
+        /// As the log has it at `now`: ended (with its handover, if any), or
+        /// still open.
+        fn at(&self, now: i64) -> crate::sessions::Session {
+            use crate::sessions::{Exit, Finished, Handover, Left, Session};
+            let ended = self.ended <= now;
+            Session {
+                id: self.id.clone(),
+                agent: "claude".to_owned(),
+                repo: self.repo.clone(),
+                outside_repo: false,
+                intent: "model".to_owned(),
+                started_ms: self.started,
+                branch: None,
+                head_at_start: None,
+                scoped: Vec::new(),
+                delivered: Vec::new(),
+                readback: None,
+                handover: (ended && self.hands_over).then(|| Handover {
+                    at_ms: self.ended,
+                    surprised: Some(format!("{} surprised", self.id)),
+                    ..Handover::default()
+                }),
+                left: ended.then(|| Left {
+                    exit: Exit::Code { code: 0 },
+                    orphaned: false,
+                    finished: Finished::NoPullRequest,
+                    ..Left::orphaned(self.ended)
+                }),
+                drafted: false,
+                usage: Vec::new(),
+                usage_refused: None,
+                intent_id: None,
+                task: None,
+                pgid: None,
+                group_started_ms: None,
+                validations: Vec::new(),
+            }
+        }
+    }
+
+    /// What there is to draft from: transcripts and reviews, each said at its
+    /// time, and sessions, some of whose windows lie before the first run.
+    struct World {
+        /// Where the first run's window starts.
+        since: i64,
+        said: Vec<Candidate>,
+        sessions: Vec<ModelSession>,
+        /// By then everything was said and every session ended.
+        end: i64,
+    }
+
+    fn said(source: &'static str, at_ms: i64, place: String, text: String) -> Candidate {
+        Candidate {
+            source,
+            at_ms,
+            at: rfc3339(at_ms.div_euclid(1000)),
+            place,
+            who: "person".to_owned(),
+            context: String::new(),
+            text,
+        }
+    }
+
+    fn world(rng: &mut Rng) -> World {
+        let since = 50_000;
+        let sessions: Vec<ModelSession> = (0..rng.below(4))
+            .map(|j| {
+                let started = rng.below(120_000) as i64;
+                ModelSession {
+                    id: format!("oh-{j}"),
+                    repo: format!("/r/s{j}"),
+                    started,
+                    ended: started + rng.below(40_000) as i64,
+                    hands_over: rng.chance(60),
+                }
+            })
+            .collect();
+        let mut out = Vec::new();
+        for session in &sessions {
+            for i in 0..rng.below(6) {
+                let at = session.started
+                    + rng.below((session.ended - session.started + 1) as u64) as i64;
+                let text = format!("{} said {i}", session.id);
+                out.push(said("claude", at, format!("{}/src", session.repo), text));
+            }
+        }
+        for i in 0..rng.below(30) {
+            // Coarse times, now and then, so candidates share a millisecond.
+            let at = if rng.chance(30) {
+                rng.below(20) as i64 * 10_000
+            } else {
+                rng.below(200_000) as i64
+            };
+            let (source, place) = match rng.below(3) {
+                0 => ("review", "https://github.com/o/r/pull/1".to_owned()),
+                1 if !sessions.is_empty() => {
+                    let session = &sessions[rng.below(sessions.len() as u64) as usize];
+                    ("claude", session.repo.clone())
+                }
+                _ => ("codex", "/r/elsewhere".to_owned()),
+            };
+            out.push(said(source, at, place, format!("said {i}")));
+        }
+        // The same words at the same time, from two sources: one candidate.
+        if let Some(first) = out.first().cloned() {
+            if rng.chance(30) {
+                out.push(Candidate {
+                    source: "review",
+                    ..first
+                });
+            }
+        }
+        let end = out
+            .iter()
+            .map(|c| c.at_ms)
+            .chain(sessions.iter().map(|s| s.ended))
+            .max()
+            .unwrap_or(0);
+        World {
+            since,
+            said: out,
+            sessions,
+            end,
+        }
+    }
+
+    #[derive(Default)]
+    struct State {
+        cursor: Option<i64>,
+        handled: Handled,
+        drafted: HashSet<String>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Fail {
+        None,
+        /// The drafter fails on this send (1-based).
+        Drafter(usize),
+        /// Killed after this batch was answered, before it was kept.
+        Killed(usize),
+    }
+
+    struct Plan {
+        cap: usize,
+        batch: usize,
+        /// Every source read without a warning.
+        clean: bool,
+        fail: Fail,
+    }
+
+    struct Ran {
+        /// Found and not handled when the run began.
+        before: usize,
+        sent: usize,
+        /// Found and not handled when it ended; `None` when it was killed.
+        after: Option<usize>,
+    }
+
+    /// One `ohjaa intake` at `now`, as `cmd_intake` runs it: the same
+    /// gathering, then the same calls. Asserts that nothing kept is ever sent
+    /// again and that the cursor never goes before the run's window.
+    fn run(
+        world: &World,
+        state: &mut State,
+        now: i64,
+        plan: &Plan,
+        kept: &mut HashSet<Key>,
+    ) -> Ran {
+        let since = state.cursor.unwrap_or(world.since);
+        let undrafted: Vec<crate::sessions::Session> = world
+            .sessions
+            .iter()
+            .filter(|s| !state.drafted.contains(&s.id))
+            .map(|s| s.at(now))
+            .collect();
+        let queued: Vec<_> = undrafted
+            .iter()
+            .filter(|s| s.left.is_some())
+            .cloned()
+            .collect();
+        let from = queued
+            .iter()
+            .map(|s| s.started_ms - 1)
+            .min()
+            .map_or(since, |earliest| earliest.min(since));
+        let visible = || world.said.iter().filter(|c| c.at_ms <= now);
+        let (new, older): (Vec<_>, Vec<_>) = visible()
+            .filter(|c| c.source != "review" && c.at_ms > from)
+            .cloned()
+            .partition(|c| c.at_ms > since);
+        let mut candidates = new;
+        candidates.extend(within_sessions(older, &queued));
+        candidates.extend(
+            visible()
+                .filter(|c| c.source == "review" && c.at_ms > since)
+                .cloned(),
+        );
+        candidates.extend(handover_candidates(&queued));
+        candidates.extend(observed_candidates(&queued));
+        let found = found(candidates);
+
+        let before = found.iter().filter(|c| !state.handled.contains(c)).count();
+        let mut handled = state.handled.clone();
+        let mut durable = state.handled.clone();
+        let (mut sends, mut keeps) = (0, 0);
+        let drafted = draft_pending(
+            &found,
+            &mut handled,
+            plan.batch,
+            plan.cap,
+            |chunk| {
+                sends += 1;
+                if matches!(plan.fail, Fail::Drafter(n) if n == sends) {
+                    bail!("the drafter failed");
+                }
+                for c in chunk {
+                    assert!(
+                        !kept.contains(&c.key()),
+                        "`{}` sent again after it was kept",
+                        c.text
+                    );
+                }
+                Ok(())
+            },
+            |handled| {
+                keeps += 1;
+                if matches!(plan.fail, Fail::Killed(n) if n == keeps) {
+                    bail!("killed");
+                }
+                durable = handled.clone();
+                Ok(())
+            },
+        );
+        kept.extend(durable.0.iter().copied());
+        let batches = before.min(plan.cap).div_ceil(plan.batch);
+        let expected = match plan.fail {
+            Fail::Drafter(n) | Fail::Killed(n) if n <= batches => {
+                let answered = if matches!(plan.fail, Fail::Killed(_)) {
+                    n
+                } else {
+                    n - 1
+                };
+                (answered * plan.batch).min(before.min(plan.cap))
+            }
+            _ => before.min(plan.cap),
+        };
+        assert_eq!(
+            drafted.sent, expected,
+            "a run drafts up to its cap, until it fails"
+        );
+        if let Fail::Killed(n) = plan.fail {
+            if n <= batches {
+                // Only what was kept survives the kill.
+                state.handled = durable;
+                return Ran {
+                    before,
+                    sent: drafted.sent,
+                    after: None,
+                };
+            }
+        }
+        assert_eq!(
+            durable, handled,
+            "every answered batch was kept before the next"
+        );
+
+        let sessions: Vec<Undrafted> = undrafted
+            .iter()
+            .map(|s| Undrafted {
+                id: s.id.clone(),
+                started_ms: s.started_ms,
+                members: (plan.clean && s.left.is_some()).then(|| members(s, &found)),
+            })
+            .collect();
+        let settled = settle(
+            &found,
+            &mut handled,
+            Some(&sessions),
+            since,
+            now,
+            plan.clean,
+        );
+        assert!(
+            settled
+                .cursor
+                .is_none_or(|cursor| cursor > since && cursor <= now),
+            "the cursor {:?} is outside ({since}, {now}]",
+            settled.cursor
+        );
+        assert_eq!(
+            settled.left,
+            before - drafted.sent,
+            "what was drafted is no longer left"
+        );
+        // `write_cursor`: forward only.
+        state.cursor = state.cursor.max(settled.cursor);
+        state.drafted.extend(settled.drafted);
+        state.handled = handled;
+        Ran {
+            before,
+            sent: drafted.sent,
+            after: Some(settled.left),
+        }
+    }
+
+    #[test]
+    fn model_every_run_makes_progress_and_repeated_runs_drain_the_queue() {
+        for seed in 0..3_000 {
+            let mut rng = Rng(seed);
+            let world = world(&mut rng);
+            let mut state = State::default();
+            let mut kept = HashSet::new();
+            let mut cursors = Vec::new();
+            let mut now = world.since;
+            // While the world changes: runs at random times, with random caps,
+            // warnings, drafter failures and kills.
+            while now < world.end {
+                now += 1 + rng.below(30_000) as i64;
+                let plan = Plan {
+                    cap: 1 + rng.below(6) as usize,
+                    batch: 1 + rng.below(3) as usize,
+                    clean: !rng.chance(15),
+                    fail: match rng.below(10) {
+                        0 | 1 => Fail::Drafter(1 + rng.below(3) as usize),
+                        2 => Fail::Killed(1 + rng.below(3) as usize),
+                        _ => Fail::None,
+                    },
+                };
+                let ran = run(&world, &mut state, now, &plan, &mut kept);
+                if matches!(plan.fail, Fail::None) && ran.before > 0 {
+                    assert!(ran.sent >= 1, "seed {seed}: a run with work left made none");
+                }
+                cursors.push(state.cursor);
+            }
+            // Then the world stands still: every run strictly reduces the work
+            // left, until one reports that nothing is left.
+            let mut runs = 0;
+            loop {
+                now += 1_000;
+                let plan = Plan {
+                    cap: 1 + rng.below(3) as usize,
+                    batch: 1 + rng.below(2) as usize,
+                    clean: true,
+                    fail: Fail::None,
+                };
+                let ran = run(&world, &mut state, now, &plan, &mut kept);
+                cursors.push(state.cursor);
+                if ran.before == 0 {
+                    assert_eq!((ran.sent, ran.after), (0, Some(0)), "seed {seed}");
+                    break;
+                }
+                assert!(ran.after.unwrap() < ran.before, "seed {seed}: no progress");
+                runs += 1;
+                assert!(runs < 500, "seed {seed}: the queue never drained");
+            }
+            assert!(
+                cursors.windows(2).all(|pair| pair[0] <= pair[1]),
+                "seed {seed}: the cursor moved back: {cursors:?}"
+            );
+            // Every session was drafted from, and every candidate there was
+            // to draft from was drafted from: those said after the first
+            // window began, and every session's own.
+            assert_eq!(state.drafted.len(), world.sessions.len(), "seed {seed}");
+            let mut owed: HashSet<Key> = world
+                .said
+                .iter()
+                .filter(|c| c.at_ms > world.since)
+                .map(Candidate::key)
+                .collect();
+            for session in &world.sessions {
+                owed.extend(members(&session.at(world.end), &world.said));
+            }
+            assert_eq!(
+                kept, owed,
+                "seed {seed}: drafted from exactly what was owed"
+            );
+            // One more run: nothing to draft, and nothing left kept that no
+            // run could find again.
+            now += 1_000;
+            let plan = Plan {
+                cap: 1,
+                batch: 1,
+                clean: true,
+                fail: Fail::None,
+            };
+            let ran = run(&world, &mut state, now, &plan, &mut kept);
+            assert_eq!((ran.before, ran.sent), (0, 0), "seed {seed}");
+            assert!(
+                state.handled.0.is_empty(),
+                "seed {seed}: {:?}",
+                state.handled
+            );
+        }
+    }
+
+    #[test]
+    fn the_audits_queue_drains_in_four_runs_of_four_hundred() {
+        // The 2026-10-26 audit, in the model: 486 old candidates of 65 queued
+        // sessions and 842 new ones, with the default cap of 400.
+        let mut out = Vec::new();
+        let sessions: Vec<ModelSession> = (0..65)
+            .map(|j| ModelSession {
+                id: format!("oh-{j}"),
+                repo: format!("/r/s{j}"),
+                started: j * 1_000,
+                ended: j * 1_000 + 900,
+                hands_over: true,
+            })
+            .collect();
+        for (i, session) in sessions.iter().enumerate() {
+            for k in 0..(if i < 31 { 7 } else { 6 }) {
+                let text = format!("{} said {k}", session.id);
+                out.push(said(
+                    "claude",
+                    session.started + k,
+                    session.repo.clone(),
+                    text,
+                ));
+            }
+        }
+        for i in 0..842 {
+            out.push(said(
+                "codex",
+                100_000 + i,
+                "/r/elsewhere".to_owned(),
+                format!("new {i}"),
+            ));
+        }
+        let world = World {
+            since: 99_999,
+            said: out,
+            sessions,
+            end: 100_000 + 842,
+        };
+        let mut state = State::default();
+        let mut kept = HashSet::new();
+        let plan = Plan {
+            cap: 400,
+            batch: 40,
+            clean: true,
+            fail: Fail::None,
+        };
+        let mut lefts = Vec::new();
+        for run_number in 1..=5 {
+            let ran = run(&world, &mut state, 200_000 + run_number, &plan, &mut kept);
+            lefts.push(ran.after.unwrap());
+        }
+        assert_eq!(lefts, [1328 - 400, 528, 128, 0, 0]);
+        assert_eq!(state.drafted.len(), 65);
+    }
 }
