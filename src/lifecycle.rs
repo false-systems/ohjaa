@@ -949,6 +949,11 @@ pub struct Receipt {
     pub path: PathBuf,
     /// The checkout sykli ran in.
     pub checkout: PathBuf,
+    /// The hash of the contract it ran under, and the digest of the lock
+    /// beside it, as the receipt names them: which contract to verify it
+    /// against.
+    pub contract_hash: Option<String>,
+    pub lock_digest: Option<String>,
 }
 
 /// Sykli receipts keyed by the tree that ran: every one of each tree, best
@@ -1165,6 +1170,8 @@ fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Rec
                     evidence,
                     path,
                     checkout: checkout.to_path_buf(),
+                    contract_hash: receipt["contract_hash"].as_str().map(str::to_owned),
+                    lock_digest: receipt["lock_digest"].as_str().map(str::to_owned),
                 },
             );
         }
@@ -2303,20 +2310,31 @@ pub fn still_at(repo: &Path, branch: &str, commit: &str) -> bool {
 /// The most receipts of one tree sykli is asked about, best first.
 const MAX_ASKED: usize = 5;
 
-/// An entry's gate for one clone: the contract the workflow home keeps for
+/// An entry's gate for one clone: the entry the workflow home keeps for
 /// the repository its origin names, the branch it observes, and the clone
 /// (a checkout's top level and the common git dir), which sykli is handed
-/// instead of asking git for it again.
+/// instead of asking git for it again. The contract each commit is judged
+/// by is derived from the commit ([`crate::derived::GateAt`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gate {
     /// `owner/name`.
     pub slug: String,
     pub branch: String,
-    /// Outside the repository: `sykli verify` reads it, and the lock beside
-    /// it, from their files.
-    pub contract: PathBuf,
+    /// The entry's folder: the gates derived for its commits (outside the
+    /// repository: `sykli verify` reads one, and the lock beside it, from
+    /// their files), and its stored copy, if it keeps one.
+    pub entry: PathBuf,
+    /// What each cargo task of a derived gate is given.
+    pub overlay: crate::derived::Overlay,
     pub top: PathBuf,
     pub common: PathBuf,
+}
+
+impl Gate {
+    /// The gate of `commit`, whose own files are `own`.
+    pub fn at(&self, commit: &str, own: Option<crate::derived::Own>) -> crate::derived::GateAt {
+        crate::derived::GateAt::of(&self.entry, &self.overlay, commit, own)
+    }
 }
 
 /// How a sykli's `verify --commit` gives its verdict, from the flags
@@ -2424,8 +2442,17 @@ pub struct Sykli {
     home: Option<PathBuf>,
     /// Each repository's gate, by its canonical path.
     gates: std::cell::RefCell<HashMap<PathBuf, Option<Gate>>>,
-    /// What a gate said of a commit: (contract, commit) to the verdict.
+    /// What a gate said of a commit: (entry, commit) to the verdict.
     judged: std::cell::RefCell<HashMap<(PathBuf, String), Check>>,
+    /// One `git cat-file --batch` per clone, by its common dir: every
+    /// commit and file this ohjaa reads of it, from one git process.
+    objects: std::cell::RefCell<HashMap<PathBuf, crate::derived::Objects>>,
+    /// The gate of each commit: (entry, commit) to it.
+    gate_at: std::cell::RefCell<HashMap<(PathBuf, String), crate::derived::GateAt>>,
+    /// Which contract the receipt that proved each commit ran under.
+    proved_under: std::cell::RefCell<HashMap<String, crate::derived::Under>>,
+    /// Where the gates sykli reads are written: never the config home.
+    derived: crate::derived::Gates,
     /// How many times `sykli verify` ran.
     verified: std::cell::Cell<usize>,
     /// How many times it may run in all; `None`: as often as it is needed.
@@ -2445,6 +2472,7 @@ impl Sykli {
     pub fn with_home(home: PathBuf) -> Sykli {
         Sykli {
             home: Some(home),
+            derived: crate::derived::Gates::of_state(),
             ..Sykli::default()
         }
     }
@@ -2456,6 +2484,7 @@ impl Sykli {
             home: Some(home),
             program: Some(program),
             limit: Some(limit),
+            derived: crate::derived::Gates::of_state(),
             ..Sykli::default()
         }
     }
@@ -2468,10 +2497,72 @@ impl Sykli {
         self.limit.unwrap_or(process::LOCAL)
     }
 
-    fn proved(&self, commit: &str, receipt: &Receipt) {
+    fn proved(&self, commit: &str, receipt: &Receipt, under: crate::derived::Under) {
         self.proofs
             .borrow_mut()
             .insert(commit.to_owned(), receipt.evidence.clone());
+        self.proved_under
+            .borrow_mut()
+            .insert(commit.to_owned(), under);
+    }
+
+    /// Which contract proved `commit`, once sykli verified a receipt of it
+    /// here: the gate derived from it, its own `sykli.json`, or the entry's
+    /// stored copy.
+    pub fn proved_under(&self, commit: &str) -> Option<crate::derived::Under> {
+        self.proved_under.borrow().get(commit).copied()
+    }
+
+    /// Ask the clone whose common git dir is `common`, through its one `git
+    /// cat-file --batch` (started the first time it is asked).
+    pub fn ask_objects<T>(
+        &self,
+        common: &Path,
+        ask: impl FnOnce(&mut crate::derived::Objects) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let key = canonical(common);
+        let mut all = self.objects.borrow_mut();
+        let objects = match all.entry(key) {
+            std::collections::hash_map::Entry::Occupied(found) => found.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(crate::derived::Objects::of_clone(common)?)
+            }
+        };
+        ask(objects)
+    }
+
+    /// Where this sykli's gates are written for sykli to read.
+    pub fn gates(&self) -> &crate::derived::Gates {
+        &self.derived
+    }
+
+    /// End every clone's `git cat-file --batch`, once nothing more is to be
+    /// read: none outlives what it was started for (a session's launch).
+    pub fn close_objects(&self) {
+        self.objects.borrow_mut().clear();
+    }
+
+    /// The commit `name` names in `gate`'s clone.
+    pub fn commit_of(
+        &self,
+        gate: &Gate,
+        name: &str,
+    ) -> Result<Option<crate::derived::Commit>, String> {
+        self.ask_objects(&gate.common, |objects| objects.commit(name))
+    }
+
+    /// The gate `commit` is judged by: derived from its own `sykli.json`,
+    /// else the entry's copy; read from the commit once, in the clone's one
+    /// git process.
+    pub fn gate_at(&self, gate: &Gate, commit: &str) -> Result<crate::derived::GateAt, String> {
+        let key = (gate.entry.clone(), commit.to_owned());
+        if let Some(known) = self.gate_at.borrow().get(&key) {
+            return Ok(known.clone());
+        }
+        let own = self.ask_objects(&gate.common, |objects| objects.own_at(commit))?;
+        let at = gate.at(commit, own);
+        self.gate_at.borrow_mut().insert(key, at.clone());
+        Ok(at)
     }
 
     /// What the receipt that proved `commit` says of its run, once sykli
@@ -2545,6 +2636,7 @@ impl Sykli {
         mut command: Command,
         commit: &str,
         receipt: &Receipt,
+        under: crate::derived::Under,
     ) -> Check {
         if answer == Answer::Document {
             command.arg("--json");
@@ -2561,7 +2653,7 @@ impl Sykli {
                 };
                 match proven {
                     Ok(()) => {
-                        self.proved(commit, receipt);
+                        self.proved(commit, receipt, under);
                         Check::Passed
                     }
                     Err(why) => Check::Unverified { why },
@@ -2586,7 +2678,7 @@ impl Sykli {
         receipts: &Receipts,
         alive: bool,
     ) -> Check {
-        let key = (gate.contract.clone(), commit.to_owned());
+        let key = (gate.entry.clone(), commit.to_owned());
         if let Some(known) = self.judged.borrow().get(&key) {
             return known.clone();
         }
@@ -2646,6 +2738,22 @@ impl Sykli {
         } else {
             Vec::new()
         };
+        // The commit's gate: derived from its own sykli.json, else the
+        // entry's copy. Read only now, when a receipt asks sykli.
+        let at = match self.gate_at(gate, commit) {
+            Ok(at) => at,
+            Err(why) => {
+                return Check::Unverified {
+                    why: format!("its gate cannot be read: {why}"),
+                }
+            }
+        };
+        if let crate::derived::GateAt::Missing(why) = &at {
+            return Check::Unverified {
+                why: format!("no gate judges it: {why}"),
+            };
+        }
+        let mut written = None;
         let mut verdicts = Vec::new();
         for receipt in passing.iter().take(MAX_ASKED) {
             if !self.may_verify() {
@@ -2659,16 +2767,43 @@ impl Sykli {
                 }
                 break;
             }
+            // A run under the repository's own contract at the commit (CI's
+            // `sykli run sykli.json`) is verified against it, read from the
+            // commit; every other against the gate.
+            let own = match &at {
+                crate::derived::GateAt::Derived(derived) => derived.own.as_ref().filter(|own| {
+                    own.ran(
+                        receipt.contract_hash.as_deref(),
+                        receipt.lock_digest.as_deref(),
+                    )
+                }),
+                _ => None,
+            };
+            let (contract, under) = match own {
+                Some(_) => (PathBuf::from("sykli.json"), crate::derived::Under::Own),
+                None => match written.get_or_insert_with(|| at.contract(&self.derived, false)) {
+                    Ok(path) => (path.clone(), at.under()),
+                    Err(why) => {
+                        verdicts.push((
+                            receipt.at,
+                            Check::Unverified {
+                                why: format!("its gate cannot be written: {why}"),
+                            },
+                        ));
+                        break;
+                    }
+                },
+            };
             let mut command = self.command();
             command
                 .arg("verify")
                 .arg(&receipt.path)
                 .arg("--contract")
-                .arg(&gate.contract)
+                .arg(&contract)
                 .args(&facts)
                 .args(["--commit", commit])
                 .current_dir(&gate.top);
-            match self.verify(answer, command, commit, receipt) {
+            match self.verify(answer, command, commit, receipt, under) {
                 Check::Passed => return Check::Passed,
                 check => verdicts.push((receipt.at, check)),
             }
@@ -2770,7 +2905,7 @@ impl Sykli {
                 .arg(&receipt.path)
                 .args(["--contract", contract, "--commit", commit])
                 .current_dir(at_commit.unwrap_or(&receipt.checkout));
-            match self.verify(answer, command, commit, receipt) {
+            match self.verify(answer, command, commit, receipt, crate::derived::Under::Own) {
                 Check::Passed => return Check::Passed,
                 check => verdicts.push((receipt.at, check)),
             }

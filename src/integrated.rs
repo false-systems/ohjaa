@@ -8,10 +8,11 @@
 //!   carries a result across trees.
 //! - When a landing reaches the observed branch (seen at leaving, or by a
 //!   launch's marks walk) and sykli has no current receipt of its tree under
-//!   the entry's gate, ohjaa asks sykli for a durable run of exactly that
-//!   tree. Under the clone's lock, a `ValidationRef` of kind `integrated` is
-//!   written into the session's record first (invariant A); then `sykli run
-//!   --detach` runs in the clone's one rolling validation checkout
+//!   its gate (derived from the commit), ohjaa asks sykli for a durable run
+//!   of exactly that tree. Under the clone's lock, a `ValidationRef` of kind
+//!   `integrated` is written into the session's record first (invariant A);
+//!   then `sykli run --detach` runs in the clone's one rolling validation
+//!   checkout
 //!   (`$XDG_STATE_HOME/ohjaa/integrated/<clone>/checkout`, a linked worktree
 //!   of the clone, reset to exactly the landed commit and verified clean
 //!   first), whose cargo builds go to a target dir of its own. ohjaa keeps
@@ -29,7 +30,7 @@ use serde_json::Value;
 
 use crate::gitconfig;
 use crate::hook::facts_for_sykli;
-use crate::lifecycle::{self, Gate, StatusHelp};
+use crate::lifecycle::{self, Gate, StatusHelp, Sykli};
 use crate::mark::{self, Marks};
 use crate::process::{self, FileLock};
 use crate::sessions::{self, Check, ObservedBranch, ReceiptRef, ValidationKind, ValidationRef};
@@ -112,13 +113,18 @@ pub fn standing(kind: ValidationKind, said: &Said) -> String {
     format!("{kind} {}", said.word())
 }
 
-/// `sykli status --commit <rev> --contract <gate> --json`, from the gate's
-/// checkout, handed the clone's facts when sykli takes them.
-fn commit_status(gate: &Gate, help: StatusHelp, rev: &str) -> Result<Value, String> {
+/// `sykli status --commit <rev> --contract <its gate> --json`, from the
+/// gate's checkout, handed the clone's facts when sykli takes them.
+fn commit_status(
+    gate: &Gate,
+    contract: &Path,
+    help: StatusHelp,
+    rev: &str,
+) -> Result<Value, String> {
     let mut command = Command::new("sykli");
     command
         .args(["status", "--commit", rev, "--contract"])
-        .arg(&gate.contract);
+        .arg(contract);
     if help.facts {
         command
             .arg("--repo-root")
@@ -172,12 +178,31 @@ pub fn said_of(status: &Value) -> Said {
     }
 }
 
-/// What sykli says of `rev` under `gate`, when this sykli can say.
-pub fn ask(gate: &Gate, caps: &Caps, rev: &str) -> Said {
+/// The gate `commit` is judged by, as the file sykli is handed, read
+/// through `sykli`'s one git process for the clone: kept in ohjaa's state
+/// for a run that outlives this ohjaa (`keep`), else where sykli reads it
+/// now.
+pub fn contract_of(
+    gate: &Gate,
+    sykli: &Sykli,
+    commit: &str,
+    keep: bool,
+) -> Result<PathBuf, String> {
+    sykli
+        .gate_at(gate, commit)
+        .and_then(|at| at.contract(sykli.gates(), keep))
+}
+
+/// What sykli says of `rev` under its gate, when this sykli can say.
+pub fn ask(gate: &Gate, sykli: &Sykli, caps: &Caps, rev: &str) -> Said {
     if !caps.status.commit {
         return Said::Unknown("this sykli cannot be asked (no `sykli status --commit`)".to_owned());
     }
-    match commit_status(gate, caps.status, rev) {
+    let contract = match contract_of(gate, sykli, rev, false) {
+        Ok(contract) => contract,
+        Err(why) => return Said::Unknown(format!("it has no gate to ask about: {why}")),
+    };
+    match commit_status(gate, &contract, caps.status, rev) {
         Ok(status) => said_of(&status),
         Err(why) => Said::Unknown(format!("sykli could not say: {why}")),
     }
@@ -303,8 +328,8 @@ pub struct Request {
 }
 
 /// The request for an integrated validation of `commit` (whose tree is
-/// `tree`), the observed branch's tip, under `gate`.
-pub fn plan(gate: &Gate, commit: &str, tree: &str, state: &Path) -> Request {
+/// `tree`), the observed branch's tip, under `contract`, its gate.
+pub fn plan(gate: &Gate, contract: &Path, commit: &str, tree: &str, state: &Path) -> Request {
     let at = now_ms();
     let checkout = CloneDir::of(state, &gate.common).checkout();
     let validation = ValidationRef {
@@ -314,8 +339,8 @@ pub fn plan(gate: &Gate, commit: &str, tree: &str, state: &Path) -> Request {
         repo: checkout.to_string_lossy().into_owned(),
         commit: commit.to_owned(),
         tree: tree.to_owned(),
-        contract: gate.contract.to_string_lossy().into_owned(),
-        contract_digest: crate::gate::pinned(&gate.contract),
+        contract: contract.to_string_lossy().into_owned(),
+        contract_digest: crate::gate::pinned(contract),
         lock_digest: None,
         requested_ms: at,
         receipt: None,
@@ -513,7 +538,7 @@ pub fn dispatch(
     let mut command = Command::new("sykli");
     command
         .arg("run")
-        .arg(&gate.contract)
+        .arg(&request.validation.contract)
         .args(&facts)
         .args(["--detach", "--json"])
         .current_dir(&request.checkout)
@@ -872,7 +897,14 @@ enum Decided {
 /// asked while this one waited): a request of the commit that stands is
 /// said, never repeated; one recorded and never dispatched is asked again
 /// at once; a checkout busy with a run is not reset under it.
-fn decide(log: &Path, state: &Path, gate: &Gate, commit: &str, tree: &str, caps: &Caps) -> Decided {
+fn decide(
+    log: &Path,
+    state: &Path,
+    gate: &Gate,
+    contract: &Path,
+    (commit, tree): (&str, &str),
+    caps: &Caps,
+) -> Decided {
     let clone = CloneDir::of(state, &gate.common);
     let lock = match clone.lock() {
         Ok(lock) => lock,
@@ -922,7 +954,7 @@ fn decide(log: &Path, state: &Path, gate: &Gate, commit: &str, tree: &str, caps:
         Previous::Free(Some(note)) => said.push_str(&format!("; {note}")),
         Previous::Free(None) => {}
     }
-    let mut request = plan(gate, commit, tree, state);
+    let mut request = plan(gate, contract, commit, tree, state);
     request.supersedes = supersedes;
     Decided::Ask(Box::new(request), lock, said)
 }
@@ -936,12 +968,12 @@ pub fn at_landing(
     log: &Path,
     state: &Path,
     session: &str,
-    gate: &Gate,
+    (gate, sykli): (&Gate, &Sykli),
     commit: &str,
     caps: &Caps,
 ) -> String {
     let onto = format!("origin/{}", gate.branch);
-    let said = ask(gate, caps, commit);
+    let said = ask(gate, sykli, caps, commit);
     let head = format!(
         "{}: {} on {onto}",
         standing(ValidationKind::Integrated, &said),
@@ -956,13 +988,20 @@ pub fn at_landing(
              run --detach`), so no run was asked for"
         );
     }
-    let tree = match tree_of(&gate.top, commit) {
-        Ok(tree) => tree,
+    // Its tree and its gate, from the clone's one git process (its gate
+    // was read already, to ask sykli).
+    let tree = match sykli.commit_of(gate, commit) {
+        Ok(Some(found)) => found.tree,
+        Ok(None) => return format!("{head} has no current sykli receipt; it is not in this clone"),
         Err(why) => {
             return format!("{head} has no current sykli receipt; its tree cannot be read ({why})")
         }
     };
-    let (request, lock, words) = match decide(log, state, gate, commit, &tree, caps) {
+    let contract = match contract_of(gate, sykli, commit, true) {
+        Ok(contract) => contract,
+        Err(why) => return format!("{head} has no current sykli receipt; it has no gate: {why}"),
+    };
+    let (request, lock, words) = match decide(log, state, gate, &contract, (commit, &tree), caps) {
         Decided::Not(words) => return format!("{head} has no current sykli receipt{words}"),
         Decided::Ask(request, lock, words) => (request, lock, words),
     };
@@ -989,15 +1028,6 @@ pub fn at_landing(
     };
     drop(lock);
     line
-}
-
-/// A commit's tree: one git process.
-fn tree_of(top: &Path, commit: &str) -> Result<String, String> {
-    git_ok_in(
-        top,
-        &["rev-parse", "--verify", "-q", &format!("{commit}^{{tree}}")],
-    )
-    .map(|tree| tree.trim().to_owned())
 }
 
 /// How a launch-time view is used.
@@ -1049,8 +1079,10 @@ impl AtLaunch {
 /// clone's lock with the log (`log`) read again (not yet recorded: the
 /// caller records it with the session, then dispatches, then drops the
 /// lock).
+#[allow(clippy::too_many_arguments)]
 pub fn at_launch(
     marks: &Marks,
+    sykli: &Sykli,
     head: Option<(&str, Option<&str>)>,
     all: &[sessions::Session],
     mode: Mode,
@@ -1064,7 +1096,7 @@ pub fn at_launch(
         return view;
     };
     let said = if caps.status.commit {
-        ask(gate, caps, &tip.commit)
+        ask(gate, sykli, caps, &tip.commit)
     } else {
         said_by_marks(&tip.check)
     };
@@ -1080,7 +1112,13 @@ pub fn at_launch(
         let requested = requested_in(all, &gate.common);
         match (mode, caps.detach) {
             (Mode::Launch, true) => {
-                match decide(log, state, gate, &tip.commit, &tip.tree, caps) {
+                let decided = match contract_of(gate, sykli, &tip.commit, true) {
+                    Ok(contract) => {
+                        decide(log, state, gate, &contract, (&tip.commit, &tip.tree), caps)
+                    }
+                    Err(why) => Decided::Not(format!("; not asked: it has no gate ({why})")),
+                };
+                match decided {
                     Decided::Not(words) => line.push_str(&words),
                     Decided::Ask(request, lock, words) => {
                         line.push_str(&format!(
@@ -1118,7 +1156,7 @@ pub fn at_launch(
     }
     let named = branch.map_or_else(String::new, |branch| format!(" ({branch})"));
     let candidate = if caps.status.commit {
-        ask(gate, caps, head)
+        ask(gate, sykli, caps, head)
     } else {
         Said::Unknown("this sykli cannot be asked (no `sykli status --commit`)".to_owned())
     };
@@ -1319,12 +1357,15 @@ mod tests {
         let gate = Gate {
             slug: "acme/widget".to_owned(),
             branch: "main".to_owned(),
-            contract: PathBuf::from("/h/sykli.json"),
+            entry: PathBuf::from("/h"),
+            overlay: crate::derived::Overlay::standard(),
             top: PathBuf::from("/nowhere/widget"),
             common: PathBuf::from("/nowhere/widget/.git"),
         };
-        let one = plan(&gate, "c1", "t1", state);
-        let two = plan(&gate, "c2", "t2", state);
+        let contract = Path::new("/h/derived/d1/sykli.json");
+        let one = plan(&gate, contract, "c1", "t1", state);
+        let two = plan(&gate, contract, "c2", "t2", state);
+        assert_eq!(one.validation.contract, "/h/derived/d1/sykli.json");
         assert_eq!(one.checkout, two.checkout, "one checkout, rolled");
         assert_eq!(one.validation.repo, a.checkout().to_string_lossy());
     }

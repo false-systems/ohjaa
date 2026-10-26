@@ -1,18 +1,21 @@
 //! Marks: what each commit on an entry's branch is, derived now and stored
 //! never. Nothing is written into a repository, and ohjaa keeps nothing.
 //!
-//! - ✓ proven: sykli accepted a receipt of its tree against the entry's
-//!   contract, `sykli verify <receipt> --contract <the entry's gate> --commit
-//!   <sha>` (receipts are unsigned files: this is what sykli accepted, not a
-//!   run of the tree);
+//! - ✓ proven: sykli accepted a receipt of its tree against the commit's
+//!   gate, `sykli verify <receipt> --contract <its gate> --commit <sha>`, or
+//!   against its own `sykli.json` for a run of that (receipts are unsigned
+//!   files: this is what sykli accepted, not a run of the tree);
 //! - ✗ failed: the newest run of its tree here failed;
 //! - ? unproven: no receipt of its tree is here, it passed under another
-//!   contract or lock than the gate's now, or sykli could not say.
+//!   contract or lock than the commit's gate and its own, or sykli could not
+//!   say.
 //!
 //! The walk starts where this clone last saw origin's copy of the entry's
 //! branch (`refs/remotes/origin/<branch>`: no fetch, no network) and goes back
 //! along first parents to the first proven commit, at most [`MAX_WALKED`]
-//! commits, tip first. Shas and trees come from one git process; receipts are
+//! commits, tip first. The commits, and the gate of each commit sykli is
+//! asked about, come from one git process (the clone's `git cat-file
+//! --batch`); receipts are
 //! read as files, from the layout: those sykli keeps for every push it
 //! accepted (`<common>/sykli/receipts`) and, in every worktree, those `sykli
 //! run` writes (`.sykli/receipts/`) and the one `ohjaa gate` saves
@@ -23,31 +26,37 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
+use crate::derived::Under;
 use crate::gitconfig::{self, Listing};
 use crate::home::{self, RepoId};
 use crate::lifecycle::{self, Gate, Receipts, Sykli};
-use crate::process;
 use crate::sessions::{self, Check};
 
 /// The most commits a walk reads.
 pub const MAX_WALKED: usize = 50;
 
 /// The gate of the clone at `top` (common git dir `common`): the entry
-/// origin's push URL names, when it has a contract; from the clone's config.
+/// origin's push URL names; from the clone's config. Which contract judges
+/// each commit is read from the commit ([`Sykli::gate_at`]).
 pub fn gate_of(home: &Path, top: &Path, common: &Path, listing: &Listing) -> Option<Gate> {
     let id = gitconfig::push_url(listing, "origin")
         .as_deref()
         .and_then(RepoId::parse)?;
     let entry = home::find_entry(home, &id).ok()??;
-    entry.has_contract().then(|| Gate {
+    Some(gate_for_entry(&id, &entry, top, common))
+}
+
+/// The gate `entry` (of the repository `id`) gives the clone at `top`.
+pub fn gate_for_entry(id: &RepoId, entry: &home::Entry, top: &Path, common: &Path) -> Gate {
+    Gate {
         slug: id.slug(),
         branch: entry.branch.clone(),
-        contract: home::absolute(entry.contract()),
+        entry: home::absolute(entry.dir.clone()),
+        overlay: entry.overlay.clone(),
         top: top.to_path_buf(),
         common: common.to_path_buf(),
-    })
+    }
 }
 
 /// The gate of the repository `repo` lies in: one git process (its config)
@@ -97,6 +106,9 @@ pub struct Walked {
     /// For a proven commit, what the receipt sykli accepted says of its run:
     /// how many tasks it records, and how many it reused from the cache.
     pub proof: Option<sessions::Evidence>,
+    /// For a proven commit, the contract that receipt ran under: the gate
+    /// derived from the commit, its own `sykli.json`, or the entry's copy.
+    pub under: Option<Under>,
 }
 
 /// Why a walk stopped where it did.
@@ -247,75 +259,75 @@ pub fn updated(common: &Path, branch: &str) -> Option<Updated> {
     })
 }
 
-/// The marks on `gate`'s branch, against `receipts`: one git process, and
+/// The marks on `gate`'s branch, against `receipts`: one git process (the
+/// clone's `git cat-file --batch`, which gives each commit, first parent by
+/// first parent, and the contract of each commit sykli is asked about), and
 /// `sykli verify` only for a commit with a receipt of its tree that says it
 /// passed, while `sykli` may still verify.
 pub fn walk(gate: &Gate, sykli: &Sykli, receipts: &Receipts) -> Result<Marks, String> {
-    let reference = format!("refs/remotes/origin/{}", gate.branch);
-    let output = process::run(
-        Command::new("git").arg("-C").arg(&gate.top).args([
-            "log",
-            "--first-parent",
-            &format!("--max-count={MAX_WALKED}"),
-            "--format=%H%x1f%T%x1f%an%x1f%at%x1f%s",
-            &reference,
-            "--",
-        ]),
-        None,
-        process::LOCAL,
-    )
-    .map_err(|error| format!("git could not be asked: {error:#}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "origin/{} cannot be read in {} ({})",
-            gate.branch,
-            gate.top.display(),
-            output.failure_detail()
-        ));
-    }
+    let mut name = format!("refs/remotes/origin/{}", gate.branch);
     let mut commits = Vec::new();
     let mut ended = None;
-    for line in output.stdout_text().lines() {
-        let mut fields = line.splitn(5, '\u{1f}');
-        let (Some(commit), Some(tree), Some(author), Some(authored), subject) = (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next().unwrap_or(""),
-        ) else {
-            continue;
+    while commits.len() < MAX_WALKED {
+        let read = sykli.commit_of(gate, &name);
+        let commit = match read {
+            Ok(Some(commit)) => commit,
+            // Its parent is not here: a shallow clone ends there.
+            Ok(None) if !commits.is_empty() => {
+                ended = Some(Ended::Root);
+                break;
+            }
+            Ok(None) => {
+                return Err(format!(
+                    "origin/{} cannot be read in {} (this clone has no {name})",
+                    gate.branch,
+                    gate.top.display()
+                ))
+            }
+            Err(why) => {
+                return Err(format!(
+                    "origin/{} cannot be read in {} ({why})",
+                    gate.branch,
+                    gate.top.display()
+                ))
+            }
         };
         let asks = receipts
-            .of(tree)
+            .of(&commit.tree)
             .iter()
             .any(|receipt| matches!(receipt.evidence.outcome.as_str(), "passed" | "cached"));
         if asks && !sykli.may_verify() {
             ended = Some(Ended::NotAsked);
             break;
         }
-        let check = sykli.check_gated(gate, commit, tree, receipts, true);
+        let check = sykli.check_gated(gate, &commit.oid, &commit.tree, receipts, true);
         let proven = check == Check::Passed;
-        let proof = proven.then(|| sykli.proof(commit)).flatten();
+        let proof = proven.then(|| sykli.proof(&commit.oid)).flatten();
+        let under = proven.then(|| sykli.proved_under(&commit.oid)).flatten();
+        let parent = commit.parent.clone();
         commits.push(Walked {
-            commit: commit.to_owned(),
-            tree: tree.to_owned(),
-            author: author.to_owned(),
-            authored: authored.parse().unwrap_or(0),
-            subject: subject.to_owned(),
+            commit: commit.oid,
+            tree: commit.tree,
+            author: commit.author,
+            authored: commit.authored,
+            subject: commit.subject,
             check,
             proof,
+            under,
         });
         if proven {
             ended = Some(Ended::Proven);
             break;
         }
+        match parent {
+            Some(parent) => name = parent,
+            None => {
+                ended = Some(Ended::Root);
+                break;
+            }
+        }
     }
-    let ended = ended.unwrap_or(if commits.len() >= MAX_WALKED {
-        Ended::Cap
-    } else {
-        Ended::Root
-    });
+    let ended = ended.unwrap_or(Ended::Cap);
     Ok(Marks {
         gate: gate.clone(),
         updated: updated(&gate.common, &gate.branch),
@@ -417,6 +429,10 @@ pub fn line(marks: &Marks) -> String {
                 .map(sessions::describe_cached)
                 .unwrap_or_default()
         );
+        // Proven by a run of the repository's own contract, not its gate.
+        if walked.under == Some(Under::Own) {
+            out.push_str(" (own sykli.json)");
+        }
     }
     match marks.ended {
         Ended::Proven => {}
@@ -478,9 +494,6 @@ pub fn of_entries(
                     walk(gate, sykli, &receipts)
                 }
                 None => Err(match home::read_entry(&dir) {
-                    Ok(Some(entry)) if !entry.has_contract() => {
-                        format!("it has no gate ({} is missing)", entry.contract().display())
-                    }
                     Ok(_) => "no clone under the roots has it as origin".to_owned(),
                     Err(error) => format!("its entry cannot be read: {error:#}"),
                 }),
@@ -499,12 +512,17 @@ pub struct AtLaunch {
     pub flag: Option<String>,
     /// The marks themselves, when the walk could be made.
     pub marks: Option<Marks>,
+    /// The sykli the walk asked, with the clone's one git process still
+    /// open: the integrated view reads the gates of the tip and of HEAD
+    /// through it, starting none.
+    pub sykli: Sykli,
 }
 
 /// For `ohjaa run` and `ohjaa brief` in the repository at `top`: the
 /// drift warnings doctor would give it, and the flag when the entry's branch
 /// is not proven at its tip. Nothing at all without an entry; else one git
-/// process for the clone's config, one for the walk, and `sykli verify` at
+/// process for the clone's config, one for the walk (and every commit or
+/// gate read after it, through [`AtLaunch::sykli`]), and `sykli verify` at
 /// most once.
 pub fn at_launch(top: &Path) -> AtLaunch {
     let Ok(home) = home::ohjaa_home() else {
@@ -526,6 +544,7 @@ pub fn at_launch(top: &Path) -> AtLaunch {
         warnings,
         flag: marks.as_ref().and_then(flag),
         marks,
+        sykli,
     }
 }
 
@@ -538,7 +557,8 @@ mod tests {
             gate: Gate {
                 slug: "acme/widget".to_owned(),
                 branch: "main".to_owned(),
-                contract: PathBuf::from("/h/sykli.json"),
+                entry: PathBuf::from("/h"),
+                overlay: crate::derived::Overlay::standard(),
                 top: PathBuf::from("/r"),
                 common: PathBuf::from("/r/.git"),
             },
@@ -554,6 +574,7 @@ mod tests {
                     subject: String::new(),
                     check: check.clone(),
                     proof: None,
+                    under: None,
                 })
                 .collect(),
             ended,

@@ -7,7 +7,8 @@
 //!
 //! 1. **Observing (pre-push only).** The repository is found by the URL git
 //!    pushes to. When the home has an entry for it and the push moves the
-//!    entry's branch, sykli judges the push against the entry's gate, quietly;
+//!    entry's branch, sykli judges the push against the pushed commit's gate
+//!    (derived from its own `sykli.json`, else the entry's stored one), quietly;
 //!    a commit it does not accept is asked about as the marks ask (a receipt
 //!    in any worktree of the clone). Nothing is refused for it: a push that
 //!    is not proven, or cannot be judged or observed at all, goes on, and
@@ -349,7 +350,7 @@ fn sykli_reason(stderr: &str) -> Option<String> {
 /// Observe a push: never refuse it, whatever fails here. The URL is git's
 /// `$2`, the entry is a file, and the repository's facts come from [`here`],
 /// so no git process is started on the way. A push that moves the entry's
-/// branch is handed to `sykli hook pre-push` against the entry's gate,
+/// branch is handed to `sykli hook pre-push` against the pushed commit's gate,
 /// quietly. sykli looks for a receipt only in the worktree that pushes; when
 /// it does not accept the push, the commit is asked about as the marks ask
 /// (every worktree's receipts, one git process for its tree and one `sykli
@@ -424,13 +425,6 @@ fn observe(args: &[OsString], here: &Here) -> Observed {
     else {
         return observed(None, input);
     };
-    if !entry.has_contract() {
-        let why = format!(
-            "its entry has no gate: {} is missing (ohjaa adopt --force)",
-            entry.contract().display()
-        );
-        return observed(Some(unproven(&entry.branch, &why)), input);
-    }
     let sykli = sykli_program();
     let help = match sykli_help(&sykli) {
         Ok(help) => help,
@@ -439,10 +433,33 @@ fn observe(args: &[OsString], here: &Here) -> Observed {
     if let Some(why) = cannot_judge(&help) {
         return observed(Some(unproven(&entry.branch, &why)), input);
     }
+    // The pushed commit's gate, derived from its own sykli.json (else the
+    // entry's copy): one git process, which a commit proven in another
+    // worktree is then asked about through as well.
+    let judge = lifecycle::Sykli::with_program(home.clone(), sykli.clone(), SYKLI_LIMIT);
+    let gate = crate::mark::gate_for_entry(
+        &id,
+        &entry,
+        here.top.as_deref().unwrap_or(&here.common),
+        &here.common,
+    );
+    let contract = match judge.gate_at(&gate, &sha) {
+        Err(why) => Err(format!("its gate cannot be read: {why}")),
+        Ok(crate::derived::GateAt::Missing(why)) => Err(format!(
+            "its entry has no gate: {why} (ohjaa adopt --force)"
+        )),
+        Ok(at) => at
+            .contract(judge.gates(), false)
+            .map_err(|why| format!("its gate cannot be written: {why}")),
+    };
+    let contract = match contract {
+        Ok(contract) => contract,
+        Err(why) => return observed(Some(unproven(&entry.branch, &why)), input),
+    };
     let mut command = Command::new(&sykli);
     command
         .args(["hook", "pre-push", "--contract"])
-        .arg(entry.contract())
+        .arg(&contract)
         .args(["--branch", &entry.branch])
         .args(facts_for_sykli(&help, here.top.as_deref(), &here.common))
         .args(args.iter().take(2));
@@ -458,57 +475,30 @@ fn observe(args: &[OsString], here: &Here) -> Observed {
                 .unwrap_or_else(|| format!("sykli hook pre-push exited {}", output.status))
         }
     };
-    let gate = here.top.as_ref().map(|top| lifecycle::Gate {
-        slug: slug.clone(),
-        branch: entry.branch.clone(),
-        contract: home::absolute(entry.contract()),
-        top: top.clone(),
-        common: here.common.clone(),
-    });
-    let proven_elsewhere = gate.is_some_and(|gate| proven_in_the_clone(&gate, &home, &sykli, &sha));
+    let proven_elsewhere = here.top.is_some() && proven_in_the_clone(&gate, &judge, &sha);
     let flag = (!proven_elsewhere).then(|| unproven(&entry.branch, &why));
     observed(flag, input)
 }
 
 /// Whether `commit` is proven as the marks would say: a receipt of its tree
-/// in any worktree of the clone, or kept by sykli, verifies against the
-/// gate. One git process (the commit's tree) and one `sykli verify` at most,
-/// by the sykli the dispatcher names.
-fn proven_in_the_clone(gate: &lifecycle::Gate, home: &Path, sykli: &Path, commit: &str) -> bool {
+/// in any worktree of the clone, or kept by sykli, verifies against its
+/// gate, or its own contract for a run of that. Its tree from the clone's
+/// git process already open, and one `sykli verify` at most, by the sykli
+/// the dispatcher names.
+fn proven_in_the_clone(gate: &lifecycle::Gate, judge: &lifecycle::Sykli, commit: &str) -> bool {
     let receipts = lifecycle::receipts_of_layout(&gate.common);
     // No receipt anywhere in the clone: nothing to ask git or sykli about.
     if receipts.is_empty() {
         return false;
     }
-    let mut command = Command::new("git");
-    command.arg("--git-dir").arg(&gate.common).args([
-        "rev-parse",
-        "--verify",
-        "-q",
-        &format!("{commit}^{{tree}}"),
-    ]);
-    for var in [
-        "GIT_DIR",
-        "GIT_COMMON_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-    ] {
-        command.env_remove(var);
-    }
-    let Some(tree) = process::run(&mut command, None, process::LOCAL)
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| output.stdout_text().trim().to_owned())
-    else {
+    let Ok(Some(found)) = judge.commit_of(gate, commit) else {
         return false;
     };
-    if receipts.of(&tree).is_empty() {
+    if receipts.of(&found.tree).is_empty() {
         return false;
     }
-    let judge =
-        lifecycle::Sykli::with_program(home.to_path_buf(), sykli.to_path_buf(), SYKLI_LIMIT);
     judge.allow_verifies(1);
-    judge.check_gated(gate, commit, &tree, &receipts, true) == crate::sessions::Check::Passed
+    judge.check_gated(gate, commit, &found.tree, &receipts, true) == crate::sessions::Check::Passed
 }
 
 /// The common git directory as git's on-disk layout names it

@@ -167,6 +167,125 @@ pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Re
     }
 }
 
+/// A child asked one question at a time on its stdin, answering each on its
+/// stdout before the next is asked (`git cat-file --batch`). Each answer is
+/// under the same deadline as [`run`]: once a question has waited `timeout`
+/// for it, or ohjaa is interrupted, the child is killed with everything it
+/// started, and a read from it ends; between questions it waits idle. Its
+/// stderr is not read. Dropped, its stdin is closed and it is waited for.
+pub struct Conversation {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    /// When the question not yet answered was asked: the deadline's start.
+    asked: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
+    /// Kills the child's group at the deadline; told to stand down before
+    /// the child is reaped, so it never signals a process id reused since.
+    watchdog: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
+}
+
+impl std::fmt::Debug for Conversation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Conversation({})", self.child.id())
+    }
+}
+
+impl Conversation {
+    pub fn start(command: &mut Command, timeout: Duration) -> Result<Conversation> {
+        let program = command.get_program().to_string_lossy().into_owned();
+        if cancelled() {
+            anyhow::bail!("{program} was not started: interrupted");
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        own_group(command);
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("cannot run {program}"))?;
+        let stdin = child.stdin.take();
+        let stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+        let (stand_down, told) = mpsc::channel::<()>();
+        let group = child.id();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let waiting = std::sync::Arc::clone(&asked);
+        let overdue = move || {
+            waiting
+                .lock()
+                .map(|asked| asked.is_some_and(|at| at.elapsed() >= timeout))
+                .unwrap_or(true)
+        };
+        let watchdog = std::thread::spawn(move || loop {
+            match told.recv_timeout(Duration::from_millis(50)) {
+                Err(mpsc::RecvTimeoutError::Timeout) if !overdue() && !cancelled() => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    #[cfg(unix)]
+                    if let Ok(group) = libc::pid_t::try_from(group) {
+                        // SAFETY: the group the child leads; the child is not
+                        // reaped before this thread has ended.
+                        unsafe { libc::kill(-group, libc::SIGKILL) };
+                    }
+                    #[cfg(not(unix))]
+                    let _ = group;
+                    return;
+                }
+                _ => return,
+            }
+        });
+        Ok(Conversation {
+            child,
+            stdin,
+            stdout,
+            asked,
+            watchdog: Some((stand_down, watchdog)),
+        })
+    }
+
+    /// Where the next question goes; its answer's deadline starts now.
+    pub fn ask(&mut self) -> Option<&mut std::process::ChildStdin> {
+        if let Ok(mut asked) = self.asked.lock() {
+            *asked = Some(Instant::now());
+        }
+        self.stdin.as_mut()
+    }
+
+    /// Where the answers come from.
+    pub fn output(&mut self) -> &mut std::io::BufReader<std::process::ChildStdout> {
+        &mut self.stdout
+    }
+
+    /// The answer is read: no deadline runs until the next question.
+    pub fn answered(&mut self) {
+        if let Ok(mut asked) = self.asked.lock() {
+            *asked = None;
+        }
+    }
+}
+
+impl Drop for Conversation {
+    fn drop(&mut self) {
+        // No more questions: the child ends on its own. The watchdog stands
+        // down first: once the child is reaped its id may be reused.
+        drop(self.stdin.take());
+        if let Some((stand_down, watchdog)) = self.watchdog.take() {
+            let _ = stand_down.send(());
+            let _ = watchdog.join();
+        }
+        let ended = Instant::now() + Duration::from_secs(2);
+        let mut poll = Duration::from_millis(1);
+        while Instant::now() < ended {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(poll),
+                Err(_) => break,
+            }
+            poll = (poll * 2).min(Duration::from_millis(20));
+        }
+        kill_group(&mut self.child);
+    }
+}
+
 /// Whether the ohjaa that started a session at `started_ms` still runs as
 /// `pid`. A pid is reused, so the process there must also be an `ohjaa` that
 /// was already running then (a couple of seconds of slack for the clock
