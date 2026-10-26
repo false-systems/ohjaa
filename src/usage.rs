@@ -186,9 +186,14 @@ pub fn handshake(session: &str) -> String {
 pub struct Native {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<NativeSession>,
-    /// Why none is named; beside named ones, what could not be read.
+    /// Why no transcript named one; beside named ones, what could not be
+    /// read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
+    /// Where the launch prompt and the agent's environment named different
+    /// sessions ([`Native::with_env`]): said, never resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disagreement: Option<String>,
 }
 
 /// One native session, named as the agent (and vessa) names it.
@@ -209,6 +214,16 @@ pub struct NativeSession {
     /// prompt is in it, or a copy of it is and the fork began in this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
+    /// The agent's own environment claimed it, in `ohjaa oriented` or `ohjaa
+    /// handover` run from inside the session ([`FromEnv`]). Its `source` is
+    /// [`ENV_SOURCE`], and it is `testimony`, when no transcript's launch
+    /// prompt named it too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub env: bool,
+    /// Only the agent's environment named it: the agent's claim, never
+    /// ohjaa's observation (law 3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub testimony: bool,
 }
 
 impl Native {
@@ -216,8 +231,146 @@ impl Native {
         Native {
             sessions: Vec::new(),
             why: Some(why.into()),
+            disagreement: None,
         }
     }
+
+    /// What the transcripts named, with what the agent's own environment
+    /// claimed added: each id once. The launch prompt in a transcript is what
+    /// ohjaa observed; the environment is the agent's claim (law 3), set by
+    /// whatever shell ran `oriented` or `handover`. An id both named is the
+    /// observed one, said as claimed too. An id only claimed is added as
+    /// testimony, said so. Where the launch prompt named sessions and the
+    /// environment claimed only others, the observation is kept, the claim is
+    /// not, and the disagreement is said. A `/clear` before the first
+    /// read-back looks the same: the launch prompt names the session it
+    /// cleared, the environment the one it started.
+    pub fn with_env(mut self, env: &[FromEnv]) -> Native {
+        if env.is_empty() {
+            return self;
+        }
+        let claimed = |s: &NativeSession| {
+            env.iter()
+                .any(|e| e.agent == s.agent && e.session_id == s.session_id)
+        };
+        // A fork is named through its parent, never by a launch prompt of
+        // its own: it neither agrees nor disagrees.
+        let observed: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|s| s.source != ENV_SOURCE && s.forked_from.is_none())
+            .map(|s| format!("{} {}", s.agent, s.session_id))
+            .collect();
+        let agreed = self
+            .sessions
+            .iter()
+            .any(|s| s.source != ENV_SOURCE && s.forked_from.is_none() && claimed(s));
+        if !observed.is_empty() && !agreed {
+            let claims: Vec<String> = env
+                .iter()
+                .map(|e| format!("{} {}", e.agent, e.session_id))
+                .collect();
+            self.disagreement = Some(format!(
+                "its launch prompt named {}, and the agent's environment claimed {} instead (a \
+                 /clear before its first read-back, or a mistake): the launch prompt's is kept, \
+                 the claim is not",
+                observed.join(", "),
+                claims.join(", ")
+            ));
+            return self;
+        }
+        for named in env {
+            match self
+                .sessions
+                .iter_mut()
+                .find(|s| s.agent == named.agent && s.session_id == named.session_id)
+            {
+                Some(found) => found.env = true,
+                None => self.sessions.push(NativeSession {
+                    agent: named.agent.clone(),
+                    session_id: named.session_id.clone(),
+                    source: ENV_SOURCE.to_owned(),
+                    resumed: false,
+                    forked_from: None,
+                    env: true,
+                    testimony: true,
+                }),
+            }
+        }
+        self.disagreement = None;
+        self
+    }
+}
+
+/// The `source` of a native session only the agent's environment named.
+pub const ENV_SOURCE: &str = "env";
+
+/// One of the agent's own sessions as its environment named it: the variable
+/// the agent sets in each shell it runs for its tools, read by `ohjaa
+/// oriented` or `ohjaa handover` run in one. Claude Code sets
+/// `CLAUDE_CODE_SESSION_ID` (its parent's id in a subagent's shell, and the
+/// new id after a `/clear`), Codex `CODEX_THREAD_ID`, pi `PI_SESSION_ID`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FromEnv {
+    /// `claude`, `codex` or `pi`.
+    pub agent: String,
+    pub session_id: String,
+    /// When it was first named; named again, it keeps that time.
+    pub at_ms: i64,
+}
+
+impl Agent {
+    /// The variable the agent names its own session with in its tools'
+    /// shells.
+    fn session_var(self) -> &'static str {
+        match self {
+            Agent::Claude => "CLAUDE_CODE_SESSION_ID",
+            Agent::Codex => "CODEX_THREAD_ID",
+            Agent::Pi => "PI_SESSION_ID",
+        }
+    }
+}
+
+/// The agent's own session as the environment names it, for a session that
+/// launched `command`: only that agent's variable is read, since an agent
+/// started from another agent's shell inherits that one's. `Ok(None)`: the
+/// variable is not set (the agent sets none, or this is no tool shell of
+/// it); `Err`: it is set to something that is no session id.
+pub fn from_env(
+    command: &str,
+    at_ms: i64,
+    var: impl Fn(&str) -> Option<String>,
+) -> Result<Option<FromEnv>, String> {
+    let Some(agent) = Agent::of(command) else {
+        return Ok(None);
+    };
+    let key = agent.session_var();
+    let Some(value) = var(key).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if !crate::sessions::is_valid_id(&value) {
+        return Err(format!(
+            "{key} is set, but not to a session id: not recorded"
+        ));
+    }
+    Ok(Some(FromEnv {
+        agent: agent.name().to_owned(),
+        session_id: value,
+        at_ms,
+    }))
+}
+
+/// Add `found` to what the environment named, once: `false` when it was
+/// named already.
+pub fn record_env(named: &mut Vec<FromEnv>, found: FromEnv) -> bool {
+    if named
+        .iter()
+        .any(|n| n.agent == found.agent && n.session_id == found.session_id)
+    {
+        return false;
+    }
+    named.push(found);
+    true
 }
 
 /// The agents whose transcripts ohjaa reads, by the basename of the command.
@@ -711,6 +864,8 @@ fn search(launch: &Launch, stores: &Stores) -> (Native, Reads) {
         source: path.display().to_string(),
         resumed: t.began_ms.is_some_and(|b| b < launch.started_ms),
         forked_from: t.forked_from.clone(),
+        env: false,
+        testimony: false,
     };
     let mut sessions: Vec<NativeSession> = Vec::new();
     let mut own: Vec<(Option<i64>, NativeSession)> = read
@@ -769,6 +924,7 @@ fn search(launch: &Launch, stores: &Stores) -> (Native, Reads) {
             Native {
                 sessions,
                 why: unread,
+                disagreement: None,
             },
             reads,
         );
@@ -1556,5 +1712,218 @@ mod tests {
             .why
             .unwrap()
             .starts_with("none found: none of the 0 codex transcript(s)"));
+    }
+}
+
+#[cfg(test)]
+mod from_env_tests {
+    use super::*;
+
+    /// A shell's environment holding only `vars`.
+    fn shell<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    fn found(agent: &str, id: &str, at_ms: i64) -> FromEnv {
+        FromEnv {
+            agent: agent.to_owned(),
+            session_id: id.to_owned(),
+            at_ms,
+        }
+    }
+
+    fn by_prompt(id: &str) -> NativeSession {
+        NativeSession {
+            agent: "claude".to_owned(),
+            session_id: id.to_owned(),
+            source: format!("/h/.claude/projects/-r/{id}.jsonl"),
+            resumed: false,
+            forked_from: None,
+            env: false,
+            testimony: false,
+        }
+    }
+
+    fn named(sessions: Vec<NativeSession>, why: Option<&str>) -> Native {
+        Native {
+            sessions,
+            why: why.map(str::to_owned),
+            disagreement: None,
+        }
+    }
+
+    #[test]
+    fn each_agent_names_its_own_session_in_its_own_variable() {
+        let env = shell(&[
+            ("CLAUDE_CODE_SESSION_ID", "c-1"),
+            ("CODEX_THREAD_ID", "x-1"),
+            ("PI_SESSION_ID", "p-1"),
+        ]);
+        for (command, agent, id) in [
+            ("/usr/local/bin/claude", "claude", "c-1"),
+            ("codex", "codex", "x-1"),
+            ("pi", "pi", "p-1"),
+        ] {
+            assert_eq!(
+                from_env(command, 7, &env),
+                Ok(Some(found(agent, id, 7))),
+                "{command}"
+            );
+        }
+        // Only the launched agent's: a codex started from a Claude shell
+        // inherits Claude's id, which is not its own.
+        let inherited = shell(&[("CLAUDE_CODE_SESSION_ID", "c-1")]);
+        assert_eq!(from_env("codex", 7, &inherited), Ok(None));
+        // An agent whose variable ohjaa does not know names nothing.
+        assert_eq!(from_env("sh", 7, &env), Ok(None));
+        assert_eq!(from_env("opencode", 7, &env), Ok(None));
+    }
+
+    #[test]
+    fn no_variable_names_nothing_and_a_wrong_one_is_said() {
+        assert_eq!(from_env("claude", 7, shell(&[])), Ok(None));
+        assert_eq!(
+            from_env("claude", 7, shell(&[("CLAUDE_CODE_SESSION_ID", "")])),
+            Ok(None)
+        );
+        let refused = from_env(
+            "claude",
+            7,
+            shell(&[("CLAUDE_CODE_SESSION_ID", "../not an id")]),
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("CLAUDE_CODE_SESSION_ID") && refused.contains("not recorded"),
+            "{refused}"
+        );
+    }
+
+    /// `/clear` starts a new session, and Claude Code names the new one in
+    /// every shell after it: each id is kept once, first named first.
+    #[test]
+    fn a_clear_names_a_second_session_and_each_is_kept_once() {
+        let mut named_env = Vec::new();
+        assert!(record_env(&mut named_env, found("claude", "before", 1_000)));
+        assert!(!record_env(
+            &mut named_env,
+            found("claude", "before", 2_000)
+        ));
+        assert!(record_env(&mut named_env, found("claude", "after", 3_000)));
+        assert_eq!(
+            named_env,
+            [
+                found("claude", "before", 1_000),
+                found("claude", "after", 3_000)
+            ],
+            "named again, an id keeps its first time"
+        );
+    }
+
+    #[test]
+    fn the_environment_and_the_launch_prompt_agreeing_name_one_session() {
+        let merged = named(vec![by_prompt("a")], None).with_env(&[found("claude", "a", 1)]);
+        assert_eq!(merged.sessions.len(), 1, "{merged:#?}");
+        assert!(merged.sessions[0].env);
+        assert!(merged.sessions[0].source.ends_with("/a.jsonl"));
+        assert_eq!(merged.disagreement, None);
+        // After a `/clear`: the first named by both, the second by the
+        // environment only. They do not disagree.
+        let cleared = named(vec![by_prompt("a")], None)
+            .with_env(&[found("claude", "a", 1), found("claude", "b", 2)]);
+        let ids: Vec<(&str, &str, bool)> = cleared
+            .sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.source.as_str(), s.env))
+            .collect();
+        assert_eq!(ids[1], ("b", ENV_SOURCE, true), "{cleared:#?}");
+        assert!(ids[0].2);
+        assert!(
+            cleared.sessions[1].testimony && !cleared.sessions[0].testimony,
+            "only what the environment alone named is the agent's claim"
+        );
+        assert_eq!(cleared.disagreement, None);
+    }
+
+    /// The environment is the agent's claim; the launch prompt is what ohjaa
+    /// observed. When they name different sessions, the observation is kept
+    /// and the claim is said, never taken.
+    #[test]
+    fn the_launch_prompt_wins_over_an_environment_naming_another_session() {
+        let merged = named(vec![by_prompt("a")], None).with_env(&[found("claude", "b", 1)]);
+        let ids: Vec<&str> = merged
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["a"], "the claim is not taken");
+        assert_eq!(
+            merged.disagreement.as_deref(),
+            Some(
+                "its launch prompt named claude a, and the agent's environment claimed claude b \
+                 instead (a /clear before its first read-back, or a mistake): the launch \
+                 prompt's is kept, the claim is not"
+            )
+        );
+        // Merging again changes nothing.
+        assert_eq!(merged.clone().with_env(&[found("claude", "b", 1)]), merged);
+    }
+
+    #[test]
+    fn the_environment_names_what_no_launch_prompt_did_and_keeps_why() {
+        let why = "none found: none of the 1 claude transcript(s) written in its folder since \
+                   its launch was given its launch prompt";
+        let merged = named(Vec::new(), Some(why)).with_env(&[found("claude", "late", 1)]);
+        assert_eq!(merged.sessions.len(), 1);
+        assert_eq!(merged.sessions[0].source, ENV_SOURCE);
+        assert!(merged.sessions[0].testimony, "the agent's claim, said so");
+        assert_eq!(
+            merged.why.as_deref(),
+            Some(why),
+            "what the search found is kept"
+        );
+        assert_eq!(merged.disagreement, None, "nothing to disagree with");
+        // Nothing named from the environment changes nothing.
+        let alone = named(vec![by_prompt("a")], None);
+        assert_eq!(alone.clone().with_env(&[]), alone);
+        // A fork is named through its parent: it neither agrees nor
+        // disagrees.
+        let mut fork = by_prompt("f");
+        fork.forked_from = Some("a".to_owned());
+        let merged = named(vec![by_prompt("a"), fork], None).with_env(&[found("claude", "a", 1)]);
+        assert_eq!(merged.disagreement, None);
+    }
+
+    /// Stored, what only the environment named says `source: "env"`, `env:
+    /// true` and `testimony: true`; one found by its launch prompt alone
+    /// says none of them.
+    #[test]
+    fn a_named_session_is_stored_with_where_it_was_named() {
+        let mut found_alone = by_prompt("f");
+        found_alone.forked_from = Some("a".to_owned());
+        let merged = named(vec![by_prompt("a"), found_alone], None)
+            .with_env(&[found("claude", "a", 1), found("claude", "b", 2)]);
+        let stored = serde_json::to_value(&merged).unwrap();
+        assert!(stored["sessions"][1].get("env").is_none(), "{stored:#}");
+        assert!(stored["sessions"][1].get("testimony").is_none());
+        assert_eq!(stored["sessions"][0]["env"], true);
+        assert!(stored["sessions"][0].get("testimony").is_none());
+        assert_eq!(stored["sessions"][2]["source"], "env");
+        assert_eq!(stored["sessions"][2]["env"], true);
+        assert_eq!(stored["sessions"][2]["testimony"], true);
+        let disagreeing = named(vec![by_prompt("a")], None).with_env(&[found("claude", "b", 1)]);
+        let stored_too = serde_json::to_value(&disagreeing).unwrap();
+        assert!(stored_too["disagreement"].is_string());
+        let read: Native = serde_json::from_value(stored).unwrap();
+        assert_eq!(read, merged);
+        // A record #55 wrote reads as before.
+        let older: Native = serde_json::from_str(
+            r#"{"sessions":[{"agent":"claude","session_id":"a","source":"/t.jsonl"}]}"#,
+        )
+        .unwrap();
+        assert!(!older.sessions[0].env && older.disagreement.is_none());
     }
 }

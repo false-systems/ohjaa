@@ -469,6 +469,11 @@ pub struct Session {
     /// Validations requested from inside the session, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validations: Vec<ValidationRef>,
+    /// The agent's own sessions its environment named when it read back or
+    /// handed over from inside this one, first named first: several after a
+    /// `/clear`. Leaving adds them to `left.native`. Older records have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_env: Vec<crate::usage::FromEnv>,
 }
 
 impl Session {
@@ -1107,6 +1112,11 @@ fn describe_landed(landed: &Landed) -> String {
 fn native_lines(native: &crate::usage::Native, out: &mut String) {
     for found in &native.sessions {
         let mut said = Vec::new();
+        if found.source == crate::usage::ENV_SOURCE {
+            said.push("claimed by the agent's environment, not observed".to_owned());
+        } else if found.env {
+            said.push("observed by its launch prompt; its environment claimed it too".to_owned());
+        }
         if found.resumed {
             said.push("resumed".to_owned());
         }
@@ -1126,6 +1136,9 @@ fn native_lines(native: &crate::usage::Native, out: &mut String) {
     }
     if let Some(why) = &native.why {
         let _ = writeln!(out, "native        {why}");
+    }
+    if let Some(disagreement) = &native.disagreement {
+        let _ = writeln!(out, "native        disagreement: {disagreement}");
     }
 }
 
@@ -1337,6 +1350,15 @@ pub fn render_record_with(
         }
         if let Some(native) = &left.native {
             native_lines(native, &mut out);
+        }
+    } else {
+        // Still open: what its environment named so far.
+        for named in &session.native_env {
+            let _ = writeln!(
+                out,
+                "native        {} {} (claimed by the agent's environment, not observed)",
+                named.agent, named.session_id
+            );
         }
     }
     out.push_str(&render_validations(
@@ -2050,6 +2072,7 @@ mod tests {
             pgid: None,
             group_started_ms: None,
             validations: Vec::new(),
+            native_env: Vec::new(),
         }
     }
 

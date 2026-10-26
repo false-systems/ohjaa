@@ -1129,18 +1129,50 @@ fn current_session_id() -> Result<String> {
     Ok(id)
 }
 
-/// Record something the agent says about its own session.
+/// Record something the agent says about its own session, and the agent's
+/// own session as its environment names it here (D7): the shell this runs in
+/// is one the agent started for its tools.
 fn record_testimony(what: &str, change: impl FnOnce(&mut sessions::Session)) -> Result<i32> {
     let id = current_session_id()?;
     let dirs = dirs()?;
     let store = sessions::Store::open(&sessions::store_path(&dirs.state))
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    match store
-        .update(&id, change)
-        .map_err(|error| anyhow::anyhow!("{error}"))?
-    {
+    let at_ms = intake::now_seconds() * 1000;
+    let mut named = None;
+    let mut refused = None;
+    let updated = store
+        .update(&id, |session| {
+            change(session);
+            match usage::from_env(&session.agent, at_ms, |key| std::env::var(key).ok()) {
+                // Only while it runs: a shell that outlived it (a tmux server
+                // started inside it) may be another session's by now.
+                Ok(Some(_)) if session.left.is_some() => {
+                    refused = Some(format!(
+                        "session {} has left: the id its environment names is not recorded, \
+                         since a shell that outlived it may be another session's",
+                        session.id
+                    ));
+                }
+                Ok(Some(found)) => {
+                    let said = format!("{} session {}", found.agent, found.session_id);
+                    if usage::record_env(&mut session.native_env, found) {
+                        named = Some(said);
+                    }
+                }
+                Ok(None) => {}
+                Err(why) => refused = Some(why),
+            }
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    match updated {
         Some(_) => {
             println!("recorded the {what} for session {id}");
+            if let Some(named) = named {
+                println!("recorded its {named}, as the agent's environment claims it");
+            }
+            if let Some(why) = refused {
+                eprintln!("ohjaa: {why}");
+            }
             Ok(0)
         }
         None => bail!("session {id} is not in the log (its entering was not recorded)"),
@@ -2772,6 +2804,8 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
             .iter()
             .map(|request| request.validation.clone())
             .collect(),
+        // Named from inside the session, by `oriented` and `handover`.
+        native_env: Vec::new(),
     };
     // From here to the end of leaving, a signal is kept, not fatal.
     lifecycle::supervise();
@@ -2910,6 +2944,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     .unwrap_or_else(|| usage::Native {
         sessions: Vec::new(),
         why: Some("not looked for: leaving was interrupted first".to_owned()),
+        disagreement: None,
     });
     // Other sessions in these repositories while this one ran: what was made
     // in a place they shared at that time is not this session's (law 3). From
@@ -3032,7 +3067,14 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     // The store is opened only now, after every slow call, and held only for
     // this one write.
     let recorded = session_store(&dirs).and_then(|store| {
-        match store.update(&session_id, |s| s.left = Some(left.clone())) {
+        // With what the agent's environment named from inside it, as the
+        // log has it now.
+        let with_env = |s: &mut sessions::Session| {
+            let mut left = left.clone();
+            left.native = left.native.map(|native| native.with_env(&s.native_env));
+            s.left = Some(left);
+        };
+        match store.update(&session_id, with_env) {
             Ok(Some(updated)) => Some(updated),
             Ok(None) => {
                 // Entering was not recorded (the log was busy then): write it all now.
@@ -3212,19 +3254,24 @@ fn close_orphans(dirs: &Dirs, write: bool) -> (Vec<sessions::Session>, Vec<sessi
     // Its agent's own sessions are found as at leaving, by its launch
     // prompt; a fork only if begun before it was last seen.
     let stores = usage::Stores::from_env();
+    // With what its agent's environment named from inside it: an orphan's
+    // agent is gone, so its record says all it ever will.
     let left_of = |session: &sessions::Session| sessions::Left {
-        native: Some(usage::find_native(
-            &usage::Launch {
-                session: &session.id,
-                agent: &session.agent,
-                folder: Path::new(&session.repo),
-                started_ms: session.started_ms,
-                // Not now: a fork made after it was last seen is not its.
-                last_seen_ms: session.last_seen_ms(),
-                unbriefed: false,
-            },
-            &stores,
-        )),
+        native: Some(
+            usage::find_native(
+                &usage::Launch {
+                    session: &session.id,
+                    agent: &session.agent,
+                    folder: Path::new(&session.repo),
+                    started_ms: session.started_ms,
+                    // Not now: a fork made after it was last seen is not its.
+                    last_seen_ms: session.last_seen_ms(),
+                    unbriefed: false,
+                },
+                &stores,
+            )
+            .with_env(&session.native_env),
+        ),
         ..sessions::Left::orphaned(now_ms)
     };
     let found: Vec<(sessions::Session, sessions::Left)> = orphans

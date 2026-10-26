@@ -2859,6 +2859,7 @@ mod tests {
             pgid: None,
             group_started_ms: None,
             validations: Vec::new(),
+            native_env: Vec::new(),
         };
         let ended = |exit: Exit| Left {
             exit,
@@ -3214,6 +3215,7 @@ mod tests {
                 pgid: None,
                 group_started_ms: None,
                 validations: Vec::new(),
+                native_env: Vec::new(),
             }
         }
     }
