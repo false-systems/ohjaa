@@ -3134,6 +3134,108 @@ fn a_store_vessa_does_not_read_is_said_every_run_and_holds_neither_cursor_nor_qu
 }
 
 #[test]
+fn a_pasted_secret_never_reaches_the_drafter_with_the_filter_on_or_off() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakesecret");
+    let repo = fixture.make_git_repo("work");
+    // Put together here, so no secret-shaped literal sits in the source.
+    let key = ["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"].concat();
+    let now = utc_now();
+    fixture.said(&[
+        vessa_line(
+            &now,
+            "/p/work",
+            &format!("i told you, the token is {key}"),
+            None,
+        ),
+        vessa_line(
+            &now,
+            "/p/work",
+            &format!("here: {key}"),
+            Some(&format!("I need {key}")),
+        ),
+    ]);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let prompts = fixture.dir.join("prompts.txt");
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!("#!/bin/sh\ncat >> '{}'\necho '[]'\n", prompts.display()),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = |extra: &[&str]| {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--source", "transcripts", "--since", "2026-09-01"])
+                .args(extra)
+                .arg("--drafter")
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    // A dry run shows the prompt, scrubbed too, and sends nothing.
+    let (stdout3, stderr3, code) = intake(&["--no-prefilter", "--dry-run"]);
+    assert_eq!(code, Some(0), "{stderr3}");
+    assert!(
+        stderr3.contains("3 secret-looking token(s) redacted from the batch shown"),
+        "{stderr3}"
+    );
+    assert!(!prompts.exists(), "a dry run sends nothing");
+    // The filter keeps the correction; its key is redacted, and counted.
+    let (stdout, stderr, code) = intake(&[]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("1 secret-looking token(s) were redacted from what it was sent"),
+        "{stderr}"
+    );
+    // Without it, the other message goes too, with the agent's words before
+    // it (the first was handled already).
+    let (stdout2, stderr2, code) = intake(&["--no-prefilter"]);
+    assert_eq!(code, Some(0), "{stderr2}");
+    assert!(
+        stderr2.contains("2 secret-looking token(s) were redacted from what it was sent"),
+        "{stderr2}"
+    );
+    let sent = fs::read_to_string(&prompts).unwrap();
+    assert!(
+        sent.contains("said: i told you, the token is [redacted]"),
+        "{sent}"
+    );
+    assert!(sent.contains("before: I need [redacted]"), "{sent}");
+    assert!(stdout3.contains("said: here: [redacted]"), "{stdout3}");
+    // Never said, logged or kept anywhere ohjaa writes.
+    for (what, text) in [
+        ("the prompts", sent.as_str()),
+        ("stdout", stdout.as_str()),
+        ("stderr", stderr.as_str()),
+        ("stdout", stdout2.as_str()),
+        ("stderr", stderr2.as_str()),
+        ("the dry run", stdout3.as_str()),
+        ("the dry run's stderr", stderr3.as_str()),
+    ] {
+        assert!(!text.contains(&key), "{what} holds the key");
+    }
+    for entry in fs::read_dir(fixture.dir.join("state/ohjaa"))
+        .unwrap()
+        .flatten()
+    {
+        if entry.path().is_file() {
+            let kept = String::from_utf8_lossy(&fs::read(entry.path()).unwrap()).into_owned();
+            assert!(
+                !kept.contains(&key),
+                "{} holds the key",
+                entry.path().display()
+            );
+        }
+    }
+    fixture.cleanup();
+}
+
+#[test]
 fn an_old_vessa_is_told_to_update_and_nothing_reads_the_transcripts_instead() {
     if !git_available() {
         return;

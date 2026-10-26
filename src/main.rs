@@ -1940,16 +1940,18 @@ fn cmd_intake(
             .take(batch)
             .cloned()
             .collect();
-        println!("{}", intake::prompt(&loaded, &first));
+        let (prompt, redacted) = intake::prompt(&loaded, &first);
+        println!("{prompt}");
         eprintln!(
-            "ohjaa: dry-run; would send {} batch(es) to `{drafter}`",
+            "ohjaa: dry-run; would send {} batch(es) to `{drafter}`; {redacted} \
+             secret-looking token(s) redacted from the batch shown",
             taken.div_ceil(batch)
         );
         return Ok(0);
     }
 
     let today = knowledge::today();
-    let (mut proposed, mut refused) = (0, 0);
+    let (mut proposed, mut refused, mut redacted) = (0, 0, 0);
     let mut drafted = intake::Drafted::default();
     if left > 0 {
         let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
@@ -1962,7 +1964,10 @@ fn cmd_intake(
                 // Re-read each time, so a draft from an earlier batch counts
                 // as existing.
                 let loaded = knowledge::load(&dirs).map_err(intake::Failure::Silent)?;
-                for draft in intake::draft(&drafter, &intake::prompt(&loaded, chunk))? {
+                // Scrubbed of secrets, whatever the source or the filter.
+                let (prompt, scrubbed) = intake::prompt(&loaded, chunk);
+                redacted += scrubbed;
+                for draft in intake::draft(&drafter, &prompt)? {
                     let id = draft.id.clone();
                     let result = draft
                         .into_proposal()
@@ -2006,7 +2011,8 @@ fn cmd_intake(
             eprintln!("ohjaa: intake stopped: {error:#}");
         }
         eprintln!(
-            "ohjaa: intake: the drafter answered for {} candidate(s) in this run",
+            "ohjaa: intake: the drafter answered for {} candidate(s) in this run; {redacted} \
+             secret-looking token(s) were redacted from what it was sent",
             drafted.sent
         );
     }

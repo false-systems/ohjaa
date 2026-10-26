@@ -146,6 +146,17 @@ lenient, and its recall low, so it is never silent:
 - PR comments, reverts, the report, handovers and observed failures are not
   filtered.
 
+**Secrets never reach the drafter.** People paste credentials to agents. As
+each prompt is made, every candidate's words and the agent's words before them,
+from every source and with the filter on or off, have secret-looking tokens
+replaced by `[redacted]`. Those are known key prefixes (`sk-`, `ghp_`, `gho_`,
+`github_pat_`, `xoxb-`/`xoxp-`/`xoxa-`/`xoxs-`, `AKIA`/`ASIA`, `glpat-`,
+`AIza`), JWTs, PEM private key blocks, and a long mixed token right after a
+word that names a secret (`api_key=…`, `GITHUB_TOKEN=…`, `password: …`,
+`Authorization: Bearer …`). A git sha or a UUID alone is left alone. The
+original is never said, logged or kept; each run says only how many were
+redacted, and a dry run shows the scrubbed prompt.
+
 It sends them in batches to a **drafter**, an agent CLI that reads a prompt on
 stdin and prints a JSON array. The default is `claude -p`; override it with
 `--drafter` or `~/.config/ohjaa/drafter`. The drafter sees the existing

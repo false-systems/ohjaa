@@ -1076,6 +1076,188 @@ pub fn members(session: &crate::sessions::Session, found: &[Candidate]) -> Vec<K
         .collect()
 }
 
+// ---- secrets ----------------------------------------------------------------
+//
+// What people paste to agents includes credentials: the review of #56 found
+// what looks like a live key in one real message. Nothing that goes to the
+// drafter keeps one. Every candidate's words, and the agent's words before
+// them, are scrubbed as the prompt is made, from every source, with the
+// pre-filter on or off: a token that looks like a secret becomes
+// `[redacted]`. The original is never said, logged or kept; only how many
+// were redacted is said. The rules are few and local: known key prefixes,
+// JWTs, private key blocks, and a long mixed token right after a word that
+// names a secret.
+
+const REDACTED: &str = "[redacted]";
+
+/// `text` with every secret-looking token replaced by `[redacted]`, and how
+/// many were.
+pub fn scrub(text: &str) -> (String, usize) {
+    let (text, blocks) = scrub_private_keys(text);
+    let (text, tokens) = scrub_tokens(&text);
+    (text, blocks + tokens)
+}
+
+/// PEM private key blocks, whole: to their end line, else to the end.
+fn scrub_private_keys(text: &str) -> (String, usize) {
+    const BEGIN: &str = "-----BEGIN ";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut count = 0;
+    while let Some(begin) = rest.find(BEGIN) {
+        let Some(label) = rest[begin + BEGIN.len()..].find("-----") else {
+            break;
+        };
+        let header_end = begin + BEGIN.len() + label + "-----".len();
+        if !rest[begin..header_end].contains("PRIVATE KEY") {
+            out.push_str(&rest[..header_end]);
+            rest = &rest[header_end..];
+            continue;
+        }
+        out.push_str(&rest[..begin]);
+        out.push_str(REDACTED);
+        count += 1;
+        let after = &rest[header_end..];
+        rest = after
+            .find("-----END ")
+            .and_then(|end| {
+                let label = end + "-----END ".len();
+                after[label..]
+                    .find("-----")
+                    .map(|close| &after[label + close + "-----".len()..])
+            })
+            .unwrap_or("");
+    }
+    out.push_str(rest);
+    (out, count)
+}
+
+/// The bytes a token is made of (all ASCII, so a run of them always starts
+/// and ends on a character boundary).
+fn token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'/' | b'~')
+}
+
+/// Every run of token bytes that looks like a secret, on its own or after
+/// the word before it.
+fn scrub_tokens(text: &str) -> (String, usize) {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let (mut count, mut copied, mut i) = (0, 0, 0);
+    let mut previous: Option<(usize, usize)> = None;
+    while i < bytes.len() {
+        if !token_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && token_byte(bytes[i]) {
+            i += 1;
+        }
+        // Base64 padding is the token's, unless more of a token follows it
+        // (`key=value`).
+        let mut end = i;
+        while end < bytes.len() && bytes[end] == b'=' {
+            end += 1;
+        }
+        if end < bytes.len() && token_byte(bytes[end]) {
+            end = i;
+        }
+        i = end;
+        // A sentence's full stop is not the token's.
+        let mut stop = end;
+        while stop > start && bytes[stop - 1] == b'.' {
+            stop -= 1;
+        }
+        let run = &text[start..stop];
+        let after = previous.map(|(s, e)| (&text[s..e], &text[e..start]));
+        if let Some(len) = secret(run, after) {
+            out.push_str(&text[copied..start]);
+            out.push_str(REDACTED);
+            copied = start + len;
+            count += 1;
+        }
+        previous = Some((start, stop));
+    }
+    out.push_str(&text[copied..]);
+    (out, count)
+}
+
+/// How much of `run` is a secret, if any: a known key prefix, a JWT, or a
+/// long mixed token right after a word that names a secret (`after`: that
+/// word, and what stands between).
+fn secret(run: &str, after: Option<(&str, &str)>) -> Option<usize> {
+    let base64url = |part: &str| {
+        part.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    let parts: Vec<&str> = run.split('.').collect();
+    if run.starts_with("eyJ")
+        && parts.len() == 3
+        && parts.iter().all(|p| p.len() >= 10 && base64url(p))
+    {
+        return Some(run.len());
+    }
+    let head = &run[..run
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .unwrap_or(run.len())];
+    let mixed = |s: &str| {
+        s.bytes().any(|b| b.is_ascii_digit()) && s.bytes().any(|b| b.is_ascii_alphabetic())
+    };
+    let prefixed = |prefix: &str, least: usize, ok: &dyn Fn(&str) -> bool| {
+        head.strip_prefix(prefix)
+            .is_some_and(|rest| rest.len() >= least && ok(rest))
+    };
+    let alnum = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric());
+    let aws = |s: &str| {
+        s.len() == 16
+            && s.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    };
+    let found = prefixed("sk-", 20, &mixed)
+        || ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+            .iter()
+            .any(|p| prefixed(p, 30, &alnum))
+        || prefixed("github_pat_", 20, &mixed)
+        || ["xoxb-", "xoxp-", "xoxa-", "xoxs-"]
+            .iter()
+            .any(|p| prefixed(p, 10, &mixed))
+        || prefixed("AKIA", 16, &aws)
+        || prefixed("ASIA", 16, &aws)
+        || prefixed("glpat-", 20, &mixed)
+        || prefixed("AIza", 30, &|_| true);
+    if found {
+        return Some(head.len());
+    }
+    let (word, between) = after?;
+    let separated = (1..=4).contains(&between.len())
+        && between
+            .bytes()
+            .all(|b| matches!(b, b' ' | b'\t' | b':' | b'=' | b'"' | b'\''));
+    let distinct = run.bytes().collect::<BTreeSet<u8>>().len();
+    let long_and_mixed =
+        run.len() >= 16 && mixed(run) && distinct >= 8 && !run.starts_with(['/', '~', '.']);
+    (separated && names_a_secret(word) && long_and_mixed).then_some(run.len())
+}
+
+/// `key`, `token`, `secret`, `password`, `passwd` or `bearer`, alone or
+/// ending a name (`api_key`, `GITHUB_TOKEN`, `apiKey`), never inside a word
+/// (`monkey`).
+fn names_a_secret(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    ["key", "token", "secret", "password", "passwd", "bearer"]
+        .iter()
+        .any(|name| {
+            lower.ends_with(name) && {
+                let cut = word.len() - name.len();
+                cut == 0
+                    || matches!(word.as_bytes()[cut - 1], b'_' | b'-' | b'.')
+                    || word.as_bytes()[cut].is_ascii_uppercase()
+                        && word.as_bytes()[cut - 1].is_ascii_lowercase()
+            }
+        })
+}
+
 // ---- drafting ---------------------------------------------------------------
 
 const INSTRUCTIONS: &str = "\
@@ -1117,9 +1299,12 @@ Output ONLY a JSON array, no prose, no code fence. Each element:
  \"refines\": \"existing-id or null\", \"supersedes\": []}
 ";
 
-/// The prompt for one batch of candidates.
-pub fn prompt(loaded: &Loaded, batch: &[Candidate]) -> String {
+/// The prompt for one batch of candidates, every candidate's words and the
+/// agent's words before them scrubbed of secrets (see [`scrub`]), and how
+/// many secret-looking tokens were redacted from it.
+pub fn prompt(loaded: &Loaded, batch: &[Candidate]) -> (String, usize) {
     let mut out = String::from(INSTRUCTIONS);
+    let mut redacted = 0;
     out.push_str("\nExisting knowledge:\n");
     if loaded.nodes.is_empty() {
         out.push_str("(none yet)\n");
@@ -1148,11 +1333,15 @@ pub fn prompt(loaded: &Loaded, batch: &[Candidate]) -> String {
             candidate.who
         );
         if !candidate.context.is_empty() {
-            let _ = writeln!(out, "    before: {}", candidate.context.replace('\n', " "));
+            let (context, n) = scrub(&candidate.context);
+            redacted += n;
+            let _ = writeln!(out, "    before: {}", context.replace('\n', " "));
         }
-        let _ = writeln!(out, "    said: {}", candidate.text.replace('\n', " "));
+        let (text, n) = scrub(&candidate.text);
+        redacted += n;
+        let _ = writeln!(out, "    said: {}", text.replace('\n', " "));
     }
-    out
+    (out, redacted)
 }
 
 /// One node as the drafter proposes it.
@@ -2325,6 +2514,155 @@ mod tests {
             "0 message(s) people wrote, listed by vessa; the pre-filter (phrase-rules.v3) \
              kept 0 and dropped 0"
         );
+    }
+
+    /// Secret-shaped strings, put together at run time so that none sits in
+    /// the source for a scanner to find. None is a real credential.
+    fn fake(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    #[test]
+    fn secret_looking_tokens_are_redacted_and_counted() {
+        let body = "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5kL7";
+        let cases = [
+            ("an OpenAI key", fake(&["s", "k-proj-", &body[..32]])),
+            (
+                "an Anthropic key",
+                fake(&["s", "k-ant-api03-", &body[..36]]),
+            ),
+            ("a GitHub token", fake(&["gh", "p_", &body[..36]])),
+            ("a GitHub OAuth token", fake(&["gh", "o_", &body[..36]])),
+            (
+                "a GitHub fine-grained token",
+                fake(&["github", "_pat_11", &body[..30]]),
+            ),
+            (
+                "a Slack token",
+                fake(&["xo", "xb-", "1234567890-", &body[..24]]),
+            ),
+            (
+                "a Slack user token",
+                fake(&["xo", "xp-", "1234567890-", &body[..24]]),
+            ),
+            ("an AWS key id", fake(&["AK", "IA", "Q3SWZ7YT2NB5XK4M"])),
+            (
+                "an AWS session key id",
+                fake(&["AS", "IA", "Q3SWZ7YT2NB5XK4M"]),
+            ),
+            ("a GitLab token", fake(&["gl", "pat-", &body[..20]])),
+            ("a Google API key", fake(&["AI", "za", "Sy", &body[..33]])),
+            (
+                "a JWT",
+                fake(&[
+                    "ey",
+                    "JhbGciOiJIUzI1NiJ9",
+                    ".",
+                    "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                    ".",
+                    &body[..28],
+                ]),
+            ),
+        ];
+        for (what, secret) in &cases {
+            for text in [
+                secret.clone(),
+                format!("use {secret} for it."),
+                format!("({secret}), then retry"),
+            ] {
+                let (scrubbed, n) = scrub(&text);
+                assert_eq!(n, 1, "{what}: {scrubbed}");
+                assert!(!scrubbed.contains(secret.as_str()), "{what}: {scrubbed}");
+                assert!(scrubbed.contains("[redacted]"), "{what}: {scrubbed}");
+            }
+        }
+        // A private key block, whole, with or without its end.
+        let pem = fake(&[
+            "-----BEGIN RSA PRIV",
+            "ATE KEY-----\n",
+            body,
+            "\n",
+            body,
+            "\n-----END RSA PRIV",
+            "ATE KEY-----",
+        ]);
+        let (scrubbed, n) = scrub(&format!("here:\n{pem}\nthanks"));
+        assert_eq!((scrubbed.as_str(), n), ("here:\n[redacted]\nthanks", 1));
+        let open = fake(&["-----BEGIN OPENSSH PRIV", "ATE KEY-----\n", body]);
+        assert_eq!(scrub(&format!("x {open}")), ("x [redacted]".to_owned(), 1));
+        // A certificate is no secret.
+        let cert = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
+        assert_eq!(scrub(cert), (cert.to_owned(), 0));
+        // A long, mixed token right after a word that names a secret.
+        let value = &body[..24];
+        for text in [
+            format!("api_key={value}"),
+            format!("API_KEY: {value}"),
+            format!("apiKey = '{value}'"),
+            format!("\"access_token\": \"{value}\""),
+            format!("client_secret {value}"),
+            format!("password: {value}"),
+            format!("Authorization: Bearer {value}"),
+            format!("export GITHUB_TOKEN={value}=="),
+        ] {
+            let (scrubbed, n) = scrub(&text);
+            assert_eq!(n, 1, "{text}: {scrubbed}");
+            assert!(!scrubbed.contains(value), "{scrubbed}");
+        }
+        // Two in one message are two.
+        assert_eq!(scrub(&format!("{} and {}", cases[2].1, cases[7].1)).1, 2);
+    }
+
+    #[test]
+    fn what_only_looks_long_is_not_redacted() {
+        for text in [
+            // A git sha, a UUID, alone or after ordinary words.
+            "commit 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b is on main",
+            "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+            "session 8c1f2e3a-4b5c-4d6e-8f70-123456789abc ended",
+            "8c1f2e3a-4b5c-4d6e-8f70-123456789abc",
+            // Words that name a secret, followed by no secret.
+            "the key thing is to keep the token budget small",
+            "password: hunter2",
+            "the token count was 1234",
+            "key /Users/yair/.ssh/id_ed25519_github_2026",
+            // Prefixes inside ordinary words, or too short to be keys.
+            "use sk-learn, or task-1234567890abcdefghij",
+            "the AKIA prefix names an AWS key",
+            "eyJ is how base64 JSON starts",
+            "monkey Ab3dE5gH7jK9mN1pQ3sT",
+        ] {
+            assert_eq!(scrub(text), (text.to_owned(), 0), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_carries_no_secret_from_any_candidate() {
+        let key = fake(&["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"]);
+        let candidate = |source: &'static str, text: String, context: String| Candidate {
+            source,
+            at_ms: 0,
+            at: rfc3339(0),
+            place: "/p/work".to_owned(),
+            who: "person".to_owned(),
+            context,
+            text,
+        };
+        let batch = [
+            candidate(
+                "claude",
+                format!("use {key} please"),
+                format!("I need {key}"),
+            ),
+            candidate("review", format!("token={key}"), String::new()),
+            candidate("handover", "next: nothing secret".to_owned(), String::new()),
+        ];
+        let (prompt, redacted) = prompt(&Loaded::default(), &batch);
+        assert!(!prompt.contains(&key), "{prompt}");
+        assert_eq!(redacted, 3);
+        assert!(prompt.contains("said: use [redacted] please"), "{prompt}");
+        assert!(prompt.contains("before: I need [redacted]"), "{prompt}");
+        assert!(prompt.contains("said: next: nothing secret"), "{prompt}");
     }
 
     #[test]
