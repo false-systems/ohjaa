@@ -201,17 +201,28 @@ mark, flag" below) and three lists for the window:
   (`vessa sessions --json --headers`, `vessa-session-headers.v1`) lists in
   the window and no `ohjaa run` launched. opencode is not judged: vessa
   does not read its sessions.
-  - A session belongs to a launch when the launch's usage receipt names it;
-    a launch with a receipt claims no other session.
-  - Otherwise a launch claims at most one session: the same agent, in the
-    launch's repository or below, started while the launch ran (from 5 s
-    before it was logged until it left, or now while it runs). An agent can
-    write its first record minutes into its launch.
+  - A session belongs to a launch that recorded its id: the launch's usage
+    receipt, what its agent's environment named from inside it
+    (`native_env`, also of a launch still open), or what leaving found by
+    its launch prompt (`left.native`; see "The agent's own sessions"). A
+    launch that recorded any id claims no other session. A session named by
+    several launches (resumed in each) is each one's.
+  - Only a launch that recorded no id falls back to time and folder: it
+    claims at most one session, the same agent, in the launch's repository
+    or below, started while the launch ran (from 5 s before it was logged
+    until it left, or now while it runs). An agent can write its first
+    record minutes into its launch.
   - When more than one could be a launch's, the one whose transcript was
     last written closest to the launch's end is its own (for a launch still
     running, or closed as an orphan, the one that started closest to it).
     Each session is any launch's at most once, and the same list always
     gives the same answer.
+  - Each session a launch claimed is said with how: counted by way in the
+    text, where each one taken by time and folder alone is named; in
+    `--json`, `bypasses.matched`, each `{agent, id, session, by}`, `by` one
+    of `receipt`, `env`, `launch_prompt` and `time_and_folder`. A session
+    named several ways is said by the surest: receipt, then environment,
+    then launch prompt.
   - Headless runs bypass nothing and are only counted: `claude -p`
     (`entrypoint` `sdk-…`), `codex exec` (`originator` naming exec), and
     intake's own drafter with them. A pi transcript does not say how pi was
@@ -525,9 +536,23 @@ not split a native session's consumption across several wrapper runs.
 
 ### The agent's own sessions
 
-At leaving, and at the launch that closes a session as orphaned, ohjaa
-finds which of the agent's own sessions it ran, so a consumer such as vessa
-can join its accounting without an imported receipt (D7). It reads the
+Ohjaa records which of the agent's own sessions a session ran, so a
+consumer such as vessa can join its accounting without an imported receipt
+(D7). It has two ways to know, and records what each says.
+
+First, the agent's own environment. Each agent sets its session's id in
+every shell it starts for its tools: Claude Code `CLAUDE_CODE_SESSION_ID`
+(the new id after a `/clear`; in a subagent's shell, its parent's), Codex
+`CODEX_THREAD_ID`, pi `PI_SESSION_ID`. `ohjaa
+oriented` and `ohjaa handover`, run in such a shell, record the id the
+launched agent's variable holds (only that agent's: a codex started from a
+Claude shell inherits Claude's) at `native_env`, each `{agent, session_id,
+at_ms}`, once, first named first; a value that is no session id is said and
+not recorded. An agent that never reads back or hands over names nothing
+this way.
+
+Second, at leaving, and at the launch that closes a session as orphaned,
+ohjaa looks for its launch prompt in the agent's transcripts. It reads the
 agent's transcripts written since the launch, never writing them: Claude
 Code's `projects/<folder>/<id>.jsonl` (`$CLAUDE_CONFIG_DIR`, else
 `~/.claude`), Codex's `sessions/…/rollout-….jsonl` (`$CODEX_HOME`, else
@@ -568,15 +593,22 @@ output or a paste. Time and folder alone name nothing.
   `--no-briefing` gives no launch prompt to look for. Neither does pi unless
   toimija's `agents:` config gives it a prompt.
 
-They are recorded at `left.native`: `sessions`, each `{agent, session_id,
-source, resumed?, forked_from?}` (the receipts' `agent` and `session_id`),
-and `why`. `why` says why none is named, or, beside named ones, what could
-not be read.
+Both are recorded together at `left.native`: `sessions`, each `{agent,
+session_id, source, resumed?, forked_from?, env?}` (the receipts' `agent`
+and `session_id`), `why` and `disagreement`. Each id is there once. `env:
+true` says the environment named it; `source` is the transcript holding its
+launch prompt, or `env` when none did. `why` says why no transcript named
+one, or, beside named ones, what could not be read. Neither way overrules
+the other: when the launch prompt named sessions and the environment named
+only others, all are kept and `disagreement` says so (the launch prompt of
+a session `/clear`ed before its first read-back names the one cleared).
+`ohjaa session` shows them, and for a session still open what its
+environment named so far.
 
 `usage export` emits `ohjaa-sessions.v1`, with `sessions` and `unreadable`.
 Each session is its record as the log holds it; what later versions added is
 additive and absent from older records: `intent_id` and `task`, `pgid` and
-`group_started_ms` (the session's process group), `left.native` (the agent's own sessions, above), and `validations` (see
+`group_started_ms` (the session's process group), `native_env` and `left.native` (the agent's own sessions, above), and `validations` (see
 `ohjaa gate`, and the integrated validations of "The integrated State",
 with `not_dispatched`). A log an ohjaa with `ohjaa judge` wrote (removed
 2026-10-26) still holds that command's tables, `judgements` and
