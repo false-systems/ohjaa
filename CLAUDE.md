@@ -14,6 +14,13 @@ modules, no lib, and an integration test suite of comparable size, plus the
 vendored `faija-knowledge`. Read the modules a change touches before
 proposing structure for it.
 
+An entry's gate is derived from each commit's own `sykli.json`
+(`src/derived.rs`; the README's "The gate of a commit"). Never bring back a
+copy of a contract the repository has: a copy drifts. What ohjaa reads of a
+clone's commits goes through its one `git cat-file --batch`
+(`Sykli::ask_objects`); a git process more on a hot path needs its budget in
+`tests/config_home.rs`.
+
 Only a person accepts, rejects, retires or confirms Knowledge. Do not add
 messaging, dispatch, presence, caching, or a dependency unless a human
 explicitly moves it into scope and updates `.toimija/repo.yaml` and `AGENTS.md`
