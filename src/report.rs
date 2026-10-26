@@ -115,16 +115,16 @@ pub struct Undated {
 }
 
 /// How a native session was found to be an `ohjaa run` launch's, surest
-/// first.
+/// first: what ohjaa observed, then what a source said (law 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum By {
-    /// A usage receipt the launch imported names it.
-    Receipt,
-    /// The agent's environment named it from inside the launch (`ohjaa
-    /// oriented`, `ohjaa handover`).
-    Env,
-    /// Its transcript holds the launch's prompt, found at leaving.
+    /// Its transcript holds the launch's prompt, found at leaving: observed.
     LaunchPrompt,
+    /// A usage receipt the launch imported names it: the source's word.
+    Receipt,
+    /// The agent's environment claimed it from inside the launch (`ohjaa
+    /// oriented`, `ohjaa handover`): the agent's word.
+    Env,
     /// Neither: the launch recorded no id, and the session is its agent's,
     /// in its folder, started while it ran.
     Window,
@@ -723,47 +723,70 @@ pub fn parse_native(
     Ok((judgeable, natives))
 }
 
-/// The ids of the agent's own sessions a launch recorded, each with how:
-/// its usage receipts, what its environment named from inside it, and what
-/// leaving found by its launch prompt.
-fn recorded(session: &Session) -> Vec<(&str, &str, By)> {
+/// An id a launch recorded: its agent, the agent's id, and how.
+type Recorded<'a> = (&'a str, &'a str, By);
+
+/// The ids of the agent's own sessions a launch recorded, each with how: its
+/// usage receipts, and its agent's own sessions. For a launch that left,
+/// those are what its leaving found (`left.native`: its launch prompt's, and
+/// what its environment claimed before it left that the launch prompt did
+/// not contradict); a leaving that recorded none of that leaves only what
+/// the environment claimed before the launch ended. For a launch still open,
+/// what its environment claimed so far. An id claimed after a launch ended
+/// is never its: a shell that outlived it may be another session's.
+fn recorded(session: &Session) -> Vec<Recorded<'_>> {
     let receipts = session
         .usage
         .iter()
         .map(|r| (r.agent.as_str(), r.session_id.as_str(), By::Receipt));
-    let env = session
-        .native_env
-        .iter()
-        .map(|e| (e.agent.as_str(), e.session_id.as_str(), By::Env));
-    let left = session
-        .left
-        .iter()
-        .flat_map(|left| left.native.iter())
-        .flat_map(|native| &native.sessions)
-        .map(|n| {
-            let by = if n.env { By::Env } else { By::LaunchPrompt };
-            (n.agent.as_str(), n.session_id.as_str(), by)
-        });
-    receipts.chain(env).chain(left).collect()
+    let claimed = |until: Option<i64>| {
+        session
+            .native_env
+            .iter()
+            .filter(move |e| until.is_none_or(|end| e.at_ms <= end))
+            .map(|e| (e.agent.as_str(), e.session_id.as_str(), By::Env))
+    };
+    let own: Vec<Recorded> = match &session.left {
+        None => claimed(None).collect(),
+        Some(left) => match &left.native {
+            Some(native) => native
+                .sessions
+                .iter()
+                .map(|n| {
+                    let by = if n.source == crate::usage::ENV_SOURCE {
+                        By::Env
+                    } else {
+                        By::LaunchPrompt
+                    };
+                    (n.agent.as_str(), n.session_id.as_str(), by)
+                })
+                .collect(),
+            None => claimed(Some(left.ended_ms)).collect(),
+        },
+    };
+    receipts.chain(own).collect()
 }
 
 /// The native sessions no `ohjaa run` launched, oldest first, and those one
 /// did, each with how it was matched.
 ///
-/// A launch that recorded the ids of its agent's own sessions is matched by
-/// them alone: a usage receipt's, what its agent's environment named from
-/// inside it (`ohjaa oriented`, `ohjaa handover`), and what leaving found by
-/// its launch prompt (`left.native`). The sessions they name are its own,
+/// A launch that recorded the ids of its agent's own sessions ([`recorded`])
+/// is matched by them alone: what leaving found by its launch prompt, a
+/// usage receipt's, and what its agent's environment claimed from inside it
+/// (`ohjaa oriented`, `ohjaa handover`). The sessions they name are its own,
 /// wherever and whenever they ran, and it claims no other. A session named
 /// by several launches (resumed in each) is each one's; it is said matched
-/// by the surest way any named it.
+/// by the surest way any named it: observed first, then a receipt, then the
+/// agent's claim (law 3). A claim never outranks an observation: an id
+/// another launch's prompt or receipt names is not the claiming launch's.
 ///
-/// Only a launch with no recorded id falls back to time and folder: it may
-/// claim one session of its agent (the launched command's file name), in
-/// its repository or below, that started while it ran: from
-/// [`LAUNCH_EARLY_MS`] before it was logged until its leaving was (to now
-/// while it runs). An agent can write its first record long after its
-/// launch, so nothing narrower holds.
+/// Only a launch with no id of its own falls back to time and folder (one
+/// whose every claim another launch overruled has none): it may claim one
+/// session of its agent (the launched command's file name), in its
+/// repository or below, that started while it ran: from [`LAUNCH_EARLY_MS`]
+/// before it was logged until its leaving was (to now while it runs). An
+/// agent can write its first record long after its launch, so nothing
+/// narrower holds.
 ///
 /// One-to-one: each pair that could match is ranked by how well it fits,
 /// best first, and taken while neither is taken. For a launch seen to end,
@@ -776,21 +799,31 @@ fn recorded(session: &Session) -> Vec<(&str, &str, By)> {
 pub fn judge_natives(native: Vec<Native>, logged: &[Session]) -> (Vec<Bypass>, Vec<Matched>) {
     let canonical =
         |path: &str| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let ids: Vec<(&Session, Vec<Recorded>)> = logged.iter().map(|s| (s, recorded(s))).collect();
     let mut by_id: std::collections::HashMap<(&str, &str), (By, &str)> =
         std::collections::HashMap::new();
-    let mut launches: Vec<(&Session, PathBuf)> = Vec::new();
-    for s in logged {
-        let ids = recorded(s);
-        if ids.is_empty() {
-            launches.push((s, canonical(&s.repo)));
-        }
-        for (agent, id, by) in ids {
+    for (s, recorded) in &ids {
+        for &(agent, id, by) in recorded {
             let surest = by_id.entry((agent, id)).or_insert((by, &s.id));
             if (by, s.id.as_str()) < (surest.0, surest.1) {
                 *surest = (by, &s.id);
             }
         }
     }
+    // A claim counts for its launch unless an observation or a receipt of
+    // another launch names that id.
+    let launches: Vec<(&Session, PathBuf)> = ids
+        .iter()
+        .filter(|(_, recorded)| {
+            !recorded.iter().any(|&(agent, id, by)| {
+                by != By::Env
+                    || by_id
+                        .get(&(agent, id))
+                        .is_some_and(|(surest, _)| *surest == By::Env)
+            })
+        })
+        .map(|(s, _)| (*s, canonical(&s.repo)))
+        .collect();
     let mut matched = Vec::new();
     let mut native: Vec<Native> = native
         .into_iter()
@@ -1075,9 +1108,9 @@ fn matched_lines(matched: &[Matched], out: &mut String) {
     }
     let count = |by: By| matched.iter().filter(|m| m.by == by).count();
     let counts: Vec<String> = [
-        (By::Env, "by the id its environment named"),
         (By::LaunchPrompt, "by its launch prompt"),
         (By::Receipt, "by a usage receipt"),
+        (By::Env, "claimed by the agent (its environment's id)"),
         (By::Window, "by time and folder alone"),
     ]
     .into_iter()
@@ -1303,6 +1336,9 @@ fn report_json(report: &Report) -> Value {
                     "id": m.id,
                     "session": m.session,
                     "by": m.by.word(),
+                    // The agent's claim or a receipt's word, not what ohjaa
+                    // observed.
+                    "testimony": m.by.testimony(),
                 })).collect::<Vec<_>>(),
                 "headless": natives.headless,
                 "undated": natives.undated.iter().map(|u| json!({

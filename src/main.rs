@@ -1144,6 +1144,15 @@ fn record_testimony(what: &str, change: impl FnOnce(&mut sessions::Session)) -> 
         .update(&id, |session| {
             change(session);
             match usage::from_env(&session.agent, at_ms, |key| std::env::var(key).ok()) {
+                // Only while it runs: a shell that outlived it (a tmux server
+                // started inside it) may be another session's by now.
+                Ok(Some(_)) if session.left.is_some() => {
+                    refused = Some(format!(
+                        "session {} has left: the id its environment names is not recorded, \
+                         since a shell that outlived it may be another session's",
+                        session.id
+                    ));
+                }
                 Ok(Some(found)) => {
                     let said = format!("{} session {}", found.agent, found.session_id);
                     if usage::record_env(&mut session.native_env, found) {
@@ -1159,7 +1168,7 @@ fn record_testimony(what: &str, change: impl FnOnce(&mut sessions::Session)) -> 
         Some(_) => {
             println!("recorded the {what} for session {id}");
             if let Some(named) = named {
-                println!("recorded its {named}, as the agent's environment names it");
+                println!("recorded its {named}, as the agent's environment claims it");
             }
             if let Some(why) = refused {
                 eprintln!("ohjaa: {why}");

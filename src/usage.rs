@@ -214,9 +214,10 @@ pub struct NativeSession {
     /// prompt is in it, or a copy of it is and the fork began in this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
-    /// The agent's own environment named it, in `ohjaa oriented` or `ohjaa
+    /// The agent's own environment claimed it, in `ohjaa oriented` or `ohjaa
     /// handover` run from inside the session ([`FromEnv`]). Its `source` is
-    /// [`ENV_SOURCE`] when no transcript's launch prompt named it too.
+    /// [`ENV_SOURCE`], and it is `testimony`, when no transcript's launch
+    /// prompt named it too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub env: bool,
     /// Only the agent's environment named it: the agent's claim, never
@@ -235,15 +236,47 @@ impl Native {
     }
 
     /// What the transcripts named, with what the agent's own environment
-    /// named added: each id once, said as named by both when both did. The
-    /// environment is the stronger word (the agent's harness sets it in every
-    /// shell it runs), but neither overrules the other: where the launch
-    /// prompt named sessions and the environment named only others, both are
-    /// kept and the disagreement is said. That is also what a `/clear` before
-    /// the first read-back looks like: the launch prompt names the session it
+    /// claimed added: each id once. The launch prompt in a transcript is what
+    /// ohjaa observed; the environment is the agent's claim (law 3), set by
+    /// whatever shell ran `oriented` or `handover`. An id both named is the
+    /// observed one, said as claimed too. An id only claimed is added as
+    /// testimony, said so. Where the launch prompt named sessions and the
+    /// environment claimed only others, the observation is kept, the claim is
+    /// not, and the disagreement is said. A `/clear` before the first
+    /// read-back looks the same: the launch prompt names the session it
     /// cleared, the environment the one it started.
     pub fn with_env(mut self, env: &[FromEnv]) -> Native {
         if env.is_empty() {
+            return self;
+        }
+        let claimed = |s: &NativeSession| {
+            env.iter()
+                .any(|e| e.agent == s.agent && e.session_id == s.session_id)
+        };
+        // A fork is named through its parent, never by a launch prompt of
+        // its own: it neither agrees nor disagrees.
+        let observed: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|s| s.source != ENV_SOURCE && s.forked_from.is_none())
+            .map(|s| format!("{} {}", s.agent, s.session_id))
+            .collect();
+        let agreed = self
+            .sessions
+            .iter()
+            .any(|s| s.source != ENV_SOURCE && s.forked_from.is_none() && claimed(s));
+        if !observed.is_empty() && !agreed {
+            let claims: Vec<String> = env
+                .iter()
+                .map(|e| format!("{} {}", e.agent, e.session_id))
+                .collect();
+            self.disagreement = Some(format!(
+                "its launch prompt named {}, and the agent's environment claimed {} instead (a \
+                 /clear before its first read-back, or a mistake): the launch prompt's is kept, \
+                 the claim is not",
+                observed.join(", "),
+                claims.join(", ")
+            ));
             return self;
         }
         for named in env {
@@ -260,28 +293,11 @@ impl Native {
                     resumed: false,
                     forked_from: None,
                     env: true,
-                    testimony: false,
+                    testimony: true,
                 }),
             }
         }
-        // A fork is named through its parent, never by a launch prompt of
-        // its own: it neither agrees nor disagrees.
-        let said = |s: &&NativeSession| format!("{} {}", s.agent, s.session_id);
-        let by_prompt: Vec<&NativeSession> = self
-            .sessions
-            .iter()
-            .filter(|s| s.source != ENV_SOURCE && s.forked_from.is_none())
-            .collect();
-        let by_env: Vec<&NativeSession> = self.sessions.iter().filter(|s| s.env).collect();
-        self.disagreement =
-            (!by_prompt.is_empty() && !by_prompt.iter().any(|s| s.env)).then(|| {
-                format!(
-                    "its launch prompt named {} and its own environment {}: both are kept, \
-                 neither is chosen",
-                    by_prompt.iter().map(said).collect::<Vec<_>>().join(", "),
-                    by_env.iter().map(said).collect::<Vec<_>>().join(", ")
-                )
-            });
+        self.disagreement = None;
         self
     }
 }

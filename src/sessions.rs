@@ -1113,9 +1113,9 @@ fn native_lines(native: &crate::usage::Native, out: &mut String) {
     for found in &native.sessions {
         let mut said = Vec::new();
         if found.source == crate::usage::ENV_SOURCE {
-            said.push("named by its environment".to_owned());
+            said.push("claimed by the agent's environment, not observed".to_owned());
         } else if found.env {
-            said.push("named by its launch prompt and its environment".to_owned());
+            said.push("observed by its launch prompt; its environment claimed it too".to_owned());
         }
         if found.resumed {
             said.push("resumed".to_owned());
@@ -1356,7 +1356,7 @@ pub fn render_record_with(
         for named in &session.native_env {
             let _ = writeln!(
                 out,
-                "native        {} {} (named by its environment)",
+                "native        {} {} (claimed by the agent's environment, not observed)",
                 named.agent, named.session_id
             );
         }
