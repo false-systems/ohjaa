@@ -508,7 +508,10 @@ said once.
 The records live in a **session log**, redb at
 `~/.local/state/ohjaa/sessions.redb`, on this machine only. Knowledge never
 lives there, so deleting the log loses no knowledge. A busy or broken log never
-blocks a launch; a broken one is reported and left alone, never replaced.
+blocks a launch; a broken one is reported and left alone, never replaced. A new
+log is made whole beside its path and only then linked into place, so two
+launches making it at once never take the other's half-made log for a broken
+one.
 `ohjaa intake` drafts proposals from each ended session once: its handover,
 what was said in its window, and what ohjaa observed going wrong in it (source
 `observed`): its own work that sykli refused at the default branch or a pull

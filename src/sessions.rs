@@ -622,23 +622,26 @@ impl Store {
             path: path.to_path_buf(),
             why,
         };
-        let db = match std::fs::metadata(path) {
+        match std::fs::metadata(path) {
             Ok(meta) if meta.len() == 0 => return Err(broken("the file is empty".to_owned())),
-            Ok(_) => Database::open(path).map_err(|error| match error {
-                DatabaseError::DatabaseAlreadyOpen => StoreError::Locked,
-                other => broken(other.to_string()),
-            })?,
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(other)?;
                 }
-                Database::create(path).map_err(|error| match error {
-                    DatabaseError::DatabaseAlreadyOpen => StoreError::Locked,
-                    error => other(error),
-                })?
+                match create_whole(path) {
+                    // Made here, or by another ohjaa first: opened as made.
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(other(error)),
+                }
             }
             Err(error) => return Err(other(error)),
-        };
+        }
+        let db = Database::open(path).map_err(|error| match error {
+            DatabaseError::DatabaseAlreadyOpen => StoreError::Locked,
+            other => broken(other.to_string()),
+        })?;
         let store = Store { db };
         // Every table exists from the first writable open, so a reader of a
         // log this ohjaa wrote never has to tell "empty" from "missing". A
@@ -827,6 +830,32 @@ impl Drop for PrivateCopy {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// Make a new log at `path`, which does not exist: whole beside it first,
+/// then linked into place, so the log is never at its path half made. redb
+/// makes a database in the file it is given, which is empty until its header
+/// is written, and another ohjaa opening the log in that moment (the first
+/// two launches on a machine, at once) would take it for a broken one.
+/// `AlreadyExists` when another ohjaa put its log there first.
+fn create_whole(path: &Path) -> std::io::Result<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let fresh = path.with_file_name(format!(
+        ".{name}.new-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // One left by an ohjaa stopped while making it, whose pid this one has.
+    let _ = std::fs::remove_file(&fresh);
+    let made = Database::create(&fresh)
+        .map(drop)
+        .map_err(std::io::Error::other)
+        // A link is never made over an existing file: the first log made
+        // stays, and every other is dropped.
+        .and_then(|()| std::fs::hard_link(&fresh, path));
+    let _ = std::fs::remove_file(&fresh);
+    made
 }
 
 /// Run `open` until it is not [`StoreError::Locked`], for at most about a
@@ -2521,6 +2550,43 @@ mod tests {
         drop(holder);
         assert!(Reader::open(&path).is_ok());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn launches_that_make_the_log_together_never_find_it_half_made() {
+        // The first launches on a machine make the log at once (two `ohjaa
+        // run`s in one checkout). One that opens it while another is still
+        // making it must never take the file for a broken log: an empty one.
+        for round in 0..40 {
+            let dir = temp(&format!("made-together-{round}"));
+            let path = store_path(&dir.join("ohjaa"));
+            let together = std::sync::Barrier::new(6);
+            let found: Vec<String> = std::thread::scope(|scope| {
+                let opens: Vec<_> = (0..6)
+                    .map(|n| {
+                        let (path, together) = (&path, &together);
+                        scope.spawn(move || {
+                            together.wait();
+                            let error = if n % 2 == 0 {
+                                Store::open(path).err()
+                            } else {
+                                Reader::open(path).err()
+                            };
+                            // Busy beside a writer is said as busy, not broken.
+                            error.filter(|error| !matches!(error, StoreError::Locked))
+                        })
+                    })
+                    .collect();
+                opens
+                    .into_iter()
+                    .filter_map(|open| open.join().unwrap())
+                    .map(|error| error.to_string())
+                    .collect()
+            });
+            assert!(found.is_empty(), "round {round}: {found:?}");
+            assert!(Reader::open(&path).is_ok(), "round {round}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
