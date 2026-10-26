@@ -1854,13 +1854,14 @@ fn cmd_intake(
     // A session is drafted from once every candidate of it is handled, in
     // however many runs, and only when its whole window was read: a
     // transcript that could not be read leaves it queued for the next run.
-    let takes_sessions = reads_transcripts && transcripts_read_cleanly;
     let sessions: Option<Vec<intake::Undrafted>> = undrafted.as_ref().map(|all| {
         all.iter()
             .map(|s| intake::Undrafted {
                 id: s.id.clone(),
                 started_ms: s.started_ms,
-                members: (takes_sessions && s.left.is_some()).then(|| intake::members(s, &found)),
+                members: (reads_transcripts && s.left.is_some())
+                    .then(|| intake::members(s, &found)),
+                whole: transcripts_read_cleanly,
             })
             .collect()
     });

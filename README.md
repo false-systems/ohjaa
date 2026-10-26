@@ -127,7 +127,17 @@ Knowledge. When a correction repeats something already known, it drafts a
 node that is not reaching agents gets noticed.
 
 Every draft is validated like any proposal, and an invalid one is refused out
-loud. The cursor moves only past what was actually drafted from.
+loud.
+
+A run drafts from at most `--batch` × `--max-batches` candidates (400 by
+default), oldest first, and never from one an earlier run already sent. As
+soon as the drafter answers for a batch, its candidates are kept as handled
+(`$XDG_STATE_HOME/ohjaa/intake-handled`: a time and a digest each, never the
+words). Every run makes progress, and a drafter that fails mid-run keeps what
+came before it. Repeated runs drain the queue: a run that leaves work for the
+next exits 4, and once nothing is left a run says `nothing new to draft from`
+and exits 0. The cursor (`intake-since`) moves only past what was actually
+drafted from, and never back.
 
 ## The bypass report: what went around the workflow
 
@@ -371,7 +381,10 @@ what was said in its window, and what ohjaa observed going wrong in it (source
 `observed`): its own work that sykli refused at the default branch or a pull
 request head (never what could not be checked, nor what is not shown to be the
 session's); a non-zero exit; a missing handover; an orphaned session. Those are
-facts, not anyone's words, and the drafter is told so.
+facts, not anyone's words, and the drafter is told so. A session is marked
+drafted from once each of its candidates has been handled, in however many
+runs that takes, and only by a run that read every transcript; until then it
+stays queued.
 
 Signals and the terminal, while a session runs (unix). The session's process
 group is apart from ohjaa's, so ohjaa does with the terminal what a

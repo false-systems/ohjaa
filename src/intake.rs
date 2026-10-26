@@ -864,9 +864,12 @@ pub fn draft_pending(
 pub struct Undrafted {
     pub id: String,
     pub started_ms: i64,
-    /// Its candidates, when this run took it on: it has ended, and the run
-    /// read its whole window. `None` leaves it waiting.
+    /// Its candidates among those found, when this run took it on (it has
+    /// ended, and the run reads transcripts). It brings them back to every
+    /// run until each is handled. `None` while it waits.
     pub members: Option<Vec<Key>>,
+    /// The run read its whole window: only then is it drafted from.
+    pub whole: bool,
 }
 
 /// What a run leaves behind, once it has drafted what it could.
@@ -883,12 +886,13 @@ pub struct Settled {
 /// Settle a run that read from `since` (`clean`: every source read without a
 /// warning), and forget what no later run can find again.
 ///
-/// The cursor moves past the candidates found after `since` that were
-/// handled, up to the first one that was not; to `started` when none is left
-/// and every source was read. So it is never before `since`. A queued
-/// session's older candidates never hold it: its session brings them back
-/// until each is handled. `sessions` is every session not yet drafted from,
-/// or `None` when the log could not be read; then nothing is forgotten.
+/// A queued session brings its own candidates back to every run until each
+/// is handled. Any other candidate comes back only while it lies after the
+/// cursor, so the first of them not handled holds the cursor: it moves past
+/// the handled candidates found after `since`, up to that one, or to
+/// `started` when none is left and every source was read. It never moves to
+/// `since` or before. `sessions` is every session not yet drafted from, or
+/// `None` when the log could not be read; then nothing is forgotten.
 pub fn settle(
     found: &[Candidate],
     handled: &mut Handled,
@@ -897,16 +901,25 @@ pub fn settle(
     started: i64,
     clean: bool,
 ) -> Settled {
-    let new = || found.iter().filter(|c| c.at_ms > since);
-    let first_left = new()
-        .filter(|c| !handled.contains(c))
+    let returning: std::collections::HashSet<Key> = sessions
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| s.members.as_ref())
+        .flatten()
+        .copied()
+        .collect();
+    let first_held = found
+        .iter()
+        .filter(|c| !handled.contains(c) && !returning.contains(&c.key()))
         .map(|c| c.at_ms)
         .min();
-    let through = new()
-        .filter(|c| handled.contains(c) && first_left.is_none_or(|first| c.at_ms < first))
+    let through = found
+        .iter()
+        .filter(|c| c.at_ms > since && handled.contains(c))
+        .filter(|c| first_held.is_none_or(|first| c.at_ms < first))
         .map(|c| c.at_ms)
         .max();
-    let cursor = match first_left {
+    let cursor = match first_held {
         None if clean => Some(started),
         _ => through,
     }
@@ -916,9 +929,10 @@ pub fn settle(
         .unwrap_or_default()
         .iter()
         .filter(|s| {
-            s.members
-                .as_ref()
-                .is_some_and(|members| members.iter().all(|key| handled.0.contains(key)))
+            s.whole
+                && s.members
+                    .as_ref()
+                    .is_some_and(|members| members.iter().all(|key| handled.0.contains(key)))
         })
         .map(|s| s.id.clone())
         .collect();
@@ -1318,6 +1332,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn the_cursor_moves_only_past_what_was_handled_and_never_to_where_it_began() {
+        let c = |at_ms: i64, text: &str| Candidate {
+            source: "review",
+            at_ms,
+            at: rfc3339(at_ms.div_euclid(1000)),
+            place: "https://github.com/o/r/pull/1".to_owned(),
+            who: "person".to_owned(),
+            context: String::new(),
+            text: text.to_owned(),
+        };
+        let (old, a, b, z) = (c(3, "old"), c(10, "a"), c(20, "b"), c(30, "c"));
+        let settle_with = |found: &[Candidate],
+                           done: &[&Candidate],
+                           sessions: Option<&[Undrafted]>,
+                           since,
+                           clean| {
+            let mut handled = Handled::default();
+            handled.0.extend(done.iter().map(|c| c.key()));
+            settle(found, &mut handled, sessions, since, 100, clean)
+        };
+        let found = [a.clone(), b.clone(), z.clone()];
+        // The first candidate not handled holds it.
+        let held = settle_with(&found, &[&a, &z], None, 5, true);
+        assert_eq!((held.cursor, held.left), (Some(10), 1));
+        // Nothing left: to where the run started, but only when every
+        // source was read; after a warning, past what was handled.
+        assert_eq!(
+            settle_with(&found, &[&a, &b, &z], None, 5, true).cursor,
+            Some(100)
+        );
+        assert_eq!(
+            settle_with(&found, &[&a, &b, &z], None, 5, false).cursor,
+            Some(30)
+        );
+        // Nothing handled after `since`: it stays.
+        assert_eq!(settle_with(&found, &[], None, 5, true).cursor, None);
+        // An older candidate no session brings back holds it where it is...
+        let found = [old.clone(), a.clone()];
+        assert_eq!(settle_with(&found, &[&a], None, 5, true).cursor, None);
+        // ...and one a queued session brings back does not.
+        let queued = [Undrafted {
+            id: "oh-1".to_owned(),
+            started_ms: 1,
+            members: Some(vec![old.key()]),
+            whole: true,
+        }];
+        let settled = settle_with(&found, &[&a], Some(&queued), 5, true);
+        assert_eq!((settled.cursor, settled.drafted.len()), (Some(100), 0));
+        // A window that begins after the run started moves nothing.
+        assert_eq!(
+            settle_with(std::slice::from_ref(&a), &[&a], None, 200, true).cursor,
+            None
+        );
+    }
+
     // ---- the model: random queues, caps and failure points ---------------------
 
     use std::collections::HashSet;
@@ -1400,6 +1470,11 @@ mod tests {
         since: i64,
         said: Vec<Candidate>,
         sessions: Vec<ModelSession>,
+        /// What the report finds: each found by a run whose window holds the
+        /// first time (a commit landing, as `git log --since` sees it), and
+        /// dated by the second (its commit time), which may lie before the
+        /// window.
+        reported: Vec<(i64, Candidate)>,
         /// By then everything was said and every session ended.
         end: i64,
     }
@@ -1465,9 +1540,18 @@ mod tests {
                 });
             }
         }
+        let reported: Vec<(i64, Candidate)> = (0..rng.below(6))
+            .map(|i| {
+                let at = rng.below(200_000) as i64;
+                let landed = at + rng.below(60_000) as i64;
+                let text = format!("unproven {i}");
+                (landed, said("observed", at, "/r/x".to_owned(), text))
+            })
+            .collect();
         let end = out
             .iter()
             .map(|c| c.at_ms)
+            .chain(reported.iter().map(|(landed, _)| *landed))
             .chain(sessions.iter().map(|s| s.ended))
             .max()
             .unwrap_or(0);
@@ -1475,6 +1559,7 @@ mod tests {
             since,
             said: out,
             sessions,
+            reported,
             end,
         }
     }
@@ -1500,6 +1585,8 @@ mod tests {
         batch: usize,
         /// Every source read without a warning.
         clean: bool,
+        /// Every transcript read: each session's whole window.
+        whole: bool,
         fail: Fail,
     }
 
@@ -1539,8 +1626,12 @@ mod tests {
             .min()
             .map_or(since, |earliest| earliest.min(since));
         let visible = || world.said.iter().filter(|c| c.at_ms <= now);
+        // Not `whole`: the transcript that could not be read is a session's.
+        let sessions_now: Vec<_> = world.sessions.iter().map(|s| s.at(now)).collect();
+        let readable = |c: &&Candidate| plan.whole || !sessions_now.iter().any(|s| in_window(c, s));
         let (new, older): (Vec<_>, Vec<_>) = visible()
             .filter(|c| c.source != "review" && c.at_ms > from)
+            .filter(readable)
             .cloned()
             .partition(|c| c.at_ms > since);
         let mut candidates = new;
@@ -1549,6 +1640,13 @@ mod tests {
             visible()
                 .filter(|c| c.source == "review" && c.at_ms > since)
                 .cloned(),
+        );
+        candidates.extend(
+            world
+                .reported
+                .iter()
+                .filter(|(landed, _)| *landed > since && *landed <= now)
+                .map(|(_, c)| c.clone()),
         );
         candidates.extend(handover_candidates(&queued));
         candidates.extend(observed_candidates(&queued));
@@ -1624,7 +1722,8 @@ mod tests {
             .map(|s| Undrafted {
                 id: s.id.clone(),
                 started_ms: s.started_ms,
-                members: (plan.clean && s.left.is_some()).then(|| members(s, &found)),
+                members: s.left.is_some().then(|| members(s, &found)),
+                whole: plan.whole,
             })
             .collect();
         let settled = settle(
@@ -1671,10 +1770,13 @@ mod tests {
             // warnings, drafter failures and kills.
             while now < world.end {
                 now += 1 + rng.below(30_000) as i64;
+                // A transcript that cannot be read is a warning too.
+                let whole = !rng.chance(10);
                 let plan = Plan {
                     cap: 1 + rng.below(6) as usize,
                     batch: 1 + rng.below(3) as usize,
-                    clean: !rng.chance(15),
+                    clean: whole && !rng.chance(10),
+                    whole,
                     fail: match rng.below(10) {
                         0 | 1 => Fail::Drafter(1 + rng.below(3) as usize),
                         2 => Fail::Killed(1 + rng.below(3) as usize),
@@ -1696,6 +1798,7 @@ mod tests {
                     cap: 1 + rng.below(3) as usize,
                     batch: 1 + rng.below(2) as usize,
                     clean: true,
+                    whole: true,
                     fail: Fail::None,
                 };
                 let ran = run(&world, &mut state, now, &plan, &mut kept);
@@ -1722,6 +1825,13 @@ mod tests {
                 .filter(|c| c.at_ms > world.since)
                 .map(Candidate::key)
                 .collect();
+            owed.extend(
+                world
+                    .reported
+                    .iter()
+                    .filter(|(landed, _)| *landed > world.since)
+                    .map(|(_, c)| c.key()),
+            );
             for session in &world.sessions {
                 owed.extend(members(&session.at(world.end), &world.said));
             }
@@ -1736,6 +1846,7 @@ mod tests {
                 cap: 1,
                 batch: 1,
                 clean: true,
+                whole: true,
                 fail: Fail::None,
             };
             let ran = run(&world, &mut state, now, &plan, &mut kept);
@@ -1785,6 +1896,7 @@ mod tests {
             since: 99_999,
             said: out,
             sessions,
+            reported: Vec::new(),
             end: 100_000 + 842,
         };
         let mut state = State::default();
@@ -1793,6 +1905,7 @@ mod tests {
             cap: 400,
             batch: 40,
             clean: true,
+            whole: true,
             fail: Fail::None,
         };
         let mut lefts = Vec::new();
