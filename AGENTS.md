@@ -31,7 +31,7 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   scope directories plus proposals waiting for a person, is the truth and lives
   in git. The **session log**, in redb at `$XDG_STATE_HOME/ohjaa/sessions.redb`,
   is machine-local history of what each session was briefed, read back,
-  committed, finished and handed over, plus explicitly attributed usage receipts, the ids of the agent's own sessions its environment named from inside the session and those found at leaving in its transcripts (read, never written), and references to the validations `ohjaa gate` and ohjaa itself requested (sykli's run ids and receipts, never outcomes) — deleting it loses no knowledge, it never
+  committed, finished and handed over, plus explicitly attributed usage receipts, the ids of the agent's own sessions found at leaving in its transcripts (read, never written) and those its environment claimed from inside the session while it was open (the agent's testimony, never outranking what was found), and references to the validations `ohjaa gate` and ohjaa itself requested (sykli's run ids and receipts, never outcomes) — deleting it loses no knowledge, it never
   blocks a launch, and a broken log is reported, never replaced. Beside it,
   `$XDG_STATE_HOME/ohjaa` holds one validation folder per clone
   (`integrated/<clone>/`: the clone's one rolling validation checkout, the
