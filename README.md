@@ -197,17 +197,21 @@ mark, flag" below) and three lists for the window:
     checkout that is gone, with no receipt kept (merge commits among them);
     sykli could not say. A window over the cap is said.
 - **Agent sessions a person started without ohjaa:** with `vessa` on PATH,
-  the top-level Claude and Codex sessions `vessa sessions --json` lists in
-  the window that no `ohjaa run` launched.
+  the top-level Claude, Codex and pi sessions that vessa's header listing
+  (`vessa sessions --json --headers`, `vessa-session-headers.v1`) lists in
+  the window and no `ohjaa run` launched. opencode is not judged: vessa
+  does not read its sessions.
   - A session belongs to a launch when the launch's usage receipt names it,
     or when it is the same agent, in the launch's repository or below,
     started within a minute after the launch. Each launch claims one.
   - Headless runs bypass nothing and are only counted: `claude -p`
     (`entrypoint` `sdk-…`), `codex exec` (`originator` naming exec), and
-    intake's own drafter with them.
+    intake's own drafter with them. A pi transcript does not say how pi was
+    started, so a `pi -p` run counts as a person's session.
   - A session vessa could not date or place is listed apart, not judged.
-  - A vessa that does not say how sessions were started (no `entrypoint` or
-    `originator`, before vessa#2) leaves the list not judged.
+  - A vessa too old for `--headers` (before vessa#5: exit 2, nothing
+    listed) leaves the list not judged, and the report says to update it.
+    The slow full listing is never read instead.
 
 Every warning vessa gives about what it read, a vessa exit other than 0 or
 4, an undated session, a capped window, and a root with no repositories is
@@ -218,8 +222,8 @@ read while the agent works, and three lines of it are said after the
 session's record, never in the agent's briefing. The week is marked only
 when that report was complete. One with a gap is said again at most once a
 day, and its last line says what the gap is, so it can be fixed (for
-example `incomplete: vessa lacks session origins — update vessa`). Only
-those two times are kept (`$XDG_STATE_HOME/ohjaa/report-at` and
+example ``incomplete: vessa is too old for `sessions --headers`; update
+it``). Only those two times are kept (`$XDG_STATE_HOME/ohjaa/report-at` and
 `report-shown-at`), like intake's cursor. `ohjaa report` records them too,
 but only when it printed to a terminal: never for `--json`, a script or an
 agent.
@@ -1130,7 +1134,8 @@ the session log (opened read-only), not the report's bookmarks
 report has gaps, as the text does.
 
 The full report reads every repository's default-branch window and asks vessa
-(up to a minute): on a root of about 50 repositories, some 500 git processes.
+for its header listing (about half a second; at most 15 s): on a root of
+about 50 repositories, some 500 git processes.
 `ohjaa report --json --marks` is the view to read often: the same document
 with `report` null, from two git processes per entry (its clone's config and
 the walk) and a `sykli verify` only for a commit whose receipt says it passed;
