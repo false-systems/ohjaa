@@ -1691,20 +1691,23 @@ fn cmd_intake(
     } else {
         sources.iter().map(String::as_str).collect()
     };
-    // Sessions that ended and were never drafted from: the agent's own
-    // handover, and what was said in that session's window, even when the
-    // window lies before the cursor. Read in one short, read-only open of the
-    // log; no store is held across the slow calls below.
-    let queued: Vec<sessions::Session> = session_reader(&dirs)
+    // Sessions never drafted from, ended or not (`None`: the log could not be
+    // read). Read in one short, read-only open of the log; no store is held
+    // across the slow calls below.
+    let undrafted: Option<Vec<sessions::Session>> = session_reader(&dirs)
         .and_then(|log| log.all().ok())
-        .map(|(all, _)| {
-            all.into_iter()
-                .filter(|s| s.left.is_some() && !s.drafted)
-                .collect()
-        })
-        .unwrap_or_default();
-    // A session is drafted as a whole, its handover with its transcript
-    // window, so only a run that reads transcripts takes it on.
+        .map(|(all, _)| all.into_iter().filter(|s| !s.drafted).collect());
+    // Those that ended are queued: the agent's own handover, and what was
+    // said in that session's window, even when the window lies before the
+    // cursor.
+    let queued: Vec<sessions::Session> = undrafted
+        .iter()
+        .flatten()
+        .filter(|s| s.left.is_some())
+        .cloned()
+        .collect();
+    // A session is drafted from with its transcript window, so only a run
+    // that reads transcripts takes it on.
     let reads_transcripts = sources.contains(&"transcripts");
     let queued = if reads_transcripts {
         queued
@@ -1772,48 +1775,37 @@ fn cmd_intake(
             queued.len()
         );
     }
-    let mut seen = std::collections::HashSet::new();
-    candidates.retain(|c| seen.insert((c.at_ms, c.text.clone())));
     for warning in &warnings {
         eprintln!("ohjaa: intake: {warning}");
     }
-    candidates.sort_by_key(|candidate| candidate.at_ms);
+    let found = intake::found(candidates);
+    // What earlier runs handled is never sent again: a run takes the oldest
+    // candidates not handled yet, so every run makes progress.
+    let mut handled = intake::read_handled(&dirs)?;
+    let left = found.iter().filter(|c| !handled.contains(c)).count();
     let batch = batch.max(1);
     let limit = batch.saturating_mul(max_batches);
-    let taken = candidates.len().min(limit);
+    let taken = left.min(limit);
     eprintln!(
-        "ohjaa: {} candidate(s) since {}; drafting from {taken}",
-        candidates.len(),
-        intake::rfc3339(since.div_euclid(1000))
+        "ohjaa: {} candidate(s) since {}, {} handled by earlier runs; drafting from {taken}",
+        found.len(),
+        intake::rfc3339(since.div_euclid(1000)),
+        found.len() - left,
     );
-    // Drafted only when its whole window was read: a transcript that could
-    // not be read leaves the session queued for the next run.
-    let mark_drafted = || {
-        if !transcripts_read_cleanly || queued.is_empty() {
-            return;
-        }
-        // Opened again only for this short write, after the drafter is done.
-        if let Some(store) = session_store(&dirs) {
-            for session in &queued {
-                if let Err(error) = store.update(&session.id, |s| s.drafted = true) {
-                    eprintln!("ohjaa: {error}");
-                }
-            }
-        }
-    };
-    if candidates.is_empty() {
-        if !dry_run && warnings.is_empty() {
-            intake::write_cursor(&dirs, started)?;
-            mark_drafted();
-        }
-        println!("nothing new to draft from");
-        return Ok(0);
-    }
-    let loaded = knowledge::load(&dirs)?;
-    let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
     if dry_run {
-        let first = &candidates[..candidates.len().min(batch)];
-        println!("{}", intake::prompt(&loaded, first));
+        if left == 0 {
+            println!("nothing new to draft from");
+            return Ok(0);
+        }
+        let loaded = knowledge::load(&dirs)?;
+        let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
+        let first: Vec<intake::Candidate> = found
+            .iter()
+            .filter(|c| !handled.contains(c))
+            .take(batch)
+            .cloned()
+            .collect();
+        println!("{}", intake::prompt(&loaded, &first));
         eprintln!(
             "ohjaa: dry-run; would send {} batch(es) to `{drafter}`",
             taken.div_ceil(batch)
@@ -1823,58 +1815,92 @@ fn cmd_intake(
 
     let today = knowledge::today();
     let (mut proposed, mut refused) = (0, 0);
-    let mut completed_through: Option<i64> = None;
-    let mut drafted = 0usize;
-    for chunk in candidates[..taken].chunks(batch) {
-        // Re-read each time, so a draft from an earlier batch counts as existing.
-        let loaded = knowledge::load(&dirs)?;
-        let drafts = match intake::draft(&drafter, &intake::prompt(&loaded, chunk)) {
-            Ok(drafts) => drafts,
-            Err(error) => {
-                eprintln!("ohjaa: intake stopped: {error:#}");
-                break;
-            }
-        };
-        for draft in drafts {
-            let id = draft.id.clone();
-            let result = draft
-                .into_proposal()
-                .and_then(|proposal| knowledge::propose(&dirs, &loaded, proposal, today));
-            match result {
-                Ok(_) => {
-                    proposed += 1;
-                    println!("proposed {id}");
+    let mut drafted = intake::Drafted::default();
+    if left > 0 {
+        let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
+        drafted = intake::draft_pending(
+            &found,
+            &mut handled,
+            batch,
+            limit,
+            |chunk| {
+                // Re-read each time, so a draft from an earlier batch counts
+                // as existing.
+                let loaded = knowledge::load(&dirs)?;
+                for draft in intake::draft(&drafter, &intake::prompt(&loaded, chunk))? {
+                    let id = draft.id.clone();
+                    let result = draft
+                        .into_proposal()
+                        .and_then(|proposal| knowledge::propose(&dirs, &loaded, proposal, today));
+                    match result {
+                        Ok(_) => {
+                            proposed += 1;
+                            println!("proposed {id}");
+                        }
+                        Err(error) => {
+                            refused += 1;
+                            eprintln!("ohjaa: draft `{id}` refused: {error:#}");
+                        }
+                    }
                 }
-                Err(error) => {
-                    refused += 1;
-                    eprintln!("ohjaa: draft `{id}` refused: {error:#}");
+                Ok(())
+            },
+            |handled| intake::write_handled(&dirs, handled),
+        );
+        if let Some(error) = &drafted.stopped {
+            eprintln!("ohjaa: intake stopped: {error:#}");
+        }
+    }
+    // A session is drafted from once every candidate of it is handled, in
+    // however many runs, and only when its whole window was read: a
+    // transcript that could not be read leaves it queued for the next run.
+    let takes_sessions = reads_transcripts && transcripts_read_cleanly;
+    let sessions: Option<Vec<intake::Undrafted>> = undrafted.as_ref().map(|all| {
+        all.iter()
+            .map(|s| intake::Undrafted {
+                id: s.id.clone(),
+                started_ms: s.started_ms,
+                members: (takes_sessions && s.left.is_some()).then(|| intake::members(s, &found)),
+            })
+            .collect()
+    });
+    let settled = intake::settle(
+        &found,
+        &mut handled,
+        sessions.as_deref(),
+        since,
+        started,
+        warnings.is_empty(),
+    );
+    if let Some(cursor) = settled.cursor {
+        intake::write_cursor(&dirs, cursor)?;
+    }
+    if !settled.drafted.is_empty() {
+        // Opened again only for this short write, after the drafter is done.
+        if let Some(store) = session_store(&dirs) {
+            for id in &settled.drafted {
+                if let Err(error) = store.update(id, |s| s.drafted = true) {
+                    eprintln!("ohjaa: {error}");
                 }
             }
         }
-        completed_through = chunk.last().map(|c| c.at_ms);
-        drafted += chunk.len();
     }
-    // Move the cursor only past what was actually drafted from, so an
-    // interrupted or partial run resumes instead of skipping. It never moves
-    // backwards (`write_cursor` refuses to).
-    // Finished only when every candidate went through the drafter: a batch
-    // that failed part-way leaves the rest for the next run.
-    let finished_all = drafted == candidates.len();
-    if let Some(through) = completed_through {
-        let cursor = if finished_all && warnings.is_empty() {
-            started
-        } else {
-            through
-        };
-        intake::write_cursor(&dirs, cursor)?;
-    }
-    if finished_all {
-        mark_drafted();
+    intake::write_handled(&dirs, &handled)?;
+    if left == 0 {
+        println!("nothing new to draft from");
+        return Ok(0);
     }
     println!(
         "{proposed} proposal(s) waiting for review (`ohjaa review`), {refused} draft(s) refused"
     );
-    Ok(if finished_all { 0 } else { INCOMPLETE })
+    if settled.left > 0 {
+        eprintln!("ohjaa: {} candidate(s) wait for the next run", settled.left);
+    }
+    Ok(if settled.left == 0 && drafted.stopped.is_none() {
+        0
+    } else {
+        INCOMPLETE
+    })
 }
 
 // ---- launching --------------------------------------------------------------

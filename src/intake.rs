@@ -6,6 +6,7 @@
 //! `claude -p`) which of them carry durable Knowledge, and writes each draft as
 //! a *proposal*. Nothing becomes current until a person accepts it.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -543,22 +544,39 @@ pub fn observed_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candida
     out
 }
 
-/// The transcript candidates that fall inside one of these sessions: its time
-/// window, in its repository (or below it).
+/// Whether a transcript candidate falls inside this session: its time window,
+/// in its repository (or below it).
+fn in_window(candidate: &Candidate, session: &crate::sessions::Session) -> bool {
+    let ended = session.left.as_ref().map_or(i64::MAX, |left| left.ended_ms);
+    candidate.at_ms >= session.started_ms
+        && candidate.at_ms <= ended
+        && Path::new(&candidate.place).starts_with(&session.repo)
+}
+
+/// The transcript candidates that fall inside one of these sessions.
 pub fn within_sessions(
     window: Vec<Candidate>,
     sessions: &[crate::sessions::Session],
 ) -> Vec<Candidate> {
     window
         .into_iter()
-        .filter(|candidate| {
-            sessions.iter().any(|session| {
-                let ended = session.left.as_ref().map_or(i64::MAX, |left| left.ended_ms);
-                candidate.at_ms >= session.started_ms
-                    && candidate.at_ms <= ended
-                    && Path::new(&candidate.place).starts_with(&session.repo)
-            })
-        })
+        .filter(|candidate| sessions.iter().any(|session| in_window(candidate, session)))
+        .collect()
+}
+
+/// Every candidate found that is this session's: what was said in its window
+/// and repository, its handover, and what ohjaa observed in it. The session
+/// is drafted from once each of them has been handled, in however many runs.
+pub fn members(session: &crate::sessions::Session, found: &[Candidate]) -> Vec<Key> {
+    let own = std::slice::from_ref(session);
+    let said = found
+        .iter()
+        .filter(|c| matches!(c.source, "claude" | "codex") && in_window(c, session));
+    handover_candidates(own)
+        .iter()
+        .chain(&observed_candidates(own))
+        .chain(said)
+        .map(Candidate::key)
         .collect()
 }
 
@@ -742,6 +760,240 @@ pub fn write_cursor(dirs: &Dirs, at_ms: i64) -> Result<()> {
     let text = format!("{}.{:03}Z\n", &at[..at.len() - 1], at_ms.rem_euclid(1000));
     std::fs::write(cursor_path(dirs), text)?;
     Ok(())
+}
+
+// ---- progress ---------------------------------------------------------------
+//
+// A run drafts from at most its cap, so a queue can take several runs. Each
+// candidate the drafter has answered for is *handled*, and kept so the moment
+// its batch is answered (`intake-handled`, beside the cursor): the next run
+// continues where this one stopped, a failure keeps what came before it, and
+// nothing handled is sent again. The cursor moves only past handled
+// candidates, so it never needs to move back.
+
+/// A candidate's identity across runs: when it was said, and a digest of what
+/// (the pair duplicates are dropped by). Only the digest is kept on disk,
+/// never the words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Key {
+    pub at_ms: i64,
+    pub digest: u64,
+}
+
+impl Candidate {
+    pub fn key(&self) -> Key {
+        Key {
+            at_ms: self.at_ms,
+            digest: fnv1a(self.text.as_bytes()),
+        }
+    }
+}
+
+/// 64-bit FNV-1a: the same on every Rust release, unlike `DefaultHasher`.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The candidates the drafter has answered for, kept until no later run can
+/// find them again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Handled(BTreeSet<Key>);
+
+impl Handled {
+    pub fn contains(&self, candidate: &Candidate) -> bool {
+        self.0.contains(&candidate.key())
+    }
+}
+
+/// What was found, once: duplicates dropped, oldest first. The order is the
+/// order of drafting.
+pub fn found(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|c| seen.insert((c.at_ms, c.text.clone())));
+    candidates.sort_by_key(|candidate| candidate.at_ms);
+    candidates
+}
+
+/// What one run's drafting came to.
+#[derive(Debug, Default)]
+pub struct Drafted {
+    /// Candidates the drafter answered for in this run.
+    pub sent: usize,
+    /// Why the run stopped short of its cap, when it did.
+    pub stopped: Option<anyhow::Error>,
+}
+
+/// Draft from up to `cap` candidates of `found` not handled before, in order,
+/// `batch` at a time. Each batch the drafter answered for (`send`) becomes
+/// handled and is kept (`keep`) before the next is sent, so a failure loses
+/// nothing that came before it.
+pub fn draft_pending(
+    found: &[Candidate],
+    handled: &mut Handled,
+    batch: usize,
+    cap: usize,
+    mut send: impl FnMut(&[Candidate]) -> Result<()>,
+    mut keep: impl FnMut(&Handled) -> Result<()>,
+) -> Drafted {
+    let pending: Vec<Candidate> = found
+        .iter()
+        .filter(|c| !handled.contains(c))
+        .take(cap)
+        .cloned()
+        .collect();
+    let mut drafted = Drafted::default();
+    for chunk in pending.chunks(batch.max(1)) {
+        if let Err(error) = send(chunk) {
+            drafted.stopped = Some(error);
+            break;
+        }
+        handled.0.extend(chunk.iter().map(Candidate::key));
+        drafted.sent += chunk.len();
+        if let Err(error) = keep(handled) {
+            drafted.stopped = Some(error.context("cannot keep intake's progress"));
+            break;
+        }
+    }
+    drafted
+}
+
+/// A session not yet drafted from, as one run sees it.
+#[derive(Debug, Clone)]
+pub struct Undrafted {
+    pub id: String,
+    pub started_ms: i64,
+    /// Its candidates, when this run took it on: it has ended, and the run
+    /// read its whole window. `None` leaves it waiting.
+    pub members: Option<Vec<Key>>,
+}
+
+/// What a run leaves behind, once it has drafted what it could.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settled {
+    /// Where the cursor moves to, when it moves.
+    pub cursor: Option<i64>,
+    /// The sessions taken on every candidate of which is now handled.
+    pub drafted: Vec<String>,
+    /// Candidates found and not handled: the next run's work.
+    pub left: usize,
+}
+
+/// Settle a run that read from `since` (`clean`: every source read without a
+/// warning), and forget what no later run can find again.
+///
+/// The cursor moves past the candidates found after `since` that were
+/// handled, up to the first one that was not; to `started` when none is left
+/// and every source was read. So it is never before `since`. A queued
+/// session's older candidates never hold it: its session brings them back
+/// until each is handled. `sessions` is every session not yet drafted from,
+/// or `None` when the log could not be read; then nothing is forgotten.
+pub fn settle(
+    found: &[Candidate],
+    handled: &mut Handled,
+    sessions: Option<&[Undrafted]>,
+    since: i64,
+    started: i64,
+    clean: bool,
+) -> Settled {
+    let new = || found.iter().filter(|c| c.at_ms > since);
+    let first_left = new()
+        .filter(|c| !handled.contains(c))
+        .map(|c| c.at_ms)
+        .min();
+    let through = new()
+        .filter(|c| handled.contains(c) && first_left.is_none_or(|first| c.at_ms < first))
+        .map(|c| c.at_ms)
+        .max();
+    let cursor = match first_left {
+        None if clean => Some(started),
+        _ => through,
+    }
+    .map(|at| at.min(started))
+    .filter(|at| *at > since);
+    let drafted: Vec<String> = sessions
+        .unwrap_or_default()
+        .iter()
+        .filter(|s| {
+            s.members
+                .as_ref()
+                .is_some_and(|members| members.iter().all(|key| handled.0.contains(key)))
+        })
+        .map(|s| s.id.clone())
+        .collect();
+    let left = found.iter().filter(|c| !handled.contains(c)).count();
+    // A key can come back only from a cursor source after the cursor, from a
+    // session not yet drafted from (never before it started), or from what
+    // this run found. Everything else is forgotten.
+    if let (Some(cursor), Some(sessions)) = (cursor, sessions) {
+        let floor = sessions
+            .iter()
+            .filter(|s| !drafted.contains(&s.id))
+            .map(|s| s.started_ms)
+            .min()
+            .unwrap_or(i64::MAX);
+        let seen: std::collections::HashSet<Key> = found.iter().map(Candidate::key).collect();
+        handled
+            .0
+            .retain(|key| key.at_ms > cursor || key.at_ms >= floor || seen.contains(key));
+    }
+    Settled {
+        cursor,
+        drafted,
+        left,
+    }
+}
+
+fn handled_path(dirs: &Dirs) -> PathBuf {
+    dirs.state.join("intake-handled")
+}
+
+/// What earlier runs handled. Unreadable progress is an error, never a
+/// silent start from nothing that would send everything again.
+pub fn read_handled(dirs: &Dirs) -> Result<Handled> {
+    let path = handled_path(dirs);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Handled::default()),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let mut keys = BTreeSet::new();
+    for line in text.lines() {
+        let key = line.split_once(' ').and_then(|(at, digest)| {
+            Some(Key {
+                at_ms: at.parse().ok()?,
+                digest: u64::from_str_radix(digest, 16).ok()?,
+            })
+        });
+        keys.insert(key.with_context(|| {
+            format!("{} holds `{line}`, not a handled candidate", path.display())
+        })?);
+    }
+    Ok(Handled(keys))
+}
+
+/// Keep what has been handled: whole or not at all (written aside, then
+/// renamed into place). Nothing handled leaves no file.
+pub fn write_handled(dirs: &Dirs, handled: &Handled) -> Result<()> {
+    let path = handled_path(dirs);
+    if handled.0.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(error).with_context(|| format!("cannot remove {}", path.display()))
+            }
+            _ => Ok(()),
+        };
+    }
+    std::fs::create_dir_all(&dirs.state)?;
+    let mut text = String::new();
+    for key in &handled.0 {
+        let _ = writeln!(text, "{} {:016x}", key.at_ms, key.digest);
+    }
+    let partial = path.with_extension("partial");
+    std::fs::write(&partial, text)
+        .and_then(|()| std::fs::rename(&partial, &path))
+        .with_context(|| format!("cannot write {}", path.display()))
 }
 
 #[cfg(test)]

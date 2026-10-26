@@ -2560,7 +2560,12 @@ fn intake_drains_a_queue_larger_than_one_run_and_never_moves_the_cursor_back() {
             break;
         }
         assert!(sent_now >= 1, "run {runs} made no progress: {stderr}");
-        assert_eq!(code, Some(4), "work is left for the next run: {stderr}");
+        let done = said_lines(&sent).len() == 6;
+        assert_eq!(
+            code,
+            Some(if done { 0 } else { 4 }),
+            "4 while work is left for the next run: {stderr}"
+        );
     }
     let mut lines = said_lines(&sent);
     assert_eq!(lines.len(), 6, "each candidate once: {lines:?}");
@@ -2799,38 +2804,43 @@ fn sessions_are_drafted_only_once_their_transcript_window_was_read() {
     make_executable(&drafter);
     let intake = |source: &str| {
         let _ = fs::remove_file(fixture.dir.join("prompt.txt"));
-        output_of(
+        let (_, stderr, _) = output_of(
             fixture
                 .ohjaa()
                 .args(["intake", "--source", source, "--drafter"])
                 .arg(&drafter)
                 .current_dir(&repo),
         );
-        fs::read_to_string(fixture.dir.join("prompt.txt")).unwrap_or_default()
+        let prompt = fs::read_to_string(fixture.dir.join("prompt.txt")).unwrap_or_default();
+        (prompt, stderr)
     };
     // A run that never reads transcripts leaves the session alone and queued...
-    let prompt = intake("reviews");
+    let (prompt, _) = intake("reviews");
     assert!(
         !prompt.contains("the handover text"),
-        "a session is drafted whole, with its transcript window: {prompt}"
+        "a session is drafted with its transcript window: {prompt}"
     );
-    // ...and so does one whose transcripts could not all be read.
+    // ...and one whose transcripts could not all be read drafts from what it
+    // found, but leaves the session queued.
     let projects = fixture.dir.join("home/.claude/projects/-work");
     fs::create_dir_all(&projects).unwrap();
     let unreadable = projects.join("locked.jsonl");
     fs::write(&unreadable, "{}").unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
-    let prompt = intake("transcripts");
+    let (prompt, _) = intake("transcripts");
     assert!(prompt.contains("the handover text"), "{prompt}");
     fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
-    // Read cleanly: drafted, and only now marked so.
-    let prompt = intake("transcripts");
+    // Read cleanly: still queued after the warning, its handover is not sent
+    // again, and only now it is marked drafted.
+    let (prompt, stderr) = intake("transcripts");
+    assert!(stderr.contains("1 ended session(s) queued"), "{stderr}");
     assert!(
-        prompt.contains("the handover text"),
-        "still queued after a warning: {prompt}"
+        !prompt.contains("the handover text"),
+        "handled once, never sent again: {prompt}"
     );
-    let prompt = intake("transcripts");
+    let (prompt, stderr) = intake("transcripts");
+    assert!(!stderr.contains("queued"), "drafted: {stderr}");
     assert!(
         !prompt.contains("the handover text"),
         "drafted once: {prompt}"
