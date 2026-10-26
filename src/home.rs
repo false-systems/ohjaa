@@ -7,8 +7,11 @@
 //! ```text
 //! ~/.config/ohjaa/
 //!   repos/<owner>/<repo>/            lower case
-//!     repo.toml    branch = "main"   the branch ohjaa observes, and nothing else
-//!     sykli.json   the gate (a sykli contract), inputs repo-relative
+//!     repo.toml    branch = "main"   the branch ohjaa observes, and [cargo_env]: the env
+//!                                    each cargo task of the gate is given (KATANA D10)
+//!     derived/<digest>/sykli.json    the gate derived from a commit's own sykli.json
+//!       and sykli.lock               (see `derived`), written when sykli is handed it
+//!     sykli.json   a stored gate, only for a repository with no sykli.json of its own
 //!     sykli.lock
 //!     hooks/<name>                   exec <ohjaa> hook <name> "$@", for pre-push
 //!                                    and each hook the entry's clones have
@@ -31,6 +34,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+use crate::derived::Overlay;
 use crate::flat_toml;
 use crate::knowledge::config_home;
 use crate::process;
@@ -111,21 +115,29 @@ impl RepoId {
     }
 }
 
-/// A repository's entry: where the workflow keeps its gate.
+/// A repository's entry: the branch ohjaa observes and the env its gate
+/// gives cargo tasks. The gate for a commit is derived from the commit's own
+/// `sykli.json` ([`crate::derived`]); the entry keeps a gate of its own (a
+/// stored copy, `sykli.json` beside `repo.toml`) only for a repository that
+/// has none.
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub dir: PathBuf,
     /// The branch ohjaa observes, judged by the gate.
     pub branch: String,
+    /// `[cargo_env]`: what each cargo task of a derived gate is given.
+    pub overlay: Overlay,
 }
 
 impl Entry {
-    pub fn contract(&self) -> PathBuf {
+    /// The stored copy, `sykli.json` beside `repo.toml`: the gate of a
+    /// commit with no `sykli.json` of its own.
+    pub fn stored(&self) -> PathBuf {
         self.dir.join("sykli.json")
     }
 
-    pub fn has_contract(&self) -> bool {
-        self.contract().is_file()
+    pub fn has_stored(&self) -> bool {
+        self.stored().is_file()
     }
 }
 
@@ -137,22 +149,28 @@ pub fn entry_dir(home: &Path, id: &RepoId) -> PathBuf {
         .join(id.name.to_ascii_lowercase())
 }
 
-/// What `repo.toml` holds: the branch, and nothing else.
-pub fn repo_toml(id: &RepoId, branch: &str) -> String {
+/// What `repo.toml` holds: the branch, and the env the gate gives cargo
+/// tasks (`[cargo_env]`; `none` says why it holds no line).
+pub fn repo_toml(id: &RepoId, branch: &str, overlay: &Overlay, none: Option<&str>) -> String {
     format!(
-        "# ohjaa's entry for {}, written by `ohjaa adopt`. ohjaa observes this branch,\n\
-         # judged by the gate beside it (sykli.json).\n\
-         branch = {}\n",
+        "# ohjaa's entry for {}, written by `ohjaa adopt`. ohjaa observes this branch. Each\n\
+         # commit is judged by the gate derived from its own sykli.json (and sykli.lock), with\n\
+         # [cargo_env] below; a commit without one, by the gate beside this file (sykli.json).\n\
+         branch = {}\n{}",
         id.slug(),
-        flat_toml::quote(branch)
+        flat_toml::quote(branch),
+        overlay.toml(none)
     )
 }
 
-fn parse_repo_toml(text: &str) -> std::result::Result<String, String> {
+fn parse_repo_toml(text: &str) -> std::result::Result<(String, Overlay), String> {
     let tables = flat_toml::parse(text)?;
-    if let Some(table) = tables.keys().find(|name| !name.is_empty()) {
+    if let Some(table) = tables
+        .keys()
+        .find(|name| !name.is_empty() && *name != "cargo_env")
+    {
         return Err(format!(
-            "unknown table [{table}]; repo.toml holds only branch"
+            "unknown table [{table}]; repo.toml holds branch and [cargo_env]"
         ));
     }
     flat_toml::only_keys(&tables, "", &["branch"])?;
@@ -163,10 +181,14 @@ fn parse_repo_toml(text: &str) -> std::result::Result<String, String> {
     if branch.is_empty() || branch.starts_with('-') || branch.chars().any(char::is_whitespace) {
         return Err(format!("{branch:?} is not a branch name"));
     }
-    Ok(branch
-        .strip_prefix("refs/heads/")
-        .unwrap_or(&branch)
-        .to_owned())
+    let overlay = Overlay::from_table(tables.get("cargo_env"))?;
+    Ok((
+        branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&branch)
+            .to_owned(),
+        overlay,
+    ))
 }
 
 /// The entry at `dir`, `Ok(None)` when there is none. A directory with files
@@ -176,11 +198,12 @@ pub fn read_entry(dir: &Path) -> Result<Option<Entry>> {
     let path = dir.join("repo.toml");
     match std::fs::read_to_string(&path) {
         Ok(text) => {
-            let branch = parse_repo_toml(&text)
+            let (branch, overlay) = parse_repo_toml(&text)
                 .map_err(|why| anyhow::anyhow!("{}: {why}", path.display()))?;
             Ok(Some(Entry {
                 dir: dir.to_path_buf(),
                 branch,
+                overlay,
             }))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -448,12 +471,24 @@ mod tests {
     }
 
     #[test]
-    fn repo_toml_holds_the_branch_and_nothing_else() {
+    fn repo_toml_holds_the_branch_and_the_cargo_env_and_nothing_else() {
         let id = RepoId::parse("git@github.com:acme/widget.git").unwrap();
-        assert_eq!(parse_repo_toml(&repo_toml(&id, "main")).unwrap(), "main");
+        let standard = Overlay::standard();
+        assert_eq!(
+            parse_repo_toml(&repo_toml(&id, "main", &standard, None)).unwrap(),
+            ("main".to_owned(), standard.clone())
+        );
+        let none = repo_toml(
+            &id,
+            "main",
+            &Overlay::default(),
+            Some("no sykli expands it"),
+        );
+        assert!(parse_repo_toml(&none).unwrap().1.is_empty(), "{none}");
+        // An entry written before [cargo_env]: the standard lines.
         assert_eq!(
             parse_repo_toml("branch = \"refs/heads/trunk\"").unwrap(),
-            "trunk"
+            ("trunk".to_owned(), standard)
         );
         for (text, why) in [
             ("", "no branch"),
@@ -463,6 +498,10 @@ mod tests {
                 "unknown key contract",
             ),
             ("[gate]\nbranch = \"main\"", "unknown table"),
+            (
+                "branch = \"main\"\n[cargo_env]\nRUSTFLAGS = \"x\"",
+                "unknown key RUSTFLAGS",
+            ),
             ("branch = main", "only \"text\" values"),
         ] {
             let error = parse_repo_toml(text).unwrap_err();
@@ -502,7 +541,7 @@ mod tests {
         std::fs::write(dir.join("repo.toml"), "branch = \"main\"\n").unwrap();
         let entry = read_entry(&dir).unwrap().unwrap();
         assert_eq!(entry.branch, "main");
-        assert!(entry.has_contract());
+        assert!(entry.has_stored());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

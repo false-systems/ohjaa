@@ -959,6 +959,11 @@ pub fn to_json(report: &Report) -> Value {
                     // how many of them it reused from sykli's cache.
                     "tasks": walked.proof.as_ref().map(|proof| proof.tasks),
                     "cached": walked.proof.as_ref().map(|proof| proof.cached),
+                    // Additive (G1a): for a proven commit, the contract that
+                    // receipt ran under: the gate derived from the commit
+                    // ("derived"), its own sykli.json ("own"), or the entry's
+                    // stored copy ("stored").
+                    "contract": walked.under.map(crate::derived::Under::word),
                     "author": walked.author,
                     "authored": rfc(walked.authored * 1000),
                     "subject": walked.subject,
@@ -1518,7 +1523,8 @@ mod tests {
         let gate = lifecycle::Gate {
             slug: "acme/widget".to_owned(),
             branch: "main".to_owned(),
-            contract: PathBuf::from("/h/repos/acme/widget/sykli.json"),
+            entry: PathBuf::from("/h/repos/acme/widget"),
+            overlay: crate::derived::Overlay::standard(),
             top: PathBuf::from("/r/widget"),
             common: PathBuf::from("/r/widget/.git"),
         };
@@ -1530,6 +1536,7 @@ mod tests {
             subject: format!("subject {sha}"),
             check,
             proof: None,
+            under: None,
         };
         let mut report = sample(Err("vessa is not on PATH".to_owned()));
         report.marks = vec![
@@ -1557,6 +1564,8 @@ mod tests {
                                 tasks: 2,
                                 cached: 1,
                             }),
+                            // A run of the commit's own sykli.json (CI's).
+                            under: Some(crate::derived::Under::Own),
                             ..walked("c1", Check::Passed)
                         },
                     ],
@@ -1666,8 +1675,11 @@ mod tests {
         let commit = &entry["commits"][1];
         assert_eq!(
             keys(commit),
-            "author,authored,cached,code,integrated,mark,sha,subject,tasks,tree,why"
+            "author,authored,cached,code,contract,integrated,mark,sha,subject,tasks,tree,why"
         );
+        // Additive (G1a): which contract proved a proven commit.
+        assert_eq!(commit["contract"], Value::Null);
+        assert_eq!(entry["commits"][2]["contract"], "own");
         // Additive: the accepted receipt's tasks and how many it reused from
         // the cache, for a proven commit only.
         assert_eq!(

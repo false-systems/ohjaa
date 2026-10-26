@@ -1,13 +1,16 @@
-//! `ohjaa adopt`: write a repository's entry into the home and regenerate
-//! the home's git config. It never touches git's global config, and never
-//! writes into a repository (it takes no lock there either: no `git
-//! status`).
+//! `ohjaa adopt`: write a repository's entry into the home (`repo.toml`: the
+//! branch and `[cargo_env]`; a stored gate only for a repository with no
+//! `sykli.json` of its own, every other commit's gate being derived from the
+//! commit) and regenerate the home's git config. It never touches git's
+//! global config, and never writes into a repository (it takes no lock there
+//! either: no `git status`).
 
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+use crate::derived::Overlay;
 use crate::gitconfig::{self, fetch_url, repo_at};
 use crate::home::{self, absolute, RepoId};
 use crate::process;
@@ -115,16 +118,45 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
         );
         return Ok(REFUSED);
     }
+    // The env a derived gate gives cargo tasks: KATANA D10's lines, only
+    // when every sykli that runs the gate expands `${worktree_cache}`.
+    let expands = sykli_expands_worktree_cache(&home);
+    let none = expands.as_ref().err().map(|why| {
+        format!(
+            "{why}, and an older sykli passes {WORKTREE_CACHE} on as written, to build inside \
+             the work tree; ohjaa adopt --force once it is updated"
+        )
+    });
+    let overlay = if none.is_none() {
+        Overlay::standard()
+    } else {
+        Overlay::default()
+    };
     let created = !dir.exists();
-    let result = write_entry(&top, &id, &dir, &branch, force);
+    let result = write_entry(&top, (&id, &dir, &branch), force, &overlay, none.as_deref());
     if result.is_err() && created {
         let _ = std::fs::remove_dir_all(&dir);
     }
-    let source = result?;
+    let (source, stored) = result?;
     println!("ohjaa adopt: {} -> {}", id, dir.display());
     println!("  branch = {branch:?} (repo.toml)");
     println!("  {source}");
-    declare_worktree_cache(&top, &common, &dir, &home);
+    match &none {
+        None => println!(
+            "  [cargo_env] (repo.toml): {} under {WORKTREE_CACHE}, for each cargo task of the gate \
+             that does not say where it builds",
+            overlay
+                .lines()
+                .iter()
+                .map(|(var, _)| var.as_str())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
+        Some(why) => println!("  [cargo_env] (repo.toml): none: {why}"),
+    }
+    if stored {
+        declare_worktree_cache(&top, &common, &dir, &expands);
+    }
     // The home's git config now names this repository too; git's global
     // config is not touched (it includes the home's file once, from apply).
     let global = gitconfig::GlobalFacts::read()?;
@@ -154,13 +186,21 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// Write the gate and `repo.toml` into `dir`; say where the gate came from.
-/// The gate is read as `origin/<branch>` holds it (else `HEAD`), in one `git
-/// cat-file --batch`.
-fn write_entry(top: &Path, id: &RepoId, dir: &Path, branch: &str, force: bool) -> Result<String> {
+/// Write `repo.toml` into `dir` (the branch, and `overlay` as its
+/// `[cargo_env]`, `none` saying why it is empty), and a stored gate only for
+/// a repository with no `sykli.json` of its own, as `origin/<branch>` holds
+/// it (else `HEAD`), read in one `git cat-file --batch`. Says where the gate
+/// comes from, and whether a copy is stored.
+fn write_entry(
+    top: &Path,
+    (id, dir, branch): (&RepoId, &Path, &str),
+    force: bool,
+    overlay: &Overlay,
+    none: Option<&str>,
+) -> Result<(String, bool)> {
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let revs = [format!("refs/remotes/origin/{branch}"), "HEAD".to_owned()];
-    let files = ["sykli.json", "sykli.lock", "sykli.rs"];
+    let files = ["sykli.json", "sykli.rs"];
     let mut names = Vec::new();
     for rev in &revs {
         names.push(rev.clone());
@@ -184,25 +224,30 @@ fn write_entry(top: &Path, id: &RepoId, dir: &Path, branch: &str, force: bool) -
     let blob = |n: usize| found[at + 1 + n].as_ref().map(|(_, bytes)| bytes.clone());
     let contract = dir.join("sykli.json");
     let lock = dir.join("sykli.lock");
-    let source = if let Some(json) = blob(0) {
-        std::fs::write(&contract, json)
-            .with_context(|| format!("cannot write {}", contract.display()))?;
-        match blob(1) {
-            Some(bytes) => {
-                std::fs::write(&lock, bytes)
-                    .with_context(|| format!("cannot write {}", lock.display()))?;
-                format!("sykli.json and sykli.lock copied from {rev} ({commit})")
-            }
-            None => {
-                let _ = std::fs::remove_file(&lock);
-                format!(
-                    "sykli.json copied from {rev} ({commit}), which has no sykli.lock; \
-                     pin it with: sykli lock {}",
-                    contract.display()
-                )
+    let (source, stored) = if blob(0).is_some() {
+        // Each commit's gate is derived from the commit: no copy is kept,
+        // and one an earlier adopt kept is dead.
+        let mut removed = Vec::new();
+        for stale in [&contract, &lock] {
+            if stale.exists() {
+                std::fs::remove_file(stale)
+                    .with_context(|| format!("cannot remove {}", stale.display()))?;
+                removed.push(stale.file_name().unwrap_or_default().to_string_lossy());
             }
         }
-    } else if blob(2).is_some() {
+        let removed = if removed.is_empty() {
+            String::new()
+        } else {
+            format!("; the copy kept before ({}) is removed", removed.join(", "))
+        };
+        (
+            format!(
+                "the gate of each commit is derived from its own sykli.json and sykli.lock \
+                 ({rev} {commit} has one), so no copy is kept{removed}"
+            ),
+            false,
+        )
+    } else if blob(1).is_some() {
         bail!(
             "{} gates with sykli.rs at {rev}; an entry holds a sykli.json contract, so write \
              one (sykli init --contract {}) and adopt again",
@@ -232,17 +277,25 @@ fn write_entry(top: &Path, id: &RepoId, dir: &Path, branch: &str, force: bool) -
         if !contract.is_file() {
             bail!("sykli init did not write {}", contract.display());
         }
-        format!(
-            "sykli.json written by sykli init --contract (no sykli.json at {rev}){}",
-            if lock.is_file() {
-                ", with sykli.lock"
-            } else {
-                ""
-            }
+        (
+            format!(
+                "sykli.json written by sykli init --contract (no sykli.json at {rev}){}: the \
+                 gate of a commit with none of its own",
+                if lock.is_file() {
+                    ", with sykli.lock"
+                } else {
+                    ""
+                }
+            ),
+            true,
         )
     };
-    home::write_file(&dir.join("repo.toml"), &home::repo_toml(id, branch), None)?;
-    Ok(source)
+    home::write_file(
+        &dir.join("repo.toml"),
+        &home::repo_toml(id, branch, overlay, none),
+        None,
+    )?;
+    Ok((source, stored))
 }
 
 // ---- KATANA D10: each worktree's gate builds in a directory of its own ----
@@ -843,10 +896,81 @@ pub fn cargo_tasks(path: &Path) -> std::result::Result<CargoTasks, String> {
         .map_err(|why| format!("{} is {why}", path.display()))
 }
 
-/// The lines each task in `missing` is given: at the end of its own `env`,
-/// or as a new `env` where sykli's emitter puts one (after `run`, or after
-/// `workdir`).
-fn declare_in(contract: &mut Json, missing: &[Unsaid]) {
+/// KATANA D10's lines, a variable and its value for each of the two places
+/// cargo builds in: what an entry's `[cargo_env]` holds unless it says
+/// otherwise.
+pub(crate) fn standard_lines() -> Vec<(String, String)> {
+    SETTINGS
+        .iter()
+        .map(|setting| (setting.var.to_owned(), setting.value.to_owned()))
+        .collect()
+}
+
+/// The variables an entry's `[cargo_env]` may set, in the order a task is
+/// given them.
+pub(crate) fn overlay_vars() -> [&'static str; 2] {
+    [SETTINGS[0].var, SETTINGS[1].var]
+}
+
+/// A repository's own contract (`text`), with `lines` (an entry's
+/// `[cargo_env]`) given to each cargo task that leaves the setting unsaid,
+/// exactly as adopt gives a gate its lines; written as sykli canonicalises a
+/// contract (keys sorted, no blanks), so the file's sha256 is the hash sykli
+/// pins for it. `bytes` is `None` when no task is given a line: the contract
+/// stands as it is. `Err` when it is no contract ohjaa can read.
+pub(crate) fn overlaid(
+    text: &[u8],
+    lines: &[(String, String)],
+) -> std::result::Result<Overlaid, String> {
+    let text = std::str::from_utf8(text).map_err(|_| "not UTF-8".to_owned())?;
+    let (mut json, mut tasks) = read_contract(text)?;
+    for unsaid in &mut tasks.missing {
+        unsaid
+            .vars
+            .retain(|var| lines.iter().any(|(given, _)| given == var));
+    }
+    tasks.missing.retain(|unsaid| !unsaid.vars.is_empty());
+    let given: Vec<String> = tasks
+        .missing
+        .iter()
+        .map(|unsaid| unsaid.task.clone())
+        .collect();
+    let bytes = if given.is_empty() {
+        None
+    } else {
+        declare_in(&mut json, &tasks.missing, lines);
+        Some(
+            serde_json::to_value(&json)
+                .and_then(|value| serde_json::to_vec(&value))
+                .map_err(|error| format!("cannot be written back ({error})"))?,
+        )
+    };
+    Ok(Overlaid {
+        bytes,
+        given,
+        cargo: tasks.cargo,
+        placeholder: tasks.placeholder,
+    })
+}
+
+/// A repository's contract with an entry's `[cargo_env]` given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Overlaid {
+    /// The contract with its lines, as sykli canonicalises it; `None` when
+    /// no task was given one.
+    pub bytes: Option<Vec<u8>>,
+    /// The tasks given lines.
+    pub given: Vec<String>,
+    /// Its tasks that run cargo.
+    pub cargo: Vec<String>,
+    /// Its tasks that name `${worktree_cache}` themselves.
+    pub placeholder: Vec<String>,
+}
+
+/// The lines each task in `missing` is given, with their values in `lines`:
+/// at the end of its own `env`, or as a new `env` where sykli's emitter puts
+/// one (after `run`, or after `workdir`).
+fn declare_in(contract: &mut Json, missing: &[Unsaid], lines: &[(String, String)]) {
     let Json::Object(members) = contract else {
         return;
     };
@@ -864,11 +988,9 @@ fn declare_in(contract: &mut Json, missing: &[Unsaid]) {
         let lines: Vec<(String, Json)> = SETTINGS
             .iter()
             .filter(|setting| unsaid.vars.contains(&setting.var))
-            .map(|setting| {
-                (
-                    setting.var.to_owned(),
-                    Json::String(setting.value.to_owned()),
-                )
+            .filter_map(|setting| {
+                let (_, value) = lines.iter().find(|(var, _)| var == setting.var)?;
+                Some((setting.var.to_owned(), Json::String(value.clone())))
             })
             .collect();
         let Json::Object(fields) = task else {
@@ -956,7 +1078,7 @@ fn sykli_on(
     process::run(&mut sykli, None, process::LOCAL).map_err(|error| format!("{error:#}"))
 }
 
-/// KATANA D10: each cargo task of the entry's gate is given, under
+/// KATANA D10: each cargo task of the entry's stored gate is given, under
 /// `${worktree_cache}`, the variable of each setting it leaves unsaid
 /// (`CARGO_TARGET_DIR`, `CARGO_BUILD_BUILD_DIR`), and a gate that had a lock
 /// is locked again. Only when every sykli that runs the gate expands the
@@ -964,7 +1086,12 @@ fn sykli_on(
 /// lock that does not means the repository changed its gate without `sykli
 /// lock`, and adopt never locks what the repository did not. Says what it
 /// did; never fails the adoption: a gate it cannot change is kept as copied.
-fn declare_worktree_cache(top: &Path, common: &Path, dir: &Path, home: &Path) {
+fn declare_worktree_cache(
+    top: &Path,
+    common: &Path,
+    dir: &Path,
+    expands: &std::result::Result<(), String>,
+) {
     let contract = dir.join("sykli.json");
     let lock = dir.join("sykli.lock");
     let text = match std::fs::read_to_string(&contract) {
@@ -991,7 +1118,7 @@ fn declare_worktree_cache(top: &Path, common: &Path, dir: &Path, home: &Path) {
     if tasks.missing.is_empty() {
         return;
     }
-    if let Err(why) = sykli_expands_worktree_cache(home) {
+    if let Err(why) = expands {
         println!(
             "  {WORKTREE_CACHE}: not declared for {}: {why}, and an older sykli passes it on as \
              written, to build inside the work tree; gate runs may share a target dir across \
@@ -1026,7 +1153,7 @@ fn declare_worktree_cache(top: &Path, common: &Path, dir: &Path, home: &Path) {
             return;
         }
     }
-    declare_in(&mut json, &tasks.missing);
+    declare_in(&mut json, &tasks.missing, &standard_lines());
     let mut declared = match serde_json::to_string_pretty(&json) {
         Ok(declared) => declared,
         Err(error) => {
@@ -1466,7 +1593,7 @@ echo "target=${{target:-no}} build=${{build:-no}}" >> '{}'
             tasks.given(),
             "CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for t; CARGO_TARGET_DIR for v"
         );
-        declare_in(&mut contract, &tasks.missing);
+        declare_in(&mut contract, &tasks.missing, &standard_lines());
         assert_eq!(
             serde_json::to_string(&contract).unwrap(),
             r#"{"schema":"sykli-contract.v1","tasks":[{"inputs":["a"],"name":"t","run":"cargo test","env":{"CARGO_TARGET_DIR":"${worktree_cache}/cargo-target","CARGO_BUILD_BUILD_DIR":"${worktree_cache}/cargo-build"},"outputs":["o"]},{"name":"u","run":"true"},{"name":"v","run":"cargo test","env":{"CARGO_BUILD_BUILD_DIR":"own","CARGO_TARGET_DIR":"${worktree_cache}/cargo-target"}},{"name":"w","run":"cargo test","env":{"CARGO_TARGET_DIR":"own"}}],"z":1.5}"#

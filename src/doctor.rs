@@ -199,6 +199,113 @@ fn check_worktree_cache(
     }
 }
 
+/// The gate derived from the tip's own `sykli.json`: where it comes from,
+/// the lines it gives, and whether the repository's own lock pins its
+/// contract (a lock that does not prevents gate evidence, as it prevents the
+/// repository's own: pushes are flagged UNPROVEN, never refused).
+fn say_derived(found: &mut Findings, slug: &str, tip: &str, derived: &crate::derived::Derived) {
+    let given = if !derived.given.is_empty() {
+        format!("; [cargo_env] given to {}", derived.given.join(", "))
+    } else if derived.unread.is_some() {
+        String::new()
+    } else if derived.cargo.is_empty() {
+        "; it runs no cargo".to_owned()
+    } else {
+        "; no cargo task is given a [cargo_env] line".to_owned()
+    };
+    found.ok(format!(
+        "{slug}: its gate is derived from {tip}'s own sykli.json{given} (no copy is consulted)"
+    ));
+    if let Some(why) = &derived.unread {
+        found.note(format!(
+            "{slug}: {tip}'s own sykli.json is {why}: its gate is that file as it is, with no \
+             [cargo_env] line"
+        ));
+    }
+    match derived.pinned {
+        crate::derived::Pinned::Yes => found.ok(format!(
+            "{slug}: {tip}'s sykli.lock pins its sykli.json, so its gate is locked too"
+        )),
+        crate::derived::Pinned::NoLock => found.note(format!(
+            "{slug}: {tip} has no sykli.lock, so its gate runs unpinned"
+        )),
+        crate::derived::Pinned::No => found.drift(format!(
+            "{slug}: {tip}'s sykli.lock does not pin its sykli.json: sykli refuses to run its \
+             gate, as it refuses the repository's own; a push is flagged UNPROVEN, not refused. \
+             Run sykli lock in the repository and land it on its observed branch"
+        )),
+    }
+}
+
+/// KATANA D10 for a derived gate: the entry's `[cargo_env]` against the
+/// syklis that run the gate. Lines naming `${worktree_cache}` while one of
+/// them does not expand it build in a `${worktree_cache}/` folder inside
+/// the work tree (drift); no line while every one does lets one worktree's
+/// gate run what another built (drift; a note while one does not).
+fn check_overlay(
+    found: &mut Findings,
+    (slug, tip): (&str, &str),
+    overlay: &crate::derived::Overlay,
+    derived: &crate::derived::Derived,
+    home: &Path,
+    expands: &mut Option<std::result::Result<(), String>>,
+) {
+    let mut expanded = || {
+        expands
+            .get_or_insert_with(|| crate::adopt::sykli_expands_worktree_cache(home))
+            .clone()
+    };
+    // The repository's own tasks may name the placeholder too.
+    if !derived.placeholder.is_empty() {
+        if let Err(why) = expanded() {
+            found.drift(format!(
+                "{slug}: {} in {tip}'s own sykli.json name ${{worktree_cache}}, but {why}: it \
+                 passes the placeholder on as written, so cargo builds in a \
+                 `${{worktree_cache}}/` folder inside the work tree (update it)",
+                derived.placeholder.join(", ")
+            ));
+        }
+    }
+    if derived.cargo.is_empty() {
+        return;
+    }
+    if overlay.is_empty() {
+        let lacking = format!(
+            "{slug}: its [cargo_env] gives cargo tasks no line: gate runs may share a target \
+             dir across worktrees"
+        );
+        match expanded() {
+            Ok(()) => found.drift(format!("{lacking} (ohjaa adopt --force <its clone>)")),
+            Err(why) => found.note(format!(
+                "{lacking}, and {why} (update it, then ohjaa adopt --force)"
+            )),
+        }
+        return;
+    }
+    let names = overlay
+        .lines()
+        .iter()
+        .any(|(_, value)| value.contains("${worktree_cache}"));
+    match expanded() {
+        Err(why) if names => found.drift(format!(
+            "{slug}: its [cargo_env] names ${{worktree_cache}}, but {why}: it passes the \
+             placeholder on as written, so cargo builds in a `${{worktree_cache}}/` folder inside \
+             the work tree (update it; ohjaa adopt --force <its clone> empties [cargo_env] \
+             meanwhile)"
+        )),
+        _ => found.ok(format!(
+            "{slug}: [cargo_env] gives each cargo task of its gate {} unless it says where it \
+             builds",
+            overlay
+                .lines()
+                .iter()
+                .map(|(var, _)| var.as_str())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        )),
+    }
+}
+
 /// An entry's gate against the `sykli.lock` beside it, as sykli judges it
 /// (`sykli validate`). A lock that no longer pins its gate (an adopt cut
 /// short between writing the two, or a hand edit) prevents gate evidence;
@@ -448,7 +555,7 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
     for entry in &entries {
         let slug = format!("{}/{}", entry.owner, entry.name);
         match home::read_entry(&entry.dir) {
-            Ok(Some(read)) if read.has_contract() => {
+            Ok(Some(read)) => {
                 readable += 1;
                 found.ok(format!("{slug}: observes {}", read.branch));
                 // The entry's clone under the roots, its facts read from its
@@ -457,19 +564,83 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
                     .iter()
                     .find(|clone| clone.entries.contains(&entry.dir))
                     .and_then(|clone| gitconfig::repo_at(&clone.path).ok());
-                check_lock(
-                    &mut found,
-                    &slug,
-                    &read.contract(),
-                    clone.as_ref(),
-                    &mut validate_help,
-                );
-                check_worktree_cache(&mut found, &slug, &read.contract(), &home, &mut expands);
+                // Which contract judges its branch's tip: derived from the
+                // tip's own sykli.json, else the entry's copy. One git
+                // process for the clone.
+                let at = clone.as_ref().map(|(_, common)| {
+                    crate::derived::Objects::of_clone(common).and_then(|mut objects| {
+                        let tip = format!("refs/remotes/origin/{}", read.branch);
+                        let own = objects.own_at(&tip)?;
+                        Ok(crate::derived::GateAt::of(
+                            &read.dir,
+                            &read.overlay,
+                            &tip,
+                            own,
+                        ))
+                    })
+                });
+                let tip = format!("origin/{}", read.branch);
+                match at {
+                    Some(Ok(crate::derived::GateAt::Derived(derived))) => {
+                        say_derived(&mut found, &slug, &tip, &derived);
+                        check_overlay(
+                            &mut found,
+                            (&slug, &tip),
+                            &read.overlay,
+                            &derived,
+                            &home,
+                            &mut expands,
+                        );
+                        if read.has_stored() {
+                            found.note(format!(
+                                "{slug}: the copy {} is used only for a commit with no \
+                                 sykli.json of its own (ohjaa adopt --force removes it)",
+                                read.stored().display()
+                            ));
+                        }
+                    }
+                    Some(Ok(crate::derived::GateAt::Missing(why))) => {
+                        found.drift(format!("{slug}: no gate for {tip}: {why}"))
+                    }
+                    stored => {
+                        match stored {
+                            Some(Ok(_)) => found.ok(format!(
+                                "{slug}: its gate is the copy beside repo.toml: {tip} has no \
+                                 sykli.json of its own"
+                            )),
+                            Some(Err(why)) => found.note(format!(
+                                "{slug}: which contract judges {tip} is unknown: {why}"
+                            )),
+                            None => found.note(format!(
+                                "{slug}: which contract judges {tip} is not known here (no \
+                                 clone under the roots); a commit with its own sykli.json is \
+                                 judged by the gate derived from it{}",
+                                if read.has_stored() {
+                                    ", any other by the copy beside repo.toml"
+                                } else {
+                                    ""
+                                }
+                            )),
+                        }
+                        if read.has_stored() {
+                            check_lock(
+                                &mut found,
+                                &slug,
+                                &read.stored(),
+                                clone.as_ref(),
+                                &mut validate_help,
+                            );
+                            check_worktree_cache(
+                                &mut found,
+                                &slug,
+                                &read.stored(),
+                                &home,
+                                &mut expands,
+                            );
+                        }
+                    }
+                }
             }
-            Ok(Some(read)) => found.drift(format!(
-                "{slug}: no gate ({} is missing)",
-                read.contract().display()
-            )),
             Ok(None) => {}
             Err(error) => found.drift(format!("{slug}: {error:#}")),
         }

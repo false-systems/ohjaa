@@ -8,6 +8,7 @@
 
 mod adopt;
 mod apply;
+mod derived;
 mod doctor;
 mod flat_toml;
 mod gate;
@@ -878,6 +879,7 @@ fn cmd_brief(
                 let head = gitconfig::read_head(top, &marks.gate.common);
                 let view = integrated::at_launch(
                     marks,
+                    &launch.sykli,
                     head.as_ref()
                         .map(|(commit, branch)| (commit.as_str(), branch.as_deref())),
                     &all,
@@ -2314,6 +2316,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 .unwrap_or_default();
             let view = integrated::at_launch(
                 marks,
+                &launch_marks.sykli,
                 head.as_ref()
                     .map(|(commit, branch)| (commit.as_str(), branch.as_deref())),
                 &all,
@@ -2333,6 +2336,9 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         }
         _ => (integrated::AtLaunch::default(), None),
     };
+    // The clone's git process for the walk and the gates ends here, before
+    // the session runs.
+    launch_marks.sykli.close_objects();
     let briefing = if no_briefing {
         None
     } else {
@@ -2886,7 +2892,7 @@ fn integrated_at_leaving(
                 &log,
                 &dirs.state,
                 &session.id,
-                &gate,
+                (&gate, sykli),
                 &landed.commit,
                 caps,
             ));
