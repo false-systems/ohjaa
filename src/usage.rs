@@ -219,6 +219,10 @@ pub struct NativeSession {
     /// [`ENV_SOURCE`] when no transcript's launch prompt named it too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub env: bool,
+    /// Only the agent's environment named it: the agent's claim, never
+    /// ohjaa's observation (law 3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub testimony: bool,
 }
 
 impl Native {
@@ -256,6 +260,7 @@ impl Native {
                     resumed: false,
                     forked_from: None,
                     env: true,
+                    testimony: false,
                 }),
             }
         }
@@ -844,6 +849,7 @@ fn search(launch: &Launch, stores: &Stores) -> (Native, Reads) {
         resumed: t.began_ms.is_some_and(|b| b < launch.started_ms),
         forked_from: t.forked_from.clone(),
         env: false,
+        testimony: false,
     };
     let mut sessions: Vec<NativeSession> = Vec::new();
     let mut own: Vec<(Option<i64>, NativeSession)> = read
@@ -1722,6 +1728,7 @@ mod from_env_tests {
             resumed: false,
             forked_from: None,
             env: false,
+            testimony: false,
         }
     }
 
@@ -1818,23 +1825,31 @@ mod from_env_tests {
             .collect();
         assert_eq!(ids[1], ("b", ENV_SOURCE, true), "{cleared:#?}");
         assert!(ids[0].2);
+        assert!(
+            cleared.sessions[1].testimony && !cleared.sessions[0].testimony,
+            "only what the environment alone named is the agent's claim"
+        );
         assert_eq!(cleared.disagreement, None);
     }
 
+    /// The environment is the agent's claim; the launch prompt is what ohjaa
+    /// observed. When they name different sessions, the observation is kept
+    /// and the claim is said, never taken.
     #[test]
-    fn the_environment_and_the_launch_prompt_disagreeing_keep_both_and_say_so() {
+    fn the_launch_prompt_wins_over_an_environment_naming_another_session() {
         let merged = named(vec![by_prompt("a")], None).with_env(&[found("claude", "b", 1)]);
         let ids: Vec<&str> = merged
             .sessions
             .iter()
             .map(|s| s.session_id.as_str())
             .collect();
-        assert_eq!(ids, ["a", "b"], "neither is dropped");
+        assert_eq!(ids, ["a"], "the claim is not taken");
         assert_eq!(
             merged.disagreement.as_deref(),
             Some(
-                "its launch prompt named claude a and its own environment claude b: both are \
-                 kept, neither is chosen"
+                "its launch prompt named claude a, and the agent's environment claimed claude b \
+                 instead (a /clear before its first read-back, or a mistake): the launch \
+                 prompt's is kept, the claim is not"
             )
         );
         // Merging again changes nothing.
@@ -1848,6 +1863,7 @@ mod from_env_tests {
         let merged = named(Vec::new(), Some(why)).with_env(&[found("claude", "late", 1)]);
         assert_eq!(merged.sessions.len(), 1);
         assert_eq!(merged.sessions[0].source, ENV_SOURCE);
+        assert!(merged.sessions[0].testimony, "the agent's claim, said so");
         assert_eq!(
             merged.why.as_deref(),
             Some(why),
@@ -1865,16 +1881,26 @@ mod from_env_tests {
         assert_eq!(merged.disagreement, None);
     }
 
-    /// Stored, the record says `source: "env"` and `env: true`; one found by
-    /// its launch prompt alone says neither new field.
+    /// Stored, what only the environment named says `source: "env"`, `env:
+    /// true` and `testimony: true`; one found by its launch prompt alone
+    /// says none of them.
     #[test]
     fn a_named_session_is_stored_with_where_it_was_named() {
-        let merged = named(vec![by_prompt("a")], None).with_env(&[found("claude", "b", 1)]);
+        let mut found_alone = by_prompt("f");
+        found_alone.forked_from = Some("a".to_owned());
+        let merged = named(vec![by_prompt("a"), found_alone], None)
+            .with_env(&[found("claude", "a", 1), found("claude", "b", 2)]);
         let stored = serde_json::to_value(&merged).unwrap();
-        assert!(stored["sessions"][0].get("env").is_none(), "{stored:#}");
-        assert_eq!(stored["sessions"][1]["source"], "env");
-        assert_eq!(stored["sessions"][1]["env"], true);
-        assert!(stored["disagreement"].is_string());
+        assert!(stored["sessions"][1].get("env").is_none(), "{stored:#}");
+        assert!(stored["sessions"][1].get("testimony").is_none());
+        assert_eq!(stored["sessions"][0]["env"], true);
+        assert!(stored["sessions"][0].get("testimony").is_none());
+        assert_eq!(stored["sessions"][2]["source"], "env");
+        assert_eq!(stored["sessions"][2]["env"], true);
+        assert_eq!(stored["sessions"][2]["testimony"], true);
+        let disagreeing = named(vec![by_prompt("a")], None).with_env(&[found("claude", "b", 1)]);
+        let stored_too = serde_json::to_value(&disagreeing).unwrap();
+        assert!(stored_too["disagreement"].is_string());
         let read: Native = serde_json::from_value(stored).unwrap();
         assert_eq!(read, merged);
         // A record #55 wrote reads as before.

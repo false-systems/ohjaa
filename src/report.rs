@@ -139,6 +139,12 @@ impl By {
             By::Window => "time_and_folder",
         }
     }
+
+    /// A source's word, not ohjaa's observation: an imported receipt, or
+    /// the agent's environment (law 3).
+    pub fn testimony(self) -> bool {
+        matches!(self, By::Receipt | By::Env)
+    }
 }
 
 /// A native session matched to the `ohjaa run` launch that ran it.
@@ -1636,19 +1642,21 @@ mod tests {
     }
 
     /// A launch that recorded its agent's own session ids is matched by them
-    /// alone, wherever and whenever those ran: by the environment first, then
-    /// the launch prompt. Only a launch that recorded none falls back to time
-    /// and folder. Each match says how it was made.
+    /// alone, wherever and whenever those ran: what ohjaa observed (the
+    /// launch prompt) first, then what the agent's environment claimed. Only
+    /// a launch that recorded none falls back to time and folder. Each match
+    /// says how it was made, a claim as a claim.
     #[test]
     fn a_recorded_id_matches_exactly_and_only_a_launch_without_one_falls_back() {
         let repo = "/nonexistent/r/app";
-        // Left, its session named by its launch prompt, and one more by both
-        // after a `/clear`.
+        // Left, its session named by its launch prompt, and one more claimed
+        // by its environment after a `/clear`.
         let mut prompt = ended(session("oh-1", "claude", repo, 1_000_000), 1_600_000);
         prompt.left.as_mut().unwrap().native = Some(
             serde_json::from_value(json!({"sessions": [
                 {"agent": "claude", "session_id": "by-prompt", "source": "/t/1.jsonl"},
-                {"agent": "claude", "session_id": "cleared", "source": "env", "env": true},
+                {"agent": "claude", "session_id": "cleared", "source": "env", "env": true,
+                 "testimony": true},
             ]}))
             .unwrap(),
         );
@@ -1683,21 +1691,107 @@ mod tests {
         assert_eq!(
             how,
             [
+                ("by-prompt", "oh-1", "launch_prompt"),
                 ("cleared", "oh-1", "env"),
                 ("by-env", "oh-2", "env"),
-                ("by-prompt", "oh-1", "launch_prompt"),
                 ("own", "oh-3", "time_and_folder"),
             ]
         );
-        // The fallback is named in the report, the rest counted.
+        assert!(matched
+            .iter()
+            .all(|m| m.by.testimony() == (m.by == By::Env)));
+        // The fallback is named in the report, the rest counted, a claim
+        // said as the agent's.
         let mut out = String::new();
         matched_lines(&matched, &mut out);
         assert_eq!(
             out,
-            "  Launched through ohjaa (4): 2 by the id its environment named, 1 by its launch \
-             prompt, 1 by time and folder alone\n  \
+            "  Launched through ohjaa (4): 1 by its launch prompt, 2 claimed by the agent (its \
+             environment's id), 1 by time and folder alone\n  \
              - pi own taken as oh-3's by time and folder: it recorded no id\n"
         );
+    }
+
+    /// Review of #57: a shell that kept a session's OHJAA_SESSION after it
+    /// left (a tmux server started inside it) can run `ohjaa handover` in a
+    /// session a person starts by hand days later. An id its environment
+    /// named after the session left is not the session's: that session is
+    /// still a bypass, and the old launch still falls back to its own.
+    #[test]
+    fn an_id_named_after_a_session_left_clears_no_bypass() {
+        let repo = "/nonexistent/r/app";
+        let stale = crate::usage::FromEnv {
+            agent: "claude".to_owned(),
+            session_id: "by-hand".to_owned(),
+            at_ms: 9_000_000,
+        };
+        let mut found_none = ended(session("oh-1", "claude", repo, 1_000_000), 1_600_000);
+        found_none.left.as_mut().unwrap().native = Some(
+            serde_json::from_value(
+                json!({"why": "none found: none of the 0 claude transcript(s)"}),
+            )
+            .unwrap(),
+        );
+        let older = ended(session("oh-1", "claude", repo, 1_000_000), 1_600_000);
+        for mut left in [found_none, older] {
+            left.native_env = vec![stale.clone()];
+            let (bypassed, matched) = judge_natives(
+                vec![
+                    native("claude", "own", repo, 1_003_000),
+                    native("claude", "by-hand", "/nonexistent/elsewhere", 9_000_000),
+                ],
+                &[left],
+            );
+            assert_eq!(ids(bypassed), ["by-hand"]);
+            assert_eq!(matched.len(), 1);
+            assert_eq!((matched[0].id.as_str(), matched[0].by), ("own", By::Window));
+        }
+    }
+
+    /// Review of #57: the agent's environment is its claim, and any shell can
+    /// set it. A claim of an id another launch's prompt was observed in is
+    /// not taken: the id is the observing launch's, and the claiming launch,
+    /// left with no id of its own, falls back to time and folder.
+    #[test]
+    fn an_environments_claim_never_outranks_an_observed_launch_prompt() {
+        let repo = "/nonexistent/r/app";
+        let mut observed = ended(session("oh-a", "claude", repo, 1_000_000), 1_600_000);
+        observed.left.as_mut().unwrap().native = Some(
+            serde_json::from_value(json!({"sessions": [
+                {"agent": "claude", "session_id": "x", "source": "/t/x.jsonl"},
+            ]}))
+            .unwrap(),
+        );
+        let mut forged = session("oh-b", "claude", repo, 2_000_000);
+        forged.native_env = vec![crate::usage::FromEnv {
+            agent: "claude".to_owned(),
+            session_id: "x".to_owned(),
+            at_ms: 2_001_000,
+        }];
+        for logged in [
+            vec![observed.clone(), forged.clone()],
+            vec![forged.clone(), observed.clone()],
+        ] {
+            let (bypassed, matched) = judge_natives(
+                vec![
+                    native("claude", "x", repo, 1_002_000),
+                    native("claude", "b-own", repo, 2_003_000),
+                ],
+                &logged,
+            );
+            assert!(ids(bypassed).is_empty());
+            let how: Vec<(&str, &str, By)> = matched
+                .iter()
+                .map(|m| (m.id.as_str(), m.session.as_str(), m.by))
+                .collect();
+            assert_eq!(
+                how,
+                [
+                    ("x", "oh-a", By::LaunchPrompt),
+                    ("b-own", "oh-b", By::Window)
+                ]
+            );
+        }
     }
 
     /// A session resumed in two launches is named by both: matched by the
@@ -1705,26 +1799,30 @@ mod tests {
     #[test]
     fn a_session_two_launches_named_is_matched_the_surest_way() {
         let repo = "/nonexistent/r/app";
-        let named = |id: &str, env: bool| {
+        let named = |id: &str, source: &str| {
             let mut s = ended(session(id, "claude", repo, 1_000_000), 1_600_000);
             s.left.as_mut().unwrap().native = Some(
                 serde_json::from_value(json!({"sessions": [
-                    {"agent": "claude", "session_id": "resumed", "source": "/t.jsonl", "env": env},
+                    {"agent": "claude", "session_id": "resumed", "source": source, "env": true},
                 ]}))
                 .unwrap(),
             );
             s
         };
-        let (bypassed, matched) = judge_natives(
-            vec![native("claude", "resumed", repo, 500_000)],
-            &[named("oh-1", false), named("oh-2", true)],
-        );
-        assert!(bypassed.is_empty());
-        assert_eq!(matched.len(), 1);
-        assert_eq!(
-            (matched[0].session.as_str(), matched[0].by),
-            ("oh-2", By::Env)
-        );
+        for logged in [
+            [named("oh-1", "env"), named("oh-2", "/t.jsonl")],
+            [named("oh-2", "/t.jsonl"), named("oh-1", "env")],
+        ] {
+            let (bypassed, matched) =
+                judge_natives(vec![native("claude", "resumed", repo, 500_000)], &logged);
+            assert!(bypassed.is_empty());
+            assert_eq!(matched.len(), 1);
+            assert_eq!(
+                (matched[0].session.as_str(), matched[0].by),
+                ("oh-2", By::LaunchPrompt),
+                "observed, not claimed"
+            );
+        }
     }
 
     /// An agent can write its first record long after its launch (Claude at

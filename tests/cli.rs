@@ -1936,7 +1936,7 @@ fn oriented_and_handover_record_the_agents_own_session_from_its_environment() {
     assert_eq!(session["native_env"].as_array().map(Vec::len), Some(1));
     assert!(
         stderr.contains(&format!(
-            "native        claude {first} (named by its launch prompt and its environment)\n"
+            "native        claude {first} (observed by its launch prompt; its environment claimed it too)\n"
         )),
         "{stderr}"
     );
@@ -1969,7 +1969,7 @@ fn oriented_and_handover_record_the_agents_own_session_from_its_environment() {
     assert!(session["left"]["native"]["disagreement"].is_null());
     assert!(
         stderr.contains(&format!(
-            "native        claude {cleared} (named by its environment)\n"
+            "native        claude {cleared} (claimed by the agent's environment, not observed)\n"
         )),
         "{stderr}"
     );
@@ -1996,29 +1996,100 @@ fn oriented_and_handover_record_the_agents_own_session_from_its_environment() {
     let found = &session["left"]["native"]["sessions"];
     assert_eq!(found.as_array().map(Vec::len), Some(1), "{session:#}");
     assert_eq!(found[0]["source"], "env");
+    assert_eq!(
+        found[0]["testimony"], true,
+        "the agent's claim: {session:#}"
+    );
     assert!(session["left"]["native"]["why"]
         .as_str()
         .unwrap()
         .starts_with("none found"));
 
-    // Disagreeing: both kept, and said.
+    // Review of #57: an environment claiming another session than the
+    // launch prompt was observed in (forged, or a `/clear` before the first
+    // read-back). The observation is kept, the claim is said and not taken.
     let (session, stderr) = run_fake_claude(
         &fixture,
         &repo,
         &[("OHJAA_FAKE_NATIVE", first), ("OHJAA_FAKE_HANDED", cleared)],
     );
+    let found = session["left"]["native"]["sessions"].as_array().unwrap();
+    assert_eq!(found.len(), 1, "{session:#}");
+    assert_eq!(found[0]["session_id"], first);
     assert_eq!(
-        session["left"]["native"]["sessions"]
-            .as_array()
-            .map(Vec::len),
-        Some(2),
-        "{session:#}"
+        session["native_env"][0]["session_id"], cleared,
+        "the claim itself is kept as said: {session:#}"
     );
     let said = format!(
-        "native        disagreement: its launch prompt named claude {first} and its own \
-         environment claude {cleared}: both are kept, neither is chosen\n"
+        "native        disagreement: its launch prompt named claude {first}, and the agent's \
+         environment claimed claude {cleared} instead (a /clear before its first read-back, or \
+         a mistake): the launch prompt's is kept, the claim is not\n"
     );
     assert!(stderr.contains(&said), "{stderr}");
+    fixture.cleanup();
+}
+
+/// Review of #57: a shell that kept a session's OHJAA_SESSION after it left
+/// (a tmux server started inside it) runs `ohjaa handover` in a session a
+/// person started by hand. Its environment's id is not recorded on the
+/// session that left, and the report still finds the bypass.
+#[test]
+fn an_id_named_after_leaving_is_not_recorded_and_the_bypass_is_still_found() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("native-env-stale");
+    let (repo, _) = report_fixture(&fixture);
+    let through = export_of(&fixture, &repo)["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["intent"] == "through ohjaa")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["handover", "--next", "from a shell that outlived it"])
+            .env("OHJAA_SESSION", &through)
+            .env("CLAUDE_CODE_SESSION_ID", "by-hand")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stdout.contains("recorded its claude session"), "{stdout}");
+    assert!(
+        stderr.contains("it has left: the id its environment names is not recorded"),
+        "{stderr}"
+    );
+    let record = export_of(&fixture, &repo)["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == through.as_str())
+        .unwrap()
+        .clone();
+    assert!(record["native_env"].is_null(), "{record:#}");
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .arg("--root")
+            .arg(&fixture.dir)
+            .args(["report", "--json"])
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+            .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let bypassed: Vec<&str> = json["report"]["bypasses"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(bypassed, ["by-hand", "pi-by-hand"], "{stdout}");
     fixture.cleanup();
 }
 
@@ -2048,7 +2119,7 @@ fn an_orphan_is_closed_with_what_its_agents_environment_named() {
     assert_eq!(code, None, "ohjaa was killed before leaving: {stderr}");
     assert!(
         stdout.contains(&format!(
-            "recorded its claude session {native}, as the agent's environment names it"
+            "recorded its claude session {native}, as the agent's environment claims it"
         )),
         "{stdout}"
     );
@@ -2062,7 +2133,7 @@ fn an_orphan_is_closed_with_what_its_agents_environment_named() {
     );
     assert!(
         stdout.contains(&format!(
-            "native        claude {native} (named by its environment)\n"
+            "native        claude {native} (claimed by the agent's environment, not observed)\n"
         )),
         "still open, it says what its environment named: {stdout}"
     );
@@ -2079,6 +2150,7 @@ fn an_orphan_is_closed_with_what_its_agents_environment_named() {
     let found = &closed["left"]["native"]["sessions"];
     assert_eq!(found[0]["session_id"], native, "{closed:#}");
     assert_eq!(found[0]["source"], "env", "{closed:#}");
+    assert_eq!(found[0]["testimony"], true, "{closed:#}");
     fixture.cleanup();
 }
 
