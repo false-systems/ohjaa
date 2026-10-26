@@ -358,8 +358,10 @@ struct Transcript {
 struct Prompt {
     session: String,
     at_ms: Option<i64>,
-    /// A fork's copy of its parent's record: Claude marks it `forkedFrom`;
-    /// a Codex or pi fork's copies are older than the fork itself.
+    /// A fork's copy of its parent's record. Claude marks each copy
+    /// `forkedFrom`. Codex copies its parent's records into a fork restamped
+    /// and unmarked, so in a Codex (or pi) fork every prompt is taken as a
+    /// copy: a fork is never named as holding a prompt itself.
     copied: bool,
 }
 
@@ -441,10 +443,7 @@ fn read_transcript(agent: Agent, path: &Path) -> std::io::Result<Transcript> {
                 transcript.forked_from = text_of(&record["parentSession"]);
                 false
             }
-            Agent::Codex | Agent::Pi => {
-                let at = time_of(&record["timestamp"]);
-                matches!((at, transcript.began_ms), (Some(at), Some(began)) if at < began)
-            }
+            Agent::Codex | Agent::Pi => transcript.forked_from.is_some(),
         };
         if !names {
             continue;
@@ -1008,6 +1007,44 @@ mod tests {
         assert_eq!(Sandbox::ids(&native), [parent, child], "{native:#?}");
         assert_eq!(native.sessions[1].forked_from.as_deref(), Some(parent));
         assert!(!native.sessions[1].resumed);
+    }
+
+    #[test]
+    fn a_codex_fork_is_named_only_as_a_fork_its_copies_restamped() {
+        let sandbox = Sandbox::new("codex-fork");
+        let parent = "019a0000-0000-7000-8000-000000000001";
+        let meta = |id: &str, began: i64, from: Option<&str>| {
+            json!({"type": "session_meta", "timestamp": at(began), "payload": {
+                "id": id, "session_id": id, "timestamp": at(began), "cwd": sandbox.cwd(),
+                "source": "cli", "forked_from_id": from}})
+        };
+        let developer = |ms: i64| {
+            json!({"type": "response_item", "timestamp": at(ms), "payload": {
+                "type": "message", "role": "developer",
+                "content": [{"type": "input_text", "text": prompt(OURS)}]}})
+        };
+        sandbox.write(
+            &format!("codex/sessions/2026/09/21/rollout-a-{parent}.jsonl"),
+            &[meta(parent, 1_000, None), developer(1_100)],
+        );
+        // As Codex writes a fork: its own header, then its parent's header
+        // and records copied after it, every one stamped anew, unmarked.
+        let fork = |id: &str, began: i64| {
+            sandbox.write(
+                &format!("codex/sessions/2026/09/21/rollout-b-{id}.jsonl"),
+                &[
+                    meta(id, began, Some(parent)),
+                    meta(parent, began + 1, None),
+                    developer(began + 2),
+                ],
+            );
+        };
+        let child = "019a0000-0000-7000-8000-000000000002";
+        fork(child, 600_000);
+        fork("019a0000-0000-7000-8000-000000000003", 7_200_000);
+        let native = sandbox.find("codex");
+        assert_eq!(Sandbox::ids(&native), [parent, child], "{native:#?}");
+        assert_eq!(native.sessions[1].forked_from.as_deref(), Some(parent));
     }
 
     #[test]
