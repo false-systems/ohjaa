@@ -3834,15 +3834,16 @@ fn the_briefing_opens_with_the_flag_and_ohjaa_gate_flips_the_tip() {
     );
     assert!(stderr.contains(&format!("ohjaa: {since}\n")), "{stderr}");
     let would = stderr
-        .lines()
-        .find(|line| line.starts_with("ohjaa: dry-run; would run: "))
+        .split_once("ohjaa: dry-run; would run: ")
+        .map(|(_, rest)| rest)
         .unwrap_or_else(|| panic!("{stderr}"));
     let briefing = would
         .split_once("--briefing ")
         .map(|(_, rest)| rest.trim_start_matches('\''))
         .unwrap_or_else(|| panic!("{would}"));
+    // After the sentinel line, which only says where ohjaa's words begin.
     assert!(
-        briefing.starts_with(&since),
+        briefing.starts_with(&format!("<!-- ohjaa-briefing v1 -->\n{since}")),
         "the flag comes first: {would}"
     );
     assert_eq!(sandbox.verifies() - before, 1, "one sykli verify");
@@ -4871,7 +4872,11 @@ fn real_sykli_the_briefing_flags_first_and_ohjaa_gate_flips_the_tip() {
     let output = sandbox.ohjaa_in(&repo, &["run", "claude", "--intent", "x", "--dry-run"]);
     let (_, stderr) = text(&output);
     assert!(
-        stderr.contains("--briefing 'FLAG: main of acme/widget has never been proven"),
+        // After the sentinel line, which only says where ohjaa's words begin.
+        stderr.contains(
+            "--briefing '<!-- ohjaa-briefing v1 -->\nFLAG: main of acme/widget has never been \
+             proven"
+        ),
         "{stderr}"
     );
 
@@ -6236,7 +6241,10 @@ fn every_command_stays_within_its_git_budget() {
     );
     assert!(
         said.contains("would run: ")
-            && said.contains("--briefing 'FLAG: main of acme/gated is unproven since "),
+            && said.contains(
+                "--briefing '<!-- ohjaa-briefing v1 -->\nFLAG: main of acme/gated is unproven \
+                 since "
+            ),
         "no flag first in the briefing: {said}"
     );
     assert_eq!(logs, 1, "one walk, in the clone's one git cat-file");

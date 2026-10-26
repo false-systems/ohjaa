@@ -122,8 +122,32 @@ exit 0
 
 /// Never the real vessa. Its header listing, `sessions --json --headers`,
 /// prints the file OHJAA_STUB_VESSA_JSON names, else no sessions; it lists
-/// nothing else, so a report that asked for the full listing would fail.
+/// no other sessions, so a report that asked for the full listing would
+/// fail. `messages` lists, as
+/// `vessa-messages.v1`, every line of `$HOME/vessa-messages.jsonl` (one
+/// message each, as vessa writes them), whatever its `--since`: intake
+/// windows what it is given too. Each call's arguments go to
+/// `$HOME/vessa-calls`. With `$HOME/vessa-gap` or `$HOME/vessa-warning` (each
+/// a JSON string) the list is partial, with that gap (a store vessa does not
+/// read) or source warning (one it could not read), and it exits 4. With
+/// `$HOME/vessa-old` it is a vessa older than `messages`.
 const VESSA_STUB: &str = r#"#!/bin/sh
+if [ "$1" = messages ]; then
+  printf '%s\n' "$*" >> "$HOME/vessa-calls"
+  if [ -e "$HOME/vessa-old" ]; then
+    echo "error: unrecognized subcommand 'messages'" >&2
+    echo "For more information, try '--help'." >&2
+    exit 2
+  fi
+  printf '{"schema":"vessa-messages.v1","messages":[\n'
+  if [ -f "$HOME/vessa-messages.jsonl" ]; then sed '$!s/$/,/' "$HOME/vessa-messages.jsonl"; fi
+  gaps=""; warnings=""; code=0
+  if [ -f "$HOME/vessa-gap" ]; then gaps=$(cat "$HOME/vessa-gap"); code=4; fi
+  if [ -f "$HOME/vessa-warning" ]; then warnings=$(cat "$HOME/vessa-warning"); code=4; fi
+  printf '],\n"sessions":[],\n"coverage":{"excluded":{},"gaps":[%s],"limitations":[]},\n"warnings":[%s]}\n' "$gaps" "$warnings"
+  [ "$code" = 4 ] && echo "vessa: partial message list (exit 4): 1 source warning, 0 limitations" >&2
+  exit "$code"
+fi
 [ "$*" = "sessions --json --headers" ] || { echo "vessa stub: not the header listing: $*" >&2; exit 64; }
 if [ -n "${OHJAA_STUB_VESSA_JSON:-}" ]; then
   cat "$OHJAA_STUB_VESSA_JSON"
@@ -131,6 +155,51 @@ else
   echo '{"schema":"vessa-session-headers.v1","sessions":[],"warnings":[]}'
 fi
 "#;
+
+/// A source warning from vessa (`$HOME/vessa-warning`): a transcript it could
+/// not read.
+const UNREADABLE: &str = r#""/h/.codex/sessions/r.jsonl: Permission denied (os error 13)""#;
+
+/// A gap from vessa (`$HOME/vessa-gap`): a store it knows of and does not
+/// read, written in the window, as on a machine where opencode is in use.
+const UNREAD_STORE: &str = r#""opencode: /h/.local/share/opencode/opencode.db not read; opencode keeps its sessions in SQLite, which Vessa does not read""#;
+
+/// One message a person wrote, as `vessa messages --json` lists it.
+fn vessa_line(at: &str, cwd: &str, text: &str, reply: Option<&str>) -> String {
+    serde_json::json!({
+        "agent": "claude", "session": "s1", "parent": null, "kind": "message", "id": null,
+        "at": at, "cwd": cwd, "text": text, "question": null,
+        "reply": reply.map(|text| serde_json::json!({
+            "text": text, "truncated": false, "failed": false, "line": 1,
+        })),
+        "source": "/t/s1.jsonl", "line": 2,
+    })
+    .to_string()
+}
+
+impl Fixture {
+    /// What the fake vessa lists, after what it already lists.
+    fn said(&self, lines: &[String]) {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("home/vessa-messages.jsonl"))
+            .unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
+
+    /// Each `vessa messages` call's arguments, in order.
+    fn vessa_calls(&self) -> Vec<String> {
+        fs::read_to_string(self.dir.join("home/vessa-calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
 
 /// A session payload exactly as `toimija sessions --json` emits it.
 fn sessions_json(sessions: &str, coverage: &str) -> String {
@@ -719,6 +788,9 @@ fn run_prepends_the_system_perimeter_to_the_task() {
     assert_eq!(argv[task + 1], "fix the lexer", "{argv:?}");
     assert_eq!(argv[task + 2], "--briefing", "{argv:?}");
     let end = argv.iter().rposition(|a| a == "--").expect("--");
+    // Its first line is the fixed sentinel vessa cuts a launch's task at
+    // (byte for byte: vessa matches it, so a change is a new version).
+    assert_eq!(argv[task + 3], "<!-- ohjaa-briefing v1 -->", "{argv:?}");
     let briefing = argv[task + 3..end].join("\n");
     assert!(briefing.contains("System perimeter"), "{briefing}");
     assert!(
@@ -1318,17 +1390,12 @@ fn intake_turns_a_correction_into_a_proposal_through_the_drafter() {
     }
     let fixture = Fixture::new("intake");
     let repo = fixture.make_git_repo("work");
-    let project = fixture.dir.join("home/.claude/projects/-work");
-    fs::create_dir_all(&project).unwrap();
-    fs::write(
-        project.join("session.jsonl"),
-        [
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Linux tests are blocked on macOS."}]}}"#,
-            r#"{"type":"user","timestamp":"2026-09-20T10:00:00Z","cwd":"/p/work","message":{"content":"we have lima baba"}}"#,
-        ]
-        .join("\n"),
-    )
-    .unwrap();
+    fixture.said(&[vessa_line(
+        "2026-09-20T10:00:00Z",
+        "/p/work",
+        "no, we have lima baba",
+        Some("Linux tests are blocked on macOS."),
+    )]);
     let drafter = fixture.stub_dir.join("drafter");
     fs::write(
         &drafter,
@@ -1396,13 +1463,12 @@ fn a_failing_drafter_stops_intake_without_moving_the_cursor() {
     }
     let fixture = Fixture::new("intakefail");
     let repo = fixture.make_git_repo("work");
-    let project = fixture.dir.join("home/.claude/projects/-work");
-    fs::create_dir_all(&project).unwrap();
-    fs::write(
-        project.join("s.jsonl"),
-        r#"{"type":"user","timestamp":"2026-09-20T10:00:00Z","message":{"content":"never python"}}"#,
-    )
-    .unwrap();
+    fixture.said(&[vessa_line(
+        "2026-09-20T10:00:00Z",
+        "/p/work",
+        "never python. i told you",
+        None,
+    )]);
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -2584,19 +2650,18 @@ fn intake_drafts_from_a_sessions_handover_once() {
 
 /// An ended session that said `count` corrections in its own window and
 /// repository (all in one second), read back and handed over: queued for
-/// intake, with `count + 1` candidates (and nothing for the report).
+/// intake, with `count + 1` candidates (and nothing for the report). Each is
+/// `correction <n>. you forgot it`, which the pre-filter keeps.
 fn session_that_said(fixture: &Fixture, repo: &Path, count: usize) {
-    let projects = fixture.dir.join("home/.claude/projects/-work");
-    fs::create_dir_all(&projects).unwrap();
     let script = format!(
         r#"sleep 1; here=$(pwd -P); at=$(date -u +%Y-%m-%dT%H:%M:%SZ); i=1
 while [ $i -le {count} ]; do
-  printf '{{"type":"user","timestamp":"%s","cwd":"%s","message":{{"content":"correction %s"}}}}\n' "$at" "$here" "$i" >> '{transcript}'
+  printf '{{"agent":"claude","session":"q","parent":null,"kind":"message","id":null,"at":"%s","cwd":"%s","text":"correction %s. you forgot it","question":null,"reply":null,"source":"/t/q.jsonl","line":%s}}\n' "$at" "$here" "$i" "$i" >> '{said}'
   i=$((i+1))
 done
 {ohjaa} oriented 'said corrections, then handed over' > /dev/null
 {ohjaa} handover --surprised 'the queue never drained'"#,
-        transcript = projects.join("queued.jsonl").display(),
+        said = fixture.dir.join("home/vessa-messages.jsonl").display(),
         ohjaa = ohjaa_bin(),
     );
     let (_, stderr, code) = run_session(fixture, repo, &script);
@@ -2922,16 +2987,12 @@ fn a_run_that_reads_only_some_sources_never_moves_the_cursor_past_the_others() {
     }
     let fixture = Fixture::new("intakepartial");
     let repo = fixture.make_git_repo("work");
-    let projects = fixture.dir.join("home/.claude/projects/-work");
-    fs::create_dir_all(&projects).unwrap();
-    fs::write(
-        projects.join("s.jsonl"),
-        format!(
-            r#"{{"type":"user","timestamp":"{}","cwd":"/p/work","message":{{"content":"the unread one"}}}}"#,
-            utc_now()
-        ),
-    )
-    .unwrap();
+    fixture.said(&[vessa_line(
+        &utc_now(),
+        "/p/work",
+        "the unread one. you forgot it",
+        None,
+    )]);
     std::thread::sleep(std::time::Duration::from_millis(1100));
     let sent = fixture.dir.join("sent.txt");
     let drafter = fixture.stub_dir.join("drafter");
@@ -2959,7 +3020,7 @@ fn a_run_that_reads_only_some_sources_never_moves_the_cursor_past_the_others() {
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(
         said_lines(&sent),
-        ["    said: the unread one"],
+        ["    said: the unread one. you forgot it"],
         "a run of reviews alone did not move past the transcripts: {stderr}"
     );
     fixture.cleanup();
@@ -2972,25 +3033,375 @@ fn a_run_with_warnings_never_says_nothing_new_and_exits_zero() {
     }
     let fixture = Fixture::new("intakewarned");
     let repo = fixture.make_git_repo("work");
-    let projects = fixture.dir.join("home/.claude/projects/-work");
-    fs::create_dir_all(&projects).unwrap();
-    let unreadable = projects.join("locked.jsonl");
-    fs::write(&unreadable, "{}").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    // vessa could not read a transcript.
+    fs::write(fixture.dir.join("home/vessa-warning"), UNREADABLE).unwrap();
     let (stdout, stderr, code) = output_of(
         fixture
             .ohjaa()
             .args(["intake", "--source", "transcripts", "--drafter", "false"])
             .current_dir(&repo),
     );
-    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(stderr.contains("cannot read"), "{stderr}");
+    assert!(
+        stderr.contains("ohjaa: intake: vessa: /h/.codex/sessions/r.jsonl: Permission denied"),
+        "{stderr}"
+    );
     assert!(
         !stdout.contains("nothing new"),
         "what could not be read is not nothing: {stdout}"
     );
     assert_eq!(code, Some(4), "{stdout}{stderr}");
+    fixture.cleanup();
+}
+
+#[test]
+fn intake_asks_vessa_from_the_cursor_and_sends_only_what_the_prefilter_keeps() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakevessa");
+    let repo = fixture.make_git_repo("work");
+    let now = utc_now();
+    let before = Some("Linux tests are blocked on macOS.");
+    fixture.said(&[
+        // A correction the phrase rules miss: dropped, and said.
+        vessa_line(&now, "/p/work", "we have lima baba", before),
+        vessa_line(&now, "/p/work", "no, run them in the lima VM", before),
+    ]);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = recording_drafter(&fixture, &sent);
+    let intake = |extra: &[&str]| {
+        output_of(
+            fixture
+                .ohjaa()
+                .arg("intake")
+                .args(extra)
+                .arg("--drafter")
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    let (_, stderr, code) = intake(&["--since", "2026-09-01"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        fixture.vessa_calls(),
+        ["messages --since 2026-09-01T00:00:00.000Z --json"],
+        "vessa is the one reader, asked from the window's start"
+    );
+    assert_eq!(
+        said_lines(&sent),
+        ["    said: no, run them in the lima VM"],
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "ohjaa: intake: 2 message(s) people wrote, listed by vessa; the pre-filter \
+             (phrase-rules.v3) kept 1 (correction 1) and dropped 1 (claude 1), keeping none \
+             of them"
+        ),
+        "read, kept and dropped, by counts: {stderr}"
+    );
+    assert!(!stderr.contains("lima baba"), "never the words: {stderr}");
+    assert!(
+        stderr.contains("the drafter answered for 1 candidate(s) in this run"),
+        "{stderr}"
+    );
+
+    // The next run asks vessa from the cursor, exactly as it is kept, and
+    // finds nothing new: the dropped message is behind the cursor now.
+    let cursor = fs::read_to_string(fixture.dir.join("state/ohjaa/intake-since")).unwrap();
+    let (stdout, stderr, code) = intake(&[]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("nothing new"), "{stdout}");
+    assert_eq!(
+        fixture.vessa_calls().last().unwrap(),
+        &format!("messages --since {} --json", cursor.trim())
+    );
+    assert_eq!(said_lines(&sent).len(), 1);
+
+    // Read again without the pre-filter, the dropped message is a candidate.
+    let (_, stderr, code) = intake(&["--since", "2026-09-01", "--no-prefilter"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        said_lines(&sent).contains(&"    said: we have lima baba".to_owned()),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("no pre-filter (--no-prefilter): 2 candidate(s)"),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_partial_list_from_vessa_holds_the_cursor_and_says_why() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakegap");
+    let repo = fixture.make_git_repo("work");
+    fixture.said(&[vessa_line(
+        &utc_now(),
+        "/p/work",
+        "i told you, never python",
+        None,
+    )]);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let unreadable = fixture.dir.join("home/vessa-warning");
+    fs::write(&unreadable, UNREADABLE).unwrap();
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = recording_drafter(&fixture, &sent);
+    let cursor_path = fixture.dir.join("state/ohjaa/intake-since");
+    let intake = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    // Exit 4 from vessa, a transcript it could not read: what it listed is
+    // drafted from, and the cursor stays where the first run's window began.
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    assert_eq!(said_lines(&sent).len(), 1, "{stderr}");
+    assert!(
+        stderr.contains("ohjaa: intake: vessa: /h/.codex/sessions/r.jsonl: Permission denied"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("transcripts could not all be read"),
+        "the held cursor is said, and what holds it: {stderr}"
+    );
+    let held = fs::read_to_string(&cursor_path).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "the cursor stays at {}",
+            held.trim().replace(".000Z", "Z")
+        )),
+        "{held} {stderr}"
+    );
+    // Once vessa reads everything, nothing is sent again, and it moves.
+    fs::remove_file(&unreadable).unwrap();
+    let (stdout, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("nothing new"), "{stdout}");
+    assert_eq!(said_lines(&sent).len(), 1, "handled once: {stderr}");
+    let moved = fs::read_to_string(&cursor_path).unwrap();
+    assert!(moved > held, "{held} -> {moved}");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_store_vessa_does_not_read_is_said_every_run_and_holds_neither_cursor_nor_queue() {
+    // The review of #56: an opencode store written in the window held the
+    // cursor, and every queued session, until vessa could read SQLite; the
+    // hold kept the window before each day's write, so it never ended.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakestore");
+    let repo = fixture.make_git_repo("work");
+    let script = format!("{} handover --surprised 'the store text'", ohjaa_bin());
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+    fixture.said(&[vessa_line(
+        &utc_now(),
+        "/p/elsewhere",
+        "i told you, never python",
+        None,
+    )]);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(fixture.dir.join("home/vessa-gap"), UNREAD_STORE).unwrap();
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = recording_drafter(&fixture, &sent);
+    let cursor_path = fixture.dir.join("state/ohjaa/intake-since");
+    let intake = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    let said = "ohjaa: intake: vessa: opencode: /h/.local/share/opencode/opencode.db not read";
+    let (stdout, stderr, code) = intake();
+    assert_eq!(
+        code,
+        Some(0),
+        "a store vessa does not read is no failure: {stderr}"
+    );
+    assert!(stderr.contains(said), "said: {stderr}");
+    assert!(!stderr.contains("cursor stays"), "{stderr}");
+    let sent_once = said_lines(&sent);
+    assert!(
+        sent_once.contains(&"    said: i told you, never python".to_owned())
+            && sent_once.iter().any(|l| l.contains("the store text")),
+        "the message, and the session's handover: {stderr}"
+    );
+    assert!(stdout.contains("0 proposal(s)"), "{stdout}");
+    let first = fs::read_to_string(&cursor_path).unwrap();
+    // Said again on the next run, which finds the session drafted and the
+    // cursor moved past what was sent.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (stdout, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains(said), "said on every run: {stderr}");
+    assert!(stdout.contains("nothing new"), "{stdout}");
+    assert!(
+        !stderr.contains("queued"),
+        "the session is drafted: {stderr}"
+    );
+    assert_eq!(said_lines(&sent), sent_once, "nothing sent twice: {stderr}");
+    let second = fs::read_to_string(&cursor_path).unwrap();
+    assert!(second > first, "the cursor moves: {first} -> {second}");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_pasted_secret_never_reaches_the_drafter_with_the_filter_on_or_off() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakesecret");
+    let repo = fixture.make_git_repo("work");
+    // Put together here, so no secret-shaped literal sits in the source.
+    let key = ["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"].concat();
+    let now = utc_now();
+    fixture.said(&[
+        vessa_line(
+            &now,
+            "/p/work",
+            &format!("i told you, the token is {key}"),
+            None,
+        ),
+        vessa_line(
+            &now,
+            "/p/work",
+            &format!("here: {key}"),
+            Some(&format!("I need {key}")),
+        ),
+    ]);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let prompts = fixture.dir.join("prompts.txt");
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!("#!/bin/sh\ncat >> '{}'\necho '[]'\n", prompts.display()),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = |extra: &[&str]| {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--source", "transcripts", "--since", "2026-09-01"])
+                .args(extra)
+                .arg("--drafter")
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    // A dry run shows the prompt, scrubbed too, and sends nothing.
+    let (stdout3, stderr3, code) = intake(&["--no-prefilter", "--dry-run"]);
+    assert_eq!(code, Some(0), "{stderr3}");
+    assert!(
+        stderr3.contains("3 secret-looking token(s) redacted from the batch shown"),
+        "{stderr3}"
+    );
+    assert!(!prompts.exists(), "a dry run sends nothing");
+    // The filter keeps the correction; its key is redacted, and counted.
+    let (stdout, stderr, code) = intake(&[]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("1 secret-looking token(s) were redacted from what it was sent"),
+        "{stderr}"
+    );
+    // Without it, the other message goes too, with the agent's words before
+    // it (the first was handled already).
+    let (stdout2, stderr2, code) = intake(&["--no-prefilter"]);
+    assert_eq!(code, Some(0), "{stderr2}");
+    assert!(
+        stderr2.contains("2 secret-looking token(s) were redacted from what it was sent"),
+        "{stderr2}"
+    );
+    let sent = fs::read_to_string(&prompts).unwrap();
+    assert!(
+        sent.contains("said: i told you, the token is [redacted]"),
+        "{sent}"
+    );
+    assert!(sent.contains("before: I need [redacted]"), "{sent}");
+    assert!(stdout3.contains("said: here: [redacted]"), "{stdout3}");
+    // Never said, logged or kept anywhere ohjaa writes.
+    for (what, text) in [
+        ("the prompts", sent.as_str()),
+        ("stdout", stdout.as_str()),
+        ("stderr", stderr.as_str()),
+        ("stdout", stdout2.as_str()),
+        ("stderr", stderr2.as_str()),
+        ("the dry run", stdout3.as_str()),
+        ("the dry run's stderr", stderr3.as_str()),
+    ] {
+        assert!(!text.contains(&key), "{what} holds the key");
+    }
+    for entry in fs::read_dir(fixture.dir.join("state/ohjaa"))
+        .unwrap()
+        .flatten()
+    {
+        if entry.path().is_file() {
+            let kept = String::from_utf8_lossy(&fs::read(entry.path()).unwrap()).into_owned();
+            assert!(
+                !kept.contains(&key),
+                "{} holds the key",
+                entry.path().display()
+            );
+        }
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn an_old_vessa_is_told_to_update_and_nothing_reads_the_transcripts_instead() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakeoldvessa");
+    let repo = fixture.make_git_repo("work");
+    fs::write(fixture.dir.join("home/vessa-old"), "").unwrap();
+    // A transcript intake once read itself: no fallback reads it now.
+    let projects = fixture.dir.join("home/.claude/projects/-work");
+    fs::create_dir_all(&projects).unwrap();
+    fs::write(
+        projects.join("s.jsonl"),
+        format!(
+            r#"{{"type":"user","timestamp":"{}","cwd":"/p/work","message":{{"content":"i told you, never python"}}}}"#,
+            utc_now()
+        ),
+    )
+    .unwrap();
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = recording_drafter(&fixture, &sent);
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(stderr.contains("update vessa"), "{stderr}");
+    assert!(
+        stderr.contains("unrecognized subcommand 'messages'"),
+        "vessa's own words: {stderr}"
+    );
+    assert!(said_lines(&sent).is_empty(), "{stderr}");
+    assert!(!stdout.contains("nothing new"), "{stdout}");
+    assert!(
+        stderr.contains("transcripts could not all be read"),
+        "{stderr}"
+    );
     fixture.cleanup();
 }
 
@@ -3087,16 +3498,12 @@ fn a_first_run_keeps_its_window_start_as_the_cursor_even_when_it_drafts_nothing(
     }
     let fixture = Fixture::new("intakefirst");
     let repo = fixture.make_git_repo("work");
-    let projects = fixture.dir.join("home/.claude/projects/-work");
-    fs::create_dir_all(&projects).unwrap();
-    fs::write(
-        projects.join("s.jsonl"),
-        format!(
-            r#"{{"type":"user","timestamp":"{}","cwd":"/p/work","message":{{"content":"never python"}}}}"#,
-            utc_now()
-        ),
-    )
-    .unwrap();
+    fixture.said(&[vessa_line(
+        &utc_now(),
+        "/p/work",
+        "never python. i told you",
+        None,
+    )]);
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -3211,16 +3618,12 @@ impl Poisoned {
         let fixture = Fixture::new(tag);
         let repo = fixture.make_git_repo("work");
         session_that_said(&fixture, &repo, 3);
-        let elsewhere = fixture.dir.join("home/.claude/projects/-elsewhere");
-        fs::create_dir_all(&elsewhere).unwrap();
-        fs::write(
-            elsewhere.join("free.jsonl"),
-            format!(
-                r#"{{"type":"user","timestamp":"{}","cwd":"/p/elsewhere","message":{{"content":"the stubborn one"}}}}"#,
-                utc_now()
-            ),
-        )
-        .unwrap();
+        fixture.said(&[vessa_line(
+            &utc_now(),
+            "/p/elsewhere",
+            "the stubborn one. you forgot it",
+            None,
+        )]);
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let (refuse, tried, sent) = (
             fixture.dir.join("refuse"),
@@ -3612,15 +4015,11 @@ fn sessions_are_drafted_only_once_their_transcript_window_was_read() {
     );
     // ...and one whose transcripts could not all be read drafts from what it
     // found, but leaves the session queued.
-    let projects = fixture.dir.join("home/.claude/projects/-work");
-    fs::create_dir_all(&projects).unwrap();
-    let unreadable = projects.join("locked.jsonl");
-    fs::write(&unreadable, "{}").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable = fixture.dir.join("home/vessa-warning");
+    fs::write(&unreadable, UNREADABLE).unwrap();
     let (prompt, _) = intake("transcripts");
     assert!(prompt.contains("the handover text"), "{prompt}");
-    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(&unreadable).unwrap();
     // Read cleanly: still queued after the warning, its handover is not sent
     // again, and only now it is marked drafted.
     let (prompt, stderr) = intake("transcripts");
@@ -4687,6 +5086,10 @@ fn a_failing_commit_pushed_to_main_flags_the_record_and_tops_the_next_briefing()
             .current_dir(&repo),
     );
     let briefing = &stderr[stderr.find("--briefing '").expect(&stderr) + 12..];
+    // After the sentinel line, which only says where ohjaa's words begin.
+    let briefing = briefing
+        .strip_prefix("<!-- ohjaa-briefing v1 -->\n")
+        .expect(briefing);
     assert!(
         briefing.starts_with("WARNING from the last session here (oh-"),
         "{briefing}"
