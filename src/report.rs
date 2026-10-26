@@ -47,8 +47,9 @@ const VESSA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// What `vessa sessions --json --headers` answers with (vessa#5).
 const VESSA_HEADERS: &str = "vessa-session-headers.v1";
 
-/// The agents whose sessions are judged.
-const NATIVE_AGENTS: [&str; 2] = ["claude", "codex"];
+/// The agents vessa reads the sessions of and `ohjaa run` launches. opencode
+/// is launched too, but vessa does not read its sessions.
+const NATIVE_AGENTS: [&str; 3] = ["claude", "codex", "pi"];
 
 /// A session that ended without the agent's testimony.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -555,7 +556,9 @@ fn native_sessions(
 
 /// Whether a session was started by no person: `claude -p` (Claude's
 /// `entrypoint` is `sdk-…`), or `codex exec` (Codex's `originator` names
-/// exec). Intake's own drafter runs one of these.
+/// exec). Intake's own drafter runs one of these unless configured
+/// otherwise. A pi transcript says nothing of how pi was started (vessa
+/// gives both as null), so a `pi -p` run is judged as a person's session.
 fn headless(session: &Value) -> bool {
     session["entrypoint"]
         .as_str()
@@ -569,7 +572,7 @@ fn headless(session: &Value) -> bool {
 /// `sessions[]` with exactly `agent`, `id`, `parent`, `started_at` (RFC
 /// 3339), `cwd`, `source`, and how each was started (`entrypoint`,
 /// `originator`), as the full listing names them; any other schema is not
-/// read. Claude and Codex sessions are judged. Subagent sessions (with a
+/// read. Claude, Codex and pi sessions are judged. Subagent sessions (with a
 /// parent) and headless runs were started by no person and are left out. A
 /// session with no date or no folder cannot be judged against a launch: it
 /// is kept apart as undated when its transcript was written in the window.
@@ -1400,6 +1403,24 @@ mod tests {
             &[receipted]
         )
         .is_empty());
+        // pi by the same rule: its launch claims it, and a claude launch
+        // claims no pi session, nor a pi launch a claude one.
+        let pi = session("oh-3", "pi", "/nonexistent/r/app", 2_000_000);
+        assert!(bypasses(
+            vec![native("pi", "h", "/nonexistent/r/app", 2_004_000)],
+            std::slice::from_ref(&pi)
+        )
+        .is_empty());
+        assert_eq!(
+            ids(bypasses(
+                vec![
+                    native("pi", "i", "/nonexistent/r/app", 1_003_000),
+                    native("claude", "j", "/nonexistent/r/app", 2_003_000),
+                ],
+                &[launched, pi]
+            )),
+            ["i", "j"]
+        );
     }
 
     #[test]
@@ -1420,6 +1441,8 @@ mod tests {
             s("tui", "claude", json!({"entrypoint": "cli"})),
             s("sub", "claude", json!({"parent": "tui"})),
             s("pi", "pi", json!({})),
+            s("pi-sub", "pi", json!({"parent": "pi"})),
+            s("other", "opencode", json!({})),
             s("old", "codex", json!({"started_at": "2026-09-01T10:00:00Z"})),
             s("headless", "claude", json!({"entrypoint": "sdk-cli"})),
             s("exec", "codex", json!({"originator": "codex_exec"})),
@@ -1428,7 +1451,14 @@ mod tests {
         ]});
         let (judgeable, natives) = parse_native(&listed, since, now).unwrap();
         let at = since + 6 * 86_400_000 + 36_000_500;
-        assert_eq!(judgeable, [native("claude", "tui", "/r/app", at)]);
+        assert_eq!(
+            judgeable,
+            [
+                native("claude", "tui", "/r/app", at),
+                native("pi", "pi", "/r/app", at)
+            ],
+            "a person's pi session is judged too; opencode, which vessa does not read, is not"
+        );
         assert_eq!(
             natives.headless, 2,
             "claude -p and codex exec bypass nothing"

@@ -5328,36 +5328,35 @@ fn a_session_keeps_its_own_commits_in_a_checkout_another_session_has_left() {
     fixture.cleanup();
 }
 
-/// One launch through ohjaa of a stub `claude` that writes when it started,
-/// and a session of `sh` that pushes a failing commit to main: what the
-/// report is made of.
+/// One launch through ohjaa each of a stub `claude` and a stub `pi` that
+/// write when they started, and a session of `sh` that pushes a failing
+/// commit to main: what the report is made of.
 fn report_fixture(fixture: &Fixture) -> (PathBuf, String) {
     let repo = clone_with_origin(fixture, "work");
-    let started = fixture.dir.join("claude-started");
-    let claude = fixture.stub_dir.join("claude");
-    fs::write(
-        &claude,
-        format!(
-            "#!/bin/sh\ndate -u +%Y-%m-%dT%H:%M:%SZ > '{}'\nexit 0\n",
-            started.display()
-        ),
-    )
-    .unwrap();
-    make_executable(&claude);
-    let (_, stderr, code) = output_of(
-        fixture
-            .ohjaa()
-            .args([
-                "run",
-                "claude",
-                "--intent",
-                "through ohjaa",
-                "--no-briefing",
-            ])
-            .env("OHJAA_STUB_RUN_AGENT", "1")
-            .current_dir(&repo),
-    );
-    assert_eq!(code, Some(0), "{stderr}");
+    let launch = |agent: &str, intent: &str| {
+        let started = fixture.dir.join(format!("{agent}-started"));
+        let stub = fixture.stub_dir.join(agent);
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\ndate -u +%Y-%m-%dT%H:%M:%SZ > '{}'\nexit 0\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&stub);
+        let (_, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args(["run", agent, "--intent", intent, "--no-briefing"])
+                .env("OHJAA_STUB_RUN_AGENT", "1")
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        fs::read_to_string(&started).unwrap().trim().to_owned()
+    };
+    let launched = launch("claude", "through ohjaa");
+    let pi_launched = launch("pi", "pi through ohjaa");
     let script = format!(
         "{RECEIPT_FN}
         set -e
@@ -5383,9 +5382,8 @@ fn report_fixture(fixture: &Fixture) -> (PathBuf, String) {
             .current_dir(&repo),
     );
     assert_eq!(code, Some(0), "{stderr}");
-    // vessa sees the launch above, and one claude session started by hand:
-    // its header listing, each session's eight fields.
-    let launched = fs::read_to_string(&started).unwrap().trim().to_owned();
+    // vessa sees the launches above, and a claude and a pi session started
+    // by hand: its header listing, each session's eight fields.
     let repo_path = std::fs::canonicalize(&repo).unwrap();
     fs::write(
         fixture.dir.join("vessa.json"),
@@ -5394,7 +5392,9 @@ fn report_fixture(fixture: &Fixture) -> (PathBuf, String) {
               {{"agent":"claude","id":"through","parent":null,"started_at":"{launched}","cwd":"{r}","source":"/nonexistent/1.jsonl","entrypoint":"cli","originator":null}},
               {{"agent":"claude","id":"by-hand","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere","source":"/nonexistent/2.jsonl","entrypoint":"cli","originator":null}},
               {{"agent":"claude","id":"by-hand","parent":"x","started_at":"{launched}","cwd":"{r}","source":"/nonexistent/3.jsonl","entrypoint":"cli","originator":null}},
-              {{"agent":"claude","id":"drafter","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere","source":"/nonexistent/4.jsonl","entrypoint":"sdk-cli","originator":null}}
+              {{"agent":"claude","id":"drafter","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere","source":"/nonexistent/4.jsonl","entrypoint":"sdk-cli","originator":null}},
+              {{"agent":"pi","id":"pi-through","parent":null,"started_at":"{pi_launched}","cwd":"{r}","source":"/nonexistent/5.jsonl","entrypoint":null,"originator":null}},
+              {{"agent":"pi","id":"pi-by-hand","parent":null,"started_at":"{pi_launched}","cwd":"{r}/elsewhere","source":"/nonexistent/6.jsonl","entrypoint":null,"originator":null}}
             ]}}"#,
             r = repo_path.display()
         )
@@ -5433,13 +5433,20 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
     // The window's report, as it was, under `report`.
     let json = &marks["report"];
     assert_eq!(json["schema"], "ohjaa-report.v1");
-    let intents: Vec<&str> = json["sessions_without_testimony"]
+    let mut intents: Vec<&str> = json["sessions_without_testimony"]
         .as_array()
         .unwrap()
         .iter()
         .map(|s| s["intent"].as_str().unwrap())
         .collect();
-    assert_eq!(intents, ["through ohjaa", "push broken"], "{stdout}");
+    // Launched within a second of each other, they are logged in no
+    // particular order.
+    intents.sort_unstable();
+    assert_eq!(
+        intents,
+        ["pi through ohjaa", "push broken", "through ohjaa"],
+        "{stdout}"
+    );
     let commits = json["unproven_commits"].as_array().unwrap();
     assert_eq!(commits.len(), 1, "{stdout}");
     assert_eq!(commits[0]["check"], "failed");
@@ -5461,8 +5468,9 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
         .collect();
     assert_eq!(
         bypassed,
-        ["by-hand"],
-        "the launch through ohjaa and a subagent are not bypasses: {stdout}"
+        ["by-hand", "pi-by-hand"],
+        "the launches through ohjaa, claude's and pi's, and a subagent are not bypasses; \
+         a pi session started by hand is: {stdout}"
     );
     let (text, _, code) = report(false);
     assert_eq!(code, Some(0));
@@ -5470,9 +5478,10 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
         text.contains("Commits on a default branch without passing evidence (1), of ")
             && text.contains("  The rest: ")
             && text.contains(&format!("work origin/main {pushed} \"broken build\""))
-            && text.contains("Agent sessions a person started without ohjaa (1):")
+            && text.contains("Agent sessions a person started without ohjaa (2):")
             && text.contains("Not counted: 1 headless run(s)")
-            && text.contains("- claude by-hand in /nonexistent/elsewhere"),
+            && text.contains("- claude by-hand in /nonexistent/elsewhere")
+            && text.contains("- pi pi-by-hand in /nonexistent/elsewhere"),
         "{text}"
     );
     assert!(
@@ -5507,7 +5516,8 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
         prompt.contains("never read back its briefing")
             && prompt
                 .contains("\"broken build\" is on origin/main in work without passing evidence")
-            && prompt.contains("a claude session (by-hand)"),
+            && prompt.contains("a claude session (by-hand)")
+            && prompt.contains("a pi session (pi-by-hand)"),
         "{prompt}"
     );
     assert!(!prompt.contains("unverified"), "{prompt}");
@@ -5874,7 +5884,8 @@ fn commands_that_only_read_the_session_log_never_write_it() {
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(log_stamp(&log), before, "usage export wrote the log");
     let export: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(export["sessions"].as_array().unwrap().len(), 2, "{out}");
+    // The fixture's three: claude's launch, pi's, and the push.
+    assert_eq!(export["sessions"].as_array().unwrap().len(), 3, "{out}");
     let id = export["sessions"][0]["id"].as_str().unwrap().to_owned();
     let root = fixture.dir.to_string_lossy().into_owned();
     let reads: [&[&str]; 10] = [
