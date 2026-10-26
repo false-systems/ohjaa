@@ -2060,7 +2060,7 @@ fn an_id_named_after_leaving_is_not_recorded_and_the_bypass_is_still_found() {
     assert_eq!(code, Some(0), "{stderr}");
     assert!(!stdout.contains("recorded its claude session"), "{stdout}");
     assert!(
-        stderr.contains("it has left: the id its environment names is not recorded"),
+        stderr.contains("has left: the id its environment names is not recorded"),
         "{stderr}"
     );
     let record = export_of(&fixture, &repo)["sessions"]
