@@ -1358,17 +1358,32 @@ mod tests {
         }
     }
 
+    /// `session` as left at `ended_ms`, its leaving observed.
+    fn ended(mut session: Session, ended_ms: i64) -> Session {
+        let mut left = sessions::Left::orphaned(ended_ms);
+        left.orphaned = false;
+        session.left = Some(left);
+        session
+    }
+
+    fn ids(list: Vec<Bypass>) -> Vec<String> {
+        list.into_iter().map(|b| b.id).collect()
+    }
+
     #[test]
     fn a_native_session_is_ohjaas_when_launched_by_it_here_and_then() {
-        let launched = session("oh-1", "claude", "/nonexistent/r/app", 1_000_000);
-        let ids = |list: Vec<Bypass>| list.into_iter().map(|b| b.id).collect::<Vec<_>>();
+        // It ran for ten minutes.
+        let launched = ended(
+            session("oh-1", "claude", "/nonexistent/r/app", 1_000_000),
+            1_600_000,
+        );
         // Its agent, in its repository (a folder below it too), seconds after.
         assert!(bypasses(
             vec![native("claude", "a", "/nonexistent/r/app/src", 1_003_000)],
             std::slice::from_ref(&launched)
         )
         .is_empty());
-        // Another agent, another place, or long after: not launched by it.
+        // Another agent, another place, or after it ended: not launched by it.
         assert_eq!(
             ids(bypasses(
                 vec![
@@ -1420,6 +1435,83 @@ mod tests {
                 &[launched, pi]
             )),
             ["i", "j"]
+        );
+    }
+
+    /// An agent can write its first record long after its launch (Claude at
+    /// the first prompt: 96 s in syva on 10-20, Codex 115 s and 188 s): what
+    /// starts while a launch runs can be its own, and nothing after it ended.
+    #[test]
+    fn a_launch_claims_what_starts_while_it_runs() {
+        let repo = "/nonexistent/r/syva";
+        let day = 86_400_000;
+        let launched = ended(
+            session("oh-1", "claude", repo, 1_000_000),
+            1_000_000 + 2 * day,
+        );
+        assert!(
+            bypasses(
+                vec![native("claude", "own", repo, 1_096_000)],
+                std::slice::from_ref(&launched)
+            )
+            .is_empty(),
+            "started 96 s into a launch that ran two days"
+        );
+        // A launch that was over in half a minute claims nothing after.
+        let short = ended(session("oh-2", "codex", repo, 1_000_000), 1_030_000);
+        assert_eq!(
+            ids(bypasses(
+                vec![native("codex", "later", repo, 1_045_000)],
+                &[short]
+            )),
+            ["later"]
+        );
+        // One still running claims what starts hours in, once.
+        let open = session("oh-3", "pi", repo, 1_000_000);
+        assert_eq!(
+            ids(bypasses(
+                vec![
+                    native("pi", "own", repo, 1_000_000 + 7_200_000),
+                    native("pi", "second", repo, 1_000_000 + 7_300_000),
+                ],
+                &[open]
+            )),
+            ["second"]
+        );
+    }
+
+    /// A launch a usage receipt names a session of is matched by its receipt
+    /// alone: it never also clears a session by time.
+    #[test]
+    fn a_launch_with_a_receipt_claims_no_other_session() {
+        let repo = "/nonexistent/r/app";
+        let mut launched = ended(session("oh-1", "claude", repo, 1_000_000), 1_600_000);
+        launched.usage = vec![serde_json::from_value(json!({
+            "schema": "agent-usage.v1", "agent": "claude", "session_id": "mine", "source": "s",
+            "observed_at_ms": 0, "complete": true, "limitations": [], "entries": []
+        }))
+        .unwrap()];
+        for (mine, by_hand) in [(1_003_000, 1_020_000), (1_004_000, 1_001_000)] {
+            assert_eq!(
+                ids(bypasses(
+                    vec![
+                        native("claude", "mine", repo, mine),
+                        native("claude", "by-hand", repo, by_hand),
+                    ],
+                    std::slice::from_ref(&launched)
+                )),
+                ["by-hand"],
+                "its own at {mine}, one by hand at {by_hand}"
+            );
+        }
+        // Its own session outside the window still is its own: the launch
+        // clears nothing else.
+        assert_eq!(
+            ids(bypasses(
+                vec![native("claude", "by-hand", repo, 1_002_000)],
+                std::slice::from_ref(&launched)
+            )),
+            ["by-hand"]
         );
     }
 

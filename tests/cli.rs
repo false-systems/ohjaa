@@ -5642,7 +5642,9 @@ fn a_vessa_too_old_for_headers_is_said_and_never_read_the_slow_way() {
         format!(
             "#!/bin/sh\necho \"$*\" >> '{}'\n\
              case \" $* \" in *' --headers '*)\n\
-               echo \"error: unexpected argument '--headers' found\" >&2; exit 2;;\n\
+               printf '%s\\n\\n%s\\n\\n%s\\n' \"error: unexpected argument '--headers' found\" \
+                 'Usage: vessa sessions [OPTIONS]' \"For more information, try '--help'.\" >&2\n\
+               exit 2;;\n\
              esac\n\
              echo '{{\"schema\":\"vessa-usage.v1\",\"sessions\":[],\"warnings\":[]}}'\n",
             calls.display()
@@ -5662,13 +5664,15 @@ fn a_vessa_too_old_for_headers_is_said_and_never_read_the_slow_way() {
         }
         output_of(&mut command)
     };
+    // What vessa said is kept: its first line, not clap's closing hint.
+    let why = "vessa is too old for `sessions --headers`; update it (vessa said: error: \
+               unexpected argument '--headers' found)";
     let (stdout, stderr, code) = report(false);
     assert_eq!(code, Some(4), "never a clean week: {stdout}{stderr}");
     assert!(
-        stdout.contains(
-            "Agent sessions a person started without ohjaa: not judged: vessa is too old for \
-             `sessions --headers`; update it"
-        ),
+        stdout.contains(&format!(
+            "Agent sessions a person started without ohjaa: not judged: {why}"
+        )),
         "{stdout}"
     );
     let (stdout, _, code) = report(true);
@@ -5676,16 +5680,122 @@ fn a_vessa_too_old_for_headers_is_said_and_never_read_the_slow_way() {
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         json["report"]["bypasses"],
-        serde_json::json!({
-            "judged": false,
-            "why": "vessa is too old for `sessions --headers`; update it"
-        })
+        serde_json::json!({"judged": false, "why": why})
     );
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
         "sessions --json --headers\nsessions --json --headers\n",
         "asked once a report, for the headers alone: no fallback to the full listing"
     );
+    fixture.cleanup();
+}
+
+/// Two pi sessions start in the repository while one `ohjaa run pi` runs:
+/// its own, whose transcript was last written as it ended, and one a person
+/// opened by hand and left at once. Whichever started first, the one by hand
+/// is the bypass, never ohjaa's own.
+#[test]
+fn of_two_sessions_started_during_a_launch_its_own_is_not_the_bypass() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("report-two-pis");
+    let repo = fixture.make_git_repo("work");
+    let repo_path = std::fs::canonicalize(&repo).unwrap();
+    // The stub pi notes two moments a second apart while it runs, each as
+    // epoch seconds and RFC 3339 from one `date`.
+    let moments = fixture.dir.join("pi-moments");
+    let pi = fixture.stub_dir.join("pi");
+    fs::write(
+        &pi,
+        format!(
+            "#!/bin/sh\ndate -u '+%s %Y-%m-%dT%H:%M:%SZ' > '{m}'\nsleep 1\n\
+             date -u '+%s %Y-%m-%dT%H:%M:%SZ' >> '{m}'\nsleep 1\nexit 0\n",
+            m = moments.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&pi);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "pi", "--intent", "pi through ohjaa", "--no-briefing"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let noted = fs::read_to_string(&moments).unwrap();
+    let at: Vec<(u64, &str)> = noted
+        .lines()
+        .map(|line| {
+            let (secs, rfc) = line.split_once(' ').unwrap();
+            (secs.parse().unwrap(), rfc)
+        })
+        .collect();
+    assert_eq!(at.len(), 2, "{noted}");
+    let (out, stderr, code) =
+        output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(code, Some(0), "{stderr}");
+    let export: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let ended_ms = export["sessions"][0]["left"]["ended_ms"].as_i64().unwrap();
+    let transcript = |name: &str, written_secs: u64| {
+        let path = fixture.dir.join(format!("{name}.jsonl"));
+        fs::write(&path, "{}\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(written_secs))
+            .unwrap();
+        path
+    };
+    for (own_at, by_hand_at) in [(at[1], at[0]), (at[0], at[1])] {
+        // Its own was written until the launch ended; the one by hand only
+        // as it started.
+        let own = transcript("own", (ended_ms / 1000) as u64);
+        let by_hand = transcript("by-hand", by_hand_at.0);
+        let line = |id: &str, started: &str, source: &Path| {
+            format!(
+                r#"{{"agent":"pi","id":"{id}","parent":null,"started_at":"{started}","cwd":"{}","source":"{}","entrypoint":null,"originator":null}}"#,
+                repo_path.display(),
+                source.display()
+            )
+        };
+        fs::write(
+            fixture.dir.join("vessa.json"),
+            format!(
+                r#"{{"schema":"vessa-session-headers.v1","warnings":[],"sessions":[{},{}]}}"#,
+                line("by-hand", by_hand_at.1, &by_hand),
+                line("own", own_at.1, &own)
+            ),
+        )
+        .unwrap();
+        let (stdout, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .arg("--root")
+                .arg(&fixture.dir)
+                .args(["report", "--json"])
+                .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+                .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+                .current_dir(&repo),
+        );
+        assert!(matches!(code, Some(0 | 4)), "{stdout}{stderr}");
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let bypassed: Vec<&str> = json["report"]["bypasses"]["sessions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{stdout}"))
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            bypassed,
+            ["by-hand"],
+            "own started {}, by hand {}: {stdout}",
+            own_at.1,
+            by_hand_at.1
+        );
+    }
     fixture.cleanup();
 }
 
