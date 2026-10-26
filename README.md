@@ -151,9 +151,13 @@ each prompt is made, every candidate's words and the agent's words before them,
 from every source and with the filter on or off, have secret-looking tokens
 replaced by `[redacted]`. Those are known key prefixes (`sk-`, `ghp_`, `gho_`,
 `github_pat_`, `xoxb-`/`xoxp-`/`xoxa-`/`xoxs-`, `AKIA`/`ASIA`, `glpat-`,
-`AIza`), JWTs, PEM private key blocks, and a long mixed token right after a
-word that names a secret (`api_key=…`, `GITHUB_TOKEN=…`, `password: …`,
-`Authorization: Bearer …`). A git sha or a UUID alone is left alone. The
+`AIza`), JWTs, PEM private key blocks, a long mixed token right after a word that
+names a secret (`api_key=…`, `GITHUB_TOKEN=…`, `password: …`,
+`Authorization: Bearer …`), and a long random-looking token alone (a key
+with no known prefix: 32 or more characters, a quarter of them capitals,
+changing case or digit nearly every other character). A git sha, a UUID or
+a long name is left alone; on the 14 days of 2026-10-26 it redacted one
+token in 1,383 candidates. The
 original is never said, logged or kept; each run says only how many were
 redacted, and a dry run shows the scrubbed prompt.
 

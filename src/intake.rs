@@ -1229,6 +1229,10 @@ fn secret(run: &str, after: Option<(&str, &str)>) -> Option<usize> {
     if found {
         return Some(head.len());
     }
+    // A key of a vendor not named here: long and random-looking, alone.
+    if random_looking(head) {
+        return Some(head.len());
+    }
     let (word, between) = after?;
     let separated = (1..=4).contains(&between.len())
         && between
@@ -1238,6 +1242,50 @@ fn secret(run: &str, after: Option<(&str, &str)>) -> Option<usize> {
     let long_and_mixed =
         run.len() >= 16 && mixed(run) && distinct >= 8 && !run.starts_with(['/', '~', '.']);
     (separated && names_a_secret(word) && long_and_mixed).then_some(run.len())
+}
+
+/// Long (32 or more), with digits, as varied as random text, a quarter or
+/// more of it capitals, and changing between lower case, capitals and
+/// digits at least every other character or so: what a key with no known
+/// prefix looks like. A git sha and a UUID have no capitals; a long name
+/// (`ProjectSettingsV2Controller`, `Base64EncodedSha256Digest`) has fewer,
+/// and changes case only between its words.
+fn random_looking(token: &str) -> bool {
+    let count = |kind: fn(&u8) -> bool| token.bytes().filter(kind).count();
+    let class = |b: u8| match b {
+        b'a'..=b'z' => 0,
+        b'A'..=b'Z' => 1,
+        b'0'..=b'9' => 2,
+        _ => 3,
+    };
+    let changes = token
+        .as_bytes()
+        .windows(2)
+        .filter(|pair| class(pair[0]) != class(pair[1]))
+        .count();
+    token.len() >= 32
+        && count(u8::is_ascii_lowercase) >= 2
+        && count(u8::is_ascii_digit) >= 2
+        && 4 * count(u8::is_ascii_uppercase) >= token.len()
+        && 10 * changes >= 4 * (token.len() - 1)
+        && entropy(token) >= 4.2
+}
+
+/// Shannon entropy, in bits per character.
+fn entropy(token: &str) -> f64 {
+    let mut counts = [0usize; 256];
+    for byte in token.bytes() {
+        counts[usize::from(byte)] += 1;
+    }
+    let n = token.len() as f64;
+    counts
+        .iter()
+        .filter(|c| **c > 0)
+        .map(|c| {
+            let p = *c as f64 / n;
+            -p * p.log2()
+        })
+        .sum()
 }
 
 /// `key`, `token`, `secret`, `password`, `passwd` or `bearer`, alone or
@@ -2609,6 +2657,14 @@ mod tests {
             assert_eq!(n, 1, "{text}: {scrubbed}");
             assert!(!scrubbed.contains(value), "{scrubbed}");
         }
+        // A long random-looking token alone, with no prefix and no name: a
+        // key of some vendor ohjaa knows nothing of.
+        let unnamed = fake(&["be3f", "Q9xT2mLk7RvA4nWp8ZcH1sYd6JgU3eBo5KfN0iMq2"]);
+        for text in [unnamed.clone(), format!("use this one: {unnamed}")] {
+            let (scrubbed, n) = scrub(&text);
+            assert_eq!(n, 1, "{scrubbed}");
+            assert!(!scrubbed.contains(&unnamed), "{scrubbed}");
+        }
         // Two in one message are two.
         assert_eq!(scrub(&format!("{} and {}", cases[2].1, cases[7].1)).1, 2);
     }
@@ -2631,6 +2687,13 @@ mod tests {
             "the AKIA prefix names an AWS key",
             "eyJ is how base64 JSON starts",
             "monkey Ab3dE5gH7jK9mN1pQ3sT",
+            // Long names and hashes people write, mixed or long as they are.
+            "see ProjectManagementDashboardSettingsV2Controller for it",
+            "test_the_cursor_moves_only_past_what_was_handled_and_never_back_2",
+            "sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "Base64EncodedSha256DigestOfTheTree is the field",
+            "AKIAIOSFODNN7EXAMPLE2026Q3RotationScheduleV2",
+            "MyS3BucketPolicyForEu1WestReplication2 x86_64AppleDarwin23NightlyToolchain2026",
         ] {
             assert_eq!(scrub(text), (text.to_owned(), 0), "{text}");
         }
