@@ -1040,13 +1040,12 @@ no window, no vessa.
 }
 ```
 
-The shape grows and does not change: `integrated` (per entry and per
-commit) is additive, and every other key is as it was, so a reader of the
-earlier `ohjaa-marks.v1` (viemäri) keeps working. One exception: the
-additive `judgements` key (KATANA D5) was removed with `ohjaa judge` on
-2026-10-26. It was optional, nothing read it (viemäri never did), and an
-audit that day found no Judgement ever recorded, so the schema stays
-`ohjaa-marks.v1`; a reader must not require it.
+The keys `ohjaa-marks.v1` had when viemäri was built on it (2026-10-13)
+never go; `integrated` (per entry and per commit) was added since, so a
+reader of the earlier shape keeps working. `judgements` was added on
+2026-10-14 (#46) and removed with `ohjaa judge` on 2026-10-26: nothing ever
+read it and no Judgement was ever recorded, so the schema kept its name.
+From now on, `ohjaa-marks.v1` only gains keys.
 
 `ended` says why the walk stopped: at a proven commit, at the branch's first
 commit, after 50, or before a commit only sykli could judge with no `sykli
