@@ -537,9 +537,17 @@ fn native_sessions(
         }
     };
     // A vessa from before vessa#5 refuses the flag as a usage error: exit 2,
-    // nothing listed. It is updated, never read the slow way.
+    // nothing listed. It is updated, never read the slow way. What it said
+    // is kept, for a usage error of another kind: its first line, where
+    // clap puts the error (its last is a hint to try --help).
     if output.status.code() == Some(2) && output.stdout.trim_ascii().is_empty() {
-        return Err("vessa is too old for `sessions --headers`; update it".to_owned());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let said = stderr.lines().map(str::trim).find(|line| !line.is_empty());
+        return Err(format!(
+            "vessa is too old for `sessions --headers`; update it{}",
+            said.map(|line| format!(" (vessa said: {line})"))
+                .unwrap_or_default()
+        ));
     }
     let listed: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         format!(
