@@ -201,9 +201,17 @@ mark, flag" below) and three lists for the window:
   (`vessa sessions --json --headers`, `vessa-session-headers.v1`) lists in
   the window and no `ohjaa run` launched. opencode is not judged: vessa
   does not read its sessions.
-  - A session belongs to a launch when the launch's usage receipt names it,
-    or when it is the same agent, in the launch's repository or below,
-    started within a minute after the launch. Each launch claims one.
+  - A session belongs to a launch when the launch's usage receipt names it;
+    a launch with a receipt claims no other session.
+  - Otherwise a launch claims at most one session: the same agent, in the
+    launch's repository or below, started while the launch ran (from 5 s
+    before it was logged until it left, or now while it runs). An agent can
+    write its first record minutes into its launch.
+  - When more than one could be a launch's, the one whose transcript was
+    last written closest to the launch's end is its own (for a launch still
+    running, or closed as an orphan, the one that started closest to it).
+    Each session is any launch's at most once, and the same list always
+    gives the same answer.
   - Headless runs bypass nothing and are only counted: `claude -p`
     (`entrypoint` `sdk-…`), `codex exec` (`originator` naming exec), and
     intake's own drafter with them. A pi transcript does not say how pi was

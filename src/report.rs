@@ -32,10 +32,10 @@ use crate::sessions::{self, Check, Session};
 /// run` says one to the person.
 pub const WEEK_MS: i64 = 7 * 86_400_000;
 
-/// How far a native session's start may lie from its `ohjaa run` launch and
-/// still be that launch's agent: entering, toimija and the agent's own start
-/// take seconds, and a loaded machine more.
-const LAUNCH_SLACK_MS: i64 = 60_000;
+/// How long before its `ohjaa run` launch was logged a native session may
+/// start and still be that launch's agent: the log and the transcript each
+/// keep their own clock.
+const LAUNCH_EARLY_MS: i64 = 5_000;
 
 /// How long vessa may take to list the sessions. Its header mode reads only
 /// each transcript's opening records: about half a second for some 950
@@ -497,6 +497,18 @@ pub struct Native {
     pub id: String,
     pub cwd: String,
     pub started_ms: i64,
+    /// When its transcript was last written, when that can be told.
+    pub written_ms: Option<i64>,
+}
+
+/// When the transcript at `source` was last written, in whole seconds, as
+/// the window's ends and the log's times are.
+fn written(source: &str) -> Option<i64> {
+    std::fs::metadata(source)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|at| at.as_secs() as i64 * 1000)
 }
 
 /// vessa's list for the window: the sessions a person started, dated and
@@ -626,16 +638,12 @@ pub fn parse_native(
                     id: text("id"),
                     cwd,
                     started_ms,
+                    written_ms: written(&text("source")),
                 });
             }
             _ => {
                 let source = text("source");
-                let written_ms = std::fs::metadata(&source)
-                    .ok()
-                    .and_then(|meta| meta.modified().ok())
-                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-                    // Whole seconds, as the window's ends are.
-                    .map(|at| at.as_secs() as i64 * 1000);
+                let written_ms = written(&source);
                 // Undated: in the window when its transcript was written then,
                 // or when that cannot be told.
                 let relevant = match (started_ms, written_ms) {
@@ -662,54 +670,85 @@ pub fn parse_native(
     Ok((judgeable, natives))
 }
 
-/// The native sessions no `ohjaa run` launched, oldest first. One matches a
-/// logged session when that session's usage receipt names it, or when it is
-/// the same agent, in that session's repository (or below it), and started
-/// within [`LAUNCH_SLACK_MS`] after the launch (or 5 s before it); each
-/// logged session claims at most one, the closest.
+/// The native sessions no `ohjaa run` launched, oldest first.
+///
+/// A launch with a usage receipt is matched by its receipts alone: the
+/// sessions they name are its own, and it claims no other. Every other
+/// launch may claim one session of its agent (the launched command's file
+/// name), in its repository or below, that started while it ran: from
+/// [`LAUNCH_EARLY_MS`] before it was logged until its leaving was (to now
+/// while it runs). An agent can write its first record long after its
+/// launch, so nothing narrower holds.
+///
+/// One-to-one: each pair that could match is ranked by how well it fits,
+/// best first, and taken while neither is taken. For a launch seen to end,
+/// the fit is how close the session's transcript was last written to that
+/// end, since its agent wrote until it exited and a session beside it
+/// rarely stops then too; otherwise, and when the transcript cannot be
+/// read, it is how close the session started to the launch. Ties go to the
+/// closer start, then the earlier session and launch by id, so the same
+/// list always gives the same answer.
 pub fn bypasses(native: Vec<Native>, logged: &[Session]) -> Vec<Bypass> {
     let canonical =
         |path: &str| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
-    let mut claimed = std::collections::HashSet::new();
-    let mut by_receipt = std::collections::HashSet::new();
-    for s in logged {
-        for receipt in &s.usage {
-            by_receipt.insert((receipt.agent.clone(), receipt.session_id.clone()));
-        }
-    }
-    let mut native = native;
-    native.sort_by_key(|n| n.started_ms);
-    let mut out = Vec::new();
-    for n in native {
-        if by_receipt.contains(&(n.agent.clone(), n.id.clone())) {
-            continue;
-        }
+    let by_receipt: std::collections::HashSet<(&str, &str)> = logged
+        .iter()
+        .flat_map(|s| &s.usage)
+        .map(|receipt| (receipt.agent.as_str(), receipt.session_id.as_str()))
+        .collect();
+    let mut native: Vec<Native> = native
+        .into_iter()
+        .filter(|n| !by_receipt.contains(&(n.agent.as_str(), n.id.as_str())))
+        .collect();
+    native.sort_by(|a, b| (a.started_ms, &a.id).cmp(&(b.started_ms, &b.id)));
+    let launches: Vec<(&Session, PathBuf)> = logged
+        .iter()
+        .filter(|s| s.usage.is_empty())
+        .map(|s| (s, canonical(&s.repo)))
+        .collect();
+    let mut pairs = Vec::new();
+    for (i, n) in native.iter().enumerate() {
         let cwd = canonical(&n.cwd);
-        let launch = logged
-            .iter()
-            .filter(|s| !claimed.contains(&s.id))
-            .filter(|s| {
-                Path::new(&s.agent).file_name().and_then(|f| f.to_str()) == Some(n.agent.as_str())
-            })
-            .filter(|s| cwd.starts_with(canonical(&s.repo)))
-            .filter(|s| {
-                n.started_ms >= s.started_ms - 5_000
-                    && n.started_ms <= s.started_ms + LAUNCH_SLACK_MS
-            })
-            .min_by_key(|s| (n.started_ms - s.started_ms).abs());
-        match launch {
-            Some(s) => {
-                claimed.insert(s.id.clone());
+        for (j, (s, repo)) in launches.iter().enumerate() {
+            let agent = Path::new(&s.agent).file_name().and_then(|f| f.to_str());
+            // Whole seconds in the log: its end may read up to one early.
+            let ran = n.started_ms >= s.started_ms - LAUNCH_EARLY_MS
+                && s.left
+                    .as_ref()
+                    .is_none_or(|left| n.started_ms < left.ended_ms + 1000);
+            if agent != Some(n.agent.as_str()) || !cwd.starts_with(repo) || !ran {
+                continue;
             }
-            None => out.push(Bypass {
-                agent: n.agent,
-                id: n.id,
-                cwd: n.cwd,
-                started_ms: n.started_ms,
-            }),
+            let from_start = (n.started_ms - s.started_ms).abs();
+            // An orphan's end was never seen, only that it was over by then.
+            let seen_end = s.left.as_ref().filter(|left| !left.orphaned);
+            let fit = match (seen_end, n.written_ms) {
+                (Some(left), Some(written)) => (written - left.ended_ms).abs(),
+                _ => from_start,
+            };
+            pairs.push(((fit, from_start, i, s.id.as_str()), i, j));
         }
     }
-    out
+    pairs.sort();
+    let mut taken_native = vec![false; native.len()];
+    let mut taken_launch = vec![false; launches.len()];
+    for (_, i, j) in pairs {
+        if !taken_native[i] && !taken_launch[j] {
+            taken_native[i] = true;
+            taken_launch[j] = true;
+        }
+    }
+    native
+        .into_iter()
+        .zip(taken_native)
+        .filter(|(_, taken)| !taken)
+        .map(|(n, _)| Bypass {
+            agent: n.agent,
+            id: n.id,
+            cwd: n.cwd,
+            started_ms: n.started_ms,
+        })
+        .collect()
 }
 
 // ---- saying it --------------------------------------------------------------
@@ -1355,6 +1394,14 @@ mod tests {
             id: id.to_owned(),
             cwd: cwd.to_owned(),
             started_ms,
+            written_ms: None,
+        }
+    }
+
+    fn last_written(native: Native, written_ms: i64) -> Native {
+        Native {
+            written_ms: Some(written_ms),
+            ..native
         }
     }
 
@@ -1513,6 +1560,65 @@ mod tests {
             )),
             ["by-hand"]
         );
+    }
+
+    /// Two sessions of one agent start while one launch runs. The one whose
+    /// transcript was last written as the launch ended is its own, whichever
+    /// started first; without an end seen, the closer start is.
+    #[test]
+    fn of_two_sessions_during_a_launch_the_one_written_until_it_ended_is_its_own() {
+        let repo = "/nonexistent/r/app";
+        let end = 1_600_000;
+        let launched = ended(session("oh-1", "pi", repo, 1_000_000), end);
+        let own = |at: i64| last_written(native("pi", "own", repo, at), end - 1_000);
+        let by_hand = |at: i64| last_written(native("pi", "by-hand", repo, at), at + 2_000);
+        for (own_at, by_hand_at) in [(1_004_000, 1_001_000), (1_001_000, 1_004_000)] {
+            for listed in [
+                vec![own(own_at), by_hand(by_hand_at)],
+                vec![by_hand(by_hand_at), own(own_at)],
+            ] {
+                assert_eq!(
+                    ids(bypasses(listed, std::slice::from_ref(&launched))),
+                    ["by-hand"],
+                    "own at {own_at}, by hand at {by_hand_at}"
+                );
+            }
+        }
+        // A session by hand that goes on after the launch ended is not it
+        // either, though it started closer.
+        let outlived = last_written(native("pi", "by-hand", repo, 1_001_000), end + 3_600_000);
+        assert_eq!(
+            ids(bypasses(
+                vec![outlived, own(1_004_000)],
+                std::slice::from_ref(&launched)
+            )),
+            ["by-hand"]
+        );
+        // Still running, or closed as an orphan (its end never seen): the
+        // closer start, the same either way the list comes.
+        let mut orphan = launched.clone();
+        orphan.left.as_mut().unwrap().orphaned = true;
+        for launch in [session("oh-2", "pi", repo, 1_000_000), orphan] {
+            for listed in [
+                vec![own(1_001_000), by_hand(1_004_000)],
+                vec![by_hand(1_004_000), own(1_001_000)],
+            ] {
+                assert_eq!(
+                    ids(bypasses(listed, std::slice::from_ref(&launch))),
+                    ["by-hand"]
+                );
+            }
+        }
+        // Two launches and their two sessions: each its own.
+        let second = ended(session("oh-3", "pi", repo, 1_010_000), 1_300_000);
+        assert!(bypasses(
+            vec![
+                last_written(native("pi", "a", repo, 1_003_000), end - 1_000),
+                last_written(native("pi", "b", repo, 1_013_000), 1_299_000),
+            ],
+            &[launched, second]
+        )
+        .is_empty());
     }
 
     #[test]
