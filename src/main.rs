@@ -47,6 +47,12 @@ const INCOMPLETE: i32 = 4;
 /// The most a briefing may be: it travels as one command-line argument, to
 /// toimija and on to the agent, and Linux caps one at 128 KiB.
 const MAX_BRIEFING: usize = 100 * 1024;
+/// The first line of the briefing every launched agent gets: one fixed line
+/// that says where ohjaa's words begin, so a reader of transcripts (vessa,
+/// cutting a launch's task from the briefing toimija appends after it) can
+/// key on it instead of on the sentences each part opens with. Others match
+/// it byte for byte: a change is a new version, never an edit.
+const BRIEFING_SENTINEL: &str = "<!-- ohjaa-briefing v1 -->";
 
 #[derive(Parser)]
 #[command(
@@ -2566,6 +2572,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         let validated = validation.briefing();
         let siblings = clone_sessions_text(&clone_scans);
         let parts: Vec<&str> = [
+            BRIEFING_SENTINEL,
             flagged.as_str(),
             validated.as_str(),
             still.as_str(),

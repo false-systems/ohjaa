@@ -713,6 +713,9 @@ fn run_prepends_the_system_perimeter_to_the_task() {
     assert_eq!(argv[task + 1], "fix the lexer", "{argv:?}");
     assert_eq!(argv[task + 2], "--briefing", "{argv:?}");
     let end = argv.iter().rposition(|a| a == "--").expect("--");
+    // Its first line is the fixed sentinel vessa cuts a launch's task at
+    // (byte for byte: vessa matches it, so a change is a new version).
+    assert_eq!(argv[task + 3], "<!-- ohjaa-briefing v1 -->", "{argv:?}");
     let briefing = argv[task + 3..end].join("\n");
     assert!(briefing.contains("System perimeter"), "{briefing}");
     assert!(
@@ -4558,6 +4561,10 @@ fn a_failing_commit_pushed_to_main_flags_the_record_and_tops_the_next_briefing()
             .current_dir(&repo),
     );
     let briefing = &stderr[stderr.find("--briefing '").expect(&stderr) + 12..];
+    // After the sentinel line, which only says where ohjaa's words begin.
+    let briefing = briefing
+        .strip_prefix("<!-- ohjaa-briefing v1 -->\n")
+        .expect(briefing);
     assert!(
         briefing.starts_with("WARNING from the last session here (oh-"),
         "{briefing}"
