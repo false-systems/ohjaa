@@ -146,20 +146,34 @@ lenient, and its recall low, so it is never silent:
 - PR comments, reverts, the report, handovers and observed failures are not
   filtered.
 
-**Secrets never reach the drafter.** People paste credentials to agents. As
-each prompt is made, every candidate's words and the agent's words before them,
-from every source and with the filter on or off, have secret-looking tokens
-replaced by `[redacted]`. Those are known key prefixes (`sk-`, `ghp_`, `gho_`,
-`github_pat_`, `xoxb-`/`xoxp-`/`xoxa-`/`xoxs-`, `AKIA`/`ASIA`, `glpat-`,
-`AIza`), JWTs, PEM private key blocks, a long mixed token right after a word that
-names a secret (`api_key=…`, `GITHUB_TOKEN=…`, `password: …`,
-`Authorization: Bearer …`), and a long random-looking token alone (a key
-with no known prefix: 32 or more characters, a quarter of them capitals,
-changing case or digit nearly every other character). A git sha, a UUID or
-a long name is left alone; on the 14 days of 2026-10-26 it redacted one
-token in 1,383 candidates. The
-original is never said, logged or kept; each run says only how many were
-redacted, and a dry run shows the scrubbed prompt.
+**Secret-looking tokens are redacted before the drafter: a best effort over
+known shapes, not a guarantee.** People paste credentials to agents. As each
+prompt is made, the candidate's words and the agent's words before them
+(not the place, the author or the session id) are scrubbed, from every source,
+with the filter on or off. A token in one of these shapes becomes `[redacted]`:
+- a known key prefix: `sk-`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`,
+  `github_pat_`, `xoxb-`/`xoxp-`/`xoxa-`/`xoxs-`, `AKIA`/`ASIA`, `glpat-`,
+  `AIza`;
+- a JWT, or a PEM private key block;
+- an id and a secret joined by a dot (`<hex, 24+>.<letters and digits,
+  12+>`), as some providers issue keys;
+- a token of 32 or more characters with two or more each of capitals, lower
+  case letters and digits, unless it is hex (a hash or a UUID, either case);
+  a path is judged by the pieces of its names;
+- a long mixed token right after a word that names a secret (`api_key=…`,
+  `GITHUB_TOKEN=…`, `password: …`, `Authorization: Bearer …`). That
+  includes a sha or a UUID after `key:` or `token:`.
+
+Anything else gets through: a short password, a key with no digits, or one in
+a shape not listed. Long random ids that are no secret (document ids, a
+base64 alphabet in code) are redacted too, at little cost to the drafter. On
+the 14 days of 2026-10-26, with `--no-prefilter`, 4 tokens were redacted in
+1,383 candidates: the credential the review of #56 found (no token of its
+shape reached the drafter) and, by a count per kind of token, document ids. The original is never said, logged or kept; each run says only how many
+were redacted, and a dry run shows the scrubbed prompt. Whether the drafter
+is a local model or `claude -p` is Yair's decision, and still open. Until it
+is made, the filter's default (on) also keeps most messages from leaving the
+machine at all.
 
 It sends them in batches to a **drafter**, an agent CLI that reads a prompt on
 stdin and prints a JSON array. The default is `claude -p`; override it with
