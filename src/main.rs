@@ -2114,10 +2114,13 @@ impl Intent {
                 format!("continued; the session log could not be read to check it ({why})")
             }
         };
+        // The handshake leaving looks for in the agent's transcript (D7).
         format!(
-            "This session is {session}; its intent is {}, {origin}. Continue it in a later \
-             session with: ohjaa run <agent> --intent-id {}\n",
-            self.id, self.id
+            "{}; its intent is {}, {origin}. Continue it in a later session with: ohjaa \
+             run <agent> --intent-id {}\n",
+            usage::handshake(session),
+            self.id,
+            self.id
         )
     }
 }
@@ -2803,6 +2806,8 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 observed: Vec::new(),
                 shared: Vec::new(),
                 orphaned: false,
+                // No agent ran.
+                native: None,
             };
             if let Some(store) = session_store(&dirs) {
                 let _ = store.update(&session_id, |s| s.left = Some(left));
@@ -2831,6 +2836,25 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let toimija_session =
         unless_interrupted(|| lifecycle::toimija_session(&root, !in_repo, child.id(), started_ms))
             .flatten();
+    // The agent's own sessions: the transcripts holding this launch's prompt.
+    let native = unless_interrupted(|| {
+        usage::find_native(
+            &usage::Launch {
+                session: &session_id,
+                agent,
+                folder: &folder,
+                started_ms,
+                // To the end of this second: times here are whole seconds.
+                last_seen_ms: (intake::now_seconds() + 1) * 1000,
+                unbriefed: briefing.is_none(),
+            },
+            &usage::Stores::from_env(),
+        )
+    })
+    .unwrap_or_else(|| usage::Native {
+        sessions: Vec::new(),
+        why: Some("not looked for: leaving was interrupted first".to_owned()),
+    });
     // Other sessions in these repositories while this one ran: what was made
     // in a place they shared at that time is not this session's (law 3). From
     // the log, and the live sessions toimija saw at launch.
@@ -2947,6 +2971,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         observed: launch.observed,
         shared: launch.shared,
         orphaned: false,
+        native: Some(native),
     };
     // The store is opened only now, after every slow call, and held only for
     // this one write.
@@ -3107,54 +3132,75 @@ fn integrated_at_leaving(
 /// entering record names it) still runs: its agent outlived its ohjaa, and
 /// it is returned apart, as still running.
 fn close_orphans(dirs: &Dirs, write: bool) -> (Vec<sessions::Session>, Vec<sessions::Session>) {
-    // A dry run only says what it would close: it opens the log to read.
-    let store = if write {
-        let Some(store) = session_store(dirs) else {
-            return (Vec::new(), Vec::new());
-        };
-        Some(store)
-    } else {
-        None
-    };
-    let all = match &store {
-        Some(store) => store.all(),
-        None => match session_reader(dirs) {
-            Some(log) => log.all(),
-            None => return (Vec::new(), Vec::new()),
-        },
-    };
-    let Ok((all, _)) = all else {
+    // Read only to find them (a dry run only says what it would close), and
+    // let go before any transcript is read. It is opened to write only for the
+    // writes.
+    let all = session_reader(dirs).map(|log| log.all());
+    let Some(Ok((all, _))) = all else {
         return (Vec::new(), Vec::new());
     };
     let now_ms = intake::now_seconds() * 1000;
-    let mut closed = Vec::new();
+    let mut orphans = Vec::new();
     let mut still_running = Vec::new();
     for session in all.into_iter().filter(|s| s.left.is_none()) {
         match sessions::observe_open(&session) {
-            sessions::Open::Running => continue,
+            sessions::Open::Running => {}
             // Its ohjaa is gone; its agent is not.
-            sessions::Open::OhjaaGone => {
-                still_running.push(session);
-                continue;
-            }
-            sessions::Open::Orphaned => {}
+            sessions::Open::OhjaaGone => still_running.push(session),
+            sessions::Open::Orphaned => orphans.push(session),
         }
-        let left = sessions::Left::orphaned(now_ms);
-        let Some(store) = &store else {
-            let mut session = session;
+    }
+    if orphans.is_empty() {
+        return (orphans, still_running);
+    }
+    // Its agent's own sessions are found as at leaving, by its launch
+    // prompt; a fork only if begun before it was last seen.
+    let stores = usage::Stores::from_env();
+    let left_of = |session: &sessions::Session| sessions::Left {
+        native: Some(usage::find_native(
+            &usage::Launch {
+                session: &session.id,
+                agent: &session.agent,
+                folder: Path::new(&session.repo),
+                started_ms: session.started_ms,
+                // Not now: a fork made after it was last seen is not its.
+                last_seen_ms: session.last_seen_ms(),
+                unbriefed: false,
+            },
+            &stores,
+        )),
+        ..sessions::Left::orphaned(now_ms)
+    };
+    let found: Vec<(sessions::Session, sessions::Left)> = orphans
+        .into_iter()
+        .map(|session| {
+            let left = left_of(&session);
+            (session, left)
+        })
+        .collect();
+    if !write {
+        let said = found.into_iter().map(|(mut session, left)| {
             session.left = Some(left);
-            closed.push(session);
-            continue;
-        };
+            session
+        });
+        return (said.collect(), still_running);
+    }
+    // Opened again only for the writes.
+    let Some(store) = session_store(dirs) else {
+        return (Vec::new(), still_running);
+    };
+    let mut closed = Vec::new();
+    for (session, left) in found {
+        // Another launch may have closed it while the transcripts were read:
+        // only a leaving this one wrote is said as closed here.
+        let ours = left.clone();
         let updated = store.update(&session.id, |s| {
             if s.left.is_none() {
                 s.left = Some(left);
             }
         });
         match updated {
-            Ok(Some(updated)) if updated.left.as_ref().is_some_and(|l| l.orphaned) => {
-                closed.push(updated)
-            }
+            Ok(Some(updated)) if updated.left.as_ref() == Some(&ours) => closed.push(updated),
             Ok(_) => {}
             Err(error) => eprintln!("ohjaa: {error}"),
         }
