@@ -1713,6 +1713,20 @@ mod tests {
         let mut longer = whole.clone();
         longer.extend_from_slice(b"5 0000000000000000\n");
         assert!(read(&longer).is_err(), "a line after the end");
+        // A digest is exactly 16 lowercase hex digits, even when the count
+        // agrees.
+        for line in [
+            "5 000000000000000",
+            "5 00000000000000000",
+            "5 000000000000000A",
+        ] {
+            let file = format!("{HANDLED_HEADER}\n{line}\nend 1\n");
+            assert!(read(file.as_bytes()).is_err(), "{line}");
+        }
+        let file =
+            format!("{HANDLED_HEADER}\n5 0123456789abcdef failed 2 review no JSON array\nend 1\n");
+        let failing = read(file.as_bytes()).unwrap();
+        assert_eq!(failing.failing.values().next().map(|f| f.attempts), Some(2));
         let _ = std::fs::remove_dir_all(&root);
     }
 

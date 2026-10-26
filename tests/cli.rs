@@ -2864,6 +2864,203 @@ fn a_run_with_warnings_never_says_nothing_new_and_exits_zero() {
     fixture.cleanup();
 }
 
+/// A stub drafter that records the `said:` lines it answers for in `sent`.
+fn recording_drafter(fixture: &Fixture, sent: &Path) -> PathBuf {
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ngrep '^    said: ' >> '{}'\necho '[]'\n",
+            sent.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    drafter
+}
+
+#[test]
+fn an_intake_killed_mid_run_keeps_every_batch_answered_before_the_kill() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakekilled");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 5);
+    let (sent, count, hung, pids) = (
+        fixture.dir.join("sent.txt"),
+        fixture.dir.join("count"),
+        fixture.dir.join("hung"),
+        fixture.dir.join("pids"),
+    );
+    // Its second call hangs, until ohjaa is killed under it.
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\nn=$(($(cat '{count}' 2>/dev/null || echo 0) + 1)); echo $n > '{count}'\n\
+             if [ $n -eq 2 ]; then sleep 30 & echo \"$$ $!\" > '{pids}'; touch '{hung}'; wait; fi\n\
+             grep '^    said: ' >> '{sent}'\necho '[]'\n",
+            count = count.display(),
+            pids = pids.display(),
+            hung = hung.display(),
+            sent = sent.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = || {
+        let mut command = fixture.ohjaa();
+        command
+            .args([
+                "intake",
+                "--source",
+                "transcripts",
+                "--batch",
+                "2",
+                "--drafter",
+            ])
+            .arg(&drafter)
+            .current_dir(&repo);
+        command
+    };
+    let mut first = intake()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_for_file(&hung), "the second call never came");
+    first.kill().unwrap();
+    first.wait().unwrap();
+    for pid in fs::read_to_string(&pids).unwrap().split_whitespace() {
+        let _ = Command::new("kill").args(["-9", pid]).status();
+    }
+    assert_eq!(said_lines(&sent).len(), 2, "the first batch was answered");
+    let (_, stderr, code) = output_of(&mut intake());
+    assert_eq!(code, Some(0), "{stderr}");
+    let mut lines = said_lines(&sent);
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    lines.sort();
+    lines.dedup();
+    assert_eq!(
+        lines.len(),
+        6,
+        "nothing answered before the kill was sent again"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_first_run_keeps_its_window_start_as_the_cursor_even_when_it_drafts_nothing() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakefirst");
+    let repo = fixture.make_git_repo("work");
+    let projects = fixture.dir.join("home/.claude/projects/-work");
+    fs::create_dir_all(&projects).unwrap();
+    fs::write(
+        projects.join("s.jsonl"),
+        format!(
+            r#"{{"type":"user","timestamp":"{}","cwd":"/p/work","message":{{"content":"never python"}}}}"#,
+            utc_now()
+        ),
+    )
+    .unwrap();
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--drafter", "exit 1"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(4), "{stderr}");
+    let since = stderr
+        .split(" since ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .expect(&stderr)
+        .to_owned();
+    let cursor = fs::read_to_string(fixture.dir.join("state/ohjaa/intake-since")).unwrap();
+    assert_eq!(
+        cursor.trim(),
+        since.replace('Z', ".000Z"),
+        "the default window's start, kept before drafting: {stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn what_no_later_run_can_find_again_is_forgotten() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakeforget");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 2);
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = recording_drafter(&fixture, &sent);
+    let handled = fixture.dir.join("state/ohjaa/intake-handled");
+    let intake = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    // Every source, so the cursor moves and the session is drafted from.
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(said_lines(&sent).len(), 3, "{stderr}");
+    let kept = fs::read_to_string(&handled).unwrap();
+    assert!(
+        kept.ends_with("end 3\n"),
+        "kept while this run found them: {kept}"
+    );
+    // The next run finds none of them again, so nothing is kept. (A second
+    // later: a run starts on the second, and one started on the cursor's
+    // second cannot move it, nor forget anything, until the next.)
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (stdout, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("nothing new"), "{stdout}");
+    assert!(!handled.exists(), "{:?}", fs::read_to_string(&handled).ok());
+    fixture.cleanup();
+}
+
+#[test]
+fn progress_is_replaced_whole_never_written_in_place() {
+    if !git_available() {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let fixture = Fixture::new("intakewhole");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 2);
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = recording_drafter(&fixture, &sent);
+    let handled = fixture.dir.join("state/ohjaa/intake-handled");
+    let one_batch = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--source", "transcripts", "--batch", "1"])
+                .args(["--max-batches", "1", "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    one_batch();
+    let first = fs::metadata(&handled).unwrap().ino();
+    one_batch();
+    let second = fs::metadata(&handled).unwrap().ino();
+    assert_ne!(first, second, "written aside and renamed into place");
+    assert!(!handled.with_extension("partial").exists());
+    assert!(fs::read_to_string(&handled).unwrap().ends_with("end 2\n"));
+    fixture.cleanup();
+}
+
 // ---- review fixes: each test failed before its fix -----------------------------
 
 /// A drafter that, while intake is drafting, checks the session log can be
