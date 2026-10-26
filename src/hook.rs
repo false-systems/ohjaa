@@ -433,9 +433,9 @@ fn observe(args: &[OsString], here: &Here) -> Observed {
     if let Some(why) = cannot_judge(&help) {
         return observed(Some(unproven(&entry.branch, &why)), input);
     }
-    // The pushed commit's gate, derived from its own sykli.json (else the
-    // entry's copy): one git process, which a commit proven in another
-    // worktree is then asked about through as well.
+    // The pushed commit's gate, derived from its own sykli.json (else from
+    // what sykli init writes for its tree): one git process, which a commit
+    // proven in another worktree is then asked about through as well.
     let judge = lifecycle::Sykli::with_program(home.clone(), sykli.clone(), SYKLI_LIMIT);
     let gate = crate::mark::gate_for_entry(
         &id,

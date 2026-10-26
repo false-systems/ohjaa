@@ -2783,8 +2783,9 @@ impl Sykli {
         } else {
             Vec::new()
         };
-        // The commit's gate: derived from its own sykli.json, else the
-        // entry's copy. Read only now, when a receipt asks sykli.
+        // The commit's gate: derived from its own sykli.json, else from what
+        // sykli init writes for its tree. Read only now, when a receipt asks
+        // sykli.
         let at = match self.gate_at(gate, commit) {
             Ok(at) => at,
             Err(why) => {
