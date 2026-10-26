@@ -1339,14 +1339,7 @@ fn intake_turns_a_correction_into_a_proposal_through_the_drafter() {
     let (stdout, stderr, code) = output_of(
         fixture
             .ohjaa()
-            .args([
-                "intake",
-                "--source",
-                "transcripts",
-                "--since",
-                "2026-09-01",
-                "--drafter",
-            ])
+            .args(["intake", "--since", "2026-09-01", "--drafter"])
             .arg(&drafter)
             .current_dir(&repo),
     );
@@ -1380,7 +1373,7 @@ fn intake_turns_a_correction_into_a_proposal_through_the_drafter() {
     let (stdout, _, code) = output_of(
         fixture
             .ohjaa()
-            .args(["intake", "--source", "transcripts", "--drafter"])
+            .args(["intake", "--drafter"])
             .arg(&drafter)
             .current_dir(&repo),
     );
@@ -1419,7 +1412,10 @@ fn a_failing_drafter_stops_intake_without_moving_the_cursor() {
             .current_dir(&repo),
     );
     assert_eq!(code, Some(4), "{stderr}");
-    assert!(stderr.contains("intake stopped"), "{stderr}");
+    assert!(
+        stderr.contains("attempt 1 of 3"),
+        "kept, to try again: {stderr}"
+    );
     assert!(!fixture.dir.join("state/ohjaa/intake-since").exists());
     fixture.cleanup();
 }
@@ -2458,8 +2454,8 @@ fn intake_drafts_from_a_sessions_handover_once() {
 }
 
 /// An ended session that said `count` corrections in its own window and
-/// repository (all in one second), then handed over: queued for intake, with
-/// `count + 1` candidates.
+/// repository (all in one second), read back and handed over: queued for
+/// intake, with `count + 1` candidates (and nothing for the report).
 fn session_that_said(fixture: &Fixture, repo: &Path, count: usize) {
     let projects = fixture.dir.join("home/.claude/projects/-work");
     fs::create_dir_all(&projects).unwrap();
@@ -2469,6 +2465,7 @@ while [ $i -le {count} ]; do
   printf '{{"type":"user","timestamp":"%s","cwd":"%s","message":{{"content":"correction %s"}}}}\n' "$at" "$here" "$i" >> '{transcript}'
   i=$((i+1))
 done
+{ohjaa} oriented 'said corrections, then handed over' > /dev/null
 {ohjaa} handover --surprised 'the queue never drained'"#,
         transcript = projects.join("queued.jsonl").display(),
         ohjaa = ohjaa_bin(),
@@ -2529,7 +2526,7 @@ fn intake_drains_a_queue_larger_than_one_run_and_never_moves_the_cursor_back() {
         assert!(runs <= 5, "intake never finished: {:?}", said_lines(&sent));
         let before = said_lines(&sent).len();
         let mut command = fixture.ohjaa();
-        command.args(["intake", "--source", "transcripts"]);
+        command.arg("intake");
         if runs == 1 {
             command.args(["--since", &since]);
         }
@@ -2590,13 +2587,14 @@ fn a_drafter_failing_mid_run_keeps_what_was_drafted_and_the_next_run_retries_the
         fixture.dir.join("failed.txt"),
         fixture.dir.join("count"),
     );
-    // Its second call fails; every other one answers that nothing is there.
+    // Its second and third calls fail (two candidates failing alone in a row
+    // stop the run); every other one answers that nothing is there.
     let drafter = fixture.stub_dir.join("drafter");
     fs::write(
         &drafter,
         format!(
             "#!/bin/sh\nn=$(($(cat '{count}' 2>/dev/null || echo 0) + 1)); echo $n > '{count}'\n\
-             if [ $n -eq 2 ]; then grep '^    said: ' >> '{failed}'; echo boom >&2; exit 1; fi\n\
+             if [ $n -eq 2 ] || [ $n -eq 3 ]; then grep '^    said: ' >> '{failed}'; echo boom >&2; exit 1; fi\n\
              grep '^    said: ' >> '{sent}'\necho '[]'\n",
             count = count.display(),
             failed = failed.display(),
@@ -2620,14 +2618,15 @@ fn a_drafter_failing_mid_run_keeps_what_was_drafted_and_the_next_run_retries_the
     assert!(stderr.contains("intake stopped"), "{stderr}");
     assert_eq!(said_lines(&sent).len(), 1, "the first batch was drafted");
     let failed = said_lines(&failed);
-    assert_eq!(failed.len(), 1);
+    assert_eq!(failed.len(), 2);
 
     let (_, stderr, code) = intake();
     assert_eq!(code, Some(4), "{stderr}");
     let lines = said_lines(&sent);
     assert_eq!(lines.len(), 4, "{lines:?}");
     assert_eq!(
-        lines[1], failed[0],
+        lines[1..3],
+        failed[..],
         "the next run starts from what failed, not from the beginning"
     );
     let (_, stderr, code) = intake();
@@ -2666,7 +2665,7 @@ fn a_second_intake_while_one_runs_says_so_and_sends_nothing() {
     let repo = fixture.make_git_repo("work");
     session_that_said(&fixture, &repo, 3);
     let (calls, started, release, sent) = (
-        fixture.dir.join("calls.txt"),
+        fixture.dir.join("drafter-calls.txt"),
         fixture.dir.join("started"),
         fixture.dir.join("release"),
         fixture.dir.join("sent.txt"),

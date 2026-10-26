@@ -206,12 +206,17 @@ enum Cmd {
         /// Candidates per drafter call.
         #[arg(long, default_value_t = 40)]
         batch: usize,
-        /// At most this many drafter calls; the rest wait for the next run.
+        /// At most this many batches a run (a batch the drafter refuses is
+        /// sent again in halves); the rest wait for the next run.
         #[arg(long, default_value_t = 10)]
         max_batches: usize,
         /// Show what would be sent, and send nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Send again the candidates set aside after the drafter failed on
+        /// each, alone, three times.
+        #[arg(long)]
+        retry_failed: bool,
     },
     /// What went around the workflow: the marks on each entry's branch (✓
     /// proven, ✗ failed, ? unproven, tip first), sessions without read-back or
@@ -1676,8 +1681,23 @@ fn cmd_intake(
     batch: usize,
     max_batches: usize,
     dry_run: bool,
+    retry_failed: bool,
 ) -> Result<i32> {
     let dirs = dirs()?;
+    // One intake at a time: two would send the same candidates and overwrite
+    // each other's progress. A dry run writes nothing, and takes no lock.
+    let _lock = if dry_run {
+        None
+    } else {
+        match process::lock_file(&dirs.state.join("intake.lock"), std::time::Duration::ZERO) {
+            Ok(lock) => Some(lock),
+            Err(why) if why.contains("held by another") => {
+                eprintln!("ohjaa: intake already running ({why}); nothing was done");
+                return Ok(REFUSED);
+            }
+            Err(why) => bail!(why),
+        }
+    };
     let started = intake::now_seconds() * 1000;
     let explicit = since.map(intake::normalize_since).transpose()?;
     let cursor = match explicit {
@@ -1784,6 +1804,10 @@ fn cmd_intake(
     // What earlier runs handled is never sent again: a run takes the oldest
     // candidates not handled yet, so every run makes progress.
     let mut handled = intake::read_handled(&dirs)?;
+    if retry_failed {
+        let forgotten = handled.retry_failed();
+        eprintln!("ohjaa: {forgotten} candidate(s) the drafter failed on are sent again");
+    }
     let left = found.iter().filter(|c| !handled.contains(c)).count();
     let batch = batch.max(1);
     let limit = batch.saturating_mul(max_batches);
@@ -1794,10 +1818,19 @@ fn cmd_intake(
         intake::rfc3339(since.div_euclid(1000)),
         found.len() - left,
     );
+    // What could not be read is never rendered as nothing new.
+    let nothing = if warnings.is_empty() {
+        "nothing new to draft from".to_owned()
+    } else {
+        format!(
+            "nothing found to draft from in what could be read ({} warning(s) above)",
+            warnings.len()
+        )
+    };
     if dry_run {
         if left == 0 {
-            println!("nothing new to draft from");
-            return Ok(0);
+            println!("{nothing}");
+            return Ok(if warnings.is_empty() { 0 } else { INCOMPLETE });
         }
         let loaded = knowledge::load(&dirs)?;
         let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
@@ -1828,7 +1861,7 @@ fn cmd_intake(
             |chunk| {
                 // Re-read each time, so a draft from an earlier batch counts
                 // as existing.
-                let loaded = knowledge::load(&dirs)?;
+                let loaded = knowledge::load(&dirs).map_err(intake::Failure::Silent)?;
                 for draft in intake::draft(&drafter, &intake::prompt(&loaded, chunk))? {
                     let id = draft.id.clone();
                     let result = draft
@@ -1849,6 +1882,26 @@ fn cmd_intake(
             },
             |handled| intake::write_handled(&dirs, handled),
         );
+        // Said by time and source, never by its words.
+        for (key, failing) in &drafted.failed {
+            let at = intake::rfc3339(key.at_ms.div_euclid(1000));
+            if failing.attempts >= intake::MAX_ATTEMPTS {
+                eprintln!(
+                    "ohjaa: intake: set aside {at} {}: the drafter failed on it alone {} times \
+                     ({}); `ohjaa intake --retry-failed` sends it again",
+                    failing.source, failing.attempts, failing.why
+                );
+            } else {
+                eprintln!(
+                    "ohjaa: intake: the drafter failed on {at} {} alone (attempt {} of {}: {}); \
+                     it is tried again next run",
+                    failing.source,
+                    failing.attempts,
+                    intake::MAX_ATTEMPTS,
+                    failing.why
+                );
+            }
+        }
         if let Some(error) = &drafted.stopped {
             eprintln!("ohjaa: intake stopped: {error:#}");
         }
@@ -1867,10 +1920,15 @@ fn cmd_intake(
             })
             .collect()
     });
+    // The cursor is one for every source: it moves only after a run that
+    // read them all, none with a warning.
+    let every_source = ["transcripts", "reviews", "reverts", "report"]
+        .iter()
+        .all(|source| sources.contains(source));
     let window = intake::Window {
         since,
         started,
-        clean: warnings.is_empty(),
+        complete: every_source && warnings.is_empty(),
     };
     let settled = intake::settle(&found, &mut handled, sessions.as_deref(), window);
     if let Some(cursor) = settled.cursor {
@@ -1887,21 +1945,31 @@ fn cmd_intake(
         }
     }
     intake::write_handled(&dirs, &handled)?;
-    if left == 0 {
-        println!("nothing new to draft from");
-        return Ok(0);
+    let aside = handled.set_aside().count();
+    if aside > 0 {
+        eprintln!(
+            "ohjaa: {aside} candidate(s) set aside: the drafter failed on each alone {} times \
+             (`ohjaa intake --retry-failed` sends them again)",
+            intake::MAX_ATTEMPTS
+        );
     }
-    println!(
-        "{proposed} proposal(s) waiting for review (`ohjaa review`), {refused} draft(s) refused"
-    );
+    let newly_aside = drafted
+        .failed
+        .iter()
+        .any(|(_, failing)| failing.attempts >= intake::MAX_ATTEMPTS);
+    if left == 0 {
+        println!("{nothing}");
+    } else {
+        println!(
+            "{proposed} proposal(s) waiting for review (`ohjaa review`), {refused} draft(s) refused"
+        );
+    }
     if settled.left > 0 {
         eprintln!("ohjaa: {} candidate(s) wait for the next run", settled.left);
     }
-    Ok(if settled.left == 0 && drafted.stopped.is_none() {
-        0
-    } else {
-        INCOMPLETE
-    })
+    let finished =
+        settled.left == 0 && drafted.stopped.is_none() && !newly_aside && warnings.is_empty();
+    Ok(if finished { 0 } else { INCOMPLETE })
 }
 
 // ---- launching --------------------------------------------------------------
@@ -3461,6 +3529,7 @@ fn main() {
             batch,
             max_batches,
             dry_run,
+            retry_failed,
         } => cmd_intake(
             &cli.root,
             since.as_deref(),
@@ -3469,6 +3538,7 @@ fn main() {
             *batch,
             *max_batches,
             *dry_run,
+            *retry_failed,
         ),
     };
     match result {
