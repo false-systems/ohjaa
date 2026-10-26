@@ -2643,6 +2643,228 @@ fn a_drafter_failing_mid_run_keeps_what_was_drafted_and_the_next_run_retries_the
     fixture.cleanup();
 }
 
+/// Wait for `path` to appear, at most ten seconds.
+fn wait_for_file(path: &Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !path.exists() {
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    true
+}
+
+#[test]
+fn a_second_intake_while_one_runs_says_so_and_sends_nothing() {
+    // Two at once sent the same batch twice, and one of them failed on the
+    // other's half-written progress.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakebusy");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 3);
+    let (calls, started, release, sent) = (
+        fixture.dir.join("calls.txt"),
+        fixture.dir.join("started"),
+        fixture.dir.join("release"),
+        fixture.dir.join("sent.txt"),
+    );
+    // Holds its first answer until released (ten seconds at most).
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\necho call >> '{calls}'\ntouch '{started}'\ni=0\n\
+             while [ ! -e '{release}' ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n\
+             grep '^    said: ' >> '{sent}'\necho '[]'\n",
+            calls = calls.display(),
+            started = started.display(),
+            release = release.display(),
+            sent = sent.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = || {
+        let mut command = fixture.ohjaa();
+        command
+            .args(["intake", "--source", "transcripts", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo);
+        command
+    };
+    let first = intake()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(wait_for_file(&started), "the first intake never asked");
+    let (_, stderr, code) = output_of(&mut intake());
+    fs::write(&release, "").unwrap();
+    let first = first.wait_with_output().unwrap();
+    assert_eq!(code, Some(3), "refused: {stderr}");
+    assert!(stderr.contains("intake already running"), "{stderr}");
+    assert_eq!(said_lines(&calls).len(), 1, "the second asked nothing");
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let mut lines = said_lines(&sent);
+    lines.sort();
+    lines.dedup();
+    assert_eq!((said_lines(&sent).len(), lines.len()), (4, 4));
+    fixture.cleanup();
+}
+
+#[test]
+fn a_candidate_the_drafter_always_fails_on_is_isolated_and_set_aside_out_loud() {
+    // One poison candidate failed its whole batch on every run: exit 4, no
+    // progress, forever.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakepoison");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 5);
+    let sent = fixture.dir.join("sent.txt");
+    // Refuses, in prose, any batch that holds `correction 3`.
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\nprompt=$(cat)\n\
+             case \"$prompt\" in *'said: correction 3'*) echo 'I cannot help with that.'; exit 0;; esac\n\
+             printf '%s\\n' \"$prompt\" | grep '^    said: ' >> '{}'\necho '[]'\n",
+            sent.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--source", "transcripts", "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    // The first run drafts from everything around it.
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    assert_eq!(said_lines(&sent).len(), 5, "all but the one: {stderr}");
+    assert!(stderr.contains("attempt 1 of 3"), "{stderr}");
+    // Each run after it tries the one alone again, until it is set aside,
+    // said with its time and source, never its words.
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(stderr.contains("attempt 2 of 3"), "{stderr}");
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(stderr.contains("set aside"), "{stderr}");
+    assert!(stderr.contains("claude"), "its source: {stderr}");
+    assert!(
+        !stderr.contains("correction 3"),
+        "never its words: {stderr}"
+    );
+    // Then nothing is left, the session is drafted from, and the set-aside
+    // one is still said.
+    let (stdout, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("nothing new"), "{stdout}");
+    assert!(stderr.contains("1 candidate(s) set aside"), "{stderr}");
+    assert!(!stderr.contains("queued for drafting"), "{stderr}");
+    let mut lines = said_lines(&sent);
+    lines.sort();
+    lines.dedup();
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("correction 3")));
+    fixture.cleanup();
+}
+
+#[test]
+fn a_run_that_reads_only_some_sources_never_moves_the_cursor_past_the_others() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakepartial");
+    let repo = fixture.make_git_repo("work");
+    let projects = fixture.dir.join("home/.claude/projects/-work");
+    fs::create_dir_all(&projects).unwrap();
+    fs::write(
+        projects.join("s.jsonl"),
+        format!(
+            r#"{{"type":"user","timestamp":"{}","cwd":"/p/work","message":{{"content":"the unread one"}}}}"#,
+            utc_now()
+        ),
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ngrep '^    said: ' >> '{}'\necho '[]'\n",
+            sent.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = |source: &str| {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--source", source, "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    let (_, stderr, _) = intake("reviews");
+    assert!(said_lines(&sent).is_empty(), "{stderr}");
+    let (_, stderr, code) = intake("transcripts");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        said_lines(&sent),
+        ["    said: the unread one"],
+        "a run of reviews alone did not move past the transcripts: {stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_run_with_warnings_never_says_nothing_new_and_exits_zero() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakewarned");
+    let repo = fixture.make_git_repo("work");
+    let projects = fixture.dir.join("home/.claude/projects/-work");
+    fs::create_dir_all(&projects).unwrap();
+    let unreadable = projects.join("locked.jsonl");
+    fs::write(&unreadable, "{}").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--source", "transcripts", "--drafter", "false"])
+            .current_dir(&repo),
+    );
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(stderr.contains("cannot read"), "{stderr}");
+    assert!(
+        !stdout.contains("nothing new"),
+        "what could not be read is not nothing: {stdout}"
+    );
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    fixture.cleanup();
+}
+
 // ---- review fixes: each test failed before its fix -----------------------------
 
 /// A drafter that, while intake is drafting, checks the session log can be

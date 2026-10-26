@@ -1432,6 +1432,57 @@ mod tests {
         assert_eq!(window_start(None, None, 100, 50), (50, Some(50)));
     }
 
+    #[test]
+    fn damaged_progress_is_an_error_never_read_as_less() {
+        let root = std::env::temp_dir().join(format!("ohjaa-damaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dirs = Dirs {
+            ours_checkout: None,
+            repo_root: None,
+            mine: root.join("mine"),
+            machine: root.join("machine"),
+            proposals: root.join("proposals"),
+            state: root.clone(),
+        };
+        let said = |at_ms: i64, text: &str| Candidate {
+            source: "claude",
+            at_ms,
+            at: rfc3339(at_ms.div_euclid(1000)),
+            place: "/p".to_owned(),
+            who: "person".to_owned(),
+            context: String::new(),
+            text: text.to_owned(),
+        };
+        let mut handled = Handled::default();
+        for (at, text) in [(5, "a"), (-7, "b"), (1_793_000_000_123, "c")] {
+            handled.0.insert(said(at, text).key());
+        }
+        write_handled(&dirs, &handled).unwrap();
+        let path = root.join("intake-handled");
+        let whole = std::fs::read(&path).unwrap();
+        assert_eq!(read_handled(&dirs).unwrap(), handled);
+        let read = |bytes: &[u8]| {
+            std::fs::write(&path, bytes).unwrap();
+            read_handled(&dirs)
+        };
+        // Nothing writes an empty file, so an empty one is damage.
+        assert!(read(b"").is_err(), "an empty file is not \"none handled\"");
+        // Cut anywhere (inside a digest, at a line boundary, inside the
+        // last line): damage, said out loud, never fewer keys read quietly.
+        for cut in 1..whole.len() {
+            assert!(
+                read(&whole[..cut]).is_err(),
+                "cut at {cut} read as progress: {:?}",
+                String::from_utf8_lossy(&whole[..cut])
+            );
+        }
+        // And what follows the end is damage too.
+        let mut longer = whole.clone();
+        longer.extend_from_slice(b"5 0000000000000000\n");
+        assert!(read(&longer).is_err(), "a line after the end");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ---- the model: random queues, caps and failure points ---------------------
 
     use std::collections::HashSet;
