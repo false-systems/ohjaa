@@ -32,13 +32,24 @@ use crate::sessions::{self, Check, Session};
 /// run` says one to the person.
 pub const WEEK_MS: i64 = 7 * 86_400_000;
 
-/// How far a native session's start may lie from its `ohjaa run` launch and
-/// still be that launch's agent: entering, toimija and the agent's own start
-/// take seconds, and a loaded machine more.
-const LAUNCH_SLACK_MS: i64 = 60_000;
+/// How long before its `ohjaa run` launch was logged a native session may
+/// start and still be that launch's agent: the log and the transcript each
+/// keep their own clock.
+const LAUNCH_EARLY_MS: i64 = 5_000;
 
-/// How long vessa may take to read the transcripts.
-const VESSA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long vessa may take to list the sessions. Its header mode reads only
+/// each transcript's opening records: about half a second for some 950
+/// sessions here, where the full listing took 10 to 50 s. 15 s leaves a
+/// loaded machine and a cold disk cache thirty times that, and a vessa that
+/// hangs costs a report seconds, not a minute.
+const VESSA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What `vessa sessions --json --headers` answers with (vessa#5).
+const VESSA_HEADERS: &str = "vessa-session-headers.v1";
+
+/// The agents vessa reads the sessions of and `ohjaa run` launches. opencode
+/// is launched too, but vessa does not read its sessions.
+const NATIVE_AGENTS: [&str; 3] = ["claude", "codex", "pi"];
 
 /// A session that ended without the agent's testimony.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,6 +497,18 @@ pub struct Native {
     pub id: String,
     pub cwd: String,
     pub started_ms: i64,
+    /// When its transcript was last written, when that can be told.
+    pub written_ms: Option<i64>,
+}
+
+/// When the transcript at `source` was last written, in whole seconds, as
+/// the window's ends and the log's times are.
+fn written(source: &str) -> Option<i64> {
+    std::fs::metadata(source)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|at| at.as_secs() as i64 * 1000)
 }
 
 /// vessa's list for the window: the sessions a person started, dated and
@@ -497,7 +520,7 @@ fn native_sessions(
     gaps: &mut Vec<String>,
 ) -> Result<(Vec<Native>, Natives), String> {
     let output = match process::run(
-        Command::new("vessa").args(["sessions", "--json"]),
+        Command::new("vessa").args(["sessions", "--json", "--headers"]),
         None,
         VESSA_TIMEOUT,
     ) {
@@ -513,6 +536,19 @@ fn native_sessions(
             );
         }
     };
+    // A vessa from before vessa#5 refuses the flag as a usage error: exit 2,
+    // nothing listed. It is updated, never read the slow way. What it said
+    // is kept, for a usage error of another kind: its first line, where
+    // clap puts the error (its last is a hint to try --help).
+    if output.status.code() == Some(2) && output.stdout.trim_ascii().is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let said = stderr.lines().map(str::trim).find(|line| !line.is_empty());
+        return Err(format!(
+            "vessa is too old for `sessions --headers`; update it{}",
+            said.map(|line| format!(" (vessa said: {line})"))
+                .unwrap_or_default()
+        ));
+    }
     let listed: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         format!(
             "vessa's sessions are not JSON ({error}; exit {:?}: {})",
@@ -540,7 +576,9 @@ fn native_sessions(
 
 /// Whether a session was started by no person: `claude -p` (Claude's
 /// `entrypoint` is `sdk-…`), or `codex exec` (Codex's `originator` names
-/// exec). Intake's own drafter runs one of these.
+/// exec). Intake's own drafter runs one of these unless configured
+/// otherwise. A pi transcript says nothing of how pi was started (vessa
+/// gives both as null), so a `pi -p` run is judged as a person's session.
 fn headless(session: &Value) -> bool {
     session["entrypoint"]
         .as_str()
@@ -550,39 +588,45 @@ fn headless(session: &Value) -> bool {
             .is_some_and(|origin| origin.contains("exec"))
 }
 
-/// Read `vessa sessions --json` (`vessa-usage.v1`): `sessions[]` with `agent`,
-/// `id`, `parent`, `started_at` (RFC 3339), `cwd`, `source`, and how each was
-/// started (`entrypoint`, `originator`). Subagent sessions (with a parent)
-/// and headless runs were started by no person and are left out. A session
-/// with no date or no folder cannot be judged against a launch: it is kept
-/// apart as undated when its transcript was written in the window. Without
-/// `entrypoint` and `originator` (an older vessa), headless runs cannot be
-/// told apart, and nothing is judged.
+/// Read `vessa sessions --json --headers` (`vessa-session-headers.v1`):
+/// `sessions[]` with exactly `agent`, `id`, `parent`, `started_at` (RFC
+/// 3339), `cwd`, `source`, and how each was started (`entrypoint`,
+/// `originator`), as the full listing names them; any other schema is not
+/// read. Claude, Codex and pi sessions are judged. Subagent sessions (with a
+/// parent) and headless runs were started by no person and are left out. A
+/// session with no date or no folder cannot be judged against a launch: it
+/// is kept apart as undated when its transcript was written in the window.
 pub fn parse_native(
     listed: &Value,
     since_ms: i64,
     now_ms: i64,
 ) -> Result<(Vec<Native>, Natives), String> {
+    match listed["schema"].as_str() {
+        Some(VESSA_HEADERS) => {}
+        Some(other) => {
+            return Err(format!(
+                "vessa listed sessions as `{other}`, not `{VESSA_HEADERS}`"
+            ))
+        }
+        None => {
+            return Err(format!(
+                "vessa's output names no schema, not `{VESSA_HEADERS}`"
+            ))
+        }
+    }
     let sessions = listed["sessions"]
         .as_array()
         .ok_or("vessa's output has no sessions list")?;
-    let says_how = |s: &Value| {
-        s.as_object()
-            .is_some_and(|o| o.contains_key("entrypoint") && o.contains_key("originator"))
-    };
-    if !sessions.is_empty() && !sessions.iter().any(says_how) {
-        return Err(
-            "vessa does not say how a session was started (no `entrypoint` or `originator`; \
-             vessa#2), so headless runs cannot be told apart"
-                .to_owned(),
-        );
-    }
     let in_window = |ms: i64| ms > since_ms && ms <= now_ms;
     let mut judgeable = Vec::new();
     let mut natives = Natives::default();
     for s in sessions
         .iter()
-        .filter(|s| matches!(s["agent"].as_str(), Some("claude" | "codex")))
+        .filter(|s| {
+            s["agent"]
+                .as_str()
+                .is_some_and(|a| NATIVE_AGENTS.contains(&a))
+        })
         .filter(|s| s["parent"].is_null())
     {
         let text = |key: &str| s[key].as_str().unwrap_or_default().to_owned();
@@ -602,16 +646,12 @@ pub fn parse_native(
                     id: text("id"),
                     cwd,
                     started_ms,
+                    written_ms: written(&text("source")),
                 });
             }
             _ => {
                 let source = text("source");
-                let written_ms = std::fs::metadata(&source)
-                    .ok()
-                    .and_then(|meta| meta.modified().ok())
-                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-                    // Whole seconds, as the window's ends are.
-                    .map(|at| at.as_secs() as i64 * 1000);
+                let written_ms = written(&source);
                 // Undated: in the window when its transcript was written then,
                 // or when that cannot be told.
                 let relevant = match (started_ms, written_ms) {
@@ -638,54 +678,85 @@ pub fn parse_native(
     Ok((judgeable, natives))
 }
 
-/// The native sessions no `ohjaa run` launched, oldest first. One matches a
-/// logged session when that session's usage receipt names it, or when it is
-/// the same agent, in that session's repository (or below it), and started
-/// within [`LAUNCH_SLACK_MS`] after the launch (or 5 s before it); each
-/// logged session claims at most one, the closest.
+/// The native sessions no `ohjaa run` launched, oldest first.
+///
+/// A launch with a usage receipt is matched by its receipts alone: the
+/// sessions they name are its own, and it claims no other. Every other
+/// launch may claim one session of its agent (the launched command's file
+/// name), in its repository or below, that started while it ran: from
+/// [`LAUNCH_EARLY_MS`] before it was logged until its leaving was (to now
+/// while it runs). An agent can write its first record long after its
+/// launch, so nothing narrower holds.
+///
+/// One-to-one: each pair that could match is ranked by how well it fits,
+/// best first, and taken while neither is taken. For a launch seen to end,
+/// the fit is how close the session's transcript was last written to that
+/// end, since its agent wrote until it exited and a session beside it
+/// rarely stops then too; otherwise, and when the transcript cannot be
+/// read, it is how close the session started to the launch. Ties go to the
+/// closer start, then the earlier session and launch by id, so the same
+/// list always gives the same answer.
 pub fn bypasses(native: Vec<Native>, logged: &[Session]) -> Vec<Bypass> {
     let canonical =
         |path: &str| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
-    let mut claimed = std::collections::HashSet::new();
-    let mut by_receipt = std::collections::HashSet::new();
-    for s in logged {
-        for receipt in &s.usage {
-            by_receipt.insert((receipt.agent.clone(), receipt.session_id.clone()));
-        }
-    }
-    let mut native = native;
-    native.sort_by_key(|n| n.started_ms);
-    let mut out = Vec::new();
-    for n in native {
-        if by_receipt.contains(&(n.agent.clone(), n.id.clone())) {
-            continue;
-        }
+    let by_receipt: std::collections::HashSet<(&str, &str)> = logged
+        .iter()
+        .flat_map(|s| &s.usage)
+        .map(|receipt| (receipt.agent.as_str(), receipt.session_id.as_str()))
+        .collect();
+    let mut native: Vec<Native> = native
+        .into_iter()
+        .filter(|n| !by_receipt.contains(&(n.agent.as_str(), n.id.as_str())))
+        .collect();
+    native.sort_by(|a, b| (a.started_ms, &a.id).cmp(&(b.started_ms, &b.id)));
+    let launches: Vec<(&Session, PathBuf)> = logged
+        .iter()
+        .filter(|s| s.usage.is_empty())
+        .map(|s| (s, canonical(&s.repo)))
+        .collect();
+    let mut pairs = Vec::new();
+    for (i, n) in native.iter().enumerate() {
         let cwd = canonical(&n.cwd);
-        let launch = logged
-            .iter()
-            .filter(|s| !claimed.contains(&s.id))
-            .filter(|s| {
-                Path::new(&s.agent).file_name().and_then(|f| f.to_str()) == Some(n.agent.as_str())
-            })
-            .filter(|s| cwd.starts_with(canonical(&s.repo)))
-            .filter(|s| {
-                n.started_ms >= s.started_ms - 5_000
-                    && n.started_ms <= s.started_ms + LAUNCH_SLACK_MS
-            })
-            .min_by_key(|s| (n.started_ms - s.started_ms).abs());
-        match launch {
-            Some(s) => {
-                claimed.insert(s.id.clone());
+        for (j, (s, repo)) in launches.iter().enumerate() {
+            let agent = Path::new(&s.agent).file_name().and_then(|f| f.to_str());
+            // Whole seconds in the log: its end may read up to one early.
+            let ran = n.started_ms >= s.started_ms - LAUNCH_EARLY_MS
+                && s.left
+                    .as_ref()
+                    .is_none_or(|left| n.started_ms < left.ended_ms + 1000);
+            if agent != Some(n.agent.as_str()) || !cwd.starts_with(repo) || !ran {
+                continue;
             }
-            None => out.push(Bypass {
-                agent: n.agent,
-                id: n.id,
-                cwd: n.cwd,
-                started_ms: n.started_ms,
-            }),
+            let from_start = (n.started_ms - s.started_ms).abs();
+            // An orphan's end was never seen, only that it was over by then.
+            let seen_end = s.left.as_ref().filter(|left| !left.orphaned);
+            let fit = match (seen_end, n.written_ms) {
+                (Some(left), Some(written)) => (written - left.ended_ms).abs(),
+                _ => from_start,
+            };
+            pairs.push(((fit, from_start, i, s.id.as_str()), i, j));
         }
     }
-    out
+    pairs.sort();
+    let mut taken_native = vec![false; native.len()];
+    let mut taken_launch = vec![false; launches.len()];
+    for (_, i, j) in pairs {
+        if !taken_native[i] && !taken_launch[j] {
+            taken_native[i] = true;
+            taken_launch[j] = true;
+        }
+    }
+    native
+        .into_iter()
+        .zip(taken_native)
+        .filter(|(_, taken)| !taken)
+        .map(|(n, _)| Bypass {
+            agent: n.agent,
+            id: n.id,
+            cwd: n.cwd,
+            started_ms: n.started_ms,
+        })
+        .collect()
 }
 
 // ---- saying it --------------------------------------------------------------
@@ -1106,9 +1177,6 @@ fn report_json(report: &Report) -> Value {
 /// What left a report incomplete, said so a person can act on it.
 fn first_gap(report: &Report) -> Option<String> {
     match &report.natives {
-        Err(why) if why.starts_with("vessa does not say how") => {
-            Some("vessa lacks session origins — update vessa (vessa#2)".to_owned())
-        }
         Err(why) if why.starts_with("vessa is not on PATH") => Some(
             "vessa is not on PATH — install vessa to see sessions started without ohjaa".to_owned(),
         ),
@@ -1334,20 +1402,43 @@ mod tests {
             id: id.to_owned(),
             cwd: cwd.to_owned(),
             started_ms,
+            written_ms: None,
         }
+    }
+
+    fn last_written(native: Native, written_ms: i64) -> Native {
+        Native {
+            written_ms: Some(written_ms),
+            ..native
+        }
+    }
+
+    /// `session` as left at `ended_ms`, its leaving observed.
+    fn ended(mut session: Session, ended_ms: i64) -> Session {
+        let mut left = sessions::Left::orphaned(ended_ms);
+        left.orphaned = false;
+        session.left = Some(left);
+        session
+    }
+
+    fn ids(list: Vec<Bypass>) -> Vec<String> {
+        list.into_iter().map(|b| b.id).collect()
     }
 
     #[test]
     fn a_native_session_is_ohjaas_when_launched_by_it_here_and_then() {
-        let launched = session("oh-1", "claude", "/nonexistent/r/app", 1_000_000);
-        let ids = |list: Vec<Bypass>| list.into_iter().map(|b| b.id).collect::<Vec<_>>();
+        // It ran for ten minutes.
+        let launched = ended(
+            session("oh-1", "claude", "/nonexistent/r/app", 1_000_000),
+            1_600_000,
+        );
         // Its agent, in its repository (a folder below it too), seconds after.
         assert!(bypasses(
             vec![native("claude", "a", "/nonexistent/r/app/src", 1_003_000)],
             std::slice::from_ref(&launched)
         )
         .is_empty());
-        // Another agent, another place, or long after: not launched by it.
+        // Another agent, another place, or after it ended: not launched by it.
         assert_eq!(
             ids(bypasses(
                 vec![
@@ -1382,6 +1473,160 @@ mod tests {
             &[receipted]
         )
         .is_empty());
+        // pi by the same rule: its launch claims it, and a claude launch
+        // claims no pi session, nor a pi launch a claude one.
+        let pi = session("oh-3", "pi", "/nonexistent/r/app", 2_000_000);
+        assert!(bypasses(
+            vec![native("pi", "h", "/nonexistent/r/app", 2_004_000)],
+            std::slice::from_ref(&pi)
+        )
+        .is_empty());
+        assert_eq!(
+            ids(bypasses(
+                vec![
+                    native("pi", "i", "/nonexistent/r/app", 1_003_000),
+                    native("claude", "j", "/nonexistent/r/app", 2_003_000),
+                ],
+                &[launched, pi]
+            )),
+            ["i", "j"]
+        );
+    }
+
+    /// An agent can write its first record long after its launch (Claude at
+    /// the first prompt: 96 s in syva on 10-20, Codex 115 s and 188 s): what
+    /// starts while a launch runs can be its own, and nothing after it ended.
+    #[test]
+    fn a_launch_claims_what_starts_while_it_runs() {
+        let repo = "/nonexistent/r/syva";
+        let day = 86_400_000;
+        let launched = ended(
+            session("oh-1", "claude", repo, 1_000_000),
+            1_000_000 + 2 * day,
+        );
+        assert!(
+            bypasses(
+                vec![native("claude", "own", repo, 1_096_000)],
+                std::slice::from_ref(&launched)
+            )
+            .is_empty(),
+            "started 96 s into a launch that ran two days"
+        );
+        // A launch that was over in half a minute claims nothing after.
+        let short = ended(session("oh-2", "codex", repo, 1_000_000), 1_030_000);
+        assert_eq!(
+            ids(bypasses(
+                vec![native("codex", "later", repo, 1_045_000)],
+                &[short]
+            )),
+            ["later"]
+        );
+        // One still running claims what starts hours in, once.
+        let open = session("oh-3", "pi", repo, 1_000_000);
+        assert_eq!(
+            ids(bypasses(
+                vec![
+                    native("pi", "own", repo, 1_000_000 + 7_200_000),
+                    native("pi", "second", repo, 1_000_000 + 7_300_000),
+                ],
+                &[open]
+            )),
+            ["second"]
+        );
+    }
+
+    /// A launch a usage receipt names a session of is matched by its receipt
+    /// alone: it never also clears a session by time.
+    #[test]
+    fn a_launch_with_a_receipt_claims_no_other_session() {
+        let repo = "/nonexistent/r/app";
+        let mut launched = ended(session("oh-1", "claude", repo, 1_000_000), 1_600_000);
+        launched.usage = vec![serde_json::from_value(json!({
+            "schema": "agent-usage.v1", "agent": "claude", "session_id": "mine", "source": "s",
+            "observed_at_ms": 0, "complete": true, "limitations": [], "entries": []
+        }))
+        .unwrap()];
+        for (mine, by_hand) in [(1_003_000, 1_020_000), (1_004_000, 1_001_000)] {
+            assert_eq!(
+                ids(bypasses(
+                    vec![
+                        native("claude", "mine", repo, mine),
+                        native("claude", "by-hand", repo, by_hand),
+                    ],
+                    std::slice::from_ref(&launched)
+                )),
+                ["by-hand"],
+                "its own at {mine}, one by hand at {by_hand}"
+            );
+        }
+        // Its own session outside the window still is its own: the launch
+        // clears nothing else.
+        assert_eq!(
+            ids(bypasses(
+                vec![native("claude", "by-hand", repo, 1_002_000)],
+                std::slice::from_ref(&launched)
+            )),
+            ["by-hand"]
+        );
+    }
+
+    /// Two sessions of one agent start while one launch runs. The one whose
+    /// transcript was last written as the launch ended is its own, whichever
+    /// started first; without an end seen, the closer start is.
+    #[test]
+    fn of_two_sessions_during_a_launch_the_one_written_until_it_ended_is_its_own() {
+        let repo = "/nonexistent/r/app";
+        let end = 1_600_000;
+        let launched = ended(session("oh-1", "pi", repo, 1_000_000), end);
+        let own = |at: i64| last_written(native("pi", "own", repo, at), end - 1_000);
+        let by_hand = |at: i64| last_written(native("pi", "by-hand", repo, at), at + 2_000);
+        for (own_at, by_hand_at) in [(1_004_000, 1_001_000), (1_001_000, 1_004_000)] {
+            for listed in [
+                vec![own(own_at), by_hand(by_hand_at)],
+                vec![by_hand(by_hand_at), own(own_at)],
+            ] {
+                assert_eq!(
+                    ids(bypasses(listed, std::slice::from_ref(&launched))),
+                    ["by-hand"],
+                    "own at {own_at}, by hand at {by_hand_at}"
+                );
+            }
+        }
+        // A session by hand that goes on after the launch ended is not it
+        // either, though it started closer.
+        let outlived = last_written(native("pi", "by-hand", repo, 1_001_000), end + 3_600_000);
+        assert_eq!(
+            ids(bypasses(
+                vec![outlived, own(1_004_000)],
+                std::slice::from_ref(&launched)
+            )),
+            ["by-hand"]
+        );
+        // Still running, or closed as an orphan (its end never seen): the
+        // closer start, the same either way the list comes.
+        let mut orphan = launched.clone();
+        orphan.left.as_mut().unwrap().orphaned = true;
+        for launch in [session("oh-2", "pi", repo, 1_000_000), orphan] {
+            for listed in [
+                vec![own(1_001_000), by_hand(1_004_000)],
+                vec![by_hand(1_004_000), own(1_001_000)],
+            ] {
+                assert_eq!(
+                    ids(bypasses(listed, std::slice::from_ref(&launch))),
+                    ["by-hand"]
+                );
+            }
+        }
+        // Two launches and their two sessions: each its own.
+        let second = ended(session("oh-3", "pi", repo, 1_010_000), 1_300_000);
+        assert!(bypasses(
+            vec![
+                last_written(native("pi", "a", repo, 1_003_000), end - 1_000),
+                last_written(native("pi", "b", repo, 1_013_000), 1_299_000),
+            ],
+            &[launched, second]
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1398,10 +1643,12 @@ mod tests {
             }
             s
         };
-        let listed = json!({"schema": "vessa-usage.v1", "warnings": [], "sessions": [
+        let listed = json!({"schema": "vessa-session-headers.v1", "warnings": [], "sessions": [
             s("tui", "claude", json!({"entrypoint": "cli"})),
             s("sub", "claude", json!({"parent": "tui"})),
             s("pi", "pi", json!({})),
+            s("pi-sub", "pi", json!({"parent": "pi"})),
+            s("other", "opencode", json!({})),
             s("old", "codex", json!({"started_at": "2026-09-01T10:00:00Z"})),
             s("headless", "claude", json!({"entrypoint": "sdk-cli"})),
             s("exec", "codex", json!({"originator": "codex_exec"})),
@@ -1409,14 +1656,14 @@ mod tests {
             s("nowhere", "codex", json!({"cwd": ""})),
         ]});
         let (judgeable, natives) = parse_native(&listed, since, now).unwrap();
+        let at = since + 6 * 86_400_000 + 36_000_500;
         assert_eq!(
             judgeable,
-            [native(
-                "claude",
-                "tui",
-                "/r/app",
-                since + 6 * 86_400_000 + 36_000_500
-            )]
+            [
+                native("claude", "tui", "/r/app", at),
+                native("pi", "pi", "/r/app", at)
+            ],
+            "a person's pi session is judged too; opencode, which vessa does not read, is not"
         );
         assert_eq!(
             natives.headless, 2,
@@ -1428,13 +1675,22 @@ mod tests {
             ["undated", "nowhere"],
             "never dropped: said apart, not judged"
         );
-        // An older vessa cannot tell a headless run from a person's session.
-        let older = json!({"sessions": [{"agent": "claude", "id": "x", "parent": null,
-            "started_at": "2026-10-09T10:00:00Z", "cwd": "/r/app"}]});
-        assert!(parse_native(&older, since, now)
+        // Only the header listing is read: the full one, or none named, is
+        // not judged.
+        let full = json!({"schema": "vessa-usage.v1", "warnings": [], "sessions": []});
+        assert_eq!(
+            parse_native(&full, since, now).unwrap_err(),
+            "vessa listed sessions as `vessa-usage.v1`, not `vessa-session-headers.v1`"
+        );
+        assert!(parse_native(&json!({"sessions": []}), since, now)
             .unwrap_err()
-            .contains("headless runs cannot be told apart"));
-        assert!(parse_native(&json!({"nothing": []}), since, now).is_err());
+            .contains("names no schema"));
+        assert!(parse_native(
+            &json!({"schema": "vessa-session-headers.v1", "nothing": []}),
+            since,
+            now
+        )
+        .is_err());
     }
 
     #[test]
@@ -1778,13 +2034,11 @@ mod tests {
         );
         // What the gap is, said so a person can fix it.
         let report = sample(Err(
-            "vessa does not say how a session was started (no `entrypoint` or `originator`; \
-             vessa#2), so headless runs cannot be told apart"
-                .to_owned(),
+            "vessa is too old for `sessions --headers`; update it".to_owned()
         ));
         let said = summary(&report);
         assert!(
-            said.contains("incomplete: vessa lacks session origins — update vessa"),
+            said.contains("incomplete: vessa is too old for `sessions --headers`; update it;"),
             "{said}"
         );
         assert_eq!(said.lines().count(), 3, "{said}");
