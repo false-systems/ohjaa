@@ -1549,6 +1549,177 @@ fn a_repository_with_no_commits_yet_is_empty_and_does_not_hold_the_cursor() {
     fixture.cleanup();
 }
 
+/// A drafter as the drafter answers it.
+fn drafted(scope: &str, id: &str, refines: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "scope": scope, "repo": null, "id": id, "kind": "lesson",
+        "body": format!("The lesson {id}."), "origin": ["2026-09-20 work: 'a test'"],
+        "refines": refines, "supersedes": [],
+    })
+}
+
+#[test]
+fn a_draft_that_repeats_what_is_present_is_not_written_and_is_counted() {
+    // Intake's first real run, 2026-10-27, wrote 108 proposals, four of them
+    // one lesson ("read back the briefing and leave a handover"), two "start
+    // sessions through ohjaa run", and a person has to review each one.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakedup");
+    let repo = fixture.make_git_repo("work");
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        "rust-elixir-only",
+        "decision",
+        "Code is Rust or Elixir.",
+    );
+    let waiting = fixture.dir.join("state/ohjaa/proposals/ours");
+    fs::create_dir_all(&waiting).unwrap();
+    let waiting = waiting.join("start-sessions-through-ohjaa-run.md");
+    let proposal = "+++\nid = \"start-sessions-through-ohjaa-run\"\nkind = \"lesson\"\n\
+                    status = \"proposed\"\nas_of = 2026-09-20\norigin = [\"a test\"]\n+++\n\
+                    Start every agent session through `ohjaa run`.\n";
+    fs::write(&waiting, proposal).unwrap();
+    fixture.said(&[
+        vessa_line(
+            "2026-09-20T10:00:00Z",
+            "/p/work",
+            "never python. i told you",
+            None,
+        ),
+        vessa_line(
+            "2026-09-20T10:05:00Z",
+            "/p/work",
+            "no, we have lima baba",
+            None,
+        ),
+    ]);
+    // One answer a batch, each prompt kept.
+    let answers = [
+        serde_json::json!([
+            drafted("ours", "start-agents-through-ohjaa-run", None),
+            drafted("mine", "code-is-rust-or-elixir", None),
+            drafted("ours", "read-back-briefing-and-leave-handover", None),
+            drafted("ours", "read-briefing-and-leave-handover", None),
+        ]),
+        serde_json::json!([
+            drafted("ours", "ohjaa-read-back-briefing-and-leave-handover", None),
+            drafted(
+                "ours",
+                "pi-sessions-need-a-wrapper-too",
+                Some("start-sessions-through-ohjaa-run"),
+            ),
+            drafted("machine", "lima-for-linux", None),
+        ]),
+    ];
+    for (n, answer) in answers.iter().enumerate() {
+        fs::write(
+            fixture.dir.join(format!("answer-{}.json", n + 1)),
+            answer.to_string(),
+        )
+        .unwrap();
+    }
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\nd='{}'\nn=$(($(cat \"$d/drafter-calls\" 2>/dev/null || echo 0) + 1))\n\
+             echo $n > \"$d/drafter-calls\"\ncat > \"$d/prompt-$n.txt\"\ncat \"$d/answer-$n.json\"\n",
+            fixture.dir.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "intake",
+                "--source",
+                "transcripts",
+                "--no-prefilter",
+                "--since",
+                "2026-09-01",
+                "--batch",
+                "1",
+                "--drafter",
+            ])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let prompt =
+        |n: usize| fs::read_to_string(fixture.dir.join(format!("prompt-{n}.txt"))).unwrap();
+    // The drafter is shown what is present, current and waiting.
+    let first = prompt(1);
+    assert!(
+        first.contains("- rust-elixir-only [mine/decision/current]: Code is Rust or Elixir."),
+        "{first}"
+    );
+    assert!(
+        first.contains(
+            "- start-sessions-through-ohjaa-run [ours/lesson/proposed]: Start every agent \
+             session through `ohjaa run`."
+        ),
+        "{first}"
+    );
+    assert!(first.contains("Return nothing for a"), "{first}");
+    // And, in the next batch, what the batch before it proposed.
+    assert!(
+        prompt(2).contains("- read-back-briefing-and-leave-handover [ours/lesson/proposed]"),
+        "{}",
+        prompt(2)
+    );
+    for line in [
+        // Near a proposal waiting before the run.
+        "duplicate start-agents-through-ohjaa-run of start-sessions-through-ohjaa-run, not written",
+        // Near current knowledge, in another scope.
+        "duplicate code-is-rust-or-elixir of rust-elixir-only, not written",
+        "proposed read-back-briefing-and-leave-handover",
+        // Near a draft written earlier in the same answer,
+        "duplicate read-briefing-and-leave-handover of read-back-briefing-and-leave-handover, \
+         not written",
+        // and in a batch before.
+        "duplicate ohjaa-read-back-briefing-and-leave-handover of \
+         read-back-briefing-and-leave-handover, not written",
+        // What the drafter itself says refines a waiting proposal.
+        "duplicate pi-sessions-need-a-wrapper-too of start-sessions-through-ohjaa-run, not written",
+        "proposed lima-for-linux",
+        "2 proposal(s) waiting for review (`ohjaa review`), 5 duplicate(s) not written, 0 \
+         draft(s) refused",
+        "not written: duplicate of read-back-briefing-and-leave-handover ×2, duplicate of \
+         rust-elixir-only ×1, duplicate of start-sessions-through-ohjaa-run ×2",
+    ] {
+        assert!(stdout.contains(line), "{line}\n{stdout}");
+    }
+    let mut written: Vec<String> = ["ours", "mine", "machine"]
+        .iter()
+        .flat_map(|scope| {
+            fs::read_dir(fixture.dir.join("state/ohjaa/proposals").join(scope))
+                .into_iter()
+                .flatten()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    written.sort();
+    assert_eq!(
+        written,
+        [
+            "lima-for-linux.md",
+            "read-back-briefing-and-leave-handover.md",
+            "start-sessions-through-ohjaa-run.md",
+        ]
+    );
+    assert_eq!(
+        fs::read_to_string(&waiting).unwrap(),
+        proposal,
+        "a waiting proposal is never touched"
+    );
+    fixture.cleanup();
+}
+
 #[test]
 fn a_file_inside_a_repository_gets_only_shared_knowledge() {
     if !git_available() {

@@ -1966,6 +1966,7 @@ fn cmd_intake(
             return Ok(if warnings.is_empty() { 0 } else { INCOMPLETE });
         }
         let loaded = knowledge::load(&dirs)?;
+        let known = intake::Known::read(&dirs, &loaded)?;
         let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
         let first: Vec<intake::Candidate> = found
             .iter()
@@ -1973,7 +1974,7 @@ fn cmd_intake(
             .take(batch)
             .cloned()
             .collect();
-        let (prompt, redacted) = intake::prompt(&loaded, &first);
+        let (prompt, redacted) = intake::prompt(&known, &first);
         println!("{prompt}");
         eprintln!(
             "ohjaa: dry-run; would send {} batch(es) to `{drafter}`; {redacted} \
@@ -1985,6 +1986,9 @@ fn cmd_intake(
 
     let today = knowledge::today();
     let (mut proposed, mut refused, mut redacted) = (0, 0, 0);
+    // Drafts not written because they repeat what is present, by the id of
+    // what each repeats.
+    let mut duplicates: std::collections::BTreeMap<String, usize> = Default::default();
     let mut drafted = intake::Drafted::default();
     if left > 0 {
         let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
@@ -1995,18 +1999,28 @@ fn cmd_intake(
             limit,
             |chunk| {
                 // Re-read each time, so a draft from an earlier batch counts
-                // as existing.
+                // as present.
                 let loaded = knowledge::load(&dirs).map_err(intake::Failure::Silent)?;
+                let mut known =
+                    intake::Known::read(&dirs, &loaded).map_err(intake::Failure::Silent)?;
                 // Scrubbed of secrets, whatever the source or the filter.
-                let (prompt, scrubbed) = intake::prompt(&loaded, chunk);
+                let (prompt, scrubbed) = intake::prompt(&known, chunk);
                 redacted += scrubbed;
                 for draft in intake::draft(&drafter, &prompt)? {
                     let id = draft.id.clone();
-                    let result = draft
-                        .into_proposal()
-                        .and_then(|proposal| knowledge::propose(&dirs, &loaded, proposal, today));
+                    if let Some(of) = known.repeated_by(&draft) {
+                        println!("duplicate {id} of {of}, not written");
+                        *duplicates.entry(of.to_owned()).or_default() += 1;
+                        continue;
+                    }
+                    let result = draft.into_proposal().and_then(|proposal| {
+                        let present = intake::Present::proposed(&proposal);
+                        knowledge::propose(&dirs, &loaded, proposal, today).map(|_| present)
+                    });
                     match result {
-                        Ok(_) => {
+                        Ok(present) => {
+                            // Present for the drafts after it in this answer.
+                            known.add(present);
                             proposed += 1;
                             println!("proposed {id}");
                         }
@@ -2149,9 +2163,18 @@ fn cmd_intake(
     if left == 0 {
         println!("{nothing}");
     } else {
+        let repeated: usize = duplicates.values().sum();
         println!(
-            "{proposed} proposal(s) waiting for review (`ohjaa review`), {refused} draft(s) refused"
+            "{proposed} proposal(s) waiting for review (`ohjaa review`), {repeated} duplicate(s) \
+             not written, {refused} draft(s) refused"
         );
+        if repeated > 0 {
+            let of: Vec<String> = duplicates
+                .iter()
+                .map(|(id, n)| format!("duplicate of {id} ×{n}"))
+                .collect();
+            println!("not written: {}", of.join(", "));
+        }
     }
     if settled.left > 0 {
         eprintln!("ohjaa: {} candidate(s) wait for the next run", settled.left);

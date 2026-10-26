@@ -15,7 +15,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use faija_knowledge::{Kind, Scope};
+use faija_knowledge::{Kind, Node, Scope, Status};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -1337,9 +1337,13 @@ questions, and anything that only mattered in that moment. Most candidates carry
 nothing, and an empty array is a good answer. Never invent: every node must be
 supported by the quoted words.
 
-If a candidate corrects something the existing knowledge already covers, that
-knowledge did not reach the agent. Draft a lesson that refines the existing id
-and says what was missed, instead of a duplicate.
+After the instructions comes the knowledge already present: the current nodes,
+and the proposals waiting for a person to review them. Return nothing for a
+lesson already present, current or waiting, however it would be worded and under
+whatever id: every draft costs that person a review, and a second draft of one
+lesson is only noise. If a candidate shows that a present node did not reach
+the agent, or adds to it, name that node's id in \"refines\" and say what was
+missed, instead of drafting a new node beside it.
 
 Scopes:
 - ours: team-wide decisions and taste that hold in every project
@@ -1352,7 +1356,7 @@ Kinds: decision (chosen, binding), fact (true about the world), taste
 
 Output ONLY a JSON array, no prose, no code fence. Each element:
 {\"scope\": \"ours|repo|mine|machine\", \"repo\": \"/absolute/path or null\",
- \"id\": \"kebab-case, at most 64 characters, not an existing id\",
+ \"id\": \"kebab-case, at most 64 characters, not an id already present\",
  \"kind\": \"decision|fact|taste|lesson\",
  \"body\": \"one to three plain sentences; imperative where it is a rule\",
  \"origin\": [\"<date> <place>: '<the person's words, under 20 words>'\"],
@@ -1361,26 +1365,12 @@ Output ONLY a JSON array, no prose, no code fence. Each element:
 
 /// The prompt for one batch of candidates, every candidate's words and the
 /// agent's words before them scrubbed of secrets (see [`scrub`]), and how
-/// many secret-looking tokens were redacted from it.
-pub fn prompt(loaded: &Loaded, batch: &[Candidate]) -> (String, usize) {
+/// many secret-looking tokens were redacted from it. The knowledge already
+/// present comes first, within [`KNOWN_BUDGET`].
+pub fn prompt(known: &Known, batch: &[Candidate]) -> (String, usize) {
     let mut out = String::from(INSTRUCTIONS);
     let mut redacted = 0;
-    out.push_str("\nExisting knowledge:\n");
-    if loaded.nodes.is_empty() {
-        out.push_str("(none yet)\n");
-    }
-    for located in &loaded.nodes {
-        let node = &located.node;
-        let _ = writeln!(
-            out,
-            "- {} [{}/{}/{}]: {}",
-            node.id,
-            located.scope.name(),
-            node.kind.name(),
-            node.status.name(),
-            node.body.lines().next().unwrap_or("")
-        );
-    }
+    known.render(&mut out);
     out.push_str("\nCandidates:\n");
     for (index, candidate) in batch.iter().enumerate() {
         let _ = writeln!(
@@ -1478,6 +1468,227 @@ pub fn draft(drafter: &str, prompt: &str) -> Result<Vec<Draft>, Failure> {
         ));
     }
     parse_drafts(&output.stdout_text()).map_err(Failure::Refused)
+}
+
+// ---- what is already present ------------------------------------------------
+//
+// Every draft costs a person a review. The drafter is shown what is already
+// present, current or waiting for that person, and told to return nothing for
+// it; and its answer is checked here too, for what it repeats anyway. A draft
+// that repeats a present node is its *duplicate*: not written, and said by
+// the id it repeats. Each draft written in a run is present for every draft
+// after it, in its batch and in the batches after.
+
+/// At most this many characters of the prompt list what is already present.
+const KNOWN_BUDGET: usize = 24_000;
+/// At most this many characters of a node's first line stand for it there.
+const SUMMARY_CHARS: usize = 100;
+
+/// A node a draft may repeat: one in a scope directory, or a proposal
+/// waiting for a person.
+#[derive(Debug, Clone)]
+pub struct Present {
+    id: String,
+    scope: Scope,
+    kind: Kind,
+    status: Status,
+    /// The first line of its body.
+    summary: String,
+    words: BTreeSet<String>,
+}
+
+impl Present {
+    fn new(scope: Scope, node: &Node) -> Present {
+        Present {
+            id: node.id.clone(),
+            scope,
+            kind: node.kind,
+            status: node.status,
+            summary: node.body.lines().next().unwrap_or("").to_owned(),
+            words: title_words(&node.id),
+        }
+    }
+
+    /// A proposal just written: waiting, like those written before this run.
+    pub fn proposed(proposal: &Proposal) -> Present {
+        Present {
+            id: proposal.id.clone(),
+            scope: proposal.scope,
+            kind: proposal.kind,
+            status: Status::Proposed,
+            summary: proposal.body.trim().lines().next().unwrap_or("").to_owned(),
+            words: title_words(&proposal.id),
+        }
+    }
+
+    /// Present as a lesson: current, or proposed and waiting. A superseded or
+    /// retired node is shown to the drafter, and is not repeated by drafting
+    /// it again: a person put it aside, and may want to see it come back.
+    fn holds(&self) -> bool {
+        matches!(self.status, Status::Current | Status::Proposed)
+    }
+}
+
+/// What is already present, in the order the drafter is shown it: every node
+/// in the scope directories, then the proposals waiting beside them.
+#[derive(Debug, Clone, Default)]
+pub struct Known {
+    nodes: Vec<Present>,
+}
+
+impl Known {
+    /// Everything loaded, and every proposal waiting for a person.
+    pub fn read(dirs: &Dirs, loaded: &Loaded) -> Result<Known> {
+        let (waiting, _) = knowledge::pending(dirs, loaded)?;
+        Ok(Known::of(loaded, &waiting))
+    }
+
+    /// A proposed node committed into a scope directory is in both `loaded`
+    /// and `waiting`; it is listed once.
+    pub fn of(loaded: &Loaded, waiting: &[knowledge::Pending]) -> Known {
+        let nodes = loaded
+            .nodes
+            .iter()
+            .map(|located| Present::new(located.scope, &located.node))
+            .chain(
+                waiting
+                    .iter()
+                    .filter(|pending| pending.staged)
+                    .map(|pending| Present::new(pending.scope, &pending.node)),
+            )
+            .collect();
+        Known { nodes }
+    }
+
+    pub fn add(&mut self, present: Present) {
+        self.nodes.push(present);
+    }
+
+    /// The id of the present node `draft` repeats, if it repeats one.
+    ///
+    /// It repeats a waiting proposal it names as what it refines: that one
+    /// is still to be reviewed, and the drafter says itself that this is the
+    /// same lesson. Otherwise it repeats the node whose title its own says
+    /// mostly again ([`near`]): the nearest, and of those as near the first
+    /// (current knowledge comes before what waits). Its title is checked
+    /// against every present node in every scope, except the current node it
+    /// refines and those it supersedes: a refinement is meant to say its base
+    /// again, and to add to it.
+    pub fn repeated_by(&self, draft: &Draft) -> Option<&str> {
+        let refines = draft.refines.as_deref().filter(|id| !id.is_empty());
+        if let Some(waiting) = self.nodes.iter().find(|present| {
+            Some(present.id.as_str()) == refines && present.status == Status::Proposed
+        }) {
+            return Some(&waiting.id);
+        }
+        let words = title_words(&draft.id);
+        self.nodes
+            .iter()
+            .filter(|present| present.holds())
+            .filter(|present| {
+                Some(present.id.as_str()) != refines && !draft.supersedes.contains(&present.id)
+            })
+            .filter_map(|present| near(&words, &present.words).map(|score| (score, present)))
+            .min_by_key(|(score, _)| std::cmp::Reverse(*score))
+            .map(|(_, present)| present.id.as_str())
+    }
+
+    /// The list the drafter is shown, within [`KNOWN_BUDGET`] characters:
+    /// current knowledge first, then what waits for a person, in the order
+    /// they are stored; what does not fit is counted, and still checked
+    /// against by [`Known::repeated_by`].
+    fn render(&self, out: &mut String) {
+        let (waiting, other): (Vec<&Present>, Vec<&Present>) = self
+            .nodes
+            .iter()
+            .partition(|present| present.status == Status::Proposed);
+        let mut budget = KNOWN_BUDGET;
+        let mut list = |heading: &str, nodes: &[&Present], out: &mut String| {
+            out.push_str(heading);
+            if nodes.is_empty() {
+                out.push_str("(none)\n");
+            }
+            let mut shown = 0;
+            for present in nodes {
+                let mut summary: String = present.summary.chars().take(SUMMARY_CHARS).collect();
+                if summary.len() < present.summary.len() {
+                    summary.push('…');
+                }
+                let line = format!(
+                    "- {} [{}/{}/{}]: {summary}\n",
+                    present.id,
+                    present.scope.name(),
+                    present.kind.name(),
+                    present.status.name(),
+                );
+                if line.len() > budget {
+                    break;
+                }
+                budget -= line.len();
+                out.push_str(&line);
+                shown += 1;
+            }
+            if shown < nodes.len() {
+                let _ = writeln!(out, "- … and {} more, not shown", nodes.len() - shown);
+            }
+        };
+        list(
+            "\nExisting knowledge (its status says whether it is current):\n",
+            &other,
+            out,
+        );
+        list(
+            "\nProposals waiting for a person to review (present too: return nothing for a lesson \
+             one of them holds):\n",
+            &waiting,
+            out,
+        );
+    }
+}
+
+/// Words that carry no lesson in a title.
+const FILLER: [&str; 45] = [
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for", "from", "has",
+    "have", "how", "in", "into", "is", "it", "its", "must", "of", "on", "onto", "or", "should",
+    "so", "than", "that", "the", "then", "this", "to", "up", "via", "was", "were", "what", "when",
+    "where", "which", "who", "will", "with",
+];
+
+/// The words of a node's title. A node has no title but its id, kebab-case
+/// words: they are split at every character that is not a letter or digit,
+/// lowercased, filler dropped, and one common English ending cut from each
+/// (`-ing`, `-ed`, `-es`, `-s` but not `-ss`, `-e`) when three letters or
+/// more remain. So `start-sessions-through-ohjaa-run` and
+/// `start-a-session-through-ohjaa-run` say the same words, and
+/// `prove-with-ohjaa-gate-before-merging` says `merg` as `merge` does.
+pub fn title_words(id: &str) -> BTreeSet<String> {
+    id.split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|word| !word.is_empty() && !FILLER.contains(&word.as_str()))
+        .map(|word| {
+            let cut = ["ing", "ed", "es", "s", "e"].iter().find_map(|ending| {
+                let stem = word.strip_suffix(ending)?;
+                (stem.chars().count() >= 3 && !(*ending == "s" && stem.ends_with('s')))
+                    .then_some(stem)
+            });
+            cut.unwrap_or(&word).to_owned()
+        })
+        .collect()
+}
+
+/// Whether two titles say mostly the same words, and how nearly (in
+/// thousandths): they share at least two words, and the shared words are at
+/// least 60% of all their words, counted as Dice's coefficient,
+/// 2·|shared| / (|a| + |b|) ≥ 0.6. `read-back-briefing-and-leave-handover`
+/// and `read-briefing-and-leave-handover` share 4 of 5 and 4 words (0.89);
+/// `start-agents-through-ohjaa-run` and `start-sessions-through-ohjaa-run`
+/// 4 of 5 and 5 (0.8); `gate-before-pushing-main` and
+/// `prove-with-ohjaa-gate-before-merging` only 2 of 4 and 5 (0.44), which
+/// the drafter, shown both, is told to see itself.
+pub fn near(a: &BTreeSet<String>, b: &BTreeSet<String>) -> Option<usize> {
+    let shared = a.intersection(b).count();
+    let total = a.len() + b.len();
+    (shared >= 2 && 10 * shared >= 3 * total).then(|| 2_000 * shared / total)
 }
 
 // ---- the cursor -------------------------------------------------------------
@@ -2761,12 +2972,308 @@ mod tests {
             candidate("review", format!("token={key}"), String::new()),
             candidate("handover", "next: nothing secret".to_owned(), String::new()),
         ];
-        let (prompt, redacted) = prompt(&Loaded::default(), &batch);
+        let (prompt, redacted) = prompt(&Known::default(), &batch);
         assert!(!prompt.contains(&key), "{prompt}");
         assert_eq!(redacted, 3);
         assert!(prompt.contains("said: use [redacted] please"), "{prompt}");
         assert!(prompt.contains("before: I need [redacted]"), "{prompt}");
         assert!(prompt.contains("said: next: nothing secret"), "{prompt}");
+    }
+
+    fn lesson(id: &str, status: Status, body: &str) -> Node {
+        Node {
+            id: id.to_owned(),
+            kind: Kind::Lesson,
+            status,
+            as_of: parse_date("2026-10-26").unwrap(),
+            origin: vec!["a test".to_owned()],
+            supersedes: Vec::new(),
+            refines: None,
+            holds_while: Vec::new(),
+            body: body.to_owned(),
+        }
+    }
+
+    /// `current` in mine, each with its status; `waiting` in ours, proposed.
+    fn known(current: &[(&str, Status)], waiting: &[&str]) -> Known {
+        let loaded = Loaded {
+            nodes: current
+                .iter()
+                .map(|(id, status)| faija_knowledge::Located {
+                    scope: Scope::Mine,
+                    node: lesson(id, *status, "A lesson in a scope."),
+                })
+                .collect(),
+            ..Loaded::default()
+        };
+        let waiting: Vec<knowledge::Pending> = waiting
+            .iter()
+            .map(|id| knowledge::Pending {
+                scope: Scope::Ours,
+                repo: None,
+                path: PathBuf::from(format!("/proposals/ours/{id}.md")),
+                node: lesson(id, Status::Proposed, "A lesson waiting."),
+                staged: true,
+            })
+            .collect();
+        Known::of(&loaded, &waiting)
+    }
+
+    fn drafting(id: &str, refines: Option<&str>, supersedes: &[&str]) -> Draft {
+        Draft {
+            scope: "ours".into(),
+            repo: None,
+            id: id.into(),
+            kind: "lesson".into(),
+            body: "b".into(),
+            origin: vec!["o".into()],
+            refines: refines.map(str::to_owned),
+            supersedes: supersedes.iter().map(|id| (*id).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_title_is_its_words_not_their_spelling() {
+        let words = |id: &str| title_words(id).into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            words("start-a-session-through-ohjaa-run"),
+            words("start-sessions-through-ohjaa-run")
+        );
+        assert_eq!(
+            words("prove-with-ohjaa-gate-before-merging"),
+            ["befor", "gat", "merg", "ohjaa", "prov"]
+        );
+        assert_eq!(words("merge"), words("merged"));
+        // `-ss` is no plural, and a short word keeps its ending.
+        assert_eq!(
+            words("the-process-passes-its-uses"),
+            ["pass", "process", "use"]
+        );
+        assert_eq!(words("Rust_or.ELIXIR"), ["elixir", "rust"]);
+    }
+
+    #[test]
+    fn titles_are_near_when_they_say_mostly_the_same_words() {
+        let near = |a: &str, b: &str| near(&title_words(a), &title_words(b));
+        // Duplicates intake's first real run wrote, 2026-10-27, and one of a
+        // node already current.
+        for (a, b) in [
+            (
+                "read-back-briefing-and-leave-handover",
+                "read-briefing-and-leave-handover",
+            ),
+            (
+                "read-back-briefing-and-leave-handover",
+                "ohjaa-read-back-briefing-and-leave-handover",
+            ),
+            (
+                "ohjaa-read-back-briefing-and-leave-handover",
+                "read-back-briefing-with-ohjaa-oriented",
+            ),
+            (
+                "start-agents-through-ohjaa-run",
+                "start-sessions-through-ohjaa-run",
+            ),
+            ("code-is-rust-or-elixir", "rust-elixir-only"),
+        ] {
+            assert!(near(a, b).is_some(), "{a} | {b}");
+            assert_eq!(near(a, b), near(b, a));
+        }
+        // The nearest pairs of its 131 ids that are not one lesson.
+        for (a, b) in [
+            (
+                "ohjaa-gate-refuses-until-adopt-after-merge",
+                "prove-with-ohjaa-gate-before-merging",
+            ),
+            (
+                "gate-proof-lives-in-its-worktree",
+                "scratch-trees-hold-live-worktrees",
+            ),
+            (
+                "linux-dev-git-is-too-old-for-reftable",
+                "linux-dev-has-nftables",
+            ),
+            // Half the words, but one word in common is never enough.
+            ("lean-first", "local-first"),
+        ] {
+            assert_eq!(near(a, b), None, "{a} | {b}");
+        }
+        // One lesson in other words is the drafter's to see, shown both.
+        assert_eq!(
+            near(
+                "gate-before-pushing-main",
+                "prove-with-ohjaa-gate-before-merging"
+            ),
+            None
+        );
+        // Nearer is more.
+        assert!(
+            near(
+                "read-back-briefing-and-leave-handover",
+                "ohjaa-read-back-briefing-and-leave-handover"
+            ) > near(
+                "read-back-briefing-and-leave-handover",
+                "read-back-briefing-with-ohjaa-oriented"
+            )
+        );
+    }
+
+    #[test]
+    fn a_draft_repeats_what_is_present_and_not_what_it_builds_on_or_was_put_aside() {
+        let present = known(
+            &[
+                ("read-back-briefing", Status::Current),
+                ("leave-a-handover-always", Status::Retired),
+            ],
+            &["start-sessions-through-ohjaa-run"],
+        );
+        let repeats = |draft: Draft| present.repeated_by(&draft).map(str::to_owned);
+        assert_eq!(
+            repeats(drafting("start-agents-through-ohjaa-run", None, &[])),
+            Some("start-sessions-through-ohjaa-run".to_owned()),
+            "near a waiting proposal"
+        );
+        assert_eq!(
+            repeats(drafting("read-the-briefing-back", None, &[])),
+            Some("read-back-briefing".to_owned()),
+            "near current knowledge, in another scope"
+        );
+        assert_eq!(
+            repeats(drafting(
+                "pi-sessions-need-a-wrapper-too",
+                Some("start-sessions-through-ohjaa-run"),
+                &[]
+            )),
+            Some("start-sessions-through-ohjaa-run".to_owned()),
+            "what the drafter says refines a waiting proposal is that proposal's lesson"
+        );
+        // A refinement of current knowledge, or what supersedes it, says it
+        // again by design.
+        assert_eq!(
+            repeats(drafting(
+                "read-back-briefing-in-codex",
+                Some("read-back-briefing"),
+                &[]
+            )),
+            None
+        );
+        assert_eq!(
+            repeats(drafting(
+                "read-back-briefing-first",
+                None,
+                &["read-back-briefing"]
+            )),
+            None
+        );
+        assert_eq!(
+            repeats(drafting("always-leave-a-handover", None, &[])),
+            None,
+            "a retired node is not present"
+        );
+        assert_eq!(repeats(drafting("lima-for-linux", None, &[])), None);
+
+        // Of several, the nearest; and what is written is present after.
+        let mut two = known(
+            &[],
+            &[
+                "read-briefing-and-leave-handover",
+                "read-back-briefing-and-leave-handover",
+            ],
+        );
+        let draft = drafting("ohjaa-read-back-briefing-and-leave-handover", None, &[]);
+        assert_eq!(
+            two.repeated_by(&draft),
+            Some("read-back-briefing-and-leave-handover")
+        );
+        let lima = drafting("lima-for-linux", None, &[]);
+        assert_eq!(two.repeated_by(&lima), None);
+        two.add(Present::proposed(&lima.clone().into_proposal().unwrap()));
+        assert_eq!(
+            two.repeated_by(&drafting("linux-for-lima", None, &[])),
+            Some("lima-for-linux")
+        );
+        // As near as each other: current knowledge is named first.
+        let tie = drafting("code-in-rust-or-elixir-only", None, &[]);
+        assert_eq!(
+            near(&title_words(&tie.id), &title_words("rust-elixir-only")),
+            near(
+                &title_words(&tie.id),
+                &title_words("code-is-rust-or-elixir")
+            )
+        );
+        assert_eq!(
+            known(
+                &[("rust-elixir-only", Status::Current)],
+                &["code-is-rust-or-elixir"]
+            )
+            .repeated_by(&tie),
+            Some("rust-elixir-only")
+        );
+    }
+
+    #[test]
+    fn a_proposed_node_in_a_scope_directory_is_listed_once() {
+        let node = lesson("x-y-z", Status::Proposed, "Committed for review.");
+        let loaded = Loaded {
+            nodes: vec![faija_knowledge::Located {
+                scope: Scope::Ours,
+                node: node.clone(),
+            }],
+            ..Loaded::default()
+        };
+        let waiting = [knowledge::Pending {
+            scope: Scope::Ours,
+            repo: None,
+            path: PathBuf::from("/ours/knowledge/x-y-z.md"),
+            node,
+            staged: false,
+        }];
+        assert_eq!(Known::of(&loaded, &waiting).nodes.len(), 1);
+    }
+
+    #[test]
+    fn the_drafter_is_shown_what_is_present_within_a_budget() {
+        let (text, _) = prompt(
+            &known(
+                &[("rust-elixir-only", Status::Current)],
+                &["start-sessions-through-ohjaa-run"],
+            ),
+            &[],
+        );
+        let current = text
+            .find("- rust-elixir-only [mine/lesson/current]: A lesson in a scope.")
+            .expect(&text);
+        let heading = text.find("\nProposals waiting for a person").expect(&text);
+        let waiting = text
+            .find("- start-sessions-through-ohjaa-run [ours/lesson/proposed]: A lesson waiting.")
+            .expect(&text);
+        assert!(current < heading && heading < waiting, "{text}");
+
+        // However many wait, the list stays within its budget, each line
+        // cut, and what is left out is counted.
+        let body = "word ".repeat(100);
+        let waiting: Vec<knowledge::Pending> = (0..1_000)
+            .map(|n| knowledge::Pending {
+                scope: Scope::Ours,
+                repo: None,
+                path: PathBuf::new(),
+                node: lesson(&format!("lesson-{n}"), Status::Proposed, &body),
+                staged: true,
+            })
+            .collect();
+        let (text, _) = prompt(&Known::of(&Loaded::default(), &waiting), &[]);
+        let list = &text[INSTRUCTIONS.len()..text.find("\nCandidates:").unwrap()];
+        assert!(list.len() < KNOWN_BUDGET + 300, "{}", list.len());
+        assert!(
+            list.contains("- lesson-0 [ours/lesson/proposed]: word"),
+            "{list}"
+        );
+        let shown = list.matches("\n- lesson-").count();
+        assert!(
+            list.contains(&format!("- … and {} more, not shown", 1_000 - shown)),
+            "{list}"
+        );
+        assert!(!list.contains(&"word ".repeat(21)), "a summary is cut");
     }
 
     #[test]
