@@ -114,10 +114,49 @@ pub struct Undated {
     pub written_ms: Option<i64>,
 }
 
+/// How a native session was found to be an `ohjaa run` launch's, surest
+/// first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum By {
+    /// A usage receipt the launch imported names it.
+    Receipt,
+    /// The agent's environment named it from inside the launch (`ohjaa
+    /// oriented`, `ohjaa handover`).
+    Env,
+    /// Its transcript holds the launch's prompt, found at leaving.
+    LaunchPrompt,
+    /// Neither: the launch recorded no id, and the session is its agent's,
+    /// in its folder, started while it ran.
+    Window,
+}
+
+impl By {
+    pub fn word(self) -> &'static str {
+        match self {
+            By::Receipt => "receipt",
+            By::Env => "env",
+            By::LaunchPrompt => "launch_prompt",
+            By::Window => "time_and_folder",
+        }
+    }
+}
+
+/// A native session matched to the `ohjaa run` launch that ran it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Matched {
+    pub agent: String,
+    pub id: String,
+    /// The ohjaa session.
+    pub session: String,
+    pub by: By,
+}
+
 /// What vessa's list says about sessions run without ohjaa.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Natives {
     pub bypasses: Vec<Bypass>,
+    /// The sessions launched through ohjaa, and how each was matched.
+    pub matched: Vec<Matched>,
     /// Headless runs (`claude -p`, `codex exec`, intake's drafter among
     /// them): no person started them, so they bypass nothing.
     pub headless: usize,
@@ -256,7 +295,7 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
     let natives = if window {
         native_sessions(since_ms, now_ms, &mut gaps).map(|listed| {
             let (judgeable, mut natives) = listed;
-            natives.bypasses = bypasses(judgeable, &logged);
+            (natives.bypasses, natives.matched) = judge_natives(judgeable, &logged);
             natives
         })
     } else {
@@ -678,12 +717,44 @@ pub fn parse_native(
     Ok((judgeable, natives))
 }
 
-/// The native sessions no `ohjaa run` launched, oldest first.
+/// The ids of the agent's own sessions a launch recorded, each with how:
+/// its usage receipts, what its environment named from inside it, and what
+/// leaving found by its launch prompt.
+fn recorded(session: &Session) -> Vec<(&str, &str, By)> {
+    let receipts = session
+        .usage
+        .iter()
+        .map(|r| (r.agent.as_str(), r.session_id.as_str(), By::Receipt));
+    let env = session
+        .native_env
+        .iter()
+        .map(|e| (e.agent.as_str(), e.session_id.as_str(), By::Env));
+    let left = session
+        .left
+        .iter()
+        .flat_map(|left| left.native.iter())
+        .flat_map(|native| &native.sessions)
+        .map(|n| {
+            let by = if n.env { By::Env } else { By::LaunchPrompt };
+            (n.agent.as_str(), n.session_id.as_str(), by)
+        });
+    receipts.chain(env).chain(left).collect()
+}
+
+/// The native sessions no `ohjaa run` launched, oldest first, and those one
+/// did, each with how it was matched.
 ///
-/// A launch with a usage receipt is matched by its receipts alone: the
-/// sessions they name are its own, and it claims no other. Every other
-/// launch may claim one session of its agent (the launched command's file
-/// name), in its repository or below, that started while it ran: from
+/// A launch that recorded the ids of its agent's own sessions is matched by
+/// them alone: a usage receipt's, what its agent's environment named from
+/// inside it (`ohjaa oriented`, `ohjaa handover`), and what leaving found by
+/// its launch prompt (`left.native`). The sessions they name are its own,
+/// wherever and whenever they ran, and it claims no other. A session named
+/// by several launches (resumed in each) is each one's; it is said matched
+/// by the surest way any named it.
+///
+/// Only a launch with no recorded id falls back to time and folder: it may
+/// claim one session of its agent (the launched command's file name), in
+/// its repository or below, that started while it ran: from
 /// [`LAUNCH_EARLY_MS`] before it was logged until its leaving was (to now
 /// while it runs). An agent can write its first record long after its
 /// launch, so nothing narrower holds.
@@ -696,24 +767,41 @@ pub fn parse_native(
 /// read, it is how close the session started to the launch. Ties go to the
 /// closer start, then the earlier session and launch by id, so the same
 /// list always gives the same answer.
-pub fn bypasses(native: Vec<Native>, logged: &[Session]) -> Vec<Bypass> {
+pub fn judge_natives(native: Vec<Native>, logged: &[Session]) -> (Vec<Bypass>, Vec<Matched>) {
     let canonical =
         |path: &str| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
-    let by_receipt: std::collections::HashSet<(&str, &str)> = logged
-        .iter()
-        .flat_map(|s| &s.usage)
-        .map(|receipt| (receipt.agent.as_str(), receipt.session_id.as_str()))
-        .collect();
+    let mut by_id: std::collections::HashMap<(&str, &str), (By, &str)> =
+        std::collections::HashMap::new();
+    let mut launches: Vec<(&Session, PathBuf)> = Vec::new();
+    for s in logged {
+        let ids = recorded(s);
+        if ids.is_empty() {
+            launches.push((s, canonical(&s.repo)));
+        }
+        for (agent, id, by) in ids {
+            let surest = by_id.entry((agent, id)).or_insert((by, &s.id));
+            if (by, s.id.as_str()) < (surest.0, surest.1) {
+                *surest = (by, &s.id);
+            }
+        }
+    }
+    let mut matched = Vec::new();
     let mut native: Vec<Native> = native
         .into_iter()
-        .filter(|n| !by_receipt.contains(&(n.agent.as_str(), n.id.as_str())))
+        .filter(|n| match by_id.get(&(n.agent.as_str(), n.id.as_str())) {
+            Some((by, session)) => {
+                matched.push(Matched {
+                    agent: n.agent.clone(),
+                    id: n.id.clone(),
+                    session: (*session).to_owned(),
+                    by: *by,
+                });
+                false
+            }
+            None => true,
+        })
         .collect();
     native.sort_by(|a, b| (a.started_ms, &a.id).cmp(&(b.started_ms, &b.id)));
-    let launches: Vec<(&Session, PathBuf)> = logged
-        .iter()
-        .filter(|s| s.usage.is_empty())
-        .map(|s| (s, canonical(&s.repo)))
-        .collect();
     let mut pairs = Vec::new();
     for (i, n) in native.iter().enumerate() {
         let cwd = canonical(&n.cwd);
@@ -738,25 +826,33 @@ pub fn bypasses(native: Vec<Native>, logged: &[Session]) -> Vec<Bypass> {
         }
     }
     pairs.sort();
-    let mut taken_native = vec![false; native.len()];
+    let mut taken_native: Vec<Option<&str>> = vec![None; native.len()];
     let mut taken_launch = vec![false; launches.len()];
     for (_, i, j) in pairs {
-        if !taken_native[i] && !taken_launch[j] {
-            taken_native[i] = true;
+        if taken_native[i].is_none() && !taken_launch[j] {
+            taken_native[i] = Some(launches[j].0.id.as_str());
             taken_launch[j] = true;
         }
     }
-    native
-        .into_iter()
-        .zip(taken_native)
-        .filter(|(_, taken)| !taken)
-        .map(|(n, _)| Bypass {
-            agent: n.agent,
-            id: n.id,
-            cwd: n.cwd,
-            started_ms: n.started_ms,
-        })
-        .collect()
+    let mut bypasses = Vec::new();
+    for (n, taken) in native.into_iter().zip(taken_native) {
+        match taken {
+            Some(session) => matched.push(Matched {
+                agent: n.agent,
+                id: n.id,
+                session: session.to_owned(),
+                by: By::Window,
+            }),
+            None => bypasses.push(Bypass {
+                agent: n.agent,
+                id: n.id,
+                cwd: n.cwd,
+                started_ms: n.started_ms,
+            }),
+        }
+    }
+    matched.sort_by(|a, b| (a.by, &a.agent, &a.id).cmp(&(b.by, &b.agent, &b.id)));
+    (bypasses, matched)
 }
 
 // ---- saying it --------------------------------------------------------------
@@ -927,6 +1023,7 @@ pub fn render(report: &Report) -> String {
                     sessions::clock(b.started_ms)
                 );
             }
+            matched_lines(&natives.matched, &mut out);
             if natives.headless > 0 {
                 let _ = writeln!(
                     out,
@@ -961,6 +1058,39 @@ pub fn render(report: &Report) -> String {
     }
     say_gaps(report, &mut out);
     out
+}
+
+/// How the sessions launched through ohjaa were told apart, counted by how;
+/// each one matched by time and folder alone is named, since only that is
+/// inferred rather than recorded.
+fn matched_lines(matched: &[Matched], out: &mut String) {
+    if matched.is_empty() {
+        return;
+    }
+    let count = |by: By| matched.iter().filter(|m| m.by == by).count();
+    let counts: Vec<String> = [
+        (By::Env, "by the id its environment named"),
+        (By::LaunchPrompt, "by its launch prompt"),
+        (By::Receipt, "by a usage receipt"),
+        (By::Window, "by time and folder alone"),
+    ]
+    .into_iter()
+    .filter(|(by, _)| count(*by) > 0)
+    .map(|(by, how)| format!("{} {how}", count(by)))
+    .collect();
+    let _ = writeln!(
+        out,
+        "  Launched through ohjaa ({}): {}",
+        matched.len(),
+        counts.join(", ")
+    );
+    for m in matched.iter().filter(|m| m.by == By::Window) {
+        let _ = writeln!(
+            out,
+            "  - {} {} taken as {}'s by time and folder: it recorded no id",
+            m.agent, m.id, m.session
+        );
+    }
 }
 
 fn say_gaps(report: &Report, out: &mut String) {
@@ -1159,6 +1289,14 @@ fn report_json(report: &Report) -> Value {
                     "id": b.id,
                     "cwd": b.cwd,
                     "started": rfc(b.started_ms),
+                })).collect::<Vec<_>>(),
+                // Additive: the sessions launched through ohjaa, and how each
+                // was matched to its launch.
+                "matched": natives.matched.iter().map(|m| json!({
+                    "agent": m.agent,
+                    "id": m.id,
+                    "session": m.session,
+                    "by": m.by.word(),
                 })).collect::<Vec<_>>(),
                 "headless": natives.headless,
                 "undated": natives.undated.iter().map(|u| json!({
@@ -1413,6 +1551,10 @@ mod tests {
         }
     }
 
+    fn bypasses(native: Vec<Native>, logged: &[Session]) -> Vec<Bypass> {
+        judge_natives(native, logged).0
+    }
+
     /// `session` as left at `ended_ms`, its leaving observed.
     fn ended(mut session: Session, ended_ms: i64) -> Session {
         let mut left = sessions::Left::orphaned(ended_ms);
@@ -1490,6 +1632,98 @@ mod tests {
                 &[launched, pi]
             )),
             ["i", "j"]
+        );
+    }
+
+    /// A launch that recorded its agent's own session ids is matched by them
+    /// alone, wherever and whenever those ran: by the environment first, then
+    /// the launch prompt. Only a launch that recorded none falls back to time
+    /// and folder. Each match says how it was made.
+    #[test]
+    fn a_recorded_id_matches_exactly_and_only_a_launch_without_one_falls_back() {
+        let repo = "/nonexistent/r/app";
+        // Left, its session named by its launch prompt, and one more by both
+        // after a `/clear`.
+        let mut prompt = ended(session("oh-1", "claude", repo, 1_000_000), 1_600_000);
+        prompt.left.as_mut().unwrap().native = Some(
+            serde_json::from_value(json!({"sessions": [
+                {"agent": "claude", "session_id": "by-prompt", "source": "/t/1.jsonl"},
+                {"agent": "claude", "session_id": "cleared", "source": "env", "env": true},
+            ]}))
+            .unwrap(),
+        );
+        // Still open, its session named by its environment.
+        let mut open = session("oh-2", "codex", repo, 1_000_000);
+        open.native_env = vec![crate::usage::FromEnv {
+            agent: "codex".to_owned(),
+            session_id: "by-env".to_owned(),
+            at_ms: 1_001_000,
+        }];
+        // Recorded nothing.
+        let bare = ended(session("oh-3", "pi", repo, 1_000_000), 1_600_000);
+        let (bypassed, matched) = judge_natives(
+            vec![
+                // Elsewhere and hours later: still its own.
+                native("claude", "by-prompt", "/nonexistent/elsewhere", 9_000_000),
+                native("claude", "cleared", repo, 1_300_000),
+                // Its agent, its folder, its time: not its own, since it
+                // recorded the ids of its own.
+                native("claude", "beside", repo, 1_002_000),
+                native("codex", "by-env", repo, 50_000_000),
+                native("codex", "codex-beside", repo, 1_002_000),
+                native("pi", "own", repo, 1_003_000),
+            ],
+            &[prompt, open, bare],
+        );
+        assert_eq!(ids(bypassed), ["beside", "codex-beside"]);
+        let how: Vec<(&str, &str, &str)> = matched
+            .iter()
+            .map(|m| (m.id.as_str(), m.session.as_str(), m.by.word()))
+            .collect();
+        assert_eq!(
+            how,
+            [
+                ("cleared", "oh-1", "env"),
+                ("by-env", "oh-2", "env"),
+                ("by-prompt", "oh-1", "launch_prompt"),
+                ("own", "oh-3", "time_and_folder"),
+            ]
+        );
+        // The fallback is named in the report, the rest counted.
+        let mut out = String::new();
+        matched_lines(&matched, &mut out);
+        assert_eq!(
+            out,
+            "  Launched through ohjaa (4): 2 by the id its environment named, 1 by its launch \
+             prompt, 1 by time and folder alone\n  \
+             - pi own taken as oh-3's by time and folder: it recorded no id\n"
+        );
+    }
+
+    /// A session resumed in two launches is named by both: matched by the
+    /// surest way either named it, and a bypass of neither.
+    #[test]
+    fn a_session_two_launches_named_is_matched_the_surest_way() {
+        let repo = "/nonexistent/r/app";
+        let named = |id: &str, env: bool| {
+            let mut s = ended(session(id, "claude", repo, 1_000_000), 1_600_000);
+            s.left.as_mut().unwrap().native = Some(
+                serde_json::from_value(json!({"sessions": [
+                    {"agent": "claude", "session_id": "resumed", "source": "/t.jsonl", "env": env},
+                ]}))
+                .unwrap(),
+            );
+            s
+        };
+        let (bypassed, matched) = judge_natives(
+            vec![native("claude", "resumed", repo, 500_000)],
+            &[named("oh-1", false), named("oh-2", true)],
+        );
+        assert!(bypassed.is_empty());
+        assert_eq!(matched.len(), 1);
+        assert_eq!(
+            (matched[0].session.as_str(), matched[0].by),
+            ("oh-2", By::Env)
         );
     }
 
@@ -2007,6 +2241,7 @@ mod tests {
                 cwd: String::new(),
                 started_ms: 7,
             }],
+            matched: Vec::new(),
             headless: 3,
             undated: Vec::new(),
         };
