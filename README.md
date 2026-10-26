@@ -655,10 +655,12 @@ ohjaa run codex --intent "change the parser" -- --model o3
   Explicit tasks and other agents retain prompt delivery. Update Toimija before
   using this version of Ohjaa; older versions reject the new flag rather than
   silently dropping context.
-- The briefing's first line is always `<!-- ohjaa-briefing v1 -->`. It says
-  where ohjaa's words begin, so a reader of transcripts can tell a launch's
-  task from the briefing toimija appends after it (vessa cuts there). It is
-  matched byte for byte: a change is a new version, never an edit.
+- The briefing `ohjaa run` hands toimija opens with the line
+  `<!-- ohjaa-briefing v1 -->`. It says where ohjaa's words begin, so a
+  reader of transcripts can tell a launch's task from the briefing toimija
+  appends after it (vessa cuts there). It is matched byte for byte: a change
+  is a new version, never an edit. `ohjaa brief` prints the same briefing
+  without it, and `brief --write` never writes it into a file.
 - `--dry-run` prints the exact command it would exec, without launching.
 - If toimija cannot fully read the sessions, or does not report its coverage,
   ohjaa refuses to launch blind.

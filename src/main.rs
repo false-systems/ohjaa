@@ -51,7 +51,8 @@ const MAX_BRIEFING: usize = 100 * 1024;
 /// that says where ohjaa's words begin, so a reader of transcripts (vessa,
 /// cutting a launch's task from the briefing toimija appends after it) can
 /// key on it instead of on the sentences each part opens with. Others match
-/// it byte for byte: a change is a new version, never an edit.
+/// it byte for byte: a change is a new version, never an edit. `ohjaa brief`
+/// prints its briefing without it, and `brief --write` never writes it.
 const BRIEFING_SENTINEL: &str = "<!-- ohjaa-briefing v1 -->";
 
 #[derive(Parser)]
