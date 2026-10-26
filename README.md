@@ -195,13 +195,19 @@ candidates that were handled, never back.
   warning that recurs on every run keeps the window growing until it is fixed.
 - With no repositories under the roots, reviews and reverts warn, and hold
   the cursor: nothing read is not nothing there.
-- vessa's exit 4 (a partial list) is such a warning: each source warning, gap
-  and session limitation it names is said, and holds the cursor, while what
-  it did list is drafted from. A store vessa knows of and does not read
-  (opencode's SQLite) is a gap only when it was written in the window, so a
-  machine where opencode is in use holds the cursor until vessa reads it.
-  A vessa that cannot list messages (older than `messages`) is told to be
-  updated, and holds the cursor too.
+- vessa's exit 4 (a partial list) names two kinds of reason, which intake
+  treats apart. What it lists is drafted from either way.
+  - A source it could not read (`warnings`), what a transcript leaves unknown
+    (`limitations`), or a run it ended with an `error` is a warning: said,
+    and it holds the cursor. So is a vessa missing from PATH, one that cannot
+    list messages (older than `messages`: update it), or output intake cannot
+    read.
+  - A store vessa knows of and never reads (`coverage.gaps`; today
+    opencode's SQLite, named only when written in the window) is said on
+    every run and holds nothing: not the cursor, not a session, not the exit
+    code. Waiting cannot read it, and a hold would keep the window before
+    every later write, so it would never end. Once vessa reads the store,
+    `ohjaa intake --source transcripts --since <its first day>` reads it back.
 - The report's own gaps are said, and do not hold the cursor.
 - A first run, with no cursor yet, keeps the start of its window (fourteen
   days back) as the cursor before it drafts.

@@ -234,9 +234,10 @@ struct VessaCoverage {
 /// What people wrote in agent sessions after `since_ms` (exclusive), as
 /// vessa, the one reader of agent conversations, lists it: `vessa messages
 /// --since <time> --json`. What vessa says it could not read is a warning
-/// here, which holds the cursor; a vessa that cannot list messages is said,
-/// and nothing reads the transcripts in its place.
-pub fn transcripts(since_ms: i64, warnings: &mut Vec<String>) -> Vec<Said> {
+/// here, which holds the cursor, and a store it does not read is a gap, said
+/// and holding nothing (see [`listed`]); a vessa that cannot list messages
+/// is said, and nothing reads the transcripts in its place.
+pub fn transcripts(since_ms: i64, warnings: &mut Vec<String>, gaps: &mut Vec<String>) -> Vec<Said> {
     let since = rfc3339_ms(since_ms);
     let output = process::run(
         Command::new("vessa").args(["messages", "--since", &since, "--json"]),
@@ -259,6 +260,7 @@ pub fn transcripts(since_ms: i64, warnings: &mut Vec<String>) -> Vec<Said> {
                 &detail,
                 since_ms,
                 warnings,
+                gaps,
             )
         }
         Err(error) => {
@@ -277,18 +279,27 @@ pub fn transcripts(since_ms: i64, warnings: &mut Vec<String>) -> Vec<Said> {
 }
 
 /// Read vessa's answer (`vessa-messages.v1`; its exit `code`, and `detail`,
-/// the last line it wrote to stderr). Exit 4 says the list is partial: each
-/// source warning, gap (a store vessa knows of and does not read, written in
-/// the window; one written before it is no gap) and session limitation it
-/// names becomes a warning. A document vessa ended with an `error` keeps the
-/// messages listed before it, and warns. A vessa with no `messages` (one
-/// older than vessa#6) is told to be updated.
+/// the last line it wrote to stderr). Exit 4 says the list is partial, for
+/// two kinds of reason, which vessa keeps apart:
+/// - a source it could not read (`warnings`), or what a transcript leaves
+///   unknown (`coverage.limitations`): each is a warning, which holds the
+///   cursor until vessa reads it;
+/// - a store it knows of and never reads (`coverage.gaps`; today opencode's
+///   SQLite, and only when written in the window): each goes to `gaps`, to
+///   be said on every run and hold nothing. Waiting cannot read it, and a
+///   hold would keep the window before every later write of the store, so
+///   it would never end; once vessa reads it, a `--since` reads it back.
+///
+/// A document vessa ended with an `error` keeps the messages listed before
+/// it, and warns. A vessa with no `messages` (one older than vessa#6) is told
+/// to be updated.
 pub fn listed(
     code: Option<i32>,
     stdout: &[u8],
     detail: &str,
     since_ms: i64,
     warnings: &mut Vec<String>,
+    gaps: &mut Vec<String>,
 ) -> Vec<Said> {
     let exit = code.map_or("a signal".to_owned(), |code| code.to_string());
     let document: VessaDocument = match serde_json::from_slice(stdout) {
@@ -318,15 +329,17 @@ pub fn listed(
         ));
         return Vec::new();
     }
-    let before = warnings.len();
+    let before = (warnings.len(), gaps.len());
     let coverage = document.coverage.as_ref();
     for warning in document
         .warnings
         .iter()
-        .chain(coverage.map(|c| &c.gaps).into_iter().flatten())
         .chain(coverage.map(|c| &c.limitations).into_iter().flatten())
     {
         warnings.push(format!("vessa: {warning}"));
+    }
+    for gap in coverage.map(|c| &c.gaps).into_iter().flatten() {
+        gaps.push(format!("vessa: {gap}"));
     }
     if let Some(error) = &document.error {
         warnings.push(format!(
@@ -334,7 +347,7 @@ pub fn listed(
             document.messages.len()
         ));
     }
-    if code != Some(0) && warnings.len() == before {
+    if code != Some(0) && (warnings.len(), gaps.len()) == before {
         warnings.push(format!(
             "vessa says its list is partial (exit {exit}: {detail})"
         ));
@@ -1846,7 +1859,14 @@ mod tests {
             &[],
         );
         let mut warnings = Vec::new();
-        let said = listed(Some(0), &document, "", since, &mut warnings);
+        let said = listed(
+            Some(0),
+            &document,
+            "",
+            since,
+            &mut warnings,
+            &mut Vec::new(),
+        );
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(said.len(), 5, "{said:?}");
         let first = &said[0].candidate;
@@ -1909,8 +1929,11 @@ mod tests {
                 Value::Null,
             )]
         };
-        // Exit 4: each gap and limitation is a warning; what was listed is kept.
-        let mut warnings = Vec::new();
+        // Exit 4: a limitation (or a source warning) is a warning, which
+        // holds the cursor; a gap, a store vessa knows of and does not read,
+        // is handed back apart, to be said without holding anything. What
+        // was listed is kept either way.
+        let (mut warnings, mut gaps) = (Vec::new(), Vec::new());
         let partial = vessa_document(
             one(),
             &["opencode: /h/.local/share/opencode/opencode.db not read"],
@@ -1922,23 +1945,48 @@ mod tests {
             "vessa: partial message list (exit 4)",
             since,
             &mut warnings,
+            &mut gaps,
         );
         assert_eq!(said.len(), 1);
         assert_eq!(
             warnings,
-            [
-                "vessa: opencode: /h/.local/share/opencode/opencode.db not read",
-                "vessa: codex/f: Codex fork of p: parent transcript not read",
-            ]
+            ["vessa: codex/f: Codex fork of p: parent transcript not read"]
         );
+        assert_eq!(
+            gaps,
+            ["vessa: opencode: /h/.local/share/opencode/opencode.db not read"]
+        );
+        // Exit 4 for a gap alone is no warning.
+        let (mut warnings, mut gaps) = (Vec::new(), Vec::new());
+        let unread = vessa_document(one(), &["opencode: /h/opencode.db not read"], &[]);
+        listed(Some(4), &unread, "partial", since, &mut warnings, &mut gaps);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(gaps.len(), 1);
+        // A source warning is a warning.
+        let (mut warnings, mut gaps) = (Vec::new(), Vec::new());
+        let mut unreadable: Value =
+            serde_json::from_slice(&vessa_document(one(), &[], &[])).unwrap();
+        unreadable["warnings"] = serde_json::json!(["/h/r.jsonl: Permission denied"]);
+        let unreadable = serde_json::to_vec(&unreadable).unwrap();
+        listed(
+            Some(4),
+            &unreadable,
+            "partial",
+            since,
+            &mut warnings,
+            &mut gaps,
+        );
+        assert_eq!(warnings, ["vessa: /h/r.jsonl: Permission denied"]);
+        assert!(gaps.is_empty());
         // Exit 4 with nothing named is still partial.
-        let mut warnings = Vec::new();
+        let (mut warnings, mut gaps) = (Vec::new(), Vec::new());
         listed(
             Some(4),
             &vessa_document(one(), &[], &[]),
             "partial",
             since,
             &mut warnings,
+            &mut gaps,
         );
         assert_eq!(
             warnings,
@@ -1950,7 +1998,10 @@ mod tests {
             "schema": "vessa-messages.v1", "messages": one(), "error": "disk on fire",
         }))
         .unwrap();
-        assert_eq!(listed(Some(1), &failed, "", since, &mut warnings).len(), 1);
+        assert_eq!(
+            listed(Some(1), &failed, "", since, &mut warnings, &mut Vec::new()).len(),
+            1
+        );
         assert_eq!(
             warnings,
             ["vessa failed after listing 1 message(s) (exit 1): disk on fire"]
@@ -1963,6 +2014,7 @@ mod tests {
             "error: unrecognized subcommand 'messages'",
             since,
             &mut warnings,
+            &mut Vec::new(),
         );
         assert!(old.is_empty());
         assert_eq!(warnings.len(), 1);
@@ -1973,13 +2025,21 @@ mod tests {
             "schema": "vessa-messages.v2", "messages": one(),
         }))
         .unwrap();
-        assert!(listed(Some(0), &other, "", since, &mut warnings).is_empty());
+        assert!(listed(Some(0), &other, "", since, &mut warnings, &mut Vec::new()).is_empty());
         assert!(warnings[0].contains("`vessa-messages.v2`"), "{warnings:?}");
         let mut warnings = Vec::new();
-        assert!(listed(Some(1), b"", "boom", since, &mut warnings).is_empty());
+        assert!(listed(Some(1), b"", "boom", since, &mut warnings, &mut Vec::new()).is_empty());
         assert_eq!(warnings, ["vessa listed no messages (exit 1: boom)"]);
         let mut warnings = Vec::new();
-        assert!(listed(Some(0), b"{\"schema\"", "", since, &mut warnings).is_empty());
+        assert!(listed(
+            Some(0),
+            b"{\"schema\"",
+            "",
+            since,
+            &mut warnings,
+            &mut Vec::new()
+        )
+        .is_empty());
         assert!(warnings[0].starts_with("vessa's messages are not vessa-messages.v1"));
         // A message no time can place cannot be windowed: said, not dropped.
         let mut warnings = Vec::new();
@@ -1994,7 +2054,7 @@ mod tests {
             &[],
             &[],
         );
-        assert!(listed(Some(0), &undated, "", since, &mut warnings).is_empty());
+        assert!(listed(Some(0), &undated, "", since, &mut warnings, &mut Vec::new()).is_empty());
         assert_eq!(
             warnings,
             ["vessa listed 1 message(s) whose time intake cannot read"]
@@ -2027,7 +2087,7 @@ mod tests {
             &[],
             &[],
         );
-        let said = listed(Some(0), &document, "", 0, &mut Vec::new());
+        let said = listed(Some(0), &document, "", 0, &mut Vec::new(), &mut Vec::new());
         assert!(said[0].long, "kept apart, to be counted");
         let (candidates, sifted) = sift(said, false);
         assert!(candidates.is_empty(), "never a candidate, filter or not");
@@ -2212,7 +2272,7 @@ mod tests {
             &[],
             &[],
         );
-        let said = listed(Some(0), &document, "", 0, &mut Vec::new());
+        let said = listed(Some(0), &document, "", 0, &mut Vec::new(), &mut Vec::new());
         let verdicts = prefilter(&said[..8]);
         assert_eq!(
             verdicts,

@@ -127,9 +127,10 @@ exit 0
 /// `vessa-messages.v1`, every line of `$HOME/vessa-messages.jsonl` (one
 /// message each, as vessa writes them), whatever its `--since`: intake
 /// windows what it is given too. Each call's arguments go to
-/// `$HOME/vessa-calls`. With `$HOME/vessa-gap` (a JSON string) the list is
-/// partial, with that gap, and it exits 4; with `$HOME/vessa-old` it is a
-/// vessa older than `messages`.
+/// `$HOME/vessa-calls`. With `$HOME/vessa-gap` or `$HOME/vessa-warning` (each
+/// a JSON string) the list is partial, with that gap (a store vessa does not
+/// read) or source warning (one it could not read), and it exits 4. With
+/// `$HOME/vessa-old` it is a vessa older than `messages`.
 const VESSA_STUB: &str = r#"#!/bin/sh
 if [ "$1" = messages ]; then
   printf '%s\n' "$*" >> "$HOME/vessa-calls"
@@ -140,9 +141,10 @@ if [ "$1" = messages ]; then
   fi
   printf '{"schema":"vessa-messages.v1","messages":[\n'
   if [ -f "$HOME/vessa-messages.jsonl" ]; then sed '$!s/$/,/' "$HOME/vessa-messages.jsonl"; fi
-  gaps=""; code=0
+  gaps=""; warnings=""; code=0
   if [ -f "$HOME/vessa-gap" ]; then gaps=$(cat "$HOME/vessa-gap"); code=4; fi
-  printf '],\n"sessions":[],\n"coverage":{"excluded":{},"gaps":[%s],"limitations":[]},\n"warnings":[]}\n' "$gaps"
+  if [ -f "$HOME/vessa-warning" ]; then warnings=$(cat "$HOME/vessa-warning"); code=4; fi
+  printf '],\n"sessions":[],\n"coverage":{"excluded":{},"gaps":[%s],"limitations":[]},\n"warnings":[%s]}\n' "$gaps" "$warnings"
   [ "$code" = 4 ] && echo "vessa: partial message list (exit 4): 1 source warning, 0 limitations" >&2
   exit "$code"
 fi
@@ -153,6 +155,14 @@ else
   echo '{"schema":"vessa-session-headers.v1","sessions":[],"warnings":[]}'
 fi
 "#;
+
+/// A source warning from vessa (`$HOME/vessa-warning`): a transcript it could
+/// not read.
+const UNREADABLE: &str = r#""/h/.codex/sessions/r.jsonl: Permission denied (os error 13)""#;
+
+/// A gap from vessa (`$HOME/vessa-gap`): a store it knows of and does not
+/// read, written in the window, as on a machine where opencode is in use.
+const UNREAD_STORE: &str = r#""opencode: /h/.local/share/opencode/opencode.db not read; opencode keeps its sessions in SQLite, which Vessa does not read""#;
 
 /// One message a person wrote, as `vessa messages --json` lists it.
 fn vessa_line(at: &str, cwd: &str, text: &str, reply: Option<&str>) -> String {
@@ -2896,13 +2906,8 @@ fn a_run_with_warnings_never_says_nothing_new_and_exits_zero() {
     }
     let fixture = Fixture::new("intakewarned");
     let repo = fixture.make_git_repo("work");
-    // vessa could not read everything: an opencode store written in the
-    // window, which it does not read.
-    fs::write(
-        fixture.dir.join("home/vessa-gap"),
-        r#""opencode: /h/.local/share/opencode/opencode.db not read""#,
-    )
-    .unwrap();
+    // vessa could not read a transcript.
+    fs::write(fixture.dir.join("home/vessa-warning"), UNREADABLE).unwrap();
     let (stdout, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -2910,7 +2915,7 @@ fn a_run_with_warnings_never_says_nothing_new_and_exits_zero() {
             .current_dir(&repo),
     );
     assert!(
-        stderr.contains("vessa: opencode: /h/.local/share/opencode/opencode.db not read"),
+        stderr.contains("ohjaa: intake: vessa: /h/.codex/sessions/r.jsonl: Permission denied"),
         "{stderr}"
     );
     assert!(
@@ -3015,12 +3020,8 @@ fn a_partial_list_from_vessa_holds_the_cursor_and_says_why() {
         None,
     )]);
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    let gap = fixture.dir.join("home/vessa-gap");
-    fs::write(
-        &gap,
-        r#""opencode: /h/.local/share/opencode/opencode.db not read; opencode keeps its sessions in SQLite""#,
-    )
-    .unwrap();
+    let unreadable = fixture.dir.join("home/vessa-warning");
+    fs::write(&unreadable, UNREADABLE).unwrap();
     let sent = fixture.dir.join("sent.txt");
     let drafter = recording_drafter(&fixture, &sent);
     let cursor_path = fixture.dir.join("state/ohjaa/intake-since");
@@ -3033,13 +3034,13 @@ fn a_partial_list_from_vessa_holds_the_cursor_and_says_why() {
                 .current_dir(&repo),
         )
     };
-    // Exit 4 from vessa: what it listed is drafted from, and the cursor
-    // stays where the first run's window began.
+    // Exit 4 from vessa, a transcript it could not read: what it listed is
+    // drafted from, and the cursor stays where the first run's window began.
     let (_, stderr, code) = intake();
     assert_eq!(code, Some(4), "{stderr}");
     assert_eq!(said_lines(&sent).len(), 1, "{stderr}");
     assert!(
-        stderr.contains("ohjaa: intake: vessa: opencode: /h/.local/share/opencode/opencode.db"),
+        stderr.contains("ohjaa: intake: vessa: /h/.codex/sessions/r.jsonl: Permission denied"),
         "{stderr}"
     );
     assert!(
@@ -3055,13 +3056,80 @@ fn a_partial_list_from_vessa_holds_the_cursor_and_says_why() {
         "{held} {stderr}"
     );
     // Once vessa reads everything, nothing is sent again, and it moves.
-    fs::remove_file(&gap).unwrap();
+    fs::remove_file(&unreadable).unwrap();
     let (stdout, stderr, code) = intake();
     assert_eq!(code, Some(0), "{stderr}");
     assert!(stdout.contains("nothing new"), "{stdout}");
     assert_eq!(said_lines(&sent).len(), 1, "handled once: {stderr}");
     let moved = fs::read_to_string(&cursor_path).unwrap();
     assert!(moved > held, "{held} -> {moved}");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_store_vessa_does_not_read_is_said_every_run_and_holds_neither_cursor_nor_queue() {
+    // The review of #56: an opencode store written in the window held the
+    // cursor, and every queued session, until vessa could read SQLite; the
+    // hold kept the window before each day's write, so it never ended.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakestore");
+    let repo = fixture.make_git_repo("work");
+    let script = format!("{} handover --surprised 'the store text'", ohjaa_bin());
+    let (_, stderr, code) = run_session(&fixture, &repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+    fixture.said(&[vessa_line(
+        &utc_now(),
+        "/p/elsewhere",
+        "i told you, never python",
+        None,
+    )]);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(fixture.dir.join("home/vessa-gap"), UNREAD_STORE).unwrap();
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = recording_drafter(&fixture, &sent);
+    let cursor_path = fixture.dir.join("state/ohjaa/intake-since");
+    let intake = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    let said = "ohjaa: intake: vessa: opencode: /h/.local/share/opencode/opencode.db not read";
+    let (stdout, stderr, code) = intake();
+    assert_eq!(
+        code,
+        Some(0),
+        "a store vessa does not read is no failure: {stderr}"
+    );
+    assert!(stderr.contains(said), "said: {stderr}");
+    assert!(!stderr.contains("cursor stays"), "{stderr}");
+    let sent_once = said_lines(&sent);
+    assert!(
+        sent_once.contains(&"    said: i told you, never python".to_owned())
+            && sent_once.iter().any(|l| l.contains("the store text")),
+        "the message, and the session's handover: {stderr}"
+    );
+    assert!(stdout.contains("0 proposal(s)"), "{stdout}");
+    let first = fs::read_to_string(&cursor_path).unwrap();
+    // Said again on the next run, which finds the session drafted and the
+    // cursor moved past what was sent.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (stdout, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains(said), "said on every run: {stderr}");
+    assert!(stdout.contains("nothing new"), "{stdout}");
+    assert!(
+        !stderr.contains("queued"),
+        "the session is drafted: {stderr}"
+    );
+    assert_eq!(said_lines(&sent), sent_once, "nothing sent twice: {stderr}");
+    let second = fs::read_to_string(&cursor_path).unwrap();
+    assert!(second > first, "the cursor moves: {first} -> {second}");
     fixture.cleanup();
 }
 
@@ -3718,15 +3786,11 @@ fn sessions_are_drafted_only_once_their_transcript_window_was_read() {
     );
     // ...and one whose transcripts could not all be read drafts from what it
     // found, but leaves the session queued.
-    let gap = fixture.dir.join("home/vessa-gap");
-    fs::write(
-        &gap,
-        r#""opencode: /h/.local/share/opencode/opencode.db not read""#,
-    )
-    .unwrap();
+    let unreadable = fixture.dir.join("home/vessa-warning");
+    fs::write(&unreadable, UNREADABLE).unwrap();
     let (prompt, _) = intake("transcripts");
     assert!(prompt.contains("the handover text"), "{prompt}");
-    fs::remove_file(&gap).unwrap();
+    fs::remove_file(&unreadable).unwrap();
     // Read cleanly: still queued after the warning, its handover is not sent
     // again, and only now it is marked drafted.
     let (prompt, stderr) = intake("transcripts");

@@ -1767,6 +1767,8 @@ fn cmd_intake(
         .min()
         .filter(|floor| *floor < since);
     let mut warnings = Vec::new();
+    // Stores vessa knows of and does not read: said, and holding nothing.
+    let mut gaps: Vec<String> = Vec::new();
     // The sources that could not all be read: they hold the cursor.
     let mut warned: Vec<&str> = Vec::new();
     let mut transcripts_read_cleanly = false;
@@ -1778,9 +1780,13 @@ fn cmd_intake(
     // One source, from `from`, unfiltered: what vessa lists of what people
     // wrote is pre-filtered in the pass below, not when read back for a
     // retry, which takes only candidates already sent.
-    let read = |source: &str, from: i64, warnings: &mut Vec<String>| -> Result<Vec<_>> {
+    let read = |source: &str,
+                from: i64,
+                warnings: &mut Vec<String>,
+                gaps: &mut Vec<String>|
+     -> Result<Vec<_>> {
         Ok(match source {
-            "transcripts" => intake::transcripts(from, warnings)
+            "transcripts" => intake::transcripts(from, warnings, gaps)
                 .into_iter()
                 .filter(|said| !said.long)
                 .map(|said| said.candidate)
@@ -1823,7 +1829,7 @@ fn cmd_intake(
                 .map(|s| s.started_ms - 1)
                 .min()
                 .map_or(since, |earliest| earliest.min(since));
-            let said = intake::transcripts(from, &mut warnings);
+            let said = intake::transcripts(from, &mut warnings, &mut gaps);
             transcripts_read_cleanly = warnings.len() == before;
             // What was said after `since`, and before it in a queued
             // session's window: only those are read, and pre-filtered.
@@ -1842,7 +1848,7 @@ fn cmd_intake(
             }
             candidates.extend(kept);
         } else {
-            candidates.extend(read(source, since, &mut warnings)?);
+            candidates.extend(read(source, since, &mut warnings, &mut gaps)?);
         }
         if warnings.len() > before {
             warned.push(source);
@@ -1853,7 +1859,7 @@ fn cmd_intake(
     if let Some(floor) = read_back {
         for source in &sources {
             let before = warnings.len();
-            let back = read(source, floor, &mut warnings)?;
+            let back = read(source, floor, &mut warnings, &mut gaps)?;
             candidates.extend(back.into_iter().filter(|c| retry.contains(&c.key())));
             if warnings.len() > before && !warned.contains(source) {
                 warned.push(source);
@@ -1870,6 +1876,15 @@ fn cmd_intake(
     }
     for warning in &warnings {
         eprintln!("ohjaa: intake: {warning}");
+    }
+    // Said on every run, once (a retry asks vessa twice); never a warning.
+    gaps.sort();
+    gaps.dedup();
+    for gap in &gaps {
+        eprintln!(
+            "ohjaa: intake: {gap} (a store vessa does not read: nothing in it is drafted \
+             from, and it does not hold the cursor)"
+        );
     }
     let found = intake::found(candidates);
     // What earlier runs handled is never sent again: a run takes the oldest
@@ -1898,8 +1913,14 @@ fn cmd_intake(
         found.len() - left,
     );
     // What could not be read is never rendered as nothing new.
-    let nothing = if warnings.is_empty() {
+    let nothing = if warnings.is_empty() && gaps.is_empty() {
         "nothing new to draft from".to_owned()
+    } else if warnings.is_empty() {
+        format!(
+            "nothing new to draft from in what vessa reads (it does not read {} store(s), \
+             said above)",
+            gaps.len()
+        )
     } else {
         format!(
             "nothing found to draft from in what could be read ({} warning(s) above)",
