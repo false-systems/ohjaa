@@ -206,10 +206,13 @@ pub struct OwnId {
 }
 
 impl OwnId {
-    /// Whether a receipt naming this contract hash and lock digest ran under
-    /// the repository's own contract.
+    /// Whether a receipt naming this contract hash (and this lock digest,
+    /// when it names one) ran under the repository's own contract. A
+    /// receipt an older sykli wrote names no lock digest: `sykli verify`
+    /// checks its lock, so only a digest it does name has to match here.
     pub fn ran(&self, contract_hash: Option<&str>, lock_digest: Option<&str>) -> bool {
-        contract_hash == Some(self.hash.as_str()) && lock_digest == self.lock_digest.as_deref()
+        contract_hash == Some(self.hash.as_str())
+            && lock_digest.is_none_or(|digest| Some(digest) == self.lock_digest.as_deref())
     }
 }
 
@@ -275,7 +278,11 @@ pub fn derive(own: &Own, overlay: &Overlay) -> Derived {
         Some(bytes) => {
             let lock = match pinned {
                 Pinned::Yes => Some(fresh_lock(&sha256(&bytes))),
-                Pinned::NoLock | Pinned::No => own.lock.clone(),
+                Pinned::NoLock => None,
+                // Locked to the repository's own contract, which a gate
+                // given lines is not: sykli refuses it, whatever the
+                // repository's lock pinned.
+                Pinned::No => own_hash.as_deref().map(fresh_lock),
             };
             let own_id = own_hash.map(|hash| OwnId {
                 hash,
@@ -310,15 +317,11 @@ pub fn derive(own: &Own, overlay: &Overlay) -> Derived {
 }
 
 impl Derived {
-    /// `<entry>/derived/<digest>`.
-    pub fn dir(&self, entry: &Path) -> PathBuf {
-        entry.join("derived").join(&self.digest)
-    }
-
-    /// The gate's file, written there (and its lock) unless it already is:
-    /// the same bytes whenever it is written.
-    pub fn write(&self, entry: &Path) -> Result<PathBuf, String> {
-        let dir = self.dir(entry);
+    /// Its file under `base`, `<base>/<digest>/sykli.json`, written there
+    /// (and its lock beside it) unless it already is: the same bytes
+    /// whenever it is written.
+    pub fn write(&self, base: &Path) -> Result<PathBuf, String> {
+        let dir = base.join(&self.digest);
         std::fs::create_dir_all(&dir)
             .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
         let contract = dir.join("sykli.json");
@@ -326,6 +329,114 @@ impl Derived {
         put(&dir.join("sykli.lock"), self.lock.as_deref())?;
         Ok(contract)
     }
+
+    /// Its file under `base` when it is there as derived, lock and all.
+    fn found(&self, base: &Path) -> Option<PathBuf> {
+        let contract = base.join(&self.digest).join("sykli.json");
+        let lock = std::fs::read(contract.with_file_name("sykli.lock")).ok();
+        (std::fs::read(&contract).ok().as_deref() == Some(&self.contract[..]) && lock == self.lock)
+            .then_some(contract)
+    }
+}
+
+/// Where derived gates are written for sykli, which reads a contract, and
+/// the `sykli.lock` beside it, from their files (it takes no contract on
+/// stdin). A gate a run that outlives this ohjaa names (`ohjaa gate`, an
+/// integrated validation) is kept in ohjaa's state, `$XDG_STATE_HOME/
+/// ohjaa/derived/<digest>/`, beside the clones' validation folders. Every
+/// other gate sykli only reads now (to verify a receipt, judge a push, say
+/// what applies to a commit, print a plan) is read from there when it is
+/// kept, else written into a folder of this process's own under `$TMPDIR`,
+/// removed when this is dropped: the marks, the report and `ohjaa gate
+/// --print` write nothing that stays, and never into the config home.
+#[derive(Debug, Default)]
+pub struct Gates {
+    /// `$XDG_STATE_HOME/ohjaa/derived`; `None` when there is no state home.
+    kept: Option<PathBuf>,
+    /// This process's own folder, made the first time a gate is written
+    /// there.
+    scratch: std::cell::RefCell<Option<PathBuf>>,
+}
+
+impl Gates {
+    pub fn new(kept: Option<PathBuf>) -> Gates {
+        Gates {
+            kept,
+            scratch: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Kept under this machine's ohjaa state.
+    pub fn of_state() -> Gates {
+        Gates::new(
+            crate::knowledge::state_home()
+                .ok()
+                .map(|state| state.join("ohjaa").join("derived")),
+        )
+    }
+
+    /// Where a run keeps `derived`, and whether it is there now; `None`
+    /// without a state home. Nothing is written.
+    pub fn kept_at(&self, derived: &Derived) -> Option<(PathBuf, bool)> {
+        let kept = self.kept.as_deref()?;
+        let found = derived.found(kept);
+        Some((
+            kept.join(&derived.digest).join("sykli.json"),
+            found.is_some(),
+        ))
+    }
+
+    /// For a run that outlives this ohjaa: kept in the state.
+    pub fn keep(&self, derived: &Derived) -> Result<PathBuf, String> {
+        let kept = self
+            .kept
+            .as_deref()
+            .ok_or("there is no state directory to keep the gate in (XDG_STATE_HOME, HOME)")?;
+        derived.write(kept)
+    }
+
+    /// For sykli to read now: where a run kept it, else in this process's
+    /// own folder.
+    pub fn read(&self, derived: &Derived) -> Result<PathBuf, String> {
+        if let Some(found) = self.kept.as_deref().and_then(|kept| derived.found(kept)) {
+            return Ok(found);
+        }
+        let mut scratch = self.scratch.borrow_mut();
+        if scratch.is_none() {
+            *scratch = Some(private_folder()?);
+        }
+        derived.write(scratch.as_deref().expect("just made"))
+    }
+}
+
+impl Drop for Gates {
+    fn drop(&mut self) {
+        if let Some(scratch) = self.scratch.get_mut().take() {
+            let _ = std::fs::remove_dir_all(scratch);
+        }
+    }
+}
+
+/// A new folder under `$TMPDIR` that only this process writes in.
+fn private_folder() -> Result<PathBuf, String> {
+    static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let tmp = std::env::temp_dir();
+    for _ in 0..100 {
+        let n = MADE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = tmp.join(format!("ohjaa-gates-{}-{n}", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("cannot create {}: {error}", dir.display())),
+        }
+    }
+    Err(format!(
+        "cannot make a folder of its own in {}",
+        tmp.display()
+    ))
 }
 
 /// Make `path` hold exactly `bytes` (no file for `None`), without a moment
@@ -375,7 +486,8 @@ impl GateAt {
                     GateAt::Stored(copy)
                 } else {
                     GateAt::Missing(format!(
-                        "{} has no sykli.json of its own, and {} is missing",
+                        "no sykli contract (sykli.json) in {}, and no stored gate ({} is \
+                         missing)",
                         short(commit),
                         copy.display()
                     ))
@@ -384,10 +496,13 @@ impl GateAt {
         }
     }
 
-    /// The file sykli is handed: a derived gate written under the entry.
-    pub fn contract(&self, entry: &Path) -> Result<PathBuf, String> {
+    /// The file sykli is handed: a derived gate where `gates` keeps it, for
+    /// a run that outlives this ohjaa (`keep`), else where sykli reads it
+    /// now; the stored copy as it is.
+    pub fn contract(&self, gates: &Gates, keep: bool) -> Result<PathBuf, String> {
         match self {
-            GateAt::Derived(derived) => derived.write(entry),
+            GateAt::Derived(derived) if keep => gates.keep(derived),
+            GateAt::Derived(derived) => gates.read(derived),
             GateAt::Stored(copy) => Ok(copy.clone()),
             GateAt::Missing(why) => Err(why.clone()),
         }
@@ -401,9 +516,10 @@ impl GateAt {
         }
     }
 
-    /// Where the gate comes from, for people: `derived from its own
-    /// sykli.json at 0c9d3b1 (cargo_env given to fmt, test)`.
-    pub fn describe(&self, commit: &str) -> String {
+    /// Where the gate comes from, for people, the contract being `at` (`at
+    /// 0c9d3b1`, `in this checkout`): `derived from the repository's own
+    /// sykli.json at 0c9d3b1; [cargo_env] given to fmt, test`.
+    pub fn describe(&self, at: &str) -> String {
         match self {
             GateAt::Derived(derived) => {
                 let given = if !derived.given.is_empty() {
@@ -425,15 +541,11 @@ impl GateAt {
                          (sykli lock it in the repository)"
                     }
                 };
-                format!(
-                    "derived from the repository's own sykli.json at {}{given}{pinned}",
-                    short(commit)
-                )
+                format!("derived from the repository's own sykli.json {at}{given}{pinned}")
             }
             GateAt::Stored(copy) => format!(
-                "the entry's copy {}: {} has no sykli.json of its own",
-                copy.display(),
-                short(commit)
+                "the entry's copy {}: there is no sykli.json of its own {at}",
+                copy.display()
             ),
             GateAt::Missing(why) => format!("no gate: {why}"),
         }
@@ -635,20 +747,86 @@ impl Objects {
             .ok_or_else(|| format!("commit {} names no tree", object.oid))
     }
 
-    /// What `commit` holds of its own: its `sykli.json` and `sykli.lock`
-    /// (files, never a folder of that name); `None` without a `sykli.json`.
+    /// What `commit` holds of its own: its `sykli.json` and `sykli.lock`,
+    /// read by the entries of its top tree; `None` without a `sykli.json`
+    /// there. Anything else is said, never read as no contract: a commit
+    /// this clone does not have, a `sykli.json` (or `sykli.lock`) that is a
+    /// symbolic link or no file, or one whose file a partial clone lacks.
     pub fn own_at(&mut self, commit: &str) -> Result<Option<Own>, String> {
-        let blob = |object: Option<Object>| {
-            object
-                .filter(|object| object.kind == "blob")
-                .map(|object| object.bytes)
+        let Some(tree) = self.get(&format!("{commit}^{{tree}}"))? else {
+            return Err(format!("{} is not in this clone", short(commit)));
         };
-        let Some(contract) = blob(self.get(&format!("{commit}:sykli.json"))?) else {
+        let entries = tree_entries(&tree.bytes, tree.oid.len() / 2)?;
+        let Some(contract) = self.file_in(commit, &entries, "sykli.json")? else {
             return Ok(None);
         };
-        let lock = blob(self.get(&format!("{commit}:sykli.lock"))?);
+        let lock = self.file_in(commit, &entries, "sykli.lock")?;
         Ok(Some(Own { contract, lock }))
     }
+
+    /// The file `name` of a top tree's `entries`, at `commit`.
+    fn file_in(
+        &mut self,
+        commit: &str,
+        entries: &[TreeEntry],
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let Some(entry) = entries.iter().find(|entry| entry.name == name) else {
+            return Ok(None);
+        };
+        let at = short(commit);
+        match entry.mode.as_str() {
+            "100644" | "100755" => {}
+            "120000" => {
+                return Err(format!(
+                    "{name} at {at} is a symbolic link; a gate is judged by a file of that name"
+                ))
+            }
+            mode => return Err(format!("{name} at {at} is not a file (mode {mode})")),
+        }
+        match self.get(&entry.oid)? {
+            Some(blob) if blob.kind == "blob" => Ok(Some(blob.bytes)),
+            _ => Err(format!(
+                "{name} at {at} is not in this clone (a partial clone without it: ohjaa never \
+                 fetches)"
+            )),
+        }
+    }
+}
+
+/// One entry of a tree object: `<mode> <name>\0<object id>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeEntry {
+    mode: String,
+    name: String,
+    oid: String,
+}
+
+/// A tree object's entries, its object ids `oid_bytes` long (20 for SHA-1,
+/// 32 for SHA-256).
+fn tree_entries(mut bytes: &[u8], oid_bytes: usize) -> Result<Vec<TreeEntry>, String> {
+    let cut = || "a tree object git gave is cut short".to_owned();
+    let mut entries = Vec::new();
+    while !bytes.is_empty() {
+        let space = bytes
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(cut)?;
+        let nul = bytes.iter().position(|byte| *byte == 0).ok_or_else(cut)?;
+        if nul < space || bytes.len() < nul + 1 + oid_bytes {
+            return Err(cut());
+        }
+        entries.push(TreeEntry {
+            mode: String::from_utf8_lossy(&bytes[..space]).into_owned(),
+            name: String::from_utf8_lossy(&bytes[space + 1..nul]).into_owned(),
+            oid: bytes[nul + 1..nul + 1 + oid_bytes]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        });
+        bytes = &bytes[nul + 1 + oid_bytes..];
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -661,6 +839,14 @@ mod tests {
         let mut long = Vec::new();
         for n in 0..1000u32 {
             long.extend_from_slice(&n.to_le_bytes());
+        }
+        for n in 0..=200usize {
+            let input: Vec<u8> = (0..n).map(|at| (at * 31 + 7) as u8).collect();
+            assert_eq!(
+                sha256(&input),
+                format!("{:x}", sha2::Sha256::digest(&input)),
+                "{n} bytes"
+            );
         }
         for input in [
             &b""[..],
@@ -756,23 +942,55 @@ mod tests {
             Some(&own_id.hash),
             own.lock.as_deref().map(sha256).as_deref()
         ));
-        assert!(!own_id.ran(Some(&own_id.hash), None));
-        // Written under the entry, by its digest; writing it again changes
-        // nothing.
-        let entry = std::env::temp_dir().join(format!("ohjaa-derived-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&entry);
-        let path = one.write(&entry).unwrap();
+        // A receipt that names no lock digest (an older sykli wrote none)
+        // ran under it all the same: `sykli verify` checks its lock.
+        assert!(own_id.ran(Some(&own_id.hash), None));
+        assert!(!own_id.ran(Some(&own_id.hash), Some("another lock")));
+        assert!(!own_id.ran(Some("another contract"), None));
+        assert!(!own_id.ran(None, None));
+    }
+
+    /// A gate sykli reads now is read from where a run kept it, in the
+    /// state, when it is there; else it is written into a folder of this
+    /// process's own, which goes when its `Gates` does. Only `keep` writes
+    /// into the state, and writing it again changes nothing.
+    #[test]
+    fn a_gate_is_kept_in_the_state_only_for_a_run_and_read_from_a_private_folder_else() {
+        let base = std::env::temp_dir().join(format!("ohjaa-gates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let state = base.join("state/ohjaa/derived");
+        let one = derive(&locked(GATE), &Overlay::standard());
+        let gates = Gates::new(Some(state.clone()));
+        let read = gates.read(&one).unwrap();
+        assert!(!read.starts_with(&state), "{}", read.display());
+        assert!(!state.exists(), "reading keeps nothing");
+        assert_eq!(std::fs::read(&read).unwrap(), one.contract);
         assert_eq!(
-            path,
-            entry.join("derived").join(&one.digest).join("sykli.json")
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), one.contract);
-        assert_eq!(
-            std::fs::read(path.with_file_name("sykli.lock")).ok(),
+            std::fs::read(read.with_file_name("sykli.lock")).ok(),
             one.lock
         );
-        assert_eq!(one.write(&entry).unwrap(), path);
-        std::fs::remove_dir_all(&entry).unwrap();
+        let kept = gates.keep(&one).unwrap();
+        assert_eq!(kept, state.join(&one.digest).join("sykli.json"));
+        assert_eq!(std::fs::read(&kept).unwrap(), one.contract);
+        assert_eq!(gates.keep(&one).unwrap(), kept);
+        let scratch = read.parent().unwrap().parent().unwrap().to_path_buf();
+        drop(gates);
+        assert!(!scratch.exists(), "the private folder goes with it");
+        // Kept: read from the state, nothing written anywhere.
+        let again = Gates::new(Some(state.clone()));
+        assert_eq!(again.read(&one).unwrap(), kept);
+        assert!(again.scratch.borrow().is_none(), "no private folder made");
+        // A gate written over in the state is not read from there.
+        std::fs::write(&kept, "{}").unwrap();
+        let other = again.read(&one).unwrap();
+        assert_ne!(other, kept);
+        assert_eq!(std::fs::read(&other).unwrap(), one.contract);
+        // No state at all: read still works, keep says why not.
+        let nowhere = Gates::new(None);
+        assert!(nowhere.read(&one).is_ok());
+        assert!(nowhere.keep(&one).is_err());
+        drop((again, nowhere));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// Any change to the commit's contract or lock, or to the entry's
@@ -805,7 +1023,7 @@ mod tests {
     /// is kept as it is: sykli refuses the gate as it refuses the
     /// repository's own. Never locked by ohjaa.
     #[test]
-    fn a_lock_that_does_not_pin_its_contract_is_kept_as_it_is() {
+    fn a_lock_that_does_not_pin_its_contract_never_pins_the_gate() {
         let stale = locked(&GATE.replace("fmt --check", "fmt"));
         let own = Own {
             contract: GATE.as_bytes().to_vec(),
@@ -813,11 +1031,33 @@ mod tests {
         };
         let derived = derive(&own, &Overlay::standard());
         assert_eq!(derived.pinned, Pinned::No);
-        assert_eq!(derived.lock, stale.lock);
+        // Locked to the repository's own contract, which the gate given
+        // lines is not: sykli refuses it, whatever that lock pinned.
+        assert_eq!(
+            pinned_in(derived.lock.as_deref().unwrap(), "sykli.json"),
+            contract_hash(GATE.as_bytes())
+        );
         assert_ne!(
             pinned_in(derived.lock.as_deref().unwrap(), "sykli.json"),
             Some(sha256(&derived.contract))
         );
+        // Even a lock that pins the gate itself, not the repository's
+        // contract, does not make sykli accept the gate.
+        let given = derive(&locked(GATE), &Overlay::standard());
+        let sneaky = Own {
+            contract: GATE.as_bytes().to_vec(),
+            lock: Some(fresh_lock(&sha256(&given.contract))),
+        };
+        let derived = derive(&sneaky, &Overlay::standard());
+        assert_eq!(derived.pinned, Pinned::No);
+        assert_ne!(
+            pinned_in(derived.lock.as_deref().unwrap(), "sykli.json"),
+            Some(sha256(&derived.contract))
+        );
+        // Given no line, the gate is the repository's contract and lock as
+        // they are: refused as the repository's own is.
+        let as_is = derive(&own, &Overlay::default());
+        assert_eq!(as_is.lock, stale.lock);
         // A contract ohjaa cannot read is the repository's, unchanged.
         let odd = derive(
             &Own {
@@ -903,6 +1143,27 @@ mod tests {
         assert_eq!(objects.own_at(&first.oid).unwrap(), None, "no sykli.json");
         assert!(objects.get("bad\nname").is_err());
         assert!(objects.commit(&head.tree).is_err(), "a tree is no commit");
+        drop(objects);
+        // A sykli.json that is a symbolic link, or a folder, is said so:
+        // never read as no contract, or as the file it names.
+        std::fs::remove_file(dir.join("sykli.json")).unwrap();
+        std::os::unix::fs::symlink("README", dir.join("sykli.json")).unwrap();
+        git(&["add", "sykli.json"]);
+        git(&["commit", "-q", "-m", "a link"]);
+        let linked = git(&["rev-parse", "HEAD"]);
+        git(&["rm", "-q", "sykli.json"]);
+        std::fs::create_dir_all(dir.join("sykli.json")).unwrap();
+        std::fs::write(dir.join("sykli.json/x"), "x\n").unwrap();
+        git(&["add", "sykli.json"]);
+        git(&["commit", "-q", "-m", "a folder"]);
+        let folder = git(&["rev-parse", "HEAD"]);
+        let mut objects = Objects::of_clone(&dir.join(".git")).unwrap();
+        let said = objects.own_at(&linked).unwrap_err();
+        assert!(said.contains("symbolic link"), "{said}");
+        let said = objects.own_at(&folder).unwrap_err();
+        assert!(said.contains("not a file"), "{said}");
+        // The session goes on after a refusal.
+        assert!(objects.own_at(&head.oid).unwrap().is_some());
         drop(objects);
         std::fs::remove_dir_all(&dir).unwrap();
     }

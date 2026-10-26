@@ -9,8 +9,6 @@
 //!   repos/<owner>/<repo>/            lower case
 //!     repo.toml    branch = "main"   the branch ohjaa observes, and [cargo_env]: the env
 //!                                    each cargo task of the gate is given (KATANA D10)
-//!     derived/<digest>/sykli.json    the gate derived from a commit's own sykli.json
-//!       and sykli.lock               (see `derived`), written when sykli is handed it
 //!     sykli.json   a stored gate, only for a repository with no sykli.json of its own
 //!     sykli.lock
 //!     hooks/<name>                   exec <ohjaa> hook <name> "$@", for pre-push

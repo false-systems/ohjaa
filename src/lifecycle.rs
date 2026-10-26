@@ -2451,6 +2451,8 @@ pub struct Sykli {
     gate_at: std::cell::RefCell<HashMap<(PathBuf, String), crate::derived::GateAt>>,
     /// Which contract the receipt that proved each commit ran under.
     proved_under: std::cell::RefCell<HashMap<String, crate::derived::Under>>,
+    /// Where the gates sykli reads are written: never the config home.
+    derived: crate::derived::Gates,
     /// How many times `sykli verify` ran.
     verified: std::cell::Cell<usize>,
     /// How many times it may run in all; `None`: as often as it is needed.
@@ -2470,6 +2472,7 @@ impl Sykli {
     pub fn with_home(home: PathBuf) -> Sykli {
         Sykli {
             home: Some(home),
+            derived: crate::derived::Gates::of_state(),
             ..Sykli::default()
         }
     }
@@ -2481,6 +2484,7 @@ impl Sykli {
             home: Some(home),
             program: Some(program),
             limit: Some(limit),
+            derived: crate::derived::Gates::of_state(),
             ..Sykli::default()
         }
     }
@@ -2525,6 +2529,11 @@ impl Sykli {
             }
         };
         ask(objects)
+    }
+
+    /// Where this sykli's gates are written for sykli to read.
+    pub fn gates(&self) -> &crate::derived::Gates {
+        &self.derived
     }
 
     /// End every clone's `git cat-file --batch`, once nothing more is to be
@@ -2772,7 +2781,7 @@ impl Sykli {
             };
             let (contract, under) = match own {
                 Some(_) => (PathBuf::from("sykli.json"), crate::derived::Under::Own),
-                None => match written.get_or_insert_with(|| at.contract(&gate.entry)) {
+                None => match written.get_or_insert_with(|| at.contract(&self.derived, false)) {
                     Ok(path) => (path.clone(), at.under()),
                     Err(why) => {
                         verdicts.push((

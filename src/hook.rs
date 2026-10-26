@@ -449,7 +449,7 @@ fn observe(args: &[OsString], here: &Here) -> Observed {
             "its entry has no gate: {why} (ohjaa adopt --force)"
         )),
         Ok(at) => at
-            .contract(&gate.entry)
+            .contract(judge.gates(), false)
             .map_err(|why| format!("its gate cannot be written: {why}")),
     };
     let contract = match contract {

@@ -178,13 +178,19 @@ pub fn said_of(status: &Value) -> Said {
     }
 }
 
-/// The gate `commit` is judged by, as the file sykli is handed (written
-/// under the entry when it is derived), read through `sykli`'s one git
-/// process for the clone.
-pub fn contract_of(gate: &Gate, sykli: &Sykli, commit: &str) -> Result<PathBuf, String> {
+/// The gate `commit` is judged by, as the file sykli is handed, read
+/// through `sykli`'s one git process for the clone: kept in ohjaa's state
+/// for a run that outlives this ohjaa (`keep`), else where sykli reads it
+/// now.
+pub fn contract_of(
+    gate: &Gate,
+    sykli: &Sykli,
+    commit: &str,
+    keep: bool,
+) -> Result<PathBuf, String> {
     sykli
         .gate_at(gate, commit)
-        .and_then(|at| at.contract(&gate.entry))
+        .and_then(|at| at.contract(sykli.gates(), keep))
 }
 
 /// What sykli says of `rev` under its gate, when this sykli can say.
@@ -192,7 +198,7 @@ pub fn ask(gate: &Gate, sykli: &Sykli, caps: &Caps, rev: &str) -> Said {
     if !caps.status.commit {
         return Said::Unknown("this sykli cannot be asked (no `sykli status --commit`)".to_owned());
     }
-    let contract = match contract_of(gate, sykli, rev) {
+    let contract = match contract_of(gate, sykli, rev, false) {
         Ok(contract) => contract,
         Err(why) => return Said::Unknown(format!("it has no gate to ask about: {why}")),
     };
@@ -991,7 +997,7 @@ pub fn at_landing(
             return format!("{head} has no current sykli receipt; its tree cannot be read ({why})")
         }
     };
-    let contract = match contract_of(gate, sykli, commit) {
+    let contract = match contract_of(gate, sykli, commit, true) {
         Ok(contract) => contract,
         Err(why) => return format!("{head} has no current sykli receipt; it has no gate: {why}"),
     };
@@ -1106,7 +1112,7 @@ pub fn at_launch(
         let requested = requested_in(all, &gate.common);
         match (mode, caps.detach) {
             (Mode::Launch, true) => {
-                let decided = match contract_of(gate, sykli, &tip.commit) {
+                let decided = match contract_of(gate, sykli, &tip.commit, true) {
                     Ok(contract) => {
                         decide(log, state, gate, &contract, (&tip.commit, &tip.tree), caps)
                     }

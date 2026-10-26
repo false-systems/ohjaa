@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::derived::{GateAt, Objects};
+use crate::derived::{GateAt, Gates, Objects, Own};
 use crate::gitconfig::{self, push_url, repo_at, Listing};
 use crate::home::{self, absolute, RepoId};
 use crate::hook::{facts_for_sykli, quote_path};
@@ -34,6 +34,8 @@ struct Gate {
     whose: String,
     /// The branch the entry observes; `None` for a repository's own contract.
     branch: Option<String>,
+    /// For `--print`: the derived gate is not kept there yet.
+    unwritten: bool,
 }
 
 /// What git said of this checkout, in one `git cat-file --batch`: HEAD, its
@@ -47,18 +49,19 @@ struct Read {
 }
 
 /// The gate of the repository at `top`: for an entry origin's push URL
-/// names, the gate of HEAD (derived from HEAD's own `sykli.json`, else the
-/// entry's copy); else the repository's own `sykli.json`; with whose it is.
-/// HEAD is read through `objects` (opened here when needed: one git
-/// process), except for an entry that keeps a copy in a checkout with no
-/// `sykli.json`: there HEAD is not read, for its copy is the only gate a
-/// run here can prove HEAD with (a HEAD that has one, not in the checkout,
-/// is not the tree that runs).
+/// names, the gate of what this checkout runs, derived from its own
+/// `sykli.json` and `sykli.lock` (else the entry's stored gate); else the
+/// repository's own `sykli.json`; with whose it is. Read from the checkout's
+/// files, no git process: when they are HEAD's, it is exactly HEAD's gate,
+/// and when they are edited, the gate of the commit they will be, so its
+/// receipt proves that commit (a receipt binds the contract it ran under,
+/// and every commit is judged by the gate derived from the commit). Kept in
+/// ohjaa's state for a run (`keep`), else in a folder of this process's own.
 fn gate_of(
     top: &Path,
     common: &Path,
     listing: &Listing,
-    objects: &mut Option<Objects>,
+    (gates, keep): (&Gates, bool),
 ) -> Result<Option<Gate>> {
     let home = absolute(home::ohjaa_home()?);
     if let Some(id) = push_url(listing, "origin")
@@ -68,31 +71,35 @@ fn gate_of(
         if let Some(entry) = home::find_entry(&home, &id)? {
             let whose = format!("the entry for {} (branch {})", id.slug(), entry.branch);
             let gate = crate::mark::gate_for_entry(&id, &entry, top, common);
-            let (at, from) = if entry.has_stored() && !top.join("sykli.json").exists() {
-                (
-                    GateAt::Stored(entry.stored()),
-                    "its copy, this checkout having no sykli.json".to_owned(),
-                )
-            } else {
-                let objects = opened(objects, top).map_err(|why| anyhow::anyhow!(why))?;
-                let own = objects
-                    .own_at("HEAD")
-                    .map_err(|why| anyhow::anyhow!("HEAD's sykli.json cannot be read: {why}"))?;
-                let at = gate.at("HEAD", own);
-                let from = at.describe("HEAD");
-                (at, from)
+            let at = match checkout_own(top).map_err(|why| anyhow::anyhow!(why))? {
+                Some(own) => GateAt::Derived(crate::derived::derive(&own, &gate.overlay)),
+                None if entry.has_stored() => GateAt::Stored(entry.stored()),
+                None => GateAt::Missing(format!(
+                    "this checkout has no sykli.json, and no stored gate ({} is missing)",
+                    entry.stored().display()
+                )),
             };
-            let contract = at.contract(&gate.entry).map_err(|why| {
+            let from = at.describe("in this checkout");
+            let no_gate = |why: String| {
                 anyhow::anyhow!(
-                    "{} has an entry but no gate for HEAD: {why} (ohjaa adopt --force {})",
-                    id.slug(),
-                    top.display()
+                    "{} has an entry but no gate in this checkout: {why}",
+                    id.slug()
                 )
-            })?;
+            };
+            // `--print` writes nothing: it names where the run keeps the
+            // gate, and says when it is not written yet.
+            let (contract, unwritten) = match (&at, keep) {
+                (GateAt::Derived(derived), false) => match gates.kept_at(derived) {
+                    Some((path, there)) => (path, !there),
+                    None => (at.contract(gates, false).map_err(no_gate)?, false),
+                },
+                _ => (at.contract(gates, keep).map_err(no_gate)?, false),
+            };
             return Ok(Some(Gate {
                 contract,
                 whose: format!("{whose}: {from}"),
                 branch: Some(entry.branch.clone()),
+                unwritten,
             }));
         }
     }
@@ -101,6 +108,34 @@ fn gate_of(
         contract: own,
         whose: "the repository's own sykli.json (no entry)".to_owned(),
         branch: None,
+        unwritten: false,
+    }))
+}
+
+/// The checkout's own `sykli.json` and the `sykli.lock` beside it, as files;
+/// `None` without a `sykli.json`. A symbolic link of that name is said so.
+fn checkout_own(top: &Path) -> std::result::Result<Option<Own>, String> {
+    let read = |name: &str| -> std::result::Result<Option<Vec<u8>>, String> {
+        let path = top.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+            Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+                "{} is a symbolic link; a gate is judged by a file of that name",
+                path.display()
+            )),
+            Ok(meta) if !meta.is_file() => Err(format!("{} is not a file", path.display())),
+            Ok(_) => std::fs::read(&path)
+                .map(Some)
+                .map_err(|error| format!("cannot read {}: {error}", path.display())),
+        }
+    };
+    let Some(contract) = read("sykli.json")? else {
+        return Ok(None);
+    };
+    Ok(Some(Own {
+        contract,
+        lock: read("sykli.lock")?,
     }))
 }
 
@@ -351,9 +386,11 @@ pub fn gate_here(print_only: bool, wait: Duration) -> Result<i32> {
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let (top, common) = repo_at(&cwd)?;
     let listing = gitconfig::clone_listing(&top)?;
-    // The checkout's one git process for HEAD, its gate and its request.
+    // The gate comes from the checkout's files; the request alone asks git
+    // (HEAD, its tree and the branch's tip), in one process.
     let mut objects = None;
-    let Some(gate) = gate_of(&top, &common, &listing, &mut objects)? else {
+    let gates = Gates::of_state();
+    let Some(gate) = gate_of(&top, &common, &listing, (&gates, !print_only))? else {
         eprintln!(
             "ohjaa gate: {} has no gate: origin names no entry (ohjaa adopt), and there is \
              no sykli.json in the repository",
@@ -390,6 +427,12 @@ pub fn gate_here(print_only: bool, wait: Duration) -> Result<i32> {
         contract.display(),
         gate.whose
     );
+    if gate.unwritten {
+        println!(
+            "ohjaa gate: it is not written yet: `ohjaa gate` writes it there when it runs \
+             (--print writes nothing)"
+        );
+    }
     if print_only {
         println!(
             "cd {} && mkdir -p .sykli && {run} && {verify}",
