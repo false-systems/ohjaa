@@ -570,11 +570,14 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
                 let at = clone.as_ref().map(|(_, common)| {
                     crate::derived::Objects::of_clone(common).and_then(|mut objects| {
                         let tip = format!("refs/remotes/origin/{}", read.branch);
-                        let own = objects.own_at(&tip)?;
+                        let commit = objects
+                            .commit(&tip)?
+                            .ok_or_else(|| format!("this clone has no {tip}"))?;
+                        let own = objects.own_at(&commit.oid)?;
                         Ok(crate::derived::GateAt::of(
                             &read.dir,
                             &read.overlay,
-                            &tip,
+                            &commit.oid,
                             own,
                         ))
                     })
