@@ -37,8 +37,18 @@ pub const WEEK_MS: i64 = 7 * 86_400_000;
 /// take seconds, and a loaded machine more.
 const LAUNCH_SLACK_MS: i64 = 60_000;
 
-/// How long vessa may take to read the transcripts.
-const VESSA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long vessa may take to list the sessions. Its header mode reads only
+/// each transcript's opening records: about half a second for some 950
+/// sessions here, where the full listing took 10 to 50 s. 15 s leaves a
+/// loaded machine and a cold disk cache thirty times that, and a vessa that
+/// hangs costs a report seconds, not a minute.
+const VESSA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What `vessa sessions --json --headers` answers with (vessa#5).
+const VESSA_HEADERS: &str = "vessa-session-headers.v1";
+
+/// The agents whose sessions are judged.
+const NATIVE_AGENTS: [&str; 2] = ["claude", "codex"];
 
 /// A session that ended without the agent's testimony.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,7 +507,7 @@ fn native_sessions(
     gaps: &mut Vec<String>,
 ) -> Result<(Vec<Native>, Natives), String> {
     let output = match process::run(
-        Command::new("vessa").args(["sessions", "--json"]),
+        Command::new("vessa").args(["sessions", "--json", "--headers"]),
         None,
         VESSA_TIMEOUT,
     ) {
@@ -513,6 +523,11 @@ fn native_sessions(
             );
         }
     };
+    // A vessa from before vessa#5 refuses the flag as a usage error: exit 2,
+    // nothing listed. It is updated, never read the slow way.
+    if output.status.code() == Some(2) && output.stdout.trim_ascii().is_empty() {
+        return Err("vessa is too old for `sessions --headers`; update it".to_owned());
+    }
     let listed: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         format!(
             "vessa's sessions are not JSON ({error}; exit {:?}: {})",
@@ -550,39 +565,45 @@ fn headless(session: &Value) -> bool {
             .is_some_and(|origin| origin.contains("exec"))
 }
 
-/// Read `vessa sessions --json` (`vessa-usage.v1`): `sessions[]` with `agent`,
-/// `id`, `parent`, `started_at` (RFC 3339), `cwd`, `source`, and how each was
-/// started (`entrypoint`, `originator`). Subagent sessions (with a parent)
-/// and headless runs were started by no person and are left out. A session
-/// with no date or no folder cannot be judged against a launch: it is kept
-/// apart as undated when its transcript was written in the window. Without
-/// `entrypoint` and `originator` (an older vessa), headless runs cannot be
-/// told apart, and nothing is judged.
+/// Read `vessa sessions --json --headers` (`vessa-session-headers.v1`):
+/// `sessions[]` with exactly `agent`, `id`, `parent`, `started_at` (RFC
+/// 3339), `cwd`, `source`, and how each was started (`entrypoint`,
+/// `originator`), as the full listing names them; any other schema is not
+/// read. Claude and Codex sessions are judged. Subagent sessions (with a
+/// parent) and headless runs were started by no person and are left out. A
+/// session with no date or no folder cannot be judged against a launch: it
+/// is kept apart as undated when its transcript was written in the window.
 pub fn parse_native(
     listed: &Value,
     since_ms: i64,
     now_ms: i64,
 ) -> Result<(Vec<Native>, Natives), String> {
+    match listed["schema"].as_str() {
+        Some(VESSA_HEADERS) => {}
+        Some(other) => {
+            return Err(format!(
+                "vessa listed sessions as `{other}`, not `{VESSA_HEADERS}`"
+            ))
+        }
+        None => {
+            return Err(format!(
+                "vessa's output names no schema, not `{VESSA_HEADERS}`"
+            ))
+        }
+    }
     let sessions = listed["sessions"]
         .as_array()
         .ok_or("vessa's output has no sessions list")?;
-    let says_how = |s: &Value| {
-        s.as_object()
-            .is_some_and(|o| o.contains_key("entrypoint") && o.contains_key("originator"))
-    };
-    if !sessions.is_empty() && !sessions.iter().any(says_how) {
-        return Err(
-            "vessa does not say how a session was started (no `entrypoint` or `originator`; \
-             vessa#2), so headless runs cannot be told apart"
-                .to_owned(),
-        );
-    }
     let in_window = |ms: i64| ms > since_ms && ms <= now_ms;
     let mut judgeable = Vec::new();
     let mut natives = Natives::default();
     for s in sessions
         .iter()
-        .filter(|s| matches!(s["agent"].as_str(), Some("claude" | "codex")))
+        .filter(|s| {
+            s["agent"]
+                .as_str()
+                .is_some_and(|a| NATIVE_AGENTS.contains(&a))
+        })
         .filter(|s| s["parent"].is_null())
     {
         let text = |key: &str| s[key].as_str().unwrap_or_default().to_owned();
@@ -1106,9 +1127,6 @@ fn report_json(report: &Report) -> Value {
 /// What left a report incomplete, said so a person can act on it.
 fn first_gap(report: &Report) -> Option<String> {
     match &report.natives {
-        Err(why) if why.starts_with("vessa does not say how") => {
-            Some("vessa lacks session origins — update vessa (vessa#2)".to_owned())
-        }
         Err(why) if why.starts_with("vessa is not on PATH") => Some(
             "vessa is not on PATH — install vessa to see sessions started without ohjaa".to_owned(),
         ),
@@ -1398,7 +1416,7 @@ mod tests {
             }
             s
         };
-        let listed = json!({"schema": "vessa-usage.v1", "warnings": [], "sessions": [
+        let listed = json!({"schema": "vessa-session-headers.v1", "warnings": [], "sessions": [
             s("tui", "claude", json!({"entrypoint": "cli"})),
             s("sub", "claude", json!({"parent": "tui"})),
             s("pi", "pi", json!({})),
@@ -1409,15 +1427,8 @@ mod tests {
             s("nowhere", "codex", json!({"cwd": ""})),
         ]});
         let (judgeable, natives) = parse_native(&listed, since, now).unwrap();
-        assert_eq!(
-            judgeable,
-            [native(
-                "claude",
-                "tui",
-                "/r/app",
-                since + 6 * 86_400_000 + 36_000_500
-            )]
-        );
+        let at = since + 6 * 86_400_000 + 36_000_500;
+        assert_eq!(judgeable, [native("claude", "tui", "/r/app", at)]);
         assert_eq!(
             natives.headless, 2,
             "claude -p and codex exec bypass nothing"
@@ -1428,13 +1439,22 @@ mod tests {
             ["undated", "nowhere"],
             "never dropped: said apart, not judged"
         );
-        // An older vessa cannot tell a headless run from a person's session.
-        let older = json!({"sessions": [{"agent": "claude", "id": "x", "parent": null,
-            "started_at": "2026-10-09T10:00:00Z", "cwd": "/r/app"}]});
-        assert!(parse_native(&older, since, now)
+        // Only the header listing is read: the full one, or none named, is
+        // not judged.
+        let full = json!({"schema": "vessa-usage.v1", "warnings": [], "sessions": []});
+        assert_eq!(
+            parse_native(&full, since, now).unwrap_err(),
+            "vessa listed sessions as `vessa-usage.v1`, not `vessa-session-headers.v1`"
+        );
+        assert!(parse_native(&json!({"sessions": []}), since, now)
             .unwrap_err()
-            .contains("headless runs cannot be told apart"));
-        assert!(parse_native(&json!({"nothing": []}), since, now).is_err());
+            .contains("names no schema"));
+        assert!(parse_native(
+            &json!({"schema": "vessa-session-headers.v1", "nothing": []}),
+            since,
+            now
+        )
+        .is_err());
     }
 
     #[test]
@@ -1778,13 +1798,11 @@ mod tests {
         );
         // What the gap is, said so a person can fix it.
         let report = sample(Err(
-            "vessa does not say how a session was started (no `entrypoint` or `originator`; \
-             vessa#2), so headless runs cannot be told apart"
-                .to_owned(),
+            "vessa is too old for `sessions --headers`; update it".to_owned()
         ));
         let said = summary(&report);
         assert!(
-            said.contains("incomplete: vessa lacks session origins — update vessa"),
+            said.contains("incomplete: vessa is too old for `sessions --headers`; update it;"),
             "{said}"
         );
         assert_eq!(said.lines().count(), 3, "{said}");

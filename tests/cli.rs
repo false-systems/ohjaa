@@ -120,13 +120,15 @@ grep -q '"outcome":"passed"' "$receipt" || { echo "refused: outcome expected pas
 exit 0
 "#;
 
-/// Never the real vessa. `sessions --json` prints the file
-/// OHJAA_STUB_VESSA_JSON names, else no sessions.
+/// Never the real vessa. Its header listing, `sessions --json --headers`,
+/// prints the file OHJAA_STUB_VESSA_JSON names, else no sessions; it lists
+/// nothing else, so a report that asked for the full listing would fail.
 const VESSA_STUB: &str = r#"#!/bin/sh
-if [ "$1 $2" = "sessions --json" ] && [ -n "${OHJAA_STUB_VESSA_JSON:-}" ]; then
+[ "$*" = "sessions --json --headers" ] || { echo "vessa stub: not the header listing: $*" >&2; exit 64; }
+if [ -n "${OHJAA_STUB_VESSA_JSON:-}" ]; then
   cat "$OHJAA_STUB_VESSA_JSON"
 else
-  echo '{"schema":"vessa-usage.v1","sessions":[],"warnings":[]}'
+  echo '{"schema":"vessa-session-headers.v1","sessions":[],"warnings":[]}'
 fi
 "#;
 
@@ -5381,17 +5383,18 @@ fn report_fixture(fixture: &Fixture) -> (PathBuf, String) {
             .current_dir(&repo),
     );
     assert_eq!(code, Some(0), "{stderr}");
-    // vessa sees the launch above, and one claude session started by hand.
+    // vessa sees the launch above, and one claude session started by hand:
+    // its header listing, each session's eight fields.
     let launched = fs::read_to_string(&started).unwrap().trim().to_owned();
     let repo_path = std::fs::canonicalize(&repo).unwrap();
     fs::write(
         fixture.dir.join("vessa.json"),
         format!(
-            r#"{{"schema":"vessa-usage.v1","warnings":[],"sessions":[
-              {{"agent":"claude","id":"through","parent":null,"started_at":"{launched}","cwd":"{r}","entrypoint":"cli","originator":null}},
-              {{"agent":"claude","id":"by-hand","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere","entrypoint":"cli","originator":null}},
-              {{"agent":"claude","id":"by-hand","parent":"x","started_at":"{launched}","cwd":"{r}","entrypoint":"cli","originator":null}},
-              {{"agent":"claude","id":"drafter","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere","entrypoint":"sdk-cli","originator":null}}
+            r#"{{"schema":"vessa-session-headers.v1","warnings":[],"sessions":[
+              {{"agent":"claude","id":"through","parent":null,"started_at":"{launched}","cwd":"{r}","source":"/nonexistent/1.jsonl","entrypoint":"cli","originator":null}},
+              {{"agent":"claude","id":"by-hand","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere","source":"/nonexistent/2.jsonl","entrypoint":"cli","originator":null}},
+              {{"agent":"claude","id":"by-hand","parent":"x","started_at":"{launched}","cwd":"{r}","source":"/nonexistent/3.jsonl","entrypoint":"cli","originator":null}},
+              {{"agent":"claude","id":"drafter","parent":null,"started_at":"{launched}","cwd":"{r}/elsewhere","source":"/nonexistent/4.jsonl","entrypoint":"sdk-cli","originator":null}}
             ]}}"#,
             r = repo_path.display()
         )
@@ -5572,7 +5575,7 @@ fn what_vessa_could_not_read_or_date_leaves_the_report_incomplete() {
     };
     // vessa read nothing, and said so: never a clean week.
     let (stdout, _, code) = report(
-        r#"{"schema":"vessa-usage.v1","sessions":[],"warnings":[
+        r#"{"schema":"vessa-session-headers.v1","sessions":[],"warnings":[
             "/home/x/.claude/projects: symlink not followed",
             "No supported native sessions found; usage is unknown"]}"#,
     );
@@ -5585,7 +5588,7 @@ fn what_vessa_could_not_read_or_date_leaves_the_report_incomplete() {
     );
     // A session vessa could not date is said apart, never dropped.
     let (stdout, _, code) = report(&format!(
-        r#"{{"schema":"vessa-usage.v1","warnings":[],"sessions":[
+        r#"{{"schema":"vessa-session-headers.v1","warnings":[],"sessions":[
             {{"agent":"claude","id":"no-date","parent":null,"started_at":null,"cwd":"",
               "source":"{}","entrypoint":"cli","originator":null}}]}}"#,
         transcript.display()
@@ -5597,15 +5600,81 @@ fn what_vessa_could_not_read_or_date_leaves_the_report_incomplete() {
             && stdout.contains("1 native session(s) vessa could not date or place: not judged"),
         "{stdout}"
     );
-    // An older vessa cannot tell a headless run from a person's session.
+    // Only the header listing is read: the full one, given instead, is not.
     let (stdout, _, code) = report(
         r#"{"schema":"vessa-usage.v1","warnings":[],"sessions":[
             {"agent":"claude","id":"old","parent":null,"started_at":"2026-10-09T10:00:00Z","cwd":"/r"}]}"#,
     );
     assert_eq!(code, Some(4), "{stdout}");
     assert!(
-        stdout.contains("not judged: vessa does not say how a session was started"),
+        stdout.contains(
+            "not judged: vessa listed sessions as `vessa-usage.v1`, not \
+             `vessa-session-headers.v1`"
+        ),
         "{stdout}"
+    );
+    fixture.cleanup();
+}
+
+/// A vessa from before vessa#5 refuses `--headers` as clap does (exit 2,
+/// nothing on stdout). The report says to update it, and never asks for the
+/// slow full listing instead.
+#[test]
+fn a_vessa_too_old_for_headers_is_said_and_never_read_the_slow_way() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("report-old-vessa");
+    let repo = fixture.make_git_repo("work");
+    let calls = fixture.dir.join("vessa-calls");
+    fs::write(
+        fixture.stub_dir.join("vessa"),
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\n\
+             case \" $* \" in *' --headers '*)\n\
+               echo \"error: unexpected argument '--headers' found\" >&2; exit 2;;\n\
+             esac\n\
+             echo '{{\"schema\":\"vessa-usage.v1\",\"sessions\":[],\"warnings\":[]}}'\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    let report = |json: bool| {
+        let mut command = fixture.ohjaa();
+        command
+            .arg("--root")
+            .arg(&fixture.dir)
+            .arg("report")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+            .current_dir(&repo);
+        if json {
+            command.arg("--json");
+        }
+        output_of(&mut command)
+    };
+    let (stdout, stderr, code) = report(false);
+    assert_eq!(code, Some(4), "never a clean week: {stdout}{stderr}");
+    assert!(
+        stdout.contains(
+            "Agent sessions a person started without ohjaa: not judged: vessa is too old for \
+             `sessions --headers`; update it"
+        ),
+        "{stdout}"
+    );
+    let (stdout, _, code) = report(true);
+    assert_eq!(code, Some(4), "{stdout}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        json["report"]["bypasses"],
+        serde_json::json!({
+            "judged": false,
+            "why": "vessa is too old for `sessions --headers`; update it"
+        })
+    );
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "sessions --json --headers\nsessions --json --headers\n",
+        "asked once a report, for the headers alone: no fallback to the full listing"
     );
     fixture.cleanup();
 }
@@ -5686,7 +5755,7 @@ fn the_weekly_report_is_said_after_the_record_at_a_terminal_and_never_briefed() 
     let gappy = fixture.dir.join("gappy.json");
     fs::write(
         &gappy,
-        r#"{"schema":"vessa-usage.v1","sessions":[],"warnings":["a source could not be read"]}"#,
+        r#"{"schema":"vessa-session-headers.v1","sessions":[],"warnings":["a source could not be read"]}"#,
     )
     .unwrap();
     let run = |intent: &str, complete: bool| {
