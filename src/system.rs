@@ -1,7 +1,8 @@
 //! The system perimeter, derived at the moment it is asked for.
 //!
 //! Every repo in the fleet self-declares its identity in `.toimija/repo.yaml`,
-//! and toimija surfaces that as the `repo` object of `context --json`. Ohjaa
+//! and toimija surfaces that as the `repo` object of `context --identity
+//! --json` (one git process; the same object `context --json` carries). Ohjaa
 //! derives the fleet's shape from those declarations plus live occupancy:
 //! nothing is stored, and the view cannot be staler than the moment it was
 //! computed. An agent gets this perimeter at launch (inside toimija's
@@ -43,7 +44,7 @@ impl Tool {
         };
         let Ok(output) = crate::process::run(
             Command::new("toimija")
-                .args(["context", "--json"])
+                .args(["context", "--identity", "--json"])
                 .current_dir(repo),
             None,
             crate::process::LOCAL,

@@ -1176,7 +1176,7 @@ fn startup_is_scoped_reuses_scans_and_delivers_repo_knowledge_from_the_root() {
     assert_eq!(
         calls
             .lines()
-            .filter(|l| l.ends_with("|context --json"))
+            .filter(|l| l.ends_with("|context --identity --json"))
             .count(),
         1,
         "{calls}"
