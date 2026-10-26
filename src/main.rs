@@ -206,12 +206,17 @@ enum Cmd {
         /// Candidates per drafter call.
         #[arg(long, default_value_t = 40)]
         batch: usize,
-        /// At most this many drafter calls; the rest wait for the next run.
+        /// At most this many batches a run (a batch the drafter refuses is
+        /// sent again in halves); the rest wait for the next run.
         #[arg(long, default_value_t = 10)]
         max_batches: usize,
         /// Show what would be sent, and send nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Send again the candidates set aside after the drafter failed on
+        /// each, alone, three times.
+        #[arg(long)]
+        retry_failed: bool,
     },
     /// What went around the workflow: the marks on each entry's branch (✓
     /// proven, ✗ failed, ? unproven, tip first), sessions without read-back or
@@ -1676,35 +1681,55 @@ fn cmd_intake(
     batch: usize,
     max_batches: usize,
     dry_run: bool,
+    retry_failed: bool,
 ) -> Result<i32> {
     let dirs = dirs()?;
-    let started = intake::now_seconds() * 1000;
-    let since = match since {
-        Some(since) => intake::normalize_since(since)?,
-        None => match intake::read_cursor(&dirs)? {
-            Some(cursor) => cursor,
-            None => started - 14 * 86_400_000,
-        },
+    // One intake at a time: two would send the same candidates and overwrite
+    // each other's progress. A dry run writes nothing, and takes no lock.
+    let _lock = if dry_run {
+        None
+    } else {
+        match process::lock_file(&dirs.state.join("intake.lock"), std::time::Duration::ZERO) {
+            Ok(lock) => Some(lock),
+            Err(why) if why.contains("held by another") => {
+                eprintln!("ohjaa: intake already running ({why}); nothing was done");
+                return Ok(REFUSED);
+            }
+            Err(why) => bail!(why),
+        }
     };
+    let started = intake::now_seconds() * 1000;
+    let explicit = since.map(intake::normalize_since).transpose()?;
+    let cursor = match explicit {
+        Some(_) => None,
+        None => intake::read_cursor(&dirs)?,
+    };
+    let (since, keep) = intake::window_start(explicit, cursor, started, 14 * 86_400_000);
+    if let Some(since) = keep.filter(|_| !dry_run) {
+        intake::write_cursor(&dirs, since)?;
+    }
     let sources: Vec<&str> = if sources.is_empty() {
         vec!["transcripts", "reviews", "reverts", "report"]
     } else {
         sources.iter().map(String::as_str).collect()
     };
-    // Sessions that ended and were never drafted from: the agent's own
-    // handover, and what was said in that session's window, even when the
-    // window lies before the cursor. Read in one short, read-only open of the
-    // log; no store is held across the slow calls below.
-    let queued: Vec<sessions::Session> = session_reader(&dirs)
+    // Sessions never drafted from, ended or not (`None`: the log could not be
+    // read). Read in one short, read-only open of the log; no store is held
+    // across the slow calls below.
+    let undrafted: Option<Vec<sessions::Session>> = session_reader(&dirs)
         .and_then(|log| log.all().ok())
-        .map(|(all, _)| {
-            all.into_iter()
-                .filter(|s| s.left.is_some() && !s.drafted)
-                .collect()
-        })
-        .unwrap_or_default();
-    // A session is drafted as a whole, its handover with its transcript
-    // window, so only a run that reads transcripts takes it on.
+        .map(|(all, _)| all.into_iter().filter(|s| !s.drafted).collect());
+    // Those that ended are queued: the agent's own handover, and what was
+    // said in that session's window, even when the window lies before the
+    // cursor.
+    let queued: Vec<sessions::Session> = undrafted
+        .iter()
+        .flatten()
+        .filter(|s| s.left.is_some())
+        .cloned()
+        .collect();
+    // A session is drafted from with its transcript window, so only a run
+    // that reads transcripts takes it on.
     let reads_transcripts = sources.contains(&"transcripts");
     let queued = if reads_transcripts {
         queued
@@ -1717,51 +1742,99 @@ fn cmd_intake(
         }
         Vec::new()
     };
+    // What earlier runs handled, read first: a retry reads back to the oldest
+    // candidate set aside.
+    let mut handled = intake::read_handled(&dirs)?;
+    let retry: std::collections::HashSet<intake::Key> = if retry_failed {
+        handled.set_aside().map(|(key, _)| *key).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let read_back = retry
+        .iter()
+        .map(|key| key.at_ms - 1)
+        .min()
+        .filter(|floor| *floor < since);
     let mut warnings = Vec::new();
+    // The sources that could not all be read: they hold the cursor.
+    let mut warned: Vec<&str> = Vec::new();
     let mut transcripts_read_cleanly = false;
     let mut candidates = Vec::new();
     let git_repos = || -> Result<Vec<PathBuf>> {
         let roots = roots::load(roots, git_root().as_deref());
         roots::git_repos(&roots)
     };
-    for source in &sources {
-        match *source {
+    // One source, from `from`.
+    let read = |source: &str, from: i64, warnings: &mut Vec<String>| -> Result<Vec<_>> {
+        Ok(match source {
             "transcripts" => {
                 let home = std::env::var_os("HOME")
                     .map(PathBuf::from)
                     .context("HOME is not set")?;
-                // One pass, from the earliest point anything needs: the cursor,
-                // or the start of the oldest queued session.
-                let from = queued
-                    .iter()
-                    .map(|s| s.started_ms - 1)
-                    .min()
-                    .map_or(since, |earliest| earliest.min(since));
-                let before = warnings.len();
-                let read = intake::transcripts(&home, from, &mut warnings);
-                transcripts_read_cleanly = warnings.len() == before;
-                let (new, older): (Vec<_>, Vec<_>) = read
-                    .into_iter()
-                    .partition(|candidate| candidate.at_ms > since);
-                candidates.extend(new);
-                candidates.extend(intake::within_sessions(older, &queued));
+                intake::transcripts(&home, from, warnings)
             }
-            "reviews" => candidates.extend(intake::reviews(&git_repos()?, since, &mut warnings)),
-            "reverts" => candidates.extend(intake::reverts(&git_repos()?, since, &mut warnings)),
+            "reviews" | "reverts" => {
+                let repos = git_repos()?;
+                if repos.is_empty() {
+                    // Nothing read is not nothing there: the cursor stays.
+                    warnings.push(format!("{source}: no git repositories under the roots"));
+                    Vec::new()
+                } else if source == "reviews" {
+                    intake::reviews(&repos, from, warnings)
+                } else {
+                    intake::reverts(&repos, from, warnings)
+                }
+            }
             "report" => {
                 // What the report finds going around the workflow: real
                 // failures and bypasses only. What it could not read is said,
                 // and does not hold the cursor back.
-                let report = report::build(&dirs, &git_repos()?, since, started);
+                let report = report::build(&dirs, &git_repos()?, from, started);
                 for gap in &report.gaps {
                     eprintln!("ohjaa: intake: report: not read: {gap}");
                 }
                 if let Err(why) = &report.natives {
                     eprintln!("ohjaa: intake: report: {why}");
                 }
-                candidates.extend(report::candidates(&report));
+                report::candidates(&report)
             }
             other => bail!("`{other}` is not a source: transcripts, reviews, reverts or report"),
+        })
+    };
+    for source in &sources {
+        let before = warnings.len();
+        if *source == "transcripts" {
+            // One pass, from the earliest point anything needs: the cursor,
+            // or the start of the oldest queued session.
+            let from = queued
+                .iter()
+                .map(|s| s.started_ms - 1)
+                .min()
+                .map_or(since, |earliest| earliest.min(since));
+            let read = read(source, from, &mut warnings)?;
+            transcripts_read_cleanly = warnings.len() == before;
+            let (new, older): (Vec<_>, Vec<_>) = read
+                .into_iter()
+                .partition(|candidate| candidate.at_ms > since);
+            candidates.extend(new);
+            candidates.extend(intake::within_sessions(older, &queued));
+        } else {
+            candidates.extend(read(source, since, &mut warnings)?);
+        }
+        if warnings.len() > before {
+            warned.push(source);
+        }
+    }
+    // A retry reads back to the oldest candidate set aside, for those alone:
+    // the cursor may have passed them, and they are not a session's.
+    if let Some(floor) = read_back {
+        for source in &sources {
+            let before = warnings.len();
+            let back = read(source, floor, &mut warnings)?;
+            candidates.extend(back.into_iter().filter(|c| retry.contains(&c.key())));
+            if warnings.len() > before && !warned.contains(source) {
+                warned.push(source);
+            }
         }
     }
     if !queued.is_empty() {
@@ -1772,48 +1845,58 @@ fn cmd_intake(
             queued.len()
         );
     }
-    let mut seen = std::collections::HashSet::new();
-    candidates.retain(|c| seen.insert((c.at_ms, c.text.clone())));
     for warning in &warnings {
         eprintln!("ohjaa: intake: {warning}");
     }
-    candidates.sort_by_key(|candidate| candidate.at_ms);
+    let found = intake::found(candidates);
+    // What earlier runs handled is never sent again: a run takes the oldest
+    // candidates not handled yet, so every run makes progress.
+    if retry_failed {
+        let reached = found.iter().filter(|c| retry.contains(&c.key())).count();
+        eprintln!(
+            "ohjaa: {reached} of {} candidate(s) set aside are sent again{}",
+            retry.len(),
+            if reached < retry.len() {
+                "; the others no source reads any more, and they stay set aside"
+            } else {
+                ""
+            }
+        );
+        handled.retry_failed();
+    }
+    let left = found.iter().filter(|c| !handled.contains(c)).count();
     let batch = batch.max(1);
     let limit = batch.saturating_mul(max_batches);
-    let taken = candidates.len().min(limit);
+    let taken = left.min(limit);
     eprintln!(
-        "ohjaa: {} candidate(s) since {}; drafting from {taken}",
-        candidates.len(),
-        intake::rfc3339(since.div_euclid(1000))
+        "ohjaa: {} candidate(s) since {}, {} handled by earlier runs; drafting from {taken}",
+        found.len(),
+        intake::rfc3339(since.div_euclid(1000)),
+        found.len() - left,
     );
-    // Drafted only when its whole window was read: a transcript that could
-    // not be read leaves the session queued for the next run.
-    let mark_drafted = || {
-        if !transcripts_read_cleanly || queued.is_empty() {
-            return;
-        }
-        // Opened again only for this short write, after the drafter is done.
-        if let Some(store) = session_store(&dirs) {
-            for session in &queued {
-                if let Err(error) = store.update(&session.id, |s| s.drafted = true) {
-                    eprintln!("ohjaa: {error}");
-                }
-            }
-        }
+    // What could not be read is never rendered as nothing new.
+    let nothing = if warnings.is_empty() {
+        "nothing new to draft from".to_owned()
+    } else {
+        format!(
+            "nothing found to draft from in what could be read ({} warning(s) above)",
+            warnings.len()
+        )
     };
-    if candidates.is_empty() {
-        if !dry_run && warnings.is_empty() {
-            intake::write_cursor(&dirs, started)?;
-            mark_drafted();
-        }
-        println!("nothing new to draft from");
-        return Ok(0);
-    }
-    let loaded = knowledge::load(&dirs)?;
-    let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
     if dry_run {
-        let first = &candidates[..candidates.len().min(batch)];
-        println!("{}", intake::prompt(&loaded, first));
+        if left == 0 {
+            println!("{nothing}");
+            return Ok(if warnings.is_empty() { 0 } else { INCOMPLETE });
+        }
+        let loaded = knowledge::load(&dirs)?;
+        let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
+        let first: Vec<intake::Candidate> = found
+            .iter()
+            .filter(|c| !handled.contains(c))
+            .take(batch)
+            .cloned()
+            .collect();
+        println!("{}", intake::prompt(&loaded, &first));
         eprintln!(
             "ohjaa: dry-run; would send {} batch(es) to `{drafter}`",
             taken.div_ceil(batch)
@@ -1823,58 +1906,172 @@ fn cmd_intake(
 
     let today = knowledge::today();
     let (mut proposed, mut refused) = (0, 0);
-    let mut completed_through: Option<i64> = None;
-    let mut drafted = 0usize;
-    for chunk in candidates[..taken].chunks(batch) {
-        // Re-read each time, so a draft from an earlier batch counts as existing.
-        let loaded = knowledge::load(&dirs)?;
-        let drafts = match intake::draft(&drafter, &intake::prompt(&loaded, chunk)) {
-            Ok(drafts) => drafts,
-            Err(error) => {
-                eprintln!("ohjaa: intake stopped: {error:#}");
-                break;
-            }
-        };
-        for draft in drafts {
-            let id = draft.id.clone();
-            let result = draft
-                .into_proposal()
-                .and_then(|proposal| knowledge::propose(&dirs, &loaded, proposal, today));
-            match result {
-                Ok(_) => {
-                    proposed += 1;
-                    println!("proposed {id}");
+    let mut drafted = intake::Drafted::default();
+    if left > 0 {
+        let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
+        drafted = intake::draft_pending(
+            &found,
+            &mut handled,
+            batch,
+            limit,
+            |chunk| {
+                // Re-read each time, so a draft from an earlier batch counts
+                // as existing.
+                let loaded = knowledge::load(&dirs).map_err(intake::Failure::Silent)?;
+                for draft in intake::draft(&drafter, &intake::prompt(&loaded, chunk))? {
+                    let id = draft.id.clone();
+                    let result = draft
+                        .into_proposal()
+                        .and_then(|proposal| knowledge::propose(&dirs, &loaded, proposal, today));
+                    match result {
+                        Ok(_) => {
+                            proposed += 1;
+                            println!("proposed {id}");
+                        }
+                        Err(error) => {
+                            refused += 1;
+                            eprintln!("ohjaa: draft `{id}` refused: {error:#}");
+                        }
+                    }
                 }
-                Err(error) => {
-                    refused += 1;
-                    eprintln!("ohjaa: draft `{id}` refused: {error:#}");
+                Ok(())
+            },
+            |handled| intake::write_handled(&dirs, handled),
+        );
+        // Said by time and source, never by its words.
+        for (key, failing) in &drafted.failed {
+            let at = intake::rfc3339(key.at_ms.div_euclid(1000));
+            if failing.attempts >= intake::MAX_ATTEMPTS {
+                eprintln!(
+                    "ohjaa: intake: set aside {at} {}: the drafter failed on it alone {} times \
+                     ({}); `ohjaa intake --retry-failed` sends it again",
+                    failing.source, failing.attempts, failing.why
+                );
+            } else {
+                eprintln!(
+                    "ohjaa: intake: the drafter failed on {at} {} alone (attempt {} of {}: {}); \
+                     it is tried again next run",
+                    failing.source,
+                    failing.attempts,
+                    intake::MAX_ATTEMPTS,
+                    failing.why
+                );
+            }
+        }
+        if let Some(error) = &drafted.stopped {
+            eprintln!("ohjaa: intake stopped: {error:#}");
+        }
+    }
+    handled.done_retrying();
+    // A session is drafted from once every candidate of it is handled, in
+    // however many runs, and only when its whole window was read: a
+    // transcript that could not be read leaves it queued for the next run.
+    let sessions: Option<Vec<intake::Undrafted>> = undrafted.as_ref().map(|all| {
+        all.iter()
+            .map(|s| intake::Undrafted {
+                id: s.id.clone(),
+                started_ms: s.started_ms,
+                members: (reads_transcripts && s.left.is_some())
+                    .then(|| intake::members(s, &found)),
+                whole: transcripts_read_cleanly,
+            })
+            .collect()
+    });
+    // The cursor is one for every source: it moves only after a run that
+    // read them all, none with a warning.
+    let every_source = ["transcripts", "reviews", "reverts", "report"]
+        .iter()
+        .all(|source| sources.contains(source));
+    let window = intake::Window {
+        since,
+        started,
+        complete: every_source && warnings.is_empty(),
+    };
+    let settled = intake::settle(&found, &mut handled, sessions.as_deref(), window);
+    if let Some(cursor) = settled.cursor {
+        intake::write_cursor(&dirs, cursor)?;
+    }
+    if !settled.drafted.is_empty() {
+        // Opened again only for this short write, after the drafter is done.
+        if let Some(store) = session_store(&dirs) {
+            for id in &settled.drafted {
+                if let Err(error) = store.update(id, |s| s.drafted = true) {
+                    eprintln!("ohjaa: {error}");
                 }
             }
         }
-        completed_through = chunk.last().map(|c| c.at_ms);
-        drafted += chunk.len();
     }
-    // Move the cursor only past what was actually drafted from, so an
-    // interrupted or partial run resumes instead of skipping. It never moves
-    // backwards (`write_cursor` refuses to).
-    // Finished only when every candidate went through the drafter: a batch
-    // that failed part-way leaves the rest for the next run.
-    let finished_all = drafted == candidates.len();
-    if let Some(through) = completed_through {
-        let cursor = if finished_all && warnings.is_empty() {
-            started
-        } else {
-            through
-        };
-        intake::write_cursor(&dirs, cursor)?;
+    intake::write_handled(&dirs, &handled)?;
+    // Every run says what is set aside, by time and source.
+    let aside: Vec<String> = handled
+        .set_aside()
+        .map(|(key, failing)| {
+            format!(
+                "{} {}",
+                intake::rfc3339(key.at_ms.div_euclid(1000)),
+                failing.source
+            )
+        })
+        .collect();
+    if !aside.is_empty() {
+        let more = aside.len().saturating_sub(5);
+        eprintln!(
+            "ohjaa: {} candidate(s) set aside, the drafter failed on each alone {} times: {}{} \
+             (`ohjaa intake --retry-failed` sends them again)",
+            aside.len(),
+            intake::MAX_ATTEMPTS,
+            aside[..aside.len() - more].join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        );
     }
-    if finished_all {
-        mark_drafted();
+    // A held cursor is said: where it stays, since when, and what holds it.
+    if !window.complete {
+        let mut why = Vec::new();
+        if !every_source {
+            why.push(format!(
+                "this run read only {}, and the cursor is one for every source, so a run of \
+                 some sources does not move it",
+                sources.join(", ")
+            ));
+        }
+        if !warned.is_empty() {
+            why.push(format!(
+                "{} could not all be read (see above); it moves after a run that reads every \
+                 source",
+                warned.join(", ")
+            ));
+        }
+        match intake::read_cursor(&dirs)? {
+            Some(at) => eprintln!(
+                "ohjaa: intake: the cursor stays at {} ({}): {}",
+                intake::rfc3339(at.div_euclid(1000)),
+                scan::ago((started - at).div_euclid(1000)),
+                why.join("; ")
+            ),
+            None => eprintln!("ohjaa: intake: no cursor is kept yet: {}", why.join("; ")),
+        }
     }
-    println!(
-        "{proposed} proposal(s) waiting for review (`ohjaa review`), {refused} draft(s) refused"
-    );
-    Ok(if finished_all { 0 } else { INCOMPLETE })
+    let newly_aside = drafted
+        .failed
+        .iter()
+        .any(|(_, failing)| failing.attempts >= intake::MAX_ATTEMPTS);
+    if left == 0 {
+        println!("{nothing}");
+    } else {
+        println!(
+            "{proposed} proposal(s) waiting for review (`ohjaa review`), {refused} draft(s) refused"
+        );
+    }
+    if settled.left > 0 {
+        eprintln!("ohjaa: {} candidate(s) wait for the next run", settled.left);
+    }
+    let finished =
+        settled.left == 0 && drafted.stopped.is_none() && !newly_aside && warnings.is_empty();
+    Ok(if finished { 0 } else { INCOMPLETE })
 }
 
 // ---- launching --------------------------------------------------------------
@@ -3434,6 +3631,7 @@ fn main() {
             batch,
             max_batches,
             dry_run,
+            retry_failed,
         } => cmd_intake(
             &cli.root,
             since.as_deref(),
@@ -3442,6 +3640,7 @@ fn main() {
             *batch,
             *max_batches,
             *dry_run,
+            *retry_failed,
         ),
     };
     match result {

@@ -1339,14 +1339,7 @@ fn intake_turns_a_correction_into_a_proposal_through_the_drafter() {
     let (stdout, stderr, code) = output_of(
         fixture
             .ohjaa()
-            .args([
-                "intake",
-                "--source",
-                "transcripts",
-                "--since",
-                "2026-09-01",
-                "--drafter",
-            ])
+            .args(["intake", "--since", "2026-09-01", "--drafter"])
             .arg(&drafter)
             .current_dir(&repo),
     );
@@ -1380,7 +1373,7 @@ fn intake_turns_a_correction_into_a_proposal_through_the_drafter() {
     let (stdout, _, code) = output_of(
         fixture
             .ohjaa()
-            .args(["intake", "--source", "transcripts", "--drafter"])
+            .args(["intake", "--drafter"])
             .arg(&drafter)
             .current_dir(&repo),
     );
@@ -1419,7 +1412,10 @@ fn a_failing_drafter_stops_intake_without_moving_the_cursor() {
             .current_dir(&repo),
     );
     assert_eq!(code, Some(4), "{stderr}");
-    assert!(stderr.contains("intake stopped"), "{stderr}");
+    assert!(
+        stderr.contains("attempt 1 of 3"),
+        "kept, to try again: {stderr}"
+    );
     assert!(!fixture.dir.join("state/ohjaa/intake-since").exists());
     fixture.cleanup();
 }
@@ -2457,6 +2453,857 @@ fn intake_drafts_from_a_sessions_handover_once() {
     fixture.cleanup();
 }
 
+/// An ended session that said `count` corrections in its own window and
+/// repository (all in one second), read back and handed over: queued for
+/// intake, with `count + 1` candidates (and nothing for the report).
+fn session_that_said(fixture: &Fixture, repo: &Path, count: usize) {
+    let projects = fixture.dir.join("home/.claude/projects/-work");
+    fs::create_dir_all(&projects).unwrap();
+    let script = format!(
+        r#"sleep 1; here=$(pwd -P); at=$(date -u +%Y-%m-%dT%H:%M:%SZ); i=1
+while [ $i -le {count} ]; do
+  printf '{{"type":"user","timestamp":"%s","cwd":"%s","message":{{"content":"correction %s"}}}}\n' "$at" "$here" "$i" >> '{transcript}'
+  i=$((i+1))
+done
+{ohjaa} oriented 'said corrections, then handed over' > /dev/null
+{ohjaa} handover --surprised 'the queue never drained'"#,
+        transcript = projects.join("queued.jsonl").display(),
+        ohjaa = ohjaa_bin(),
+    );
+    let (_, stderr, code) = run_session(fixture, repo, &script);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+/// Now, as the cursor writes it (milliseconds), from `date`.
+fn utc_now() -> String {
+    let output = Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%S.000Z"])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// The `said:` line of every candidate in each answered prompt, in order.
+fn said_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn intake_drains_a_queue_larger_than_one_run_and_never_moves_the_cursor_back() {
+    // The 2026-10-26 audit: queued sessions' old candidates outnumbered a
+    // run's cap, so every run drafted the same first ones, put the cursor
+    // before where the run began, never marked a session drafted and exited
+    // 4, forever.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakedrain");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 5);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // The window starts after the session: all six candidates are older.
+    let since = utc_now();
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ngrep '^    said: ' >> '{}'\necho '[]'\n",
+            sent.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let cursor_path = fixture.dir.join("state/ohjaa/intake-since");
+    let mut cursors: Vec<String> = Vec::new();
+    let mut runs = 0;
+    loop {
+        runs += 1;
+        assert!(runs <= 5, "intake never finished: {:?}", said_lines(&sent));
+        let before = said_lines(&sent).len();
+        let mut command = fixture.ohjaa();
+        command.arg("intake");
+        if runs == 1 {
+            command.args(["--since", &since]);
+        }
+        command
+            .args(["--batch", "1", "--max-batches", "2", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo);
+        let (stdout, stderr, code) = output_of(&mut command);
+        let sent_now = said_lines(&sent).len() - before;
+        assert!(sent_now <= 2, "a run takes at most its cap: {stderr}");
+        let cursor = fs::read_to_string(&cursor_path).unwrap_or_default();
+        let cursor = cursor.trim().to_owned();
+        assert!(
+            cursor.is_empty() || cursor >= since,
+            "run {runs}: the cursor {cursor} is before where the run began, {since}"
+        );
+        if let Some(last) = cursors.last() {
+            assert!(cursor >= *last, "run {runs}: the cursor moved back");
+        }
+        cursors.push(cursor);
+        if stdout.contains("nothing new") {
+            assert_eq!(code, Some(0), "{stderr}");
+            assert_eq!(sent_now, 0, "{stderr}");
+            assert!(
+                !stderr.contains("queued for drafting"),
+                "the session is drafted: {stderr}"
+            );
+            break;
+        }
+        assert!(sent_now >= 1, "run {runs} made no progress: {stderr}");
+        let done = said_lines(&sent).len() == 6;
+        assert_eq!(
+            code,
+            Some(if done { 0 } else { 4 }),
+            "4 while work is left for the next run: {stderr}"
+        );
+    }
+    let mut lines = said_lines(&sent);
+    assert_eq!(lines.len(), 6, "each candidate once: {lines:?}");
+    lines.sort();
+    lines.dedup();
+    assert_eq!(lines.len(), 6, "no candidate twice: {lines:?}");
+    assert!(lines.iter().any(|l| l.contains("the queue never drained")));
+    assert_eq!(runs, 4, "three runs of two, then nothing left");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_drafter_failing_mid_run_keeps_what_was_drafted_and_the_next_run_retries_the_rest() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakeresume");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 5);
+    let (sent, failed, count) = (
+        fixture.dir.join("sent.txt"),
+        fixture.dir.join("failed.txt"),
+        fixture.dir.join("count"),
+    );
+    // Its second and third calls fail (two candidates failing alone in a row
+    // stop the run); every other one answers that nothing is there.
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\nn=$(($(cat '{count}' 2>/dev/null || echo 0) + 1)); echo $n > '{count}'\n\
+             if [ $n -eq 2 ] || [ $n -eq 3 ]; then grep '^    said: ' >> '{failed}'; echo boom >&2; exit 1; fi\n\
+             grep '^    said: ' >> '{sent}'\necho '[]'\n",
+            count = count.display(),
+            failed = failed.display(),
+            sent = sent.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--source", "transcripts", "--batch", "1"])
+                .args(["--max-batches", "3", "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(stderr.contains("intake stopped"), "{stderr}");
+    assert_eq!(said_lines(&sent).len(), 1, "the first batch was drafted");
+    let failed = said_lines(&failed);
+    assert_eq!(failed.len(), 2);
+
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    let lines = said_lines(&sent);
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(
+        lines[1..3],
+        failed[..],
+        "the next run starts from what failed, not from the beginning"
+    );
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    let (stdout, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("nothing new"), "{stdout}");
+    let mut lines = said_lines(&sent);
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    lines.sort();
+    lines.dedup();
+    assert_eq!(lines.len(), 6, "nothing drafted twice: {lines:?}");
+    fixture.cleanup();
+}
+
+/// Wait for `path` to appear, at most ten seconds.
+fn wait_for_file(path: &Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !path.exists() {
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    true
+}
+
+#[test]
+fn a_second_intake_while_one_runs_says_so_and_sends_nothing() {
+    // Two at once sent the same batch twice, and one of them failed on the
+    // other's half-written progress.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakebusy");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 3);
+    let (calls, started, release, sent) = (
+        fixture.dir.join("drafter-calls.txt"),
+        fixture.dir.join("started"),
+        fixture.dir.join("release"),
+        fixture.dir.join("sent.txt"),
+    );
+    // Holds its first answer until released (ten seconds at most).
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\necho call >> '{calls}'\ntouch '{started}'\ni=0\n\
+             while [ ! -e '{release}' ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n\
+             grep '^    said: ' >> '{sent}'\necho '[]'\n",
+            calls = calls.display(),
+            started = started.display(),
+            release = release.display(),
+            sent = sent.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = || {
+        let mut command = fixture.ohjaa();
+        command
+            .args(["intake", "--source", "transcripts", "--drafter"])
+            .arg(&drafter)
+            .current_dir(&repo);
+        command
+    };
+    let first = intake()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(wait_for_file(&started), "the first intake never asked");
+    let (_, stderr, code) = output_of(&mut intake());
+    fs::write(&release, "").unwrap();
+    let first = first.wait_with_output().unwrap();
+    assert_eq!(code, Some(3), "refused: {stderr}");
+    assert!(stderr.contains("intake already running"), "{stderr}");
+    assert_eq!(said_lines(&calls).len(), 1, "the second asked nothing");
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let mut lines = said_lines(&sent);
+    lines.sort();
+    lines.dedup();
+    assert_eq!((said_lines(&sent).len(), lines.len()), (4, 4));
+    fixture.cleanup();
+}
+
+#[test]
+fn a_candidate_the_drafter_always_fails_on_is_isolated_and_set_aside_out_loud() {
+    // One poison candidate failed its whole batch on every run: exit 4, no
+    // progress, forever.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakepoison");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 5);
+    let sent = fixture.dir.join("sent.txt");
+    // Refuses, in prose, any batch that holds `correction 3`.
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\nprompt=$(cat)\n\
+             case \"$prompt\" in *'said: correction 3'*) echo 'I cannot help with that.'; exit 0;; esac\n\
+             printf '%s\\n' \"$prompt\" | grep '^    said: ' >> '{}'\necho '[]'\n",
+            sent.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--source", "transcripts", "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    // The first run drafts from everything around it.
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    assert_eq!(said_lines(&sent).len(), 5, "all but the one: {stderr}");
+    assert!(stderr.contains("attempt 1 of 3"), "{stderr}");
+    // Each run after it tries the one alone again, until it is set aside,
+    // said with its time and source, never its words.
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(stderr.contains("attempt 2 of 3"), "{stderr}");
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(stderr.contains("set aside"), "{stderr}");
+    assert!(stderr.contains("claude"), "its source: {stderr}");
+    assert!(
+        !stderr.contains("correction 3"),
+        "never its words: {stderr}"
+    );
+    // Then nothing is left, and the set-aside one is still said, by its time
+    // and source; its session stays queued, so a retry can find it.
+    let (stdout, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("nothing new"), "{stdout}");
+    assert!(stderr.contains("1 candidate(s) set aside"), "{stderr}");
+    assert!(stderr.contains("Z claude"), "{stderr}");
+    assert!(stderr.contains("queued for drafting"), "{stderr}");
+    let mut lines = said_lines(&sent);
+    lines.sort();
+    lines.dedup();
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("correction 3")));
+    fixture.cleanup();
+}
+
+#[test]
+fn a_run_that_reads_only_some_sources_never_moves_the_cursor_past_the_others() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakepartial");
+    let repo = fixture.make_git_repo("work");
+    let projects = fixture.dir.join("home/.claude/projects/-work");
+    fs::create_dir_all(&projects).unwrap();
+    fs::write(
+        projects.join("s.jsonl"),
+        format!(
+            r#"{{"type":"user","timestamp":"{}","cwd":"/p/work","message":{{"content":"the unread one"}}}}"#,
+            utc_now()
+        ),
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ngrep '^    said: ' >> '{}'\necho '[]'\n",
+            sent.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = |source: &str| {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--source", source, "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    let (_, stderr, _) = intake("reviews");
+    assert!(said_lines(&sent).is_empty(), "{stderr}");
+    let (_, stderr, code) = intake("transcripts");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        said_lines(&sent),
+        ["    said: the unread one"],
+        "a run of reviews alone did not move past the transcripts: {stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_run_with_warnings_never_says_nothing_new_and_exits_zero() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakewarned");
+    let repo = fixture.make_git_repo("work");
+    let projects = fixture.dir.join("home/.claude/projects/-work");
+    fs::create_dir_all(&projects).unwrap();
+    let unreadable = projects.join("locked.jsonl");
+    fs::write(&unreadable, "{}").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--source", "transcripts", "--drafter", "false"])
+            .current_dir(&repo),
+    );
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(stderr.contains("cannot read"), "{stderr}");
+    assert!(
+        !stdout.contains("nothing new"),
+        "what could not be read is not nothing: {stdout}"
+    );
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    fixture.cleanup();
+}
+
+/// A stub drafter that records the `said:` lines it answers for in `sent`.
+fn recording_drafter(fixture: &Fixture, sent: &Path) -> PathBuf {
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\ngrep '^    said: ' >> '{}'\necho '[]'\n",
+            sent.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    drafter
+}
+
+#[test]
+fn an_intake_killed_mid_run_keeps_every_batch_answered_before_the_kill() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakekilled");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 5);
+    let (sent, count, hung, pids) = (
+        fixture.dir.join("sent.txt"),
+        fixture.dir.join("count"),
+        fixture.dir.join("hung"),
+        fixture.dir.join("pids"),
+    );
+    // Its second call hangs, until ohjaa is killed under it.
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\nn=$(($(cat '{count}' 2>/dev/null || echo 0) + 1)); echo $n > '{count}'\n\
+             if [ $n -eq 2 ]; then sleep 30 & echo \"$$ $!\" > '{pids}'; touch '{hung}'; wait; fi\n\
+             grep '^    said: ' >> '{sent}'\necho '[]'\n",
+            count = count.display(),
+            pids = pids.display(),
+            hung = hung.display(),
+            sent = sent.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+    let intake = || {
+        let mut command = fixture.ohjaa();
+        command
+            .args([
+                "intake",
+                "--source",
+                "transcripts",
+                "--batch",
+                "2",
+                "--drafter",
+            ])
+            .arg(&drafter)
+            .current_dir(&repo);
+        command
+    };
+    let mut first = intake()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_for_file(&hung), "the second call never came");
+    first.kill().unwrap();
+    first.wait().unwrap();
+    for pid in fs::read_to_string(&pids).unwrap().split_whitespace() {
+        let _ = Command::new("kill").args(["-9", pid]).status();
+    }
+    assert_eq!(said_lines(&sent).len(), 2, "the first batch was answered");
+    let (_, stderr, code) = output_of(&mut intake());
+    assert_eq!(code, Some(0), "{stderr}");
+    let mut lines = said_lines(&sent);
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    lines.sort();
+    lines.dedup();
+    assert_eq!(
+        lines.len(),
+        6,
+        "nothing answered before the kill was sent again"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_first_run_keeps_its_window_start_as_the_cursor_even_when_it_drafts_nothing() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakefirst");
+    let repo = fixture.make_git_repo("work");
+    let projects = fixture.dir.join("home/.claude/projects/-work");
+    fs::create_dir_all(&projects).unwrap();
+    fs::write(
+        projects.join("s.jsonl"),
+        format!(
+            r#"{{"type":"user","timestamp":"{}","cwd":"/p/work","message":{{"content":"never python"}}}}"#,
+            utc_now()
+        ),
+    )
+    .unwrap();
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--drafter", "exit 1"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(4), "{stderr}");
+    let since = stderr
+        .split(" since ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .expect(&stderr)
+        .to_owned();
+    let cursor = fs::read_to_string(fixture.dir.join("state/ohjaa/intake-since")).unwrap();
+    assert_eq!(
+        cursor.trim(),
+        since.replace('Z', ".000Z"),
+        "the default window's start, kept before drafting: {stderr}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn what_no_later_run_can_find_again_is_forgotten() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakeforget");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 2);
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = recording_drafter(&fixture, &sent);
+    let handled = fixture.dir.join("state/ohjaa/intake-handled");
+    let intake = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    // Every source, so the cursor moves and the session is drafted from.
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(said_lines(&sent).len(), 3, "{stderr}");
+    let kept = fs::read_to_string(&handled).unwrap();
+    assert!(
+        kept.ends_with("end 3\n"),
+        "kept while this run found them: {kept}"
+    );
+    // The next run finds none of them again, so nothing is kept. (A second
+    // later: a run starts on the second, and one started on the cursor's
+    // second cannot move it, nor forget anything, until the next.)
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (stdout, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("nothing new"), "{stdout}");
+    assert!(!handled.exists(), "{:?}", fs::read_to_string(&handled).ok());
+    fixture.cleanup();
+}
+
+#[test]
+fn progress_is_replaced_whole_never_written_in_place() {
+    if !git_available() {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let fixture = Fixture::new("intakewhole");
+    let repo = fixture.make_git_repo("work");
+    session_that_said(&fixture, &repo, 2);
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = recording_drafter(&fixture, &sent);
+    let handled = fixture.dir.join("state/ohjaa/intake-handled");
+    let one_batch = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--source", "transcripts", "--batch", "1"])
+                .args(["--max-batches", "1", "--drafter"])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    one_batch();
+    let first = fs::metadata(&handled).unwrap().ino();
+    one_batch();
+    let second = fs::metadata(&handled).unwrap().ino();
+    assert_ne!(first, second, "written aside and renamed into place");
+    assert!(!handled.with_extension("partial").exists());
+    assert!(fs::read_to_string(&handled).unwrap().ends_with("end 2\n"));
+    fixture.cleanup();
+}
+
+/// The second review's setup: an ended session that said three corrections,
+/// and a correction said outside any session, after it. A drafter refuses, in
+/// prose, any batch holding `correction 2` or the outside one while `refuse`
+/// exists; it records every `said:` line it is sent in `tried`, and those it
+/// answers for in `sent`. Three runs of every source set both aside, and the
+/// cursor moves past them.
+struct Poisoned {
+    fixture: Fixture,
+    repo: PathBuf,
+    drafter: PathBuf,
+    refuse: PathBuf,
+    tried: PathBuf,
+    sent: PathBuf,
+}
+
+impl Poisoned {
+    fn new(tag: &str) -> Poisoned {
+        let fixture = Fixture::new(tag);
+        let repo = fixture.make_git_repo("work");
+        session_that_said(&fixture, &repo, 3);
+        let elsewhere = fixture.dir.join("home/.claude/projects/-elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(
+            elsewhere.join("free.jsonl"),
+            format!(
+                r#"{{"type":"user","timestamp":"{}","cwd":"/p/elsewhere","message":{{"content":"the stubborn one"}}}}"#,
+                utc_now()
+            ),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let (refuse, tried, sent) = (
+            fixture.dir.join("refuse"),
+            fixture.dir.join("tried.txt"),
+            fixture.dir.join("sent.txt"),
+        );
+        fs::write(&refuse, "").unwrap();
+        let drafter = fixture.stub_dir.join("drafter");
+        fs::write(
+            &drafter,
+            format!(
+                "#!/bin/sh\nprompt=$(cat)\nprintf '%s\\n' \"$prompt\" | grep '^    said: ' >> '{tried}'\n\
+                 if [ -e '{refuse}' ]; then case \"$prompt\" in\n\
+                 *'said: correction 2'*|*'said: the stubborn one'*) echo 'I cannot help with that.'; exit 0;;\n\
+                 esac; fi\n\
+                 printf '%s\\n' \"$prompt\" | grep '^    said: ' >> '{sent}'\necho '[]'\n",
+                tried = tried.display(),
+                refuse = refuse.display(),
+                sent = sent.display(),
+            ),
+        )
+        .unwrap();
+        make_executable(&drafter);
+        let poisoned = Poisoned {
+            fixture,
+            repo,
+            drafter,
+            refuse,
+            tried,
+            sent,
+        };
+        for run in 1..=3 {
+            let (_, stderr, code) = poisoned.intake(&[]);
+            assert_eq!(code, Some(4), "run {run}: {stderr}");
+        }
+        let (_, stderr, _) = poisoned.intake(&[]);
+        assert!(stderr.contains("2 candidate(s) set aside"), "{stderr}");
+        poisoned
+    }
+
+    fn intake(&self, extra: &[&str]) -> (String, String, Option<i32>) {
+        // A second apart: the cursor is kept in whole seconds of a run's start.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        output_of(
+            self.fixture
+                .ohjaa()
+                .arg("intake")
+                .args(extra)
+                .arg("--drafter")
+                .arg(&self.drafter)
+                .current_dir(&self.repo),
+        )
+    }
+
+    fn count(path: &Path, words: &str) -> usize {
+        said_lines(path)
+            .iter()
+            .filter(|l| l.contains(words))
+            .count()
+    }
+}
+
+#[test]
+fn retry_failed_sends_set_aside_candidates_again_after_the_cursor_passed_them() {
+    if !git_available() {
+        return;
+    }
+    let poisoned = Poisoned::new("intakeretry");
+    // Set aside, each is still said by its time and source in every run.
+    let (_, stderr, _) = poisoned.intake(&[]);
+    assert_eq!(stderr.matches(" claude").count(), 2, "{stderr}");
+    fs::remove_file(&poisoned.refuse).unwrap();
+    let (_, stderr, code) = poisoned.intake(&["--retry-failed"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    for words in ["said: correction 2", "said: the stubborn one"] {
+        assert_eq!(
+            Poisoned::count(&poisoned.sent, words),
+            1,
+            "{words}, answered once retried: {stderr}"
+        );
+    }
+    // Answered: no longer set aside, and the session is drafted from.
+    let (stdout, stderr, code) = poisoned.intake(&[]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("nothing new"), "{stdout}");
+    assert!(!stderr.contains("set aside"), "{stderr}");
+    assert!(!stderr.contains("queued for drafting"), "{stderr}");
+    poisoned.fixture.cleanup();
+}
+
+#[test]
+fn a_retry_that_fails_again_keeps_them_set_aside_until_the_drafter_answers() {
+    if !git_available() {
+        return;
+    }
+    let poisoned = Poisoned::new("intakeretryfail");
+    let before = Poisoned::count(&poisoned.tried, "said: the stubborn one");
+    let (_, stderr, code) = poisoned.intake(&["--retry-failed"]);
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(
+        Poisoned::count(&poisoned.tried, "said: the stubborn one") > before,
+        "retried: {stderr}"
+    );
+    assert!(stderr.contains("2 candidate(s) set aside"), "{stderr}");
+    assert!(
+        !stderr.contains("wait for the next run"),
+        "set aside again, not waiting: {stderr}"
+    );
+    // Still kept, still said, and retried again later with success.
+    let (_, stderr, _) = poisoned.intake(&[]);
+    assert!(stderr.contains("2 candidate(s) set aside"), "{stderr}");
+    fs::remove_file(&poisoned.refuse).unwrap();
+    let (_, stderr, code) = poisoned.intake(&["--retry-failed"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(Poisoned::count(&poisoned.sent, "said: correction 2"), 1);
+    assert_eq!(Poisoned::count(&poisoned.sent, "said: the stubborn one"), 1);
+    let (_, stderr, _) = poisoned.intake(&[]);
+    assert!(!stderr.contains("set aside"), "{stderr}");
+    poisoned.fixture.cleanup();
+}
+
+#[test]
+fn a_held_cursor_says_where_it_stays_and_which_source_holds_it() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakeheld");
+    let repo = fixture.make_git_repo("work");
+    // A GitHub remote, and a gh that is not logged in: reviews always fail.
+    run_git(
+        &repo,
+        &["remote", "add", "origin", "git@github.com:o/r.git"],
+    );
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = recording_drafter(&fixture, &sent);
+    let cursor = fixture.dir.join("state/ohjaa/intake-since");
+    let intake = |extra: &[&str]| {
+        output_of(
+            fixture
+                .ohjaa()
+                .arg("intake")
+                .args(extra)
+                .arg("--drafter")
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    let (_, stderr, code) = intake(&[]);
+    assert_eq!(code, Some(4), "{stderr}");
+    let kept = fs::read_to_string(&cursor).unwrap();
+    let at = &kept.trim()[..19];
+    for _ in 0..2 {
+        let (_, stderr, code) = intake(&[]);
+        assert_eq!(code, Some(4), "{stderr}");
+        assert!(
+            stderr.contains(&format!("the cursor stays at {at}")),
+            "where it stays: {stderr}"
+        );
+        assert!(
+            stderr.contains("reviews"),
+            "which source holds it: {stderr}"
+        );
+        assert_eq!(fs::read_to_string(&cursor).unwrap(), kept);
+    }
+    // A run of some sources says it does not move the shared cursor.
+    let (_, stderr, code) = intake(&["--source", "transcripts"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!("the cursor stays at {at}")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("one for every source"), "{stderr}");
+    fixture.cleanup();
+}
+
+#[test]
+fn no_repositories_under_the_roots_holds_the_cursor_and_says_so() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakenorepos");
+    let empty = fixture.make_folder("empty");
+    let sent = fixture.dir.join("sent.txt");
+    let drafter = recording_drafter(&fixture, &sent);
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa_in(&empty)
+            .arg("--root")
+            .arg(&empty)
+            .args(["intake", "--drafter"])
+            .arg(&drafter),
+    );
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(
+        stderr.contains("reviews: no git repositories under the roots"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("reverts: no git repositories under the roots"),
+        "{stderr}"
+    );
+    let since = stderr
+        .split(" since ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .expect(&stderr)
+        .replace('Z', ".000Z");
+    let cursor = fs::read_to_string(fixture.dir.join("state/ohjaa/intake-since")).unwrap();
+    assert_eq!(cursor.trim(), since, "not moved past what it never read");
+    fixture.cleanup();
+}
+
 // ---- review fixes: each test failed before its fix -----------------------------
 
 /// A drafter that, while intake is drafting, checks the session log can be
@@ -2618,38 +3465,43 @@ fn sessions_are_drafted_only_once_their_transcript_window_was_read() {
     make_executable(&drafter);
     let intake = |source: &str| {
         let _ = fs::remove_file(fixture.dir.join("prompt.txt"));
-        output_of(
+        let (_, stderr, _) = output_of(
             fixture
                 .ohjaa()
                 .args(["intake", "--source", source, "--drafter"])
                 .arg(&drafter)
                 .current_dir(&repo),
         );
-        fs::read_to_string(fixture.dir.join("prompt.txt")).unwrap_or_default()
+        let prompt = fs::read_to_string(fixture.dir.join("prompt.txt")).unwrap_or_default();
+        (prompt, stderr)
     };
     // A run that never reads transcripts leaves the session alone and queued...
-    let prompt = intake("reviews");
+    let (prompt, _) = intake("reviews");
     assert!(
         !prompt.contains("the handover text"),
-        "a session is drafted whole, with its transcript window: {prompt}"
+        "a session is drafted with its transcript window: {prompt}"
     );
-    // ...and so does one whose transcripts could not all be read.
+    // ...and one whose transcripts could not all be read drafts from what it
+    // found, but leaves the session queued.
     let projects = fixture.dir.join("home/.claude/projects/-work");
     fs::create_dir_all(&projects).unwrap();
     let unreadable = projects.join("locked.jsonl");
     fs::write(&unreadable, "{}").unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
-    let prompt = intake("transcripts");
+    let (prompt, _) = intake("transcripts");
     assert!(prompt.contains("the handover text"), "{prompt}");
     fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
-    // Read cleanly: drafted, and only now marked so.
-    let prompt = intake("transcripts");
+    // Read cleanly: still queued after the warning, its handover is not sent
+    // again, and only now it is marked drafted.
+    let (prompt, stderr) = intake("transcripts");
+    assert!(stderr.contains("1 ended session(s) queued"), "{stderr}");
     assert!(
-        prompt.contains("the handover text"),
-        "still queued after a warning: {prompt}"
+        !prompt.contains("the handover text"),
+        "handled once, never sent again: {prompt}"
     );
-    let prompt = intake("transcripts");
+    let (prompt, stderr) = intake("transcripts");
+    assert!(!stderr.contains("queued"), "drafted: {stderr}");
     assert!(
         !prompt.contains("the handover text"),
         "drafted once: {prompt}"

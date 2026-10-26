@@ -6,12 +6,13 @@
 //! `claude -p`) which of them carry durable Knowledge, and writes each draft as
 //! a *proposal*. Nothing becomes current until a person accepts it.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use faija_knowledge::{Kind, Scope};
 use serde::Deserialize;
 use serde_json::Value;
@@ -543,22 +544,39 @@ pub fn observed_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candida
     out
 }
 
-/// The transcript candidates that fall inside one of these sessions: its time
-/// window, in its repository (or below it).
+/// Whether a transcript candidate falls inside this session: its time window,
+/// in its repository (or below it).
+fn in_window(candidate: &Candidate, session: &crate::sessions::Session) -> bool {
+    let ended = session.left.as_ref().map_or(i64::MAX, |left| left.ended_ms);
+    candidate.at_ms >= session.started_ms
+        && candidate.at_ms <= ended
+        && Path::new(&candidate.place).starts_with(&session.repo)
+}
+
+/// The transcript candidates that fall inside one of these sessions.
 pub fn within_sessions(
     window: Vec<Candidate>,
     sessions: &[crate::sessions::Session],
 ) -> Vec<Candidate> {
     window
         .into_iter()
-        .filter(|candidate| {
-            sessions.iter().any(|session| {
-                let ended = session.left.as_ref().map_or(i64::MAX, |left| left.ended_ms);
-                candidate.at_ms >= session.started_ms
-                    && candidate.at_ms <= ended
-                    && Path::new(&candidate.place).starts_with(&session.repo)
-            })
-        })
+        .filter(|candidate| sessions.iter().any(|session| in_window(candidate, session)))
+        .collect()
+}
+
+/// Every candidate found that is this session's: what was said in its window
+/// and repository, its handover, and what ohjaa observed in it. The session
+/// is drafted from once each of them has been handled, in however many runs.
+pub fn members(session: &crate::sessions::Session, found: &[Candidate]) -> Vec<Key> {
+    let own = std::slice::from_ref(session);
+    let said = found
+        .iter()
+        .filter(|c| matches!(c.source, "claude" | "codex") && in_window(c, session));
+    handover_candidates(own)
+        .iter()
+        .chain(&observed_candidates(own))
+        .chain(said)
+        .map(Candidate::key)
         .collect()
 }
 
@@ -701,16 +719,20 @@ impl Draft {
 }
 
 /// Ask the drafter about one batch: the prompt goes in on stdin.
-pub fn draft(drafter: &str, prompt: &str) -> Result<Vec<Draft>> {
+pub fn draft(drafter: &str, prompt: &str) -> Result<Vec<Draft>, Failure> {
     let output = process::run(
         Command::new("sh").args(["-c", drafter]),
         Some(prompt.as_bytes()),
         Duration::from_secs(600),
-    )?;
+    )
+    .map_err(Failure::Silent)?;
     if !output.status.success() {
-        bail!("the drafter failed: {}", output.failure_detail());
+        let detail = anyhow!("{}", output.failure_detail());
+        return Err(Failure::Refused(
+            detail.context(format!("the drafter failed ({})", output.status)),
+        ));
     }
-    parse_drafts(&output.stdout_text())
+    parse_drafts(&output.stdout_text()).map_err(Failure::Refused)
 }
 
 // ---- the cursor -------------------------------------------------------------
@@ -742,6 +764,526 @@ pub fn write_cursor(dirs: &Dirs, at_ms: i64) -> Result<()> {
     let text = format!("{}.{:03}Z\n", &at[..at.len() - 1], at_ms.rem_euclid(1000));
     std::fs::write(cursor_path(dirs), text)?;
     Ok(())
+}
+
+// ---- progress ---------------------------------------------------------------
+//
+// A run drafts from at most its cap, so a queue can take several runs. Each
+// candidate the drafter has answered for is *handled*, and kept the moment
+// its batch is answered (`intake-handled`, beside the cursor): the next run
+// continues where this one stopped, a failure keeps what came before it, and
+// nothing answered for is sent again. A batch the drafter cannot answer is
+// split until the candidate it fails on stands alone; one that fails alone
+// `MAX_ATTEMPTS` times, over as many runs, is set aside and said, never
+// dropped in silence. The cursor moves only past handled candidates, and only
+// when every source was read, so it never needs to move back.
+
+/// How often a candidate may fail alone before it is set aside.
+pub const MAX_ATTEMPTS: u8 = 3;
+
+/// A candidate's identity across runs: when it was said, and a digest of what
+/// (the pair duplicates are dropped by). Only the digest is kept on disk,
+/// never the words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Key {
+    pub at_ms: i64,
+    pub digest: u64,
+}
+
+impl Candidate {
+    pub fn key(&self) -> Key {
+        Key {
+            at_ms: self.at_ms,
+            digest: fnv1a(self.text.as_bytes()),
+        }
+    }
+}
+
+/// 64-bit FNV-1a: the same on every Rust release, unlike `DefaultHasher`.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// A candidate the drafter failed on alone: how often, and why the last time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failing {
+    pub attempts: u8,
+    /// Where it came from (`claude`, `review`, …), to say it by.
+    pub source: String,
+    /// Why, in ohjaa's words: never the drafter's answer, never the words.
+    pub why: String,
+}
+
+/// What earlier runs did with each candidate: answered for (kept until no
+/// later run can find it again), or failed alone (kept until the drafter
+/// answers for it; set aside once it has failed `MAX_ATTEMPTS` times).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Handled {
+    answered: BTreeSet<Key>,
+    failing: BTreeMap<Key, Failing>,
+    /// This run sends the set-aside candidates again (`--retry-failed`):
+    /// until it is done drafting, they are not done with. Never kept.
+    retrying: bool,
+}
+
+impl Handled {
+    /// Done with: answered for, or set aside.
+    pub fn contains(&self, candidate: &Candidate) -> bool {
+        self.has(&candidate.key())
+    }
+
+    fn has(&self, key: &Key) -> bool {
+        self.answered.contains(key)
+            || (!self.retrying
+                && self
+                    .failing
+                    .get(key)
+                    .is_some_and(|f| f.attempts >= MAX_ATTEMPTS))
+    }
+
+    fn answer(&mut self, chunk: &[Candidate]) {
+        for candidate in chunk {
+            let key = candidate.key();
+            self.failing.remove(&key);
+            self.answered.insert(key);
+        }
+    }
+
+    /// One more failure of `candidate` alone.
+    fn fail(&mut self, candidate: &Candidate, why: String) -> Failing {
+        let failing = self.failing.entry(candidate.key()).or_insert(Failing {
+            attempts: 0,
+            source: candidate.source.to_owned(),
+            why: String::new(),
+        });
+        failing.attempts = failing.attempts.saturating_add(1);
+        failing.why = why;
+        failing.clone()
+    }
+
+    /// The candidates set aside: when, from where, and why.
+    pub fn set_aside(&self) -> impl Iterator<Item = (&Key, &Failing)> {
+        self.failing
+            .iter()
+            .filter(|(_, f)| f.attempts >= MAX_ATTEMPTS)
+    }
+
+    /// Send the set-aside candidates again in this run, from their records,
+    /// which stay until the drafter answers for them.
+    pub fn retry_failed(&mut self) {
+        self.retrying = true;
+    }
+
+    /// Drafting is done: a set-aside candidate the drafter failed on again
+    /// is set aside again.
+    pub fn done_retrying(&mut self) {
+        self.retrying = false;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.answered.is_empty() && self.failing.is_empty()
+    }
+
+    /// Forget answered keys that `keep` does not; a failure stays until the
+    /// drafter answers for it, so a retry can find it.
+    fn retain(&mut self, keep: impl Fn(&Key) -> bool) {
+        self.answered.retain(|key| keep(key));
+    }
+}
+
+/// What was found, once: duplicates dropped, oldest first. The order is the
+/// order of drafting.
+pub fn found(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|c| seen.insert((c.at_ms, c.text.clone())));
+    candidates.sort_by_key(|candidate| candidate.at_ms);
+    candidates
+}
+
+/// Why the drafter gave no drafts for a batch.
+#[derive(Debug)]
+pub enum Failure {
+    /// No answer at all: it could not be asked, or did not finish in time.
+    /// Splitting the batch would not help, so the run stops.
+    Silent(anyhow::Error),
+    /// It answered, but not with drafts (it failed, or said something else):
+    /// the batch may hold a candidate it cannot take, so it is split.
+    Refused(anyhow::Error),
+}
+
+/// Why, in ohjaa's words: the outermost message only (the drafter's answer
+/// and output stay out), on one short line.
+fn why(error: &anyhow::Error) -> String {
+    error
+        .to_string()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(120)
+        .collect()
+}
+
+/// What one run's drafting came to.
+#[derive(Debug, Default)]
+pub struct Drafted {
+    /// Candidates the drafter answered for in this run.
+    pub sent: usize,
+    /// The candidates it failed on alone in this run, as they stand now
+    /// (`MAX_ATTEMPTS` attempts: set aside).
+    pub failed: Vec<(Key, Failing)>,
+    /// Why the run stopped short of its cap, when it did.
+    pub stopped: Option<anyhow::Error>,
+}
+
+/// Draft from up to `cap` candidates of `found` not handled before, in order,
+/// `batch` at a time. Each batch the drafter answered for (`send`) becomes
+/// handled and is kept (`keep`) before the next is sent, so a failure loses
+/// nothing that came before it. A batch it refuses is split in two, and each
+/// half sent, down to the one candidate it fails on, whose failure is kept
+/// too: every run makes progress, even past a candidate the drafter never
+/// takes. Two candidates failing alone in a row look like a drafter that
+/// answers nothing, and stop the run.
+pub fn draft_pending(
+    found: &[Candidate],
+    handled: &mut Handled,
+    batch: usize,
+    cap: usize,
+    mut send: impl FnMut(&[Candidate]) -> Result<(), Failure>,
+    mut keep: impl FnMut(&Handled) -> Result<()>,
+) -> Drafted {
+    let pending: Vec<Candidate> = found
+        .iter()
+        .filter(|c| !handled.contains(c))
+        .take(cap)
+        .cloned()
+        .collect();
+    let mut work: std::collections::VecDeque<&[Candidate]> = pending.chunks(batch.max(1)).collect();
+    let mut drafted = Drafted::default();
+    let mut alone_in_a_row = 0;
+    while let Some(chunk) = work.pop_front() {
+        match send(chunk) {
+            Ok(()) => {
+                handled.answer(chunk);
+                drafted.sent += chunk.len();
+                alone_in_a_row = 0;
+            }
+            Err(Failure::Silent(error)) => {
+                drafted.stopped = Some(error);
+                break;
+            }
+            Err(Failure::Refused(_)) if chunk.len() > 1 => {
+                let (left, right) = chunk.split_at(chunk.len() / 2);
+                work.push_front(right);
+                work.push_front(left);
+                continue;
+            }
+            Err(Failure::Refused(error)) => {
+                let candidate = &chunk[0];
+                let failing = handled.fail(candidate, why(&error));
+                drafted.failed.push((candidate.key(), failing));
+                alone_in_a_row += 1;
+                if alone_in_a_row >= 2 {
+                    drafted.stopped =
+                        Some(error.context("the drafter failed on two candidates in a row, alone"));
+                }
+            }
+        }
+        if let Err(error) = keep(handled) {
+            drafted.stopped = Some(error.context("cannot keep intake's progress"));
+            break;
+        }
+        if drafted.stopped.is_some() {
+            break;
+        }
+    }
+    drafted
+}
+
+/// A session not yet drafted from, as one run sees it.
+#[derive(Debug, Clone)]
+pub struct Undrafted {
+    pub id: String,
+    pub started_ms: i64,
+    /// Its candidates among those found, when this run took it on (it has
+    /// ended, and the run reads transcripts). It brings them back to every
+    /// run until each is handled. `None` while it waits.
+    pub members: Option<Vec<Key>>,
+    /// The run read its whole window: only then is it drafted from.
+    pub whole: bool,
+}
+
+/// What a run leaves behind, once it has drafted what it could.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settled {
+    /// Where the cursor moves to, when it moves.
+    pub cursor: Option<i64>,
+    /// The sessions taken on every candidate of which is now handled.
+    pub drafted: Vec<String>,
+    /// Candidates found and not handled: the next run's work.
+    pub left: usize,
+}
+
+/// Where a run reads from: the person's `--since`, else the cursor, else
+/// `default_ms` back from `started`. A default window is also returned as the
+/// cursor to keep before anything is drafted, so that the next run's default
+/// does not slide past what this one did not reach, even if this one is
+/// killed.
+pub fn window_start(
+    explicit: Option<i64>,
+    cursor: Option<i64>,
+    started: i64,
+    default_ms: i64,
+) -> (i64, Option<i64>) {
+    match (explicit, cursor) {
+        (Some(since), _) => (since, None),
+        (None, Some(cursor)) => (cursor, None),
+        (None, None) => {
+            let since = started - default_ms;
+            (since, Some(since))
+        }
+    }
+}
+
+/// Where a run read from, and how.
+#[derive(Debug, Clone, Copy)]
+pub struct Window {
+    /// The start: the cursor or the person's `--since` (see `window_start`).
+    pub since: i64,
+    /// When the run started: the furthest the cursor can move.
+    pub started: i64,
+    /// Every source was read, and none with a warning. Only then may the
+    /// cursor move: it is one for all of them, and must not pass what a
+    /// source it skipped, or could not read, still holds.
+    pub complete: bool,
+}
+
+/// Settle a run, and forget what no later run can find again.
+///
+/// A queued session brings its own candidates back to every run until each
+/// is handled. Any other candidate comes back only while it lies after the
+/// cursor, so the first of them not handled holds the cursor: it moves past
+/// the handled candidates found after `since`, up to that one, or to
+/// `started` when none is left. It moves only after a complete run, and
+/// never to `since` or before. `sessions` is every session not yet drafted
+/// from, or `None` when the log could not be read; then nothing is
+/// forgotten.
+pub fn settle(
+    found: &[Candidate],
+    handled: &mut Handled,
+    sessions: Option<&[Undrafted]>,
+    window: Window,
+) -> Settled {
+    let Window {
+        since,
+        started,
+        complete,
+    } = window;
+    let returning: std::collections::HashSet<Key> = sessions
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| s.members.as_ref())
+        .flatten()
+        .copied()
+        .collect();
+    let first_held = found
+        .iter()
+        .filter(|c| !handled.contains(c) && !returning.contains(&c.key()))
+        .map(|c| c.at_ms)
+        .min();
+    let through = found
+        .iter()
+        .filter(|c| c.at_ms > since && handled.contains(c))
+        .filter(|c| first_held.is_none_or(|first| c.at_ms < first))
+        .map(|c| c.at_ms)
+        .max();
+    let cursor = match first_held {
+        _ if !complete => None,
+        None => Some(started),
+        Some(_) => through,
+    }
+    .map(|at| at.min(started))
+    .filter(|at| *at > since);
+    let drafted: Vec<String> = sessions
+        .unwrap_or_default()
+        .iter()
+        .filter(|s| {
+            s.whole
+                && s.members
+                    .as_ref()
+                    .is_some_and(|members| members.iter().all(|key| handled.answered.contains(key)))
+        })
+        .map(|s| s.id.clone())
+        .collect();
+    let left = found.iter().filter(|c| !handled.contains(c)).count();
+    // A key can come back only from a cursor source after the cursor, from a
+    // session not yet drafted from (never before it started), or from what
+    // this run found. Everything else is forgotten.
+    if let (Some(cursor), Some(sessions)) = (cursor, sessions) {
+        let floor = sessions
+            .iter()
+            .filter(|s| !drafted.contains(&s.id))
+            .map(|s| s.started_ms)
+            .min()
+            .unwrap_or(i64::MAX);
+        let seen: std::collections::HashSet<Key> = found.iter().map(Candidate::key).collect();
+        handled.retain(|key| key.at_ms > cursor || key.at_ms >= floor || seen.contains(key));
+    }
+    Settled {
+        cursor,
+        drafted,
+        left,
+    }
+}
+
+fn handled_path(dirs: &Dirs) -> PathBuf {
+    dirs.state.join("intake-handled")
+}
+
+/// The first line of `intake-handled`: what it is, and in which form. A
+/// change to how candidates are rendered changes their digests, so it comes
+/// with a new version, by choice.
+const HANDLED_HEADER: &str = "ohjaa intake-handled v1";
+
+/// What earlier runs handled. Damaged progress (empty, cut short, or not in
+/// this form) is an error, never read as less, which would send it again.
+pub fn read_handled(dirs: &Dirs) -> Result<Handled> {
+    let path = handled_path(dirs);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Handled::default()),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    parse_handled(&text).with_context(|| {
+        format!(
+            "{} is damaged; remove it to start over (what is still in the window is then sent \
+             again)",
+            path.display()
+        )
+    })
+}
+
+/// `HANDLED_HEADER`, one line per candidate (`<at_ms> <digest>`, or
+/// `<at_ms> <digest> failed <attempts> <source> <why>`), and `end <lines>`.
+fn parse_handled(text: &str) -> Result<Handled> {
+    let body = text
+        .strip_suffix('\n')
+        .context("it does not end with a whole line")?;
+    let mut lines = body.split('\n');
+    if lines.next() != Some(HANDLED_HEADER) {
+        bail!("it does not begin with `{HANDLED_HEADER}`");
+    }
+    let mut handled = Handled::default();
+    let (mut entries, mut end) = (0usize, None);
+    for line in lines {
+        if end.is_some() {
+            bail!("a line follows its end");
+        }
+        if let Some(count) = line.strip_prefix("end ") {
+            end = Some(
+                count
+                    .parse::<usize>()
+                    .ok()
+                    .context("its end line holds no count")?,
+            );
+            continue;
+        }
+        let (key, failing) =
+            handled_line(line).with_context(|| format!("`{line}` is not an entry"))?;
+        match failing {
+            None => handled.answered.insert(key),
+            Some(failing) => handled.failing.insert(key, failing).is_none(),
+        };
+        entries += 1;
+    }
+    match end {
+        Some(count) if count == entries => Ok(handled),
+        Some(count) => bail!("it ends saying {count} entries, and holds {entries}"),
+        None => bail!("it has no end line: it was cut short"),
+    }
+}
+
+fn handled_line(line: &str) -> Option<(Key, Option<Failing>)> {
+    let mut fields = line.splitn(3, ' ');
+    let at_ms = fields.next()?.parse().ok()?;
+    let digest = fields.next().filter(|d| {
+        d.len() == 16
+            && d.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })?;
+    let key = Key {
+        at_ms,
+        digest: u64::from_str_radix(digest, 16).ok()?,
+    };
+    let Some(rest) = fields.next() else {
+        return Some((key, None));
+    };
+    let mut fields = rest.splitn(4, ' ');
+    if fields.next()? != "failed" {
+        return None;
+    }
+    let attempts = fields.next()?.parse().ok().filter(|n| *n >= 1)?;
+    let source = fields.next().filter(|s| !s.is_empty())?.to_owned();
+    let why = fields.next().unwrap_or("").to_owned();
+    Some((
+        key,
+        Some(Failing {
+            attempts,
+            source,
+            why,
+        }),
+    ))
+}
+
+/// Keep what has been handled: whole or not at all. Nothing handled leaves
+/// no file.
+pub fn write_handled(dirs: &Dirs, handled: &Handled) -> Result<()> {
+    let path = handled_path(dirs);
+    if handled.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(error).with_context(|| format!("cannot remove {}", path.display()))
+            }
+            _ => Ok(()),
+        };
+    }
+    std::fs::create_dir_all(&dirs.state)?;
+    let mut text = format!("{HANDLED_HEADER}\n");
+    for key in &handled.answered {
+        let _ = writeln!(text, "{} {:016x}", key.at_ms, key.digest);
+    }
+    for (key, failing) in &handled.failing {
+        let _ = writeln!(
+            text,
+            "{} {:016x} failed {} {} {}",
+            key.at_ms, key.digest, failing.attempts, failing.source, failing.why
+        );
+    }
+    let _ = writeln!(
+        text,
+        "end {}",
+        handled.answered.len() + handled.failing.len()
+    );
+    replace_durably(&path, text.as_bytes())
+}
+
+/// Replace `path` whole: written aside and flushed to disk, renamed into
+/// place, and its folder flushed after, so neither a kill nor a power loss
+/// leaves part of it.
+fn replace_durably(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let partial = path.with_extension("partial");
+    let replace = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&partial)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&partial, path)?;
+        if let Some(folder) = path.parent() {
+            std::fs::File::open(folder)?.sync_all()?;
+        }
+        Ok(())
+    };
+    replace().with_context(|| format!("cannot write {}", path.display()))
 }
 
 #[cfg(test)]
@@ -1016,5 +1558,903 @@ mod tests {
             "an unreadable cursor is an error"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn handled_candidates_are_kept_by_digest_and_unreadable_progress_is_an_error() {
+        let root = std::env::temp_dir().join(format!("ohjaa-handled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dirs = Dirs {
+            ours_checkout: None,
+            repo_root: None,
+            mine: root.join("mine"),
+            machine: root.join("machine"),
+            proposals: root.join("proposals"),
+            state: root.clone(),
+        };
+        assert_eq!(read_handled(&dirs).unwrap(), Handled::default());
+        let said = |at_ms: i64, text: &str| Candidate {
+            source: "claude",
+            at_ms,
+            at: rfc3339(at_ms.div_euclid(1000)),
+            place: "/p".to_owned(),
+            who: "person".to_owned(),
+            context: String::new(),
+            text: text.to_owned(),
+        };
+        let mut handled = Handled::default();
+        handled.answered.insert(said(-5, "never python").key());
+        handled.answered.insert(said(7, "we have lima").key());
+        write_handled(&dirs, &handled).unwrap();
+        let kept = std::fs::read_to_string(root.join("intake-handled")).unwrap();
+        assert!(
+            !kept.contains("python") && !kept.contains("lima"),
+            "digests, never the words: {kept}"
+        );
+        assert_eq!(read_handled(&dirs).unwrap(), handled);
+        assert!(read_handled(&dirs)
+            .unwrap()
+            .contains(&said(7, "we have lima")));
+        assert!(!read_handled(&dirs)
+            .unwrap()
+            .contains(&said(8, "we have lima")));
+        std::fs::write(root.join("intake-handled"), "7 nothex\n").unwrap();
+        assert!(read_handled(&dirs).is_err(), "never a silent start over");
+        write_handled(&dirs, &Handled::default()).unwrap();
+        assert!(
+            !root.join("intake-handled").exists(),
+            "nothing handled, no file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_cursor_moves_only_past_what_was_handled_and_never_to_where_it_began() {
+        let c = |at_ms: i64, text: &str| Candidate {
+            source: "review",
+            at_ms,
+            at: rfc3339(at_ms.div_euclid(1000)),
+            place: "https://github.com/o/r/pull/1".to_owned(),
+            who: "person".to_owned(),
+            context: String::new(),
+            text: text.to_owned(),
+        };
+        let (old, a, b, z) = (c(3, "old"), c(10, "a"), c(20, "b"), c(30, "c"));
+        let settle_with = |found: &[Candidate],
+                           done: &[&Candidate],
+                           sessions: Option<&[Undrafted]>,
+                           since,
+                           complete| {
+            let mut handled = Handled::default();
+            handled.answered.extend(done.iter().map(|c| c.key()));
+            let window = Window {
+                since,
+                started: 100,
+                complete,
+            };
+            settle(found, &mut handled, sessions, window)
+        };
+        let found = [a.clone(), b.clone(), z.clone()];
+        // The first candidate not handled holds it.
+        let held = settle_with(&found, &[&a, &z], None, 5, true);
+        assert_eq!((held.cursor, held.left), (Some(10), 1));
+        // Nothing left: to where the run started, but only when every
+        // source was read; after a warning, or a run of some sources, it
+        // stays: it is one cursor for all of them.
+        assert_eq!(
+            settle_with(&found, &[&a, &b, &z], None, 5, true).cursor,
+            Some(100)
+        );
+        assert_eq!(
+            settle_with(&found, &[&a, &b, &z], None, 5, false).cursor,
+            None
+        );
+        // Nothing handled after `since`: it stays.
+        assert_eq!(settle_with(&found, &[], None, 5, true).cursor, None);
+        // An older candidate no session brings back holds it where it is...
+        let found = [old.clone(), a.clone()];
+        assert_eq!(settle_with(&found, &[&a], None, 5, true).cursor, None);
+        // ...and one a queued session brings back does not.
+        let queued = [Undrafted {
+            id: "oh-1".to_owned(),
+            started_ms: 1,
+            members: Some(vec![old.key()]),
+            whole: true,
+        }];
+        let settled = settle_with(&found, &[&a], Some(&queued), 5, true);
+        assert_eq!((settled.cursor, settled.drafted.len()), (Some(100), 0));
+        // A window that begins after the run started moves nothing.
+        assert_eq!(
+            settle_with(std::slice::from_ref(&a), &[&a], None, 200, true).cursor,
+            None
+        );
+        // Where a run reads from: `--since`, else the cursor, else the
+        // default window, which is kept as the cursor before drafting.
+        assert_eq!(window_start(Some(7), Some(9), 100, 50), (7, None));
+        assert_eq!(window_start(None, Some(9), 100, 50), (9, None));
+        assert_eq!(window_start(None, None, 100, 50), (50, Some(50)));
+    }
+
+    #[test]
+    fn damaged_progress_is_an_error_never_read_as_less() {
+        let root = std::env::temp_dir().join(format!("ohjaa-damaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dirs = Dirs {
+            ours_checkout: None,
+            repo_root: None,
+            mine: root.join("mine"),
+            machine: root.join("machine"),
+            proposals: root.join("proposals"),
+            state: root.clone(),
+        };
+        let said = |at_ms: i64, text: &str| Candidate {
+            source: "claude",
+            at_ms,
+            at: rfc3339(at_ms.div_euclid(1000)),
+            place: "/p".to_owned(),
+            who: "person".to_owned(),
+            context: String::new(),
+            text: text.to_owned(),
+        };
+        let mut handled = Handled::default();
+        for (at, text) in [(5, "a"), (-7, "b"), (1_793_000_000_123, "c")] {
+            handled.answered.insert(said(at, text).key());
+        }
+        write_handled(&dirs, &handled).unwrap();
+        let path = root.join("intake-handled");
+        let whole = std::fs::read(&path).unwrap();
+        assert_eq!(read_handled(&dirs).unwrap(), handled);
+        let read = |bytes: &[u8]| {
+            std::fs::write(&path, bytes).unwrap();
+            read_handled(&dirs)
+        };
+        // Nothing writes an empty file, so an empty one is damage.
+        assert!(read(b"").is_err(), "an empty file is not \"none handled\"");
+        // Cut anywhere (inside a digest, at a line boundary, inside the
+        // last line): damage, said out loud, never fewer keys read quietly.
+        for cut in 1..whole.len() {
+            assert!(
+                read(&whole[..cut]).is_err(),
+                "cut at {cut} read as progress: {:?}",
+                String::from_utf8_lossy(&whole[..cut])
+            );
+        }
+        // And what follows the end is damage too.
+        let mut longer = whole.clone();
+        longer.extend_from_slice(b"5 0000000000000000\n");
+        assert!(read(&longer).is_err(), "a line after the end");
+        // A digest is exactly 16 lowercase hex digits, even when the count
+        // agrees.
+        for line in [
+            "5 000000000000000",
+            "5 00000000000000000",
+            "5 000000000000000A",
+        ] {
+            let file = format!("{HANDLED_HEADER}\n{line}\nend 1\n");
+            assert!(read(file.as_bytes()).is_err(), "{line}");
+        }
+        let file =
+            format!("{HANDLED_HEADER}\n5 0123456789abcdef failed 2 review no JSON array\nend 1\n");
+        let failing = read(file.as_bytes()).unwrap();
+        assert_eq!(failing.failing.values().next().map(|f| f.attempts), Some(2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- the model: random queues, caps and failure points ---------------------
+
+    use std::collections::HashSet;
+
+    /// SplitMix64: a small deterministic generator, so a failing seed replays.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        /// In `0..n`.
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    struct ModelSession {
+        id: String,
+        repo: String,
+        started: i64,
+        ended: i64,
+        hands_over: bool,
+    }
+
+    impl ModelSession {
+        /// As the log has it at `now`: ended (with its handover, if any), or
+        /// still open.
+        fn at(&self, now: i64) -> crate::sessions::Session {
+            use crate::sessions::{Exit, Finished, Handover, Left, Session};
+            let ended = self.ended <= now;
+            Session {
+                id: self.id.clone(),
+                agent: "claude".to_owned(),
+                repo: self.repo.clone(),
+                outside_repo: false,
+                intent: "model".to_owned(),
+                started_ms: self.started,
+                branch: None,
+                head_at_start: None,
+                scoped: Vec::new(),
+                delivered: Vec::new(),
+                readback: None,
+                handover: (ended && self.hands_over).then(|| Handover {
+                    at_ms: self.ended,
+                    surprised: Some(format!("{} surprised", self.id)),
+                    ..Handover::default()
+                }),
+                left: ended.then(|| Left {
+                    exit: Exit::Code { code: 0 },
+                    orphaned: false,
+                    finished: Finished::NoPullRequest,
+                    ..Left::orphaned(self.ended)
+                }),
+                drafted: false,
+                usage: Vec::new(),
+                usage_refused: None,
+                intent_id: None,
+                task: None,
+                pgid: None,
+                group_started_ms: None,
+                validations: Vec::new(),
+            }
+        }
+    }
+
+    /// What there is to draft from: transcripts and reviews, each said at its
+    /// time, and sessions, some of whose windows lie before the first run.
+    struct World {
+        /// Where the first run's window starts.
+        since: i64,
+        /// How far back a run with no cursor reads (fourteen days, for
+        /// `ohjaa intake`): the first run is at `since + window`.
+        window: i64,
+        said: Vec<Candidate>,
+        sessions: Vec<ModelSession>,
+        /// What the report finds: each found by a run whose window holds the
+        /// first time (a commit landing, as `git log --since` sees it), and
+        /// dated by the second (its commit time), which may lie before the
+        /// window.
+        reported: Vec<(i64, Candidate)>,
+        /// Candidates the drafter never takes: it refuses any batch that
+        /// holds one (a refusal answered in prose).
+        poison: HashSet<Key>,
+        /// By then everything was said and every session ended.
+        end: i64,
+    }
+
+    fn said(source: &'static str, at_ms: i64, place: String, text: String) -> Candidate {
+        Candidate {
+            source,
+            at_ms,
+            at: rfc3339(at_ms.div_euclid(1000)),
+            place,
+            who: "person".to_owned(),
+            context: String::new(),
+            text,
+        }
+    }
+
+    fn world(rng: &mut Rng) -> World {
+        let since = 50_000;
+        let sessions: Vec<ModelSession> = (0..rng.below(4))
+            .map(|j| {
+                let started = rng.below(120_000) as i64;
+                ModelSession {
+                    id: format!("oh-{j}"),
+                    repo: format!("/r/s{j}"),
+                    started,
+                    ended: started + rng.below(40_000) as i64,
+                    hands_over: rng.chance(60),
+                }
+            })
+            .collect();
+        let mut out = Vec::new();
+        for session in &sessions {
+            for i in 0..rng.below(6) {
+                let at = session.started
+                    + rng.below((session.ended - session.started + 1) as u64) as i64;
+                let text = format!("{} said {i}", session.id);
+                out.push(said("claude", at, format!("{}/src", session.repo), text));
+            }
+        }
+        for i in 0..rng.below(30) {
+            // Coarse times, now and then, so candidates share a millisecond.
+            let at = if rng.chance(30) {
+                rng.below(20) as i64 * 10_000
+            } else {
+                rng.below(200_000) as i64
+            };
+            let (source, place) = match rng.below(3) {
+                0 => ("review", "https://github.com/o/r/pull/1".to_owned()),
+                1 if !sessions.is_empty() => {
+                    let session = &sessions[rng.below(sessions.len() as u64) as usize];
+                    ("claude", session.repo.clone())
+                }
+                _ => ("codex", "/r/elsewhere".to_owned()),
+            };
+            out.push(said(source, at, place, format!("said {i}")));
+        }
+        // The same words at the same time, from two sources: one candidate.
+        if let Some(first) = out.first().cloned() {
+            if rng.chance(30) {
+                out.push(Candidate {
+                    source: "review",
+                    ..first
+                });
+            }
+        }
+        let reported: Vec<(i64, Candidate)> = (0..rng.below(6))
+            .map(|i| {
+                let at = rng.below(200_000) as i64;
+                let landed = at + rng.below(60_000) as i64;
+                let text = format!("unproven {i}");
+                (landed, said("observed", at, "/r/x".to_owned(), text))
+            })
+            .collect();
+        let end = out
+            .iter()
+            .map(|c| c.at_ms)
+            .chain(reported.iter().map(|(landed, _)| *landed))
+            .chain(sessions.iter().map(|s| s.ended))
+            .max()
+            .unwrap_or(0);
+        let poison = if out.is_empty() || !rng.chance(30) {
+            HashSet::new()
+        } else {
+            (0..1 + rng.below(3))
+                .map(|_| out[rng.below(out.len() as u64) as usize].key())
+                .collect()
+        };
+        World {
+            since,
+            window: 1 + rng.below(40_000) as i64,
+            said: out,
+            sessions,
+            reported,
+            poison,
+            end,
+        }
+    }
+
+    #[derive(Default)]
+    struct State {
+        cursor: Option<i64>,
+        handled: Handled,
+        drafted: HashSet<String>,
+    }
+
+    /// What the model saw, across runs.
+    #[derive(Default)]
+    struct Seen {
+        /// Every candidate whose answer was kept.
+        kept: HashSet<Key>,
+        /// Every candidate set aside, as kept.
+        aside: HashSet<Key>,
+        /// How often each candidate was refused alone.
+        alone: std::collections::HashMap<Key, u8>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Fail {
+        None,
+        /// The drafter refuses this send (1-based), and only this one.
+        Once(usize),
+        /// It refuses every send from this one on: it answers nothing.
+        Outage(usize),
+        /// This send gets no answer at all (it did not finish in time).
+        Silent(usize),
+        /// Killed after this batch was answered, before it was kept.
+        Killed(usize),
+    }
+
+    struct Plan {
+        cap: usize,
+        batch: usize,
+        /// Every source read, none with a warning.
+        complete: bool,
+        /// Every transcript read: each session's whole window.
+        whole: bool,
+        fail: Fail,
+        /// `--retry-failed`.
+        retry: bool,
+        /// The drafter still refuses the world's poison candidates.
+        poisoned: bool,
+    }
+
+    struct Ran {
+        /// Found and not handled when the run began.
+        before: usize,
+        sent: usize,
+        /// Found and not handled when it ended; `None` when it was killed.
+        after: Option<usize>,
+        /// The work left before and after: each candidate not handled
+        /// weighs one more than the failures it has left before it is set
+        /// aside.
+        work: (usize, usize),
+    }
+
+    fn work(found: &[Candidate], handled: &Handled) -> usize {
+        found
+            .iter()
+            .filter(|c| !handled.contains(c))
+            .map(|c| {
+                let attempts = handled.failing.get(&c.key()).map_or(0, |f| f.attempts);
+                usize::from((MAX_ATTEMPTS + 1).saturating_sub(attempts).max(1))
+            })
+            .sum()
+    }
+
+    /// One `ohjaa intake` at `now`, as `cmd_intake` runs it: the same
+    /// gathering, then the same calls. Asserts that nothing kept or set aside
+    /// is ever sent again and that the cursor never goes before the run's
+    /// window.
+    fn run(world: &World, state: &mut State, now: i64, plan: &Plan, seen: &mut Seen) -> Ran {
+        // With no cursor yet, the default window, which slides with time
+        // unless it is kept.
+        let (since, keep) = window_start(None, state.cursor, now, world.window);
+        state.cursor = state.cursor.max(keep);
+        let undrafted: Vec<crate::sessions::Session> = world
+            .sessions
+            .iter()
+            .filter(|s| !state.drafted.contains(&s.id))
+            .map(|s| s.at(now))
+            .collect();
+        let queued: Vec<_> = undrafted
+            .iter()
+            .filter(|s| s.left.is_some())
+            .cloned()
+            .collect();
+        let from = queued
+            .iter()
+            .map(|s| s.started_ms - 1)
+            .min()
+            .map_or(since, |earliest| earliest.min(since));
+        let visible = || world.said.iter().filter(|c| c.at_ms <= now);
+        // Not `whole`: the transcript that could not be read is a session's.
+        let sessions_now: Vec<_> = world.sessions.iter().map(|s| s.at(now)).collect();
+        let readable = |c: &&Candidate| plan.whole || !sessions_now.iter().any(|s| in_window(c, s));
+        let (new, older): (Vec<_>, Vec<_>) = visible()
+            .filter(|c| c.source != "review" && c.at_ms > from)
+            .filter(readable)
+            .cloned()
+            .partition(|c| c.at_ms > since);
+        let mut candidates = new;
+        candidates.extend(within_sessions(older, &queued));
+        candidates.extend(
+            visible()
+                .filter(|c| c.source == "review" && c.at_ms > since)
+                .cloned(),
+        );
+        candidates.extend(
+            world
+                .reported
+                .iter()
+                .filter(|(landed, _)| *landed > since && *landed <= now)
+                .map(|(_, c)| c.clone()),
+        );
+        candidates.extend(handover_candidates(&queued));
+        candidates.extend(observed_candidates(&queued));
+        // A retry reads back to the oldest candidate set aside, for those
+        // alone, as `cmd_intake` does.
+        let retry: HashSet<Key> = if plan.retry {
+            state.handled.set_aside().map(|(key, _)| *key).collect()
+        } else {
+            HashSet::new()
+        };
+        if let Some(floor) = retry
+            .iter()
+            .map(|key| key.at_ms - 1)
+            .min()
+            .filter(|floor| *floor < since)
+        {
+            candidates.extend(
+                visible()
+                    .filter(|c| c.at_ms > floor && retry.contains(&c.key()))
+                    .cloned(),
+            );
+            candidates.extend(
+                world
+                    .reported
+                    .iter()
+                    .filter(|(landed, c)| {
+                        *landed > floor && *landed <= now && retry.contains(&c.key())
+                    })
+                    .map(|(_, c)| c.clone()),
+            );
+        }
+        let found = found(candidates);
+
+        let mut handled = state.handled.clone();
+        if plan.retry {
+            handled.retry_failed();
+        }
+        let before = found.iter().filter(|c| !handled.contains(c)).count();
+        let work_before = work(&found, &state.handled);
+        let mut durable = handled.clone();
+        let (mut sends, mut keeps, mut killed) = (0, 0, false);
+        let (kept, aside, alone) = (&seen.kept, &seen.aside, &mut seen.alone);
+        let drafted = draft_pending(
+            &found,
+            &mut handled,
+            plan.batch,
+            plan.cap,
+            |chunk| {
+                sends += 1;
+                for c in chunk {
+                    assert!(
+                        !kept.contains(&c.key()),
+                        "`{}` sent after it was kept",
+                        c.text
+                    );
+                    assert!(
+                        plan.retry || !aside.contains(&c.key()),
+                        "`{}` sent after it was set aside",
+                        c.text
+                    );
+                }
+                if matches!(plan.fail, Fail::Silent(n) if n == sends) {
+                    return Err(Failure::Silent(anyhow!("did not finish in time")));
+                }
+                let refused = match plan.fail {
+                    Fail::Once(n) => n == sends,
+                    Fail::Outage(n) => sends >= n,
+                    _ => false,
+                } || (plan.poisoned
+                    && chunk.iter().any(|c| world.poison.contains(&c.key())));
+                if refused {
+                    if let [one] = chunk {
+                        *alone.entry(one.key()).or_default() += 1;
+                    }
+                    return Err(Failure::Refused(anyhow!("no JSON array")));
+                }
+                Ok(())
+            },
+            |handled| {
+                keeps += 1;
+                if matches!(plan.fail, Fail::Killed(n) if n == keeps) {
+                    killed = true;
+                    bail!("killed");
+                }
+                durable = handled.clone();
+                Ok(())
+            },
+        );
+        seen.kept.extend(durable.answered.iter().copied());
+        seen.aside.extend(durable.set_aside().map(|(key, _)| *key));
+        if killed {
+            // Only what was kept survives the kill.
+            durable.done_retrying();
+            state.handled = durable;
+            return Ran {
+                before,
+                sent: drafted.sent,
+                after: None,
+                work: (work_before, work(&found, &state.handled)),
+            };
+        }
+        assert_eq!(
+            durable, handled,
+            "every answer and every failure alone was kept before the next send"
+        );
+        handled.done_retrying();
+        let taken = before.min(plan.cap);
+        let failed = drafted.failed.len();
+        if matches!(plan.fail, Fail::None | Fail::Once(_)) {
+            // Each candidate taken was answered for or failed alone, unless
+            // two failed alone in a row (and the run stopped).
+            assert!(
+                drafted.stopped.is_some() || drafted.sent + failed == taken,
+                "{} answered and {failed} failed of {taken}",
+                drafted.sent
+            );
+            assert!(taken == 0 || drafted.sent + failed >= 1, "no progress");
+        }
+
+        let sessions: Vec<Undrafted> = undrafted
+            .iter()
+            .map(|s| Undrafted {
+                id: s.id.clone(),
+                started_ms: s.started_ms,
+                members: s.left.is_some().then(|| members(s, &found)),
+                whole: plan.whole,
+            })
+            .collect();
+        let window = Window {
+            since,
+            started: now,
+            complete: plan.complete,
+        };
+        let settled = settle(&found, &mut handled, Some(&sessions), window);
+        assert!(
+            settled
+                .cursor
+                .is_none_or(|cursor| cursor > since && cursor <= now),
+            "the cursor {:?} is outside ({since}, {now}]",
+            settled.cursor
+        );
+        assert!(
+            plan.complete || settled.cursor.is_none(),
+            "it moved after a partial run"
+        );
+        let newly_aside = drafted
+            .failed
+            .iter()
+            .filter(|(_, f)| f.attempts >= MAX_ATTEMPTS)
+            .count();
+        assert_eq!(
+            settled.left,
+            before - drafted.sent - newly_aside,
+            "what was drafted, or set aside, is no longer left"
+        );
+        let work_after = work(&found, &handled);
+        // `write_cursor`: forward only.
+        state.cursor = state.cursor.max(settled.cursor);
+        state.drafted.extend(settled.drafted);
+        state.handled = handled;
+        Ran {
+            before,
+            sent: drafted.sent,
+            after: Some(settled.left),
+            work: (work_before, work_after),
+        }
+    }
+
+    #[test]
+    fn model_every_run_makes_progress_and_repeated_runs_drain_the_queue() {
+        for seed in 0..3_000 {
+            let mut rng = Rng(seed);
+            let world = world(&mut rng);
+            let mut state = State::default();
+            let mut seen = Seen::default();
+            let mut cursors = Vec::new();
+            let mut now = world.since + world.window;
+            // While the world changes: runs at random times, with random caps,
+            // partial runs and warnings, refusals, outages, silences and kills.
+            loop {
+                // A transcript that cannot be read is a warning too.
+                let whole = !rng.chance(10);
+                let plan = Plan {
+                    cap: 1 + rng.below(6) as usize,
+                    batch: 1 + rng.below(3) as usize,
+                    complete: whole && !rng.chance(15),
+                    whole,
+                    fail: match rng.below(20) {
+                        0 | 1 => Fail::Once(1 + rng.below(4) as usize),
+                        2 => Fail::Outage(1 + rng.below(3) as usize),
+                        3 => Fail::Silent(1 + rng.below(3) as usize),
+                        4 | 5 => Fail::Killed(1 + rng.below(3) as usize),
+                        _ => Fail::None,
+                    },
+                    retry: false,
+                    poisoned: true,
+                };
+                run(&world, &mut state, now, &plan, &mut seen);
+                cursors.push(state.cursor);
+                if now >= world.end {
+                    break;
+                }
+                now += 1 + rng.below(30_000) as i64;
+            }
+            // Then the world stands still: every run strictly reduces the work
+            // left, even past a candidate the drafter never takes, until one
+            // reports that nothing is left.
+            let mut runs = 0;
+            loop {
+                now += 1_000;
+                let plan = Plan {
+                    cap: 1 + rng.below(3) as usize,
+                    batch: 1 + rng.below(4) as usize,
+                    complete: true,
+                    whole: true,
+                    fail: Fail::None,
+                    retry: false,
+                    poisoned: true,
+                };
+                let ran = run(&world, &mut state, now, &plan, &mut seen);
+                cursors.push(state.cursor);
+                if ran.before == 0 {
+                    assert_eq!((ran.sent, ran.after), (0, Some(0)), "seed {seed}");
+                    break;
+                }
+                assert!(ran.work.1 < ran.work.0, "seed {seed}: no progress");
+                runs += 1;
+                assert!(runs < 500, "seed {seed}: the queue never drained");
+            }
+            assert!(
+                cursors.windows(2).all(|pair| pair[0] <= pair[1]),
+                "seed {seed}: the cursor moved back: {cursors:?}"
+            );
+            // Every session was drafted from but those holding a candidate set
+            // aside, which stay queued so that a retry finds it; and every
+            // candidate there was to draft from was drafted from or set aside,
+            // never both: those said after the first window began, and every
+            // session's own.
+            let holding: HashSet<&str> = world
+                .sessions
+                .iter()
+                .filter(|s| {
+                    members(&s.at(world.end), &world.said)
+                        .iter()
+                        .any(|key| seen.aside.contains(key))
+                })
+                .map(|s| s.id.as_str())
+                .collect();
+            assert!(
+                holding.iter().all(|id| !state.drafted.contains(*id)),
+                "seed {seed}: drafted while holding one set aside"
+            );
+            assert_eq!(
+                state.drafted.len() + holding.len(),
+                world.sessions.len(),
+                "seed {seed}"
+            );
+            let mut owed: HashSet<Key> = world
+                .said
+                .iter()
+                .filter(|c| c.at_ms > world.since)
+                .map(Candidate::key)
+                .collect();
+            owed.extend(
+                world
+                    .reported
+                    .iter()
+                    .filter(|(landed, _)| *landed > world.since)
+                    .map(|(_, c)| c.key()),
+            );
+            for session in &world.sessions {
+                owed.extend(members(&session.at(world.end), &world.said));
+            }
+            let done: HashSet<Key> = seen.kept.union(&seen.aside).copied().collect();
+            assert_eq!(
+                done, owed,
+                "seed {seed}: drafted from exactly what was owed"
+            );
+            assert!(seen.kept.is_disjoint(&seen.aside), "seed {seed}");
+            // Set aside: every candidate the drafter never takes, and only
+            // after it failed alone that often.
+            for key in world.poison.intersection(&owed) {
+                assert!(
+                    seen.aside.contains(key),
+                    "seed {seed}: poison not set aside"
+                );
+            }
+            for key in &seen.aside {
+                assert!(
+                    seen.alone[key] >= MAX_ATTEMPTS,
+                    "seed {seed}: set aside early"
+                );
+            }
+            // One more run: nothing to draft, and nothing left kept that no
+            // run could find again.
+            now += 1_000;
+            let plan = Plan {
+                cap: 1,
+                batch: 1,
+                complete: true,
+                whole: true,
+                fail: Fail::None,
+                retry: false,
+                poisoned: true,
+            };
+            let ran = run(&world, &mut state, now, &plan, &mut seen);
+            assert_eq!((ran.before, ran.sent), (0, 0), "seed {seed}");
+            // Kept: what is set aside, until the drafter answers, and what a
+            // session still queued may bring back (not before it started).
+            let floor = world
+                .sessions
+                .iter()
+                .filter(|s| holding.contains(s.id.as_str()))
+                .map(|s| s.started)
+                .min()
+                .unwrap_or(i64::MAX);
+            assert!(
+                state.handled.answered.iter().all(|key| key.at_ms >= floor),
+                "seed {seed}"
+            );
+            assert_eq!(state.handled.failing.len(), seen.aside.len(), "seed {seed}");
+            // Then the drafter takes them: one `--retry-failed` sends every one
+            // set aside again, however far the cursor has moved past it, and
+            // the sessions holding them are drafted from at last.
+            now += 1_000;
+            let retry = Plan {
+                cap: 10_000,
+                batch: 1 + rng.below(4) as usize,
+                complete: true,
+                whole: true,
+                fail: Fail::None,
+                retry: true,
+                poisoned: false,
+            };
+            let ran = run(&world, &mut state, now, &retry, &mut seen);
+            assert_eq!(
+                ran.sent,
+                seen.aside.len(),
+                "seed {seed}: not all sent again"
+            );
+            assert_eq!(state.handled.set_aside().count(), 0, "seed {seed}");
+            assert_eq!(state.drafted.len(), world.sessions.len(), "seed {seed}");
+            assert!(seen.aside.is_subset(&seen.kept), "seed {seed}");
+            now += 1_000;
+            let ran = run(&world, &mut state, now, &plan, &mut seen);
+            assert_eq!((ran.before, ran.sent), (0, 0), "seed {seed}");
+            assert!(state.handled.is_empty(), "seed {seed}: {:?}", state.handled);
+        }
+    }
+
+    #[test]
+    fn the_audits_queue_drains_in_four_runs_of_four_hundred() {
+        // The 2026-10-26 audit, in the model: 486 old candidates of 65 queued
+        // sessions and 842 new ones, with the default cap of 400.
+        let mut out = Vec::new();
+        let sessions: Vec<ModelSession> = (0..65)
+            .map(|j| ModelSession {
+                id: format!("oh-{j}"),
+                repo: format!("/r/s{j}"),
+                started: j * 1_000,
+                ended: j * 1_000 + 900,
+                hands_over: true,
+            })
+            .collect();
+        for (i, session) in sessions.iter().enumerate() {
+            for k in 0..(if i < 31 { 7 } else { 6 }) {
+                let text = format!("{} said {k}", session.id);
+                out.push(said(
+                    "claude",
+                    session.started + k,
+                    session.repo.clone(),
+                    text,
+                ));
+            }
+        }
+        for i in 0..842 {
+            out.push(said(
+                "codex",
+                100_000 + i,
+                "/r/elsewhere".to_owned(),
+                format!("new {i}"),
+            ));
+        }
+        let world = World {
+            since: 99_999,
+            window: 100_002,
+            said: out,
+            sessions,
+            reported: Vec::new(),
+            poison: HashSet::new(),
+            end: 100_000 + 842,
+        };
+        let mut state = State::default();
+        let mut seen = Seen::default();
+        let plan = Plan {
+            cap: 400,
+            batch: 40,
+            complete: true,
+            whole: true,
+            fail: Fail::None,
+            retry: false,
+            poisoned: true,
+        };
+        let mut lefts = Vec::new();
+        for run_number in 1..=5 {
+            let ran = run(&world, &mut state, 200_000 + run_number, &plan, &mut seen);
+            lefts.push(ran.after.unwrap());
+        }
+        assert_eq!(lefts, [1328 - 400, 528, 128, 0, 0]);
+        assert_eq!(state.drafted.len(), 65);
     }
 }

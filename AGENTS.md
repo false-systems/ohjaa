@@ -38,9 +38,16 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   cargo target dir that checkout builds in, and copies of its runs'
   receipts), the lock that lets one ohjaa at a time ask for a clone's
   validation, and the gates derived from commits that a run outliving its
-  ohjaa names (`derived/<digest>/`). Everything
-  else — fleet, perimeter, coverage, marks — is derived now and stored never. No
-  knowledge index, no cache, no daemon.
+  ohjaa names (`derived/<digest>/`). It also holds intake's cursor
+  (`intake-since`), intake's progress (`intake-handled`: a version line; per
+  candidate the drafter answered for or failed on, its time and a digest of
+  its words, never the words, and for a failure how often and why in ohjaa's
+  words, kept until the drafter answers for it; an end line with the count),
+  the lock that lets one intake run at a time (`intake.lock`), and the
+  report's two times (`report-at`, `report-shown-at`). Deleting them loses no
+  knowledge: intake then reads its default window again, and sends once more
+  what is still in it. Everything else — fleet, perimeter, coverage, marks —
+  is derived now and stored never. No knowledge index, no cache, no daemon.
 - **The workflow lives in the home, outside every repository.**
   `~/.config/ohjaa` holds each repository's entry (`repos/<owner>/<repo>/`:
   `repo.toml`, the branch ohjaa observes and the env its gate gives cargo
