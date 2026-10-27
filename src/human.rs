@@ -2225,6 +2225,45 @@ mod tests {
         assert!(after(&view, &seen.full_from(NOW + HOUR_MS)).is_empty());
     }
 
+    /// Review of #67, finding 1: a pull request at the very end of a
+    /// digest's GitHub stretch (merged in the second GitHub was read, or
+    /// while its search ran) is said by that digest and not by the next.
+    #[test]
+    fn a_pull_request_at_the_end_of_a_digests_stretch_is_said_once() {
+        // Read at 700 ms into the second #79 merged in; #78 merged while
+        // the search ran, two seconds after the read began.
+        let mut read = snapshot(NOW + 700);
+        read.github.value = vec![pr(79, HOUR_MS, Some(0)), pr(78, HOUR_MS, Some(-2_000))];
+        let shown = build(&[], Ok(Vec::new()), Some(&read), NOW + 5_000, 0);
+        let keys = |view: &View, from: &Window| -> Vec<String> {
+            after(view, from)
+                .iter()
+                .map(|item| item.key.clone())
+                .collect()
+        };
+        assert_eq!(
+            keys(&shown, &Window::at(NOW - DAY_MS)),
+            vec![
+                "pr:false-systems/sykli#78:merged",
+                "pr:false-systems/sykli#79:merged"
+            ]
+        );
+        let seen = advance(
+            &shown,
+            &Seen::first(NOW + 5_000),
+            Some(&read),
+            NOW + 5_000,
+            Shown::Full,
+            "d",
+        );
+        let mut later = read.clone();
+        later.at_ms = NOW + HOUR_MS;
+        later.github.as_of_ms = Some(NOW + HOUR_MS);
+        let view = build(&[], Ok(Vec::new()), Some(&later), NOW + HOUR_MS, 0);
+        assert!(keys(&view, &seen.full_from(NOW + HOUR_MS)).is_empty());
+        assert!(keys(&view, &seen.daily_from(NOW + HOUR_MS)).is_empty());
+    }
+
     /// Second review of #63, a nit: a source is said in the line for each
     /// failure, not once while the first stands; the same failure with its
     /// numbers moved (a count, a time) is the same.

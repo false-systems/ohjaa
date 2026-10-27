@@ -2281,8 +2281,10 @@ mod tests {
         assert_eq!(json["schema"], "ohjaa-marks.v1");
         assert_eq!(
             keys(&json),
-            "complete,entries,generated,proposals,report,schema,sessions"
+            "complete,entries,generated,proposals,report,schema,sessions,unlisted"
         );
+        // Additive (review of #67): why no entry is listed, when none is.
+        assert_eq!(json["unlisted"], Value::Null);
         let entry = &json["entries"][0];
         assert_eq!(
             keys(entry),
@@ -2391,6 +2393,25 @@ mod tests {
         assert_eq!(keys(&marks_only), keys(&json));
         assert_eq!(marks_only["report"], Value::Null);
         assert_eq!(marks_only["entries"], json["entries"]);
+    }
+
+    /// Review of #67, finding 3: when the entries cannot be listed, the
+    /// marks say why in their own key, beside no entry and `complete` false.
+    #[test]
+    fn the_marks_json_says_why_no_entry_is_listed() {
+        let why = "the entries cannot be listed: cannot read /h/repos/acme";
+        let mut report = sample(Ok(Natives::default()));
+        report.unlisted = Some(why.to_owned());
+        report.gaps.push(why.to_owned());
+        let json = to_json(&report);
+        assert_eq!(json["unlisted"], why);
+        assert_eq!(json["entries"], json!([]));
+        assert_eq!(json["complete"], false);
+        // `--marks`: never "no repository has an entry" then.
+        report.window = false;
+        let text = render(&report);
+        assert!(text.contains(&format!("- none marked: {why}")), "{text}");
+        assert!(!text.contains("no repository has an entry"), "{text}");
     }
 
     #[test]

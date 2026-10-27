@@ -9678,9 +9678,25 @@ fn a_branch_stays_as_last_read_when_the_entries_cannot_be_listed() {
     let owner = fixture.dir.join("config/ohjaa/repos/false-systems");
     fs::set_permissions(&owner, fs::Permissions::from_mode(0o000)).unwrap();
     let unlisted = output_of(fixture.person().arg("collect"));
+    let marks = output_of(fixture.person().args(["report", "--json", "--marks"]));
     fs::set_permissions(&owner, fs::Permissions::from_mode(0o755)).unwrap();
     let (stdout, stderr, code) = unlisted;
     assert_eq!(code, Some(4), "{stdout}{stderr}");
+    // Review of #67, finding 3: `ohjaa-marks.v1` says why no entry is
+    // listed, in its own key.
+    let (stdout, stderr, code) = marks;
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        (&json["complete"], &json["entries"]),
+        (&serde_json::json!(false), &serde_json::json!([]))
+    );
+    assert!(
+        json["unlisted"]
+            .as_str()
+            .is_some_and(|why| why.starts_with("the entries cannot be listed: cannot read")),
+        "{stdout}"
+    );
     let snapshot = fs::read_to_string(fixture.human_dir().join("collected.json")).unwrap();
     assert!(!snapshot.contains("(entries)"), "{snapshot}");
     let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
@@ -9787,6 +9803,9 @@ fn a_pull_request_github_indexes_late_is_in_the_next_digest_once() {
     }
     let fixture = Fixture::new("human-late");
     fixture.human_view(false);
+    // Review of #67, finding 2: a second or more between writing GitHub's
+    // answer and reading it moves no pull request across the overlap's edge.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     output_of(fixture.person().arg("collect"));
     let (first, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
     assert!(first.contains("#76 merged by yairfalse"), "{first}");
