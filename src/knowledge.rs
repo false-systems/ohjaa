@@ -1475,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn repo_proposals_wait_per_repository_and_land_in_it() {
+    fn repo_proposals_wait_per_repository_and_land_in_ohjaas_state_not_in_it() {
         let sandbox = Sandbox::new("repo");
         let elsewhere = sandbox.root.join("other repo%x");
         let mut proposal = sandbox.proposal(Scope::Repo, "uploader-owner");
@@ -1485,11 +1485,30 @@ mod tests {
         assert_eq!(waiting[0].repo.as_deref(), Some(elsewhere.as_path()));
 
         let outcome = accept(&sandbox.dirs, "uploader-owner", date("2026-09-24")).unwrap();
-        assert_eq!(
-            outcome.written,
-            vec![repo_knowledge(&elsewhere).join("uploader-owner.md")]
+        assert_eq!(outcome.written.len(), 1, "{:?}", outcome.written);
+        let written = &outcome.written[0];
+        assert!(
+            written.starts_with(sandbox.dirs.state.join("lessons")),
+            "kept in ohjaa's state until it reaches the repository's AGENTS.md: {}",
+            written.display()
         );
-        assert_eq!(outcome.review_in, vec![elsewhere]);
+        assert!(written.ends_with("uploader-owner.md"));
+        assert!(
+            !repo_knowledge(&elsewhere).exists() && !elsewhere.exists(),
+            "nothing is written into the repository"
+        );
+        assert!(
+            outcome.review_in.is_empty(),
+            "ohjaa opens the pull request itself"
+        );
+        // That repository's knowledge has it, current.
+        let mut there = sandbox.dirs.clone();
+        there.repo_root = Some(elsewhere.clone());
+        let loaded = load(&there).unwrap();
+        assert_eq!(
+            loaded.get("uploader-owner").unwrap().node.status,
+            Status::Current
+        );
     }
 
     #[test]
