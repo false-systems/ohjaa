@@ -67,7 +67,7 @@ fn parse_context(repo: &Path, stdout: &str) -> Option<Tool> {
     Some(Tool {
         path: repo.to_path_buf(),
         name: repo_section.name,
-        role: Some(repo_section.role).filter(|role| !role.is_empty()),
+        role: repo_section.role.filter(|role| !role.is_empty()),
         not: repo_section.not_roles,
     })
 }
@@ -80,8 +80,9 @@ struct ContextPayload {
 #[derive(Debug, Deserialize)]
 struct RepoSection {
     name: String,
+    /// toimija writes `null` for a repo.yaml that declares no role.
     #[serde(default)]
-    role: String,
+    role: Option<String>,
     #[serde(default)]
     not_roles: Vec<String>,
 }
