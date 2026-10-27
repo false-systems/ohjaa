@@ -230,9 +230,13 @@ fn git_available() -> bool {
 }
 
 fn make_executable(path: &Path) {
+    make_mode(path, 0o755);
+}
+
+fn make_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
+    permissions.set_mode(mode);
     fs::set_permissions(path, permissions).unwrap();
 }
 
@@ -434,9 +438,43 @@ impl Fixture {
         .unwrap();
     }
 
+    /// A current node as of `as_of`, as [`Fixture::node`] writes one.
+    fn node_as_of(&self, dir: &Path, id: &str, kind: &str, as_of: &str, body: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join(format!("{id}.md")),
+            format!(
+                "+++\nid = \"{id}\"\nkind = \"{kind}\"\nstatus = \"current\"\n\
+                 as_of = {as_of}\norigin = [\"a test\"]\n+++\n{body}\n"
+            ),
+        )
+        .unwrap();
+    }
+
     fn cleanup(self) {
         fs::remove_dir_all(self.dir).ok();
     }
+}
+
+/// What opens every knowledge section of a briefing.
+const KNOWLEDGE_PREAMBLE: &str =
+    "Knowledge (ohjaa, knowledge-node.v1): what the people you work for know and\n\
+     have decided, as of the date on each entry. Follow it. If an entry looks\n\
+     wrong or stale, say so instead of quietly working around it. Propose new\n\
+     knowledge with `ohjaa propose`; only a person makes it current.\n";
+
+/// The block `ohjaa apply` writes into an agent's own instruction file,
+/// holding these lines.
+fn applied_block(lines: &[&str]) -> String {
+    format!(
+        "<!-- ohjaa:knowledge begin: mine and machine, written by `ohjaa apply` and after each \
+         decision, removed by `ohjaa apply --undo`; edit the nodes (`ohjaa list`), not this \
+         block -->\nKnowledge (ohjaa, mine and machine): what the person you work for has \
+         decided and knows. Follow it; if an entry looks wrong or stale, say so instead of \
+         quietly working around it. Propose changes with `ohjaa propose`; only a person makes \
+         them current.\n{}\n<!-- ohjaa:knowledge end -->\n",
+        lines.join("\n")
+    )
 }
 
 #[test]
@@ -1062,6 +1100,328 @@ fn the_briefing_orders_knowledge_by_scope_then_kind() {
     .collect();
     assert!(order.windows(2).all(|w| w[0] < w[1]), "{stdout}");
     assert!(stdout.contains("(rust · as of 2026-09-20)"), "{stdout}");
+    fixture.cleanup();
+}
+
+/// Over its budget the briefing degrades: every decision in full, then
+/// taste, lesson and fact, each newest first, while they fit with the count
+/// of the rest, then that count. One node over: only the oldest fact goes.
+#[test]
+fn the_briefing_keeps_every_decision_then_fills_its_budget_by_priority() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("briefing-budget");
+    let repo = fixture.make_git_repo("work");
+    let (ours, mine, machine) = (
+        fixture.dir.join("ours/knowledge"),
+        fixture.dir.join("config/ohjaa/mine"),
+        fixture.dir.join("config/ohjaa/machine"),
+    );
+    let long = |sentence: &str, times: usize| sentence.repeat(times).trim_end().to_owned();
+    let (small, answer, menu, vm, lima) = (
+        long("Keep it small. ", 115),
+        long("Answer first. ", 125),
+        long("A menu is stopping. ", 86),
+        long("The VM empties its tmp. ", 72),
+        long("Lima is here. ", 125),
+    );
+    fixture.node(&ours, "team", "decision", "Team rule.");
+    fixture.node(&mine, "rust", "decision", "Rust only.");
+    fixture.node_as_of(&mine, "small", "taste", "2026-09-20", &small);
+    fixture.node_as_of(&mine, "answer", "taste", "2026-09-10", &answer);
+    fixture.node_as_of(&mine, "menu", "lesson", "2026-09-20", &menu);
+    fixture.node_as_of(&machine, "vm", "fact", "2026-09-20", &vm);
+    fixture.node_as_of(&machine, "lima", "fact", "2026-09-10", &lima);
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["brief", "--knowledge-only"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stdout,
+        format!(
+            "{KNOWLEDGE_PREAMBLE}\nOurs: decided by the team, binding everywhere:\n\
+             - [decision] Team rule.\n  (team · as of 2026-09-20)\n\
+             \nMine: how the person you work for likes to work:\n\
+             - [decision] Rust only.\n  (rust · as of 2026-09-20)\n\
+             - [taste] {answer}\n  (answer · as of 2026-09-10)\n\
+             - [taste] {small}\n  (small · as of 2026-09-20)\n\
+             - [lesson] {menu}\n  (menu · as of 2026-09-20)\n\
+             \nThis machine:\n- [fact] {vm}\n  (vm · as of 2026-09-20)\n\
+             \n1 more: `ohjaa list`\n"
+        )
+    );
+    assert!(
+        stderr.contains(
+            "the briefing holds every decision and 4 more, and names the other 1 by count; \
+             merge or retire some (`ohjaa check`)"
+        ),
+        "{stderr}"
+    );
+    fixture.cleanup();
+}
+
+/// The agent's own instruction file holds mine and machine, current, byte
+/// for byte the block apply would write now: the briefing leaves them out
+/// and says where they are. Otherwise it carries them and says why, each in
+/// one line, and a flag on a node it left out is still said.
+#[test]
+fn the_briefing_leaves_out_what_the_agents_own_file_holds_current() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("own-file");
+    let repo = fixture.make_git_repo("work");
+    let (ours, mine, machine) = (
+        fixture.dir.join("ours/knowledge"),
+        fixture.dir.join("config/ohjaa/mine"),
+        fixture.dir.join("config/ohjaa/machine"),
+    );
+    fixture.node(&ours, "team", "decision", "Team rule.");
+    fixture.node(&mine, "rust", "decision", "Rust only.");
+    fixture.node(&machine, "lima", "fact", "Lima is here.");
+    let file = fixture.dir.join("home/.claude/CLAUDE.md");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let current = applied_block(&["- decision: Rust only.", "- fact: Lima is here."]);
+    fs::write(&file, format!("# My notes\n\n{current}")).unwrap();
+    let brief = |agent: &str| {
+        let (stdout, stderr, code) = output_of(
+            fixture
+                .ohjaa()
+                .args(["brief", "--knowledge-only", "--agent", agent])
+                .current_dir(&repo),
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        stdout
+    };
+    let ours_part = "\nOurs: decided by the team, binding everywhere:\n\
+                     - [decision] Team rule.\n  (team · as of 2026-09-20)\n";
+    let file_shown = file.display().to_string();
+    assert_eq!(
+        brief("claude"),
+        format!(
+            "{KNOWLEDGE_PREAMBLE}{ours_part}\nMine and machine (2 nodes) are not repeated here: \
+             Claude Code has them from its own instructions, {file_shown}, whose ohjaa block is \
+             current.\n"
+        )
+    );
+    // The agent as a path: its file name says which it is.
+    assert_eq!(brief("/opt/bin/claude"), brief("claude"));
+    // A flag the block cannot carry: that node is repeated, with its flag.
+    fs::write(
+        machine.join("lima.md"),
+        "+++\nid = \"lima\"\nkind = \"fact\"\nstatus = \"current\"\nas_of = 2026-09-20\n\
+         origin = [\"a test\"]\nholds_while = [\"command:no-such-command-ohjaa-test\"]\n+++\n\
+         Lima is here.\n",
+    )
+    .unwrap();
+    assert_eq!(
+        brief("claude"),
+        format!(
+            "{KNOWLEDGE_PREAMBLE}{ours_part}\nThis machine:\n- [fact] Lima is here.\n  \
+             (lima · as of 2026-09-20)\n  ! may no longer hold: \
+             command:no-such-command-ohjaa-test is false\n\nMine and machine (2 nodes) are not \
+             repeated here: Claude Code has them from its own instructions, {file_shown}, whose \
+             ohjaa block is current. Flagged, so repeated above: lima.\n"
+        )
+    );
+    fixture.node(&machine, "lima", "fact", "Lima is here.");
+    // No agent ohjaa writes the own file of: the briefing as it always was,
+    // and nothing said.
+    let full = format!(
+        "{KNOWLEDGE_PREAMBLE}{ours_part}\nMine: how the person you work for likes to work:\n\
+         - [decision] Rust only.\n  (rust · as of 2026-09-20)\n\nThis machine:\n\
+         - [fact] Lima is here.\n  (lima · as of 2026-09-20)\n"
+    );
+    assert_eq!(brief("sh"), full);
+    let (unnamed, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["brief", "--knowledge-only"])
+            .current_dir(&repo),
+    );
+    assert_eq!((unnamed, code), (full.clone(), Some(0)), "{stderr}");
+    // Carried in full, and why.
+    let carried = |agent: &str, why: &str| {
+        format!(
+            "{full}\nMine and machine are carried here, not left to {agent}'s own \
+             instructions: {why}.\n"
+        )
+    };
+    // Stale: what the block holds is not what apply would write now.
+    fs::write(
+        &file,
+        format!(
+            "# My notes\n\n{}",
+            applied_block(&["- decision: Rust only."])
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        brief("claude"),
+        carried(
+            "Claude Code",
+            &format!(
+                "the ohjaa block in {file_shown} is not the one `ohjaa apply` would write now"
+            )
+        )
+    );
+    // No block.
+    fs::write(&file, "# My notes\n").unwrap();
+    assert_eq!(
+        brief("claude"),
+        carried(
+            "Claude Code",
+            &format!("{file_shown} holds no ohjaa block (`ohjaa apply` writes it)")
+        )
+    );
+    // A block apply did not write.
+    fs::write(
+        &file,
+        "# My notes\n\n<!-- ohjaa:knowledge begin: generated by `ohjaa brief --write`; edit the \
+         nodes, not this block -->\nRust only.\n<!-- ohjaa:knowledge end -->\n",
+    )
+    .unwrap();
+    assert_eq!(
+        brief("claude"),
+        carried(
+            "Claude Code",
+            &format!(
+                "the ohjaa block in {file_shown} is not apply's: `ohjaa brief --write` or the \
+                 person wrote it"
+            )
+        )
+    );
+    // Two blocks: not one block ohjaa can read.
+    fs::write(&file, format!("{current}\n{current}")).unwrap();
+    assert_eq!(
+        brief("claude"),
+        carried(
+            "Claude Code",
+            &format!(
+                "{file_shown} cannot be read as one ohjaa block (the file has an ohjaa knowledge \
+                 marker without its partner, or more than one block; fix it by hand)"
+            )
+        )
+    );
+    // A file that cannot be read at all (unless the tests run as root).
+    fs::write(&file, &current).unwrap();
+    make_mode(&file, 0o000);
+    if fs::read(&file).is_err() {
+        assert_eq!(
+            brief("claude"),
+            carried(
+                "Claude Code",
+                &format!("{file_shown} cannot be read (Permission denied (os error 13))")
+            )
+        );
+    }
+    make_mode(&file, 0o644);
+    // No file.
+    fs::remove_file(&file).unwrap();
+    assert_eq!(
+        brief("claude"),
+        carried("Claude Code", &format!("{file_shown} does not exist"))
+    );
+    let codex = fixture.dir.join("home/.codex/AGENTS.md");
+    assert_eq!(
+        brief("codex"),
+        carried("Codex", &format!("{} does not exist", codex.display()))
+    );
+    // Codex reads its override first, where there is one.
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    fs::write(&codex, &current).unwrap();
+    let ours_and_line = |file: &Path| {
+        format!(
+            "{KNOWLEDGE_PREAMBLE}{ours_part}\nMine and machine (2 nodes) are not repeated here: \
+             Codex has them from its own instructions, {}, whose ohjaa block is current.\n",
+            file.display()
+        )
+    };
+    assert_eq!(brief("codex"), ours_and_line(&codex));
+    let wins = codex.with_file_name("AGENTS.override.md");
+    fs::write(&wins, "# Override\n").unwrap();
+    assert_eq!(
+        brief("codex"),
+        carried(
+            "Codex",
+            &format!(
+                "{} holds no ohjaa block (`ohjaa apply` writes it)",
+                wins.display()
+            )
+        )
+    );
+    fixture.cleanup();
+}
+
+/// `ohjaa run` decides it for the agent it launches, and the session log
+/// says which nodes the agent's own file carried.
+#[test]
+fn run_leaves_out_what_the_agents_own_file_holds_and_records_where_it_was() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("run-own-file");
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    fixture.node(
+        &fixture.dir.join("ours/knowledge"),
+        "team",
+        "decision",
+        "Team rule.",
+    );
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        "rust",
+        "decision",
+        "Rust only.",
+    );
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/machine"),
+        "lima",
+        "fact",
+        "Lima is here.",
+    );
+    let file = fixture.dir.join("home/.claude/CLAUDE.md");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(
+        &file,
+        applied_block(&["- decision: Rust only.", "- fact: Lima is here."]),
+    )
+    .unwrap();
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "claude", "--intent", "x"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let briefing = fixture.argv().join("\n");
+    assert!(
+        briefing.contains(&format!(
+            "\nMine and machine (2 nodes) are not repeated here: Claude Code has them from its \
+             own instructions, {}, whose ohjaa block is current.\n",
+            file.display()
+        )) && briefing.contains("- [decision] Team rule.")
+            && !briefing.contains("Rust only.")
+            && !briefing.contains("Lima is here."),
+        "{briefing}"
+    );
+    let (export, stderr, code) =
+        output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(&repo));
+    assert_eq!(code, Some(0), "{stderr}");
+    let export: serde_json::Value = serde_json::from_str(&export).unwrap();
+    assert_eq!(
+        export["sessions"][0]["delivered"],
+        serde_json::json!([
+            {"id": "team", "scope": "ours", "as_of": "2026-09-20"},
+            {"id": "rust", "scope": "mine", "as_of": "2026-09-20", "via": file.to_str().unwrap()},
+            {"id": "lima", "scope": "machine", "as_of": "2026-09-20", "via": file.to_str().unwrap()},
+        ])
+    );
     fixture.cleanup();
 }
 
@@ -5054,8 +5414,15 @@ fn a_briefing_too_big_for_one_command_line_argument_is_refused_clearly() {
     fixture.node(&mine, "big", "fact", &"long knowledge ".repeat(500));
     let (_, stderr, code) = launch();
     assert_eq!(code, Some(0), "{stderr}");
-    // Linux caps one argument at 128 KiB, and the briefing is one, twice.
+    // A fact past the budget is named by count, not sent.
     fixture.node(&mine, "huge", "fact", &"long knowledge ".repeat(8_000));
+    let (_, stderr, code) = launch();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("\n1 more: `ohjaa list`\n"), "{stderr}");
+    assert_eq!(stderr.matches("long knowledge").count(), 500);
+    // Every decision is sent in full, however long. Linux caps one argument
+    // at 128 KiB, and the briefing is one, twice.
+    fixture.node(&mine, "huge-rule", "decision", &"long rule ".repeat(12_000));
     let (_, stderr, code) = launch();
     assert_eq!(code, Some(3), "{stderr}");
     assert!(

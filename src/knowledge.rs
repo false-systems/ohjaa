@@ -1565,21 +1565,157 @@ mod tests {
             "briefing order, mine and machine only, no origins"
         );
         assert_eq!((all.shown, all.more), (4, 0));
+        // One node over: only the last by priority goes, the fact.
         let tight = render_compact(&loaded, &scopes, all.text.len() - 1);
         assert_eq!(
             tight.text,
             format!(
                 "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only. No Python.\n\
-                 - decision: Builds in /tmp.\n2 more: `ohjaa list`\n"
+                 - taste: Answer first.\n- decision: Builds in /tmp.\n1 more: `ohjaa list`\n"
             )
         );
-        assert_eq!((tight.shown, tight.more), (2, 2));
-        assert!(tight.summary().contains("2 decisions and 2 more by count"));
+        assert_eq!((tight.shown, tight.more), (3, 1));
+        assert_eq!(
+            tight.summary(),
+            "3 of 4 nodes, the other 1 by count: over the 8000-character budget, merge or \
+             retire some"
+        );
         // Decisions alone over it: still every one, in full.
         let none = render_compact(&loaded, &scopes, 10);
         assert!(none.text.contains("Rust only. No Python.") && none.text.contains("/tmp."));
         let empty = render_compact(&Loaded::default(), &scopes, DEFAULT_BUDGET);
         assert!(empty.text.contains("None recorded yet"), "{}", empty.text);
+    }
+
+    /// Over the budget, a degrade and not a cliff: every decision in full,
+    /// then taste, lesson and fact, each newest first, for as long as they
+    /// fit with the count of the rest; then that count.
+    #[test]
+    fn over_the_budget_the_block_keeps_every_decision_then_taste_lesson_fact_newest_first() {
+        let dated = |scope, id, kind, as_of: &str, body| {
+            let mut node = located(scope, id, kind, body);
+            node.node.as_of = date(as_of);
+            node
+        };
+        let loaded = Loaded {
+            nodes: vec![
+                dated(
+                    Scope::Mine,
+                    "rust",
+                    Kind::Decision,
+                    "2026-10-01",
+                    "Rust only.",
+                ),
+                dated(
+                    Scope::Machine,
+                    "box-rule",
+                    Kind::Decision,
+                    "2026-09-01",
+                    "Builds in /tmp.",
+                ),
+                dated(
+                    Scope::Mine,
+                    "answer",
+                    Kind::Taste,
+                    "2026-09-25",
+                    "Answer first.",
+                ),
+                dated(
+                    Scope::Mine,
+                    "small",
+                    Kind::Taste,
+                    "2026-10-27",
+                    "Keep it small.",
+                ),
+                dated(
+                    Scope::Mine,
+                    "menu",
+                    Kind::Lesson,
+                    "2026-10-27",
+                    "A menu is stopping.",
+                ),
+                dated(
+                    Scope::Machine,
+                    "lima",
+                    Kind::Fact,
+                    "2026-09-27",
+                    "Lima is here.",
+                ),
+                dated(
+                    Scope::Machine,
+                    "vm",
+                    Kind::Fact,
+                    "2026-10-27",
+                    "The VM's /tmp empties.",
+                ),
+            ],
+            ..Loaded::default()
+        };
+        let scopes = [Scope::Mine, Scope::Machine];
+        let start = INSTRUCTIONS_PREAMBLE.len() + 1;
+        let block = |budget| {
+            let compact = render_compact(&loaded, &scopes, budget);
+            (compact.text, compact.shown, compact.more)
+        };
+        // All of it fits: briefing order, as it always was.
+        let all = format!(
+            "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only.\n- taste: Answer first.\n\
+             - taste: Keep it small.\n- lesson: A menu is stopping.\n- decision: Builds in /tmp.\n\
+             - fact: Lima is here.\n- fact: The VM's /tmp empties.\n"
+        );
+        assert_eq!(all.len(), start + 181);
+        assert_eq!(block(all.len()), (all.clone(), 7, 0));
+        // One node over the budget: the oldest fact goes, and is counted.
+        assert_eq!(
+            block(all.len() - 1),
+            (
+                format!(
+                    "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only.\n- taste: Answer first.\n\
+                     - taste: Keep it small.\n- lesson: A menu is stopping.\n\
+                     - decision: Builds in /tmp.\n- fact: The VM's /tmp empties.\n\
+                     1 more: `ohjaa list`\n"
+                ),
+                6,
+                1
+            )
+        );
+        // The lesson does not fit: the filling stops there, though the
+        // oldest fact, shorter, would have fitted after it.
+        assert_eq!(
+            block(start + 148),
+            (
+                format!(
+                    "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only.\n- taste: Answer first.\n\
+                     - taste: Keep it small.\n- decision: Builds in /tmp.\n3 more: `ohjaa list`\n"
+                ),
+                4,
+                3
+            )
+        );
+        // The newest taste first.
+        assert_eq!(
+            block(start + 96),
+            (
+                format!(
+                    "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only.\n- taste: Keep it small.\n\
+                     - decision: Builds in /tmp.\n4 more: `ohjaa list`\n"
+                ),
+                3,
+                4
+            )
+        );
+        // The decisions alone over it: every one, in full, and the rest counted.
+        assert_eq!(
+            block(10),
+            (
+                format!(
+                    "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only.\n\
+                     - decision: Builds in /tmp.\n5 more: `ohjaa list`\n"
+                ),
+                2,
+                5
+            )
+        );
     }
 
     #[test]
