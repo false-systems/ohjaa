@@ -19,7 +19,7 @@
 //! opens with the flag.
 //!
 //! Ignored by default, since CI's runners have none of these tools. Run it
-//! with the installed ones (11 to 16 seconds on 2026-10-27):
+//! with the installed ones (9 to 16 seconds here on 2026-10-27):
 //!
 //! ```sh
 //! OHJAA_TEST_SYKLI=$(command -v sykli) OHJAA_TEST_TOIMIJA=$(command -v toimija) \
@@ -443,8 +443,10 @@ impl World {
 
 impl Drop for World {
     fn drop(&mut self) {
-        // A failure keeps the world to look at.
-        if !std::thread::panicking() {
+        // A failure keeps the world to look at, and says where.
+        if std::thread::panicking() {
+            eprintln!("the world is kept in {}", self.dir.display());
+        } else {
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
@@ -507,7 +509,7 @@ fn session_named(briefing: &str) -> String {
     rest.split(';').next().unwrap().to_owned()
 }
 
-/// The commit `mark` names, from an entry's marks.
+/// The mark of `sha`, from an entry's marks.
 fn mark<'a>(entry: &'a Value, sha: &str) -> &'a Value {
     entry["commits"]
         .as_array()
@@ -784,7 +786,9 @@ fn the_whole_loop_on_the_real_tools() {
         refused.stderr
     );
     assert!(waiting.is_file(), "a refused decision changes nothing");
-    // At a terminal, as the person runs it.
+    // At a terminal, as the person runs it. Here the test is that person,
+    // deciding a proposal of the sandbox's own: an agent never makes a
+    // terminal to accept on a person's behalf (AGENTS.md).
     let accepted = world.under_a_terminal(&clone, &["accept", PROPOSAL]);
     assert!(
         accepted.contains(&format!("accepted {PROPOSAL}")),
