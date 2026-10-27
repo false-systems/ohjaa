@@ -44,11 +44,23 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   candidate the drafter answered for or failed on, its time and a digest of
   its words, never the words, and for a failure how often and why in ohjaa's
   words, kept until the drafter answers for it; an end line with the count),
-  the lock that lets one intake run at a time (`intake.lock`), and the
-  report's two times (`report-at`, `report-shown-at`). Deleting them loses no
-  knowledge: intake then reads its default window again, and sends once more
-  what is still in it. Everything else — fleet, perimeter, coverage, marks —
-  is derived now and stored never. No knowledge index, no cache, no daemon.
+  the lock that lets one intake run at a time (`intake.lock`), the
+  report's two times (`report-at`, `report-shown-at`), and the human view's
+  folder (`human/`: `seen.json`, what the person last saw and when, the keys
+  of what was said in the last two hours, where the next digest begins and
+  where what the day's digest left out begins; `seen.lock`, held by the
+  terminal saying the line; `collected.json`, the snapshot `ohjaa collect`
+  writes of what `ohjaa line` cannot derive without git or the network,
+  namely the marks and open sessions, GitHub's pull requests and vessa's
+  usage of the sessions ended lately, each with when it was read and what it
+  could not read; and `collect.lock`, held by the one collect that runs).
+  Deleting them loses no knowledge: intake then reads its default window
+  again, and sends once more what is still in it, and the human view starts
+  from the last day. Everything else — fleet, perimeter, coverage, marks —
+  is derived now and stored never, but in the human view's snapshot: a copy
+  that is said with its age wherever it is shown, read only by `ohjaa line`
+  and `ohjaa digest`, never by a briefing, a gate or a report. No knowledge
+  index and no daemon; that snapshot is the one cache.
 - **The workflow lives in the home, outside every repository.**
   `~/.config/ohjaa` holds each repository's entry (`repos/<owner>/<repo>/`:
   `repo.toml`, the branch ohjaa observes and the env lines its gate gives
@@ -108,11 +120,15 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   between agents, presence, and dispatch (assigning work to an agent).
   Knowledge is not a message — it carries its time, its why and whose it is. A
   session's handover is a record for whoever comes next, shown in the next
-  briefing, never a message to a particular agent.
+  briefing, never a message to a particular agent. The human view (`ohjaa
+  line`, `ohjaa digest`) is a record a person reads at their own terminal,
+  never a notification.
 - **Network only through `gh` and the drafter** — in `ohjaa intake` (review
-  comments, drafting) and when a session leaves (its branch's pull request,
-  bounded, recorded as unknown when gh cannot say). Every other command works
-  from the filesystem and local CLIs.
+  comments, drafting), when a session leaves (its branch's pull request,
+  bounded, recorded as unknown when gh cannot say), and in `ohjaa collect`
+  (one search for the pull requests of the entries' owners, at most two
+  calls). Every other command works from the filesystem and local CLIs, and
+  `ohjaa line` starts no git process either.
 - Failed coverage is never rendered as an empty result. If a scan could not
   look, it says so and exits non-zero.
 
