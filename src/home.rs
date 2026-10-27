@@ -342,20 +342,49 @@ pub fn unset_global(key: &str, value: Option<&str>) -> Result<()> {
 /// How long a change to the home waits for another ohjaa's to finish.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The home's lock, in its repository's own folder (made, when missing,
-/// before the repository is): one ohjaa at a time changes the home and
-/// commits it, so each decision, apply and adopt is one commit holding its
-/// own change, and the agents' block is rendered from what was just decided.
-/// Not taken in time, it is said and the change goes on without it: nothing
-/// waits on another ohjaa for good.
-pub fn lock(home: &Path) -> Option<process::FileLock> {
+/// The home's repository folders, from the file system: where its own
+/// files go (`git dir`) and where git reads its excludes (`common dir`).
+/// `.git` itself, or, when `.git` is a file (a worktree, a submodule), the
+/// folder it names and, for a worktree, the common folder that one names.
+fn repository_dirs(home: &Path) -> (PathBuf, PathBuf) {
     let dot_git = home.join(".git");
-    let path = if dot_git.is_file() {
-        home.join(".ohjaa.lock")
-    } else {
-        dot_git.join("ohjaa.lock")
+    let named = |base: &Path, file: &Path, prefix: &str| -> Option<PathBuf> {
+        let text = std::fs::read_to_string(file).ok()?;
+        let named = text
+            .trim()
+            .strip_prefix(prefix)
+            .unwrap_or(text.trim())
+            .trim();
+        (!named.is_empty()).then(|| base.join(named))
     };
-    match process::lock_file(&path, LOCK_WAIT) {
+    let Some(git_dir) = dot_git
+        .is_file()
+        .then(|| named(home, &dot_git, "gitdir:"))
+        .flatten()
+    else {
+        return (dot_git.clone(), dot_git);
+    };
+    let common = named(&git_dir, &git_dir.join("commondir"), "").unwrap_or_else(|| git_dir.clone());
+    (git_dir, common)
+}
+
+/// The home's lock, in its repository's own folder (made, when missing,
+/// before the repository is), never in the files the history holds: one
+/// ohjaa at a time changes the home and commits it, so each decision, apply
+/// and adopt is one commit holding its own change, and the agents' block is
+/// rendered from what was just decided. A change that has to wait says so;
+/// one that cannot take it in time says that, and goes on without it:
+/// nothing waits on another ohjaa for good.
+pub fn lock(home: &Path) -> Option<process::FileLock> {
+    let path = repository_dirs(home).0.join("ohjaa.lock");
+    let taken = process::lock_file(&path, std::time::Duration::ZERO).or_else(|_| {
+        eprintln!(
+            "ohjaa: waiting for another ohjaa's change to the home ({}) to finish",
+            path.display()
+        );
+        process::lock_file(&path, LOCK_WAIT)
+    });
+    match taken {
         Ok(lock) => Some(lock),
         Err(why) => {
             eprintln!(
@@ -395,14 +424,9 @@ const EXCLUDE: &[&str] = &[
 
 /// The allowlist in the home's repository's own `info/exclude` (git keeps
 /// it untracked, so the home needs no file of its own), as a marked block
-/// beside anything else there. A home whose `.git` is a file (a worktree)
-/// keeps its own excludes.
+/// beside anything else there; in the common folder a `.git` file names.
 fn keep_out_strays(home: &Path) -> Result<()> {
-    let dot_git = home.join(".git");
-    if !dot_git.is_dir() {
-        return Ok(());
-    }
-    let path = dot_git.join("info").join("exclude");
+    let path = repository_dirs(home).1.join("info").join("exclude");
     let now = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -681,6 +705,42 @@ mod tests {
             let error = parse_repo_toml(text).unwrap_err();
             assert!(error.contains(why), "{text:?}: {error}");
         }
+    }
+
+    /// A home whose `.git` is a file (a worktree of another repository): the
+    /// lock goes in the folder it names, and the allowlist where git reads
+    /// it, the common folder; neither is ever in the files the history holds.
+    #[test]
+    fn a_home_whose_git_is_a_file_keeps_its_lock_and_allowlist_out_of_its_files() {
+        let dir = std::env::temp_dir().join(format!("ohjaa-gitfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (home, store) = (dir.join("home"), dir.join("store"));
+        std::fs::create_dir_all(store.join("worktrees/home")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".git"), "gitdir: ../store/worktrees/home\n").unwrap();
+        std::fs::write(store.join("worktrees/home/commondir"), "../..\n").unwrap();
+        let (git_dir, common) = repository_dirs(&home);
+        assert_eq!(git_dir, home.join("../store/worktrees/home"));
+        assert_eq!(common, home.join("../store/worktrees/home").join("../.."));
+        let lock = lock(&home).expect("the lock");
+        assert!(store.join("worktrees/home/ohjaa.lock").is_file());
+        drop(lock);
+        keep_out_strays(&home).unwrap();
+        keep_out_strays(&home).unwrap();
+        let exclude = std::fs::read_to_string(store.join("info/exclude")).unwrap();
+        assert_eq!(exclude.matches(EXCLUDE_BEGIN).count(), 1, "{exclude}");
+        let names: Vec<_> = std::fs::read_dir(&home)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [".git"], "nothing of ohjaa's among the home's files");
+        // A plain home: both are its `.git`.
+        let plain = dir.join("plain");
+        assert_eq!(
+            repository_dirs(&plain),
+            (plain.join(".git"), plain.join(".git"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// `sharing.toml` said how `ohjaa judge` shared its notes; with the

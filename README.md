@@ -978,8 +978,15 @@ of block `brief --write` writes, so a file holds one; a block apply did not
 write (`brief --write`'s, or one you wrote) is yours: apply, each decision and
 undo leave it as it is and say so. An agent's file apply cannot read as a
 whole (two blocks, a marker without its partner) is said and skipped, and the
-rest is applied. Agents launched through ohjaa read this knowledge in their
-briefing too.
+rest is applied, but apply is not done: it ends with `applied, except 1
+agent file not written: <file> (<why>)` and exits 4, its commit names the
+file, and every later apply and dry run, and `ohjaa doctor`, say so again
+until you fix the file by hand. A home whose `.git` is a file (a worktree)
+keeps the lock and the allowlist in the folders that file names. A bare
+dotfiles repository (`git --git-dir=~/.dotfiles --work-tree=~`) has no `.git`
+above the file, so ohjaa cannot see that a file is in it: give such an
+agent's file no block by putting one of your own there. Agents launched
+through ohjaa read this knowledge in their briefing too.
 
 ## The fleet and the perimeter
 

@@ -740,7 +740,23 @@ pub fn apply(
         ));
     }
 
-    steps.extend(instruction_steps()?);
+    // Each agent's file apply could not write: the rest is applied, but
+    // apply is not done while one stays unwritten, and every run says so.
+    let (instruction, not_written) = instruction_steps()?;
+    steps.extend(instruction);
+    let except = (!not_written.is_empty()).then(|| {
+        format!(
+            "applied, except {} agent file{} not written: {}",
+            not_written.len(),
+            if not_written.len() == 1 { "" } else { "s" },
+            not_written.join("; ")
+        )
+    });
+    let code = if except.is_some() {
+        crate::INCOMPLETE
+    } else {
+        0
+    };
 
     // Which ohjaa and sykli the dispatchers run: adopt writes an entry's
     // dispatchers with them, whatever else this run changes.
@@ -754,18 +770,24 @@ pub fn apply(
         }
     }
     if steps.is_empty() {
-        println!(
-            "ohjaa apply: nothing to change; the workflow is applied from {}",
-            home.display()
-        );
-        return Ok(0);
+        match &except {
+            None => println!(
+                "ohjaa apply: nothing to change; the workflow is applied from {}",
+                home.display()
+            ),
+            Some(except) => println!("ohjaa apply: nothing else to change; {except}"),
+        }
+        return Ok(code);
     }
     if options.dry_run {
         for step in &steps {
             println!("ohjaa apply: {}", step.will);
         }
         println!("ohjaa apply: dry run; nothing was changed");
-        return Ok(0);
+        if let Some(except) = &except {
+            println!("ohjaa apply: it would be {except}");
+        }
+        return Ok(code);
     }
     let mut done = Vec::new();
     for step in steps {
@@ -775,8 +797,25 @@ pub fn apply(
         println!("ohjaa apply: {}", step.did);
         done.push(step.did);
     }
-    home::commit_and_say(&home, &history_message("apply", &done), "ohjaa apply");
-    Ok(0)
+    let mut message = history_message("apply", &done);
+    if let Some(except) = &except {
+        let (subject, body) = message.split_once('\n').unwrap_or((&message, ""));
+        message = format!(
+            "{subject}; {} agent file{} not written\n{body}\n{}",
+            not_written.len(),
+            if not_written.len() == 1 { "" } else { "s" },
+            not_written
+                .iter()
+                .map(|file| format!("not written: {file}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        home::commit_and_say(&home, &message, "ohjaa apply");
+        println!("ohjaa apply: {except}");
+    } else {
+        home::commit_and_say(&home, &message, "ohjaa apply");
+    }
+    Ok(code)
 }
 
 /// The commit that records what apply (or `--undo`) did, change by change.
@@ -792,8 +831,9 @@ fn history_message(what: &str, done: &[String]) -> String {
 /// The knowledge block in each agent's own instruction file: added, or
 /// rewritten where it is, in each file that exists outside every repository.
 /// Where an agent is set up but has no such file, or its file is inside a
-/// repository, that is said, and nothing is written.
-fn instruction_steps() -> Result<Vec<Step>> {
+/// repository, that is said, and nothing is written. Also each file apply
+/// should write and cannot (`<file> (<agent>'s own instructions: <why>)`).
+fn instruction_steps() -> Result<(Vec<Step>, Vec<String>)> {
     let (compact, broken) = crate::instructions::home_knowledge()?;
     for broken in &broken {
         eprintln!(
@@ -811,6 +851,7 @@ fn instruction_steps() -> Result<Vec<Step>> {
         );
     }
     let mut steps = Vec::new();
+    let mut not_written = Vec::new();
     for target in crate::instructions::targets() {
         let Some(file) = target.file.clone() else {
             if target.installed {
@@ -855,6 +896,11 @@ fn instruction_steps() -> Result<Vec<Step>> {
                     file.display(),
                     target.agent
                 );
+                not_written.push(format!(
+                    "{} ({}'s own instructions: {error:#})",
+                    file.display(),
+                    target.agent
+                ));
                 continue;
             }
         };
@@ -891,7 +937,7 @@ fn instruction_steps() -> Result<Vec<Step>> {
             home::write_file(&file, &new, None)
         }));
     }
-    Ok(steps)
+    Ok((steps, not_written))
 }
 
 /// Text as it was before apply: without a final newline when it had none.

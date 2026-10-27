@@ -350,7 +350,10 @@ enum Cmd {
         2  refused: no roots file and no --root (apply does not guess where the\n     \
            repositories are: run it once with --root <dir>)\n  \
         3  refused: a global core.hooksPath (see --force), an ohjaa that is not the\n     \
-           one on PATH (see --bin), or --prune without a roots file\n\n\
+           one on PATH (see --bin), or --prune without a roots file\n  \
+        4  applied, except an agent's own instruction file apply cannot write (a\n     \
+           block it cannot tell from the rest): each is named, with why, on every\n     \
+           apply and dry run until it is fixed by hand; `ohjaa doctor` names it too\n\n\
         Writes in the home:\n  \
         repos/<o>/<r>/hooks/<name>    exec <ohjaa> hook <name> \"$@\": pre-push, and each\n                                \
         hook that entry's clones under the roots have of their own\n  \
