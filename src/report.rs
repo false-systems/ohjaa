@@ -292,8 +292,15 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
         }
     };
     for (slug, marked) in &marks {
-        if let Err(why) = marked {
-            gaps.push(format!("{slug}: not marked: {why}"));
+        match marked {
+            Err(why) => gaps.push(format!("{slug}: not marked: {why}")),
+            // A receipt sykli named that cannot be read: never taken for one.
+            Ok(marked) => gaps.extend(
+                marked
+                    .unreadable
+                    .iter()
+                    .map(|why| format!("{slug}: a receipt cannot be read: {why}")),
+            ),
         }
     }
     let proposals = waiting(dirs);
@@ -1201,8 +1208,9 @@ pub fn to_json(report: &Report) -> Value {
                     "cached": walked.proof.as_ref().map(|proof| proof.cached),
                     // Additive (G1a): for a proven commit, the contract that
                     // receipt ran under: the gate derived from the commit
-                    // ("derived"), its own sykli.json ("own"), or the entry's
-                    // stored copy ("stored").
+                    // ("derived": from its own sykli.json, or what sykli init
+                    // writes for its tree), or its own sykli.json ("own").
+                    // "stored", an entry's copy, is no longer given.
                     "contract": walked.under.map(crate::derived::Under::word),
                     "author": walked.author,
                     "authored": rfc(walked.authored * 1000),
@@ -2194,6 +2202,7 @@ mod tests {
                         },
                     ],
                     ended: mark::Ended::Proven,
+                    unreadable: Vec::new(),
                 }),
             ),
             (

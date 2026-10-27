@@ -1497,6 +1497,393 @@ fn a_failing_drafter_stops_intake_without_moving_the_cursor() {
 }
 
 #[test]
+fn a_repository_with_no_commits_yet_is_empty_and_does_not_hold_the_cursor() {
+    // Intake's first real run, 2026-10-27: `git log` refuses a repository
+    // with no commits yet, so the reverts of two such repositories counted
+    // as unread, and held the cursor 336 hours back and the sessions queued
+    // behind it.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakeempty");
+    let repo = fixture.make_git_repo("work");
+    let fresh = fixture.make_repo("fresh");
+    run_git(&fresh, &["init", "-q"]);
+    let cursor = fixture.dir.join("state/ohjaa/intake-since");
+
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--since", "2026-09-01", "--drafter", "exit 1"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "nothing to read is not a failure: {stderr}");
+    assert!(stdout.contains("nothing new to draft from"), "{stdout}");
+    assert!(
+        !stderr.contains("does not have any commits yet"),
+        "an empty repository is not a warning: {stderr}"
+    );
+    assert!(cursor.is_file(), "the cursor moves: {stderr}");
+    let moved = fs::read_to_string(&cursor).unwrap();
+
+    // A repository git cannot read at all still holds it, out loud.
+    let gone = fixture.make_folder("gone");
+    fs::write(
+        gone.join(".git"),
+        format!("gitdir: {}\n", fixture.dir.join("nowhere").display()),
+    )
+    .unwrap();
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["intake", "--drafter", "exit 1"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(4), "{stderr}");
+    assert!(
+        stderr.contains("gone") && stderr.contains("not a git repository"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("the cursor stays"), "{stderr}");
+    assert_eq!(fs::read_to_string(&cursor).unwrap(), moved);
+    fixture.cleanup();
+}
+
+#[test]
+fn only_a_branch_never_committed_to_is_empty_not_one_whose_ref_was_lost() {
+    // The review of #61: git says "does not have any commits yet" for a
+    // branch never committed to, and also for one whose ref was lost (a
+    // loose ref deleted, `packed-refs` cut short). Only the first is empty.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakelost");
+    let committed = |name: &str| {
+        let repo = fixture.make_repo(name);
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "ohjaa@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Ohjaa Test"]);
+        run_git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        repo
+    };
+    let repo = committed("work");
+    // A new branch with no history of its own, in a repository with some.
+    let orphan = committed("orphan");
+    run_git(&orphan, &["checkout", "-q", "--orphan", "fresh"]);
+    let intake = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--since", "2026-09-01", "--drafter", "exit 1"])
+                .current_dir(&repo),
+        )
+    };
+    let (_, stderr, code) = intake();
+    assert_eq!(
+        code,
+        Some(0),
+        "a branch never committed to is empty: {stderr}"
+    );
+
+    // Lost refs exist only where refs are files.
+    let lost = committed("lost");
+    let loose = lost.join(".git/refs/heads/main");
+    if !loose.is_file() {
+        fixture.cleanup();
+        return;
+    }
+    fs::remove_file(&loose).unwrap();
+    let truncated = committed("truncated");
+    run_git(&truncated, &["pack-refs", "--all"]);
+    let packed = truncated.join(".git/packed-refs");
+    let header = fs::read_to_string(&packed).unwrap();
+    fs::write(&packed, format!("{}\n", header.lines().next().unwrap())).unwrap();
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    for broken in [&lost, &truncated] {
+        assert!(
+            stderr.contains(&format!("{}: ", broken.display()))
+                && stderr.contains("its ref is lost"),
+            "{} warns: {stderr}",
+            broken.display()
+        );
+    }
+    assert!(!stderr.contains(&orphan.display().to_string()), "{stderr}");
+    fixture.cleanup();
+}
+
+/// A draft as the drafter answers it; `repo` for a repo one.
+fn drafted(scope: &str, repo: Option<&Path>, id: &str, refines: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "scope": scope, "repo": repo.map(|repo| repo.display().to_string()), "id": id,
+        "kind": "lesson", "body": format!("The lesson {id}."),
+        "origin": ["2026-09-20 work: 'a test'"], "refines": refines, "supersedes": [],
+    })
+}
+
+/// A proposal waiting for a person, written as `ohjaa propose` writes it.
+fn waiting_proposal(dir: &Path, id: &str, body: &str) -> (PathBuf, String) {
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("{id}.md"));
+    let text = format!(
+        "+++\nid = \"{id}\"\nkind = \"lesson\"\nstatus = \"proposed\"\nas_of = 2026-09-20\n\
+         origin = [\"a test\"]\n+++\n{body}\n"
+    );
+    fs::write(&path, &text).unwrap();
+    (path, text)
+}
+
+#[test]
+fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
+    // Intake's first real run, 2026-10-27, wrote 108 proposals, four of them
+    // one lesson ("read back the briefing and leave a handover"). The review
+    // of #61: refusing what looks repeated drops real lessons for good
+    // (`tapio-linux-only` as `rauha-linux-only`), and a person is the only
+    // one who decides. So each is written, and said to that person.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakedup");
+    let repo = fixture.make_git_repo("work");
+    let (rauha, tapio) = (fixture.make_folder("rauha"), fixture.make_folder("tapio"));
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        "rust-elixir-only",
+        "decision",
+        "Code is Rust or Elixir.",
+    );
+    let proposals = fixture.dir.join("state/ohjaa/proposals");
+    let (waiting, proposal) = waiting_proposal(
+        &proposals.join("ours"),
+        "start-sessions-through-ohjaa-run",
+        "Start every agent session through `ohjaa run`.",
+    );
+    let encoded = |repo: &Path| {
+        repo.display()
+            .to_string()
+            .trim_start_matches('/')
+            .replace('%', "%25")
+            .replace('/', "%2F")
+    };
+    waiting_proposal(
+        &proposals.join("repo").join(encoded(&rauha)),
+        "rauha-linux-only",
+        "Rauha runs on Linux only.",
+    );
+    fixture.said(&[
+        vessa_line(
+            "2026-09-20T10:00:00Z",
+            "/p/work",
+            "never python. i told you",
+            None,
+        ),
+        vessa_line(
+            "2026-09-20T10:05:00Z",
+            &rauha.display().to_string(),
+            "no, we have lima baba",
+            None,
+        ),
+    ]);
+    // One answer a batch, each prompt kept.
+    let answers = [
+        serde_json::json!([
+            drafted("ours", None, "start-agents-through-ohjaa-run", None),
+            drafted("mine", None, "code-is-rust-or-elixir", None),
+            // Near current knowledge, of another scope: another lesson.
+            drafted("ours", None, "rust-elixir-only-everywhere", None),
+            drafted("ours", None, "read-back-briefing-and-leave-handover", None),
+            drafted("ours", None, "read-briefing-and-leave-handover", None),
+        ]),
+        serde_json::json!([
+            drafted(
+                "ours",
+                None,
+                "ohjaa-read-back-briefing-and-leave-handover",
+                None
+            ),
+            drafted(
+                "ours",
+                None,
+                "pi-sessions-need-a-wrapper-too",
+                Some("start-sessions-through-ohjaa-run"),
+            ),
+            drafted("repo", Some(&tapio), "tapio-linux-only", None),
+            drafted("machine", None, "lima-for-linux", None),
+        ]),
+    ];
+    for (n, answer) in answers.iter().enumerate() {
+        fs::write(
+            fixture.dir.join(format!("answer-{}.json", n + 1)),
+            answer.to_string(),
+        )
+        .unwrap();
+    }
+    let drafter = fixture.stub_dir.join("drafter");
+    fs::write(
+        &drafter,
+        format!(
+            "#!/bin/sh\nd='{}'\nn=$(($(cat \"$d/drafter-calls\" 2>/dev/null || echo 0) + 1))\n\
+             echo $n > \"$d/drafter-calls\"\ncat > \"$d/prompt-$n.txt\"\ncat \"$d/answer-$n.json\"\n",
+            fixture.dir.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&drafter);
+
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "intake",
+                "--source",
+                "transcripts",
+                "--no-prefilter",
+                "--since",
+                "2026-09-01",
+                "--batch",
+                "1",
+                "--drafter",
+            ])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let prompt =
+        |n: usize| fs::read_to_string(fixture.dir.join(format!("prompt-{n}.txt"))).unwrap();
+    // The drafter is shown what is present, current and waiting, and a
+    // repository's proposals only with a batch from it.
+    let (first, second) = (prompt(1), prompt(2));
+    assert!(
+        first.contains("- rust-elixir-only [mine/decision/current]: Code is Rust or Elixir."),
+        "{first}"
+    );
+    assert!(
+        first.contains(
+            "- start-sessions-through-ohjaa-run [ours/lesson/proposed]: Start every agent \
+             session through `ohjaa run`."
+        ),
+        "{first}"
+    );
+    assert!(first.contains("Return nothing for a"), "{first}");
+    assert!(!first.contains("rauha-linux-only"), "{first}");
+    assert!(
+        second.contains(&format!(
+            "- rauha-linux-only [repo/lesson/proposed] in {}: Rauha runs on Linux only.",
+            rauha.display()
+        )),
+        "{second}"
+    );
+    // And, in the next batch, what the batch before it proposed.
+    assert!(
+        second.contains("- read-back-briefing-and-leave-handover [ours/lesson/proposed]"),
+        "{second}"
+    );
+    for line in [
+        // Near a proposal waiting before the run.
+        "proposed start-agents-through-ohjaa-run, a possible duplicate of \
+         start-sessions-through-ohjaa-run\n",
+        // Near current knowledge of its scope.
+        "proposed code-is-rust-or-elixir, a possible duplicate of rust-elixir-only\n",
+        "proposed rust-elixir-only-everywhere\n",
+        "proposed read-back-briefing-and-leave-handover\n",
+        // Near a draft written earlier in the same answer,
+        "proposed read-briefing-and-leave-handover, a possible duplicate of \
+         read-back-briefing-and-leave-handover\n",
+        // and in a batch before.
+        "proposed ohjaa-read-back-briefing-and-leave-handover, a possible duplicate of \
+         read-back-briefing-and-leave-handover\n",
+        // A refinement of a waiting proposal is kept, as refining it.
+        "proposed pi-sessions-need-a-wrapper-too\n",
+        // The same words of another repository are another lesson.
+        "proposed tapio-linux-only\n",
+        "proposed lima-for-linux\n",
+        "9 proposal(s) waiting for review (`ohjaa review`), 4 of them possible duplicates, 0 \
+         draft(s) refused",
+        "possible duplicates: of read-back-briefing-and-leave-handover ×2, of rust-elixir-only \
+         ×1, of start-sessions-through-ohjaa-run ×1",
+    ] {
+        assert!(stdout.contains(line), "{line}\n{stdout}");
+    }
+    // Nothing drafted is lost: every draft waits for a person, and nothing
+    // is stored beside it (the re-review of #61: a possible duplicate is
+    // derived when a person reviews).
+    for (scope, id) in [
+        ("ours", "start-agents-through-ohjaa-run"),
+        ("mine", "code-is-rust-or-elixir"),
+        ("ours", "rust-elixir-only-everywhere"),
+        ("ours", "read-back-briefing-and-leave-handover"),
+        ("ours", "read-briefing-and-leave-handover"),
+        ("ours", "ohjaa-read-back-briefing-and-leave-handover"),
+        ("ours", "pi-sessions-need-a-wrapper-too"),
+        ("machine", "lima-for-linux"),
+    ] {
+        assert!(
+            proposals.join(scope).join(format!("{id}.md")).is_file(),
+            "{id}"
+        );
+    }
+    let mut stored = Vec::new();
+    let mut folders = vec![proposals.clone()];
+    while let Some(folder) = folders.pop() {
+        for entry in fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if path.extension().is_none_or(|ext| ext != "md") {
+                stored.push(path);
+            }
+        }
+    }
+    assert_eq!(stored, Vec::<PathBuf>::new(), "only proposals are stored");
+    let tapio_dir = proposals.join("repo").join(encoded(&tapio));
+    assert!(tapio_dir.join("tapio-linux-only.md").is_file());
+    let refinement =
+        fs::read_to_string(proposals.join("ours/pi-sessions-need-a-wrapper-too.md")).unwrap();
+    assert!(
+        refinement.contains("refines = \"start-sessions-through-ohjaa-run\""),
+        "{refinement}"
+    );
+    assert_eq!(
+        fs::read_to_string(&waiting).unwrap(),
+        proposal,
+        "a waiting proposal is never touched"
+    );
+
+    // A person sees each one after what it may repeat, and decides.
+    let (listed, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["review", "--list"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let at = |text: &str| {
+        listed
+            .find(text)
+            .unwrap_or_else(|| panic!("{text}\n{listed}"))
+    };
+    assert!(
+        at("\nstart-sessions-through-ohjaa-run  [") < at("\nstart-agents-through-ohjaa-run  [")
+            && at("\nstart-agents-through-ohjaa-run  [")
+                < at("possible duplicate of: start-sessions-through-ohjaa-run (waiting too)"),
+        "{listed}"
+    );
+    assert!(
+        listed
+            .contains("possible duplicate of: rust-elixir-only (current: Code is Rust or Elixir.)"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains(
+            "refines: start-sessions-through-ohjaa-run (waiting too); it can be accepted once \
+             that one is"
+        ),
+        "{listed}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
 fn a_file_inside_a_repository_gets_only_shared_knowledge() {
     if !git_available() {
         return;

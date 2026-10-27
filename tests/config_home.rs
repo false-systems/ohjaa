@@ -35,7 +35,9 @@ use std::process::{Command, Output};
 /// check's words do not). `run` writes its receipt as sykli does,
 /// also as `.sykli/receipts/rcpt_<sha256>.json`: one task, passed (with
 /// `$SANDBOX/with-cached` a second one reused from the cache; with
-/// `$SANDBOX/all-cached` both reused, the run `cached`). With STUB_SYKLI_D3 it is the
+/// `$SANDBOX/all-cached` both reused, the run `cached`; with `$SANDBOX/keep-runs`
+/// a copy in the run's own folder, `<common>/sykli/runs/<run>/`, as sykli keeps
+/// every run's, found from `.git`'s files). With STUB_SYKLI_D3 it is the
 /// durable-run sykli of KATANA D3, exactly as DECISIONS.md writes it: `run
 /// --json` names its `run`, `run --detach --json` answers `{schema:
 /// "sykli-run.v1", run}` once the run is recorded, and `status --run <id>
@@ -67,7 +69,10 @@ use std::process::{Command, Output};
 /// beside it pins another digest, and of any gate with
 /// `$SANDBOX/gate-invalid`. `init --contract <path>` writes
 /// `$SANDBOX/init-gate` there when a test wrote one (and `$SANDBOX/init-lock`
-/// beside it), else an empty contract. Like sykli's, `lock` and `validate` find the
+/// beside it), else an empty contract, and with `$SANDBOX/init-fails` says
+/// there is nothing to declare (exit 1); with `$SANDBOX/init-lists` it writes one task
+/// whose inputs are every file the tree tracks (one `git ls-files`, as sykli
+/// init declares them). Like sykli's, `lock` and `validate` find the
 /// repository with one `git rev-parse` unless they are handed
 /// `--repo-root` and `--git-common-dir`. Nothing else runs git (without the
 /// files above), so a trace2 count is ohjaa's own and what ohjaa leaves sykli
@@ -102,6 +107,15 @@ receipt() {
     "$run_field" "$top" "$(date +%s)000" "$ran" "$tree" "$dirty" "$t1" "$more" > .sykli/receipts/.new
   sum=$(digest .sykli/receipts/.new)
   mv .sykli/receipts/.new ".sykli/receipts/rcpt_$sum.json"
+  # With $SANDBOX/keep-runs, as sykli keeps every run: a copy in the run's own
+  # folder under the clone's common dir, found from .git's files (no git).
+  if [ -f "$SANDBOX/keep-runs" ]; then
+    if [ -d .git ]; then common=.git; else
+      gitdir=$(sed -n 's/^gitdir: //p' .git); common="$gitdir/$(cat "$gitdir/commondir")"
+    fi
+    mkdir -p "$common/sykli/runs/${2:-fg-$sum}"
+    cp ".sykli/receipts/rcpt_$sum.json" "$common/sykli/runs/${2:-fg-$sum}/"
+  fi
   echo "$PWD/.sykli/receipts/rcpt_$sum.json"
 }
 case "$1" in
@@ -140,8 +154,24 @@ case "$1" in
       [ -n "${STUB_SYKLI_CONTRACT:-}" ] && echo "      --contract <CONTRACT>  write the contract there"
       exit 0
     fi
-    # With $SANDBOX/init-gate, the contract written is that (and with
-    # $SANDBOX/init-lock, a sykli.lock beside it).
+    # With $SANDBOX/init-fails, nothing to declare; with $SANDBOX/init-gate,
+    # the contract written is that (and with $SANDBOX/init-lock, a sykli.lock
+    # beside it).
+    if [ -f "$SANDBOX/init-fails" ]; then
+      echo "nothing to declare: no Cargo.toml, package.json or go.mod" >&2; exit 1
+    fi
+    # With $SANDBOX/init-blocks, it hangs (its pid in $SANDBOX/init-pid).
+    if [ -f "$SANDBOX/init-blocks" ]; then
+      echo $$ > "$SANDBOX/init-pid"; exec sleep 30
+    fi
+    # With $SANDBOX/init-lists, as sykli init declares them: one task whose
+    # inputs are every file the tree tracks (one `git ls-files`).
+    if [ "$2" = --contract ] && [ -f "$SANDBOX/init-lists" ]; then
+      inputs=$(git ls-files | sed 's/.*/"&"/' | paste -sd, -)
+      printf '{"schema":"sykli-contract.v1","tasks":[{"name":"t","run":"true","inputs":[%s]}]}\n' \
+        "$inputs" > "$3"
+      exit 0
+    fi
     if [ "$2" = --contract ] && [ -f "$SANDBOX/init-gate" ]; then
       cp "$SANDBOX/init-gate" "$3"
       [ -f "$SANDBOX/init-lock" ] && cp "$SANDBOX/init-lock" "$(dirname "$3")/sykli.lock"
@@ -1297,8 +1327,13 @@ fn adopt_keeps_no_copy_of_a_gate_the_repository_has_and_never_writes_into_the_re
     assert_eq!(names_in(&entry), ["gated.config", "hooks", "repo.toml"]);
 }
 
+/// G1c: a repository with no sykli.json of its own gets no stored gate:
+/// each commit's gate is what sykli init writes for its tree, derived when
+/// it is needed. adopt asks sykli nothing but whether it can write a
+/// contract outside a repository, and refuses when it cannot; a copy an
+/// earlier adopt stored is removed.
 #[test]
-fn adopt_asks_sykli_for_a_gate_kept_outside_the_repo_and_refuses_when_it_cannot() {
+fn adopt_keeps_no_gate_for_a_repository_without_one_and_refuses_when_sykli_cannot_write_one() {
     let mut sandbox = Sandbox::new("adopt-init");
     let (plain, _) = sandbox.repo("acme", "plain", &[]);
     let before = sandbox.status(&plain);
@@ -1312,20 +1347,38 @@ fn adopt_asks_sykli_for_a_gate_kept_outside_the_repo_and_refuses_when_it_cannot(
     );
 
     sandbox.stub_contract = "1";
+    let entry = sandbox.config().join("repos/acme/plain");
+    // An entry adopted before kept a copy: it is dead.
+    fs::create_dir_all(&entry).unwrap();
+    fs::write(entry.join("sykli.json"), "{}\n").unwrap();
+    fs::write(entry.join("sykli.lock"), COPIED_LOCK).unwrap();
     let output = sandbox.ohjaa(&["adopt", &plain.to_string_lossy()]);
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
-    let entry = sandbox.config().join("repos/acme/plain");
-    assert!(entry.join("sykli.json").is_file());
-    assert!(entry.join("repo.toml").is_file());
     assert!(
-        sandbox.read("sykli-calls").contains(&format!(
-            "{}|init --contract {}",
-            plain.display(),
-            entry.join("sykli.json").display()
-        )),
-        "{}",
-        sandbox.read("sykli-calls")
+        stdout.contains(
+            "has no sykli.json: the gate of a commit with none of its own is derived from what \
+             sykli init writes for its tree"
+        ) && stdout.contains("; the copy kept before (sykli.json, sykli.lock) is removed"),
+        "{stdout}"
+    );
+    // The review of #60, finding 4: one "so", said once.
+    let said = stdout
+        .lines()
+        .find(|line| line.contains("has no sykli.json"))
+        .unwrap_or_default();
+    assert_eq!(said.matches(", so ").count(), 1, "{said}");
+    assert!(
+        !names_in(&entry)
+            .iter()
+            .any(|name| name.starts_with("sykli")),
+        "no copy of a gate: {:?}",
+        names_in(&entry)
+    );
+    let calls = sandbox.read("sykli-calls");
+    assert!(
+        calls.contains("|init --help") && !calls.contains("|init --contract"),
+        "{calls}"
     );
     assert_eq!(sandbox.status(&plain), before);
     // Before apply, adopt cannot make ohjaa observe it: git's global config
@@ -1486,10 +1539,6 @@ const RUST_GATE_DECLARED: &str = r#"{
   ]
 }
 "#;
-
-/// What adopt says it gave [`RUST_GATE`]'s tasks.
-const RUST_GATE_GIVEN: &str = "CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR declared for fmt, \
-     doc, test; CARGO_TARGET_DIR for inherited";
 
 /// An Erlang gate, like ote's: rebar3 and make under mise, no cargo.
 const ERLANG_GATE: &str = r#"{"schema":"sykli-contract.v1","tasks":[{"name":"fmt","run":"env REBAR_CACHE_DIR=$PWD/_build/rebar-cache rebar3 fmt --check","inputs":["rebar.config"]},{"name":"test","run":"mise exec -- make test","after":["fmt"]}]}
@@ -1933,158 +1982,119 @@ impl Sandbox {
     }
 }
 
-/// A repository with no sykli.json of its own keeps a stored gate, written
-/// by `sykli init --contract`, and it gets its lines as before (KATANA D10):
-/// declared for each cargo task that lacks them, and locked again.
+/// G1c: a commit with no sykli.json of its own is judged by what sykli init
+/// writes for its tree, given its lines as a repository's own contract is
+/// (KATANA D10): declared for each cargo task that lacks them, and locked as
+/// sykli init locked it. sykli is asked in a scratch checkout of exactly
+/// that tree, outside the repository, each time the commit is judged:
+/// `--print` keeps nothing, `ohjaa gate` keeps only the gate its run names,
+/// and a later reader asks sykli init again, never reading that back as the
+/// tree's gate (what sykli init writes then is a gate of its own).
 #[test]
-fn a_stored_gate_gets_a_worktree_cache_for_each_cargo_task_and_is_locked_again() {
-    let mut sandbox = Sandbox::new("d10-adopt");
+fn a_gate_sykli_init_writes_for_a_tree_gets_its_lines_and_is_derived_each_time() {
+    let mut sandbox = Sandbox::new("d10-init");
     sandbox.stub_contract = "1";
     fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
     fs::write(sandbox.dir.join("init-gate"), RUST_GATE).unwrap();
-    fs::write(sandbox.dir.join("init-lock"), stub_lock(RUST_GATE)).unwrap();
+    fs::write(sandbox.dir.join("init-lock"), sykli_lock(RUST_GATE)).unwrap();
     let (rusty, _) = sandbox.repo("acme", "rusty", &[]);
+    // Beside it, a file no commit holds: never in the tree sykli init sees.
+    fs::write(rusty.join("untracked.rs"), "x\n").unwrap();
+    sandbox.apply();
+    sandbox.adopt(&rusty);
     let before = sandbox.status(&rusty);
-    let entry = sandbox.config().join("repos/acme/rusty");
+    let tree = sandbox.tree(&rusty, "HEAD");
+    let inits = |sandbox: &Sandbox| {
+        sandbox
+            .read("sykli-calls")
+            .matches("|init --contract ")
+            .count()
+    };
 
-    let output = sandbox.ohjaa(&["adopt", &rusty.to_string_lossy()]);
-    let (stdout, stderr) = text(&output);
-    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let (named, said) = sandbox.gate_named(&rusty);
     assert!(
-        stdout.contains("sykli.json written by sykli init --contract (no sykli.json at origin/main), with sykli.lock: the gate of a commit with none of its own"),
-        "{stdout}"
-    );
-    assert_eq!(
-        fs::read_to_string(entry.join("sykli.json")).unwrap(),
-        RUST_GATE_DECLARED
-    );
-    assert_eq!(
-        fs::read_to_string(entry.join("sykli.lock")).unwrap(),
-        stub_lock(RUST_GATE_DECLARED),
-        "the entry's gate is locked again"
-    );
-    assert!(
-        sandbox.read("sykli-calls").contains(&format!(
-            "{}|lock {}\n",
-            rusty.display(),
-            entry.join("sykli.json").display()
-        )),
-        "{}",
-        sandbox.read("sykli-calls")
-    );
-    for said in [
-        &format!("  ${{worktree_cache}}: {RUST_GATE_GIVEN}, and sykli.lock locked again"),
-        "; kept as they declare it: own, both\n",
-    ] {
-        assert!(stdout.contains(said), "missing {said:?} in:\n{stdout}");
-    }
-    assert_eq!(
-        sandbox.status(&rusty),
-        before,
-        "adopt wrote into the repository"
-    );
-    // HEAD has no sykli.json: the gate is the copy.
-    let (gate, said) = sandbox.gate_named(&rusty);
-    assert_eq!(gate, entry.join("sykli.json"));
-    assert!(
-        said.contains("the entry's copy")
-            && said.contains("no sykli.json of its own in this checkout"),
+        said.contains(&format!(
+            "derived from what sykli init writes for the tree at HEAD ({}), which has no \
+             sykli.json of its own; [cargo_env] given to fmt, doc, test, inherited)",
+            short(&tree)
+        )) && said.contains("ohjaa gate: it is not written yet"),
         "{said}"
     );
+    assert!(!named.exists(), "--print keeps nothing");
+    assert_eq!(inits(&sandbox), 1);
+    // Asked in a scratch checkout of the tree, outside the repository and
+    // the state, gone since.
+    let asked = sandbox
+        .read("sykli-calls")
+        .lines()
+        .find(|line| line.contains("|init --contract "))
+        .map(str::to_owned)
+        .unwrap();
+    let scratch = PathBuf::from(asked.split('|').next().unwrap());
+    assert!(
+        scratch.starts_with(sandbox.dir.join("tmp")) && !scratch.exists(),
+        "{asked}"
+    );
 
-    // Adopted again: the copy gains the lines once, never twice.
-    let output = sandbox.ohjaa(&["adopt", &rusty.to_string_lossy(), "--force"]);
-    let (stdout, stderr) = text(&output);
-    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    fs::write(sandbox.dir.join("tree"), &tree).unwrap();
+    let (gate, said) = sandbox.gate_kept(&rusty);
+    assert_eq!(gate, named, "{said}");
+    assert!(said.contains("it proves HEAD as committed"), "{said}");
+    let bytes = fs::read(&gate).unwrap();
     assert_eq!(
-        fs::read_to_string(entry.join("sykli.json")).unwrap(),
-        RUST_GATE_DECLARED
+        String::from_utf8_lossy(&bytes),
+        canonical(RUST_GATE_DECLARED)
     );
+    let lock: serde_json::Value =
+        serde_json::from_slice(&fs::read(gate.with_file_name("sykli.lock")).unwrap()).unwrap();
+    assert_eq!(lock["contracts"]["sykli.json"], sha256_hex(&bytes));
+    assert_eq!(inits(&sandbox), 2, "asked again");
     assert_eq!(
-        fs::read_to_string(entry.join("sykli.lock")).unwrap(),
-        stub_lock(RUST_GATE_DECLARED)
+        names_in(&sandbox.dir.join("state/ohjaa")),
+        ["derived"],
+        "only the gate its run names is kept"
     );
+    // Asked again by every later reader: the same gate while sykli init
+    // writes the same, and another once it writes another.
+    assert_eq!(sandbox.gate_named(&rusty).0, gate);
+    assert_eq!(inits(&sandbox), 3);
+    fs::write(sandbox.dir.join("init-gate"), ERLANG_GATE).unwrap();
+    fs::write(sandbox.dir.join("init-lock"), sykli_lock(ERLANG_GATE)).unwrap();
+    let (other, said) = sandbox.gate_named(&rusty);
+    assert_ne!(other, gate, "never the gate kept for a run: {said}");
+    assert!(said.contains("ohjaa gate: it is not written yet"), "{said}");
+    assert_eq!(
+        sandbox.status_but_sykli(&rusty),
+        before,
+        "nothing is written into the repository but sykli's receipt"
+    );
+    let entry = sandbox.config().join("repos/acme/rusty");
+    assert!(!names_in(&entry)
+        .iter()
+        .any(|name| name.starts_with("sykli")));
 }
 
-/// A stored gate sykli refuses, for itself or for its lock: kept as it was
-/// written, and said so in sykli's words.
+/// G1c: what sykli init cannot write a gate for (no Cargo.toml, package.json
+/// or go.mod, in sykli's words) has no gate, said so in sykli's words; the
+/// branch is flagged unproven, never failed.
 #[test]
-fn a_stored_gate_sykli_refuses_is_kept_as_written() {
-    let mut sandbox = Sandbox::new("d10-invalid");
+fn a_tree_sykli_init_writes_no_gate_for_is_said_so() {
+    let mut sandbox = Sandbox::new("init-nothing");
     sandbox.stub_contract = "1";
-    fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
-    fs::write(sandbox.dir.join("init-gate"), RUST_GATE).unwrap();
-    fs::write(sandbox.dir.join("init-lock"), COPIED_LOCK).unwrap();
-    let (rusty, _) = sandbox.repo("acme", "rusty", &[]);
-    let entry = sandbox.config().join("repos/acme/rusty");
-    let contract = entry.join("sykli.json");
-    let output = sandbox.ohjaa(&["adopt", &rusty.to_string_lossy()]);
+    fs::write(sandbox.dir.join("init-fails"), "").unwrap();
+    let (repo, _) = sandbox.repo("acme", "docs", &[]);
+    sandbox.apply();
+    sandbox.adopt(&repo);
+    let output = sandbox.ohjaa_in(&repo, &["gate", "--print"]);
     let (stdout, stderr) = text(&output);
-    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
-    assert_eq!(fs::read_to_string(&contract).unwrap(), RUST_GATE);
-    assert_eq!(
-        fs::read_to_string(entry.join("sykli.lock")).unwrap(),
-        COPIED_LOCK
-    );
-    for said in [
-        format!(
-            "Sykli says: invalid {}: contract differs from {}",
-            contract.display(),
-            entry.join("sykli.lock").display()
+    assert_ne!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stderr.contains(
+            "no sykli contract (sykli.json) in HEAD, and sykli init writes none for its tree: \
+             sykli init exited 1: nothing to declare"
         ),
-        "the gate is kept as copied, without ${worktree_cache}".to_owned(),
-    ] {
-        assert!(stderr.contains(&said), "missing {said:?} in:\n{stderr}");
-    }
-    assert!(!sandbox.read("sykli-calls").contains("|lock "));
-    assert!(!stdout.contains("declared for"), "{stdout}");
-
-    // sykli refuses the gate itself, never as a lock out of date.
-    fs::write(sandbox.dir.join("init-lock"), stub_lock(RUST_GATE)).unwrap();
-    fs::write(sandbox.dir.join("gate-invalid"), "").unwrap();
-    let output = sandbox.ohjaa(&["adopt", &rusty.to_string_lossy(), "--force"]);
-    let (stdout, stderr) = text(&output);
-    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
-    assert_eq!(fs::read_to_string(&contract).unwrap(), RUST_GATE);
-    assert!(
-        stderr.contains(&format!(
-            "Sykli says: invalid {}: task \"fmt\" has an empty command",
-            contract.display()
-        )) && !stderr.contains("out of date"),
         "{stderr}"
     );
-    assert!(!sandbox.read("sykli-calls").contains("|lock "));
-}
-
-#[test]
-fn a_stored_gate_sykli_cannot_lock_again_is_kept_as_written() {
-    let mut sandbox = Sandbox::new("d10-lock");
-    sandbox.stub_contract = "1";
-    fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
-    fs::write(sandbox.dir.join("lock-fails"), "").unwrap();
-    fs::write(sandbox.dir.join("init-gate"), RUST_GATE).unwrap();
-    fs::write(sandbox.dir.join("init-lock"), stub_lock(RUST_GATE)).unwrap();
-    let (rusty, _) = sandbox.repo("acme", "rusty", &[]);
-    let entry = sandbox.config().join("repos/acme/rusty");
-    let output = sandbox.ohjaa(&["adopt", &rusty.to_string_lossy()]);
-    let (stdout, stderr) = text(&output);
-    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
-    assert_eq!(
-        fs::read_to_string(entry.join("sykli.json")).unwrap(),
-        RUST_GATE
-    );
-    assert_eq!(
-        fs::read_to_string(entry.join("sykli.lock")).unwrap(),
-        stub_lock(RUST_GATE)
-    );
-    assert!(
-        stderr.contains(&format!(
-            "ohjaa adopt: warning: sykli lock {} failed (error: cannot hash",
-            entry.join("sykli.json").display()
-        )) && stderr.contains("the gate is kept as copied, without ${worktree_cache}"),
-        "{stderr}"
-    );
-    assert!(!stdout.contains("declared for"), "{stdout}");
 }
 
 /// KATANA D10 for derived gates: an entry whose [cargo_env] gives no line
@@ -2210,66 +2220,47 @@ fn doctor_flags_a_placeholder_an_older_sykli_would_pass_on_as_written() {
     );
 }
 
-/// The review of #47, finding 6, for a stored gate: an adopt cut short
-/// between writing the gate and locking it leaves a lock that pins the gate
-/// as it was written, and every gate run and push of the entry is then
-/// refused. doctor asks sykli (`validate`, handed the clone's facts) and
-/// says so; adopt --force mends it.
+/// G1c: doctor says that a tip with no sykli.json of its own is judged by
+/// what sykli init writes for its tree, with its lines and as sykli init
+/// locked it (asked in a scratch checkout: doctor keeps nothing), and that a
+/// copy an earlier adopt stored is never read.
 #[test]
-fn doctor_flags_a_stored_gate_its_lock_does_not_pin() {
-    let mut sandbox = Sandbox::new("d10-torn");
+fn doctor_says_a_tip_with_no_contract_is_judged_by_what_sykli_init_writes() {
+    let mut sandbox = Sandbox::new("doctor-init");
     sandbox.stub_contract = "fast";
     fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
     fs::write(sandbox.dir.join("init-gate"), RUST_GATE).unwrap();
-    fs::write(sandbox.dir.join("init-lock"), stub_lock(RUST_GATE)).unwrap();
+    fs::write(sandbox.dir.join("init-lock"), sykli_lock(RUST_GATE)).unwrap();
     let (rusty, _) = sandbox.repo("acme", "rusty", &[]);
     sandbox.apply();
     sandbox.adopt(&rusty);
     let entry = sandbox.config().join("repos/acme/rusty");
-    let contract = entry.join("sykli.json");
-    let doctor = || {
-        let output = sandbox.ohjaa(&["doctor"]);
-        let (stdout, stderr) = text(&output);
-        (output.status.code(), format!("{stdout}{stderr}"))
-    };
-    let (code, said) = doctor();
-    assert_eq!(code, Some(0), "{said}");
+    fs::write(entry.join("sykli.json"), "{}\n").unwrap();
+    let output = sandbox.ohjaa(&["doctor"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let tree = sandbox.tree(&rusty, "origin/main");
     for line in [
-        "ok     acme/rusty: its gate is the copy beside repo.toml: origin/main has no \
-         sykli.json of its own",
-        "ok     acme/rusty: sykli validate accepts its sykli.lock",
+        format!(
+            "ok     acme/rusty: its gate is derived from what sykli init writes for \
+             origin/main's tree ({}), which has no sykli.json of its own; [cargo_env] given to \
+             fmt, doc, test, inherited (no copy is consulted)",
+            short(&tree)
+        ),
+        "ok     acme/rusty: sykli init locked the contract it wrote, so its gate is locked too"
+            .to_owned(),
+        format!(
+            "note   acme/rusty: the copy {} is never read: every commit's gate is derived from \
+             the commit (ohjaa adopt --force removes it)",
+            entry.join("sykli.json").display()
+        ),
     ] {
-        assert!(said.contains(line), "missing {line:?} in:\n{said}");
+        assert!(stdout.contains(&line), "missing {line:?} in:\n{stdout}");
     }
-    let calls = sandbox.read("sykli-calls");
     assert!(
-        calls.contains(&format!(
-            "{0}|validate {1} --repo-root {0} --git-common-dir {2}\n",
-            rusty.display(),
-            contract.display(),
-            rusty.join(".git").display()
-        )),
-        "{calls}"
+        !sandbox.dir.join("state/ohjaa/derived").exists(),
+        "doctor keeps nothing"
     );
-
-    // Cut short: the gate with its lines, its lock as it was written.
-    fs::write(entry.join("sykli.lock"), stub_lock(RUST_GATE)).unwrap();
-    let (code, said) = doctor();
-    assert_eq!(code, Some(4), "{said}");
-    assert!(
-        said.contains(&format!(
-            "DRIFT  acme/rusty: its gate does not validate against its sykli.lock (invalid {}: \
-             contract differs from {}",
-            contract.display(),
-            entry.join("sykli.lock").display()
-        )) && said.contains("a push is flagged UNPROVEN, not refused"),
-        "{said}"
-    );
-
-    let output = sandbox.ohjaa(&["adopt", &rusty.to_string_lossy(), "--force"]);
-    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
-    let (code, said) = doctor();
-    assert_eq!(code, Some(0), "{said}");
 }
 
 /// A receipt of `tree` that passed, made under the contract whose hash is
@@ -2435,18 +2426,20 @@ fn a_run_of_the_repositorys_own_contract_proves_the_commit() {
     );
 }
 
-/// "We don't want to run git git git", G1a. A stored entry (a repository
-/// with no sykli.json of its own) is judged within the budgets it had, and
-/// so is a derived one: `ohjaa gate` derives from the checkout's files, and
-/// each commit's own contract is read in the clone's one `git cat-file
-/// --batch`, which walks the marks too.
+/// "We don't want to run git git git", G1a. A derived entry is judged within
+/// its budgets: `ohjaa gate` derives from the checkout's files, and each
+/// commit's own contract is read in the clone's one `git cat-file --batch`,
+/// which walks the marks too. G1c: an entry with no sykli.json of its own is
+/// judged by what sykli init writes for each tree, asked each time a
+/// commit is judged: two git processes more (the scratch checkout's `init`
+/// and `read-tree -u`) and a `sykli init`, every time; `ohjaa gate` also
+/// reads HEAD (one more).
 #[test]
 fn the_gate_and_the_marks_stay_within_their_git_budget_on_both_paths() {
     let mut sandbox = Sandbox::new("budget-g1a");
     sandbox.stub_contract = "fast";
     fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
-    let (stored, stored_bare) = sandbox.repo("acme", "stored", &[]);
-    sandbox.entry("acme", "stored", Some("{}\n"));
+    let (inferred, inferred_bare) = sandbox.repo("acme", "inferred", &[]);
     let (derived, derived_bare) = sandbox.repo(
         "acme",
         "derived",
@@ -2457,6 +2450,7 @@ fn the_gate_and_the_marks_stay_within_their_git_budget_on_both_paths() {
     );
     sandbox.apply();
     sandbox.adopt(&derived);
+    sandbox.adopt(&inferred);
     let root = sandbox.projects();
     let mut report = Vec::new();
     let mut budget = |what: &str, starts: usize, at_most: usize| {
@@ -2464,7 +2458,7 @@ fn the_gate_and_the_marks_stay_within_their_git_budget_on_both_paths() {
         report.push((what.to_owned(), starts, at_most));
     };
     let output = sandbox
-        .command("ohjaa", &stored)
+        .command("ohjaa", &inferred)
         .args([
             "run",
             "sh",
@@ -2478,14 +2472,24 @@ fn the_gate_and_the_marks_stay_within_their_git_budget_on_both_paths() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", text(&output).1);
-    let session = sandbox.export(&stored)["sessions"][0]["id"]
+    let session = sandbox.export(&inferred)["sessions"][0]["id"]
         .as_str()
         .unwrap()
         .to_owned();
 
-    for (name, repo, bare, outside) in [
-        ("stored", &stored, &stored_bare, 1),
-        ("derived", &derived, &derived_bare, 1),
+    // (its config; for inferred, HEAD and a scratch checkout of its tree,
+    // each time), then the same inside a session, and a push of a commit no
+    // gate ran on.
+    for (name, repo, bare, outside, inside, hook) in [
+        (
+            "inferred",
+            &inferred,
+            &inferred_bare,
+            1 + 1 + 2,
+            2 + 2,
+            1 + 2,
+        ),
+        ("derived", &derived, &derived_bare, 1, 2, 1),
     ] {
         sandbox.commit(repo, &format!("{name}-gated"));
         fs::write(sandbox.dir.join("tree"), sandbox.tree(repo, "HEAD")).unwrap();
@@ -2507,7 +2511,7 @@ fn the_gate_and_the_marks_stay_within_their_git_budget_on_both_paths() {
         budget(
             &format!("ohjaa gate ({name}, inside a session)"),
             starts.len(),
-            2,
+            inside,
         );
 
         // A push of a commit no worktree proves, through the dispatcher,
@@ -2536,7 +2540,7 @@ fn the_gate_and_the_marks_stay_within_their_git_budget_on_both_paths() {
         budget(
             &format!("ohjaa hook pre-push ({name})"),
             through.saturating_sub(direct),
-            1,
+            hook,
         );
     }
 
@@ -2559,16 +2563,13 @@ fn the_gate_and_the_marks_stay_within_their_git_budget_on_both_paths() {
     let (stdout, stderr) = text(&output);
     let json: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}{stderr}"));
-    for (at, (repo, contract)) in [("acme/derived", "derived"), ("acme/stored", "stored")]
-        .into_iter()
-        .enumerate()
-    {
+    for (at, repo) in ["acme/derived", "acme/inferred"].into_iter().enumerate() {
         let entry = &json["entries"][at];
         assert_eq!(entry["repo"], repo, "{json:#}");
         assert_eq!(entry["ended"], "proven", "{json:#}");
         let commits = entry["commits"].as_array().unwrap();
         assert_eq!(commits.len(), 3, "{json:#}");
-        assert_eq!(commits[2]["contract"], contract, "{json:#}");
+        assert_eq!(commits[2]["contract"], "derived", "{json:#}");
     }
     assert_eq!(verified() - before, 2, "one sykli verify per entry");
     assert_eq!(walks_in(&starts), 2, "one walk per entry");
@@ -2576,15 +2577,26 @@ fn the_gate_and_the_marks_stay_within_their_git_budget_on_both_paths() {
         .iter()
         .filter(|line| line.contains("\"config\",\"-z\",\"--list\""))
         .count();
+    // The inferred entry's proven commit is asked of sykli init again, in a
+    // scratch checkout of its tree (two git processes), at every report.
+    assert!(
+        started(&starts, "read-tree"),
+        "a scratch checkout of its tree"
+    );
     budget(
-        "ohjaa report --json --marks (a stored and a derived entry)",
+        "ohjaa report --json --marks (a derived and an inferred entry)",
         starts.len(),
-        2 * 2 + 1,
+        2 * 2 + 1 + 2,
     );
     budget(
         "  of which the marks: configs and walks",
         listings + walks_in(&starts),
         2 * 2,
+    );
+    assert_eq!(
+        names_in(&sandbox.dir.join("state/ohjaa/derived")).len(),
+        2,
+        "the report keeps nothing: the two gates are those `ohjaa gate` ran"
     );
 
     let over: Vec<_> = report
@@ -2668,8 +2680,28 @@ fn report_json_and_gate_print_write_nothing_even_with_a_read_only_config_home() 
             "main",
         ],
     );
+    // G1c: and one with no sykli.json of its own, judged by what sykli init
+    // writes for its tree.
+    let (plain, _) = sandbox.repo("acme", "plain", &[]);
+    sandbox.adopt(&plain);
+    let plain_head = sandbox.commit(&plain, "proven");
+    fs::write(sandbox.dir.join("tree"), sandbox.tree(&plain, "HEAD")).unwrap();
+    let (code, said) = sandbox.gate(&plain);
+    assert_eq!(code, Some(0), "{said}");
+    sandbox.git(
+        &plain,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "-q",
+            "origin",
+            "main",
+        ],
+    );
     // The receipt's gate is not kept here (another machine's run, or a
-    // state wiped since): the report must write it to read it.
+    // state wiped since): the report must write it to read it, and ask
+    // sykli init again for the tree with no contract of its own.
     fs::remove_dir_all(sandbox.dir.join("state/ohjaa/derived")).unwrap();
     let config = sandbox.config();
     let state = sandbox.dir.join("state");
@@ -2683,10 +2715,25 @@ fn report_json_and_gate_print_write_nothing_even_with_a_read_only_config_home() 
     let (stdout, stderr) = text(&output);
     let json: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}{stderr}"));
-    let tip = &json["entries"][0]["commits"][0];
-    assert_eq!(tip["sha"], head.as_str(), "{json:#}");
-    assert_eq!(tip["mark"], "proven", "{json:#}");
-    assert_eq!(tip["contract"], "derived", "{json:#}");
+    let tip_of = |repo: &str| {
+        json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["repo"] == repo)
+            .map(|entry| entry["commits"][0].clone())
+            .unwrap_or_default()
+    };
+    for (repo, head) in [("acme/rusty", &head), ("acme/plain", &plain_head)] {
+        let tip = tip_of(repo);
+        assert_eq!(tip["sha"], head.as_str(), "{json:#}");
+        assert_eq!(tip["mark"], "proven", "{json:#}");
+        assert_eq!(tip["contract"], "derived", "{json:#}");
+    }
+    assert!(
+        !plain.join(".git/worktrees").exists(),
+        "sykli init is asked in a scratch checkout, never a worktree of the clone"
+    );
     let verified = sandbox
         .read("sykli-calls")
         .lines()
@@ -2702,13 +2749,15 @@ fn report_json_and_gate_print_write_nothing_even_with_a_read_only_config_home() 
         "read from a folder of the report's own: {verified}"
     );
 
-    let output = sandbox.ohjaa_in(&repo, &["gate", "--print"]);
-    let (stdout, stderr) = text(&output);
-    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
-    assert!(
-        stdout.contains("ohjaa gate: it is not written yet"),
-        "{stdout}"
-    );
+    for repo in [&repo, &plain] {
+        let output = sandbox.ohjaa_in(repo, &["gate", "--print"]);
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("ohjaa gate: it is not written yet"),
+            "{stdout}"
+        );
+    }
 
     writable(&config, true);
     assert_eq!(
@@ -3328,6 +3377,7 @@ fn an_entry_without_a_gate_flags_its_branch() {
     sandbox.stub_contract = "1";
     let (repo, bare) = sandbox.repo("acme", "widget", &[]);
     sandbox.entry("acme", "widget", None);
+    fs::write(sandbox.dir.join("init-fails"), "").unwrap();
     sandbox.apply();
     let head = sandbox.commit(&repo, "a");
     sandbox.git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/feature"]);
@@ -3335,7 +3385,9 @@ fn an_entry_without_a_gate_flags_its_branch() {
     let (_, stderr) = text(&output);
     assert!(output.status.success(), "{stderr}");
     assert!(
-        stderr.contains("ohjaa: UNPROVEN push to main (its entry has no gate: "),
+        stderr.contains(
+            "ohjaa: UNPROVEN push to main (it has no gate: no sykli contract (sykli.json) in "
+        ),
         "{stderr}"
     );
     assert_eq!(sandbox.git(&bare, &["rev-parse", "main"]), head);
@@ -3349,19 +3401,23 @@ fn ohjaa_gate_runs_the_entry_gate_and_prints_it() {
     let (repo, bare) = sandbox.repo("acme", "widget", &[]);
     sandbox.entry("acme", "widget", Some("{}\n"));
     sandbox.apply();
-    let contract = sandbox.config().join("repos/acme/widget/sykli.json");
     fs::create_dir_all(repo.join("src")).unwrap();
 
     let output = sandbox.ohjaa_in(&repo.join("src"), &["gate", "--print"]);
     let (stdout, _) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}");
+    // No sykli.json: what sykli init writes for HEAD's tree, kept in ohjaa's
+    // state once a run is judged by it; never the copy beside repo.toml.
+    let contract = named_gate(&stdout);
     assert!(
-        stdout.contains(&format!(
-            "ohjaa gate: the gate is {} (the entry for acme/widget (branch main): the entry's \
-             copy {}: there is no sykli.json of its own in this checkout)",
-            contract.display(),
-            contract.display()
-        )),
+        contract.starts_with(sandbox.dir.join("state/ohjaa/derived"))
+            && stdout.contains(&format!(
+                "ohjaa gate: the gate is {} (the entry for acme/widget (branch main): derived \
+                 from what sykli init writes for the tree at HEAD ({}), which has no sykli.json \
+                 of its own",
+                contract.display(),
+                short(&sandbox.tree(&repo, "HEAD"))
+            )),
         "{stdout}"
     );
     assert!(
@@ -3437,14 +3493,30 @@ fn receipt(path: &Path, tree: &str, outcome: &str, at_ms: u64) {
 
 /// A receipt of a run that passed under another contract than the gate's.
 fn receipt_under_another_contract(path: &Path, tree: &str, at_ms: u64) {
-    receipt(path, tree, "passed", at_ms);
+    receipt_hashed(path, tree, "passed", "other-contract", at_ms);
+}
+
+/// A receipt of `tree` that says `outcome`, of a run under the contract
+/// whose hash is `hash`, as sykli names it.
+fn receipt_hashed(path: &Path, tree: &str, outcome: &str, hash: &str, at_ms: u64) {
+    receipt(path, tree, outcome, at_ms);
     let text = fs::read_to_string(path).unwrap();
     let text = text.replacen(
         "\"schema\"",
-        "\"contract_hash\":\"other-contract\",\"schema\"",
+        &format!("\"contract_hash\":\"{hash}\",\"schema\""),
         1,
     );
     fs::write(path, text).unwrap();
+}
+
+/// What the stub's `init --contract` writes when no test says otherwise:
+/// the gate of a commit with no contract of its own.
+const STUB_INIT: &str = "{\"version\":\"1\",\"tasks\":{}}\n";
+
+/// The hash sykli gives `contract` (and names in a receipt of a run under
+/// it): the SHA-256 of its JSON, keys sorted, no blanks.
+fn hash_of(contract: &str) -> String {
+    sha256_hex(canonical(contract).as_bytes())
 }
 
 fn short(commit: &str) -> &str {
@@ -3662,13 +3734,14 @@ fn marks_are_derived_from_receipts_tip_first() {
         "passed",
         1_000,
     );
-    // Failed: its run in this worktree.
+    // Failed: its run of the gate in this worktree.
     let c2 = sandbox.commit(&repo, "two");
     let t2 = sandbox.tree(&repo, "HEAD");
-    receipt(
+    receipt_hashed(
         &repo.join(".sykli/receipts/rcpt_2.json"),
         &t2,
         "failed",
+        &hash_of(STUB_INIT),
         2_000,
     );
     // Never run.
@@ -3695,16 +3768,21 @@ fn marks_are_derived_from_receipts_tip_first() {
         1,
         "sykli asked only about the one receipt that says it passed"
     );
+    // Against what sykli init writes for its tree, in a folder of the
+    // report's own: never the copy beside repo.toml.
     let calls = sandbox.read("sykli-calls");
-    let contract = sandbox.config().join("repos/acme/widget/sykli.json");
+    let asked = format!(
+        "|verify {} --contract {}/ohjaa-gates-",
+        common.join("sykli/receipts/rcpt_1.json").display(),
+        sandbox.dir.join("tmp").display()
+    );
     assert!(
-        calls.contains(&format!(
-            "|verify {} --contract {} --repo-root {} --git-common-dir {} --commit {c1}",
-            common.join("sykli/receipts/rcpt_1.json").display(),
-            contract.display(),
-            repo.display(),
-            common.display()
-        )),
+        calls.contains(&asked)
+            && calls.contains(&format!(
+                " --repo-root {} --git-common-dir {} --commit {c1}",
+                repo.display(),
+                common.display()
+            )),
         "{calls}"
     );
 
@@ -3912,7 +3990,7 @@ fn a_run_that_passed_under_another_contract_is_unproven_not_failed() {
     assert_eq!(tip["code"], "other_contract", "{json:#}");
     assert_eq!(
         tip["why"],
-        "passed under another contract than the gate's (refused: contract expected 1111 but \
+        "ran under another contract than the gate's (refused: contract expected 1111 but \
          got 2222)"
     );
     assert_eq!(json["entries"][0]["commits"][1]["code"], "no_receipt");
@@ -3924,7 +4002,7 @@ fn a_run_that_passed_under_another_contract_is_unproven_not_failed() {
     assert!(
         stdout.starts_with(&format!(
             "FLAG: main of acme/widget has never been proven against its current gate (2 \
-             commits: ? {}, ? {}; 1 passed under another contract; origin/main as of a push at \
+             commits: ? {}, ? {}; 1 ran under another contract; origin/main as of a push at \
              <time>). Start by running `ohjaa gate` on main and fix forward what fails.\n",
             short(&c1),
             short(&init)
@@ -3932,12 +4010,13 @@ fn a_run_that_passed_under_another_contract_is_unproven_not_failed() {
         "{stdout}"
     );
 
-    // A run that failed is ✗, still.
+    // A run of the gate that failed is ✗, still.
     let c2 = sandbox.commit(&repo, "two");
-    receipt(
+    receipt_hashed(
         &repo.join(".sykli/receipts/rcpt_2.json"),
         &sandbox.tree(&repo, "HEAD"),
         "failed",
+        &hash_of(STUB_INIT),
         2_000,
     );
     sandbox.git(&repo, &["push", "-q", "origin", "main"]);
@@ -3949,6 +4028,37 @@ fn a_run_that_passed_under_another_contract_is_unproven_not_failed() {
             short(&c1),
             short(&init)
         )),
+        "{report}"
+    );
+
+    // The review of #60, finding 1: a run under any other contract that
+    // failed says nothing of the gate, as one that passed says nothing: ?,
+    // never ✗. Kept with its run under the common dir, it outlives the
+    // worktree it ran in, so it must never stand for the gate.
+    let c3 = sandbox.commit(&repo, "three");
+    let foreign = format!("rcpt_{}.json", "f".repeat(64));
+    receipt_hashed(
+        &repo.join(".git/sykli/runs/elsewhere").join(&foreign),
+        &sandbox.tree(&repo, "HEAD"),
+        "failed",
+        "another-contract",
+        3_000,
+    );
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+    let json = sandbox.report_json(&repo);
+    let tip = &json["entries"][0]["commits"][0];
+    assert_eq!(tip["sha"], c3.as_str(), "{json:#}");
+    assert_eq!(tip["mark"], "unproven", "{json:#}");
+    assert_eq!(tip["code"], "other_contract", "{json:#}");
+    assert!(
+        tip["why"].as_str().is_some_and(|why| why.starts_with(
+            "ran under another contract than the gate's (its receipt says the run failed"
+        )),
+        "{json:#}"
+    );
+    let report = sandbox.report(&repo);
+    assert!(
+        report.contains(&format!(": ? {} ✗ {}", short(&c3), short(&c2))),
         "{report}"
     );
 }
@@ -4058,6 +4168,252 @@ fn a_commit_proven_in_another_worktree_is_a_quiet_push() {
     );
 }
 
+/// G1c: the proof `ohjaa gate` leaves outlives the worktree it ran in. A
+/// pull request proven in a linked worktree and merged on the forge (a merge
+/// with its head's tree) stays ✓ once the worktree is removed, as it is
+/// after every merge: sykli keeps the receipt a run concluded with in the
+/// run's own folder under the clone's common dir, and the marks read it
+/// there. Without that copy, the proof went with the worktree.
+#[test]
+fn a_proof_outlives_the_worktree_ohjaa_gate_ran_in() {
+    let mut sandbox = Sandbox::new("durable");
+    sandbox.stub_contract = "1";
+    fs::write(sandbox.dir.join("keep-runs"), "").unwrap();
+    let (repo, bare) = sandbox.repo("acme", "widget", &[("sykli.json", "{}\n")]);
+    sandbox.apply();
+    sandbox.adopt(&repo);
+    let linked = sandbox.dir.join("pr");
+    sandbox.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "pr",
+            &linked.to_string_lossy(),
+            "main",
+        ],
+    );
+    let head = sandbox.commit(&linked, "feature");
+    fs::write(sandbox.dir.join("tree"), sandbox.tree(&linked, "HEAD")).unwrap();
+    let (code, said) = sandbox.gate(&linked);
+    assert_eq!(code, Some(0), "{said}");
+    let quiet = ["-c", "core.hooksPath=/dev/null", "push", "-q", "origin"];
+    sandbox.git(&linked, &[&quiet[..], &["pr"]].concat());
+    // Merged on the forge: a merge commit with the pull request's tree.
+    sandbox.git(
+        &sandbox.dir,
+        &["clone", "-q", &bare.to_string_lossy(), "forge"],
+    );
+    let forge = sandbox.dir.join("forge");
+    sandbox.git(
+        &forge,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge pull request #1",
+            "origin/pr",
+        ],
+    );
+    sandbox.git(&forge, &[&quiet[..], &["main"]].concat());
+    sandbox.git(&repo, &["fetch", "-q", "origin"]);
+    let merge = sandbox.git(&repo, &["rev-parse", "origin/main"]);
+    assert_ne!(merge, head);
+    assert_eq!(sandbox.tree(&repo, &merge), sandbox.tree(&linked, "HEAD"));
+    let tip = |sandbox: &Sandbox| sandbox.report_json(&repo)["entries"][0]["commits"][0].clone();
+    assert_eq!(tip(&sandbox)["mark"], "proven", "{:#}", tip(&sandbox));
+
+    // The worktree removed, as after every merge: still proven, by the
+    // receipt sykli kept with its run.
+    sandbox.git(
+        &repo,
+        &["worktree", "remove", "--force", &linked.to_string_lossy()],
+    );
+    assert!(!linked.exists());
+    let after = tip(&sandbox);
+    assert_eq!(after["sha"], merge.as_str(), "{after:#}");
+    assert_eq!(after["mark"], "proven", "{after:#}");
+    let runs = repo.join(".git/sykli/runs");
+    let verified = sandbox
+        .read("sykli-calls")
+        .lines()
+        .rev()
+        .find(|line| line.contains("|verify ") && line.contains(&merge))
+        .map(str::to_owned)
+        .unwrap_or_default();
+    assert!(
+        verified.contains(&format!("|verify {}/", runs.display())),
+        "the receipt kept with its run: {verified}"
+    );
+
+    // The review of #60, finding 2: a file cut short under the same name in
+    // the main checkout never hides it, and is said as a gap.
+    let name = PathBuf::from(verified.split(' ').nth(1).unwrap_or_default());
+    let name = name.file_name().unwrap().to_owned();
+    let cut = repo.join(".sykli/receipts").join(&name);
+    fs::create_dir_all(cut.parent().unwrap()).unwrap();
+    fs::write(&cut, "{\"truncated").unwrap();
+    let json = sandbox.report_json(&repo);
+    assert_eq!(
+        json["entries"][0]["commits"][0]["mark"], "proven",
+        "{json:#}"
+    );
+    assert_eq!(json["complete"], false, "{json:#}");
+    let report = sandbox.report(&repo);
+    assert!(
+        report.contains(&format!(
+            "acme/widget: a receipt cannot be read: {}",
+            fs::canonicalize(&cut).unwrap().display()
+        )),
+        "{report}"
+    );
+    fs::remove_file(&cut).unwrap();
+
+    // That copy is what proves it: without it, nothing is left of the run.
+    fs::remove_dir_all(&runs).unwrap();
+    let gone = tip(&sandbox);
+    assert_eq!(gone["mark"], "unproven", "{gone:#}");
+    assert_eq!(gone["code"], "no_receipt", "{gone:#}");
+}
+
+/// The review of #60, finding 3: an ohjaa killed while sykli init runs (a
+/// report, a hook or a gate, which keep the default disposition) leaves its
+/// scratch checkout of the tree behind. The next ohjaa that makes a folder
+/// of its own removes every one whose ohjaa is gone, and only those.
+#[test]
+fn a_scratch_checkout_a_killed_ohjaa_left_is_removed_by_the_next() {
+    let mut sandbox = Sandbox::new("init-killed");
+    sandbox.stub_contract = "1";
+    let (repo, _) = sandbox.repo("acme", "widget", &[]);
+    sandbox.apply();
+    sandbox.adopt(&repo);
+    sandbox.commit(&repo, "one");
+    let tree = sandbox.tree(&repo, "HEAD");
+    // A receipt of its tree that passed: the marks ask for its gate.
+    receipt(
+        &repo.join(".git/sykli/receipts/rcpt_1.json"),
+        &tree,
+        "passed",
+        1_000,
+    );
+    sandbox.git(
+        &repo,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "-q",
+            "origin",
+            "main",
+        ],
+    );
+    let root = sandbox.projects();
+    let report = ["report", "--json", "--marks", "--root", root.as_str()];
+    fs::write(sandbox.dir.join("init-blocks"), "").unwrap();
+    let mut running = sandbox
+        .command("ohjaa", &repo)
+        .args(report)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while sandbox.read("init-pid").trim().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "sykli init never ran");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let killed = running.id();
+    let signal = |signal: &str, pid: &str| {
+        Command::new("kill")
+            .args([signal, pid])
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(signal("-TERM", &killed.to_string()));
+    running.wait().unwrap();
+    signal("-KILL", sandbox.read("init-pid").trim());
+    fs::remove_file(sandbox.dir.join("init-blocks")).unwrap();
+    let tmp = sandbox.dir.join("tmp");
+    let of = |pid: u32| {
+        names_in(&tmp)
+            .into_iter()
+            .filter(|name| name.starts_with(&format!("ohjaa-gates-{pid}-")))
+            .collect::<Vec<_>>()
+    };
+    let left = of(killed);
+    assert_eq!(left.len(), 1, "{:?}", names_in(&tmp));
+    assert!(
+        tmp.join(&left[0])
+            .join(format!("init-{tree}/tree/.git/objects/info/alternates"))
+            .is_file(),
+        "the killed ohjaa's scratch checkout of the tree is left"
+    );
+    // One whose ohjaa still runs (this test's own pid) stays.
+    let live = tmp.join(format!("ohjaa-gates-{}-0", std::process::id()));
+    fs::create_dir_all(live.join("in-use")).unwrap();
+
+    let output = sandbox.ohjaa_in(&repo, &report);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["entries"][0]["commits"][0]["mark"], "proven",
+        "{json:#}"
+    );
+    assert!(of(killed).is_empty(), "{:?}", names_in(&tmp));
+    assert!(live.join("in-use").is_dir(), "a live ohjaa's folder stays");
+    fs::remove_dir_all(&live).unwrap();
+}
+
+/// G1c: a repository with no sykli.json of its own adds a source file, and
+/// its next landing is proven with no adopt in between: each commit's gate
+/// is what sykli init writes for its tree, which declares every file the
+/// tree tracks, the one added too. A stored copy drifted the moment a file
+/// was added, until someone adopted again.
+#[test]
+fn a_file_added_to_a_repository_without_a_contract_is_declared_by_its_next_gate() {
+    let mut sandbox = Sandbox::new("init-added");
+    sandbox.stub_contract = "1";
+    fs::write(sandbox.dir.join("init-lists"), "").unwrap();
+    let (repo, _) = sandbox.repo("acme", "widget", &[("main.rs", "fn main() {}\n")]);
+    sandbox.apply();
+    sandbox.adopt(&repo);
+    let land = |sandbox: &Sandbox, file: &str| {
+        let head = sandbox.commit(&repo, file);
+        let tree = sandbox.tree(&repo, "HEAD");
+        fs::write(sandbox.dir.join("tree"), &tree).unwrap();
+        let (code, said) = sandbox.gate(&repo);
+        assert_eq!(code, Some(0), "{said}");
+        sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+        let tip = sandbox.report_json(&repo)["entries"][0]["commits"][0].clone();
+        assert_eq!(tip["sha"], head.as_str(), "{tip:#}");
+        assert_eq!(tip["mark"], "proven", "{tip:#}");
+        assert_eq!(tip["contract"], "derived", "{tip:#}");
+        // The gate the run was judged by, as `ohjaa gate` names it.
+        fs::read_to_string(named_gate(&said)).unwrap()
+    };
+    let before = land(&sandbox, "one.rs");
+    assert!(
+        before.contains("\"one.rs\"") && !before.contains("\"new.rs\""),
+        "{before}"
+    );
+    let after = land(&sandbox, "new.rs");
+    assert!(
+        after.contains("\"one.rs\"") && after.contains("\"new.rs\""),
+        "the file added is declared by its commit's gate: {after}"
+    );
+    let entry = sandbox.config().join("repos/acme/widget");
+    assert!(
+        !names_in(&entry)
+            .iter()
+            .any(|name| name.starts_with("sykli")),
+        "no copy, and no adopt in between: {:?}",
+        names_in(&entry)
+    );
+}
+
 // ---- KATANA D4: validation references ----------------------------------------
 
 /// A receipt of `tree` whose tasks ended as `tasks` say (`passed`, `cached`,
@@ -4124,18 +4480,20 @@ impl Sandbox {
             .count()
     }
 
-    /// An entry whose gate's lock pins it as `pin`.
+    /// An entry for a repository with no sykli.json of its own, whose gate
+    /// (what sykli init writes for each tree, `{}`) has a lock pinning it as
+    /// `pin`.
     fn locked_entry(&self, owner: &str, name: &str, pin: &str) -> PathBuf {
-        self.entry(owner, name, Some("{}\n"));
-        let entry = self.config().join("repos").join(owner).join(name);
+        self.entry(owner, name, None);
+        fs::write(self.dir.join("init-gate"), "{}\n").unwrap();
         fs::write(
-            entry.join("sykli.lock"),
+            self.dir.join("init-lock"),
             format!(
                 "{{\"schema\":\"sykli-lock.v2\",\"contracts\":{{\"sykli.json\":\"{pin}\"}}}}\n"
             ),
         )
         .unwrap();
-        entry
+        self.config().join("repos").join(owner).join(name)
     }
 }
 
@@ -4181,9 +4539,13 @@ fn ohjaa_gate_records_its_request_before_asking_sykli() {
     assert_eq!(found["kind"], "candidate");
     assert_eq!(found["commit"], head.as_str());
     assert_eq!(found["tree"], tree.as_str());
-    assert_eq!(
-        found["contract"],
-        entry.join("sykli.json").to_str().unwrap()
+    // The gate it ran: what sykli init wrote for HEAD's tree, kept in ohjaa's
+    // state, never a copy beside the entry.
+    let contract = PathBuf::from(found["contract"].as_str().unwrap());
+    assert!(
+        contract.starts_with(sandbox.dir.join("state/ohjaa/derived"))
+            && !contract.starts_with(&entry),
+        "{found:#}"
     );
     assert_eq!(
         found["contract_digest"], "c0ffee",
@@ -4645,8 +5007,10 @@ const NEEDS_SYKLI: &str = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo tes
 const REAL_GATE: &str = r#"{"schema":"sykli-contract.v1","tasks":[{"name":"ok","run":"! grep -q broken state.txt","inputs":["state.txt"]}]}"#;
 
 impl Sandbox {
-    /// A sandbox whose sykli is the real one, with `acme/widget` cloned and
-    /// given an entry whose gate the real sykli locked.
+    /// A sandbox whose sykli is the real one, with `acme/widget` cloned, its
+    /// own contract ([`REAL_GATE`]) and a lock pinning it in its first
+    /// commit, and given an entry (no copy of a gate: each commit's is
+    /// derived from it).
     fn with_real_sykli(tag: &str) -> (Sandbox, PathBuf, PathBuf) {
         let sykli = std::env::var_os("OHJAA_TEST_SYKLI")
             .map(PathBuf::from)
@@ -4656,16 +5020,16 @@ impl Sandbox {
         let bin = sandbox.dir.join("bin/sykli");
         fs::remove_file(&bin).unwrap();
         std::os::unix::fs::symlink(&sykli, &bin).unwrap();
-        let (repo, bare) = sandbox.repo("acme", "widget", &[("state.txt", "ok\n")]);
-        sandbox.entry("acme", "widget", Some(REAL_GATE));
-        let contract = sandbox.config().join("repos/acme/widget/sykli.json");
-        let output = sandbox
-            .command("sykli", &repo)
-            .arg("lock")
-            .arg(&contract)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", text(&output).1);
+        let (repo, bare) = sandbox.repo(
+            "acme",
+            "widget",
+            &[
+                ("state.txt", "ok\n"),
+                ("sykli.json", REAL_GATE),
+                ("sykli.lock", &sykli_lock(REAL_GATE)),
+            ],
+        );
+        sandbox.entry("acme", "widget", None);
         sandbox.apply();
         (sandbox, repo, bare)
     }
@@ -4925,10 +5289,10 @@ fn real_sykli_a_gate_in_a_session_records_the_receipt_sykli_kept() {
         durable,
         "{found:#}"
     );
-    let lock: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(sandbox.config().join("repos/acme/widget/sykli.lock")).unwrap(),
-    )
-    .unwrap();
+    let gate = PathBuf::from(found["contract"].as_str().unwrap());
+    let lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(gate.with_file_name("sykli.lock")).unwrap())
+            .unwrap();
     assert_eq!(
         found["contract_digest"], lock["contracts"]["sykli.json"],
         "the pin in the gate's lock: {found:#}"
@@ -4968,27 +5332,21 @@ fn real_sykli_a_gate_in_a_session_records_the_receipt_sykli_kept() {
     assert_ne!(dirty["ran"]["tree"], tree.as_str(), "{dirty:#}");
 }
 
+/// G1c: an entry adopted before kept a copy of a gate beside repo.toml, and
+/// a run under that copy (one task more than the commit's own contract)
+/// passed. The copy is never read now: each commit's gate is derived from
+/// it, so that receipt is another contract's: unproven, never failed, and
+/// said so; `ohjaa gate` proves the commit under its gate.
 #[test]
 #[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
-fn real_sykli_a_new_gate_leaves_old_proofs_unproven_not_failed() {
+fn real_sykli_a_proof_under_a_copy_no_longer_read_is_unproven_not_failed() {
     let (sandbox, repo, _) = Sandbox::with_real_sykli("real-regate");
     let init = sandbox.git(&repo, &["rev-parse", "HEAD"]);
     let c1 = sandbox.state(&repo, "ok, one", "one");
-    let (code, said) = sandbox.gate(&repo);
-    assert_eq!(code, Some(0), "{said}");
-    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
-    assert!(
-        sandbox
-            .report(&repo)
-            .contains(&format!(": ✓ {}\n", short(&c1))),
-        "{}",
-        sandbox.report(&repo)
-    );
-
-    // The gate gains a task, and is locked again.
-    let contract = sandbox.config().join("repos/acme/widget/sykli.json");
+    // As an older `ohjaa gate` ran it: under the copy, locked by sykli.
+    let copy = sandbox.config().join("repos/acme/widget/sykli.json");
     fs::write(
-        &contract,
+        &copy,
         format!(
             "{},{}]}}",
             REAL_GATE.strip_suffix("]}").unwrap(),
@@ -4996,13 +5354,16 @@ fn real_sykli_a_new_gate_leaves_old_proofs_unproven_not_failed() {
         ),
     )
     .unwrap();
-    let output = sandbox
-        .command("sykli", &repo)
-        .arg("lock")
-        .arg(&contract)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{}", text(&output).1);
+    for args in [&["lock"][..], &["run"][..]] {
+        let output = sandbox
+            .command("sykli", &repo)
+            .args(args)
+            .arg(&copy)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {}", text(&output).1);
+    }
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
 
     let report = sandbox.report(&repo);
     assert!(
@@ -5024,12 +5385,240 @@ fn real_sykli_a_new_gate_leaves_old_proofs_unproven_not_failed() {
     assert!(
         stdout.starts_with(&format!(
             "FLAG: main of acme/widget has never been proven against its current gate (2 \
-             commits: ? {}, ? {}; 1 passed under another contract; ",
+             commits: ? {}, ? {}; 1 ran under another contract; ",
             short(&c1),
             short(&init)
         )),
         "{stdout}"
     );
+    let (code, said) = sandbox.gate(&repo);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(
+        sandbox
+            .report(&repo)
+            .contains(&format!(": ✓ {}", short(&c1))),
+        "proven under its gate: {}",
+        sandbox.report(&repo)
+    );
+}
+
+/// G1c against sykli's main: the proof `ohjaa gate` leaves outlives the
+/// worktree it ran in. A pull request proven in a linked worktree, merged on
+/// the forge (a merge with its head's tree), is ✓ while the worktree is
+/// there and once it is removed: sykli keeps the receipt each run concluded
+/// with in the run's own folder under the clone's common dir, and so sykli's
+/// own `status --commit` still says passed.
+#[test]
+#[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
+fn real_sykli_a_proof_outlives_the_worktree_ohjaa_gate_ran_in() {
+    let (sandbox, repo, bare) = Sandbox::with_real_sykli("real-durable");
+    let linked = sandbox.dir.join("pr");
+    sandbox.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "pr",
+            &linked.to_string_lossy(),
+            "main",
+        ],
+    );
+    let head = sandbox.state(&linked, "ok, the feature", "feature");
+    let (code, said) = sandbox.gate(&linked);
+    assert_eq!(code, Some(0), "{said}");
+    sandbox.git(&linked, &["push", "-q", "origin", "pr"]);
+    sandbox.git(
+        &sandbox.dir,
+        &["clone", "-q", &bare.to_string_lossy(), "forge"],
+    );
+    let forge = sandbox.dir.join("forge");
+    sandbox.git(
+        &forge,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge pull request #1",
+            "origin/pr",
+        ],
+    );
+    sandbox.git(
+        &forge,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "-q",
+            "origin",
+            "main",
+        ],
+    );
+    sandbox.git(&repo, &["fetch", "-q", "origin"]);
+    let merge = sandbox.git(&repo, &["rev-parse", "origin/main"]);
+    assert_ne!(merge, head);
+    let proven = format!(
+        "- acme/widget main (origin/main as of a fetch at <time>): ✓ {}\n",
+        short(&merge)
+    );
+    let report = sandbox.report(&repo);
+    assert!(report.contains(&proven), "{report}");
+
+    sandbox.git(
+        &repo,
+        &["worktree", "remove", "--force", &linked.to_string_lossy()],
+    );
+    assert!(!linked.exists());
+    let report = sandbox.report(&repo);
+    assert!(
+        report.contains(&proven),
+        "still proven, its worktree gone: {report}"
+    );
+    let kept: Vec<String> = fs::read_dir(repo.join(".git/sykli/runs"))
+        .unwrap()
+        .flatten()
+        .flat_map(|run| names_in(&run.path()))
+        .filter(|name| name.starts_with("rcpt_"))
+        .collect();
+    assert!(!kept.is_empty(), "the receipt sykli kept with its run");
+    let output = sandbox
+        .command("sykli", &repo)
+        .args([
+            "status",
+            "--commit",
+            &merge,
+            "--contract",
+            "sykli.json",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    assert_eq!(status["verdict"], "passed", "sykli's own word: {status:#}");
+}
+
+/// G1c against sykli's main: a Rust repository with no sykli.json of its
+/// own. adopt keeps no gate; each commit's gate is what the real `sykli
+/// init` writes for its tree, with the entry's lines, and `ohjaa gate` runs
+/// it (a cargo that records where it was told to build stands in for
+/// cargo). A source file added is declared by its commit's gate, and the
+/// next landing is proven with no adopt in between, by the marks and by
+/// sykli's own `status --commit` under that gate.
+#[test]
+#[ignore = "needs a real sykli: OHJAA_TEST_SYKLI=<path> cargo test -- --ignored"]
+fn real_sykli_a_repository_without_a_contract_adds_a_file_and_its_next_landing_is_proven() {
+    let sykli = sykli_named_by("OHJAA_TEST_SYKLI");
+    let sandbox = Sandbox::new("real-init");
+    sandbox.use_sykli(&sykli);
+    // sykli keys a Cargo graph by the toolchain (`rustc -vV`, `cargo -V`).
+    write_executable(
+        &sandbox.dir.join("bin/rustc"),
+        "#!/bin/sh\necho \"rustc 0.0.0 (a stand-in)\"\n",
+    );
+    write_executable(
+        &sandbox.dir.join("bin/cargo"),
+        "#!/bin/sh\n[ \"$1\" = -V ] && { echo \"cargo 0.0.0 (a stand-in)\"; exit 0; }\n\
+         printf '%s|%s|%s\\n' \"$PWD\" \"$CARGO_TARGET_DIR\" \"$CARGO_BUILD_BUILD_DIR\" \
+         >> \"$HOME/cargo-env\"\n",
+    );
+    let (repo, _) = sandbox.repo(
+        "acme",
+        "widget",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"widget\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [[bin]]\nname = \"widget\"\npath = \"main.rs\"\n",
+            ),
+            ("main.rs", "fn main() {}\n"),
+        ],
+    );
+    sandbox.apply();
+    let output = sandbox.ohjaa(&["adopt", &repo.to_string_lossy()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let entry = sandbox.config().join("repos/acme/widget");
+    assert!(!names_in(&entry)
+        .iter()
+        .any(|name| name.starts_with("sykli")));
+    let land = |file: &str, body: &str| {
+        fs::write(repo.join(file), body).unwrap();
+        sandbox.git(&repo, &["add", file]);
+        sandbox.git(&repo, &["commit", "-q", "-m", file]);
+        let head = sandbox.git(&repo, &["rev-parse", "HEAD"]);
+        let (code, said) = sandbox.gate(&repo);
+        assert_eq!(code, Some(0), "{said}");
+        assert!(
+            said.contains("derived from what sykli init writes for the tree at HEAD"),
+            "{said}"
+        );
+        sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+        let report = sandbox.report(&repo);
+        assert!(
+            report.contains(&format!(
+                "- acme/widget main (origin/main as of a push at <time>): ✓ {}\n",
+                short(&head)
+            )),
+            "{report}"
+        );
+        let gate = named_gate(&said);
+        (head, fs::read_to_string(&gate).unwrap(), gate)
+    };
+    let (_, before, _) = land("notes.md", "the first landing\n");
+    assert!(
+        before.contains("\"main.rs\"") && !before.contains("\"util.rs\""),
+        "{before}"
+    );
+    let (head, after, gate) = land("util.rs", "pub fn util() {}\n");
+    assert!(
+        after.contains("\"util.rs\""),
+        "the file added is declared by its commit's gate: {after}"
+    );
+    // What each report costs for it, with the real sykli: the report's own
+    // one, the clone's config and walk, the scratch checkout (`init`,
+    // `read-tree -u`), sykli init's own two (`rev-parse`, `ls-files`) and
+    // sykli verify's one, every time: four of them for the gate sykli init
+    // writes.
+    let root = sandbox.projects();
+    for _ in 0..2 {
+        let (starts, output) = sandbox.git_starts(
+            sandbox
+                .command("ohjaa", &repo)
+                .args(["report", "--json", "--marks", "--root", &root]),
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            json["entries"][0]["commits"][0]["mark"], "proven",
+            "{json:#}"
+        );
+        assert!(started(&starts, "read-tree"), "asked again: {starts:#?}");
+        assert!(
+            starts.len() <= 1 + 2 + 2 + 2 + 1,
+            "{} git processes: {starts:#?}",
+            starts.len()
+        );
+    }
+    // The lines went to the cargo tasks sykli init wrote.
+    let ran = fs::read_to_string(sandbox.home().join("cargo-env")).unwrap_or_default();
+    assert!(
+        ran.lines()
+            .all(|line| line.contains("/sykli/worktrees/") && line.contains("/cargo-target|")),
+        "{ran}"
+    );
+    let output = sandbox
+        .command("sykli", &repo)
+        .args(["status", "--commit", &head, "--contract"])
+        .arg(&gate)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    assert_eq!(status["verdict"], "passed", "sykli's own word: {status:#}");
+    assert!(!names_in(&entry)
+        .iter()
+        .any(|name| name.starts_with("sykli")));
 }
 
 #[test]
@@ -7332,10 +7921,13 @@ fn the_stale_base_check_and_integrated_validation_stay_within_their_git_budget()
     assert!(said.contains("candidate unverified: HEAD "), "{said}");
     let (without, none, _) = dry_run(false);
     assert_eq!(none, 0);
+    // G1c: no git process for a derived gate; for one sykli init writes, a
+    // scratch checkout (`init`, `read-tree -u`) of each tree whose gate no
+    // run kept here yet: the tip's and HEAD's.
     budget(
         "ohjaa run's briefing (integrated and candidate)",
         with.saturating_sub(without),
-        0,
+        2 * 2,
     );
     sandbox.git(&repo, &["checkout", "-q", "main"]);
 
@@ -7449,8 +8041,9 @@ fn real_sykli_a_landing_is_validated_as_the_integrated_state() {
         .unwrap_or_else(|| panic!("no validation of the landing: {record:#}"));
     assert_eq!(integrated["kind"], "integrated", "{record:#}");
     assert!(integrated["run"].is_string(), "{record:#}");
-    // sykli's own word on the landed commit, once the run is done.
-    let contract = sandbox.config().join("repos/acme/widget/sykli.json");
+    // sykli's own word on the landed commit, once the run is done, under
+    // its own contract (its gate, which runs no cargo, is that unchanged).
+    let contract = repo.join("sykli.json");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let verdict = loop {
         let output = sandbox

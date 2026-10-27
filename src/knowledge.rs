@@ -620,7 +620,24 @@ pub fn propose(dirs: &Dirs, loaded: &Loaded, proposal: Proposal, today: Date) ->
     if loaded.get(&node.id).is_some() || waiting.iter().any(|p| p.node.id == node.id) {
         return refuse(format!("`{}` already exists; choose another id", node.id));
     }
-    check_fits(loaded, proposal.scope, &node, &[])?;
+    // It may build on a proposal still waiting (of its own repository, for a
+    // repo one): it is checked with that one beside the Knowledge, and can
+    // be accepted once that one is.
+    let beside: Vec<Located> = node
+        .refines
+        .iter()
+        .filter(|base| loaded.get(base).is_none())
+        .filter_map(|base| {
+            waiting
+                .iter()
+                .find(|p| p.node.id == **base && (p.scope != Scope::Repo || p.repo == repo))
+        })
+        .map(|p| Located {
+            scope: p.scope,
+            node: p.node.clone(),
+        })
+        .collect();
+    check_fits(loaded, proposal.scope, &node, &[], &beside)?;
 
     let dir = dirs.proposal_dir(proposal.scope, repo.as_deref())?;
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
@@ -630,7 +647,14 @@ pub fn propose(dirs: &Dirs, loaded: &Loaded, proposal: Proposal, today: Date) ->
 }
 
 /// Refuse a change whose result would break a set rule involving `node`.
-fn check_fits(loaded: &Loaded, scope: Scope, node: &Node, replaced: &[Located]) -> Result<()> {
+/// `beside` joins the set unjudged: proposals `node` builds on.
+fn check_fits(
+    loaded: &Loaded,
+    scope: Scope,
+    node: &Node,
+    replaced: &[Located],
+    beside: &[Located],
+) -> Result<()> {
     let mut set: Vec<Located> = loaded
         .nodes
         .iter()
@@ -640,6 +664,7 @@ fn check_fits(loaded: &Loaded, scope: Scope, node: &Node, replaced: &[Located]) 
         .cloned()
         .collect();
     set.extend(replaced.iter().cloned());
+    set.extend(beside.iter().cloned());
     set.push(Located {
         scope,
         node: node.clone(),
@@ -747,7 +772,7 @@ pub fn accept(dirs: &Dirs, id: &str, today: Date) -> Result<Outcome> {
         replaced.push(old);
         replaced_files.push(file.to_path_buf());
     }
-    check_fits(&loaded, pending.scope, &node, &replaced)?;
+    check_fits(&loaded, pending.scope, &node, &replaced, &[])?;
 
     let dir = target_dir(dirs, pending.scope, pending.repo.as_deref())?;
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
@@ -887,6 +912,30 @@ mod tests {
 
     fn date(text: &str) -> Date {
         parse_date(text).unwrap()
+    }
+
+    #[test]
+    fn a_proposal_may_refine_one_still_waiting_and_is_accepted_after_it() {
+        let sandbox = Sandbox::new("refinewaiting");
+        sandbox
+            .propose(sandbox.proposal(Scope::Mine, "base"))
+            .unwrap();
+        let refinement = Proposal {
+            refines: Some("base".to_owned()),
+            ..sandbox.proposal(Scope::Mine, "base-in-codex")
+        };
+        let path = sandbox.propose(refinement).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("refines = \"base\""),
+            "kept, marked as refining"
+        );
+        let today = date("2026-09-25");
+        let refused = accept(&sandbox.dirs, "base-in-codex", today).unwrap_err();
+        assert!(format!("{refused:#}").contains("`base`"), "{refused:#}");
+        accept(&sandbox.dirs, "base", today).unwrap();
+        accept(&sandbox.dirs, "base-in-codex", today).unwrap();
     }
 
     #[test]

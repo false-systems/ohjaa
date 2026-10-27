@@ -1502,7 +1502,12 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     Ok(0)
 }
 
-fn show_pending(pending: &knowledge::Pending) {
+fn show_pending(
+    pending: &knowledge::Pending,
+    duplicate_of: Option<&str>,
+    loaded: &knowledge::Loaded,
+    waiting: &[knowledge::Pending],
+) {
     let node = &pending.node;
     let place = match &pending.repo {
         Some(repo) => format!("{} · {}", pending.scope.name(), repo.display()),
@@ -1515,11 +1520,37 @@ fn show_pending(pending: &knowledge::Pending) {
     for why in &node.origin {
         println!("    why: {why}");
     }
+    // What a node it names is now: current, still waiting, or gone.
+    let standing = |id: &str| {
+        if let Some(located) = loaded.get(id).filter(|l| l.node.status != Status::Proposed) {
+            let first = located.node.body.lines().next().unwrap_or("");
+            format!("{id} ({}: {first})", located.node.status.name())
+        } else if waiting.iter().any(|p| p.node.id == id) {
+            format!("{id} (waiting too)")
+        } else {
+            format!("{id} (no longer here)")
+        }
+    };
     if let Some(base) = &node.refines {
-        println!("    refines: {base}");
+        let waits = loaded.get(base).is_none() && waiting.iter().any(|p| p.node.id == *base);
+        println!(
+            "    refines: {}{}",
+            standing(base),
+            if waits {
+                "; it can be accepted once that one is"
+            } else {
+                ""
+            }
+        );
     }
     if !node.supersedes.is_empty() {
         println!("    supersedes: {}", node.supersedes.join(", "));
+    }
+    if let Some(of) = duplicate_of {
+        println!(
+            "    possible duplicate of: {} (their titles are near; you decide)",
+            standing(of)
+        );
     }
 }
 
@@ -1527,6 +1558,9 @@ fn cmd_review(list: bool) -> Result<i32> {
     let dirs = dirs()?;
     let loaded = knowledge::load(&dirs)?;
     let (waiting, broken) = knowledge::pending(&dirs, &loaded)?;
+    // What each may repeat, derived now, and each right after that one.
+    let marks = intake::possible_duplicates(&loaded, &waiting, dirs.repo_root.as_deref());
+    let reviewed = intake::review_order(waiting.iter().cloned().zip(marks).collect());
     for broken in &broken {
         eprintln!(
             "ohjaa: unreadable proposal {}: {}",
@@ -1539,8 +1573,8 @@ fn cmd_review(list: bool) -> Result<i32> {
         return Ok(0);
     }
     if list {
-        for pending in &waiting {
-            show_pending(pending);
+        for (pending, of) in &reviewed {
+            show_pending(pending, of.as_deref(), &loaded, &waiting);
         }
         println!(
             "\n{} waiting; decide with `ohjaa review` at a terminal",
@@ -1552,8 +1586,8 @@ fn cmd_review(list: bool) -> Result<i32> {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     let today = knowledge::today();
-    for pending in &waiting {
-        show_pending(pending);
+    for (pending, of) in &reviewed {
+        show_pending(pending, of.as_deref(), &loaded, &waiting);
         print!("  [a]ccept  [r]eject  [s]kip  [q]uit > ");
         std::io::stdout().flush()?;
         let answer = lines.next().transpose()?.unwrap_or_default();
@@ -1966,6 +2000,7 @@ fn cmd_intake(
             return Ok(if warnings.is_empty() { 0 } else { INCOMPLETE });
         }
         let loaded = knowledge::load(&dirs)?;
+        let known = intake::Known::read(&dirs, &loaded)?;
         let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
         let first: Vec<intake::Candidate> = found
             .iter()
@@ -1973,7 +2008,7 @@ fn cmd_intake(
             .take(batch)
             .cloned()
             .collect();
-        let (prompt, redacted) = intake::prompt(&loaded, &first);
+        let (prompt, redacted) = intake::prompt(&known, &first);
         println!("{prompt}");
         eprintln!(
             "ohjaa: dry-run; would send {} batch(es) to `{drafter}`; {redacted} \
@@ -1985,6 +2020,9 @@ fn cmd_intake(
 
     let today = knowledge::today();
     let (mut proposed, mut refused, mut redacted) = (0, 0, 0);
+    // Proposals that may repeat what was present, by the id of what each may
+    // repeat.
+    let mut possible: std::collections::BTreeMap<String, usize> = Default::default();
     let mut drafted = intake::Drafted::default();
     if left > 0 {
         let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
@@ -1995,20 +2033,34 @@ fn cmd_intake(
             limit,
             |chunk| {
                 // Re-read each time, so a draft from an earlier batch counts
-                // as existing.
+                // as present.
                 let loaded = knowledge::load(&dirs).map_err(intake::Failure::Silent)?;
+                let mut known =
+                    intake::Known::read(&dirs, &loaded).map_err(intake::Failure::Silent)?;
                 // Scrubbed of secrets, whatever the source or the filter.
-                let (prompt, scrubbed) = intake::prompt(&loaded, chunk);
+                let (prompt, scrubbed) = intake::prompt(&known, chunk);
                 redacted += scrubbed;
                 for draft in intake::draft(&drafter, &prompt)? {
                     let id = draft.id.clone();
-                    let result = draft
-                        .into_proposal()
-                        .and_then(|proposal| knowledge::propose(&dirs, &loaded, proposal, today));
+                    let result = draft.into_proposal().and_then(|proposal| {
+                        let near = known.repeated_by(&proposal).map(str::to_owned);
+                        let present = known.present(&proposal);
+                        knowledge::propose(&dirs, &loaded, proposal, today).map(|_| (present, near))
+                    });
                     match result {
-                        Ok(_) => {
+                        Ok((present, near)) => {
+                            // Present for the drafts after it in this answer.
+                            known.add(present);
                             proposed += 1;
-                            println!("proposed {id}");
+                            // Written, so never lost; said, and stored never:
+                            // a person decides.
+                            match near {
+                                None => println!("proposed {id}"),
+                                Some(of) => {
+                                    println!("proposed {id}, a possible duplicate of {of}");
+                                    *possible.entry(of).or_default() += 1;
+                                }
+                            }
                         }
                         Err(error) => {
                             refused += 1;
@@ -2149,9 +2201,21 @@ fn cmd_intake(
     if left == 0 {
         println!("{nothing}");
     } else {
+        let marked: usize = possible.values().sum();
         println!(
-            "{proposed} proposal(s) waiting for review (`ohjaa review`), {refused} draft(s) refused"
+            "{proposed} proposal(s) waiting for review (`ohjaa review`), {marked} of them \
+             possible duplicates, {refused} draft(s) refused"
         );
+        if marked > 0 {
+            let of: Vec<String> = possible
+                .iter()
+                .map(|(id, n)| format!("of {id} ×{n}"))
+                .collect();
+            println!(
+                "possible duplicates: {} (`ohjaa review` shows each after what it may repeat)",
+                of.join(", ")
+            );
+        }
     }
     if settled.left > 0 {
         eprintln!("ohjaa: {} candidate(s) wait for the next run", settled.left);

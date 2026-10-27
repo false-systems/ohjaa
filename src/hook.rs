@@ -433,9 +433,9 @@ fn observe(args: &[OsString], here: &Here) -> Observed {
     if let Some(why) = cannot_judge(&help) {
         return observed(Some(unproven(&entry.branch, &why)), input);
     }
-    // The pushed commit's gate, derived from its own sykli.json (else the
-    // entry's copy): one git process, which a commit proven in another
-    // worktree is then asked about through as well.
+    // The pushed commit's gate, derived from its own sykli.json (else from
+    // what sykli init writes for its tree): one git process, which a commit
+    // proven in another worktree is then asked about through as well.
     let judge = lifecycle::Sykli::with_program(home.clone(), sykli.clone(), SYKLI_LIMIT);
     let gate = crate::mark::gate_for_entry(
         &id,
@@ -445,9 +445,7 @@ fn observe(args: &[OsString], here: &Here) -> Observed {
     );
     let contract = match judge.gate_at(&gate, &sha) {
         Err(why) => Err(format!("its gate cannot be read: {why}")),
-        Ok(crate::derived::GateAt::Missing(why)) => Err(format!(
-            "its entry has no gate: {why} (ohjaa adopt --force)"
-        )),
+        Ok(crate::derived::GateAt::Missing(why)) => Err(format!("it has no gate: {why}")),
         Ok(at) => at
             .contract(judge.gates(), false)
             .map_err(|why| format!("its gate cannot be written: {why}")),
