@@ -1714,6 +1714,78 @@ mod tests {
         assert!(empty.text.contains("None recorded yet"), "{}", empty.text);
     }
 
+    /// What stderr says of a briefing the budget cut, in each of its cases.
+    #[test]
+    fn what_the_budget_cut_is_said_as_it_is() {
+        let rule = located(
+            Scope::Mine,
+            "rule",
+            Kind::Decision,
+            &"Rust only. ".repeat(20),
+        );
+        let short = located(Scope::Mine, "short", Kind::Decision, "Rust.");
+        let taste = located(Scope::Mine, "small", Kind::Taste, "Keep it small.");
+        let big = located(Scope::Mine, "big", Kind::Taste, &"Keep it. ".repeat(30));
+        let fact = located(Scope::Machine, "lima", Kind::Fact, "Lima is here.");
+        let said = |nodes: Vec<&Located>, budget: usize| {
+            let within = render_within(nodes, &[], budget);
+            let over = within.over(budget);
+            (over, within.full, within.text.len())
+        };
+        // It fits: nothing is said.
+        assert_eq!(said(vec![&taste], DEFAULT_BUDGET).0, None);
+        // One node over: every decision, the taste, and the fact by count.
+        let full = render_scopes(
+            &Loaded {
+                nodes: vec![rule.clone(), taste.clone(), fact.clone()],
+                ..Loaded::default()
+            },
+            &[],
+            &Scope::ALL,
+        )
+        .len();
+        let (over, _, _) = said(vec![&rule, &taste, &fact], full - 1);
+        assert_eq!(
+            over.unwrap(),
+            format!(
+                "the knowledge is {full} characters, over the {} an agent will reliably read: \
+                 the briefing holds every decision and 1 more, and names the other 1 by count; \
+                 merge or retire some (`ohjaa check`)",
+                full - 1
+            )
+        );
+        // The decisions fit, the first of the rest does not.
+        let (over, full, _) = said(vec![&short, &big, &fact], 450);
+        assert_eq!(
+            over.unwrap(),
+            format!(
+                "the knowledge is {full} characters, over the 450 an agent will reliably read: \
+                 the briefing holds its decisions alone, and names the other 2 by count; merge \
+                 or retire some (`ohjaa check`)"
+            )
+        );
+        // The decisions alone are over it, with more besides.
+        let (over, full, len) = said(vec![&rule, &taste, &fact], 100);
+        assert_eq!(
+            over.unwrap(),
+            format!(
+                "the knowledge is {full} characters, and its decisions alone are over the 100 an \
+                 agent will reliably read: the briefing holds every decision, in {len} \
+                 characters, and names the other 2 by count; merge or retire some (`ohjaa check`)"
+            )
+        );
+        // Decisions, and nothing else, over it.
+        let (over, full, _) = said(vec![&rule], 100);
+        assert_eq!(
+            over.unwrap(),
+            format!(
+                "the knowledge is {full} characters, all of it decisions, over the 100 an agent \
+                 will reliably read: the briefing holds every one; merge or retire some \
+                 (`ohjaa check`)"
+            )
+        );
+    }
+
     /// Over the budget, a degrade and not a cliff: every decision in full,
     /// then taste, lesson and fact, each newest first, for as long as they
     /// fit with the count of the rest; then that count.
