@@ -97,6 +97,17 @@ identity of delivered repo nodes; older records without that identity still read
   why.
 - Shared Knowledge (ours, repo) is then committed and reviewed in a pull
   request, like code. For shared scopes that review is the real gate.
+- Personal Knowledge (mine, machine) is versioned in the home itself:
+  `~/.config/ohjaa` is a local git repository, with no remote and never
+  pushed, made by its first commit (or the repository the home already is).
+  Each decision on it (`accept`, `reject`, `retire`, `confirm`, and each one
+  `review` makes) is one commit, with your git identity, saying what and why:
+  `accept code-is-rust: Code is Rust or Elixir.`, then the kind, the scope and
+  each `why:` of its origin; a retirement carries its `--why`. `ohjaa apply`,
+  `apply --undo` and `adopt` commit what they change in the home the same way.
+  A commit that fails (another git holding the index, no identity) is said,
+  and the decision stands; the next commit takes it in. `git -C
+  ~/.config/ohjaa log` is the history of what you decided.
 
 **How strong the person-only guard is:** it stops a careless agent, which is
 the kind the correction history shows. It does not stop a determined one. A
@@ -786,6 +797,41 @@ For agents not launched through ohjaa, `ohjaa brief --write <file>` writes the
 Knowledge as a generated block into an instruction file such as `CLAUDE.md` or
 `AGENTS.md`, and leaves everything else in the file alone.
 
+Your general knowledge (mine, machine) reaches every agent's own global
+instruction file the same way, from one source, the nodes in the home.
+`ohjaa apply` writes the block into each of these that exists, where the
+agent itself finds it, and creates none:
+
+| agent | its global instruction file (the first that exists) |
+|---|---|
+| Claude Code | `$CLAUDE_CONFIG_DIR` (else `~/.claude`)`/CLAUDE.md` |
+| Codex | `$CODEX_HOME` (else `~/.codex`)`/AGENTS.override.md`, `AGENTS.md` |
+| pi | `$PI_CODING_AGENT_DIR` (else `~/.pi/agent`)`/AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md` |
+| opencode | `$XDG_CONFIG_HOME` (else `~/.config`)`/opencode/AGENTS.md` |
+
+An agent that is set up but has no such file is said so (create the file,
+even empty, and apply again), and a file inside a git repository gets no
+block: one person's knowledge never goes into a file a repository shares.
+The block is one line per current node, `kind: text`, in briefing order,
+without origins:
+
+```
+<!-- ohjaa:knowledge begin: mine and machine, written by `ohjaa apply` and after each decision, … -->
+Knowledge (ohjaa, mine and machine): what the person you work for has decided and knows. …
+- decision: Code is Rust, or Elixir/Erlang.
+- fact: Linux and eBPF builds and tests run in the Lima VM.
+<!-- ohjaa:knowledge end -->
+```
+
+Past the briefing's budget (8,000 characters) it holds the decisions in full
+and names the rest by count, ``30 more: `ohjaa list` ``, and apply says so.
+After each decision the block is rewritten wherever it is (moved, or
+between your own lines), and only where it is: a block you take out stays
+out until the next apply. `apply --undo` takes it out and puts back exactly
+what was there, a final newline that was missing included. It is the same block `brief --write` writes, so a file
+holds one. Agents launched through ohjaa read this knowledge in their
+briefing too.
+
 ## The fleet and the perimeter
 
 `ohjaa system` derives what every tool in the fleet is, from each repo's own
@@ -945,16 +991,22 @@ starts it.
   roots                             where apply and doctor look (from the first apply's --root)
   applied.toml                      what apply changed outside the home, for --undo
   mine/ machine/ ours drafter       (knowledge and settings, as before)
+  .git/                             the home's history: one commit per decision on mine
+                                    or machine, per apply and per adopt; never pushed
 ~/.gitconfig                        [include] path = ~/.config/ohjaa/git/config (once)
 ~/.config/git/ignore                git's global excludes (or core.excludesFile):
                                     a block marked "ohjaa apply" holds .sykli/ and .teko/
+~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.pi/agent/AGENTS.md,
+~/.config/opencode/AGENTS.md        each that exists: a block marked "ohjaa:knowledge"
+                                    holds mine and machine (see "Keeping it true")
 ```
 
 ```bash
 ohjaa apply --root ~/projects --dry-run # the first time: name where the repositories are
-ohjaa apply --root ~/projects          # the home's files, the include, the ignore block, ~/.zshrc
+ohjaa apply --root ~/projects          # the home's files, the include, the ignore block, ~/.zshrc,
+                                       # the agents' knowledge blocks; then a commit in the home
 ohjaa apply                            # later runs read the roots it wrote down
-ohjaa apply --undo                     # put back what apply changed; entries and roots stay
+ohjaa apply --undo                     # put back what apply changed; entries, roots, history stay
 ohjaa apply --prune                    # also remove dispatchers no clone needs any more
 ohjaa adopt ~/projects/taso            # entry: origin's default branch, and [cargo_env]
 ohjaa gate                             # prove HEAD: run this repo's gate, as a push is judged
@@ -1033,7 +1085,13 @@ reused: `checkout -f`, `clean` and `status`; two more where the commit has
 submodules, `submodule deinit` and `submodule foreach`; and it all again, made
 from nothing, when the reset or its check fails). A pre-push of any other branch than the
 observed one reads the session log and the clone's ref as files, for a base
-that moved: no process. `tests/config_home.rs` holds these budgets.
+that moved: no process. The home's history costs two per commit (`add -A`
+and `commit`, with git's automatic maintenance off, which would start one
+more, detached) and one more once, the home's `git init`: a decision on mine
+or machine starts those beside the one that finds the repository it runs in,
+and apply starts them when it changed something, adopt each time; the
+agents' instruction files are read and written without git. `tests/config_home.rs`
+holds these budgets, and `tests/terminal.rs` a decision's.
 
 **`ohjaa gate`** proves HEAD: it runs the gate a push is judged by, from the
 repository root: `mkdir -p .sykli && sykli run <contract> --json >
