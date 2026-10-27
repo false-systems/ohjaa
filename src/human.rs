@@ -327,7 +327,7 @@ fn standing(kind: Kind, class: Class, key: String, repo: &str, text: String) -> 
         key,
         at_ms: 0,
         github: false,
-        repo: name(repo),
+        repo: clean(&name(repo)),
         text,
     }
 }
@@ -339,7 +339,7 @@ fn event(kind: Kind, key: String, at_ms: i64, github: bool, repo: &str, text: St
         key,
         at_ms,
         github,
-        repo: name(repo),
+        repo: clean(&name(repo)),
         text,
     }
 }
@@ -386,56 +386,43 @@ fn ended(session: &Session, left: &Left, costed: Option<&Cost>) -> Item {
     )
 }
 
+/// A pull request's opening, and its merge or close. A merge into another
+/// branch (a stacked pull request) is no landing: it is said with the
+/// pull requests.
 fn pr_events(pr: &Pr, out: &mut Vec<Item>) {
-    let key = format!("pr:{}#{}", pr.repo, pr.number);
-    let title = clean(&pr.title);
+    let (number, title) = (pr.number, clean(&pr.title));
     let who = |login: &Option<String>| clean(login.as_deref().unwrap_or("?"));
-    let mut say = |kind, what: &str, at_ms| {
-        out.push(event(
-            kind,
-            format!("{key}:{what}"),
-            at_ms,
-            true,
-            &pr.repo,
-            String::new(),
-        ));
+    let mut say = |kind, what: &str, at_ms, text: String| {
+        let key = format!("pr:{}#{number}:{what}", pr.repo);
+        out.push(event(kind, key, at_ms, true, &pr.repo, text));
     };
-    say(Kind::Opened, "opened", pr.created_ms);
-    let opened = out.len() - 1;
-    out[opened].text = format!("#{} opened by {}: {title}", pr.number, who(&pr.author));
-    let (kind, what, at_ms, text) = match (pr.merged_ms, pr.closed_ms) {
-        (Some(at), _) if pr.landed() => (
+    say(
+        Kind::Opened,
+        "opened",
+        pr.created_ms,
+        format!("#{number} opened by {}: {title}", who(&pr.author)),
+    );
+    match (pr.merged_ms, pr.closed_ms) {
+        (Some(at), _) if pr.landed() => say(
             Kind::Merged,
             "merged",
             at,
-            format!("#{} merged by {}: {title}", pr.number, who(&pr.merged_by)),
+            format!("#{number} merged by {}: {title}", who(&pr.merged_by)),
         ),
-        (Some(at), _) => (
+        (Some(at), _) => say(
             Kind::Closed,
             "merged",
             at,
-            format!(
-                "#{} merged into {}: {title}",
-                pr.number,
-                who(&pr.base).trim_start_matches('?')
-            ),
+            format!("#{number} merged into {}: {title}", who(&pr.base)),
         ),
-        (None, Some(at)) => (
+        (None, Some(at)) => say(
             Kind::Closed,
             "closed",
             at,
-            format!("#{} closed: {title}", pr.number),
+            format!("#{number} closed: {title}"),
         ),
-        (None, None) => return,
-    };
-    out.push(event(
-        kind,
-        format!("{key}:{what}"),
-        at_ms,
-        true,
-        &pr.repo,
-        text,
-    ));
+        (None, None) => {}
+    }
 }
 
 /// Everything the view can say now: from the session log, the proposals
@@ -760,16 +747,13 @@ fn one_line(news: &News) -> Option<String> {
         .collect();
     match mains.as_slice() {
         [] => {}
+        // `sykli main: 2 unproven (1 failed)`, as the digest says it.
         [one] => parts.push(format!(
-            "{} main {}",
+            "{} {}",
             one.repo,
-            if one.class == Some(Class::Failed) {
-                "failed"
-            } else {
-                "unproven"
-            }
+            one.text.split(" since ").next().unwrap_or(&one.text)
         )),
-        many => parts.push(format!("main unproven in {} repos", many.len())),
+        many => parts.push(format!("{} branches not proven", many.len())),
     }
     for (kind, one, many) in [
         (
@@ -800,15 +784,17 @@ fn one_line(news: &News) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
-    let tail = " · ohjaa digest";
+    // Whole parts only: what does not fit is left to the digest, said with `…`.
+    let (more, tail) = (" · …", " · ohjaa digest");
     let mut line = String::from("ohjaa");
     for (i, part) in parts.iter().enumerate() {
-        let more = if i + 1 < parts.len() { " · …" } else { "" };
-        if line.chars().count() + 3 + part.chars().count() + more.len() + tail.chars().count()
-            > WIDTH
-            && i > 0
-        {
-            line.push_str(" · …");
+        let after = if i + 1 < parts.len() { more } else { "" };
+        let width = [line.as_str(), " · ", part, after, tail]
+            .iter()
+            .map(|s| s.chars().count())
+            .sum::<usize>();
+        if width > WIDTH && i > 0 {
+            line.push_str(more);
             break;
         }
         line.push_str(" · ");
@@ -838,7 +824,11 @@ fn repo_width<'a>(items: impl Iterator<Item = &'a Item>) -> usize {
 /// Today's proposal in one line, with its id and the command that decides it.
 fn proposal_line(view: &View) -> Option<String> {
     let waiting = &view.waiting[view.today?];
-    let head = format!("  ? today's proposal {} ({})", waiting.name, waiting.scope);
+    let head = format!(
+        "  ? today's proposal {} ({})",
+        clean(&waiting.name),
+        clean(&waiting.scope)
+    );
     let tail = format!(" · {} wait · ohjaa review", view.waiting.len());
     let room = WIDTH.saturating_sub(head.chars().count() + tail.chars().count() + 2);
     let title = clean(&waiting.title);
@@ -943,7 +933,9 @@ fn full(view: &View, since_ms: i64, pending: Option<&str>) -> String {
         out.push_str(&cut(
             &format!(
                 "  {} ({}, since {})",
-                waiting.name, waiting.scope, waiting.since
+                clean(&waiting.name),
+                clean(&waiting.scope),
+                clean(&waiting.since)
             ),
             WIDTH,
         ));
@@ -1423,10 +1415,7 @@ mod tests {
         );
         let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
         assert!(line.chars().count() <= WIDTH + 1, "{line}");
-        assert!(
-            line.starts_with("ohjaa · main unproven in 3 repos"),
-            "{line}"
-        );
+        assert!(line.starts_with("ohjaa · 3 branches not proven"), "{line}");
         assert!(line.trim_end().ends_with("· ohjaa digest"), "{line}");
         // No ids in the line, and nothing raw from outside.
         assert!(!line.contains("oh-") && !line.contains("s1"), "{line}");
@@ -1502,7 +1491,10 @@ mod tests {
         collected.local.value.branches[2].tip = Some("newer".into());
         let view = build(&logged, Ok(Vec::new()), Some(&collected), NOW, 0);
         let line = one_line(&news(&view, &seen)).unwrap();
-        assert!(line.contains("failed main failed"), "{line}");
+        assert!(
+            line.contains("ohjaa · failed main: 1 unproven (1 failed) · ohjaa digest"),
+            "{line}"
+        );
     }
 
     #[test]
