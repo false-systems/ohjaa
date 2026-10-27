@@ -2272,12 +2272,20 @@ fn an_orphan_is_closed_with_its_agents_own_session_named() {
 }
 
 /// `ohjaa run claude` with the stand-in claude, given these env settings:
-/// the session's export record and leaving's stderr.
+/// the export record of the session this launch made, and leaving's stderr.
+/// That session is the one the log did not hold before it, never the latest
+/// by `started_ms`: a launch's time is a whole second, and launches a moment
+/// apart share one.
 fn run_fake_claude(
     fixture: &Fixture,
     repo: &Path,
     vars: &[(&str, &str)],
 ) -> (serde_json::Value, String) {
+    let ids = |export: &serde_json::Value| -> Vec<serde_json::Value> {
+        let sessions = export["sessions"].as_array().unwrap();
+        sessions.iter().map(|s| s["id"].clone()).collect()
+    };
+    let before = ids(&export_of(fixture, repo));
     let mut command = fixture.ohjaa();
     command
         .args(["run", "claude", "--intent", "native env"])
@@ -2289,15 +2297,15 @@ fn run_fake_claude(
     }
     let (_, stderr, code) = output_of(&mut command);
     assert_eq!(code, Some(0), "{stderr}");
-    let sessions = export_of(fixture, repo)["sessions"].clone();
-    let latest = sessions
+    let export = export_of(fixture, repo);
+    let made: Vec<&serde_json::Value> = export["sessions"]
         .as_array()
         .unwrap()
         .iter()
-        .max_by_key(|s| s["started_ms"].as_i64())
-        .unwrap()
-        .clone();
-    (latest, stderr)
+        .filter(|s| !before.contains(&s["id"]))
+        .collect();
+    assert_eq!(made.len(), 1, "one session per launch: {export:#}");
+    (made[0].clone(), stderr)
 }
 
 /// D7 by the environment: `oriented` and `handover`, run from the agent's
@@ -2306,6 +2314,11 @@ fn run_fake_claude(
 /// at the handover) both are kept; with none in the environment nothing
 /// changes; and a launch prompt and an environment naming different ones are
 /// both kept, the disagreement said.
+///
+/// Each launch is a new Claude session, with a transcript of its own. A
+/// launch given an earlier one's transcript would resume it, and ohjaa tells
+/// a resume by whether the transcript began before the launch's second:
+/// launches a moment apart share one, and the resume goes unseen.
 #[test]
 fn oriented_and_handover_record_the_agents_own_session_from_its_environment() {
     if !git_available() {
@@ -2315,8 +2328,13 @@ fn oriented_and_handover_record_the_agents_own_session_from_its_environment() {
     let repo = fixture.make_git_repo("work");
     fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
     fake_claude(&fixture);
+    // The session each launch's prompt is kept in (the fourth keeps none),
+    // and `cleared`, the one a `/clear` starts: the environment's alone.
     let first = "0a4b8c3e-0000-4000-8000-000000000001";
     let cleared = "0a4b8c3e-0000-4000-8000-000000000002";
+    let second = "0a4b8c3e-0000-4000-8000-000000000003";
+    let third = "0a4b8c3e-0000-4000-8000-000000000004";
+    let fifth = "0a4b8c3e-0000-4000-8000-000000000005";
 
     // Agreeing: one session, named by both.
     let (session, stderr) = run_fake_claude(
@@ -2348,8 +2366,8 @@ fn oriented_and_handover_record_the_agents_own_session_from_its_environment() {
         &fixture,
         &repo,
         &[
-            ("OHJAA_FAKE_NATIVE", first),
-            ("OHJAA_FAKE_ORIENTED", first),
+            ("OHJAA_FAKE_NATIVE", second),
+            ("OHJAA_FAKE_ORIENTED", second),
             ("OHJAA_FAKE_HANDED", cleared),
         ],
     );
@@ -2365,7 +2383,11 @@ fn oriented_and_handover_record_the_agents_own_session_from_its_environment() {
         })
         .collect();
     assert_eq!(ids.len(), 2, "{session:#}");
-    assert_eq!(ids[0].0, first);
+    assert_eq!(ids[0].0, second);
+    assert!(
+        ids[0].1.ends_with(&format!("/{second}.jsonl")),
+        "the first is observed by its launch prompt: {session:#}"
+    );
     assert_eq!(ids[1], (cleared, "env"));
     assert!(session["left"]["native"]["disagreement"].is_null());
     assert!(
@@ -2379,12 +2401,12 @@ fn oriented_and_handover_record_the_agents_own_session_from_its_environment() {
     let (session, _) = run_fake_claude(
         &fixture,
         &repo,
-        &[("OHJAA_FAKE_NATIVE", first), ("OHJAA_FAKE_ORIENTED", "-")],
+        &[("OHJAA_FAKE_NATIVE", third), ("OHJAA_FAKE_ORIENTED", "-")],
     );
     assert!(session["readback"].is_object(), "it read back: {session:#}");
     assert!(session["native_env"].is_null(), "{session:#}");
     let found = &session["left"]["native"]["sessions"][0];
-    assert_eq!(found["session_id"], first);
+    assert_eq!(found["session_id"], third, "{session:#}");
     assert!(found["env"].is_null(), "{session:#}");
 
     // Only the environment: a launch prompt never kept (late, or cleared
@@ -2412,17 +2434,17 @@ fn oriented_and_handover_record_the_agents_own_session_from_its_environment() {
     let (session, stderr) = run_fake_claude(
         &fixture,
         &repo,
-        &[("OHJAA_FAKE_NATIVE", first), ("OHJAA_FAKE_HANDED", cleared)],
+        &[("OHJAA_FAKE_NATIVE", fifth), ("OHJAA_FAKE_HANDED", cleared)],
     );
     let found = session["left"]["native"]["sessions"].as_array().unwrap();
     assert_eq!(found.len(), 1, "{session:#}");
-    assert_eq!(found[0]["session_id"], first);
+    assert_eq!(found[0]["session_id"], fifth);
     assert_eq!(
         session["native_env"][0]["session_id"], cleared,
         "the claim itself is kept as said: {session:#}"
     );
     let said = format!(
-        "native        disagreement: its launch prompt named claude {first}, and the agent's \
+        "native        disagreement: its launch prompt named claude {fifth}, and the agent's \
          environment claimed claude {cleared} instead (a /clear before its first read-back, or \
          a mistake): the launch prompt's is kept, the claim is not\n"
     );
