@@ -874,8 +874,8 @@ fn git(repo: &Path, args: &[&str]) -> Result<Option<String>> {
 /// Whether `branch` of `repo` was ever committed to, read from the files:
 /// git keeps a reflog of each branch beside the refs (unless
 /// `core.logAllRefUpdates` is off), written with its first commit and kept
-/// when its ref is lost. A repository whose refs live in a reftable has no
-/// such file, and reads as never committed to.
+/// when its ref is lost. (A reftable keeps no such file; git calls a
+/// damaged reftable branch broken, which warns.)
 fn had_commits(repo: &Path, branch: &str) -> bool {
     common_dir(repo).is_some_and(|common| common.join("logs/refs/heads").join(branch).is_file())
 }
@@ -1518,10 +1518,10 @@ pub fn draft(drafter: &str, prompt: &str) -> Result<Vec<Draft>, Failure> {
 // that person, and told to return nothing for it; and its answer is checked
 // here too. A draft whose title mostly repeats a present node's, in the same
 // scope (and repository), may be its duplicate. Only a person decides that:
-// it is written like any other proposal, and marked as a *possible
-// duplicate* of that node, which `ohjaa review` shows it after. Each draft
-// written in a run is present for every draft after it, in its batch and in
-// the batches after.
+// it is written like any other proposal, and said as a *possible duplicate*
+// of that node, in the run and whenever `ohjaa review` shows it (after that
+// node), derived each time and stored never. Each draft written in a run is
+// present for every draft after it, in its batch and in the batches after.
 
 /// At most this many characters of the prompt list what is already present.
 const KNOWN_BUDGET: usize = 24_000;
@@ -1556,15 +1556,13 @@ impl Present {
         }
     }
 
-    /// A proposal just written: waiting, like those written before this run.
-    pub fn proposed(proposal: &Proposal) -> Present {
+    /// A proposal just written, of `repo` for a repo one: waiting, like
+    /// those written before this run.
+    fn proposed(proposal: &Proposal, repo: Option<PathBuf>) -> Present {
         Present {
             id: proposal.id.clone(),
             scope: proposal.scope,
-            repo: proposal
-                .repo
-                .clone()
-                .filter(|_| proposal.scope == Scope::Repo),
+            repo: repo.filter(|_| proposal.scope == Scope::Repo),
             kind: proposal.kind,
             status: Status::Proposed,
             summary: proposal.body.trim().lines().next().unwrap_or("").to_owned(),
@@ -1619,6 +1617,8 @@ fn concerns(repo: &Path, batch: &[Candidate]) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct Known {
     nodes: Vec<Present>,
+    /// The repository ohjaa runs in: a repo proposal naming none is its.
+    repo_root: Option<PathBuf>,
 }
 
 impl Known {
@@ -1645,36 +1645,40 @@ impl Known {
                     }),
             )
             .collect();
-        Known { nodes }
+        Known {
+            nodes,
+            repo_root: repo_root.map(Path::to_path_buf),
+        }
+    }
+
+    /// The repository of a repo proposal, as `propose` files it: the one it
+    /// names, else the one ohjaa runs in.
+    fn repo_of(&self, proposal: &Proposal) -> Option<PathBuf> {
+        (proposal.scope == Scope::Repo)
+            .then(|| proposal.repo.clone().or_else(|| self.repo_root.clone()))
+            .flatten()
+    }
+
+    /// `proposal` as present once it is written, waiting.
+    pub fn present(&self, proposal: &Proposal) -> Present {
+        Present::proposed(proposal, self.repo_of(proposal))
     }
 
     pub fn add(&mut self, present: Present) {
         self.nodes.push(present);
     }
 
-    /// The id of the present node `proposal` may repeat, if any: one of the
-    /// same scope (and, for a repo one, the same repository) whose title its
-    /// own says mostly again ([`near`]); the nearest, and of those as near
-    /// the first (current knowledge comes before what waits). The node it
-    /// refines, current or waiting, and those it supersedes, are not
-    /// compared: a refinement is meant to say its base again, and to add to
-    /// it. A person decides whether it does repeat.
+    /// The id of the present node `proposal` may repeat, if any (see
+    /// [`nearest`]). A person decides whether it does.
     pub fn repeated_by(&self, proposal: &Proposal) -> Option<&str> {
-        let words = title_words(&proposal.id);
-        self.nodes
-            .iter()
-            .filter(|present| present.holds())
-            .filter(|present| {
-                present.scope == proposal.scope
-                    && (present.scope != Scope::Repo || present.repo == proposal.repo)
-            })
-            .filter(|present| {
-                proposal.refines.as_deref() != Some(present.id.as_str())
-                    && !proposal.supersedes.contains(&present.id)
-            })
-            .filter_map(|present| near(&words, &present.words).map(|score| (score, present)))
-            .min_by_key(|(score, _)| std::cmp::Reverse(*score))
-            .map(|(_, present)| present.id.as_str())
+        nearest(
+            self.nodes.iter(),
+            proposal.scope,
+            self.repo_of(proposal).as_deref(),
+            &proposal.id,
+            proposal.refines.as_deref(),
+            &proposal.supersedes,
+        )
     }
 
     /// The list the drafter is shown with `batch`, within [`KNOWN_BUDGET`]
@@ -1738,6 +1742,114 @@ impl Known {
             out,
         );
     }
+}
+
+/// The id of the node among `nodes` that the node `id` may repeat, if any:
+/// one present ([`Present::holds`]), of the same scope (and, for a repo one,
+/// the same repository), whose title its own says mostly again ([`near`]);
+/// the nearest, and of those as near the first. The node it refines,
+/// current or waiting, and those it supersedes, are not compared: a
+/// refinement is meant to say its base again, and to add to it.
+fn nearest<'a>(
+    nodes: impl Iterator<Item = &'a Present>,
+    scope: Scope,
+    repo: Option<&Path>,
+    id: &str,
+    refines: Option<&str>,
+    supersedes: &[String],
+) -> Option<&'a str> {
+    let words = title_words(id);
+    nodes
+        .filter(|present| present.holds() && present.id != id)
+        .filter(|present| {
+            present.scope == scope && (scope != Scope::Repo || present.repo.as_deref() == repo)
+        })
+        .filter(|present| refines != Some(present.id.as_str()) && !supersedes.contains(&present.id))
+        .filter_map(|present| near(&words, &present.words).map(|score| (score, present)))
+        .min_by_key(|(score, _)| std::cmp::Reverse(*score))
+        .map(|(_, present)| present.id.as_str())
+}
+
+/// For each of `waiting`, in its order, the id of the node it may repeat,
+/// derived now ([`nearest`]) and stored never: among current knowledge and
+/// the proposals that came before it, older, or as old and stored first. Of
+/// two near proposals the later is the possible duplicate, never both.
+/// Superseded and retired nodes are not present. A person decides.
+pub fn possible_duplicates(
+    loaded: &Loaded,
+    waiting: &[knowledge::Pending],
+    repo_root: Option<&Path>,
+) -> Vec<Option<String>> {
+    let current: Vec<Present> = loaded
+        .nodes
+        .iter()
+        .filter(|located| located.node.status != Status::Proposed)
+        .map(|located| Present::new(located.scope, repo_root, &located.node))
+        .collect();
+    let proposed: Vec<Present> = waiting
+        .iter()
+        .map(|pending| Present::new(pending.scope, pending.repo.as_deref(), &pending.node))
+        .collect();
+    let came = |i: usize| (waiting[i].node.as_of, i);
+    waiting
+        .iter()
+        .enumerate()
+        .map(|(i, pending)| {
+            let before = proposed
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| came(*j) < came(i))
+                .map(|(_, present)| present);
+            nearest(
+                current.iter().chain(before),
+                pending.scope,
+                pending.repo.as_deref(),
+                &pending.node.id,
+                pending.node.refines.as_deref(),
+                &pending.node.supersedes,
+            )
+            .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The waiting proposals, each with what it may repeat, in the order a
+/// person reviews them: as found, with each possible duplicate right after
+/// the one it may repeat, when that one waits too.
+pub fn review_order(
+    waiting: Vec<(knowledge::Pending, Option<String>)>,
+) -> Vec<(knowledge::Pending, Option<String>)> {
+    let ids: BTreeSet<String> = waiting.iter().map(|(p, _)| p.node.id.clone()).collect();
+    let follows = |of: &Option<String>| of.as_ref().filter(|of| ids.contains(*of)).cloned();
+    let mut rest: Vec<Option<(knowledge::Pending, Option<String>)>> =
+        waiting.into_iter().map(Some).collect();
+    let mut order = Vec::with_capacity(rest.len());
+    for start in 0..rest.len() {
+        if rest[start]
+            .as_ref()
+            .is_none_or(|(_, of)| follows(of).is_some())
+        {
+            continue;
+        }
+        let mut stack = vec![start];
+        while let Some(at) = stack.pop() {
+            let Some(item) = rest[at].take() else {
+                continue;
+            };
+            // Its followers in their order, the first on top.
+            let after: Vec<usize> = (0..rest.len())
+                .filter(|i| {
+                    rest[*i].as_ref().is_some_and(|(_, of)| {
+                        follows(of).as_deref() == Some(item.0.node.id.as_str())
+                    })
+                })
+                .collect();
+            stack.extend(after.into_iter().rev());
+            order.push(item);
+        }
+    }
+    order.extend(rest.into_iter().flatten());
+    order
 }
 
 /// Words that carry no lesson in a title.
@@ -3112,7 +3224,6 @@ mod tests {
                 path: PathBuf::from(format!("/proposals/{}/{id}.md", scope.name())),
                 node: lesson(id, Status::Proposed, "A lesson waiting."),
                 staged: true,
-                duplicate_of: None,
             })
             .collect();
         Known::of(&loaded, &waiting, Some(Path::new("/r/here")))
@@ -3349,7 +3460,8 @@ mod tests {
         );
         let lima = proposing(Ours, None, "lima-for-linux", None, &[]);
         assert_eq!(two.repeated_by(&lima), None);
-        two.add(Present::proposed(&lima));
+        let written = two.present(&lima);
+        two.add(written);
         assert_eq!(
             two.repeated_by(&proposing(Ours, None, "linux-for-lima", None, &[])),
             Some("lima-for-linux")
@@ -3374,6 +3486,117 @@ mod tests {
     }
 
     #[test]
+    fn a_repo_proposal_naming_no_repository_is_compared_in_the_one_it_is_made_in() {
+        // The re-review of #61: `propose` files it under the repository it
+        // runs in, and the comparison looked in none.
+        let present = known(&[(
+            Scope::Repo,
+            Some("/r/here"),
+            "rauha-linux-only",
+            Status::Proposed,
+        )]);
+        let unnamed = proposing(Scope::Repo, None, "rauha-is-linux-only", None, &[]);
+        assert_eq!(present.repeated_by(&unnamed), Some("rauha-linux-only"));
+        let mut empty = Known::of(&Loaded::default(), &[], Some(Path::new("/r/here")));
+        let written = empty.present(&unnamed);
+        empty.add(written);
+        assert_eq!(
+            empty.repeated_by(&proposing(
+                Scope::Repo,
+                Some("/r/here"),
+                "rauha-runs-linux-only",
+                None,
+                &[]
+            )),
+            Some("rauha-is-linux-only")
+        );
+    }
+
+    #[test]
+    fn a_waiting_proposal_is_shown_as_a_possible_duplicate_of_what_came_before_it() {
+        // The re-review of #61: the mark is derived when a person reviews,
+        // and stored never.
+        use Scope::{Mine, Ours, Repo};
+        let loaded = Loaded {
+            nodes: [
+                ("rust-elixir-only", Status::Current),
+                ("leave-a-handover-always", Status::Retired),
+            ]
+            .into_iter()
+            .map(|(id, status)| faija_knowledge::Located {
+                scope: Mine,
+                node: lesson(id, status, "In a scope."),
+            })
+            .collect(),
+            ..Loaded::default()
+        };
+        let waiting = |scope: Scope, repo: Option<&str>, id: &str, day: &str| knowledge::Pending {
+            scope,
+            repo: repo.map(PathBuf::from),
+            path: PathBuf::from(format!("/proposals/{id}.md")),
+            node: Node {
+                as_of: parse_date(day).unwrap(),
+                ..lesson(id, Status::Proposed, "Waiting.")
+            },
+            staged: true,
+        };
+        let all = vec![
+            waiting(
+                Ours,
+                None,
+                "read-back-briefing-and-leave-handover",
+                "2026-10-27",
+            ),
+            waiting(Ours, None, "read-briefing-and-leave-handover", "2026-10-26"),
+            waiting(Mine, None, "code-is-rust-or-elixir", "2026-10-27"),
+            waiting(Mine, None, "always-leave-a-handover", "2026-10-27"),
+            waiting(Repo, Some("/r/tapio"), "tapio-linux-only", "2026-10-27"),
+            waiting(Repo, Some("/r/rauha"), "rauha-linux-only", "2026-10-26"),
+            waiting(Repo, Some("/r/rauha"), "rauha-is-linux-only", "2026-10-27"),
+            // As old as each other: the one stored first came before.
+            waiting(Ours, None, "start-sessions-through-ohjaa-run", "2026-10-27"),
+            waiting(Ours, None, "start-agents-through-ohjaa-run", "2026-10-27"),
+        ];
+        let marks = possible_duplicates(&loaded, &all, None);
+        let of = |id: &str| Some(id.to_owned());
+        assert_eq!(
+            marks,
+            [
+                // Of the older one; never the other way round.
+                of("read-briefing-and-leave-handover"),
+                None,
+                of("rust-elixir-only"),
+                // A retired node is not present.
+                None,
+                // Another repository's words are another lesson.
+                None,
+                None,
+                of("rauha-linux-only"),
+                None,
+                of("start-sessions-through-ohjaa-run"),
+            ]
+        );
+        let order: Vec<String> = review_order(all.into_iter().zip(marks).collect())
+            .into_iter()
+            .map(|(pending, _)| pending.node.id)
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "read-briefing-and-leave-handover",
+                "read-back-briefing-and-leave-handover",
+                "code-is-rust-or-elixir",
+                "always-leave-a-handover",
+                "tapio-linux-only",
+                "rauha-linux-only",
+                "rauha-is-linux-only",
+                "start-sessions-through-ohjaa-run",
+                "start-agents-through-ohjaa-run",
+            ]
+        );
+    }
+
+    #[test]
     fn a_proposed_node_in_a_scope_directory_is_listed_once() {
         let node = lesson("x-y-z", Status::Proposed, "Committed for review.");
         let loaded = Loaded {
@@ -3389,7 +3612,6 @@ mod tests {
             path: PathBuf::from("/ours/knowledge/x-y-z.md"),
             node,
             staged: false,
-            duplicate_of: None,
         }];
         assert_eq!(Known::of(&loaded, &waiting, None).nodes.len(), 1);
     }
@@ -3427,7 +3649,6 @@ mod tests {
                 path: PathBuf::new(),
                 node: lesson(&format!("lesson-{n}"), Status::Proposed, &body),
                 staged: true,
-                duplicate_of: None,
             })
             .collect();
         let (text, _) = prompt(&Known::of(&Loaded::default(), &waiting, None), &[]);
@@ -3565,7 +3786,6 @@ mod tests {
             path: PathBuf::from("/proposals/ours/api-token.md"),
             node: lesson("api-token", Status::Proposed, &straddling),
             staged: true,
-            duplicate_of: None,
         }];
         let (text, redacted) = prompt(&Known::of(&loaded, &waiting, None), &[]);
         assert!(!text.contains(&key[..8]), "{text}");

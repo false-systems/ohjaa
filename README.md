@@ -196,17 +196,18 @@ present. When a correction shows that a present node is not reaching agents,
 or adds to it, it names that node in `refines` and says what was missed, and
 that is how such a node gets noticed.
 
-**A draft that may repeat what is present is written, and marked for a
+**A draft that may repeat what is present is written, and said to a
 person.** Every draft costs a person a review, and only a person decides
 what is Knowledge, so the drafter's answer is checked too, and nothing in it
 is dropped. A draft whose title says mostly what the title of a present node
-of its own scope says (for a repo one, of its own repository) is written like
-any other proposal, and marked as a *possible duplicate* of that node, the
-nearest one. Present means current, or proposed and waiting; a superseded or
-retired node is not. The node a draft refines, current or waiting, and those
-it supersedes, are not compared: a refinement says its base again by design,
-and is kept as refining it (one refining a proposal still waiting can be
-accepted once that one is).
+of its own scope says (for a repo one, of its own repository: the one it
+names, else the one intake runs in) is written like any other proposal, and
+said to be a *possible duplicate* of that node, the nearest one. Present
+means current, or proposed and waiting; a superseded or retired node is not.
+The node a draft refines, current or waiting, and those it supersedes, are
+not compared: a refinement says its base again by design, and is kept as
+refining it (one refining a proposal still waiting can be accepted once that
+one is).
 - A node's title is its id: its words, lowercased, without filler (`a`,
   `the`, `and`, `with`, …), each with one common ending cut (`-ing`, `-ed`,
   `-es`, `-s` but not `-ss`, `-e`).
@@ -214,18 +215,19 @@ accepted once that one is).
   words are at least 60% of both: Dice's coefficient, 2·shared / (a + b) ≥
   0.6.
 
-The mark is one line beside the proposal (`<id>.duplicate-of`, the id of
-what it may repeat). `ohjaa review` shows a marked proposal right after the
-one it may repeat when that one waits too, and the first line of it when it
-is current; accepting or rejecting the proposal removes its mark. A run says
-`proposed <id>, marked as a possible duplicate of <present id>`, and its
-summary counts the marked ones by what they may repeat. Each draft written is
-present for every draft after it, in its answer and in the batches after.
-Among the 131 ids present after the first real run, 8 pairs are near, each
-one lesson; the review of #61 made up distinct lessons that are near too
-(`tapio-linux-only` and `rauha-linux-only`, two valvo LSM lessons, a
+Nothing of it is stored: it is derived each time it is said. A run says
+`proposed <id>, a possible duplicate of <present id>`, and its summary counts
+them by what they may repeat; each draft written is present for every draft
+after it, in its answer and in the batches after. `ohjaa review` works it out
+again for every waiting proposal, against current knowledge and the
+proposals that came before it (older, or as old and stored first), so of two
+near ones only the later is said, and shows it right after the one it may
+repeat when that one waits too, with the first line of it when it is
+current. Among the 131 ids present after the first real run, 8 pairs are
+near, each one lesson; the review of #61 made up distinct lessons that are
+near too (`tapio-linux-only` and `rauha-linux-only`, two valvo LSM lessons, a
 correction that reuses the words of what it corrects), which is why a near
-draft is marked, never refused. The same lesson in other words
+draft is said, never refused. The same lesson in other words
 (`gate-before-pushing-main`, `prove-with-ohjaa-gate-before-merging`: 0.44)
 is the drafter's to see, shown both.
 
@@ -276,8 +278,8 @@ candidates that were handled, never back.
   unread, and holds nothing. git refuses it in words it also uses for a
   branch whose ref was lost (a loose ref deleted, `packed-refs` cut short);
   a lost ref keeps its reflog, so a branch with one is said as lost, warns
-  and holds the cursor. With reflogs off (`core.logAllRefUpdates`), or refs
-  in a reftable, a lost ref reads as empty. git is asked in the C locale,
+  and holds the cursor. With reflogs off (`core.logAllRefUpdates`), a lost
+  ref reads as empty. git is asked in the C locale,
   `LANGUAGE` removed, and no git process more is spent on this. One git
   cannot read at all (its `.git` names nothing, a garbage ref, a missing
   object) warns, and holds the cursor.

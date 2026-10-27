@@ -1634,12 +1634,12 @@ fn waiting_proposal(dir: &Path, id: &str, body: &str) -> (PathBuf, String) {
 }
 
 #[test]
-fn a_draft_that_may_repeat_what_is_present_is_written_marked_for_a_person() {
+fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
     // Intake's first real run, 2026-10-27, wrote 108 proposals, four of them
     // one lesson ("read back the briefing and leave a handover"). The review
     // of #61: refusing what looks repeated drops real lessons for good
     // (`tapio-linux-only` as `rauha-linux-only`), and a person is the only
-    // one who decides. So each is written, and marked for that person.
+    // one who decides. So each is written, and said to that person.
     if !git_available() {
         return;
     }
@@ -1780,65 +1780,63 @@ fn a_draft_that_may_repeat_what_is_present_is_written_marked_for_a_person() {
     );
     for line in [
         // Near a proposal waiting before the run.
-        "proposed start-agents-through-ohjaa-run, marked as a possible duplicate of \
-         start-sessions-through-ohjaa-run",
+        "proposed start-agents-through-ohjaa-run, a possible duplicate of \
+         start-sessions-through-ohjaa-run\n",
         // Near current knowledge of its scope.
-        "proposed code-is-rust-or-elixir, marked as a possible duplicate of rust-elixir-only",
+        "proposed code-is-rust-or-elixir, a possible duplicate of rust-elixir-only\n",
         "proposed rust-elixir-only-everywhere\n",
         "proposed read-back-briefing-and-leave-handover\n",
         // Near a draft written earlier in the same answer,
-        "proposed read-briefing-and-leave-handover, marked as a possible duplicate of \
-         read-back-briefing-and-leave-handover",
+        "proposed read-briefing-and-leave-handover, a possible duplicate of \
+         read-back-briefing-and-leave-handover\n",
         // and in a batch before.
-        "proposed ohjaa-read-back-briefing-and-leave-handover, marked as a possible duplicate \
-         of read-back-briefing-and-leave-handover",
+        "proposed ohjaa-read-back-briefing-and-leave-handover, a possible duplicate of \
+         read-back-briefing-and-leave-handover\n",
         // A refinement of a waiting proposal is kept, as refining it.
         "proposed pi-sessions-need-a-wrapper-too\n",
         // The same words of another repository are another lesson.
         "proposed tapio-linux-only\n",
         "proposed lima-for-linux\n",
-        "9 proposal(s) waiting for review (`ohjaa review`), 4 of them marked as possible \
-         duplicates, 0 draft(s) refused",
+        "9 proposal(s) waiting for review (`ohjaa review`), 4 of them possible duplicates, 0 \
+         draft(s) refused",
         "possible duplicates: of read-back-briefing-and-leave-handover ×2, of rust-elixir-only \
          ×1, of start-sessions-through-ohjaa-run ×1",
     ] {
         assert!(stdout.contains(line), "{line}\n{stdout}");
     }
-    // Nothing drafted is lost: every draft waits for a person, marked.
-    let mark = |scope: &str, id: &str| {
-        fs::read_to_string(proposals.join(scope).join(format!("{id}.duplicate-of"))).ok()
-    };
-    for (scope, id, of) in [
-        (
-            "ours",
-            "start-agents-through-ohjaa-run",
-            Some("start-sessions-through-ohjaa-run"),
-        ),
-        ("mine", "code-is-rust-or-elixir", Some("rust-elixir-only")),
-        ("ours", "rust-elixir-only-everywhere", None),
-        ("ours", "read-back-briefing-and-leave-handover", None),
-        (
-            "ours",
-            "read-briefing-and-leave-handover",
-            Some("read-back-briefing-and-leave-handover"),
-        ),
-        (
-            "ours",
-            "ohjaa-read-back-briefing-and-leave-handover",
-            Some("read-back-briefing-and-leave-handover"),
-        ),
-        ("ours", "pi-sessions-need-a-wrapper-too", None),
-        ("machine", "lima-for-linux", None),
+    // Nothing drafted is lost: every draft waits for a person, and nothing
+    // is stored beside it (the re-review of #61: a possible duplicate is
+    // derived when a person reviews).
+    for (scope, id) in [
+        ("ours", "start-agents-through-ohjaa-run"),
+        ("mine", "code-is-rust-or-elixir"),
+        ("ours", "rust-elixir-only-everywhere"),
+        ("ours", "read-back-briefing-and-leave-handover"),
+        ("ours", "read-briefing-and-leave-handover"),
+        ("ours", "ohjaa-read-back-briefing-and-leave-handover"),
+        ("ours", "pi-sessions-need-a-wrapper-too"),
+        ("machine", "lima-for-linux"),
     ] {
         assert!(
             proposals.join(scope).join(format!("{id}.md")).is_file(),
             "{id}"
         );
-        assert_eq!(mark(scope, id), of.map(|of| format!("{of}\n")), "{id}");
     }
+    let mut stored = Vec::new();
+    let mut folders = vec![proposals.clone()];
+    while let Some(folder) = folders.pop() {
+        for entry in fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if path.extension().is_none_or(|ext| ext != "md") {
+                stored.push(path);
+            }
+        }
+    }
+    assert_eq!(stored, Vec::<PathBuf>::new(), "only proposals are stored");
     let tapio_dir = proposals.join("repo").join(encoded(&tapio));
     assert!(tapio_dir.join("tapio-linux-only.md").is_file());
-    assert!(!tapio_dir.join("tapio-linux-only.duplicate-of").exists());
     let refinement =
         fs::read_to_string(proposals.join("ours/pi-sessions-need-a-wrapper-too.md")).unwrap();
     assert!(
