@@ -1017,10 +1017,15 @@ file, and every later apply and dry run, and `ohjaa doctor`, say so again
 until you fix the file by hand. A home whose `.git` is a file (a worktree)
 keeps the lock in the folder that file names. A linked worktree keeps the
 allowlist there too, as `ohjaa.exclude`, which the home's `git add` is given
-as its excludes file (in place of the global one, for that one command):
-git reads the common folder's `info/exclude` for every worktree of the
-repository, and the allowlist begins by leaving out everything, which
-would hide the other worktrees' new files. A bare
+as its excludes file: git reads the common folder's `info/exclude` for every
+worktree of the repository, and the allowlist begins by leaving out
+everything, which would hide the other worktrees' new files. That file
+takes the global excludes file's place for that one command, so it holds
+your own excludes file's lines (`core.excludesFile`, else
+`~/.config/git/ignore`), read for each commit, and then the allowlist: the
+allowlist decides wherever it matches, and your patterns (a merge tool's
+`*.orig`) everywhere else, as they do below `info/exclude` in a plain home.
+The repository's shared `info/exclude` is still read above both. A bare
 dotfiles repository (`git --git-dir=~/.dotfiles --work-tree=~`) has no `.git`
 above the file, so ohjaa cannot see that a file is in it: give such an
 agent's file no block by putting one of your own there.

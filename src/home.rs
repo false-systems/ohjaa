@@ -456,36 +456,86 @@ fn without_allowlist(now: &str) -> Option<(String, usize)> {
 
 /// The allowlist, as a marked block beside anything else in the file git
 /// reads it from, kept untracked so the home needs no file of its own: the
-/// home's repository's own `info/exclude`. A home that is a linked worktree
-/// keeps it in its own worktree folder instead (`ohjaa.exclude`), and that
-/// file is returned, to give `git add` as its excludes file: git reads the
-/// common folder's `info/exclude` for every worktree of the repository, and
-/// the allowlist begins by leaving out everything. A block an earlier ohjaa
-/// wrote there is taken out.
-fn keep_out_strays(home: &Path) -> Result<Option<PathBuf>> {
+/// home's repository's own `info/exclude`, which outranks the person's own
+/// excludes file, read below it. A home that is a linked worktree keeps it in
+/// its own worktree folder instead (`ohjaa.exclude`), and that file is
+/// returned, to give `git add` as its excludes file: git reads the common
+/// folder's `info/exclude` for every worktree of the repository, and the
+/// allowlist begins by leaving out everything. That file holds the person's
+/// own excludes (`person`, read for each commit) and then the allowlist: as
+/// the last pattern that matches decides, the allowlist decides wherever it
+/// matches, and the person's patterns everywhere else, as they would below
+/// `info/exclude`. A block an earlier ohjaa wrote in the shared file is
+/// taken out.
+fn keep_out_strays(
+    home: &Path,
+    person: impl FnOnce() -> Result<String>,
+) -> Result<Option<PathBuf>> {
     let (git_dir, common) = repository_dirs(home);
     let shared = common.join("info").join("exclude");
-    let linked = git_dir != common;
-    let path = if linked {
+    let block = format!("{EXCLUDE_BEGIN}\n{}\n{EXCLUDE_END}\n", EXCLUDE.join("\n"));
+    if git_dir != common {
         let now = read_or_empty(&shared)?;
         if let Some((without, _)) = without_allowlist(&now) {
             write_file(&shared, &without, None)?;
         }
-        git_dir.join("ohjaa.exclude")
-    } else {
-        shared
-    };
-    let now = read_or_empty(&path)?;
-    let block = format!("{EXCLUDE_BEGIN}\n{}\n{EXCLUDE_END}\n", EXCLUDE.join("\n"));
+        let path = git_dir.join("ohjaa.exclude");
+        let mut person = person()?;
+        if !person.is_empty() && !person.ends_with('\n') {
+            person.push('\n');
+        }
+        let new = format!(
+            "# Written by ohjaa for each commit in its home: the person's own excludes, then\n\
+             # the allowlist, which decides wherever it matches.\n{person}{block}"
+        );
+        if read_or_empty(&path)? != new {
+            write_file(&path, &new, None)?;
+        }
+        return Ok(Some(path));
+    }
+    let now = read_or_empty(&shared)?;
     let new = match without_allowlist(&now) {
         Some((without, at)) => format!("{}{block}{}", &without[..at], &without[at..]),
         None if now.is_empty() || now.ends_with('\n') => format!("{now}{block}"),
         None => format!("{now}\n{block}"),
     };
     if new != now {
-        write_file(&path, &new, None)?;
+        write_file(&shared, &new, None)?;
     }
-    Ok(linked.then_some(path))
+    Ok(None)
+}
+
+/// The person's own excludes file, as git finds it for the home: its
+/// `core.excludesFile` (from any of git's configs), else git's default,
+/// `$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`; its text, or
+/// nothing when there is none. One git process.
+fn person_excludes(home: &Path) -> Result<String> {
+    let args = ["config", "--path", "--get", "core.excludesFile"];
+    let mut command = Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(home.join(".git"))
+        .args(args)
+        .current_dir(home);
+    for var in REPOSITORY_VARS {
+        command.env_remove(var);
+    }
+    let file = match value_of(&mut command, &args)? {
+        Some(file) => Some(PathBuf::from(file)),
+        None => std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|home| !home.is_empty())
+                    .map(|home| PathBuf::from(home).join(".config"))
+            })
+            .map(|dir| dir.join("git").join("ignore")),
+    };
+    match file {
+        Some(file) => read_or_empty(&file),
+        None => Ok(String::new()),
+    }
 }
 
 /// The variables that would point git at another repository than the home.
@@ -603,8 +653,8 @@ pub fn commit(home: &Path, message: &str, lock: Option<&process::FileLock>) -> R
         // No template (`init.templateDir`): no hook is copied in.
         home_git(home, &["init", "-q", "--template="], false, lock)?;
     }
-    let excludes =
-        keep_out_strays(home)?.map(|file| format!("core.excludesFile={}", file.display()));
+    let excludes = keep_out_strays(home, || person_excludes(home))?
+        .map(|file| format!("core.excludesFile={}", file.display()));
     let mut add: Vec<&str> = Vec::new();
     if let Some(excludes) = &excludes {
         add.extend(["-c", excludes]);
@@ -831,12 +881,19 @@ mod tests {
         let lock = lock(&home).expect("the lock");
         assert!(store.join("worktrees/home/ohjaa.lock").is_file());
         drop(lock);
-        keep_out_strays(&home).unwrap();
-        keep_out_strays(&home).unwrap();
+        for _ in 0..2 {
+            let given = keep_out_strays(&home, || Ok("*.orig".to_owned())).unwrap();
+            assert_eq!(given, Some(git_dir.join("ohjaa.exclude")));
+        }
         let shared = std::fs::read_to_string(store.join("info/exclude")).unwrap();
         assert_eq!(shared, "# the person's\n*.log\nbuild/\n");
+        // The person's own excludes, then the allowlist, which decides
+        // wherever it matches.
         let exclude = std::fs::read_to_string(store.join("worktrees/home/ohjaa.exclude")).unwrap();
         assert_eq!(exclude.matches(EXCLUDE_BEGIN).count(), 1, "{exclude}");
+        let (person, allowlist) = exclude.split_once(EXCLUDE_BEGIN).unwrap();
+        assert!(person.ends_with("\n*.orig\n"), "{exclude}");
+        assert!(allowlist.trim_end().ends_with(EXCLUDE_END), "{exclude}");
         let names: Vec<_> = std::fs::read_dir(&home)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
