@@ -1905,7 +1905,7 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     let lock = decision_lock();
     let dirs = dirs()?;
     let today = knowledge::today();
-    let mut asker = lessons::Asker::default();
+    let mut asker = lessons::Asker::new(roots::load(&[], dirs.repo_root.as_deref()));
     let ready = match action {
         "accept" => screen_accept(&dirs, id, &mut asker)?,
         _ => None,
@@ -2044,7 +2044,7 @@ fn cmd_review(list: bool) -> Result<i32> {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     let today = knowledge::today();
-    let mut asker = lessons::Asker::default();
+    let mut asker = lessons::Asker::new(roots::load(&[], dirs.repo_root.as_deref()));
     for (pending, of) in &reviewed {
         show_pending(pending, of.as_deref(), &loaded, &waiting);
         print!("  [a]ccept  [r]eject  [s]kip  [q]uit > ");
@@ -2087,8 +2087,8 @@ fn cmd_lessons_publish(roots: &[PathBuf], repos: &[PathBuf], dry_run: bool) -> R
     let today = knowledge::today();
     let mut checkouts = Vec::new();
     let mut complete = true;
+    let roots = roots::load(roots, dirs.repo_root.as_deref());
     if repos.is_empty() {
-        let roots = roots::load(roots, dirs.repo_root.as_deref());
         checkouts = lessons::waiting(&dirs.state, &roots::git_repos(&roots)?);
     } else {
         for repo in repos {
@@ -2108,7 +2108,7 @@ fn cmd_lessons_publish(roots: &[PathBuf], repos: &[PathBuf], dry_run: bool) -> R
         );
         return Ok(0);
     }
-    let mut asker = lessons::Asker::default();
+    let mut asker = lessons::Asker::new(roots);
     for checkout in &checkouts {
         let mut said = Vec::new();
         let extra = lessons::untracked(checkout, &mut said);

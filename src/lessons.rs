@@ -295,12 +295,26 @@ pub fn with_lessons(
 
 // ---- the deny list ----------------------------------------------------------
 
-/// What the person keeps private, as GitHub lists it to them: the names of
-/// their private repositories, and their login and name.
+/// What the person keeps private: the names of their private repositories,
+/// as GitHub lists them to gh, and of those under their roots that gh does
+/// not show as public; and their login and name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Private {
     pub repos: Vec<String>,
     pub people: Vec<String>,
+    /// Names of repositories under the roots whose visibility is not known
+    /// to be public (no GitHub remote, or gh does not show it).
+    pub unlisted: Vec<String>,
+}
+
+/// The repositories GitHub lists to gh: the names of those not public, the
+/// names of the public ones, and every one's `owner/name`, all lower case
+/// but `private`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    pub private: Vec<String>,
+    pub public: BTreeSet<String>,
+    pub listed: BTreeSet<String>,
 }
 
 /// Every repository the person can see, as GitHub's REST API lists them to
@@ -341,10 +355,10 @@ pub fn parse_user(output: &[u8]) -> Result<Vec<String>, String> {
     Ok(people)
 }
 
-/// The names of the repositories `gh api user/repos?… --paginate` printed
-/// (one JSON array, or one per page) that are not public.
-pub fn parse_repos(output: &[u8]) -> Result<Vec<String>, String> {
-    let mut names = Vec::new();
+/// The repositories `gh api user/repos?… --paginate` printed (one JSON
+/// array, or one per page).
+pub fn parse_repos(output: &[u8]) -> Result<Listing, String> {
+    let mut listing = Listing::default();
     let mut pages = 0;
     for page in serde_json::Deserializer::from_slice(output).into_iter::<Value>() {
         let page = page.map_err(|error| format!("gh printed no answer GitHub gave: {error}"))?;
@@ -365,15 +379,20 @@ pub fn parse_repos(output: &[u8]) -> Result<Vec<String>, String> {
                 Some(visibility) => visibility.eq_ignore_ascii_case("public"),
                 None => repo["private"].as_bool() == Some(false),
             };
-            if !public {
-                add_once(&mut names, name);
+            if public {
+                listing.public.insert(name.to_lowercase());
+            } else {
+                add_once(&mut listing.private, name);
+            }
+            if let Some(full) = repo["full_name"].as_str() {
+                listing.listed.insert(full.to_lowercase());
             }
         }
     }
     if pages == 0 {
         return Err("gh printed nothing".to_owned());
     }
-    Ok(names)
+    Ok(listing)
 }
 
 /// Everything a line that goes to a repository that is not private may not
@@ -419,6 +438,15 @@ impl DenyList {
         for name in &private.repos {
             if !name.eq_ignore_ascii_case(own) {
                 list.add(name, "the name of a private repository of yours", true);
+            }
+        }
+        for name in &private.unlisted {
+            if !name.eq_ignore_ascii_case(own) {
+                list.add(
+                    name,
+                    "the name of a repository under your roots that gh does not show as public",
+                    true,
+                );
             }
         }
         let account = home
@@ -873,22 +901,28 @@ pub struct Ready {
     pub deny: Option<DenyList>,
 }
 
-/// The facts one run asks once: the person's private context.
+/// The facts one run asks once: the person's private context, checked
+/// against the repositories under their roots.
 #[derive(Debug, Default)]
 pub struct Asker {
+    roots: Vec<PathBuf>,
     private: Option<Result<Private, String>>,
 }
 
 impl Asker {
+    /// An asker for a run whose person keeps their repositories under
+    /// `roots` (ohjaa's roots file, else the repository's siblings).
+    pub fn new(roots: Vec<PathBuf>) -> Asker {
+        Asker {
+            roots,
+            private: None,
+        }
+    }
+
     fn private(&mut self) -> Result<Private, String> {
+        let roots = self.roots.clone();
         self.private
-            .get_or_insert_with(|| {
-                let people =
-                    gh(&["api", "user"], None, GH).and_then(|out| parse_user(out.as_bytes()))?;
-                let repos = gh(&["api", PRIVATE_REPOS, "--paginate"], None, GH)
-                    .and_then(|out| parse_repos(out.as_bytes()))?;
-                Ok(Private { repos, people })
-            })
+            .get_or_insert_with(|| private_context(&roots))
             .clone()
     }
 
@@ -947,6 +981,86 @@ impl Asker {
             deny,
         })
     }
+}
+
+/// The person's private context, never trusted from gh's list alone: a list
+/// that holds no private repository is refused, and so is one that lacks a
+/// repository found under `roots` that gh does not show as public (a token
+/// that sees one organisation, an account switched). The name of every
+/// repository under the roots gh does not show as public counts as private.
+fn private_context(roots: &[PathBuf]) -> Result<Private, String> {
+    let people = gh(&["api", "user"], None, GH).and_then(|out| parse_user(out.as_bytes()))?;
+    let listing = gh(&["api", PRIVATE_REPOS, "--paginate"], None, GH)
+        .and_then(|out| parse_repos(out.as_bytes()))?;
+    if listing.private.is_empty() {
+        return Err(
+            "gh lists none of your repositories as private or internal, so what is sent cannot \
+             be checked against them (is gh signed in to the account that owns them?)"
+                .to_owned(),
+        );
+    }
+    let under = crate::roots::git_repos(roots).map_err(|error| {
+        format!("the repositories under your roots cannot be listed: {error:#}")
+    })?;
+    let mut unlisted = Vec::new();
+    let mut viewed: BTreeMap<String, bool> = BTreeMap::new();
+    for repo in under {
+        let slug = github_slug(&repo).ok();
+        let public = match &slug {
+            Some(slug) if listing.listed.contains(&slug.to_lowercase()) => {
+                let name = slug.rsplit('/').next().unwrap_or(slug);
+                listing.public.contains(&name.to_lowercase())
+            }
+            Some(slug) => match viewed.get(slug) {
+                Some(public) => *public,
+                None => {
+                    let visibility = gh(&["repo", "view", slug, "--json", "visibility"], None, GH)
+                        .and_then(|out| {
+                            serde_json::from_str::<Value>(&out)
+                                .map_err(|error| error.to_string())?["visibility"]
+                                .as_str()
+                                .map(str::to_owned)
+                                .ok_or_else(|| "no visibility".to_owned())
+                        });
+                    match visibility {
+                        Ok(visibility) if visibility.eq_ignore_ascii_case("PUBLIC") => {
+                            viewed.insert(slug.clone(), true);
+                            true
+                        }
+                        Ok(visibility) => {
+                            return Err(format!(
+                                "gh's list of your repositories is not complete: it lacks {slug} \
+                                 (under your roots at {}), which gh says is {}",
+                                repo.display(),
+                                visibility.to_ascii_lowercase()
+                            ))
+                        }
+                        Err(why) => {
+                            return Err(format!(
+                                "gh's list of your repositories is not complete: it lacks {slug} \
+                                 (under your roots at {}), which gh cannot show: {why}",
+                                repo.display()
+                            ))
+                        }
+                    }
+                }
+            },
+            None => false,
+        };
+        if !public {
+            if let Some(dir) = repo.file_name() {
+                add_once(&mut unlisted, &dir.to_string_lossy());
+            }
+            if let Some(name) = slug.as_deref().and_then(|slug| slug.rsplit('/').next()) {
+                add_once(&mut unlisted, name);
+            }
+        }
+    }
+    Ok(Private {
+        repos: listing.private,
+        people,
+        unlisted,
+    })
 }
 
 /// Before a person's accept of a repo proposal: what its delivery needs,
@@ -1999,6 +2113,7 @@ mod tests {
                 "widget".to_owned(),
             ],
             people: vec!["octo-gh".to_owned(), "Octo Cat".to_owned()],
+            ..Private::default()
         };
         let deny = DenyList::build(&private, Some(Path::new("/Users/octocat")), "acme/widget");
         assert!(
@@ -2042,6 +2157,7 @@ mod tests {
                 .map(str::to_owned)
                 .to_vec(),
             people: Vec::new(),
+            ..Private::default()
         };
         let deny = DenyList::build(&private, None, "acme/widget");
         for hidden in [
@@ -2122,6 +2238,7 @@ mod tests {
         let private = Private {
             repos: vec!["secret-thing".to_owned()],
             people: vec!["octocat".to_owned(), "Octo Cat".to_owned()],
+            ..Private::default()
         };
         // The person's own public repository: their login is in its URL.
         let deny = DenyList::build(&private, Some(Path::new("/Users/octocat")), "octocat/site");
@@ -2152,9 +2269,9 @@ mod tests {
         assert!(parse_user(br#"{"message":"Bad credentials"}"#).is_err());
         // One array, as gh joins the pages, or one per page.
         let joined = br#"[{"name":"a","full_name":"o/a"},{"name":"b"},{"name":"a"}]"#;
-        assert_eq!(parse_repos(joined).unwrap(), vec!["a", "b"]);
+        assert_eq!(parse_repos(joined).unwrap().private, vec!["a", "b"]);
         let pages = b"[{\"name\":\"a\"}]\n[{\"name\":\"c\"}]";
-        assert_eq!(parse_repos(pages).unwrap(), vec!["a", "c"]);
+        assert_eq!(parse_repos(pages).unwrap().private, vec!["a", "c"]);
         assert!(parse_repos(b"").is_err());
         assert!(parse_repos(br#"{"message":"Not Found"}"#)
             .unwrap_err()
@@ -2166,10 +2283,14 @@ mod tests {
             {"name":"inner","visibility":"internal","private":true},
             {"name":"closed","visibility":"private","private":true},
             {"name":"old-public","private":false},{"name":"unsaid"}]"#;
+        let listing = parse_repos(mixed).unwrap();
+        assert_eq!(listing.private, vec!["inner", "closed", "unsaid"]);
         assert_eq!(
-            parse_repos(mixed).unwrap(),
-            vec!["inner", "closed", "unsaid"]
+            listing.public.iter().collect::<Vec<_>>(),
+            vec!["old-public", "open"]
         );
+        let full = br#"[{"name":"A","full_name":"Acme/A","visibility":"private"}]"#;
+        assert!(parse_repos(full).unwrap().listed.contains("acme/a"));
     }
 
     #[test]
