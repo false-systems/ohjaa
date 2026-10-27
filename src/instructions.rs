@@ -8,7 +8,8 @@
 //! | Codex       | `$CODEX_HOME` (else `~/.codex`)`/AGENTS.override.md`, `AGENTS.md` |
 //! | pi          | `$PI_CODING_AGENT_DIR` (else `~/.pi/agent`)`/AGENTS.override.md`, |
 //! |             | `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`                |
-//! | opencode    | `$XDG_CONFIG_HOME` (else `~/.config`)`/opencode/AGENTS.md`        |
+//! | opencode    | `$OPENCODE_CONFIG_DIR` (else `$XDG_CONFIG_HOME/opencode`, else    |
+//! |             | `~/.config/opencode`)`/AGENTS.md`                                 |
 //!
 //! ohjaa writes only inside its marked block (the kind `brief --write`
 //! writes, opened by [`knowledge::INSTRUCTIONS_BEGIN`]), never the text
@@ -45,6 +46,9 @@ pub struct Target {
     pub usual: PathBuf,
     /// Its folder exists: the agent is set up on this machine.
     pub installed: bool,
+    /// The folder the file is in, and the variables that move it.
+    pub dir: PathBuf,
+    pub moved_by: &'static str,
 }
 
 /// Every agent's own instruction file, each where the agent finds it itself.
@@ -60,61 +64,87 @@ pub fn target_of(command: &str) -> Option<Target> {
     let key = Path::new(command).file_name()?.to_str()?;
     table()
         .into_iter()
-        .find(|(_, row_key, _, _)| *row_key == key)
+        .find(|row| row.key == key)
         .and_then(target)
 }
 
-type Row = (
-    &'static str,
-    &'static str,
-    Option<PathBuf>,
-    &'static [&'static str],
-);
+/// An agent, its key, the folder its own file is in (from the environment
+/// alone), the names it reads there, the first that exists, and the
+/// variables that move that folder.
+struct Row {
+    agent: &'static str,
+    key: &'static str,
+    dir: Option<PathBuf>,
+    names: &'static [&'static str],
+    moved_by: &'static str,
+}
 
-/// Each agent, its key, the folder its own file is in (from the environment
-/// alone) and the names it reads there, the first that exists.
 fn table() -> [Row; 4] {
     let stores = crate::usage::Stores::from_env();
-    let opencode = knowledge::config_home()
-        .ok()
-        .map(|dir| dir.join("opencode"));
+    // opencode 2.1.4: `OPENCODE_CONFIG_DIR`, when it is not empty, else
+    // `$XDG_CONFIG_HOME/opencode`.
+    let opencode = std::env::var_os("OPENCODE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            knowledge::config_home()
+                .ok()
+                .map(|dir| dir.join("opencode"))
+        });
     [
-        ("Claude Code", "claude", stores.claude, &["CLAUDE.md"]),
-        (
-            "Codex",
-            "codex",
-            stores.codex,
-            &["AGENTS.override.md", "AGENTS.md"],
-        ),
-        (
-            "pi",
-            "pi",
-            stores.pi,
-            &[
+        Row {
+            agent: "Claude Code",
+            key: "claude",
+            dir: stores.claude,
+            names: &["CLAUDE.md"],
+            moved_by: "CLAUDE_CONFIG_DIR",
+        },
+        Row {
+            agent: "Codex",
+            key: "codex",
+            dir: stores.codex,
+            names: &["AGENTS.override.md", "AGENTS.md"],
+            moved_by: "CODEX_HOME",
+        },
+        Row {
+            agent: "pi",
+            key: "pi",
+            dir: stores.pi,
+            names: &[
                 "AGENTS.override.md",
                 "AGENTS.md",
                 "AGENTS.MD",
                 "CLAUDE.md",
                 "CLAUDE.MD",
             ],
-        ),
-        ("opencode", "opencode", opencode, &["AGENTS.md"]),
+            moved_by: "PI_CODING_AGENT_DIR",
+        },
+        Row {
+            agent: "opencode",
+            key: "opencode",
+            dir: opencode,
+            names: &["AGENTS.md"],
+            moved_by: "OPENCODE_CONFIG_DIR, else XDG_CONFIG_HOME",
+        },
     ]
 }
 
 /// A row's target: the first of its names that is a file.
-fn target((agent, key, dir, names): Row) -> Option<Target> {
-    let dir = dir?;
+fn target(row: Row) -> Option<Target> {
+    let dir = row.dir?;
+    let names = row.names;
     let usual = dir.join(if names.len() > 1 { names[1] } else { names[0] });
     Some(Target {
-        agent,
-        key,
+        agent: row.agent,
+        key: row.key,
         file: names
             .iter()
             .map(|name| dir.join(name))
             .find(|path| path.is_file()),
         usual,
         installed: dir.is_dir(),
+        dir,
+        moved_by: row.moved_by,
     })
 }
 
@@ -170,6 +200,16 @@ pub fn source(command: &str, args: &[String], compact: &Compact) -> Option<Sourc
     let target = target_of(command)?;
     let agent = target.agent;
     let carried = |why: String| Some(Source::Briefing { agent, why });
+    // The agent resolves a relative folder where it starts, which is not
+    // where ohjaa is: the file it reads cannot be told from here.
+    if target.dir.is_relative() {
+        return carried(format!(
+            "its folder, {}, is not an absolute path ({}), so ohjaa cannot tell which file it \
+             reads",
+            target.dir.display(),
+            target.moved_by
+        ));
+    }
     let looked = target.file.as_deref().unwrap_or(&target.usual);
     if let Some(why) = not_read(target.key, args, looked, |name| std::env::var_os(name)) {
         return carried(why);
@@ -202,47 +242,81 @@ pub fn source(command: &str, args: &[String], compact: &Compact) -> Option<Sourc
 
 /// Why the agent `key`, launched with `args` in the environment `var`
 /// reads, will not read its own instruction file `file`, when its own
-/// options or variables say so (Claude Code 2.1.311, from its `--help` and
-/// what it does):
-/// - `--bare` and `--safe-mode`, before its own `--`, and their variables
-///   `CLAUDE_CODE_SIMPLE` and `CLAUDE_CODE_SAFE_MODE` when truthy as it
-///   reads them (`1`, `true`, `yes`, `on`, in any case), skip every CLAUDE.md;
-/// - `--setting-sources` without `user` skips the user's own CLAUDE.md;
-/// - `CLAUDE_CONFIG_DIR` set but empty is taken as is, so the file is not
-///   the one under `~/.claude` that an empty variable means to ohjaa.
+/// options or variables say so. Only what comes before the agent's own
+/// `--` is its options. From each agent's `--help` and what it does:
 ///
-/// Codex 0.164.0 has no option or setting in `codex --help` or `codex exec
-/// --help` that skips `$CODEX_HOME/AGENTS.md`, nor do pi and opencode here.
+/// - Claude Code 2.1.311: `--bare` and `--safe-mode`, and their variables
+///   `CLAUDE_CODE_SIMPLE` and `CLAUDE_CODE_SAFE_MODE` when truthy as it
+///   reads them (`1`, `true`, `yes`, `on`, in any case), skip every
+///   CLAUDE.md; `--setting-sources` without `user` skips the user's own; and
+///   `CLAUDE_CONFIG_DIR` set but empty is taken as is, so the file is not
+///   the one under `~/.claude` that an empty variable means to ohjaa.
+/// - pi 1.2.0: `--no-context-files` and `-nc` skip every AGENTS.md and
+///   CLAUDE.md. No variable does.
+/// - opencode 2.1.4: `--server <url>` hands the session to a server, which
+///   reads its own instructions. No option or variable skips its own
+///   `AGENTS.md` (`OPENCODE_DISABLE_PROJECT_CONFIG` skips the project's).
+/// - Codex 0.164.0: no option in `codex --help` or `codex exec --help`
+///   skips `$CODEX_HOME/AGENTS.md` (`--ignore-user-config` skips its
+///   `config.toml`).
 fn not_read(
     key: &str,
     args: &[String],
     file: &Path,
     var: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<String> {
-    if key != "claude" {
-        return None;
-    }
     let options: Vec<&str> = args
         .iter()
         .map(String::as_str)
         .take_while(|arg| *arg != "--")
         .collect();
+    // An option's value, written `--name value` or `--name=value`, and how
+    // it was written.
+    let valued = |at: usize, name: &str| -> Option<String> {
+        match options[at].strip_prefix(name)? {
+            "" => options.get(at + 1).map(|value| format!("{name} {value}")),
+            joined => joined
+                .strip_prefix('=')
+                .map(|value| format!("{name}={value}")),
+        }
+    };
+    match key {
+        "pi" => options
+            .iter()
+            .find(|option| matches!(**option, "--no-context-files" | "-nc"))
+            .map(|option| {
+                format!("`{option}` is passed to pi, which then reads no AGENTS.md or CLAUDE.md")
+            }),
+        "opencode" => (0..options.len())
+            .find_map(|at| valued(at, "--server"))
+            .map(|server| {
+                format!(
+                    "`{server}` is passed to opencode, so a server ohjaa cannot see reads its \
+                     own instructions"
+                )
+            }),
+        "claude" => claude_not_read(&options, file, &var, valued),
+        _ => None,
+    }
+}
+
+fn claude_not_read(
+    options: &[&str],
+    file: &Path,
+    var: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    valued: impl Fn(usize, &str) -> Option<String>,
+) -> Option<String> {
     for (at, option) in options.iter().enumerate() {
         if matches!(*option, "--bare" | "--safe-mode") {
             return Some(format!(
                 "`{option}` is passed to Claude Code, which then reads no CLAUDE.md"
             ));
         }
-        let sources = match option.strip_prefix("--setting-sources") {
-            Some("") => options.get(at + 1).map(|value| (*value, " ")),
-            Some(value) => value.strip_prefix('=').map(|value| (value, "=")),
-            None => None,
-        };
-        if let Some((value, joined)) = sources {
+        if let Some(sources) = valued(at, "--setting-sources") {
+            let value = &sources["--setting-sources".len() + 1..];
             if !value.split(',').any(|source| source.trim() == "user") {
                 return Some(format!(
-                    "`--setting-sources{joined}{value}` leaves out `user`, so Claude Code does \
-                     not read {}",
+                    "`{sources}` leaves out `user`, so Claude Code does not read {}",
                     file.display()
                 ));
             }
