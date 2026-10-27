@@ -122,9 +122,11 @@ enum Cmd {
         #[arg(long, value_name = "PATH", conflicts_with = "write")]
         scope: Vec<String>,
         /// The agent the briefing is for, as `ohjaa run` names it (claude,
-        /// codex, pi, opencode): as run does, mine and machine are left out
-        /// when that agent's own instruction file holds them current, and
-        /// the briefing says where they come from.
+        /// codex, pi, opencode): as run does, what that agent's own
+        /// instruction file holds current is left out, unless its
+        /// environment says it will not read the file, and the briefing
+        /// says where mine and machine come from. The arguments `ohjaa run
+        /// … -- <args>` would give the agent are not known here.
         #[arg(long, value_name = "COMMAND", conflicts_with = "write")]
         agent: Option<String>,
         /// Write the knowledge as a generated block into this file (repeatable),
@@ -745,12 +747,19 @@ struct Briefed {
 }
 
 /// The knowledge section of the briefing for these scopes, within its
-/// budget, and exactly which nodes it delivers. For `agent`, the command
-/// `ohjaa run` launches: when its own instruction file holds mine and
-/// machine current, they are left out but for a flagged one; either way
-/// that is said, in one line. Broken files are reported on stderr, out loud,
-/// and so is a briefing the budget cut; a flag is shown beside its node.
-fn knowledge_briefing_for(dirs: &Dirs, scopes: &[Scope], agent: Option<&str>) -> Result<Briefed> {
+/// budget (the one line about mine and machine included), and exactly which
+/// nodes it delivers. For `agent`, the command `ohjaa run` launches and the
+/// arguments it gives it: when that agent reads its own instruction file
+/// and the file holds mine and machine current, the briefing leaves out
+/// what the file holds, but for a flagged node, and carries what it does
+/// not; either way that is said, in one line. Broken files are reported on
+/// stderr, out loud, and so is a briefing the budget cut; a flag is shown
+/// beside its node.
+fn knowledge_briefing_for(
+    dirs: &Dirs,
+    scopes: &[Scope],
+    agent: Option<(&str, &[String])>,
+) -> Result<Briefed> {
     let loaded = knowledge::load(dirs)?;
     for broken in &loaded.broken {
         eprintln!(
@@ -769,38 +778,56 @@ fn knowledge_briefing_for(dirs: &Dirs, scopes: &[Scope], agent: Option<&str>) ->
     // whether it does.
     let own = agent
         .filter(|_| current.iter().any(|located| home.contains(&located.scope)))
-        .and_then(|agent| {
+        .and_then(|(agent, args)| {
             let compact = knowledge::render_compact(&loaded, &home, knowledge::DEFAULT_BUDGET);
-            instructions::source(agent, &compact).map(|source| (source, compact))
+            instructions::source(agent, args, &compact).map(|source| (source, compact))
         });
     let left_out = match &own {
         Some((instructions::Source::OwnFile { file, .. }, compact)) => Some((file, compact)),
         _ => None,
     };
     let flagged = |id: &str| flags.iter().any(|flag| flag.id() == id);
+    // What the agent's own file holds, when the briefing leaves it to it.
+    let held = |located: &fk::Located| {
+        left_out.is_some_and(|(_, compact)| {
+            home.contains(&located.scope) && compact.held.contains(&located.node.id)
+        })
+    };
     let shown: Vec<&fk::Located> = current
         .iter()
         .copied()
-        .filter(|located| {
-            left_out.is_none() || !home.contains(&located.scope) || flagged(&located.node.id)
-        })
+        .filter(|located| !held(located) || flagged(&located.node.id))
         .collect();
-    let within = knowledge::render_within(shown, &flags, knowledge::DEFAULT_BUDGET);
+    // The line is part of the section, so its room is kept first: as long
+    // as the longest it can come to.
+    let repeatable: Vec<&str> = shown
+        .iter()
+        .filter(|located| held(located))
+        .map(|located| located.node.id.as_str())
+        .collect();
+    let room = own.as_ref().map_or(0, |(source, compact)| {
+        source_line(source, compact, &repeatable, compact.more).len() + 2
+    });
+    let within = knowledge::render_within(
+        shown,
+        &flags,
+        knowledge::DEFAULT_BUDGET.saturating_sub(room),
+    );
     if let Some(over) = within.over(knowledge::DEFAULT_BUDGET) {
         eprintln!("ohjaa: {over}");
     }
+    let kept = |located: &fk::Located| within.kept.iter().any(|kept| std::ptr::eq(*kept, located));
     let delivered = current
         .iter()
         .filter_map(|located| {
-            let via = if within.kept.iter().any(|kept| std::ptr::eq(*kept, *located)) {
+            let via = if kept(located) {
                 None
+            } else if held(located) {
+                // Delivered by the agent's own file.
+                left_out.map(|(file, _)| file.to_string_lossy().into_owned())
             } else {
-                // Left out: delivered by the agent's own file, if it holds it.
-                let (file, compact) = left_out.filter(|_| home.contains(&located.scope))?;
-                if !compact.held.contains(&located.node.id) {
-                    return None;
-                }
-                Some(file.to_string_lossy().into_owned())
+                // Named only by count.
+                return None;
             };
             Some(sessions::Delivered {
                 id: located.node.id.clone(),
@@ -813,48 +840,69 @@ fn knowledge_briefing_for(dirs: &Dirs, scopes: &[Scope], agent: Option<&str>) ->
             })
         })
         .collect();
-    let source = own.map(|(source, compact)| match source {
-        instructions::Source::OwnFile { agent, file } => {
-            let count = match compact.more {
-                0 => format!(
-                    "{} node{}",
-                    compact.shown,
-                    if compact.shown == 1 { "" } else { "s" }
-                ),
-                more => format!(
-                    "{} of {} nodes; {more} more: `ohjaa list`",
-                    compact.shown,
-                    compact.shown + more
-                ),
-            };
-            let repeated: Vec<&str> = within
-                .kept
-                .iter()
-                .filter(|located| home.contains(&located.scope))
-                .map(|located| located.node.id.as_str())
-                .collect();
-            format!(
-                "Mine and machine ({count}) are not repeated here: {agent} has them from its \
-                 own instructions, {}, whose ohjaa block is current.{}",
-                file.display(),
-                if repeated.is_empty() {
-                    String::new()
-                } else {
-                    format!(" Flagged, so repeated above: {}.", repeated.join(", "))
-                }
-            )
-        }
-        instructions::Source::Briefing { agent, why } => {
-            format!(
-                "Mine and machine are carried here, not left to {agent}'s own instructions: {why}."
-            )
-        }
+    let source = own.as_ref().map(|(source, compact)| {
+        let repeated: Vec<&str> = within
+            .kept
+            .iter()
+            .filter(|located| held(located))
+            .map(|located| located.node.id.as_str())
+            .collect();
+        let counted = current
+            .iter()
+            .filter(|located| home.contains(&located.scope) && !held(located) && !kept(located))
+            .count();
+        source_line(source, compact, &repeated, counted)
     });
     Ok(Briefed {
         text: within.text,
         delivered,
         source,
     })
+}
+
+/// The one line about where mine and machine come from. For the agent's own
+/// file: how many nodes it holds, and when it holds not all of them, that
+/// the others are above, `counted` of them only by count; `repeated`, the
+/// ones it holds that are above too, being flagged.
+fn source_line(
+    source: &instructions::Source,
+    compact: &knowledge::Compact,
+    repeated: &[&str],
+    counted: usize,
+) -> String {
+    let flagged = if repeated.is_empty() {
+        String::new()
+    } else {
+        format!(" Flagged, so repeated above: {}.", repeated.join(", "))
+    };
+    match source {
+        instructions::Source::OwnFile { agent, file } if compact.more == 0 => format!(
+            "Mine and machine ({} node{}) are not repeated here: {agent} has them from its own \
+             instructions, {}, whose ohjaa block is current.{flagged}",
+            compact.shown,
+            if compact.shown == 1 { "" } else { "s" },
+            file.display()
+        ),
+        instructions::Source::OwnFile { agent, file } => format!(
+            "Mine and machine: {agent} has {} of their {} nodes from its own instructions, {}, \
+             whose ohjaa block is current; the other {} {} above{}.{flagged}",
+            compact.shown,
+            compact.shown + compact.more,
+            file.display(),
+            compact.more,
+            if compact.more == 1 { "is" } else { "are" },
+            if counted == 0 {
+                String::new()
+            } else {
+                format!(", {counted} of them only by count")
+            }
+        ),
+        instructions::Source::Briefing { agent, why } => {
+            format!(
+                "Mine and machine are carried here, not left to {agent}'s own instructions: {why}."
+            )
+        }
+    }
 }
 
 /// Shared/personal knowledge once, plus the knowledge of each named repo,
@@ -864,7 +912,7 @@ fn knowledge_briefing_for(dirs: &Dirs, scopes: &[Scope], agent: Option<&str>) ->
 fn knowledge_for_work(
     dirs: &Dirs,
     scoped: &[PathBuf],
-    agent: Option<&str>,
+    agent: Option<(&str, &[String])>,
 ) -> Result<(String, Vec<sessions::Delivered>)> {
     let Briefed {
         mut text,
@@ -1050,7 +1098,7 @@ fn cmd_brief(
         return Ok(0);
     }
     let (scoped, unscoped) = scoped_repos(scope, dirs.repo_root.as_deref());
-    let (knowledge, _) = knowledge_for_work(&dirs, &scoped, agent)?;
+    let (knowledge, _) = knowledge_for_work(&dirs, &scoped, agent.map(|agent| (agent, &[][..])))?;
     for path in &unscoped {
         eprintln!("ohjaa: --scope {path} is not inside a Git repository; no repository knowledge or context was read there");
     }
@@ -2917,7 +2965,8 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let briefing = if no_briefing {
         None
     } else {
-        let (knowledge, nodes) = knowledge_for_work(&dirs, &scoped_repos, Some(agent))?;
+        let (knowledge, nodes) =
+            knowledge_for_work(&dirs, &scoped_repos, Some((agent, passthrough)))?;
         delivered = nodes;
         // sykli is asked about each pending validation shown, once.
         let runs = lifecycle::RunStatus::default();

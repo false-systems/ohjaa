@@ -435,32 +435,43 @@ pub struct Within<'a> {
     pub more: usize,
     /// How long the rendering of every node would be.
     pub full: usize,
+    /// The budget it was rendered within.
+    pub budget: usize,
 }
 
 impl Within<'_> {
     /// What is said on stderr when the budget cut it, or its decisions
-    /// alone are over it.
-    pub fn over(&self, budget: usize) -> Option<String> {
-        if self.more > 0 {
-            let rest = self
-                .kept
-                .iter()
-                .filter(|located| located.node.kind != Kind::Decision)
-                .count();
-            Some(format!(
-                "the knowledge is {} characters, over the {budget} an agent will reliably read: \
-                 the briefing holds every decision and {rest} more, and names the other {} by \
-                 count; merge or retire some (`ohjaa check`)",
-                self.full, self.more
-            ))
-        } else if self.text.len() > budget {
-            Some(format!(
-                "the knowledge's decisions alone are {} characters, over the {budget} an agent \
-                 will reliably read; merge or retire some (`ohjaa check`)",
-                self.text.len()
-            ))
+    /// alone are over it, naming `said` as the budget: the one a reader is
+    /// told of (the section's, of which this rendering may be a part).
+    pub fn over(&self, said: usize) -> Option<String> {
+        let full = self.full;
+        let (more, len) = (self.more, self.text.len());
+        let advice = "merge or retire some (`ohjaa check`)";
+        let rest = self
+            .kept
+            .iter()
+            .filter(|located| located.node.kind != Kind::Decision)
+            .count();
+        let holds = if rest == 0 {
+            "its decisions alone".to_owned()
         } else {
-            None
+            format!("every decision and {rest} more")
+        };
+        match (len > self.budget, more) {
+            (true, 0) => Some(format!(
+                "the knowledge is {full} characters, all of it decisions, over the {said} an \
+                 agent will reliably read: the briefing holds every one; {advice}"
+            )),
+            (true, more) => Some(format!(
+                "the knowledge is {full} characters, and its decisions alone are over the {said} \
+                 an agent will reliably read: the briefing holds every decision, in {len} \
+                 characters, and names the other {more} by count; {advice}"
+            )),
+            (false, 0) => None,
+            (false, more) => Some(format!(
+                "the knowledge is {full} characters, over the {said} an agent will reliably \
+                 read: the briefing holds {holds}, and names the other {more} by count; {advice}"
+            )),
         }
     }
 }
@@ -503,6 +514,7 @@ fn within<'a>(
             kept: nodes,
             more: 0,
             full,
+            budget,
         };
     }
     let mut keep: Vec<bool> = nodes
@@ -536,6 +548,7 @@ fn within<'a>(
         kept: chosen(&keep),
         more,
         full,
+        budget,
     }
 }
 

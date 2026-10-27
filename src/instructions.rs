@@ -161,14 +161,19 @@ pub enum Source {
     Briefing { agent: &'static str, why: String },
 }
 
-/// For the agent `command` launches, whether its own instruction file holds
-/// `compact` (mine and machine, as apply would write them now) current.
-/// `None` for a command that is no agent ohjaa writes the own file of. One
-/// file is read, and no git runs.
-pub fn source(command: &str, compact: &Compact) -> Option<Source> {
+/// For the agent `command` launches with `args` (what follows the command),
+/// whether it reads its own instruction file, and that file holds `compact`
+/// (mine and machine, as apply would write them now) current. `None` for a
+/// command that is no agent ohjaa writes the own file of. One file is read,
+/// and no git runs.
+pub fn source(command: &str, args: &[String], compact: &Compact) -> Option<Source> {
     let target = target_of(command)?;
     let agent = target.agent;
     let carried = |why: String| Some(Source::Briefing { agent, why });
+    let looked = target.file.as_deref().unwrap_or(&target.usual);
+    if let Some(why) = not_read(target.key, args, looked, |name| std::env::var_os(name)) {
+        return carried(why);
+    }
     let Some(file) = target.file else {
         return carried(format!("{} does not exist", target.usual.display()));
     };
@@ -193,6 +198,75 @@ pub fn source(command: &str, compact: &Compact) -> Option<Source> {
             "{shown} cannot be read as one ohjaa block ({error})"
         )),
     }
+}
+
+/// Why the agent `key`, launched with `args` in the environment `var`
+/// reads, will not read its own instruction file `file`, when its own
+/// options or variables say so (Claude Code 2.1.311, from its `--help` and
+/// what it does):
+/// - `--bare` and `--safe-mode`, before its own `--`, and their variables
+///   `CLAUDE_CODE_SIMPLE` and `CLAUDE_CODE_SAFE_MODE` when truthy as it
+///   reads them (`1`, `true`, `yes`, `on`, in any case), skip every CLAUDE.md;
+/// - `--setting-sources` without `user` skips the user's own CLAUDE.md;
+/// - `CLAUDE_CONFIG_DIR` set but empty is taken as is, so the file is not
+///   the one under `~/.claude` that an empty variable means to ohjaa.
+///
+/// Codex 0.164.0 has no option or setting in `codex --help` or `codex exec
+/// --help` that skips `$CODEX_HOME/AGENTS.md`, nor do pi and opencode here.
+fn not_read(
+    key: &str,
+    args: &[String],
+    file: &Path,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<String> {
+    if key != "claude" {
+        return None;
+    }
+    let options: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .take_while(|arg| *arg != "--")
+        .collect();
+    for (at, option) in options.iter().enumerate() {
+        if matches!(*option, "--bare" | "--safe-mode") {
+            return Some(format!(
+                "`{option}` is passed to Claude Code, which then reads no CLAUDE.md"
+            ));
+        }
+        let sources = match option.strip_prefix("--setting-sources") {
+            Some("") => options.get(at + 1).map(|value| (*value, " ")),
+            Some(value) => value.strip_prefix('=').map(|value| (value, "=")),
+            None => None,
+        };
+        if let Some((value, joined)) = sources {
+            if !value.split(',').any(|source| source.trim() == "user") {
+                return Some(format!(
+                    "`--setting-sources{joined}{value}` leaves out `user`, so Claude Code does \
+                     not read {}",
+                    file.display()
+                ));
+            }
+        }
+    }
+    for name in ["CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_SAFE_MODE"] {
+        let Some(value) = var(name) else { continue };
+        let value = value.to_string_lossy().into_owned();
+        if matches!(
+            value.trim().to_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ) {
+            return Some(format!(
+                "{name}={value} is in the environment, so Claude Code reads no CLAUDE.md"
+            ));
+        }
+    }
+    if var("CLAUDE_CONFIG_DIR").is_some_and(|value| value.is_empty()) {
+        return Some(format!(
+            "CLAUDE_CONFIG_DIR is set but empty, so Claude Code does not read {}",
+            file.display()
+        ));
+    }
+    None
 }
 
 /// The repository a file is inside, from the file system (a `.git` beside

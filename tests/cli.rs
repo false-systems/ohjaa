@@ -5702,15 +5702,16 @@ fn a_briefing_too_big_for_one_command_line_argument_is_refused_clearly() {
                 .current_dir(&repo),
         )
     };
-    fixture.node(&mine, "big", "fact", &"long knowledge ".repeat(500));
+    fixture.node(&mine, "big", "fact", &"long knowledge ".repeat(450));
     let (_, stderr, code) = launch();
     assert_eq!(code, Some(0), "{stderr}");
-    // A fact past the budget is named by count, not sent.
+    // A fact past the budget is named by count, not sent. (The budget holds the
+    // line saying why Codex is briefed with mine and machine, too.)
     fixture.node(&mine, "huge", "fact", &"long knowledge ".repeat(8_000));
     let (_, stderr, code) = launch();
     assert_eq!(code, Some(0), "{stderr}");
     assert!(stderr.contains("\n1 more: `ohjaa list`\n"), "{stderr}");
-    assert_eq!(stderr.matches("long knowledge").count(), 500);
+    assert_eq!(stderr.matches("long knowledge").count(), 450);
     // Every decision is sent in full, however long. Linux caps one argument
     // at 128 KiB, and the briefing is one, twice.
     fixture.node(&mine, "huge-rule", "decision", &"long rule ".repeat(12_000));
