@@ -1044,7 +1044,10 @@ instructions: /Users/you/.codex/AGENTS.md does not exist.`), when:
   - pi 1.2.0 given `--no-context-files` or `-nc` reads no AGENTS.md or
     CLAUDE.md;
   - opencode 2.1.4 given `--server <url>` leaves its instructions to that
-    server;
+    server; without `--standalone` it leaves them to its background
+    service, which reads them with the environment it was started with, so
+    when `OPENCODE_CONFIG_DIR` or `XDG_CONFIG_HOME` is set (they move the
+    file) the service may read another file than the one ohjaa checked;
   - Codex 0.164.0 has no option that skips its own `AGENTS.md`;
 - the folder the file is in is not an absolute path (a relative
   `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR` or

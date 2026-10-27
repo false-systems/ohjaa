@@ -254,7 +254,10 @@ pub fn source(command: &str, args: &[String], compact: &Compact) -> Option<Sourc
 /// - pi 1.2.0: `--no-context-files` and `-nc` skip every AGENTS.md and
 ///   CLAUDE.md. No variable does.
 /// - opencode 2.1.4: `--server <url>` hands the session to a server, which
-///   reads its own instructions. No option or variable skips its own
+///   reads its own instructions, and so does no `--standalone` to its
+///   background service, which reads them with the environment it was
+///   started with: carried when OPENCODE_CONFIG_DIR or XDG_CONFIG_HOME is set
+///   here ([`opencode_service`]). No option or variable skips its own
 ///   `AGENTS.md` (`OPENCODE_DISABLE_PROJECT_CONFIG` skips the project's).
 /// - Codex 0.164.0: no option in `codex --help` or `codex exec --help`
 ///   skips `$CODEX_HOME/AGENTS.md` (`--ignore-user-config` skips its
@@ -294,10 +297,38 @@ fn not_read(
                     "`{server}` is passed to opencode, so a server ohjaa cannot see reads its \
                      own instructions"
                 )
-            }),
+            })
+            .or_else(|| opencode_service(&options, &var)),
         "claude" => claude_not_read(&options, file, &var, valued),
         _ => None,
     }
+}
+
+/// opencode without `--standalone` hands the session to its background
+/// service, which reads its own AGENTS.md with the environment it was
+/// started with. ohjaa cannot see that environment: where this one moves the
+/// file (OPENCODE_CONFIG_DIR, XDG_CONFIG_HOME, either not empty), the
+/// service may read another, so the briefing carries the knowledge. With
+/// neither set, both name the usual file.
+fn opencode_service(
+    options: &[&str],
+    var: &impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<String> {
+    if options.contains(&"--standalone") {
+        return None;
+    }
+    let set: Vec<&str> = ["OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"]
+        .into_iter()
+        .filter(|name| var(name).is_some_and(|value| !value.is_empty()))
+        .collect();
+    (!set.is_empty()).then(|| {
+        format!(
+            "opencode hands the session to its background service unless `--standalone` is \
+             passed, and the service reads its own instructions with the environment it was \
+             started with, which may not set {} as this one does",
+            set.join(" and ")
+        )
+    })
 }
 
 fn claude_not_read(
