@@ -513,8 +513,20 @@ fn ran(command: &mut Command) -> Ran {
     }
 }
 
+/// Write an executable that no process holds open for writing when it runs.
+/// Linux refuses to exec a file any process has open for writing (ETXTBSY),
+/// and a child another test thread forks holds a copy of every descriptor
+/// this process has open until that child execs: a file written here, then
+/// closed, even renamed, can still be open for writing in such a child at
+/// the moment it is run. So this process writes only the text, beside it,
+/// and `cp`, a process of its own that forks nothing, writes the executable.
 fn write_executable(path: &Path, text: &str) {
-    fs::write(path, text).unwrap();
+    let name = path.file_name().unwrap().to_string_lossy();
+    let source = path.with_file_name(format!(".{name}.text"));
+    fs::write(&source, text).unwrap();
+    let copied = Command::new("cp").arg(&source).arg(path).status().unwrap();
+    assert!(copied.success(), "cp {}", path.display());
+    fs::remove_file(&source).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 

@@ -229,7 +229,20 @@ fn git_available() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-fn make_executable(path: &Path) {
+/// Write an executable that no process holds open for writing when it runs.
+/// Linux refuses to exec a file any process has open for writing (ETXTBSY),
+/// and a child another test thread forks holds a copy of every descriptor
+/// this process has open until that child execs: a file written here, then
+/// closed, even renamed, can still be open for writing in such a child at
+/// the moment it is run. So this process writes only the text, beside it,
+/// and `cp`, a process of its own that forks nothing, writes the executable.
+fn write_executable(path: &Path, text: impl AsRef<str>) {
+    let name = path.file_name().unwrap().to_string_lossy();
+    let source = path.with_file_name(format!(".{name}.text"));
+    fs::write(&source, text.as_ref()).unwrap();
+    let copied = Command::new("cp").arg(&source).arg(path).status().unwrap();
+    assert!(copied.success(), "cp {}", path.display());
+    fs::remove_file(&source).unwrap();
     make_mode(path, 0o755);
 }
 
@@ -294,20 +307,16 @@ impl Fixture {
         fs::create_dir_all(&stub_dir).unwrap();
         fs::create_dir_all(dir.join("home")).unwrap();
         let stub = stub_dir.join("toimija");
-        fs::write(&stub, STUB).unwrap();
-        make_executable(&stub);
+        write_executable(&stub, STUB);
         // Never the real gh: no network, and a controlled answer.
         let gh = stub_dir.join("gh");
-        fs::write(&gh, GH_STUB).unwrap();
-        make_executable(&gh);
+        write_executable(&gh, GH_STUB);
         // Never the real sykli: `verify --help` names --commit only on demand.
         let sykli = stub_dir.join("sykli");
-        fs::write(&sykli, SYKLI_STUB).unwrap();
-        make_executable(&sykli);
+        write_executable(&sykli, SYKLI_STUB);
         // Never the real vessa: no native sessions unless a test lists some.
         let vessa = stub_dir.join("vessa");
-        fs::write(&vessa, VESSA_STUB).unwrap();
-        make_executable(&vessa);
+        write_executable(&vessa, VESSA_STUB);
         let fixture = Fixture { dir, stub_dir };
         // Default: an empty, fully available scan, in repos and outside them.
         fixture.set_sessions(&sessions_json("", "available"));
@@ -2306,7 +2315,7 @@ fn intake_turns_a_correction_into_a_proposal_through_the_drafter() {
         Some("Linux tests are blocked on macOS."),
     )]);
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\ncat > {}\ncat <<'JSON'\nSure:\n[{{\"scope\":\"machine\",\"repo\":null,\"id\":\"lima-for-linux\",\
@@ -2314,9 +2323,7 @@ fn intake_turns_a_correction_into_a_proposal_through_the_drafter() {
              \"refines\":null,\"supersedes\":[]}},{{\"scope\":\"nowhere\",\"id\":\"bad\",\"kind\":\"fact\",\"body\":\"x\"}}]\nJSON\n",
             fixture.dir.join("prompt.txt").display()
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
 
     let (stdout, stderr, code) = output_of(
         fixture
@@ -2624,16 +2631,14 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
         .unwrap();
     }
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\nd='{}'\nn=$(($(cat \"$d/drafter-calls\" 2>/dev/null || echo 0) + 1))\n\
              echo $n > \"$d/drafter-calls\"\ncat > \"$d/prompt-$n.txt\"\ncat \"$d/answer-$n.json\"\n",
             fixture.dir.display()
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
 
     let (stdout, stderr, code) = output_of(
         fixture
@@ -3056,8 +3061,7 @@ exit 0
 
 fn fake_claude(fixture: &Fixture) {
     let path = fixture.stub_dir.join("claude");
-    fs::write(&path, FAKE_CLAUDE).unwrap();
-    make_executable(&path);
+    write_executable(&path, FAKE_CLAUDE);
 }
 
 /// D7: leaving names the agent's own session, found by the launch prompt in
@@ -4228,15 +4232,13 @@ fn intake_drafts_from_a_sessions_handover_once() {
     assert_eq!(code, Some(0), "{stderr}");
 
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\ncat > {}\necho '[]'\n",
             fixture.dir.join("prompt.txt").display()
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -4320,15 +4322,13 @@ fn intake_drains_a_queue_larger_than_one_run_and_never_moves_the_cursor_back() {
     let since = utc_now();
     let sent = fixture.dir.join("sent.txt");
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\ngrep '^    said: ' >> '{}'\necho '[]'\n",
             sent.display()
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     let cursor_path = fixture.dir.join("state/ohjaa/intake-since");
     let mut cursors: Vec<String> = Vec::new();
     let mut runs = 0;
@@ -4401,7 +4401,7 @@ fn a_drafter_failing_mid_run_keeps_what_was_drafted_and_the_next_run_retries_the
     // Its second and third calls fail (two candidates failing alone in a row
     // stop the run); every other one answers that nothing is there.
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\nn=$(($(cat '{count}' 2>/dev/null || echo 0) + 1)); echo $n > '{count}'\n\
@@ -4411,9 +4411,7 @@ fn a_drafter_failing_mid_run_keeps_what_was_drafted_and_the_next_run_retries_the
             failed = failed.display(),
             sent = sent.display(),
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     let intake = || {
         output_of(
             fixture
@@ -4483,7 +4481,7 @@ fn a_second_intake_while_one_runs_says_so_and_sends_nothing() {
     );
     // Holds its first answer until released (ten seconds at most).
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\necho call >> '{calls}'\ntouch '{started}'\ni=0\n\
@@ -4494,9 +4492,7 @@ fn a_second_intake_while_one_runs_says_so_and_sends_nothing() {
             release = release.display(),
             sent = sent.display(),
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     let intake = || {
         let mut command = fixture.ohjaa();
         command
@@ -4543,7 +4539,7 @@ fn a_candidate_the_drafter_always_fails_on_is_isolated_and_set_aside_out_loud() 
     let sent = fixture.dir.join("sent.txt");
     // Refuses, in prose, any batch that holds `correction 3`.
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\nprompt=$(cat)\n\
@@ -4551,9 +4547,7 @@ fn a_candidate_the_drafter_always_fails_on_is_isolated_and_set_aside_out_loud() 
              printf '%s\\n' \"$prompt\" | grep '^    said: ' >> '{}'\necho '[]'\n",
             sent.display()
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     let intake = || {
         output_of(
             fixture
@@ -4613,15 +4607,13 @@ fn a_run_that_reads_only_some_sources_never_moves_the_cursor_past_the_others() {
     std::thread::sleep(std::time::Duration::from_millis(1100));
     let sent = fixture.dir.join("sent.txt");
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\ngrep '^    said: ' >> '{}'\necho '[]'\n",
             sent.display()
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     let intake = |source: &str| {
         output_of(
             fixture
@@ -4904,12 +4896,10 @@ fn a_pasted_secret_never_reaches_the_drafter_with_the_filter_on_or_off() {
     std::thread::sleep(std::time::Duration::from_millis(1100));
     let prompts = fixture.dir.join("prompts.txt");
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!("#!/bin/sh\ncat >> '{}'\necho '[]'\n", prompts.display()),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     let intake = |extra: &[&str]| {
         output_of(
             fixture
@@ -5025,15 +5015,13 @@ fn an_old_vessa_is_told_to_update_and_nothing_reads_the_transcripts_instead() {
 /// A stub drafter that records the `said:` lines it answers for in `sent`.
 fn recording_drafter(fixture: &Fixture, sent: &Path) -> PathBuf {
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\ngrep '^    said: ' >> '{}'\necho '[]'\n",
             sent.display()
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     drafter
 }
 
@@ -5053,7 +5041,7 @@ fn an_intake_killed_mid_run_keeps_every_batch_answered_before_the_kill() {
     );
     // Its second call hangs, until ohjaa is killed under it.
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\nn=$(($(cat '{count}' 2>/dev/null || echo 0) + 1)); echo $n > '{count}'\n\
@@ -5064,9 +5052,7 @@ fn an_intake_killed_mid_run_keeps_every_batch_answered_before_the_kill() {
             hung = hung.display(),
             sent = sent.display(),
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     let intake = || {
         let mut command = fixture.ohjaa();
         command
@@ -5266,7 +5252,7 @@ impl Poisoned {
         );
         fs::write(&refuse, "").unwrap();
         let drafter = fixture.stub_dir.join("drafter");
-        fs::write(
+        write_executable(
             &drafter,
             format!(
                 "#!/bin/sh\nprompt=$(cat)\nprintf '%s\\n' \"$prompt\" | grep '^    said: ' >> '{tried}'\n\
@@ -5278,9 +5264,7 @@ impl Poisoned {
                 refuse = refuse.display(),
                 sent = sent.display(),
             ),
-        )
-        .unwrap();
-        make_executable(&drafter);
+        );
         let poisoned = Poisoned {
             fixture,
             repo,
@@ -5476,7 +5460,7 @@ fn no_repositories_under_the_roots_holds_the_cursor_and_says_so() {
 /// opened by another ohjaa (as `oriented`, `handover` and leaving must).
 fn drafter_that_opens_the_log(fixture: &Fixture) -> PathBuf {
     let drafter = fixture.stub_dir.join("drafter-opens-log");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\ncat > {prompt}\n{ohjaa} session > {during} 2>&1\necho \"exit $?\" >> {during}\necho '[]'\n",
@@ -5484,9 +5468,7 @@ fn drafter_that_opens_the_log(fixture: &Fixture) -> PathBuf {
             ohjaa = ohjaa_bin(),
             during = fixture.dir.join("during.txt").display(),
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     drafter
 }
 
@@ -5620,15 +5602,13 @@ fn sessions_are_drafted_only_once_their_transcript_window_was_read() {
     let (_, stderr, code) = run_session(&fixture, &repo, &script);
     assert_eq!(code, Some(0), "{stderr}");
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\ncat > {}\necho '[]'\n",
             fixture.dir.join("prompt.txt").display()
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     let intake = |source: &str| {
         let _ = fs::remove_file(fixture.dir.join("prompt.txt"));
         let (_, stderr, _) = output_of(
@@ -6818,15 +6798,13 @@ fn a_session_whose_ohjaa_was_killed_is_closed_as_orphaned_at_the_next_launch() {
     );
     // Queued for intake, like any ended session.
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\ncat > {}\necho '[]'\n",
             fixture.dir.join("prompt.txt").display()
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -6878,15 +6856,13 @@ fn intake_drafts_from_what_ohjaa_observed_going_wrong_not_only_the_handover() {
     assert_eq!(code, Some(3), "{stderr}");
     let pushed = short_head(&repo);
     let drafter = fixture.stub_dir.join("drafter");
-    fs::write(
+    write_executable(
         &drafter,
         format!(
             "#!/bin/sh\ncat > {}\necho '[]'\n",
             fixture.dir.join("prompt.txt").display()
         ),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -7579,15 +7555,13 @@ fn report_fixture(fixture: &Fixture) -> (PathBuf, String) {
     let launch = |agent: &str, intent: &str| {
         let started = fixture.dir.join(format!("{agent}-started"));
         let stub = fixture.stub_dir.join(agent);
-        fs::write(
+        write_executable(
             &stub,
             format!(
                 "#!/bin/sh\ndate -u +%Y-%m-%dT%H:%M:%SZ > '{}'\nexit 0\n",
                 started.display()
             ),
-        )
-        .unwrap();
-        make_executable(&stub);
+        );
         let (_, stderr, code) = output_of(
             fixture
                 .ohjaa()
@@ -7755,12 +7729,10 @@ fn the_report_lists_untold_sessions_unproven_commits_and_bypasses() {
     // checked.
     let drafter = fixture.stub_dir.join("drafter");
     let prompt = fixture.dir.join("prompt.txt");
-    fs::write(
+    write_executable(
         &drafter,
         format!("#!/bin/sh\ncat > '{}'\necho '[]'\n", prompt.display()),
-    )
-    .unwrap();
-    make_executable(&drafter);
+    );
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -7899,8 +7871,8 @@ fn a_vessa_too_old_for_headers_is_said_and_never_read_the_slow_way() {
     let fixture = Fixture::new("report-old-vessa");
     let repo = fixture.make_git_repo("work");
     let calls = fixture.dir.join("vessa-calls");
-    fs::write(
-        fixture.stub_dir.join("vessa"),
+    write_executable(
+        &fixture.stub_dir.join("vessa"),
         format!(
             "#!/bin/sh\necho \"$*\" >> '{}'\n\
              case \" $* \" in *' --headers '*)\n\
@@ -7911,8 +7883,7 @@ fn a_vessa_too_old_for_headers_is_said_and_never_read_the_slow_way() {
              echo '{{\"schema\":\"vessa-usage.v1\",\"sessions\":[],\"warnings\":[]}}'\n",
             calls.display()
         ),
-    )
-    .unwrap();
+    );
     let report = |json: bool| {
         let mut command = fixture.ohjaa();
         command
@@ -7968,16 +7939,14 @@ fn of_two_sessions_started_during_a_launch_its_own_is_not_the_bypass() {
     // epoch seconds and RFC 3339 from one `date`.
     let moments = fixture.dir.join("pi-moments");
     let pi = fixture.stub_dir.join("pi");
-    fs::write(
+    write_executable(
         &pi,
         format!(
             "#!/bin/sh\ndate -u '+%s %Y-%m-%dT%H:%M:%SZ' > '{m}'\nsleep 1\n\
              date -u '+%s %Y-%m-%dT%H:%M:%SZ' >> '{m}'\nsleep 1\nexit 0\n",
             m = moments.display()
         ),
-    )
-    .unwrap();
-    make_executable(&pi);
+    );
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -9295,15 +9264,13 @@ fn line_starts_no_git_and_touches_no_network() {
     fs::create_dir_all(&shims).unwrap();
     for program in ["git", "gh", "vessa", "sykli", "toimija", "ps", "kill", "sh"] {
         let path = shims.join(program);
-        fs::write(
+        write_executable(
             &path,
             format!(
                 "#!/bin/sh\necho {program} >> '{}'\n",
                 fixture.dir.join("started").display()
             ),
-        )
-        .unwrap();
-        make_executable(&path);
+        );
     }
     let trace = fixture.dir.join("git-trace");
     let mut command = fixture.person();

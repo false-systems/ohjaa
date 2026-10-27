@@ -406,9 +406,27 @@ fn executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
 }
 
+/// Write an executable that no process holds open for writing when it runs.
+/// Linux refuses to exec a file any process has open for writing (ETXTBSY),
+/// and a child another test thread forks holds a copy of every descriptor
+/// this process has open until that child execs: a file written here, then
+/// closed, even renamed, can still be open for writing in such a child at
+/// the moment it is run. So this process writes only the text, beside it,
+/// and `cp`, a process of its own that forks nothing, writes the executable.
 fn write_executable(path: &Path, text: &str) {
-    fs::write(path, text).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    let name = path.file_name().unwrap().to_string_lossy();
+    let source = path.with_file_name(format!(".{name}.text"));
+    fs::write(&source, text).unwrap();
+    copy_executable(&source, path);
+    fs::remove_file(&source).unwrap();
+}
+
+/// `from`'s bytes at `to`, executable, written by `cp` (see
+/// [`write_executable`]).
+fn copy_executable(from: &Path, to: &Path) {
+    let copied = Command::new("cp").arg(from).arg(to).status().unwrap();
+    assert!(copied.success(), "cp {} {}", from.display(), to.display());
+    fs::set_permissions(to, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// The lines a child writes to `pipe`, as it writes them.
@@ -955,7 +973,7 @@ fn apply_includes_one_file_and_no_repository_without_an_entry_runs_ohjaa() {
     );
 
     // An edited dispatcher is drift, and apply puts it back.
-    fs::write(hooks.join("pre-push"), "#!/bin/sh\nexit 0\n").unwrap();
+    write_executable(&hooks.join("pre-push"), "#!/bin/sh\nexit 0\n");
     let output = sandbox.ohjaa(&["doctor", "--root", &sandbox.projects()]);
     let (stdout, _) = text(&output);
     assert_eq!(output.status.code(), Some(4), "{stdout}");
@@ -7804,7 +7822,7 @@ fn apply_runs_the_ohjaa_on_path_unless_bin_names_another() {
     sandbox.entry("acme", "widget", Some("{}\n"));
     let other = sandbox.dir.join("other");
     fs::create_dir_all(&other).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_ohjaa"), other.join("ohjaa")).unwrap();
+    copy_executable(Path::new(env!("CARGO_BIN_EXE_ohjaa")), &other.join("ohjaa"));
     let elsewhere = other.join("ohjaa").to_string_lossy().into_owned();
     let output = sandbox
         .command(&elsewhere, &sandbox.dir)

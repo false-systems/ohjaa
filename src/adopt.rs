@@ -1219,15 +1219,12 @@ echo "target=${{target:-no}} build=${{build:-no}}" >> '{}'
     /// command's own setting.)
     #[test]
     fn what_adopt_counts_as_said_holds_under_sh() {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = std::env::temp_dir().join(format!("ohjaa-under-sh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (bin, work, log) = (dir.join("bin"), dir.join("work"), dir.join("cargo-log"));
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(work.join("sub")).unwrap();
-        std::fs::write(bin.join("cargo"), fake_cargo(&log)).unwrap();
-        std::fs::set_permissions(bin.join("cargo"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        crate::process::write_executable(&bin.join("cargo"), &fake_cargo(&log));
         let runs = REVIEW_48
             .iter()
             .map(|(_, _, run, _)| *run)

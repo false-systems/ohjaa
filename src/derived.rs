@@ -1321,19 +1321,16 @@ mod tests {
         let tree = git(&clone, &["rev-parse", "HEAD^{tree}"]);
         // A sykli whose init writes the files git tracks where it runs.
         let sykli = base.join("sykli");
-        std::fs::write(
+        crate::process::write_executable(
             &sykli,
-            format!(
+            &format!(
                 "#!/bin/sh\necho \"$PWD|$*\" >> '{}'\n\
                  [ \"$2\" = --help ] && {{ echo '      --contract <PATH>  outside'; exit 0; }}\n\
                  printf '{{\"inputs\":\"%s\"}}' \"$(git ls-files | paste -sd, -)\" > \"$3\"\n\
                  echo lock > \"$(dirname \"$3\")/sykli.lock\"\n",
                 base.join("calls").display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&sykli, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        );
         let state = base.join("state/ohjaa/derived");
         let limit = std::time::Duration::from_secs(30);
         let gates = Gates::new(Some(state.clone()));
