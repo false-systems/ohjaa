@@ -428,13 +428,33 @@ fn roots_text(roots: &[PathBuf]) -> String {
     text
 }
 
+/// The home's lock for one apply: taken once, when apply first changes the
+/// home (flock would block on a second take in the same process).
+#[derive(Default)]
+struct HomeLock {
+    tried: bool,
+    _held: Option<crate::process::FileLock>,
+}
+
+impl HomeLock {
+    fn take(&mut self, home: &Path) {
+        if !std::mem::replace(&mut self.tried, true) {
+            self._held = home::lock(home);
+        }
+    }
+}
+
 /// Read git's global config once; when an unreadable generated file breaks
 /// that (every git command fails then, apply's own among them), remove what
-/// git cannot read and read again: apply writes it anew below.
-fn global_facts(home: &Path, repair: bool) -> Result<gitconfig::GlobalFacts> {
+/// git cannot read and read again: apply writes it anew below. The removal
+/// changes the home, so it is made under the home's lock (`lock`), taken
+/// here before any refusal: that home exists already, since a file apply
+/// generated is in it.
+fn global_facts(home: &Path, repair: bool, lock: &mut HomeLock) -> Result<gitconfig::GlobalFacts> {
     match gitconfig::GlobalFacts::read() {
         Ok(facts) => Ok(facts),
         Err(error) if repair => {
+            lock.take(home);
             let mut generated = vec![gitconfig::include_file(home)];
             generated.extend(
                 gitconfig::entry_names(home)?
@@ -488,7 +508,8 @@ pub fn apply(
         return Ok(2);
     }
     let version = gitconfig::require_git()?;
-    let global = global_facts(&home, !options.dry_run)?;
+    let mut lock = HomeLock::default();
+    let global = global_facts(&home, !options.dry_run, &mut lock)?;
     let mut steps: Vec<Step> = Vec::new();
 
     let ohjaa = match chosen_ohjaa(options.bin) {
@@ -567,8 +588,11 @@ pub fn apply(
     }
     // Past every refusal: what apply plans, makes and commits is one change
     // to the home, never interleaved with a decision's or an adopt's. A dry
-    // run writes nothing, the lock's file included.
-    let _lock = (!options.dry_run).then(|| home::lock(&home)).flatten();
+    // run writes nothing, the lock's file included. (A repair above took
+    // the lock already.)
+    if !options.dry_run {
+        lock.take(&home);
+    }
     if !configured {
         if repos.is_empty() {
             eprintln!(
