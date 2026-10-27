@@ -186,8 +186,8 @@ const SEEN_SCHEMA: &str = "ohjaa-seen.v1";
 struct Window {
     sessions_ms: i64,
     github_ms: i64,
-    /// The keys of what GitHub said in the overlap before `github_ms`, as
-    /// the digest that ended here had it.
+    /// The keys of what GitHub said from the overlap before `github_ms` on,
+    /// its very end included, as the digest that ended here had it.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     said: BTreeSet<String>,
 }
@@ -203,14 +203,15 @@ impl Window {
 
     /// `item` happened in the stretch from here, by its source's own clock
     /// and from the second (a session's record and GitHub keep whole
-    /// seconds); GitHub's from the overlap on, but what was said in it.
+    /// seconds); GitHub's from the overlap on, but what the digest that
+    /// ended here said. That holds what it said of the very end too: what
+    /// merged in the second GitHub was read, or while its search ran.
     fn holds(&self, item: &Item) -> bool {
         let second = |ms: i64| ms - ms.rem_euclid(1000);
         if !item.github {
             return item.at_ms >= second(self.sessions_ms);
         }
-        item.at_ms >= second(self.github_ms)
-            || (item.at_ms >= second(self.github_ms - OVERLAP_MS) && !self.said.contains(&item.key))
+        item.at_ms >= second(self.github_ms - OVERLAP_MS) && !self.said.contains(&item.key)
     }
 }
 

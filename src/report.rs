@@ -1271,6 +1271,9 @@ pub fn to_json(report: &Report) -> Value {
         "schema": "ohjaa-marks.v1",
         "generated": rfc(report.until_ms),
         "complete": report.complete(),
+        // Additive (review of #67): why no entry is listed, when none could
+        // be; `entries` is then empty, and says nothing.
+        "unlisted": report.unlisted,
         "entries": entries,
         "proposals": match &report.proposals {
             Ok(waiting) => json!({

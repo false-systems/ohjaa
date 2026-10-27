@@ -8341,10 +8341,13 @@ fn report_json_is_ohjaa_marks_v1_and_writes_nothing() {
             "proposals",
             "report",
             "schema",
-            "sessions"
+            "sessions",
+            "unlisted"
         ]
     );
     assert_eq!(json["entries"], serde_json::json!([]), "no entries here");
+    // No entries, and listed: none in the home, not none read.
+    assert_eq!(json["unlisted"], serde_json::Value::Null);
     assert_eq!(json["proposals"]["listed"], true);
     let waiting = &json["proposals"]["waiting"][0];
     assert_eq!(keys(waiting), ["name", "repo", "scope", "since", "title"]);
@@ -8963,11 +8966,21 @@ const AGENT_MARKERS: [&str; 17] = [
 /// ago and one opened then, in false-systems.
 /// With `extra`, that many more merged into sykli's main half an hour ago.
 fn graphql_page(more: bool, extra: u64) -> String {
+    graphql_page_at(unix_seconds(), more, extra)
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// [`graphql_page`], its times counted back from `now` (unix seconds): two
+/// answers from one base differ in what they hold, never in when a pull
+/// request happened, however long apart they are written.
+fn graphql_page_at(now: i64, more: bool, extra: u64) -> String {
     let at = |ago_s: i64| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
         let (days, s) = (
             (now - ago_s).div_euclid(86_400),
             (now - ago_s).rem_euclid(86_400),
@@ -9803,6 +9816,17 @@ fn a_pull_request_github_indexes_late_is_in_the_next_digest_once() {
     }
     let fixture = Fixture::new("human-late");
     fixture.human_view(false);
+    // Both of GitHub's answers count back from one time: a pull request
+    // happened when it happened, whenever its answer is written.
+    let base = unix_seconds();
+    let page = |extra: u64| {
+        fs::write(
+            fixture.dir.join("graphql.json"),
+            graphql_page_at(base, false, extra),
+        )
+        .unwrap();
+    };
+    page(0);
     // Review of #67, finding 2: a second or more between writing GitHub's
     // answer and reading it moves no pull request across the overlap's edge.
     std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -9812,7 +9836,7 @@ fn a_pull_request_github_indexes_late_is_in_the_next_digest_once() {
     assert!(!first.contains("#100"), "{first}");
     // #100 merged half an hour ago, before that snapshot, and is only now
     // in GitHub's search.
-    fs::write(fixture.dir.join("graphql.json"), graphql_page(false, 1)).unwrap();
+    page(1);
     std::thread::sleep(std::time::Duration::from_millis(1100));
     output_of(fixture.person().arg("collect"));
     assert_eq!(fixture.graphql_calls(), 2, "no call more for the overlap");

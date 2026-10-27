@@ -1738,8 +1738,11 @@ no window, no vessa.
   "schema": "ohjaa-marks.v1",
   "generated": "<RFC 3339>",
   "complete": true,                      // false: something could not be read
-  "entries": [{                          // every entry in the home; none, and complete
-                                         // false, when the entries cannot be listed
+  "unlisted": null | "<why>",            // why no entry could be listed (the workflow home
+                                         // cannot be found, or its entries cannot be read)
+  "entries": [{                          // every entry in the home; none, with complete
+                                         // false and unlisted saying why, when they cannot
+                                         // be listed
     "repo": "owner/name",
     "branch": "main", "ref": "origin/main",
     "tip": "<sha>" | null,               // where origin/main is here
@@ -1783,7 +1786,8 @@ no window, no vessa.
 
 The keys `ohjaa-marks.v1` had when viemäri was built on it (2026-10-13)
 never go; `integrated` (per entry and per commit) and, on 2026-10-26, the
-commits' `contract` were added since, so a
+commits' `contract` were added since, and on 2026-10-27 the top-level
+`unlisted`, so a
 reader of the earlier shape keeps working. `judgements` was added on
 2026-10-14 (#46) and removed with `ohjaa judge` on 2026-10-26: nothing ever
 read it and no Judgement was ever recorded, so the schema kept its name.
