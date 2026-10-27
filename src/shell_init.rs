@@ -1,5 +1,6 @@
 //! `ohjaa shell-init zsh`: the launcher that routes `claude` and `codex`
-//! through `ohjaa run`, printed for `~/.zshrc` to eval.
+//! through `ohjaa run`, printed for `~/.zshrc` to eval, and the human view's
+//! line for a terminal's opening.
 
 use anyhow::Result;
 
@@ -7,12 +8,21 @@ use anyhow::Result;
 /// person's own: see the comments in the file.
 const LAUNCH_ZSH: &str = include_str!("launch.zsh");
 
+/// Run once, as the eval runs: a terminal opening. `ohjaa line` says nothing
+/// in an agent's shell or without a terminal, so it needs no guard here.
+const LINE_ZSH: &str = "
+# What happened since you last looked: one line when something is new, and
+# the day's digest at the first terminal of the day (`ohjaa digest`, all of
+# it). Silent in an agent's shell. Off for a shell: OHJAA_LINE=0.
+[[ ${OHJAA_LINE:-1} == 0 ]] || ohjaa line
+";
+
 pub fn shell_init(shell: &str) -> Result<i32> {
     if shell != "zsh" {
         eprintln!("ohjaa shell-init: only zsh is supported, not {shell}");
         return Ok(2);
     }
-    print!("{LAUNCH_ZSH}");
+    print!("{LAUNCH_ZSH}{LINE_ZSH}");
     Ok(0)
 }
 
@@ -35,5 +45,13 @@ mod tests {
         }
         assert!(LAUNCH_ZSH.contains("shell-init zsh"));
         assert!(!LAUNCH_ZSH.contains("source ~/projects/ohjaa-launch.zsh"));
+    }
+
+    #[test]
+    fn the_line_runs_once_as_the_shell_starts_and_can_be_switched_off() {
+        let lines: Vec<&str> = LINE_ZSH.lines().filter(|l| !l.starts_with('#')).collect();
+        assert!(lines.contains(&"[[ ${OHJAA_LINE:-1} == 0 ]] || ohjaa line"));
+        // Never inside a function: it runs at the eval, once.
+        assert!(!LINE_ZSH.contains("() {"));
     }
 }

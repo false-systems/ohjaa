@@ -21,6 +21,8 @@ ohjaa propose --scope ours --id rust-only --kind decision \
 ohjaa review                           # a person decides what becomes current
 ohjaa intake                           # draft proposals from what people said
 ohjaa report                           # what went around the workflow this week
+ohjaa line                             # for a terminal's opening: what is new since you looked
+ohjaa digest                           # what happened, for you: all of it
 ohjaa check                            # validate, and flag what may no longer hold
 ohjaa session                          # the record of the last ended session here, or of one by id
 ohjaa graph rust-only                  # a node, its neighbours, who was briefed with it
@@ -400,6 +402,138 @@ These become `observed` candidates:
 - a session a person started without ohjaa.
 
 What could not be checked or judged never does.
+
+## The human view: what happened, for the person
+
+```bash
+ohjaa line            # at a terminal's opening: one line when something is new, else nothing
+ohjaa digest          # all you have not seen in full; moves the cursor
+ohjaa digest --since 7d   # a window instead; the cursor stays
+ohjaa collect         # gather the snapshot `line` reads (it starts this itself when it is old)
+```
+
+An agent learns the state of the work from its briefing. A person learns it
+here. It records only: nothing is sent to anyone, decided or refused.
+
+- **`ohjaa line`** prints one line when something happened since the person
+  last saw the view, and nothing otherwise. The first `line` of each local
+  day prints the day's digest instead: at most 15 lines, what stands first,
+  then today's proposal, then what happened since the last digest. Seeing a
+  line or a digest moves the cursor. A line that has been seen is not said
+  again, and terminals opened together say it once: the one that claims
+  `seen.lock` says it.
+- **`ohjaa digest`** shows what the person has not seen in full: what the
+  day's digest left out (`… 44 more: ohjaa digest`), else what happened
+  since the last digest. Who is live it asks now, as `ohjaa fleet` does.
+- **Only a person sees it.** `line` prints, reads, writes and starts nothing
+  unless stdout is a terminal and no agent session's marker is set:
+  `OHJAA_SESSION`, `TOIMIJA_SESSION`, `TOIMIJA_RUN`, `CLAUDECODE`,
+  `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`,
+  `CODEX_SESSION_ID`, `CODEX_CI`, `CODEX_SANDBOX`,
+  `CODEX_SANDBOX_NETWORK_DISABLED`, `CODEX_MANAGED_BY_NPM`, `PI_SESSION_ID`,
+  `PI_CODING_AGENT`, `OPENCODE`, `OPENCODE_SESSION_ID` and `AI_AGENT`. These
+  are the variables the agents here set in the shells they run tools in, and
+  an agent's shell reads `~/.zshrc` too. A variable a person sets
+  themselves, such as `CODEX_HOME`, is not a marker. `ohjaa digest` moves
+  the cursor by the same rule, and never with `--since`.
+- **`line` starts no git and touches no network.** It reads the session log
+  and the proposals itself. Everything else comes from the snapshot `ohjaa
+  collect` writes. When the snapshot is older than 15 minutes, `line` starts
+  one collect in the background, detached, unless one is running, and says
+  what the snapshot holds with its age: the day's digest never waits for a
+  collect (`snapshot as of 23:10 UTC; a fresh collect runs in the
+  background`). `ohjaa digest` collects first when the snapshot is more than
+  5 minutes old, and waits for it at most 10 s.
+- **`ohjaa collect`** asks three sources once, at the same time. A source
+  that fails keeps what it held before, and is said to be as of then.
+  - The marks and the open sessions, as `ohjaa report --marks` finds them. A
+    branch whose marks cannot be read keeps what it was last read as.
+  - GitHub: one `gh api graphql` search for the pull requests updated in the
+    owners of the workflow home's entries, at most 2 calls. It reads from
+    where the next digest begins, by GitHub's clock (2 hours earlier, for
+    what is indexed late), at least a day back and at most a week. A digest
+    whose window starts earlier says `pull requests only since …`.
+  - vessa: `vessa usage --json --input <transcript>…` over the transcripts of
+    the sessions that ended since then, found at leaving (`left.native`). It
+    never reads every transcript.
+- **What could not be read is said, never an all-clear.** A source that did
+  not answer, or could not read all it asked (an entry that cannot be
+  marked, a page of pull requests not asked for, vessa's partial usage, the
+  fleet's failed scans), is said where the view is read, with how old what
+  it holds is: `! marks  1 could not be read, as of 08:12 UTC: …`. `ohjaa
+  collect` and `ohjaa digest` then exit 4, as `ohjaa report` does.
+
+What stays until it is resolved comes first, in this order:
+
+1. a branch with a failed commit;
+2. what is unknown: a source that could not be read, a session still running
+   with its ohjaa gone, an orphan, a commit sykli could say nothing about;
+3. a branch whose commits lack evidence (`main: 2 unproven since 5fcdeef.
+   Prove it: ohjaa gate`);
+4. what waits for a person: a session open more than a day.
+
+A branch is said as it was last read: when that was not just now, with its
+age (`, as of 05:00 UTC (unread since)`), and it stays until a read resolves
+it. A branch is said again when its tip moves. What happened is said once:
+- each session that ended, with how it ended, how long it ran, whether it
+  read back and handed over, what landed, its pull request and its cost;
+- the pull requests merged into a default branch;
+- those opened or closed.
+
+A pull request opened and merged in the same stretch is said once, as merged.
+
+**Cost** is vessa's estimate, never a bill. It is joined by the agent's own
+session ids ohjaa found in the transcripts at leaving. It is unknown, never
+zero, unless every one of the session's own sessions was read. An estimate in
+dollars is given only when vessa priced all of it, which it does only with a
+rate card; otherwise the cost is given in tokens, with the reads of the
+cache apart (`115k tokens + 2.9M cache reads`): they are most of it.
+
+**Today's proposal:** one of the proposals waiting for a person, in turn,
+oldest first, a different one each day. It is shown with its id, and decided
+with `ohjaa review`. A new proposal is news in the line once.
+
+Lines are at most 100 characters. They are plain words with no colour, and
+ids appear only where a person needs one: a session to look at with `ohjaa
+session <id>`, a commit, a pull request, a proposal. Text from a source (a
+title, an intent, a tool's error) has every control character and bidi
+control replaced with U+FFFD before it reaches the terminal.
+
+**State**, in `$XDG_STATE_HOME/ohjaa/human/`:
+- `seen.json`, the cursor: when the person last saw the view, the keys of
+  what they saw then (within the overlap), where the next digest begins and
+  where what the day's digest left out begins, and the day it was shown;
+- `seen.lock`, which the terminal saying the line holds with `flock(2)`;
+- `collected.json`, the snapshot: the marks and open sessions, GitHub's pull
+  requests and vessa's usage, each with when it was read and what it could
+  not read;
+- `collect.lock`, which the one running collect holds with `flock(2)`.
+
+Deleting them loses no knowledge. The view then starts from the last day.
+
+### From viemari
+
+`ohjaa line` replaces `viemari line`; its facts were ohjaa's already. To
+switch over, once this ohjaa is installed:
+
+1. Remove the two lines `viemari shell-init` added to `~/.zshrc`, the comment
+   and `command -v viemari >/dev/null && viemari line`. `ohjaa shell-init zsh`
+   now ends with `[[ ${OHJAA_LINE:-1} == 0 ]] || ohjaa line`, and the line
+   `ohjaa apply` wrote already evals it.
+2. Run `ohjaa collect` once. The first terminal after that gets the day's
+   digest.
+3. Archive viemari. Its state, `~/.local/state/viemari/`, can then be removed.
+
+Not carried over: viemari's lifecycle view (Intent, session, change,
+validation, each sykli run asked by id), its rework and lead-time measures,
+pull request reviews, and direct pushes that are proven. `ohjaa session`,
+`ohjaa report` and `ohjaa graph` show the depth.
+
+In particular, viemari's day listed each failed validation a session asked
+sykli for (`FAILED: test`). This view does not ask sykli about validation
+runs, so their absence here is **not a pass**: a failed run shows here only
+as the mark of a commit on an entry's branch (`main: 1 unproven (1
+failed)`). `ohjaa session <id>` shows the validations a session asked for.
 
 ## Sessions: entering to leaving
 
