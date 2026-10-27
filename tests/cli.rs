@@ -1612,38 +1612,64 @@ fn only_a_branch_never_committed_to_is_empty_not_one_whose_ref_was_lost() {
     fixture.cleanup();
 }
 
-/// A drafter as the drafter answers it.
-fn drafted(scope: &str, id: &str, refines: Option<&str>) -> serde_json::Value {
+/// A draft as the drafter answers it; `repo` for a repo one.
+fn drafted(scope: &str, repo: Option<&Path>, id: &str, refines: Option<&str>) -> serde_json::Value {
     serde_json::json!({
-        "scope": scope, "repo": null, "id": id, "kind": "lesson",
-        "body": format!("The lesson {id}."), "origin": ["2026-09-20 work: 'a test'"],
-        "refines": refines, "supersedes": [],
+        "scope": scope, "repo": repo.map(|repo| repo.display().to_string()), "id": id,
+        "kind": "lesson", "body": format!("The lesson {id}."),
+        "origin": ["2026-09-20 work: 'a test'"], "refines": refines, "supersedes": [],
     })
 }
 
+/// A proposal waiting for a person, written as `ohjaa propose` writes it.
+fn waiting_proposal(dir: &Path, id: &str, body: &str) -> (PathBuf, String) {
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("{id}.md"));
+    let text = format!(
+        "+++\nid = \"{id}\"\nkind = \"lesson\"\nstatus = \"proposed\"\nas_of = 2026-09-20\n\
+         origin = [\"a test\"]\n+++\n{body}\n"
+    );
+    fs::write(&path, &text).unwrap();
+    (path, text)
+}
+
 #[test]
-fn a_draft_that_repeats_what_is_present_is_not_written_and_is_counted() {
+fn a_draft_that_may_repeat_what_is_present_is_written_marked_for_a_person() {
     // Intake's first real run, 2026-10-27, wrote 108 proposals, four of them
-    // one lesson ("read back the briefing and leave a handover"), two "start
-    // sessions through ohjaa run", and a person has to review each one.
+    // one lesson ("read back the briefing and leave a handover"). The review
+    // of #61: refusing what looks repeated drops real lessons for good
+    // (`tapio-linux-only` as `rauha-linux-only`), and a person is the only
+    // one who decides. So each is written, and marked for that person.
     if !git_available() {
         return;
     }
     let fixture = Fixture::new("intakedup");
     let repo = fixture.make_git_repo("work");
+    let (rauha, tapio) = (fixture.make_folder("rauha"), fixture.make_folder("tapio"));
     fixture.node(
         &fixture.dir.join("config/ohjaa/mine"),
         "rust-elixir-only",
         "decision",
         "Code is Rust or Elixir.",
     );
-    let waiting = fixture.dir.join("state/ohjaa/proposals/ours");
-    fs::create_dir_all(&waiting).unwrap();
-    let waiting = waiting.join("start-sessions-through-ohjaa-run.md");
-    let proposal = "+++\nid = \"start-sessions-through-ohjaa-run\"\nkind = \"lesson\"\n\
-                    status = \"proposed\"\nas_of = 2026-09-20\norigin = [\"a test\"]\n+++\n\
-                    Start every agent session through `ohjaa run`.\n";
-    fs::write(&waiting, proposal).unwrap();
+    let proposals = fixture.dir.join("state/ohjaa/proposals");
+    let (waiting, proposal) = waiting_proposal(
+        &proposals.join("ours"),
+        "start-sessions-through-ohjaa-run",
+        "Start every agent session through `ohjaa run`.",
+    );
+    let encoded = |repo: &Path| {
+        repo.display()
+            .to_string()
+            .trim_start_matches('/')
+            .replace('%', "%25")
+            .replace('/', "%2F")
+    };
+    waiting_proposal(
+        &proposals.join("repo").join(encoded(&rauha)),
+        "rauha-linux-only",
+        "Rauha runs on Linux only.",
+    );
     fixture.said(&[
         vessa_line(
             "2026-09-20T10:00:00Z",
@@ -1653,7 +1679,7 @@ fn a_draft_that_repeats_what_is_present_is_not_written_and_is_counted() {
         ),
         vessa_line(
             "2026-09-20T10:05:00Z",
-            "/p/work",
+            &rauha.display().to_string(),
             "no, we have lima baba",
             None,
         ),
@@ -1661,19 +1687,28 @@ fn a_draft_that_repeats_what_is_present_is_not_written_and_is_counted() {
     // One answer a batch, each prompt kept.
     let answers = [
         serde_json::json!([
-            drafted("ours", "start-agents-through-ohjaa-run", None),
-            drafted("mine", "code-is-rust-or-elixir", None),
-            drafted("ours", "read-back-briefing-and-leave-handover", None),
-            drafted("ours", "read-briefing-and-leave-handover", None),
+            drafted("ours", None, "start-agents-through-ohjaa-run", None),
+            drafted("mine", None, "code-is-rust-or-elixir", None),
+            // Near current knowledge, of another scope: another lesson.
+            drafted("ours", None, "rust-elixir-only-everywhere", None),
+            drafted("ours", None, "read-back-briefing-and-leave-handover", None),
+            drafted("ours", None, "read-briefing-and-leave-handover", None),
         ]),
         serde_json::json!([
-            drafted("ours", "ohjaa-read-back-briefing-and-leave-handover", None),
             drafted(
                 "ours",
+                None,
+                "ohjaa-read-back-briefing-and-leave-handover",
+                None
+            ),
+            drafted(
+                "ours",
+                None,
                 "pi-sessions-need-a-wrapper-too",
                 Some("start-sessions-through-ohjaa-run"),
             ),
-            drafted("machine", "lima-for-linux", None),
+            drafted("repo", Some(&tapio), "tapio-linux-only", None),
+            drafted("machine", None, "lima-for-linux", None),
         ]),
     ];
     for (n, answer) in answers.iter().enumerate() {
@@ -1715,8 +1750,9 @@ fn a_draft_that_repeats_what_is_present_is_not_written_and_is_counted() {
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     let prompt =
         |n: usize| fs::read_to_string(fixture.dir.join(format!("prompt-{n}.txt"))).unwrap();
-    // The drafter is shown what is present, current and waiting.
-    let first = prompt(1);
+    // The drafter is shown what is present, current and waiting, and a
+    // repository's proposals only with a batch from it.
+    let (first, second) = (prompt(1), prompt(2));
     assert!(
         first.contains("- rust-elixir-only [mine/decision/current]: Code is Rust or Elixir."),
         "{first}"
@@ -1729,56 +1765,122 @@ fn a_draft_that_repeats_what_is_present_is_not_written_and_is_counted() {
         "{first}"
     );
     assert!(first.contains("Return nothing for a"), "{first}");
+    assert!(!first.contains("rauha-linux-only"), "{first}");
+    assert!(
+        second.contains(&format!(
+            "- rauha-linux-only [repo/lesson/proposed] in {}: Rauha runs on Linux only.",
+            rauha.display()
+        )),
+        "{second}"
+    );
     // And, in the next batch, what the batch before it proposed.
     assert!(
-        prompt(2).contains("- read-back-briefing-and-leave-handover [ours/lesson/proposed]"),
-        "{}",
-        prompt(2)
+        second.contains("- read-back-briefing-and-leave-handover [ours/lesson/proposed]"),
+        "{second}"
     );
     for line in [
         // Near a proposal waiting before the run.
-        "duplicate start-agents-through-ohjaa-run of start-sessions-through-ohjaa-run, not written",
-        // Near current knowledge, in another scope.
-        "duplicate code-is-rust-or-elixir of rust-elixir-only, not written",
-        "proposed read-back-briefing-and-leave-handover",
+        "proposed start-agents-through-ohjaa-run, marked as a possible duplicate of \
+         start-sessions-through-ohjaa-run",
+        // Near current knowledge of its scope.
+        "proposed code-is-rust-or-elixir, marked as a possible duplicate of rust-elixir-only",
+        "proposed rust-elixir-only-everywhere\n",
+        "proposed read-back-briefing-and-leave-handover\n",
         // Near a draft written earlier in the same answer,
-        "duplicate read-briefing-and-leave-handover of read-back-briefing-and-leave-handover, \
-         not written",
+        "proposed read-briefing-and-leave-handover, marked as a possible duplicate of \
+         read-back-briefing-and-leave-handover",
         // and in a batch before.
-        "duplicate ohjaa-read-back-briefing-and-leave-handover of \
-         read-back-briefing-and-leave-handover, not written",
-        // What the drafter itself says refines a waiting proposal.
-        "duplicate pi-sessions-need-a-wrapper-too of start-sessions-through-ohjaa-run, not written",
-        "proposed lima-for-linux",
-        "2 proposal(s) waiting for review (`ohjaa review`), 5 duplicate(s) not written, 0 \
-         draft(s) refused",
-        "not written: duplicate of read-back-briefing-and-leave-handover ×2, duplicate of \
-         rust-elixir-only ×1, duplicate of start-sessions-through-ohjaa-run ×2",
+        "proposed ohjaa-read-back-briefing-and-leave-handover, marked as a possible duplicate \
+         of read-back-briefing-and-leave-handover",
+        // A refinement of a waiting proposal is kept, as refining it.
+        "proposed pi-sessions-need-a-wrapper-too\n",
+        // The same words of another repository are another lesson.
+        "proposed tapio-linux-only\n",
+        "proposed lima-for-linux\n",
+        "9 proposal(s) waiting for review (`ohjaa review`), 4 of them marked as possible \
+         duplicates, 0 draft(s) refused",
+        "possible duplicates: of read-back-briefing-and-leave-handover ×2, of rust-elixir-only \
+         ×1, of start-sessions-through-ohjaa-run ×1",
     ] {
         assert!(stdout.contains(line), "{line}\n{stdout}");
     }
-    let mut written: Vec<String> = ["ours", "mine", "machine"]
-        .iter()
-        .flat_map(|scope| {
-            fs::read_dir(fixture.dir.join("state/ohjaa/proposals").join(scope))
-                .into_iter()
-                .flatten()
-                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        })
-        .collect();
-    written.sort();
-    assert_eq!(
-        written,
-        [
-            "lima-for-linux.md",
-            "read-back-briefing-and-leave-handover.md",
-            "start-sessions-through-ohjaa-run.md",
-        ]
+    // Nothing drafted is lost: every draft waits for a person, marked.
+    let mark = |scope: &str, id: &str| {
+        fs::read_to_string(proposals.join(scope).join(format!("{id}.duplicate-of"))).ok()
+    };
+    for (scope, id, of) in [
+        (
+            "ours",
+            "start-agents-through-ohjaa-run",
+            Some("start-sessions-through-ohjaa-run"),
+        ),
+        ("mine", "code-is-rust-or-elixir", Some("rust-elixir-only")),
+        ("ours", "rust-elixir-only-everywhere", None),
+        ("ours", "read-back-briefing-and-leave-handover", None),
+        (
+            "ours",
+            "read-briefing-and-leave-handover",
+            Some("read-back-briefing-and-leave-handover"),
+        ),
+        (
+            "ours",
+            "ohjaa-read-back-briefing-and-leave-handover",
+            Some("read-back-briefing-and-leave-handover"),
+        ),
+        ("ours", "pi-sessions-need-a-wrapper-too", None),
+        ("machine", "lima-for-linux", None),
+    ] {
+        assert!(
+            proposals.join(scope).join(format!("{id}.md")).is_file(),
+            "{id}"
+        );
+        assert_eq!(mark(scope, id), of.map(|of| format!("{of}\n")), "{id}");
+    }
+    let tapio_dir = proposals.join("repo").join(encoded(&tapio));
+    assert!(tapio_dir.join("tapio-linux-only.md").is_file());
+    assert!(!tapio_dir.join("tapio-linux-only.duplicate-of").exists());
+    let refinement =
+        fs::read_to_string(proposals.join("ours/pi-sessions-need-a-wrapper-too.md")).unwrap();
+    assert!(
+        refinement.contains("refines = \"start-sessions-through-ohjaa-run\""),
+        "{refinement}"
     );
     assert_eq!(
         fs::read_to_string(&waiting).unwrap(),
         proposal,
         "a waiting proposal is never touched"
+    );
+
+    // A person sees each one after what it may repeat, and decides.
+    let (listed, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["review", "--list"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let at = |text: &str| {
+        listed
+            .find(text)
+            .unwrap_or_else(|| panic!("{text}\n{listed}"))
+    };
+    assert!(
+        at("\nstart-sessions-through-ohjaa-run  [") < at("\nstart-agents-through-ohjaa-run  [")
+            && at("\nstart-agents-through-ohjaa-run  [")
+                < at("possible duplicate of: start-sessions-through-ohjaa-run (waiting too)"),
+        "{listed}"
+    );
+    assert!(
+        listed
+            .contains("possible duplicate of: rust-elixir-only (current: Code is Rust or Elixir.)"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains(
+            "refines: start-sessions-through-ohjaa-run (waiting too); it can be accepted once \
+             that one is"
+        ),
+        "{listed}"
     );
     fixture.cleanup();
 }

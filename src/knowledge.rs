@@ -16,6 +16,7 @@
 //! Proposals wait in `$XDG_STATE_HOME/ohjaa/proposals/` until a person accepts
 //! them, so an agent's draft never lands in a shared repository by itself.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -500,6 +501,78 @@ pub struct Pending {
     /// `true` when it waits among the proposals, `false` when a proposed node was
     /// committed into a scope directory (for review in a pull request).
     pub staged: bool,
+    /// The id of a node intake found it may repeat ([`mark_possible_duplicate`]):
+    /// a person decides whether it does.
+    pub duplicate_of: Option<String>,
+}
+
+/// Beside a proposal waiting at `<id>.md`, the id of a node it may repeat,
+/// as intake found it: `<id>.duplicate-of`, one line.
+fn duplicate_mark(path: &Path) -> PathBuf {
+    path.with_extension("duplicate-of")
+}
+
+/// Mark the proposal waiting at `path` as a possible duplicate of `of`. It
+/// waits like any other, and `ohjaa review` shows it after `of`; accepting
+/// or rejecting it removes the mark with it.
+pub fn mark_possible_duplicate(path: &Path, of: &str) -> Result<()> {
+    let mark = duplicate_mark(path);
+    let partial = mark.with_extension("duplicate-of.tmp");
+    std::fs::write(&partial, format!("{of}\n"))
+        .and_then(|()| std::fs::rename(&partial, &mark))
+        .with_context(|| format!("cannot write {}", mark.display()))
+}
+
+/// Remove a decided proposal's mark, if it has one.
+fn unmark(path: &Path, outcome: &mut Outcome) -> Result<()> {
+    let mark = duplicate_mark(path);
+    match std::fs::remove_file(&mark) {
+        Ok(()) => outcome.removed.push(mark),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot remove {}", mark.display()))
+        }
+    }
+    Ok(())
+}
+
+/// The waiting proposals in the order a person reviews them: as found, with
+/// each one marked as a possible duplicate right after the one it may
+/// repeat, when that one waits too.
+pub fn review_order(waiting: Vec<Pending>) -> Vec<Pending> {
+    let ids: BTreeSet<String> = waiting.iter().map(|p| p.node.id.clone()).collect();
+    let follows = |p: &Pending| {
+        p.duplicate_of
+            .as_ref()
+            .filter(|of| **of != p.node.id && ids.contains(*of))
+            .cloned()
+    };
+    let mut rest: Vec<Option<Pending>> = waiting.into_iter().map(Some).collect();
+    let mut order = Vec::with_capacity(rest.len());
+    for start in 0..rest.len() {
+        if rest[start].as_ref().is_none_or(|p| follows(p).is_some()) {
+            continue;
+        }
+        let mut stack = vec![start];
+        while let Some(at) = stack.pop() {
+            let Some(pending) = rest[at].take() else {
+                continue;
+            };
+            // Its followers in their order, the first on top.
+            let after: Vec<usize> = (0..rest.len())
+                .filter(|i| {
+                    rest[*i]
+                        .as_ref()
+                        .is_some_and(|p| follows(p).as_deref() == Some(pending.node.id.as_str()))
+                })
+                .collect();
+            stack.extend(after.into_iter().rev());
+            order.push(pending);
+        }
+    }
+    // Marks that only lead to each other (written by hand): as found.
+    order.extend(rest.into_iter().flatten());
+    order
 }
 
 /// Everything awaiting a decision: the proposals, plus proposed nodes already in
@@ -514,6 +587,10 @@ pub fn pending(dirs: &Dirs, loaded: &Loaded) -> Result<(Vec<Pending>, Vec<Broken
                     Ok(node) => found.push(Pending {
                         scope,
                         repo: repo.clone(),
+                        duplicate_of: std::fs::read_to_string(duplicate_mark(&path))
+                            .ok()
+                            .map(|of| of.trim().to_owned())
+                            .filter(|of| !of.is_empty()),
                         path,
                         node,
                         staged: true,
@@ -552,6 +629,7 @@ pub fn pending(dirs: &Dirs, loaded: &Loaded) -> Result<(Vec<Pending>, Vec<Broken
                 path: file.clone(),
                 node: located.node.clone(),
                 staged: false,
+                duplicate_of: None,
             });
         }
     }
@@ -620,7 +698,24 @@ pub fn propose(dirs: &Dirs, loaded: &Loaded, proposal: Proposal, today: Date) ->
     if loaded.get(&node.id).is_some() || waiting.iter().any(|p| p.node.id == node.id) {
         return refuse(format!("`{}` already exists; choose another id", node.id));
     }
-    check_fits(loaded, proposal.scope, &node, &[])?;
+    // It may build on a proposal still waiting (of its own repository, for a
+    // repo one): it is checked with that one beside the Knowledge, and can
+    // be accepted once that one is.
+    let beside: Vec<Located> = node
+        .refines
+        .iter()
+        .filter(|base| loaded.get(base).is_none())
+        .filter_map(|base| {
+            waiting
+                .iter()
+                .find(|p| p.node.id == **base && (p.scope != Scope::Repo || p.repo == repo))
+        })
+        .map(|p| Located {
+            scope: p.scope,
+            node: p.node.clone(),
+        })
+        .collect();
+    check_fits(loaded, proposal.scope, &node, &[], &beside)?;
 
     let dir = dirs.proposal_dir(proposal.scope, repo.as_deref())?;
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
@@ -630,7 +725,14 @@ pub fn propose(dirs: &Dirs, loaded: &Loaded, proposal: Proposal, today: Date) ->
 }
 
 /// Refuse a change whose result would break a set rule involving `node`.
-fn check_fits(loaded: &Loaded, scope: Scope, node: &Node, replaced: &[Located]) -> Result<()> {
+/// `beside` joins the set unjudged: proposals `node` builds on.
+fn check_fits(
+    loaded: &Loaded,
+    scope: Scope,
+    node: &Node,
+    replaced: &[Located],
+    beside: &[Located],
+) -> Result<()> {
     let mut set: Vec<Located> = loaded
         .nodes
         .iter()
@@ -640,6 +742,7 @@ fn check_fits(loaded: &Loaded, scope: Scope, node: &Node, replaced: &[Located]) 
         .cloned()
         .collect();
     set.extend(replaced.iter().cloned());
+    set.extend(beside.iter().cloned());
     set.push(Located {
         scope,
         node: node.clone(),
@@ -747,7 +850,7 @@ pub fn accept(dirs: &Dirs, id: &str, today: Date) -> Result<Outcome> {
         replaced.push(old);
         replaced_files.push(file.to_path_buf());
     }
-    check_fits(&loaded, pending.scope, &node, &replaced)?;
+    check_fits(&loaded, pending.scope, &node, &replaced, &[])?;
 
     let dir = target_dir(dirs, pending.scope, pending.repo.as_deref())?;
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
@@ -762,6 +865,7 @@ pub fn accept(dirs: &Dirs, id: &str, today: Date) -> Result<Outcome> {
     if pending.staged && pending.path != path {
         std::fs::remove_file(&pending.path)?;
         outcome.removed.push(pending.path.clone());
+        unmark(&pending.path, &mut outcome)?;
     }
     if let Some(checkout) = shared_checkout(dirs, pending.scope, pending.repo.as_deref()) {
         outcome.review_in.push(checkout);
@@ -778,10 +882,10 @@ pub fn reject(dirs: &Dirs, id: &str) -> Result<Outcome> {
         removed: vec![pending.path.clone()],
         ..Outcome::default()
     };
-    if !pending.staged {
-        if let Some(checkout) = shared_checkout(dirs, pending.scope, pending.repo.as_deref()) {
-            outcome.review_in.push(checkout);
-        }
+    if pending.staged {
+        unmark(&pending.path, &mut outcome)?;
+    } else if let Some(checkout) = shared_checkout(dirs, pending.scope, pending.repo.as_deref()) {
+        outcome.review_in.push(checkout);
     }
     Ok(outcome)
 }
@@ -887,6 +991,76 @@ mod tests {
 
     fn date(text: &str) -> Date {
         parse_date(text).unwrap()
+    }
+
+    #[test]
+    fn a_proposal_may_refine_one_still_waiting_and_is_accepted_after_it() {
+        let sandbox = Sandbox::new("refinewaiting");
+        sandbox
+            .propose(sandbox.proposal(Scope::Mine, "base"))
+            .unwrap();
+        let refinement = Proposal {
+            refines: Some("base".to_owned()),
+            ..sandbox.proposal(Scope::Mine, "base-in-codex")
+        };
+        let path = sandbox.propose(refinement).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("refines = \"base\""),
+            "kept, marked as refining"
+        );
+        let today = date("2026-09-25");
+        let refused = accept(&sandbox.dirs, "base-in-codex", today).unwrap_err();
+        assert!(format!("{refused:#}").contains("`base`"), "{refused:#}");
+        accept(&sandbox.dirs, "base", today).unwrap();
+        accept(&sandbox.dirs, "base-in-codex", today).unwrap();
+    }
+
+    #[test]
+    fn a_possible_duplicate_waits_marked_after_its_original_and_goes_with_its_decision() {
+        let sandbox = Sandbox::new("possibledup");
+        for id in ["zeta-original", "alpha-unrelated"] {
+            sandbox.propose(sandbox.proposal(Scope::Mine, id)).unwrap();
+        }
+        let beta = sandbox
+            .propose(sandbox.proposal(Scope::Mine, "beta-repeat"))
+            .unwrap();
+        mark_possible_duplicate(&beta, "zeta-original").unwrap();
+        let delta = sandbox
+            .propose(sandbox.proposal(Scope::Mine, "delta-repeat"))
+            .unwrap();
+        mark_possible_duplicate(&delta, "beta-repeat").unwrap();
+        let order = |sandbox: &Sandbox| -> Vec<(String, Option<String>)> {
+            let loaded = load(&sandbox.dirs).unwrap();
+            let (waiting, _) = pending(&sandbox.dirs, &loaded).unwrap();
+            review_order(waiting)
+                .into_iter()
+                .map(|p| (p.node.id, p.duplicate_of))
+                .collect()
+        };
+        let mark = |of: &str| Some(of.to_owned());
+        assert_eq!(
+            order(&sandbox),
+            [
+                ("alpha-unrelated".to_owned(), None),
+                ("zeta-original".to_owned(), None),
+                ("beta-repeat".to_owned(), mark("zeta-original")),
+                ("delta-repeat".to_owned(), mark("beta-repeat")),
+            ]
+        );
+        let marked = |path: &Path| path.with_extension("duplicate-of");
+        let outcome = reject(&sandbox.dirs, "beta-repeat").unwrap();
+        assert!(!marked(&beta).exists());
+        assert!(outcome.removed.contains(&marked(&beta)), "{outcome:?}");
+        // What it may repeat is gone: it stands alone, and keeps its mark.
+        assert_eq!(
+            order(&sandbox).last(),
+            Some(&("zeta-original".to_owned(), None))
+        );
+        let outcome = accept(&sandbox.dirs, "delta-repeat", date("2026-09-25")).unwrap();
+        assert!(!marked(&delta).exists());
+        assert!(outcome.removed.contains(&marked(&delta)), "{outcome:?}");
     }
 
     #[test]

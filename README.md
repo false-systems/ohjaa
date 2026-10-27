@@ -180,37 +180,52 @@ machine at all.
 It sends them in batches to a **drafter**, an agent CLI that reads a prompt on
 stdin and prints a JSON array. The default is `claude -p`; override it with
 `--drafter` or `~/.config/ohjaa/drafter`. The drafter sees what is already
-present: the existing Knowledge, then the proposals waiting for a person,
-each by its id, scope, kind, status and the first 100 characters of its
-body, in at most 24,000 characters. What does not fit is counted; the 131
-nodes present after the first real run take about 21,000. It is told to
-return nothing for a lesson already present. When a correction shows that a
-present node is not reaching agents, it names that node in `refines` and
-says what was missed, and that is how such a node gets noticed.
+present where the batch comes from: the existing Knowledge, then the
+proposals waiting for a person, of ours, mine and machine, and of each
+repository the batch's candidates come from. A candidate comes from a
+repository when its place (or, for a review, the repository it was read
+from) lies in it, or names a folder after it, as a pull request's URL and a
+worktree named `<repo>-<topic>` do. Each node is shown by its id, scope, kind
+and status (a repo one with its repository) and the first 100 characters of
+its body, in at most 24,000 characters; what does not fit is counted. On the
+131 nodes present after the first real run, every batch carried all of them
+(about 21,000 characters); now a batch from no repository carries 75 (12,011),
+most repositories add 1 to 3 (to about 12,600), habitat 14 (14,821) and
+valvo 24 (16,799). The drafter is told to return nothing for a lesson already
+present. When a correction shows that a present node is not reaching agents,
+or adds to it, it names that node in `refines` and says what was missed, and
+that is how such a node gets noticed.
 
-**A draft that repeats what is present is not written.** Every draft costs a
-person a review, so the drafter's answer is checked too. A draft is a
-*duplicate* of a present node (current, or proposed and waiting; a superseded
-or retired one is not present) when:
-- it names a waiting proposal in `refines`: that one is still to be reviewed;
-  or
-- its title says mostly what that node's says. A node's title is its id: its
-  words, lowercased, without filler (`a`, `the`, `and`, `with`, …), each with
-  one common ending cut (`-ing`, `-ed`, `-es`, `-s` but not `-ss`, `-e`).
-  Two titles are near when they share at least two words, and the shared
-  words are at least 60% of both: Dice's coefficient,
-  2·shared / (a + b) ≥ 0.6. The current node a draft refines, and those it
-  supersedes, are not compared: a refinement says its base again by design.
+**A draft that may repeat what is present is written, and marked for a
+person.** Every draft costs a person a review, and only a person decides
+what is Knowledge, so the drafter's answer is checked too, and nothing in it
+is dropped. A draft whose title says mostly what the title of a present node
+of its own scope says (for a repo one, of its own repository) is written like
+any other proposal, and marked as a *possible duplicate* of that node, the
+nearest one. Present means current, or proposed and waiting; a superseded or
+retired node is not. The node a draft refines, current or waiting, and those
+it supersedes, are not compared: a refinement says its base again by design,
+and is kept as refining it (one refining a proposal still waiting can be
+accepted once that one is).
+- A node's title is its id: its words, lowercased, without filler (`a`,
+  `the`, `and`, `with`, …), each with one common ending cut (`-ing`, `-ed`,
+  `-es`, `-s` but not `-ss`, `-e`).
+- Two titles are near when they share at least two words, and the shared
+  words are at least 60% of both: Dice's coefficient, 2·shared / (a + b) ≥
+  0.6.
 
-A duplicate is said as `duplicate <id> of <present id>, not written`, and the
-run's summary counts them by what they repeat. Each draft written is present
-for every draft after it, in its answer and in the batches after. Replayed
-over the 115 proposals waiting after intake's first real run (2026-10-27), in
-the order their files were written and against the 16 current nodes, the
-check finds 5 duplicates: three of "read back the briefing and leave a
-handover", one of "start sessions through `ohjaa run`" and one of the current
-`rust-elixir-only`. Among those 131 ids, the nearest pair it lets through
-that is not one lesson scores 0.5. The same lesson in other words
+The mark is one line beside the proposal (`<id>.duplicate-of`, the id of
+what it may repeat). `ohjaa review` shows a marked proposal right after the
+one it may repeat when that one waits too, and the first line of it when it
+is current; accepting or rejecting the proposal removes its mark. A run says
+`proposed <id>, marked as a possible duplicate of <present id>`, and its
+summary counts the marked ones by what they may repeat. Each draft written is
+present for every draft after it, in its answer and in the batches after.
+Among the 131 ids present after the first real run, 8 pairs are near, each
+one lesson; the review of #61 made up distinct lessons that are near too
+(`tapio-linux-only` and `rauha-linux-only`, two valvo LSM lessons, a
+correction that reuses the words of what it corrects), which is why a near
+draft is marked, never refused. The same lesson in other words
 (`gate-before-pushing-main`, `prove-with-ohjaa-gate-before-merging`: 0.44)
 is the drafter's to see, shown both.
 
