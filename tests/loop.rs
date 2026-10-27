@@ -19,7 +19,8 @@
 //! opens with the flag.
 //!
 //! Ignored by default, since CI's runners have none of these tools. Run it
-//! with the installed ones (9 to 16 seconds here on 2026-10-27):
+//! with the installed ones. Measured on 2026-10-27, it takes 9 to 16 seconds
+//! on macOS and 6 to 8 on Linux:
 //!
 //! ```sh
 //! OHJAA_TEST_SYKLI=$(command -v sykli) OHJAA_TEST_TOIMIJA=$(command -v toimija) \
@@ -30,9 +31,11 @@
 //! environment: HOME, XDG_CONFIG_HOME, XDG_STATE_HOME, CARGO_HOME, TMPDIR and
 //! OHJAA_OURS in the sandbox, GIT_CONFIG_GLOBAL at a sandbox file,
 //! GIT_CONFIG_NOSYSTEM=1, and a PATH of the sandbox's `bin` (this ohjaa, the
-//! three tools named, and stand-ins), the toolchain that builds this test
-//! (the fixture's cargo, with no rustup between, which would look for its
-//! toolchains in the sandbox's HOME), git's directory and the system's. The
+//! three tools named, git, and stand-ins), the toolchain that builds this
+//! test (the fixture's cargo, with no rustup between, which would look for
+//! its toolchains in the sandbox's HOME) and the system's directories. git
+//! is linked into `bin`, so a folder it shares with other tools (Homebrew's)
+//! is never on PATH. The
 //! real claude never runs (a stand-in agent is first on PATH), nor the real
 //! gh (a stand-in that is not signed in), nor a real drafter. There is no
 //! network: origin is a bare repository in the sandbox, and the fixture crate
@@ -131,6 +134,16 @@ exit 4
 const CONTRACT: &str = r#"{"schema":"sykli-contract.v1","tasks":[{"name":"test","run":"cargo test --offline --quiet","inputs":["Cargo.toml","Cargo.lock","src/lib.rs"]}]}"#;
 
 const CARGO_TOML: &str = "[package]\nname = \"widget\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+
+/// What the fixture says it is, as every repository of the platform does;
+/// toimija reads it, and the briefing's perimeter is complete.
+const REPO_YAML: &str =
+    "repo:\n  name: widget\n  role: the loop test's fixture crate\n  not:\n    - a product\n";
+
+/// What toimija writes beside `repo.yaml`, as ohjaa's own `.gitignore` has it.
+const GITIGNORE: &str = "target/\n.toimija/current.md\n.toimija/current.json\n\
+                         .toimija/sessions/\n.toimija/history.jsonl\n.toimija/history.lock\n\
+                         .toimija/runs/\n.toimija/tmp/\n";
 
 const LIB: &str = "pub fn add(a: u32, b: u32) -> u32 {
     a + b
@@ -270,14 +283,16 @@ impl World {
         write_executable(&bin.join("claude"), AGENT);
         write_executable(&bin.join("gh"), GH);
         write_executable(&dir.join("drafter"), DRAFTER);
+        // git alone, never the folder it is in: Homebrew's holds the real gh.
         let git = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .find(|dir| dir.join("git").is_file())
-            .unwrap_or_else(|| PathBuf::from("/usr/bin"));
+            .map(|dir| dir.join("git"))
+            .find(|git| git.is_file())
+            .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
+        std::os::unix::fs::symlink(git, bin.join("git")).unwrap();
         let path = format!(
-            "{}:{}:{}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "{}:{}:/usr/bin:/bin:/usr/sbin:/sbin",
             bin.display(),
-            toolchain().display(),
-            git.display()
+            toolchain().display()
         );
         World { dir, path }
     }
@@ -347,7 +362,9 @@ impl World {
         fs::create_dir_all(clone.join("src")).unwrap();
         fs::write(clone.join("Cargo.toml"), CARGO_TOML).unwrap();
         fs::write(clone.join("src/lib.rs"), LIB).unwrap();
-        fs::write(clone.join(".gitignore"), "target/\n.toimija/\n").unwrap();
+        fs::write(clone.join(".gitignore"), GITIGNORE).unwrap();
+        fs::create_dir_all(clone.join(".toimija")).unwrap();
+        fs::write(clone.join(".toimija/repo.yaml"), REPO_YAML).unwrap();
         fs::write(clone.join("sykli.json"), CONTRACT).unwrap();
         self.ok(&clone, "cargo", &["generate-lockfile", "--offline"]);
         self.ok(&clone, "sykli", &["lock", "sykli.json"]);
@@ -420,9 +437,10 @@ impl World {
     }
 
     /// `ohjaa <args>` under a pseudo-terminal, as a person runs it at
-    /// theirs, with what it printed: `tests/cli.rs`'s `under_a_terminal`,
-    /// from the sandbox's emptied environment.
-    fn under_a_terminal(&self, cwd: &Path, args: &[&str]) -> String {
+    /// theirs: `tests/cli.rs`'s `under_a_terminal`, from the sandbox's
+    /// emptied environment. What it printed, and how it ended: `script`
+    /// exits with the command's status (`-e` on Linux).
+    fn under_a_terminal(&self, cwd: &Path, args: &[&str]) -> Ran {
         let quoted = std::iter::once("ohjaa")
             .chain(args.iter().copied())
             .map(|word| format!("'{}'", word.replace('\'', "'\\''")))
@@ -437,7 +455,11 @@ impl World {
         let output = script
             .output()
             .expect("`script` makes the terminal a person has");
-        String::from_utf8_lossy(&output.stdout).replace('\r', "")
+        Ran {
+            code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
     }
 }
 
@@ -629,31 +651,55 @@ fn the_whole_loop_on_the_real_tools() {
         ],
     );
     assert_eq!(verified.code, Some(0), "{}", verified.said());
+    // A receipt verifies against the contract it ran, so it must also say the
+    // fixture's test ran: a gate with no task would verify as well.
+    let ran: Value = serde_json::from_str(&fs::read_to_string(receipt).unwrap()).unwrap();
+    let tasks: Vec<(&str, &str)> = ran["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a receipt without tasks: {ran:#}"))
+        .iter()
+        .map(|task| {
+            (
+                task["name"].as_str().unwrap_or_default(),
+                task["outcome"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(tasks, [("test", "passed")], "{ran:#}");
 
-    // ---- 3. Ship: a quiet push, ✓, and ✓ once the worktree is gone ----------
+    // ---- 3. Ship: sykli's hook accepts the push; ✓, and ✓ from the run alone
     let push = world.kept(&out, "push");
     assert!(
         push.contains("HEAD -> main") && !push.contains("ohjaa:"),
         "a proven push is quiet: {push}"
     );
     assert_eq!(world.git(&bare, &["rev-parse", "main"]), commit);
+    // sykli's pre-push hook accepted it, and keeps the receipt that proved it.
+    let digest = validation["receipt"]["digest"].as_str().unwrap();
+    let hooks = clone.join(".git/sykli/receipts");
+    assert!(
+        hooks.join(format!("rcpt_{digest}.json")).is_file(),
+        "sykli's hook kept no receipt of the push: {push}"
+    );
     let marks = &world.marks()["entries"][0];
     assert_eq!(marks["tip"], commit.as_str(), "{marks:#}");
     assert_eq!(mark(marks, &commit)["mark"], "proven", "{marks:#}");
+    assert_eq!(mark(marks, &commit)["tasks"], 1, "{marks:#}");
     assert_eq!(marks["proven_at_tip"], true, "{marks:#}");
     world.git(&clone, &["worktree", "remove", path(&worktree)]);
     assert!(!worktree.exists());
+    // With the worktree gone and the hook's copy set aside, what proves the
+    // commit is the receipt sykli kept beside its run's journal, in the clone.
+    fs::rename(&hooks, world.dir.join("hook-receipts-set-aside")).unwrap();
     let marks = &world.marks()["entries"][0];
     assert_eq!(
         mark(marks, &commit)["mark"],
         "proven",
         "the proof outlives the worktree: {marks:#}"
     );
-    // sykli kept the run's receipt beside its journal, in the clone.
     let kept = clone.join(format!(
-        ".git/sykli/runs/{}/rcpt_{}.json",
-        validation["run"].as_str().unwrap(),
-        validation["receipt"]["digest"].as_str().unwrap()
+        ".git/sykli/runs/{}/rcpt_{digest}.json",
+        validation["run"].as_str().unwrap()
     ));
     let verified = world.run(
         &clone,
@@ -788,13 +834,15 @@ fn the_whole_loop_on_the_real_tools() {
     assert!(waiting.is_file(), "a refused decision changes nothing");
     // At a terminal, as the person runs it. Here the test is that person,
     // deciding a proposal of the sandbox's own: an agent never makes a
-    // terminal to accept on a person's behalf (AGENTS.md).
+    // terminal to accept on a person's behalf, outside a world of its own
+    // (AGENTS.md).
     let accepted = world.under_a_terminal(&clone, &["accept", PROPOSAL]);
     assert!(
-        accepted.contains(&format!("accepted {PROPOSAL}")),
-        "{accepted}"
+        accepted.code == Some(0) && accepted.stdout.contains(&format!("accepted {PROPOSAL}")),
+        "{}",
+        accepted.said()
     );
-    assert!(!waiting.exists(), "{accepted}");
+    assert!(!waiting.exists(), "{}", accepted.said());
     assert!(
         fs::read_to_string(world.dir.join(format!("config/ohjaa/mine/{PROPOSAL}.md")))
             .unwrap()
@@ -890,5 +938,9 @@ fn the_whole_loop_on_the_real_tools() {
         third.stderr
     );
     let brief = world.ohjaa(&clone, &["brief"]);
-    assert!(brief.stdout.starts_with(&flag), "{}", brief.said());
+    assert!(
+        brief.code == Some(0) && brief.stdout.starts_with(&flag),
+        "{}",
+        brief.said()
+    );
 }
