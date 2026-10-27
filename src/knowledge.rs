@@ -138,6 +138,17 @@ pub fn repo_knowledge(root: &Path) -> PathBuf {
     root.join(".ohjaa").join("knowledge")
 }
 
+/// `.ohjaa/knowledge/`, then `.ohjaa/`, taken out of a checkout once
+/// nothing is left in them: what ohjaa left untracked there, gone whole.
+pub fn tidy_untracked(root: &Path) {
+    let untracked = repo_knowledge(root);
+    if std::fs::remove_dir(&untracked).is_ok() {
+        if let Some(dot) = untracked.parent() {
+            let _ = std::fs::remove_dir(dot);
+        }
+    }
+}
+
 /// The clone `repo` is a checkout of, as its common git directory read from
 /// git's layout (no git process), else `repo` itself: every worktree of a
 /// clone shares the repo knowledge accepted for it.
@@ -1250,6 +1261,9 @@ pub fn accept(dirs: &Dirs, id: &str, today: Date) -> Result<Outcome> {
     outcome.repo = (pending.scope == Scope::Repo)
         .then(|| pending.repo.clone().or_else(|| dirs.repo_root.clone()))
         .flatten();
+    if let Some(root) = outcome.repo.as_deref() {
+        tidy_untracked(root);
+    }
     outcome.decided = Some(Located {
         scope: pending.scope,
         node,
@@ -1290,12 +1304,36 @@ fn amend(dirs: &Dirs, id: &str, change: impl FnOnce(&mut Node) -> Result<()>) ->
     }
     let mut node = located.node.clone();
     change(&mut node)?;
-    write_atomic(&path, &fk::to_text(&node))?;
+    let repo = (located.scope == Scope::Repo)
+        .then(|| dirs.repo_root.clone())
+        .flatten();
+    // A repo node still untracked in the checkout goes into ohjaa's state:
+    // nothing is written into the checkout.
+    let into_state = repo
+        .as_deref()
+        .map(|root| accepted_dir(&dirs.state, root))
+        .filter(|dir| path.parent() != Some(dir.as_path()));
+    let (written, removed) = match into_state {
+        Some(dir) => {
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("cannot create {}", dir.display()))?;
+            let to = dir.join(format!("{id}.md"));
+            write_atomic(&to, &fk::to_text(&node))?;
+            std::fs::remove_file(&path)?;
+            if let Some(root) = repo.as_deref() {
+                tidy_untracked(root);
+            }
+            (vec![to], vec![path])
+        }
+        None => {
+            write_atomic(&path, &fk::to_text(&node))?;
+            (vec![path], Vec::new())
+        }
+    };
     let mut outcome = Outcome {
-        written: vec![path],
-        repo: (located.scope == Scope::Repo)
-            .then(|| dirs.repo_root.clone())
-            .flatten(),
+        written,
+        removed,
+        repo,
         decided: Some(Located {
             scope: located.scope,
             node,
@@ -1576,6 +1614,48 @@ mod tests {
         assert_eq!(
             loaded.get("uploader-owner").unwrap().node.status,
             Status::Current
+        );
+    }
+
+    #[test]
+    fn retiring_or_confirming_an_untracked_node_takes_it_out_of_the_checkout() {
+        let sandbox = Sandbox::new("amend-untracked");
+        let root = sandbox.dirs.repo_root.clone().unwrap();
+        let untracked = repo_knowledge(&root);
+        std::fs::create_dir_all(&untracked).unwrap();
+        for id in ["to-retire", "to-confirm"] {
+            let node = Node {
+                id: id.to_owned(),
+                kind: Kind::Fact,
+                status: Status::Current,
+                as_of: date("2026-09-01"),
+                origin: vec!["accepted before".to_owned()],
+                supersedes: Vec::new(),
+                refines: None,
+                holds_while: Vec::new(),
+                body: format!("{id}."),
+            };
+            std::fs::write(untracked.join(format!("{id}.md")), fk::to_text(&node)).unwrap();
+        }
+        let accepted = accepted_dir(&sandbox.dirs.state, &root);
+        let outcome = retire(&sandbox.dirs, "to-retire", "gone", date("2026-09-24")).unwrap();
+        assert_eq!(outcome.written, vec![accepted.join("to-retire.md")]);
+        assert_eq!(outcome.removed, vec![untracked.join("to-retire.md")]);
+        assert!(untracked.is_dir(), "the other is still there");
+        let outcome = confirm(&sandbox.dirs, "to-confirm", date("2026-09-24")).unwrap();
+        assert_eq!(outcome.written, vec![accepted.join("to-confirm.md")]);
+        assert!(
+            !root.join(".ohjaa").exists(),
+            "nothing of ohjaa's is left in the checkout"
+        );
+        let loaded = load(&sandbox.dirs).unwrap();
+        assert_eq!(
+            loaded.get("to-retire").unwrap().node.status,
+            Status::Retired
+        );
+        assert_eq!(
+            loaded.get("to-confirm").unwrap().node.as_of,
+            date("2026-09-24")
         );
     }
 

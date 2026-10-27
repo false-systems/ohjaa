@@ -133,10 +133,11 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   through a pull request ohjaa opens and the person merges; until its line is
   on the checked-out commit, the briefing carries it, marked. What ohjaa
   writes into a repository names no tool, and a repository that is not
-  private is sent nothing that names what is (the person's private
-  repositories, home path, account, login or name): a line that would is held
-  back, anything else that would stops the delivery, and no why is sent. A
-  proposal never lands in a shared repository by itself.
+  private is sent nothing that names what is (this tool, the person's
+  private or internal repositories, home path, account, login or name): a
+  line that would is held back, anything else that would stops the delivery,
+  and no why is sent. A proposal never lands in a shared repository by
+  itself.
 - **Cross-repo yes, messaging no.** Permanently refused: request/response
   between agents, presence, and dispatch (assigning work to an agent).
   Knowledge is not a message — it carries its time, its why and whose it is. A

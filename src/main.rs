@@ -511,19 +511,21 @@ enum LessonsCmd {
         1  it could not run\n\n\
         Per repository, from a checkout of it, never in it:\n  \
         gh repo view <owner/repo> --json visibility,defaultBranchRef\n  \
-        gh api user, gh api user/repos?visibility=private… --paginate\n                              \
+        gh api user, gh api user/repos?… --paginate\n                              \
         for a repository that is not private, once a run: your login\n                              \
-        and name, and every private repository you can see\n  \
-        gh pr list -R <owner/repo>  an open pull request of the lessons gets the next commit\n  \
+        and name, and every repository you can see that is not public\n  \
+        gh pr list -R <owner/repo> --author @me\n                              \
+        your open pull request of the lessons gets the next commit\n  \
         git fetch https://github.com/<owner/repo>.git <branch>, then a worktree off it in\n  \
         $XDG_STATE_HOME/ohjaa/lessons/.work/, git commit, git push to the same URL\n  \
         HEAD:refs/heads/agents-md-lessons/<date>-<n>, gh pr create, and the worktree removed;\n  \
         git reaches GitHub by HTTPS with gh's credentials (no SSH key's prompt holds it up)\n\
         What goes to a repository names no tool. For one that is not private, all of it is\n\
-        checked first: a line that names one of your private repositories, your home path,\n\
-        your account or your name is held back and said, its text sent nowhere and its file\n\
-        left; anything else that would stops the delivery. A dry run reads AGENTS.md as last\n\
-        fetched here, and fetches, writes and sends nothing.")]
+        checked first: a line that names ohjaa, one of your repositories that is not public,\n\
+        your home path, your account or your name is held back and said, its text sent\n\
+        nowhere and its file left; anything else that would stops the delivery. AGENTS.md is\n\
+        read whole or not at all. A dry run reads AGENTS.md as last fetched here, and fetches,\n\
+        writes and sends nothing.")]
     Publish {
         /// The repositories (any directory inside each). Default: every
         /// repository under the roots with a `.ohjaa/knowledge/`, and every
@@ -867,7 +869,7 @@ fn knowledge_briefing_for(
             && located.scope == Scope::Repo
             && standing
                 .as_ref()
-                .is_some_and(|standing| standing.in_agents_md(&located.node.id))
+                .is_some_and(|standing| standing.in_agents_md(&located.node))
     };
     let shown: Vec<&fk::Located> = current
         .iter()
@@ -879,7 +881,7 @@ fn knowledge_briefing_for(
         .iter()
         .filter(|located| located.scope == Scope::Repo)
         .filter_map(|located| {
-            let note = standing.as_ref()?.note(&located.node.id)?;
+            let note = standing.as_ref()?.note(&located.node)?;
             Some((located.node.id.clone(), note))
         })
         .collect();
@@ -1748,7 +1750,7 @@ fn cmd_list(all: bool) -> Result<i32> {
             node.body.lines().next().unwrap_or("")
         );
         let status = (located.scope == Scope::Repo && node.status == Status::Current)
-            .then(|| standing.as_ref()?.status(&node.id))
+            .then(|| standing.as_ref()?.status(node))
             .flatten();
         if let Some(status) = status {
             println!("{:<8} {status}", "");

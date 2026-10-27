@@ -1104,12 +1104,15 @@ it like any change. Nothing is written into your checkout:
   own lines, and a line of an id ohjaa does not know, stay as they are.
   Writing the same nodes again changes nothing. What ohjaa writes into a
   repository names no tool: not its marks, its words, its branch, its
-  commit or (but in a private repository's pull request, which also says
-  why each was accepted) its pull request.
+  commit or its pull request (a private repository's says why each was
+  accepted, in your words). AGENTS.md is read whole, from the branch as
+  fetched: one git cannot read, or that is not UTF-8, is never written
+  over, and the delivery says why.
 - **The pull request.** From the clone, never in your checkout: `gh repo
-  view` (its visibility and default branch), `gh pr list` (an open pull
-  request of the lessons, from a branch `agents-md-lessons/…`, gets the next
-  commit, on its tip, never a force), `git fetch` of that branch, a
+  view` (its visibility and default branch), `gh pr list --author `
+  (your open pull request of the lessons, from a branch
+  `agents-md-lessons/…` of that repository, gets the next commit, on its
+  tip, never a force), `git fetch` of that branch, a
   worktree off it in `~/.local/state/ohjaa/lessons/.work/`, `git commit`
   (with your identity, and the repository's own hooks), `git push` to
   `refs/heads/agents-md-lessons/<date>-<n>`, `gh pr create`, and the
@@ -1118,7 +1121,8 @@ it like any change. Nothing is written into your checkout:
   gh's credentials (`gh auth git-credential`): no SSH key's prompt can hold
   it up, and your `insteadOf` rules still apply. The origin names the
   repository; it must be on GitHub. One delivery at a time
-  (`lessons/lessons.lock`). `retire` and `confirm` of a node ohjaa holds
+  (`lessons/lessons.lock`), which first takes out what a delivery that did
+  not end (killed mid-push) left in `lessons/.work/`. `retire` and `confirm` of a node ohjaa holds
   deliver the same way.
 - **When it cannot be delivered** (no remote named origin, an origin not on
   GitHub, no gh, gh signed out, a fetch or push that fails), the decision
@@ -1129,11 +1133,15 @@ it like any change. Nothing is written into your checkout:
 **A repository that is not private** (public, or internal) gets nothing
 that names what is. Everything it would be sent is checked first against a
 deny list built from your private context, asked of gh once a run: the names
-of every private repository you can see (GitHub's REST `user/repos`,
-`visibility=private`, as owner, collaborator and organisation member, every
-page), your home path (anywhere), your home folder's name, and your GitHub
-login and name, as words, letter case not told apart. What that repository's
-own URL says is no secret in it: its name, and its owner. A line that names
+of every repository you can see that is not public (GitHub's REST
+`user/repos` as owner, collaborator and organisation member, every page,
+keeping the private and internal ones), your home path, your home folder's
+name, and your GitHub login and name; and always `ohjaa`, this tool's own
+name, whatever gh lists. Names match as words, letter case not told apart
+(Unicode's), a capital after a small letter starting a word (`SelkoClient`
+names `selko`); the home path and `ohjaa` match anywhere (`.ohjaa/`).
+What that repository's own URL says is no secret in it: its name, and its
+owner. A line that names
 something on the list is held back and said, with what it named, and its
 text goes nowhere: at `accept`, the accept is refused and the proposal stays
 waiting; at `publish`, the node waits where it is. The rest of what would
@@ -1143,8 +1151,10 @@ too, and a match there stops the delivery whole. No why is ever sent to a
 repository that is not private.
 
 **The briefing** reads the launch repository's AGENTS.md as checked out
-(the file, no git). The nodes it holds are left to it, but a flagged one,
-and one line says so:
+(the file, no git). The nodes whose lines it holds, as they are now, are
+left to it, but a flagged one, and one line says so (a line of a node's id
+in other words, older or edited by hand, does not count, and the node is
+carried, marked `AGENTS.md holds another line of it`):
 
 ```
 This repository's lessons (14 nodes) are not repeated here: its AGENTS.md (/Users/you/projects/widget/AGENTS.md) holds them, in its ## Lessons section.

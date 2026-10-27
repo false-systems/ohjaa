@@ -669,6 +669,32 @@ fn publish_opens_one_pull_request_then_moves_each_file_out_of_the_checkout() {
     list.arg("list");
     let (listed, _, _) = world.run(&mut list);
     assert!(listed.contains("in AGENTS.md"), "{listed}");
+    // Only the person's own lessons pull request is added to.
+    assert!(
+        world
+            .gh_calls()
+            .lines()
+            .filter(|call| call.starts_with("pr list"))
+            .all(|call| call.contains("--author @me")),
+        "{}",
+        world.gh_calls()
+    );
+
+    // A line edited by hand is not the node: the briefing carries it again.
+    let agents = world.checkout.join("AGENTS.md");
+    let edited = fs::read_to_string(&agents)
+        .unwrap()
+        .replace("Widget code is Rust.", "Widget code is anything.");
+    fs::write(&agents, edited).unwrap();
+    let mut brief = world.ohjaa(&world.checkout);
+    brief.args(["brief", "--knowledge-only"]);
+    let (briefing, _, _) = world.run(&mut brief);
+    assert!(briefing.contains("Widget code is Rust."), "{briefing}");
+    assert!(
+        briefing.contains("AGENTS.md holds another line of it"),
+        "{briefing}"
+    );
+    assert!(!briefing.contains("failing test"), "{briefing}");
 }
 
 #[test]
@@ -852,13 +878,24 @@ fn a_scoped_repositorys_lessons_are_carried_though_its_agents_md_holds_them() {
 fn when_every_line_is_held_nothing_is_pushed() {
     let world = World::new("allheld");
     world.set_visibility("PUBLIC");
+    // gh does not list the tool's own repository: it is held back anyway.
+    fs::write(world.dir.join("gh/repos.json"), "[{\"name\":\"ote\"}]\n").unwrap();
     let held = world.legacy("widget-calls-ote", "fact", "Widget calls ote.");
+    let tool = world.legacy(
+        "widget-knowledge-folder",
+        "fact",
+        "Accepted lessons sat in .ohjaa/knowledge/ before.",
+    );
     let (stdout, stderr, code) = world.publish(&[]);
     assert_eq!(code, Some(4), "{stdout}{stderr}");
     assert!(stdout.contains("`ote`"), "{stdout}");
+    assert!(
+        stdout.contains("`ohjaa` (the name of this tool, which is private)"),
+        "{stdout}"
+    );
     assert_eq!(world.remote_heads(), vec!["main"]);
     assert!(!world.gh_calls().contains("pr create"));
-    assert!(held.exists());
+    assert!(held.exists() && tool.exists());
     assert_eq!(world.worktrees(), 1);
 }
 
@@ -1036,4 +1073,47 @@ fn when_what_ohjaa_itself_writes_names_something_private_nothing_is_sent() {
     assert!(!world.gh_calls().contains("pr create"));
     assert!(file.exists());
     assert_eq!(world.worktrees(), 1);
+}
+
+#[test]
+fn an_agents_md_that_cannot_be_read_whole_is_never_written_over() {
+    let world = World::new("notutf8");
+    // main's AGENTS.md, with a byte that is no UTF-8.
+    let seed = world.dir.join("seed");
+    fs::write(
+        seed.join("AGENTS.md"),
+        b"# Agent guide\n\nLatin-1: caf\xe9\n",
+    )
+    .unwrap();
+    world.git(&seed, &["commit", "-q", "-am", "latin-1"]);
+    world.git(&seed, &["push", "-q", "origin", "HEAD:main"]);
+    let file = world.legacy("widget-uses-rust", "decision", "Widget code is Rust.");
+    let (stdout, stderr, code) = world.publish(&[]);
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    assert!(stdout.contains("not UTF-8"), "{stdout}");
+    assert_eq!(world.remote_heads(), vec!["main"], "nothing is pushed");
+    assert!(!world.gh_calls().contains("pr create"));
+    assert!(file.exists());
+    assert_eq!(world.worktrees(), 1);
+}
+
+#[test]
+fn retiring_an_untracked_node_at_a_terminal_takes_it_out_of_the_checkout() {
+    let world = World::new("retire-untracked");
+    world.legacy("widget-old-rule", "decision", "An old rule.");
+    let mut retire = world.ohjaa(&world.checkout);
+    retire.args(["retire", "widget-old-rule", "--why", "no longer"]);
+    let (said, code) = at_terminal(retire);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(
+        !world.checkout.join(".ohjaa").exists(),
+        "nothing is written into the checkout: {said}"
+    );
+    let node = fs::read_to_string(world.accepted().join("widget-old-rule.md")).unwrap();
+    assert!(node.contains("status = \"retired\""), "{node}");
+    assert!(node.contains("retired: no longer"), "{node}");
+    assert!(
+        !world.gh_calls().contains("pr create"),
+        "a retired node that never had a line opens nothing"
+    );
 }

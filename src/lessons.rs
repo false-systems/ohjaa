@@ -54,12 +54,16 @@ pub const INTRO: &str = "<!-- This repository's accepted knowledge: one line per
 pub const BRANCH_PREFIX: &str = "agents-md-lessons/";
 pub const SCHEMA: &str = "ohjaa-lessons.v1";
 const TITLE: &str = "AGENTS.md: accepted lessons";
+/// This tool's name: private, so never sent to a repository that is not.
+const TOOL: &str = "ohjaa";
 
 const GH: Duration = Duration::from_secs(30);
 const GH_CREATE: Duration = Duration::from_secs(60);
 const FETCH: Duration = Duration::from_secs(120);
-/// A push runs the repository's own pre-push hook.
-const PUSH: Duration = Duration::from_secs(300);
+/// A commit and a push run the repository's own hooks, never skipped: in a
+/// fresh worktree a pre-commit that runs clippy on the workspace (tapio's)
+/// builds it first.
+const HOOKS: Duration = Duration::from_secs(900);
 /// How long a delivery waits for another ohjaa's to the same state.
 const LOCK_WAIT: Duration = Duration::from_secs(120);
 
@@ -89,9 +93,18 @@ fn marked(line: &str) -> Option<&str> {
     fk::is_valid_id(id).then_some(id)
 }
 
-/// Every id a line of ohjaa's marks in `text`, wherever it is.
-pub fn ids_in(text: &str) -> BTreeSet<String> {
-    text.lines().filter_map(marked).map(str::to_owned).collect()
+/// Every marked line in `text`, wherever it is, trimmed, by the id it marks.
+pub fn lines_in(text: &str) -> BTreeMap<String, Vec<String>> {
+    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for text in text.lines() {
+        if let Some(id) = marked(text) {
+            found
+                .entry(id.to_owned())
+                .or_default()
+                .push(text.trim().to_owned());
+        }
+    }
+    found
 }
 
 /// What [`with_lessons`] changed, by id.
@@ -254,12 +267,13 @@ pub struct Private {
     pub people: Vec<String>,
 }
 
-/// Every private repository the person can see, as GitHub's REST API lists
-/// them to gh: their own, their organisations', and those they collaborate
-/// on, every page (`--paginate`). GraphQL's `viewer.repositories` leaves out
-/// most of an organisation's.
+/// Every repository the person can see, as GitHub's REST API lists them to
+/// gh: their own, their organisations', and those they collaborate on, every
+/// page (`--paginate`); [`parse_repos`] keeps those that are not public, so
+/// an organisation's internal ones count as private. GraphQL's
+/// `viewer.repositories` leaves out most of an organisation's.
 const PRIVATE_REPOS: &str =
-    "user/repos?visibility=private&affiliation=owner,collaborator,organization_member&per_page=100";
+    "user/repos?affiliation=owner,collaborator,organization_member&per_page=100";
 
 fn add_once(list: &mut Vec<String>, text: &str) {
     let text = text.trim();
@@ -291,8 +305,8 @@ pub fn parse_user(output: &[u8]) -> Result<Vec<String>, String> {
     Ok(people)
 }
 
-/// The names of the repositories `gh api user/repos?… --paginate` printed:
-/// one JSON array, or one per page.
+/// The names of the repositories `gh api user/repos?… --paginate` printed
+/// (one JSON array, or one per page) that are not public.
 pub fn parse_repos(output: &[u8]) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     let mut pages = 0;
@@ -309,7 +323,15 @@ pub fn parse_repos(output: &[u8]) -> Result<Vec<String>, String> {
             let name = repo["name"]
                 .as_str()
                 .ok_or("GitHub listed a repository without its name")?;
-            add_once(&mut names, name);
+            // Public only when GitHub says so: private, internal, or not
+            // said, it counts as private.
+            let public = match repo["visibility"].as_str() {
+                Some(visibility) => visibility.eq_ignore_ascii_case("public"),
+                None => repo["private"].as_bool() == Some(false),
+            };
+            if !public {
+                add_once(&mut names, name);
+            }
         }
     }
     if pages == 0 {
@@ -343,6 +365,11 @@ impl DenyList {
     pub fn build(private: &Private, home: Option<&Path>, slug: &str) -> DenyList {
         let (owner, own) = slug.split_once('/').unwrap_or(("", slug));
         let mut list = DenyList::default();
+        // This tool is private, whatever gh lists: never named, even inside a
+        // word (`.ohjaa/`, `OhjaaCli`), but in its own repository.
+        if !own.eq_ignore_ascii_case(TOOL) {
+            list.add(TOOL, "the name of this tool, which is private", false);
+        }
         for name in &private.repos {
             if !name.eq_ignore_ascii_case(own) {
                 list.add(name, "the name of a private repository of yours", true);
@@ -400,8 +427,7 @@ impl DenyList {
                 if entry.word {
                     names_word(text, &entry.text)
                 } else {
-                    text.to_ascii_lowercase()
-                        .contains(&entry.text.to_ascii_lowercase())
+                    names_anywhere(text, &entry.text)
                 }
             })
             .map(|entry| format!("`{}` ({})", entry.text, entry.what))
@@ -409,24 +435,40 @@ impl DenyList {
     }
 }
 
-/// Whether `haystack` holds `needle` as a word of its own: what is on either
-/// side of it is no letter or digit.
+/// One character as matching compares it: lower case (its first, where
+/// lowering makes more than one).
+fn fold(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Whether `haystack` holds `needle` anywhere, letter case not told apart.
+fn names_anywhere(haystack: &str, needle: &str) -> bool {
+    let hay: String = haystack.chars().map(fold).collect();
+    let needle: String = needle.chars().map(fold).collect();
+    !needle.is_empty() && hay.contains(&needle)
+}
+
+/// Whether `haystack` holds `needle` as a word of its own, letter case not
+/// told apart: what is on either side of it is no letter or digit, or a
+/// change from a lower-case letter to a capital (`myOte`, `SelkoClient`).
 fn names_word(haystack: &str, needle: &str) -> bool {
-    let (hay, needle) = (haystack.to_ascii_lowercase(), needle.to_ascii_lowercase());
-    if needle.is_empty() {
+    let hay: Vec<char> = haystack.chars().collect();
+    let folded: Vec<char> = hay.iter().copied().map(fold).collect();
+    let needle: Vec<char> = needle.chars().map(fold).collect();
+    if needle.is_empty() || needle.len() > hay.len() {
         return false;
     }
-    let edge = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
-    let mut from = 0;
-    while let Some(at) = hay[from..].find(&needle) {
-        let start = from + at;
+    let apart = |left: char, right: char| {
+        !left.is_alphanumeric()
+            || !right.is_alphanumeric()
+            || (left.is_lowercase() && right.is_uppercase())
+    };
+    (0..=hay.len() - needle.len()).any(|start| {
         let end = start + needle.len();
-        if edge(hay[..start].chars().next_back()) && edge(hay[end..].chars().next()) {
-            return true;
-        }
-        from = start + hay[start..].chars().next().map_or(1, char::len_utf8);
-    }
-    false
+        folded[start..end] == needle[..]
+            && (start == 0 || apart(hay[start - 1], hay[start]))
+            && (end == hay.len() || apart(hay[end - 1], hay[end]))
+    })
 }
 
 // ---- the record ---------------------------------------------------------------
@@ -540,7 +582,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[derive(Debug, Default)]
 pub struct Standing {
     pub agents_md: PathBuf,
-    in_file: BTreeSet<String>,
+    /// The marked lines the file holds, by id.
+    in_file: BTreeMap<String, Vec<String>>,
     record: Record,
     /// Ids still in the checkout's `.ohjaa/knowledge/`.
     untracked: BTreeSet<String>,
@@ -555,7 +598,7 @@ impl Standing {
         let root = dirs.repo_root.as_deref()?;
         let agents_md = root.join("AGENTS.md");
         let in_file = std::fs::read_to_string(&agents_md)
-            .map(|text| ids_in(&text))
+            .map(|text| lines_in(&text))
             .unwrap_or_default();
         let dir = knowledge::accepted_dir(&dirs.state, root);
         let record = Record::read(&dir).unwrap_or_else(|why| {
@@ -582,17 +625,30 @@ impl Standing {
         Some(standing)
     }
 
-    /// Whether AGENTS.md, as checked out, holds the line of `id`.
-    pub fn in_agents_md(&self, id: &str) -> bool {
-        self.in_file.contains(id)
+    /// Whether AGENTS.md, as checked out, holds `node`'s line as it is now:
+    /// a line of its id in other words (older, edited by hand) does not
+    /// count.
+    pub fn in_agents_md(&self, node: &Node) -> bool {
+        self.in_file
+            .get(&node.id)
+            .is_some_and(|lines| lines.contains(&line(node)))
     }
 
     /// What the briefing says beside a repo node it carries: why it is not
     /// left to AGENTS.md.
-    pub fn note(&self, id: &str) -> Option<String> {
-        if self.in_agents_md(id) {
+    pub fn note(&self, node: &Node) -> Option<String> {
+        if self.in_agents_md(node) {
             return Some("in AGENTS.md too".to_owned());
         }
+        let note = self.delivery_note(&node.id);
+        if self.in_file.contains_key(&node.id) {
+            let other = "AGENTS.md holds another line of it";
+            return Some(note.map_or(other.to_owned(), |note| format!("{note}; {other}")));
+        }
+        note
+    }
+
+    fn delivery_note(&self, id: &str) -> Option<String> {
         let delivery = self.record.nodes.get(id);
         let held = delivery.is_some_and(|delivery| delivery.state == State::Held);
         if self.untracked.contains(id) && !held {
@@ -628,12 +684,12 @@ impl Standing {
     }
 
     /// What `ohjaa list` says under a current repo node.
-    pub fn status(&self, id: &str) -> Option<String> {
-        if self.in_agents_md(id) {
+    pub fn status(&self, node: &Node) -> Option<String> {
+        if self.in_agents_md(node) {
             return Some(format!("in AGENTS.md ({})", self.agents_md.display()));
         }
-        let note = self.note(id)?;
-        Some(if self.untracked.contains(id) {
+        let note = self.note(node)?;
+        Some(if self.untracked.contains(&node.id) {
             format!(
                 "{note}: untracked in .ohjaa/knowledge/; deliver it with `ohjaa lessons publish`"
             )
@@ -676,6 +732,12 @@ fn gh(args: &[&str], input: Option<&[u8]>, timeout: Duration) -> Result<String, 
 }
 
 fn git_in(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+    git_bytes(dir, args, timeout).map(|out| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// What git printed, byte for byte, or why it failed, named by its command
+/// (past any `-c <setting>` before it).
+fn git_bytes(dir: &Path, args: &[&str], timeout: Duration) -> Result<Vec<u8>, String> {
     let mut command = Command::new("git");
     command
         .args(args)
@@ -685,7 +747,6 @@ fn git_in(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String
     for var in gitconfig::REPO_ENV {
         command.env_remove(var);
     }
-    // Named by its command, past any `-c <setting>` before it.
     let mut words = args.iter().copied();
     let mut command_word = "";
     while let Some(word) = words.next() {
@@ -700,10 +761,33 @@ fn git_in(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String
     let output =
         process::run(&mut command, None, timeout).map_err(|error| format!("{what}: {error:#}"))?;
     if output.status.success() {
-        Ok(output.stdout_text())
+        Ok(output.stdout)
     } else {
         Err(format!("{what}: {}", output.failure_detail()))
     }
+}
+
+/// AGENTS.md as `rev` holds it: empty when it holds none. Anything else that
+/// keeps it from being read whole (git failing, bytes that are not UTF-8) is
+/// an error, so that the file is never written over from a reading that
+/// failed or lost something.
+fn agents_md_at(checkout: &Path, rev: &str) -> Result<String, String> {
+    let listed = git_in(
+        checkout,
+        &["ls-tree", "--name-only", rev, "--", "AGENTS.md"],
+        process::LOCAL,
+    )?;
+    if listed.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let bytes = git_bytes(
+        checkout,
+        &["cat-file", "blob", &format!("{rev}:AGENTS.md")],
+        process::LOCAL,
+    )?;
+    String::from_utf8(bytes).map_err(|_| {
+        format!("AGENTS.md on {rev} is not UTF-8, and ohjaa rewrites no file it cannot read whole")
+    })
 }
 
 /// The repository on GitHub, by HTTPS: the one the pull request is opened
@@ -865,13 +949,16 @@ pub fn screen(asker: &mut Asker, checkout: &Path, node: &Node) -> Result<Result<
     Ok(ready)
 }
 
-/// An open pull request of ohjaa's lessons.
+/// An open pull request of the lessons.
 #[derive(Debug, Clone)]
 struct OpenPr {
     url: String,
     branch: String,
 }
 
+/// The person's own open pull request of the lessons in `slug`, from a
+/// branch of that repository: a lessons branch someone else opened is not
+/// added to.
 fn open_pr(slug: &str) -> Result<Option<OpenPr>, String> {
     let out = gh(
         &[
@@ -879,6 +966,8 @@ fn open_pr(slug: &str) -> Result<Option<OpenPr>, String> {
             "list",
             "-R",
             slug,
+            "--author",
+            "@me",
             "--state",
             "open",
             "--json",
@@ -960,6 +1049,34 @@ struct Work {
 }
 
 impl Work {
+    /// What a delivery that was killed left in `lessons/.work/`: taken out,
+    /// under the lessons lock (so no delivery is writing there), and git's
+    /// record of it in `checkout`'s clone pruned. Another clone's record of
+    /// one is pruned by git in its own time.
+    fn sweep(checkout: &Path, state: &Path, said: &mut Vec<String>) {
+        let base = state.join("lessons").join(".work");
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            return;
+        };
+        let mut swept = 0;
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => swept += 1,
+                Err(error) => said.push(format!(
+                    "left {}, from a delivery that did not end: {error}",
+                    entry.path().display()
+                )),
+            }
+        }
+        if swept > 0 {
+            said.push(format!(
+                "took out {swept} worktree(s) a delivery that did not end left in {}",
+                base.display()
+            ));
+            let _ = git_in(checkout, &["worktree", "prune"], process::LOCAL);
+        }
+    }
+
     fn add(checkout: &Path, state: &Path, rev: &str) -> Result<Work, String> {
         let base = state.join("lessons").join(".work");
         std::fs::create_dir_all(&base)
@@ -1189,7 +1306,10 @@ pub fn deliver(
         None
     } else {
         match process::lock_file(&state.join("lessons").join("lessons.lock"), LOCK_WAIT) {
-            Ok(lock) => Some(lock),
+            Ok(lock) => {
+                Work::sweep(checkout, state, &mut said);
+                Some(lock)
+            }
             Err(why) => {
                 said.push(format!("not delivered: {why}"));
                 stays(extra.len(), &mut said);
@@ -1326,7 +1446,7 @@ pub fn deliver(
             knowledge::repo_knowledge(checkout).display(),
             dir.display()
         ));
-        remove_if_empty(checkout);
+        knowledge::tidy_untracked(checkout);
     }
     stays(stayed, &mut said);
     Delivered {
@@ -1365,26 +1485,25 @@ fn attempt(
         .as_ref()
         .map_or(ready.default_branch.clone(), |pr| pr.branch.clone());
     let tracking = |branch: &str| format!("refs/remotes/origin/{branch}");
-    let show = |branch: &str| {
+    let tracked = |branch: &str| {
         git_in(
             checkout,
-            &["show", &format!("{}:AGENTS.md", tracking(branch))],
+            &["rev-parse", "--verify", "--quiet", &tracking(branch)],
             process::LOCAL,
         )
-        .unwrap_or_default()
+        .is_ok()
     };
     let read_from = if dry_run {
         // The branch as last fetched here: a dry run fetches nothing.
-        let tracked = git_in(
-            checkout,
-            &["rev-parse", "--verify", "--quiet", &tracking(&base_branch)],
-            process::LOCAL,
-        )
-        .is_ok();
-        if tracked {
+        if tracked(&base_branch) {
             base_branch.clone()
-        } else {
+        } else if tracked(&ready.default_branch) {
             ready.default_branch.clone()
+        } else {
+            return Err(format!(
+                "origin/{} was never fetched here, and a dry run fetches nothing",
+                ready.default_branch
+            ));
         }
     } else {
         let refspec = format!("+refs/heads/{base_branch}:{}", tracking(&base_branch));
@@ -1395,7 +1514,7 @@ fn attempt(
         )?;
         base_branch.clone()
     };
-    let base = show(&read_from);
+    let base = agents_md_at(checkout, &tracking(&read_from))?;
     let plan = plan(&base, &wanted.lines, &wanted.gone, ready.deny.as_ref());
     let out = outgoing(&ready, &plan, &wanted.located, open.as_ref(), today);
     if let Some(deny) = &ready.deny {
@@ -1453,13 +1572,17 @@ fn attempt(
     let work = Work::add(checkout, state, &tracking(&base_branch))?;
     write_atomic(&work.path.join("AGENTS.md"), plan.text.as_bytes())?;
     git_in(&work.path, &["add", "AGENTS.md"], process::LOCAL)?;
-    git_in(&work.path, &["commit", "--quiet", "-m", &out.message], PUSH)?;
+    git_in(
+        &work.path,
+        &["commit", "--quiet", "-m", &out.message],
+        HOOKS,
+    )?;
     // Never a force: on an open pull request's branch, a commit on its tip.
     let refspec = format!("HEAD:refs/heads/{}", out.branch);
     git_in(
         &work.path,
         &over_https(&["push", "--quiet", &github_url(&ready.slug), &refspec]),
-        PUSH,
+        HOOKS,
     )?;
     drop(work);
     let url = match &open {
@@ -1529,9 +1652,9 @@ fn commit_message(changes: &Changes) -> String {
     message.trim_end().to_owned()
 }
 
-/// A new pull request's body. For a private repository it says why each
-/// was accepted, and that ohjaa wrote it; for any other it names no tool and
-/// carries no reason.
+/// A new pull request's body, in words that name no tool. For a private
+/// repository it says why each was accepted, in the person's own words; for
+/// any other it carries no reason.
 fn pr_body(ready: &Ready, plan: &Plan, located: &[Located]) -> String {
     let mut body = format!(
         "Repository knowledge a person accepted, written into the `{HEADING}` section of \
@@ -1555,7 +1678,7 @@ fn pr_body(ready: &Ready, plan: &Plan, located: &[Located]) -> String {
             ready.visibility.to_ascii_lowercase()
         );
     } else {
-        body.push_str("\nWritten by ohjaa. Why each was accepted:\n");
+        body.push_str("\nWhy each was accepted:\n");
         for id in plan.changes.sent() {
             if let Some(located) = located.iter().find(|located| located.node.id == *id) {
                 let _ = writeln!(body, "- `{id}`: {}", located.node.origin.join("; "));
@@ -1610,16 +1733,6 @@ fn move_in(from: &Path, to: &Path) -> Result<(), String> {
             to.display()
         )
     })
-}
-
-/// `.ohjaa/knowledge/`, then `.ohjaa/`, taken out of the checkout once
-/// nothing is left in them.
-fn remove_if_empty(checkout: &Path) {
-    let knowledge = knowledge::repo_knowledge(checkout);
-    let _ = std::fs::remove_dir(&knowledge);
-    if let Some(dot) = knowledge.parent() {
-        let _ = std::fs::remove_dir(dot);
-    }
 }
 
 // ---- which repositories are waiting ------------------------------------------------
@@ -1707,9 +1820,31 @@ mod tests {
         assert_eq!(marked("  - <!-- lesson: x-1 --> anything\r"), Some("x-1"));
         assert_eq!(marked("- <!-- lesson: Not An Id --> x"), None);
         assert_eq!(marked("- a person's line"), None);
+        let found =
+            lines_in("x\n- <!-- lesson: one --> a\r\n## Other\n  - <!-- lesson: two --> b\n");
+        assert_eq!(found.len(), 2);
+        assert_eq!(found["one"], vec!["- <!-- lesson: one --> a"]);
+        assert_eq!(found["two"], vec!["- <!-- lesson: two --> b"]);
+    }
+
+    #[test]
+    fn agents_md_holds_a_node_only_in_its_words_as_they_are() {
+        let rust = node("rust", Kind::Decision, "Rust only.");
+        let mut confirmed = rust.clone();
+        confirmed.as_of = Date::new(2026, 11, 2).unwrap();
+        let standing = Standing {
+            in_file: lines_in(&format!("# G\n\n{}\n", line(&rust))),
+            accepted: ["rust".to_owned()].into_iter().collect(),
+            ..Standing::default()
+        };
+        assert!(standing.in_agents_md(&rust));
+        assert!(
+            !standing.in_agents_md(&confirmed),
+            "an older line is not the node as it is now"
+        );
         assert_eq!(
-            ids_in("x\n- <!-- lesson: one --> a\n## Other\n- <!-- lesson: two --> b\n"),
-            ["one", "two"].iter().map(|s| s.to_string()).collect()
+            standing.note(&confirmed).unwrap(),
+            "not delivered yet; AGENTS.md holds another line of it"
         );
     }
 
@@ -1866,6 +2001,29 @@ mod tests {
     }
 
     #[test]
+    fn a_name_inside_camel_case_or_beyond_ascii_is_still_named() {
+        assert!(
+            names_word("SelkoClient", "selko"),
+            "a capital starts a word"
+        );
+        assert!(names_word("myOteThing", "ote"));
+        assert!(!names_word("remote", "ote") && !names_word("Xote", "ote"));
+        assert!(names_word("ask Étienne", "étienne"));
+        assert!(names_word("ÉTIENNE said", "Étienne"));
+        assert!(names_anywhere("/HOME/Ünal/x", "/home/ünal"));
+    }
+
+    #[test]
+    fn the_tools_own_name_is_always_on_the_list_but_in_its_own_repository() {
+        let deny = DenyList::build(&Private::default(), None, "acme/widget");
+        let tool = vec!["`ohjaa` (the name of this tool, which is private)".to_owned()];
+        assert_eq!(deny.matches("see .ohjaa/knowledge/"), tool);
+        assert_eq!(deny.matches("OhjaaCli and ohjaa-marks"), tool);
+        let own = DenyList::build(&Private::default(), None, "false-systems/ohjaa");
+        assert!(own.matches("ohjaa").is_empty());
+    }
+
+    #[test]
     fn the_owner_of_the_repository_is_no_secret_in_it() {
         let private = Private {
             repos: vec!["secret-thing".to_owned()],
@@ -1908,6 +2066,16 @@ mod tests {
             .unwrap_err()
             .contains("Not Found"));
         assert!(parse_repos(br#"[{"id":1}]"#).is_err());
+        // Public ones are left out; internal and private ones, and one whose
+        // visibility GitHub does not say, are kept.
+        let mixed = br#"[{"name":"open","visibility":"public","private":false},
+            {"name":"inner","visibility":"internal","private":true},
+            {"name":"closed","visibility":"private","private":true},
+            {"name":"old-public","private":false},{"name":"unsaid"}]"#;
+        assert_eq!(
+            parse_repos(mixed).unwrap(),
+            vec!["inner", "closed", "unsaid"]
+        );
     }
 
     #[test]
