@@ -511,16 +511,19 @@ enum LessonsCmd {
         1  it could not run\n\n\
         Per repository, from a checkout of it, never in it:\n  \
         gh repo view <owner/repo> --json visibility,defaultBranchRef\n  \
-        gh api graphql --paginate   for a repository that is not private, once a run: the\n                              \
-        names of your private repositories, your login and name\n  \
-        gh pr list -R <owner/repo>  an open pull request of ohjaa's lessons gets the next commit\n  \
-        git fetch origin <branch>, then a worktree off it in $XDG_STATE_HOME/ohjaa/lessons/.work/,\n  \
-        git commit, git push origin HEAD:refs/heads/ohjaa/lessons-<date>-<n>, gh pr create,\n  \
-        and the worktree removed\n\
-        A line that would go to a repository that is not private and names one of your private\n\
-        repositories, your home path, your account or your name is held back and said, and its\n\
-        text goes nowhere; its file stays. A dry run reads AGENTS.md as last fetched here, and\n\
-        fetches, writes and sends nothing.")]
+        gh api user, gh api user/repos?visibility=private… --paginate\n                              \
+        for a repository that is not private, once a run: your login\n                              \
+        and name, and every private repository you can see\n  \
+        gh pr list -R <owner/repo>  an open pull request of the lessons gets the next commit\n  \
+        git fetch https://github.com/<owner/repo>.git <branch>, then a worktree off it in\n  \
+        $XDG_STATE_HOME/ohjaa/lessons/.work/, git commit, git push to the same URL\n  \
+        HEAD:refs/heads/agents-md-lessons/<date>-<n>, gh pr create, and the worktree removed;\n  \
+        git reaches GitHub by HTTPS with gh's credentials (no SSH key's prompt holds it up)\n\
+        What goes to a repository names no tool. For one that is not private, all of it is\n\
+        checked first: a line that names one of your private repositories, your home path,\n\
+        your account or your name is held back and said, its text sent nowhere and its file\n\
+        left; anything else that would stops the delivery. A dry run reads AGENTS.md as last\n\
+        fetched here, and fetches, writes and sends nothing.")]
     Publish {
         /// The repositories (any directory inside each). Default: every
         /// repository under the roots with a `.ohjaa/knowledge/`, and every

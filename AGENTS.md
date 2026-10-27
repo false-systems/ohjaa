@@ -145,16 +145,17 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   line`, `ohjaa digest`) is a record a person reads at their own terminal,
   never a notification.
 - **Network only through `gh`, the drafter and, to deliver repo knowledge,
-  the repository's origin** — in `ohjaa intake` (review comments, drafting),
-  when a session leaves (its branch's pull request, bounded, recorded as
-  unknown when gh cannot say), in `ohjaa collect` (one search for the pull
-  requests of the entries' owners, at most two calls), and after a person's
-  decision on repo knowledge and in `ohjaa lessons publish` (gh: the
-  repository's visibility, the person's private repositories and name once a
-  run, its open lessons pull request, `pr create`; git: one fetch and one push
-  of its origin; a dry run fetches and pushes nothing). Every other command
-  works from the filesystem and local CLIs, and `ohjaa line` starts no git
-  process either.
+  git to GitHub with gh's credentials** — in `ohjaa intake` (review
+  comments, drafting), when a session leaves (its branch's pull request,
+  bounded, recorded as unknown when gh cannot say), in `ohjaa collect` (one
+  search for the pull requests of the entries' owners, at most two calls),
+  and after a person's decision on repo knowledge and in `ohjaa lessons
+  publish` (gh: the repository's visibility, the person's private
+  repositories and name once a run, its open lessons pull request, `pr
+  create`; git: one fetch and one push to the repository on GitHub, by HTTPS
+  with gh's credentials; a dry run fetches and pushes nothing). Every other
+  command works from the filesystem and local CLIs, and `ohjaa line` starts
+  no git process either.
 - Failed coverage is never rendered as an empty result. If a scan could not
   look, it says so and exits non-zero.
 

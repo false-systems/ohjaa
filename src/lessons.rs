@@ -685,7 +685,18 @@ fn git_in(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String
     for var in gitconfig::REPO_ENV {
         command.env_remove(var);
     }
-    let what = format!("git {}", args.first().copied().unwrap_or_default());
+    // Named by its command, past any `-c <setting>` before it.
+    let mut words = args.iter().copied();
+    let mut command_word = "";
+    while let Some(word) = words.next() {
+        if word == "-c" {
+            words.next();
+        } else {
+            command_word = word;
+            break;
+        }
+    }
+    let what = format!("git {command_word}");
     let output =
         process::run(&mut command, None, timeout).map_err(|error| format!("{what}: {error:#}"))?;
     if output.status.success() {
@@ -693,6 +704,27 @@ fn git_in(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String
     } else {
         Err(format!("{what}: {}", output.failure_detail()))
     }
+}
+
+/// The repository on GitHub, by HTTPS: the one the pull request is opened
+/// on, whatever the checkout's origin pushes to.
+fn github_url(slug: &str) -> String {
+    format!("https://github.com/{slug}.git")
+}
+
+/// `args` for a git that reaches GitHub over HTTPS with gh's credentials
+/// (`gh auth git-credential`), the gh a delivery has just been answered by:
+/// no SSH key's prompt can hold it up, nor any other helper's. git's own
+/// `insteadOf` rules still apply to the URL.
+fn over_https<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut all = vec![
+        "-c",
+        "credential.helper=",
+        "-c",
+        "credential.helper=!gh auth git-credential",
+    ];
+    all.extend_from_slice(args);
+    all
 }
 
 /// The repository on GitHub that `checkout`'s origin names, `owner/name`,
@@ -1355,14 +1387,10 @@ fn attempt(
             ready.default_branch.clone()
         }
     } else {
+        let refspec = format!("+refs/heads/{base_branch}:{}", tracking(&base_branch));
         git_in(
             checkout,
-            &[
-                "fetch",
-                "--quiet",
-                "origin",
-                &format!("+refs/heads/{base_branch}:{}", tracking(&base_branch)),
-            ],
+            &over_https(&["fetch", "--quiet", &github_url(&ready.slug), &refspec]),
             FETCH,
         )?;
         base_branch.clone()
@@ -1427,14 +1455,10 @@ fn attempt(
     git_in(&work.path, &["add", "AGENTS.md"], process::LOCAL)?;
     git_in(&work.path, &["commit", "--quiet", "-m", &out.message], PUSH)?;
     // Never a force: on an open pull request's branch, a commit on its tip.
+    let refspec = format!("HEAD:refs/heads/{}", out.branch);
     git_in(
         &work.path,
-        &[
-            "push",
-            "--quiet",
-            "origin",
-            &format!("HEAD:refs/heads/{}", out.branch),
-        ],
+        &over_https(&["push", "--quiet", &github_url(&ready.slug), &refspec]),
         PUSH,
     )?;
     drop(work);

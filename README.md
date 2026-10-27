@@ -1109,11 +1109,15 @@ it like any change. Nothing is written into your checkout:
 - **The pull request.** From the clone, never in your checkout: `gh repo
   view` (its visibility and default branch), `gh pr list` (an open pull
   request of the lessons, from a branch `agents-md-lessons/…`, gets the next
-  commit, on its tip, never a force), `git fetch origin <branch>`, a
+  commit, on its tip, never a force), `git fetch` of that branch, a
   worktree off it in `~/.local/state/ohjaa/lessons/.work/`, `git commit`
-  (with your identity, and the repository's own hooks), `git push origin
-  HEAD:refs/heads/agents-md-lessons/<date>-<n>`, `gh pr create`, and the
-  worktree removed however it ends. One delivery at a time
+  (with your identity, and the repository's own hooks), `git push` to
+  `refs/heads/agents-md-lessons/<date>-<n>`, `gh pr create`, and the
+  worktree removed however it ends. git reaches the repository on GitHub,
+  `https://github.com/<owner>/<repo>.git`, whatever origin pushes to, with
+  gh's credentials (`gh auth git-credential`): no SSH key's prompt can hold
+  it up, and your `insteadOf` rules still apply. The origin names the
+  repository; it must be on GitHub. One delivery at a time
   (`lessons/lessons.lock`). `retire` and `confirm` of a node ohjaa holds
   deliver the same way.
 - **When it cannot be delivered** (no remote named origin, an origin not on

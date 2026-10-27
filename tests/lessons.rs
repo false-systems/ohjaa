@@ -554,6 +554,16 @@ fn publish_opens_one_pull_request_then_moves_each_file_out_of_the_checkout() {
         "Write the failing test\nfirst.",
     );
     let head = world.git(&world.checkout, &["rev-parse", "HEAD"]);
+    // Where origin pushes to is not where the pull request is: git goes to
+    // the repository on GitHub itself.
+    world.git(
+        &world.checkout,
+        &[
+            "config",
+            "remote.origin.pushurl",
+            "file:///nowhere/at/all.git",
+        ],
+    );
     let (stdout, stderr, code) = world.publish(&[]);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     assert!(
