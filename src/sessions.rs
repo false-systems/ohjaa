@@ -2454,6 +2454,9 @@ mod tests {
             .get("rs-1-1")
             .unwrap()
             .is_some());
+        drop(tx);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
