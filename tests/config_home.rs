@@ -406,9 +406,77 @@ fn executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
 }
 
+/// Write an executable that no process holds open for writing when it runs.
+/// Linux refuses to exec a file any process has open for writing (ETXTBSY),
+/// and a child another test thread forks holds a copy of every descriptor
+/// this process has open until that child execs: a file written here, then
+/// closed, even renamed, can still be open for writing in such a child at
+/// the moment it is run. So this process writes only the text, beside it,
+/// and `cp`, a process of its own that forks nothing, writes the executable.
 fn write_executable(path: &Path, text: &str) {
-    fs::write(path, text).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    let name = path.file_name().unwrap().to_string_lossy();
+    let source = path.with_file_name(format!(".{name}.text"));
+    fs::write(&source, text).unwrap();
+    copy_executable(&source, path);
+    fs::remove_file(&source).unwrap();
+}
+
+/// `from`'s bytes at `to`, executable, written by `cp` (see
+/// [`write_executable`]).
+fn copy_executable(from: &Path, to: &Path) {
+    let copied = Command::new("cp").arg(from).arg(to).status().unwrap();
+    assert!(copied.success(), "cp {} {}", from.display(), to.display());
+    fs::set_permissions(to, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The real git, as found on the test's own PATH.
+fn system_git() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("git"))
+        .find(|git| git.is_file())
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/git"))
+}
+
+/// The lines a child writes to `pipe`, as it writes them.
+fn lines_of(pipe: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<String> {
+    let (send, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufRead::lines(std::io::BufReader::new(pipe)).map_while(Result::ok) {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    lines
+}
+
+/// The lines up to the first holding `wanted`, and whether it came: the
+/// child ended, or a minute passed, without it.
+fn until_line(lines: &std::sync::mpsc::Receiver<String>, wanted: &str) -> (bool, Vec<String>) {
+    let mut seen = Vec::new();
+    while let Ok(line) = lines.recv_timeout(std::time::Duration::from_secs(60)) {
+        let found = line.contains(wanted);
+        seen.push(line);
+        if found {
+            return (true, seen);
+        }
+    }
+    (false, seen)
+}
+
+/// The home's lock, held by the test as another ohjaa's change would hold it.
+fn hold_the_homes_lock(home: &Path) -> fs::File {
+    use std::os::unix::io::AsRawFd as _;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(home.join(".git/ohjaa.lock"))
+        .unwrap();
+    // SAFETY: flock(2) on a descriptor the test owns.
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(taken, 0, "the home's lock is free");
+    file
 }
 
 fn text(output: &Output) -> (String, String) {
@@ -467,9 +535,7 @@ impl Sandbox {
         write_executable(&bin.join("codex"), CODEX_STUB);
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ohjaa"), bin.join("ohjaa")).unwrap();
         // Only the stubs and the system: no real sykli, cargo, agent or ohjaa.
-        let git_dir = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .find(|dir| dir.join("git").is_file())
-            .unwrap_or_else(|| PathBuf::from("/usr/bin"));
+        let git_dir = system_git().parent().unwrap().to_path_buf();
         let path = format!(
             "{}:{}:/usr/bin:/bin:/usr/sbin:/sbin",
             bin.display(),
@@ -913,7 +979,7 @@ fn apply_includes_one_file_and_no_repository_without_an_entry_runs_ohjaa() {
     );
 
     // An edited dispatcher is drift, and apply puts it back.
-    fs::write(hooks.join("pre-push"), "#!/bin/sh\nexit 0\n").unwrap();
+    write_executable(&hooks.join("pre-push"), "#!/bin/sh\nexit 0\n");
     let output = sandbox.ohjaa(&["doctor", "--root", &sandbox.projects()]);
     let (stdout, _) = text(&output);
     assert_eq!(output.status.code(), Some(4), "{stdout}");
@@ -1490,6 +1556,225 @@ fn the_homes_history_never_takes_a_stray_file() {
         .contains("!/mine/"));
 }
 
+/// #65's re-review: a home that is a linked worktree of another repository
+/// (the person's dotfiles, say). git reads one `info/exclude` for every
+/// worktree of a repository, so the home's allowlist, which begins by
+/// leaving out everything (`/*`), is kept to the home's own worktree: its
+/// history still takes no stray, and the other worktree still sees a new
+/// file of its own.
+#[test]
+fn a_home_that_is_a_linked_worktree_keeps_its_allowlist_to_itself() {
+    let sandbox = Sandbox::new("linked-home");
+    let dotfiles = sandbox.dir.join("dotfiles");
+    fs::create_dir_all(&dotfiles).unwrap();
+    sandbox.git(&dotfiles, &["init", "-q", "-b", "main"]);
+    fs::write(dotfiles.join(".zprofile"), "# mine\n").unwrap();
+    sandbox.git(&dotfiles, &["add", "-A"]);
+    sandbox.git(&dotfiles, &["commit", "-q", "-m", "dotfiles"]);
+    let config = sandbox.config();
+    sandbox.git(
+        &dotfiles,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "ohjaa",
+            &config.to_string_lossy(),
+        ],
+    );
+    knowledge_node(&config.join("mine"), "lima", "fact", "Lima is here.");
+    // The person's own global excludes still keep out what they name (the
+    // review of #68, L1): a merge tool's `.orig` here.
+    fs::create_dir_all(sandbox.dir.join("config/git")).unwrap();
+    fs::write(sandbox.dir.join("config/git/ignore"), "*.orig\n").unwrap();
+    let strays = [
+        ".DS_Store",
+        "notes.txt",
+        "mine/lima.md~",
+        "mine/lima.md.orig",
+    ];
+    for stray in strays {
+        fs::write(config.join(stray), "stray\n").unwrap();
+    }
+    sandbox.repo("acme", "widget", &[("sykli.json", "{}\n")]);
+    sandbox.apply();
+    let tracked = sandbox.git(&config, &["ls-files"]);
+    for owned in ["mine/lima.md", "roots", "applied.toml"] {
+        assert!(
+            tracked.lines().any(|line| line == owned),
+            "{owned}: {tracked}"
+        );
+    }
+    for stray in strays {
+        assert!(
+            !tracked.lines().any(|line| line == stray),
+            "{stray}: {tracked}"
+        );
+    }
+    fs::write(dotfiles.join(".zshenv"), "# new\n").unwrap();
+    let status = sandbox.git(&dotfiles, &["status", "--porcelain"]);
+    assert!(
+        status.lines().any(|line| line == "?? .zshenv"),
+        "the other worktree sees its new file: {status}"
+    );
+    let shared = fs::read_to_string(dotfiles.join(".git/info/exclude")).unwrap_or_default();
+    assert!(!shared.contains("ohjaa"), "{shared}");
+}
+
+/// #65's re-review, L1: ohjaa is killed while the home's git commits. That
+/// git goes on (it runs in a process group of its own), and it holds the
+/// home's lock until it ends: the next change waits for it, and each commit
+/// holds its own change, never another's. The home runs no hook, so the
+/// commit is held up by a `git` first on PATH, the git ohjaa runs.
+#[test]
+fn a_commit_its_ohjaa_was_killed_in_holds_the_homes_lock_until_it_ends() {
+    let sandbox = Sandbox::new("killed-commit");
+    let (first, _) = sandbox.repo("acme", "first", &[("sykli.json", "{}\n")]);
+    let (second, _) = sandbox.repo("acme", "second", &[("sykli.json", "{}\n")]);
+    sandbox.apply();
+    let config = sandbox.config();
+    // The home's first commit after `hold` is made says it began, and waits
+    // while `hold` exists, before it is git's; every other git is git's.
+    write_executable(
+        &sandbox.dir.join("bin/git"),
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" {home}/.git \"*\" commit \"*)\n    \
+             if [ -e \"$SANDBOX/hold\" ] && [ ! -e \"$SANDBOX/in-commit\" ]; then\n      \
+             touch \"$SANDBOX/in-commit\"\n      \
+             while [ -e \"$SANDBOX/hold\" ]; do sleep 0.05; done\n    fi;;\nesac\n\
+             exec '{git}' \"$@\"\n",
+            home = config.display(),
+            git = system_git().display()
+        ),
+    );
+    let hold = sandbox.dir.join("hold");
+    fs::write(&hold, "").unwrap();
+    let mut killed = sandbox
+        .command("ohjaa", &sandbox.dir)
+        .args(["adopt", &first.to_string_lossy()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let began = std::time::Instant::now();
+    while !sandbox.dir.join("in-commit").exists() {
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(60),
+            "the first adopt never began its commit"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    killed.kill().unwrap();
+    killed.wait().unwrap();
+    let mut next = sandbox
+        .command("ohjaa", &sandbox.dir)
+        .args(["adopt", &second.to_string_lossy()])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = lines_of(next.stdout.take().unwrap());
+    let stderr = lines_of(next.stderr.take().unwrap());
+    let (waited, said) = until_line(&stderr, "waiting for another ohjaa's change to the home");
+    // Let the killed adopt's commit end, whatever the next one did.
+    fs::remove_file(&hold).unwrap();
+    let status = next.wait().unwrap();
+    let said: Vec<String> = said.into_iter().chain(stderr.iter()).collect();
+    let printed: Vec<String> = stdout.iter().collect();
+    assert!(waited, "the next change waited for the lock: {said:#?}");
+    assert!(status.success(), "{printed:#?}{said:#?}");
+    assert!(
+        !said.iter().any(|line| line.contains("warning")),
+        "{said:#?}"
+    );
+    let files =
+        |commit: &str| sandbox.git(&config, &["show", "--name-only", "--format=%s", commit]);
+    let (newest, before) = (files("HEAD"), files("HEAD~1"));
+    assert!(newest.starts_with("adopt acme/second"), "{newest}");
+    assert!(newest.contains("repos/acme/second/repo.toml"), "{newest}");
+    assert!(!newest.contains("repos/acme/first/"), "{newest}");
+    assert!(before.starts_with("adopt acme/first"), "{before}");
+    assert!(before.contains("repos/acme/first/repo.toml"), "{before}");
+    assert!(!before.contains("repos/acme/second/"), "{before}");
+}
+
+/// The review of #68, M1: nothing the home's git can leave running holds
+/// the home's lock. The person's config turns on what git starts beside
+/// itself: an fsmonitor (`core.fsmonitor`, here as a command, which git runs
+/// on every platform; `true` starts git's own daemon, which lives on), hooks
+/// from a template (`init.templateDir`) and from config (`hook.<name>`), and
+/// a hook in the home's own hooks folder. Each one that runs leaves a process
+/// behind, with whatever it was given open. Once the home's commit is done,
+/// its lock is free, and the next change does not wait.
+#[test]
+fn nothing_the_homes_git_leaves_running_holds_the_homes_lock() {
+    let sandbox = Sandbox::new("lingering");
+    let (first, _) = sandbox.repo("acme", "first", &[("sykli.json", "{}\n")]);
+    let (second, _) = sandbox.repo("acme", "second", &[("sykli.json", "{}\n")]);
+    let linger = |name: &str| {
+        format!("#!/bin/sh\ntouch \"$SANDBOX/ran-{name}\"\nsleep 15 >/dev/null 2>&1 &\nexit 1\n")
+    };
+    let template = sandbox.dir.join("template");
+    fs::create_dir_all(template.join("hooks")).unwrap();
+    let events = [
+        "pre-commit",
+        "prepare-commit-msg",
+        "commit-msg",
+        "post-commit",
+        "post-index-change",
+        "reference-transaction",
+    ];
+    for event in events {
+        write_executable(&template.join("hooks").join(event), &linger(event));
+    }
+    write_executable(&sandbox.dir.join("bin/fsmonitor"), &linger("fsmonitor"));
+    write_executable(&sandbox.dir.join("bin/config-hook"), &linger("config-hook"));
+    for (key, value) in [
+        ("core.fsmonitor", sandbox.dir.join("bin/fsmonitor")),
+        ("init.templateDir", template),
+        ("hook.linger.command", sandbox.dir.join("bin/config-hook")),
+    ] {
+        sandbox.git(
+            &sandbox.dir,
+            &["config", "--global", key, &value.to_string_lossy()],
+        );
+    }
+    for event in events {
+        sandbox.git(
+            &sandbox.dir,
+            &["config", "--global", "--add", "hook.linger.event", event],
+        );
+    }
+    // The home's first commit: init, then add and commit.
+    sandbox.apply();
+    let config = sandbox.config();
+    drop(hold_the_homes_lock(&config));
+    assert!(
+        !config.join(".git/hooks/pre-commit").exists(),
+        "no hook is copied from a template"
+    );
+    fs::create_dir_all(config.join(".git/hooks")).unwrap();
+    write_executable(&config.join(".git/hooks/post-commit"), &linger("home"));
+    sandbox.adopt(&first);
+    drop(hold_the_homes_lock(&config));
+    for event in events {
+        assert!(
+            !sandbox.dir.join(format!("ran-{event}")).exists(),
+            "{event}: a template's hook ran"
+        );
+    }
+    assert!(
+        !sandbox.dir.join("ran-home").exists(),
+        "the home's own hook ran"
+    );
+    let output = sandbox.ohjaa(&["adopt", &second.to_string_lossy()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(!stderr.contains("waiting"), "{stderr}");
+    drop(hold_the_homes_lock(&config));
+}
+
 /// A knowledge block apply did not write (`brief --write`'s, or one the
 /// person wrote) is theirs: apply leaves it and says so, and so does undo.
 #[test]
@@ -1524,6 +1809,113 @@ fn a_block_apply_did_not_write_is_left_as_the_persons() {
         "{stdout}"
     );
     assert_eq!(fs::read_to_string(&codex).unwrap(), theirs);
+}
+
+/// The review of #66: apply ran once with an agent's folder where it usually
+/// is and once moved (`CLAUDE_CONFIG_DIR`, `OPENCODE_CONFIG_DIR`), and wrote a
+/// block into each file. Every file apply writes a block into is recorded, so
+/// undo, run with neither variable, takes back all four and says so; none
+/// keeps a block nobody will take out.
+#[test]
+fn undo_takes_back_every_file_apply_wrote_a_block_into() {
+    let sandbox = Sandbox::new("moved-folders");
+    knowledge_node(&sandbox.config().join("mine"), "rust", "decision", "Rust.");
+    let claude = sandbox.home().join(".claude/CLAUDE.md");
+    let opencode = sandbox.dir.join("config/opencode/AGENTS.md");
+    let moved_claude = sandbox.dir.join("elsewhere/claude/CLAUDE.md");
+    let moved_opencode = sandbox.dir.join("elsewhere/opencode/AGENTS.md");
+    let before = [
+        (&claude, "# Claude\n"),
+        (&opencode, "# opencode\r\n\r\nKeep."),
+        (&moved_claude, "# Moved Claude"),
+        (&moved_opencode, "# Moved opencode\n\n"),
+    ];
+    for (file, text) in before {
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, text).unwrap();
+    }
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let output = sandbox
+        .command("ohjaa", &sandbox.dir)
+        .env("CLAUDE_CONFIG_DIR", moved_claude.parent().unwrap())
+        .env("OPENCODE_CONFIG_DIR", moved_opencode.parent().unwrap())
+        .args(["apply", "--root", &sandbox.projects()])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    for (file, _) in before {
+        assert!(
+            fs::read_to_string(file)
+                .unwrap()
+                .contains("- decision: Rust.\n"),
+            "{} holds the block",
+            file.display()
+        );
+    }
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    for (file, text) in before {
+        assert_eq!(
+            fs::read_to_string(file).unwrap(),
+            text,
+            "{} is as it was: {stdout}",
+            file.display()
+        );
+        assert!(
+            stdout.contains(&format!(
+                "removed the knowledge block from {}\n",
+                file.display()
+            )),
+            "{stdout}"
+        );
+    }
+}
+
+/// The review of #68, L2: one file named two ways (`~/.claude` a link to
+/// the folder a later `CLAUDE_CONFIG_DIR` names) is one file to apply and to
+/// undo: recorded once, and put back byte for byte.
+#[test]
+fn a_file_named_two_ways_is_recorded_once_and_undone_exactly() {
+    let sandbox = Sandbox::new("two-spellings");
+    let mine = sandbox.config().join("mine");
+    knowledge_node(&mine, "rust", "decision", "Rust.");
+    let real = sandbox.home().join("real-claude");
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, sandbox.home().join(".claude")).unwrap();
+    let before = "# Claude\nmy own text, no final newline";
+    fs::write(real.join("CLAUDE.md"), before).unwrap();
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    knowledge_node(&mine, "lima", "fact", "Lima is here.");
+    let output = sandbox
+        .command("ohjaa", &sandbox.dir)
+        .env("CLAUDE_CONFIG_DIR", &real)
+        .args(["apply", "--root", &sandbox.projects()])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        fs::read_to_string(real.join("CLAUDE.md"))
+            .unwrap()
+            .contains("- fact: Lima is here.\n"),
+        "rewritten through the other name"
+    );
+    let record = fs::read_to_string(sandbox.config().join("applied.toml")).unwrap();
+    assert!(!record.contains("instructions_claude_2"), "{record}");
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(
+        fs::read_to_string(real.join("CLAUDE.md")).unwrap(),
+        before,
+        "{stdout}"
+    );
 }
 
 /// One agent's file apply cannot read as a whole (two blocks in it) is said
@@ -1592,10 +1984,19 @@ fn one_broken_agent_file_is_skipped_and_the_rest_is_applied() {
     let output = sandbox.ohjaa(&["doctor", "--root", &sandbox.projects()]);
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(4), "{stdout}{stderr}");
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.contains("DRIFT") && line.contains(&pi.display().to_string())),
+    // Said once, as the reason says it: "fix it by hand" (#65's review).
+    let drift: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains("DRIFT") && line.contains(&pi.display().to_string()))
+        .collect();
+    assert_eq!(
+        drift,
+        [format!(
+            "  DRIFT  {} (pi's own instructions): apply cannot write the knowledge block there: \
+             the file has an ohjaa knowledge marker without its partner, or more than one \
+             block; fix it by hand (once it is fixed, ohjaa apply)",
+            pi.display()
+        )],
         "{stdout}"
     );
 
@@ -6603,6 +7004,52 @@ fn an_unreadable_generated_file_is_named_and_apply_repairs_it() {
     assert!(sandbox.gated(&repo));
 }
 
+/// #65's re-review: apply's repair, removing a generated file git cannot
+/// read, changes the home as anything apply writes does, so it waits for
+/// the home's lock: while another ohjaa's change holds it, the file is as
+/// it was.
+#[test]
+fn apply_repairs_the_home_only_under_its_lock() {
+    let sandbox = Sandbox::new("repair-locked");
+    let (repo, _) = sandbox.repo("acme", "widget", &[]);
+    sandbox.entry("acme", "widget", Some("{}\n"));
+    sandbox.apply();
+    let broken = sandbox.config().join("git/config");
+    let unreadable = "[includeIf \"hasconfig:remote.*.url:x\n";
+    fs::write(&broken, unreadable).unwrap();
+    let held = hold_the_homes_lock(&sandbox.config());
+    let mut apply = sandbox
+        .command("ohjaa", &sandbox.dir)
+        .args(["apply", "--root", &sandbox.projects()])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = lines_of(apply.stdout.take().unwrap());
+    let stderr = lines_of(apply.stderr.take().unwrap());
+    let (waited, said) = until_line(&stderr, "waiting for another ohjaa's change to the home");
+    let untouched = fs::read_to_string(&broken).ok();
+    drop(held);
+    let status = apply.wait().unwrap();
+    let printed: Vec<String> = stdout.iter().collect();
+    assert!(waited, "apply waited for the lock: {said:#?}{printed:#?}");
+    assert_eq!(
+        untouched.as_deref(),
+        Some(unreadable),
+        "nothing is repaired before the lock is taken: {printed:#?}"
+    );
+    assert!(status.success(), "{printed:#?}");
+    assert!(
+        printed.iter().any(|line| line.contains(&format!(
+            "removed {}, which git could not read",
+            broken.display()
+        ))),
+        "{printed:#?}"
+    );
+    assert!(sandbox.git_out(&repo, &["status"]).status.success());
+    assert!(sandbox.gated(&repo));
+}
+
 #[test]
 fn shell_init_prints_the_launcher_and_its_rules_hold() {
     let sandbox = Sandbox::new("shell");
@@ -7518,7 +7965,7 @@ fn apply_runs_the_ohjaa_on_path_unless_bin_names_another() {
     sandbox.entry("acme", "widget", Some("{}\n"));
     let other = sandbox.dir.join("other");
     fs::create_dir_all(&other).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_ohjaa"), other.join("ohjaa")).unwrap();
+    copy_executable(Path::new(env!("CARGO_BIN_EXE_ohjaa")), &other.join("ohjaa"));
     let elsewhere = other.join("ohjaa").to_string_lossy().into_owned();
     let output = sandbox
         .command(&elsewhere, &sandbox.dir)

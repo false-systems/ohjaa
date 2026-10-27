@@ -79,18 +79,26 @@ fn kill_group(child: &mut std::process::Child) {
 /// Run `command` with `input` on stdin, killing it and everything it started
 /// once `timeout` has passed.
 pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
+    command.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    run_as_given(command, input, timeout)
+}
+
+/// [`run`], with `stdin` (a lock, [`FileLock::as_stdin`]) for its stdin.
+pub fn run_with_stdin(command: &mut Command, stdin: Stdio, timeout: Duration) -> Result<Output> {
+    command.stdin(stdin);
+    run_as_given(command, None, timeout)
+}
+
+fn run_as_given(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
     let program = command.get_program().to_string_lossy().into_owned();
     if cancelled() {
         anyhow::bail!("{program} was not started: interrupted");
     }
-    command
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     own_group(command);
     let mut child = command
         .spawn()
@@ -465,6 +473,19 @@ pub struct FileLock {
     _file: std::fs::File,
 }
 
+impl FileLock {
+    /// This lock as the stdin of a process ohjaa starts ([`run_with_stdin`]):
+    /// a copy of the same open file, so that process holds the lock too, for
+    /// as long as it runs, and it is let go only once both have ended. What
+    /// that process does under the lock is then never cut loose by ohjaa being
+    /// killed. Only its stdin holds it: what it starts with a stdin of its
+    /// own (git gives its hooks /dev/null, a daemon closes it) does not. The
+    /// file is empty and open to read, so a read from it is at its end.
+    pub fn as_stdin(&self) -> std::io::Result<Stdio> {
+        Ok(Stdio::from(self._file.try_clone()?))
+    }
+}
+
 /// Take the lock on `path` (made, with its folder, when missing), waiting
 /// at most `wait` while another process holds it.
 pub fn lock_file(path: &std::path::Path, wait: Duration) -> Result<FileLock, String> {
@@ -475,6 +496,7 @@ pub fn lock_file(path: &std::path::Path, wait: Duration) -> Result<FileLock, Str
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
+        .read(true)
         .write(true)
         .open(path)
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
@@ -539,6 +561,26 @@ pub fn names_flag(help: &str, flag: &str) -> bool {
                 .is_none_or(|next| next.is_whitespace() || matches!(next, '=' | '<' | '['))
         })
     })
+}
+
+/// For tests: write an executable that no process holds open for writing
+/// when it runs. Linux refuses to exec a file any process has open for
+/// writing (ETXTBSY), and a child another test thread forks holds a copy of
+/// every descriptor this process has open until that child execs: a file
+/// written here, then closed, even renamed, can still be open for writing in
+/// such a child at the moment it is run. So this process writes only the
+/// text, beside it, and `cp`, a process of its own that forks nothing,
+/// writes the executable.
+#[cfg(all(test, unix))]
+pub fn write_executable(path: &std::path::Path, text: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let name = path.file_name().unwrap().to_string_lossy();
+    let source = path.with_file_name(format!(".{name}.text"));
+    std::fs::write(&source, text).unwrap();
+    let copied = Command::new("cp").arg(&source).arg(path).status().unwrap();
+    assert!(copied.success(), "cp {}", path.display());
+    std::fs::remove_file(&source).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[cfg(test)]

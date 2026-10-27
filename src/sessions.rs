@@ -435,7 +435,15 @@ pub struct Session {
     /// What it was asked to do (`--task`), as given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// The second it was launched in: its id and every time window are
+    /// built on whole seconds.
     pub started_ms: i64,
+    /// The launch's own instant, in milliseconds. Only the agent's own
+    /// records, which carry milliseconds, are compared with it: a transcript
+    /// begun in the second of the launch but before it was resumed by it.
+    /// Older records have none ([`Session::launch_instant_ms`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched_ms: Option<i64>,
     /// The process group the session runs in (`toimija run` leads it, and
     /// the agent runs in it). Whether the group is alive says whether the
     /// session is, even after the ohjaa that started it is gone. Recorded
@@ -481,6 +489,12 @@ pub struct Session {
 }
 
 impl Session {
+    /// The launch's own instant; for a record from before it was kept, the
+    /// launch's second.
+    pub fn launch_instant_ms(&self) -> i64 {
+        self.launched_ms.unwrap_or(self.started_ms)
+    }
+
     /// The last time its record shows it active: its start, its process
     /// group's, its read-back, its handover, the validations it requested.
     /// An orphan's end was never observed; this is as far as it was seen.
@@ -2248,6 +2262,7 @@ mod tests {
             outside_repo: false,
             intent: "retry uploads".to_owned(),
             started_ms,
+            launched_ms: None,
             branch: Some("main".to_owned()),
             head_at_start: None,
             scoped: Vec::new(),
@@ -2439,6 +2454,9 @@ mod tests {
             .get("rs-1-1")
             .unwrap()
             .is_some());
+        drop(tx);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -66,8 +66,10 @@ use serde_json::Value;
 /// argument, as it hands the real one; it keeps it in `$LOOP_OUT/briefing`
 /// and, with `LOOP_IDLE` set, does nothing more. Otherwise it works as an
 /// agent briefed by ohjaa does. It keeps its transcript in the sandbox's
-/// HOME, as Claude Code does: its launch prompt first, then what the person
-/// said (`LOOP_SAID`), each followed by its reply. From a shell whose
+/// HOME, as Claude Code does, each record timed to the fraction of a second
+/// (leaving compares them with the launch's own instant): its launch prompt
+/// first, then what the person said (`LOOP_SAID`), each followed by its
+/// reply. From a shell whose
 /// `CLAUDE_CODE_SESSION_ID` is its own session (`LOOP_NATIVE`), as Claude
 /// Code's tool shells have it, it reads back, makes a worktree of origin's
 /// main (`LOOP_WORKTREE`, on branch `LOOP_BRANCH`), commits `LOOP_LIB` as
@@ -83,7 +85,7 @@ cwd=$(pwd -P)
 dir="$HOME/.claude/projects/$(printf '%s' "$cwd" | sed 's/[^A-Za-z0-9]/-/g')"
 mkdir -p "$dir"
 json() { awk 'BEGIN { ORS = "" } { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); if (NR > 1) print "\\n"; print }'; }
-at() { date -u +%Y-%m-%dT%H:%M:%S.000Z; }
+at() { date -u +%Y-%m-%dT%H:%M:%S.%NZ; }
 user() {
   printf '{"type":"user","uuid":"u-%s-%s","sessionId":"%s","cwd":"%s","timestamp":"%s","isSidechain":false,"message":{"role":"user","content":"%s"}}\n' \
     "$LOOP_NATIVE" "$1" "$LOOP_NATIVE" "$cwd" "$(at)" "$2"
@@ -513,8 +515,20 @@ fn ran(command: &mut Command) -> Ran {
     }
 }
 
+/// Write an executable that no process holds open for writing when it runs.
+/// Linux refuses to exec a file any process has open for writing (ETXTBSY),
+/// and a child another test thread forks holds a copy of every descriptor
+/// this process has open until that child execs: a file written here, then
+/// closed, even renamed, can still be open for writing in such a child at
+/// the moment it is run. So this process writes only the text, beside it,
+/// and `cp`, a process of its own that forks nothing, writes the executable.
 fn write_executable(path: &Path, text: &str) {
-    fs::write(path, text).unwrap();
+    let name = path.file_name().unwrap().to_string_lossy();
+    let source = path.with_file_name(format!(".{name}.text"));
+    fs::write(&source, text).unwrap();
+    let copied = Command::new("cp").arg(&source).arg(path).status().unwrap();
+    assert!(copied.success(), "cp {}", path.display());
+    fs::remove_file(&source).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
