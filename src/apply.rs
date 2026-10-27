@@ -742,7 +742,7 @@ pub fn apply(
 
     // Each agent's file apply could not write: the rest is applied, but
     // apply is not done while one stays unwritten, and every run says so.
-    let (instruction, not_written) = instruction_steps()?;
+    let (instruction, not_written) = instruction_steps(&read_record(&home)?)?;
     steps.extend(instruction);
     let except = (!not_written.is_empty()).then(|| {
         format!(
@@ -828,12 +828,64 @@ fn history_message(what: &str, done: &[String]) -> String {
     )
 }
 
+/// The record's slots for the agent `key`'s files, in the order they were
+/// recorded: `instructions_<key>` for the first file apply wrote a block
+/// into, then `instructions_<key>_2`, `_3`, … for each other one (the agent's
+/// folder moved by its variable between applies). Each slot keeps its own
+/// `_blank` and `_newline`.
+fn instruction_slots(record: &Record, key: &str) -> Vec<(String, PathBuf)> {
+    let first = format!("instructions_{key}");
+    let mut slots: Vec<(u32, String, PathBuf)> = record
+        .iter()
+        .filter_map(|(slot, file)| {
+            let n = if *slot == first {
+                1
+            } else {
+                let n = slot.strip_prefix(&first)?.strip_prefix('_')?;
+                if !n.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                n.parse().ok()?
+            };
+            Some((n, slot.clone(), PathBuf::from(file)))
+        })
+        .collect();
+    slots.sort();
+    slots
+        .into_iter()
+        .map(|(_, slot, file)| (slot, file))
+        .collect()
+}
+
+/// The slot that records `file` for the agent `key`: the one that already
+/// names it, else the next free one.
+fn instruction_slot(record: &Record, key: &str, file: &Path) -> String {
+    let slots = instruction_slots(record, key);
+    if let Some((slot, _)) = slots.iter().find(|(_, recorded)| recorded == file) {
+        return slot.clone();
+    }
+    let first = format!("instructions_{key}");
+    (1..)
+        .map(|n| {
+            if n == 1 {
+                first.clone()
+            } else {
+                format!("{first}_{n}")
+            }
+        })
+        .find(|slot| !record.contains_key(slot))
+        .unwrap_or(first)
+}
+
 /// The knowledge block in each agent's own instruction file: added, or
 /// rewritten where it is, in each file that exists outside every repository.
 /// Where an agent is set up but has no such file, or its file is inside a
 /// repository, that is said, and nothing is written. Also each file apply
 /// should write and cannot (`<file> (<agent>'s own instructions: <why>)`).
-fn instruction_steps() -> Result<(Vec<Step>, Vec<String>)> {
+/// Every file a block is written into is recorded, each in a slot of its own
+/// ([`instruction_slots`]), so undo takes each back wherever the agent's
+/// folder is when it runs.
+fn instruction_steps(record: &Record) -> Result<(Vec<Step>, Vec<String>)> {
     let (compact, broken) = crate::instructions::home_knowledge()?;
     for broken in &broken {
         eprintln!(
@@ -918,14 +970,11 @@ fn instruction_steps() -> Result<(Vec<Step>, Vec<String>)> {
             crate::knowledge::Held::Applied => (("rewrite", "rewrote"), "in"),
             crate::knowledge::Held::None => (("write", "wrote"), "into"),
         };
-        let key = target.key;
+        let slot = instruction_slot(record, target.key, &file);
         let record = vec![
-            (
-                format!("instructions_{key}"),
-                file.to_string_lossy().into_owned(),
-            ),
-            (format!("instructions_{key}_blank"), flag(placed.blank)),
-            (format!("instructions_{key}_newline"), flag(placed.newline)),
+            (slot.clone(), file.to_string_lossy().into_owned()),
+            (format!("{slot}_blank"), flag(placed.blank)),
+            (format!("{slot}_newline"), flag(placed.newline)),
         ];
         let said = format!(
             "the knowledge block ({}) {what} {}, {}'s own instructions",
@@ -1046,25 +1095,24 @@ pub fn undo(dry_run: bool) -> Result<i32> {
         ));
     }
 
-    // The knowledge block apply wrote, from each agent's own file: the one
-    // it wrote into (recorded), and the one the agent reads now. A block apply
-    // did not write is the person's, and stays. The recorded file, unreadable
-    // as a whole, refuses undo, as any change it cannot take back exactly; any
-    // other is said and skipped.
+    // The knowledge block apply wrote, from each agent's own file: each one
+    // it wrote into (recorded, wherever the agent's folder was then), and the
+    // one the agent reads now. A block apply did not write is the person's,
+    // and stays. A recorded file, unreadable as a whole, refuses undo, as any
+    // change it cannot take back exactly; any other is said and skipped.
     let mut files: Vec<(PathBuf, crate::knowledge::Placed, bool)> = Vec::new();
     for target in crate::instructions::targets() {
-        let key = target.key;
-        let placed = crate::knowledge::Placed {
-            blank: yes(&format!("instructions_{key}_blank")),
-            newline: newline(&format!("instructions_{key}_newline")),
-        };
-        let recorded_file = recorded(&format!("instructions_{key}")).map(PathBuf::from);
-        if let Some(file) = &recorded_file {
+        let slots = instruction_slots(&record, target.key);
+        for (slot, file) in &slots {
+            let placed = crate::knowledge::Placed {
+                blank: yes(&format!("{slot}_blank")),
+                newline: newline(&format!("{slot}_newline")),
+            };
             files.push((file.clone(), placed, true));
         }
         if let Some(file) = target
             .file
-            .filter(|file| Some(file) != recorded_file.as_ref())
+            .filter(|file| !slots.iter().any(|(_, recorded)| recorded == file))
         {
             files.push((file, crate::knowledge::Placed::IN_PLACE, false));
         }

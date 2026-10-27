@@ -992,7 +992,10 @@ then the rest by count, ``30 more: `ohjaa list` ``, and apply says so.
 After each decision the block is rewritten wherever it is (moved, or
 between your own lines), and only where it is: a block you take out stays
 out until the next apply. `apply --undo` takes it out and puts back exactly
-what was there, a final newline that was missing included. It is the same kind
+what was there, a final newline that was missing included. Every file apply
+writes a block into is recorded, so undo takes back each, also one written
+while a variable (`CLAUDE_CONFIG_DIR`, `OPENCODE_CONFIG_DIR`, …) moved the
+agent's folder, whatever the variables say when undo runs. It is the same kind
 of block `brief --write` writes, so a file holds one; a block apply did not
 write (`brief --write`'s, or one you wrote) is yours: apply, each decision and
 undo leave it as it is and say so. An agent's file apply cannot read as a
