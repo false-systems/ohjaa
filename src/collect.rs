@@ -14,7 +14,8 @@
 //! itself, as it speaks, and `ohjaa digest` asks for the fleet itself. Each
 //! part says when it was read, what it could not read, and, when it could
 //! not answer, why; a part that failed keeps what it held before, as of
-//! then, and so does a branch whose marks could not be read.
+//! then, and so does a branch whose marks could not be read, and every
+//! branch when the entries themselves could not be listed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -269,11 +270,7 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, Answer<T>>) -> Answer<T> 
 /// could not be read keeps what `known` said of it.
 fn local(dirs: &Dirs, repos: &[PathBuf], known: &[Branch], now_ms: i64) -> (Local, Vec<String>) {
     let report = report::build_marks(dirs, repos, now_ms - report::WEEK_MS, now_ms);
-    let branches = report
-        .marks
-        .iter()
-        .map(|(slug, marked)| branch(slug, marked, known, now_ms))
-        .collect();
+    let branches = branches(&report.marks, report.unlisted.as_deref(), known, now_ms);
     let open = |pick: fn(&report::Untold) -> bool| {
         report
             .open
@@ -288,6 +285,30 @@ fn local(dirs: &Dirs, repos: &[PathBuf], known: &[Branch], now_ms: i64) -> (Loca
         orphaned: open(|s| s.orphaned),
     };
     (local, report.gaps)
+}
+
+/// Each entry's branch now. When the entries themselves could not be listed
+/// (`unlisted`, why), no entry's absence says anything: every branch known
+/// stays as it was last read, with why it was not read this time.
+pub fn branches(
+    marks: &[(String, Result<mark::Marks, String>)],
+    unlisted: Option<&str>,
+    known: &[Branch],
+    now_ms: i64,
+) -> Vec<Branch> {
+    match unlisted {
+        Some(why) => known
+            .iter()
+            .map(|last| Branch {
+                error: Some(why.to_owned()),
+                ..last.clone()
+            })
+            .collect(),
+        None => marks
+            .iter()
+            .map(|(slug, marked)| branch(slug, marked, known, now_ms))
+            .collect(),
+    }
 }
 
 /// An entry's branch now, or, when its marks cannot be read, as it was last
@@ -775,6 +796,50 @@ mod tests {
         let never = branch("false-systems/valvo", &unread, &known, 9_000);
         assert_eq!((never.unproven, never.as_of_ms), (0, None));
         assert!(never.error.is_some());
+    }
+
+    /// Second review of #63, finding 1: when the entries cannot be listed
+    /// (or the workflow home cannot be found), every branch known stays as
+    /// it was last read, with why; none is dropped, and no pseudo-entry
+    /// takes their place.
+    #[test]
+    fn every_branch_stays_as_last_read_when_the_entries_cannot_be_listed() {
+        let known = vec![
+            Branch {
+                slug: "false-systems/sykli".into(),
+                branch: "main".into(),
+                tip: Some("5fcdeef0".into()),
+                unproven: 1,
+                failed: 1,
+                oldest: Some("5fcdeef0".into()),
+                as_of_ms: Some(5_000),
+                ..Branch::default()
+            },
+            Branch {
+                slug: "false-systems/ohjaa".into(),
+                branch: "main".into(),
+                as_of_ms: Some(5_000),
+                ..Branch::default()
+            },
+        ];
+        let why = "the entries cannot be listed: cannot read /h/repos/false-systems";
+        let kept = branches(&[], Some(why), &known, 9_000);
+        assert_eq!(kept.len(), 2);
+        for (kept, last) in kept.iter().zip(&known) {
+            assert_eq!(
+                (&kept.slug, kept.unproven, kept.failed, kept.as_of_ms),
+                (&last.slug, last.unproven, last.failed, Some(5_000))
+            );
+            assert_eq!(kept.error.as_deref(), Some(why));
+        }
+        // Listed: an entry gone from the home is gone from the marks.
+        let listed = vec![(
+            "false-systems/ohjaa".to_owned(),
+            Err::<mark::Marks, _>("git: cannot run".to_owned()),
+        )];
+        let now = branches(&listed, None, &known, 9_000);
+        assert_eq!(now.len(), 1);
+        assert_eq!(now[0].slug, "false-systems/ohjaa");
     }
 
     #[test]

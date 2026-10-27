@@ -181,6 +181,10 @@ pub struct Report {
     pub natives: Result<Natives, String>,
     /// The marks on each entry's branch, or why it has none, by `owner/name`.
     pub marks: Vec<(String, Result<mark::Marks, String>)>,
+    /// Why no entry could be listed, when none could (the workflow home
+    /// cannot be found, or its entries cannot be read): then `marks` is
+    /// empty, and no entry's absence from it says anything.
+    pub unlisted: Option<String>,
     /// What waits for a person's decision, or why it could not be listed.
     pub proposals: Result<Vec<Waiting>, String>,
     /// Sessions in the log that are still open, and those closed as orphaned
@@ -284,11 +288,16 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
     } else {
         (Vec::new(), Judged::default())
     };
-    let marks = match crate::home::ohjaa_home() {
-        Ok(home) => mark::of_entries(&crate::home::absolute(home), repos, &sykli),
-        Err(error) => {
-            gaps.push(format!("the workflow home cannot be found: {error:#}"));
-            Vec::new()
+    let listed = match crate::home::ohjaa_home() {
+        Ok(home) => mark::of_entries(&crate::home::absolute(home), repos, &sykli)
+            .map_err(|why| format!("the entries cannot be listed: {why}")),
+        Err(error) => Err(format!("the workflow home cannot be found: {error:#}")),
+    };
+    let (marks, unlisted) = match listed {
+        Ok(marks) => (marks, None),
+        Err(why) => {
+            gaps.push(why.clone());
+            (Vec::new(), Some(why))
         }
     };
     for (slug, marked) in &marks {
@@ -342,6 +351,7 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
         judged,
         natives,
         marks,
+        unlisted,
         proposals,
         open,
         gaps,
@@ -1003,7 +1013,14 @@ pub fn render(report: &Report) -> String {
             }
         }
         if report.marks.is_empty() {
-            let _ = writeln!(out, "- no repository has an entry (ohjaa adopt <repo>)");
+            match &report.unlisted {
+                Some(why) => {
+                    let _ = writeln!(out, "- none marked: {why}");
+                }
+                None => {
+                    let _ = writeln!(out, "- no repository has an entry (ohjaa adopt <repo>)");
+                }
+            }
         }
     }
     if !report.window {
@@ -2140,6 +2157,7 @@ mod tests {
             judged: Judged::default(),
             natives,
             marks: Vec::new(),
+            unlisted: None,
             proposals: Ok(Vec::new()),
             open: Vec::new(),
             gaps: Vec::new(),

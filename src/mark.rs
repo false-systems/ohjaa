@@ -63,30 +63,56 @@ pub fn gate_for_entry(id: &RepoId, entry: &home::Entry, top: &Path, common: &Pat
     }
 }
 
+/// A clone that may be an entry's, but whose gate could not be read: an
+/// entry it may be is not marked, and that is not for want of a clone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unasked {
+    /// The entries its config file names, lowercase; `None`: it may be any
+    /// (it includes another file, or its config could not be read).
+    pub names: Option<Vec<String>>,
+    pub why: String,
+}
+
+impl Unasked {
+    fn may_be(&self, slug: &str) -> bool {
+        self.names
+            .as_ref()
+            .is_none_or(|names| names.iter().any(|name| name.eq_ignore_ascii_case(slug)))
+    }
+}
+
 /// The gate of the repository `repo` lies in: one git process (its config)
 /// for a clone whose config file names an entry's `owner/name` (or includes
 /// another file), none for any other clone, nor when the home has no entry.
-pub fn gate_here(home: &Path, repo: &Path) -> Option<Gate> {
-    let entries = gitconfig::entry_names(home).ok()?;
+/// `Err`: why a clone that may be an entry's could not say: where it keeps
+/// its git, its config file, or git's listing of it.
+pub fn gate_asked(home: &Path, repo: &Path) -> Result<Option<Gate>, Unasked> {
+    let any = |why: String| Unasked { names: None, why };
+    let entries = gitconfig::entry_names(home).map_err(|error| any(format!("{error:#}")))?;
     if entries.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let (top, common) = gitconfig::repo_at(repo).ok()?;
-    let config = std::fs::read_to_string(common.join("config"))
-        .unwrap_or_default()
-        .to_lowercase();
-    let named = config.contains("[include")
-        || entries.iter().any(|entry| {
-            names(
-                &config,
-                &format!("{}/{}", entry.owner, entry.name).to_lowercase(),
-            )
-        });
-    if !named {
-        return None;
+    let (top, common) = gitconfig::repo_at(repo).map_err(|error| any(format!("{error:#}")))?;
+    let file = common.join("config");
+    let config = match std::fs::read_to_string(&file) {
+        Ok(text) => text.to_lowercase(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(any(format!("cannot read {}: {error}", file.display()))),
+    };
+    let named: Vec<String> = entries
+        .iter()
+        .map(|entry| format!("{}/{}", entry.owner, entry.name).to_lowercase())
+        .filter(|slug| names(&config, slug))
+        .collect();
+    let includes = config.contains("[include");
+    if named.is_empty() && !includes {
+        return Ok(None);
     }
-    let listing = gitconfig::clone_listing(&top).ok()?;
-    gate_of(home, &top, &common, &listing)
+    let listing = gitconfig::clone_listing(&top).map_err(|error| Unasked {
+        names: (!includes).then_some(named),
+        why: format!("{error:#}"),
+    })?;
+    Ok(gate_of(home, &top, &common, &listing))
 }
 
 /// Whether `text` names `owner/name` as a whole: `acme/r1` in
@@ -453,39 +479,48 @@ pub fn line(marks: &Marks) -> String {
     out
 }
 
+/// Each entry's marks, or why it has none, by `owner/name`.
+pub type Marked = Vec<(String, Result<Marks, String>)>;
+
 /// Every entry in `home`, with the marks on its branch, or why there are
 /// none. An entry is marked in the clones under the roots (`repos`) whose
 /// origin names it: a clone's config file must name the entry before git is
 /// asked about it (one process), and the walk is one more. With several
 /// clones of one entry, the walk is in the one updated last, against
-/// the receipts of all of them.
-pub fn of_entries(
-    home: &Path,
-    repos: &[PathBuf],
-    sykli: &Sykli,
-) -> Vec<(String, Result<Marks, String>)> {
-    let entries = match home::entry_dirs(home) {
-        Ok(entries) => entries,
-        Err(error) => return vec![("(entries)".to_owned(), Err(format!("{error:#}")))],
-    };
+/// the receipts of all of them. `Err` when the entries themselves cannot be
+/// listed: then no entry's absence says anything.
+pub fn of_entries(home: &Path, repos: &[PathBuf], sykli: &Sykli) -> Result<Marked, String> {
+    let entries = home::entry_dirs(home).map_err(|error| format!("{error:#}"))?;
     if entries.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut gates: Vec<Gate> = Vec::new();
+    // Clones that may be an entry's but could not say: an entry with no
+    // clone found is then not for want of one.
+    let mut unasked: Vec<Unasked> = Vec::new();
     let mut commons = std::collections::HashSet::new();
     for repo in repos {
-        let Ok((_, common)) = gitconfig::repo_at(repo) else {
-            continue;
+        let common = match gitconfig::repo_at(repo) {
+            Ok((_, common)) => common,
+            Err(error) => {
+                unasked.push(Unasked {
+                    names: None,
+                    why: format!("{error:#}"),
+                });
+                continue;
+            }
         };
         // A worktree of a clone already read is the same clone.
         if !commons.insert(std::fs::canonicalize(&common).unwrap_or(common)) {
             continue;
         }
-        if let Some(gate) = sykli.gate_for(repo) {
-            gates.push(gate);
+        match sykli.gate_asked(repo) {
+            Ok(Some(gate)) => gates.push(gate),
+            Ok(None) => {}
+            Err(why) => unasked.push(why),
         }
     }
-    entries
+    Ok(entries
         .into_iter()
         .map(|(slug, dir)| {
             let mine: Vec<&Gate> = gates
@@ -502,13 +537,31 @@ pub fn of_entries(
                     walk(gate, sykli, &receipts)
                 }
                 None => Err(match home::read_entry(&dir) {
-                    Ok(_) => "no clone under the roots has it as origin".to_owned(),
+                    Ok(_) => no_clone(&slug, &unasked),
                     Err(error) => format!("its entry cannot be read: {error:#}"),
                 }),
             };
             (slug, marked)
         })
-        .collect()
+        .collect())
+}
+
+/// Why an entry has no clone to mark it in: none has it as origin, or one
+/// that may have could not be read.
+fn no_clone(slug: &str, unasked: &[Unasked]) -> String {
+    let maybe: Vec<&Unasked> = unasked.iter().filter(|u| u.may_be(slug)).collect();
+    match maybe.as_slice() {
+        [] => "no clone under the roots has it as origin".to_owned(),
+        [one] => format!(
+            "a clone under the roots that may have it as origin could not be read: {}",
+            one.why
+        ),
+        [first, ..] => format!(
+            "{} clones under the roots that may have it as origin could not be read; the first: {}",
+            maybe.len(),
+            first.why
+        ),
+    }
 }
 
 /// What a launch in a repository learns of its entry's branch.
@@ -660,6 +713,41 @@ mod tests {
              got b)"
         );
         assert_eq!(why(&Check::Passed), None);
+    }
+
+    /// Second review of #63, a nit: an entry without a clone because git
+    /// could not read one that may be its is said as that, never as a clone
+    /// that is not there.
+    #[test]
+    fn a_clone_that_could_not_be_read_is_no_missing_clone() {
+        let named = |names: &[&str], why: &str| Unasked {
+            names: Some(names.iter().map(|n| n.to_string()).collect()),
+            why: why.to_owned(),
+        };
+        assert_eq!(
+            no_clone("acme/r1", &[]),
+            "no clone under the roots has it as origin"
+        );
+        let other = named(&["acme/r2"], "git config --list in /c/r2 failed: exit 128");
+        assert_eq!(
+            no_clone("acme/r1", std::slice::from_ref(&other)),
+            "no clone under the roots has it as origin",
+            "another entry's clone is not this one's"
+        );
+        let mine = named(&["acme/r1"], "git config --list in /c/r1 failed: exit 128");
+        assert_eq!(
+            no_clone("Acme/R1", &[other, mine]),
+            "a clone under the roots that may have it as origin could not be read: git config \
+             --list in /c/r1 failed: exit 128"
+        );
+        // Its config includes another file, or could not be read: any entry's.
+        let any = Unasked {
+            names: None,
+            why: "cannot read /c/r3/.git/config".to_owned(),
+        };
+        let twice = [any.clone(), any];
+        assert!(no_clone("acme/r1", &twice)
+            .starts_with("2 clones under the roots that may have it as origin could not be read"));
     }
 
     #[test]
