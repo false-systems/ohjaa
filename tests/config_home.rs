@@ -1527,7 +1527,10 @@ fn a_block_apply_did_not_write_is_left_as_the_persons() {
 }
 
 /// One agent's file apply cannot read as a whole (two blocks in it) is said
-/// and skipped; everything else is applied, and undone.
+/// and skipped, and everything else is applied; but apply is not done while
+/// it stays unwritten. Every apply ends saying which file and why, and exits
+/// 4 (incomplete), the commit names it, and doctor reports it, until the
+/// file is fixed; undo skips it and undoes the rest.
 #[test]
 fn one_broken_agent_file_is_skipped_and_the_rest_is_applied() {
     let sandbox = Sandbox::new("broken-file");
@@ -1541,12 +1544,20 @@ fn one_broken_agent_file_is_skipped_and_the_rest_is_applied() {
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(file, text).unwrap();
     }
+    let except = format!(
+        "applied, except 1 agent file not written: {} (pi's own instructions:",
+        pi.display()
+    );
     let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
     let (stdout, stderr) = text(&output);
-    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(output.status.code(), Some(4), "{stdout}{stderr}");
     assert!(
         stderr.contains(&format!("warning: not writing {}", pi.display())),
         "{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("ohjaa apply: {except}")),
+        "{stdout}"
     );
     assert_eq!(fs::read_to_string(&pi).unwrap(), broken);
     assert!(fs::read_to_string(&claude)
@@ -1555,6 +1566,40 @@ fn one_broken_agent_file_is_skipped_and_the_rest_is_applied() {
     assert!(fs::read_to_string(sandbox.home().join(".zshrc"))
         .unwrap()
         .contains(&sandbox.launch_line()));
+    let history = sandbox.history();
+    assert!(
+        history[0].starts_with("apply: ")
+            && history[0].contains("1 agent file not written")
+            && history[0].contains(&format!("\nnot written: {} (", pi.display())),
+        "{history:#?}"
+    );
+
+    // Applied again, and as a dry run: still not done, and said so.
+    for args in [
+        vec!["apply", "--root", &sandbox.projects()],
+        vec!["apply", "--dry-run", "--root", &sandbox.projects()],
+    ] {
+        let output = sandbox.ohjaa(&args);
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(4), "{args:?}: {stdout}{stderr}");
+        assert!(
+            stdout.contains("except 1 agent file not written")
+                && !stdout.contains("the workflow is applied"),
+            "{args:?}: {stdout}"
+        );
+    }
+    assert_eq!(sandbox.history().len(), 1, "nothing more to commit");
+    let output = sandbox.ohjaa(&["doctor", "--root", &sandbox.projects()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(4), "{stdout}{stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("DRIFT") && line.contains(&pi.display().to_string())),
+        "{stdout}"
+    );
+
+    // Undo skips it, and undoes the rest.
     let output = sandbox.ohjaa(&["apply", "--undo"]);
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
@@ -1564,6 +1609,33 @@ fn one_broken_agent_file_is_skipped_and_the_rest_is_applied() {
     );
     assert_eq!(fs::read_to_string(&claude).unwrap(), "# Mine\n");
     assert_eq!(fs::read_to_string(&pi).unwrap(), broken);
+
+    // Fixed by hand: apply is done, and doctor finds the block current.
+    fs::write(&pi, "# pi\n").unwrap();
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(!stdout.contains("except"), "{stdout}");
+    assert!(fs::read_to_string(&pi)
+        .unwrap()
+        .contains("- decision: Rust.\n"));
+    let output = sandbox.ohjaa(&["doctor", "--root", &sandbox.projects()]);
+    let (stdout, _) = text(&output);
+    for file in [&claude, &pi] {
+        let file = file.display().to_string();
+        assert!(
+            stdout.lines().any(|line| line.contains("ok")
+                && line.contains(&file)
+                && line.contains("knowledge block")),
+            "{stdout}"
+        );
+        assert!(
+            !stdout
+                .lines()
+                .any(|line| line.contains("DRIFT") && line.contains(&file)),
+            "{stdout}"
+        );
+    }
 }
 
 /// A commit that fails is said, and what apply did stands.
