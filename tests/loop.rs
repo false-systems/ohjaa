@@ -5,9 +5,12 @@
 //!    through the real toimija, which gives it the briefing in its launch
 //!    prompt. The agent reads back with `ohjaa oriented`.
 //! 2. **Work.** It commits in a worktree of its own and runs `ohjaa gate`: the
-//!    real sykli runs the gate derived from the commit and writes a receipt.
-//! 3. **Ship.** It pushes to origin's main. The hook observes the push, and
-//!    the marks say ✓, still ✓ once the worktree is removed.
+//!    real sykli runs the gate derived from the commit, the fixture's test
+//!    among it, and writes a receipt.
+//! 3. **Ship.** It pushes to origin's main. The hook hands the push to sykli,
+//!    which accepts it and keeps the receipt that proved it, and the marks
+//!    say ✓. Once the worktree is removed and that copy is set aside, they
+//!    still say ✓, from the receipt sykli kept of the run.
 //! 4. **Learn.** It hands over with `ohjaa handover`, and leaving writes the
 //!    record. `ohjaa intake` drafts a proposal from what the person said in
 //!    the session, which the real vessa finds in the agent's transcript.
@@ -19,8 +22,8 @@
 //! opens with the flag.
 //!
 //! Ignored by default, since CI's runners have none of these tools. Run it
-//! with the installed ones. Measured on 2026-10-27, it takes 9 to 16 seconds
-//! on macOS and 6 to 8 on Linux:
+//! with the installed ones. Measured on 2026-10-27, it takes 8 to 16 seconds
+//! on macOS and 3 to 8 on Linux:
 //!
 //! ```sh
 //! OHJAA_TEST_SYKLI=$(command -v sykli) OHJAA_TEST_TOIMIJA=$(command -v toimija) \
