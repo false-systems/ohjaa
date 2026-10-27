@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 
 /// Never the real gh. Each call's arguments go to `$STUB_GH/calls`.
 /// `repo view` says the visibility in `$STUB_GH/visibility` (and `main`),
-/// or, with `$STUB_GH/signed-out`, that gh is not signed in; `api graphql`
-/// prints `$STUB_GH/private.json`; `pr list` prints `$STUB_GH/open.json`;
+/// or, with `$STUB_GH/signed-out`, that gh is not signed in; `api user`
+/// prints `$STUB_GH/user.json` and `api user/repos?…` `$STUB_GH/repos.json`;
+/// `pr list` prints `$STUB_GH/open.json`;
 /// `pr create` keeps its body (stdin) in `$STUB_GH/body-<n>`, its repo, base
 /// and head in `$STUB_GH/created`, makes it the open one and prints its URL.
 const GH_STUB: &str = r#"#!/bin/sh
@@ -39,7 +40,8 @@ case "$1 $2" in
     fi
     printf '{"visibility":"%s","defaultBranchRef":{"name":"main"}}\n' "$(cat "$d/visibility")"
     exit 0;;
-  "api graphql") cat "$d/private.json"; exit 0;;
+  "api user") cat "$d/user.json"; exit 0;;
+  "api user/repos"*) cat "$d/repos.json"; exit 0;;
   "pr list") cat "$d/open.json"; exit 0;;
   "pr create")
     repo=""; head=""; base=""
@@ -63,12 +65,13 @@ echo "gh stub: not expected: $*" >&2
 exit 64
 "#;
 
+/// The person, as gh is signed in.
+const USER: &str = r#"{"login":"octo-gh","name":"Octo Cat"}"#;
+
 /// The person's private repositories, as GitHub lists them to gh: two
-/// pages, as `gh api graphql --paginate` prints them. `widget` is also the
-/// name of the repository the lessons go to: its own name is no secret there.
-const PRIVATE: &str = r#"{"data":{"viewer":{"login":"octo-gh","name":"Octo Cat","repositories":{"nodes":[{"name":"secret-thing"},{"name":"ote"}],"pageInfo":{"hasNextPage":true,"endCursor":"Y3Vyc29y"}}}}}
-{"data":{"viewer":{"login":"octo-gh","name":"Octo Cat","repositories":{"nodes":[{"name":"widget"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}
-"#;
+/// pages. `widget` is also the name of the repository the lessons go to:
+/// its own name is no secret there.
+const REPOS: &str = "[{\"name\":\"secret-thing\"},{\"name\":\"ote\"}]\n[{\"name\":\"widget\"},{\"name\":\"ohjaa\"}]\n";
 
 const AGENTS: &str = "# Agent guide\n\nRead this first.\n\n## Languages\n\nRust.\n";
 
@@ -156,7 +159,8 @@ impl World {
             &format!("#!/bin/sh\nexec {} \"$@\"\n", real_git().display()),
         );
         fs::write(dir.join("gh/visibility"), "PRIVATE").unwrap();
-        fs::write(dir.join("gh/private.json"), PRIVATE).unwrap();
+        fs::write(dir.join("gh/user.json"), USER).unwrap();
+        fs::write(dir.join("gh/repos.json"), REPOS).unwrap();
         fs::write(dir.join("gh/open.json"), "[]\n").unwrap();
         let world = World {
             checkout: dir.join("projects/widget"),
@@ -329,7 +333,7 @@ impl World {
         let heads: Vec<String> = self
             .remote_heads()
             .into_iter()
-            .filter(|head| head.starts_with("ohjaa/lessons-"))
+            .filter(|head| head.starts_with("agents-md-lessons/"))
             .collect();
         assert_eq!(heads.len(), 1, "{heads:?}");
         heads[0].clone()
@@ -524,8 +528,8 @@ fn a_dry_run_says_what_it_would_write_and_changes_nothing() {
     assert!(stdout.contains("acme/widget"), "{stdout}");
     assert!(stdout.contains("private"), "{stdout}");
     for line in [
-        "- <!-- ohjaa:lesson widget-uses-rust --> **decision**: Widget code is Rust. (as of 2026-10-20)",
-        "- <!-- ohjaa:lesson widget-tests-first --> **lesson**: Write the failing test first. (as of 2026-10-20)",
+        "- <!-- lesson: widget-uses-rust --> **decision**: Widget code is Rust. (as of 2026-10-20)",
+        "- <!-- lesson: widget-tests-first --> **lesson**: Write the failing test first. (as of 2026-10-20)",
     ] {
         assert!(stdout.contains(line), "the line it would add: {stdout}");
     }
@@ -571,14 +575,14 @@ fn publish_opens_one_pull_request_then_moves_each_file_out_of_the_checkout() {
     assert!(agents.starts_with(AGENTS), "{agents}");
     let section = &agents[AGENTS.len()..];
     assert!(
-        section.starts_with("\n## Lessons\n\n<!-- ohjaa"),
+        section.starts_with("\n## Lessons\n\n<!-- This repository's accepted knowledge"),
         "{agents}"
     );
     let decision = section
-        .find("- <!-- ohjaa:lesson widget-uses-rust --> **decision**: Widget code is Rust. (as of 2026-10-20)\n")
+        .find("- <!-- lesson: widget-uses-rust --> **decision**: Widget code is Rust. (as of 2026-10-20)\n")
         .expect(&agents);
     let lesson = section
-        .find("- <!-- ohjaa:lesson widget-tests-first --> **lesson**: Write the failing test first. (as of 2026-10-20)\n")
+        .find("- <!-- lesson: widget-tests-first --> **lesson**: Write the failing test first. (as of 2026-10-20)\n")
         .expect(&agents);
     assert!(decision < lesson, "{agents}");
     assert!(agents.ends_with("(as of 2026-10-20)\n"), "{agents}");
@@ -690,7 +694,7 @@ fn a_later_publish_adds_to_the_open_pull_request_and_one_with_nothing_new_change
         "a commit on top of the one before, never a force: {log}"
     );
     let agents = world.remote_show(&branch);
-    assert_eq!(agents.matches("<!-- ohjaa:lesson ").count(), 2, "{agents}");
+    assert_eq!(agents.matches("<!-- lesson: ").count(), 2, "{agents}");
     assert!(agents.contains("No unwrap outside tests."), "{agents}");
     assert!(!world.checkout.join(".ohjaa").exists());
     assert_eq!(
@@ -762,13 +766,22 @@ fn a_public_repository_gets_no_line_that_names_something_private() {
     );
     let log = world.remote_log(&format!("refs/heads/{branch}"));
     let body = world.body(41);
-    for sent in [&log, &body] {
+    // `pr create`'s arguments: its title among them.
+    let created = world
+        .gh_calls()
+        .lines()
+        .find(|call| call.starts_with("pr create"))
+        .unwrap()
+        .to_owned();
+    for sent in [&log, &body, &agents, &branch, &created] {
         assert!(!sent.to_lowercase().contains("secret-thing"), "{sent}");
         assert!(!sent.contains("widget-calls-secret"), "{sent}");
         assert!(
             !sent.contains("was accepted"),
             "no origins go to a public repo: {sent}"
         );
+        // The tool is private too: what it writes names no tool.
+        assert!(!sent.to_lowercase().contains("ohjaa"), "{sent}");
     }
     // What was held stays where it was, and waits; the rest moved.
     assert!(secret.exists() && path.exists() && person.exists());
@@ -863,7 +876,7 @@ fn accepting_a_repo_proposal_at_a_terminal_opens_the_pull_request() {
     let agents = world.remote_show(&branch);
     assert!(
         agents.contains(
-            "- <!-- ohjaa:lesson widget-uses-rust --> **decision**: Widget code is Rust. (as of 2026-10-27)"
+            "- <!-- lesson: widget-uses-rust --> **decision**: Widget code is Rust. (as of 2026-10-27)"
         ),
         "{agents}"
     );
@@ -945,4 +958,25 @@ fn an_accept_gh_cannot_deliver_stays_accepted_and_undelivered_until_publish() {
         "{stdout}"
     );
     assert_eq!(world.delivery()["nodes"]["widget-uses-rust"]["state"], "pr");
+}
+
+#[test]
+fn when_what_ohjaa_itself_writes_names_something_private_nothing_is_sent() {
+    let world = World::new("ownwords");
+    world.set_visibility("PUBLIC");
+    // A private repository named like the section's heading.
+    fs::write(
+        world.dir.join("gh/repos.json"),
+        "[{\"name\":\"lessons\"}]\n",
+    )
+    .unwrap();
+    let file = world.legacy("widget-uses-rust", "decision", "Widget code is Rust.");
+    let (stdout, stderr, code) = world.publish(&[]);
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    assert!(stdout.contains("`lessons`"), "{stdout}");
+    assert!(stdout.contains("nothing was sent"), "{stdout}");
+    assert_eq!(world.remote_heads(), vec!["main"]);
+    assert!(!world.gh_calls().contains("pr create"));
+    assert!(file.exists());
+    assert_eq!(world.worktrees(), 1);
 }

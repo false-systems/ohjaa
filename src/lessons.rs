@@ -16,11 +16,14 @@
 //!
 //! The lines are written in a fresh worktree of the repository off its
 //! origin's branch, kept in `lessons/.work/` and removed when done, never in
-//! the person's checkout. A repository that is not private gets no line that
-//! names what is: every line ohjaa would add or change there is first checked
-//! against a [`DenyList`] built from the person's private context. A line
-//! that names something on it is held back and said, with what it named; its
-//! text is sent nowhere.
+//! the person's checkout. What ohjaa writes into a repository names no tool:
+//! not its marks, its words around the lines, its branch, its commit or its
+//! pull request, since a repository may be public and ohjaa is not. A
+//! repository that is not private gets nothing that names what is: all it
+//! would be sent is first checked against a [`DenyList`] built from the
+//! person's private context. A line that names something on it is held back
+//! and said, with what it named; its text goes nowhere. Anything else that
+//! does stops the delivery.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -38,18 +41,19 @@ use crate::{gitconfig, home, process};
 
 /// The heading of the section ohjaa writes in AGENTS.md.
 pub const HEADING: &str = "## Lessons";
-/// What a line of ohjaa's begins with, after its `- `: the node's id follows.
-const MARK: &str = "<!-- ohjaa:lesson ";
+/// What a line of the section begins with, after its `- `: the node's id
+/// follows.
+const MARK: &str = "<!-- lesson: ";
 const MARK_END: &str = " -->";
 /// What opens the section when ohjaa makes it.
-pub const INTRO: &str = "<!-- ohjaa: this repository's accepted knowledge (knowledge-node.v1), \
-     one line per node, each marked with its id. ohjaa writes them through a pull request when a \
-     person accepts one; to change one, propose it with `ohjaa propose --scope repo`: a line \
-     changed here by hand is replaced the next time ohjaa writes it. -->";
-/// The branches of ohjaa's lessons pull requests begin with this.
-pub const BRANCH_PREFIX: &str = "ohjaa/lessons-";
+pub const INTRO: &str = "<!-- This repository's accepted knowledge: one line per node, each \
+     marked with its id, written here through a pull request when a person accepts one. A line \
+     changed here by hand is replaced the next time it is written: change a lesson where it is \
+     decided. -->";
+/// The branches of the lessons pull requests begin with this.
+pub const BRANCH_PREFIX: &str = "agents-md-lessons/";
 pub const SCHEMA: &str = "ohjaa-lessons.v1";
-const TITLE: &str = "AGENTS.md: lessons from ohjaa";
+const TITLE: &str = "AGENTS.md: accepted lessons";
 
 const GH: Duration = Duration::from_secs(30);
 const GH_CREATE: Duration = Duration::from_secs(60);
@@ -99,6 +103,7 @@ pub struct Changes {
 }
 
 impl Changes {
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
     }
@@ -249,59 +254,68 @@ pub struct Private {
     pub people: Vec<String>,
 }
 
-/// One page per repository the person can see that is private: in their
-/// account, in the organisations they belong to, and those they collaborate
-/// on. `--paginate` asks for every page.
-const PRIVATE_QUERY: &str =
-    "query($endCursor: String) { viewer { login name repositories(first: 100, \
-     after: $endCursor, privacy: PRIVATE, ownerAffiliations: [OWNER, COLLABORATOR, \
-     ORGANIZATION_MEMBER]) { nodes { name } pageInfo { hasNextPage endCursor } } } }";
+/// Every private repository the person can see, as GitHub's REST API lists
+/// them to gh: their own, their organisations', and those they collaborate
+/// on, every page (`--paginate`). GraphQL's `viewer.repositories` leaves out
+/// most of an organisation's.
+const PRIVATE_REPOS: &str =
+    "user/repos?visibility=private&affiliation=owner,collaborator,organization_member&per_page=100";
 
-/// What `gh api graphql --paginate` printed for [`PRIVATE_QUERY`]: one JSON
-/// document per page.
-pub fn parse_private(output: &[u8]) -> Result<Private, String> {
-    let mut private = Private::default();
-    let mut pages = 0;
-    let add = |list: &mut Vec<String>, text: &str| {
-        let text = text.trim();
-        if !text.is_empty() && !list.iter().any(|known| known == text) {
-            list.push(text.to_owned());
+fn add_once(list: &mut Vec<String>, text: &str) {
+    let text = text.trim();
+    if !text.is_empty() && !list.iter().any(|known| known == text) {
+        list.push(text.to_owned());
+    }
+}
+
+/// The person as gh is signed in (`gh api user`): their login, their name,
+/// and each word of it of three letters or more.
+pub fn parse_user(output: &[u8]) -> Result<Vec<String>, String> {
+    let user: Value = serde_json::from_slice(output)
+        .map_err(|error| format!("gh api user printed no answer: {error}"))?;
+    let login = user["login"]
+        .as_str()
+        .filter(|login| !login.is_empty())
+        .ok_or("gh api user said no login")?;
+    let mut people = Vec::new();
+    add_once(&mut people, login);
+    if let Some(name) = user["name"].as_str() {
+        add_once(&mut people, name);
+        for part in name
+            .split_whitespace()
+            .filter(|part| part.chars().count() >= 3)
+        {
+            add_once(&mut people, part);
         }
-    };
+    }
+    Ok(people)
+}
+
+/// The names of the repositories `gh api user/repos?… --paginate` printed:
+/// one JSON array, or one per page.
+pub fn parse_repos(output: &[u8]) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    let mut pages = 0;
     for page in serde_json::Deserializer::from_slice(output).into_iter::<Value>() {
         let page = page.map_err(|error| format!("gh printed no answer GitHub gave: {error}"))?;
-        if let Some(message) = page["errors"][0]["message"].as_str() {
-            return Err(format!("GitHub refused the listing: {message}"));
-        }
-        let viewer = &page["data"]["viewer"];
-        let Some(nodes) = viewer["repositories"]["nodes"].as_array() else {
-            return Err("GitHub answered without the repositories".to_owned());
+        let Some(repos) = page.as_array() else {
+            return Err(format!(
+                "GitHub answered without the repositories: {}",
+                page["message"].as_str().unwrap_or("no list")
+            ));
         };
         pages += 1;
-        for node in nodes {
-            if let Some(name) = node["name"].as_str() {
-                add(&mut private.repos, name);
-            }
-        }
-        for key in ["login", "name"] {
-            let Some(said) = viewer[key].as_str() else {
-                continue;
-            };
-            add(&mut private.people, said);
-            if key == "name" {
-                for part in said
-                    .split_whitespace()
-                    .filter(|part| part.chars().count() >= 3)
-                {
-                    add(&mut private.people, part);
-                }
-            }
+        for repo in repos {
+            let name = repo["name"]
+                .as_str()
+                .ok_or("GitHub listed a repository without its name")?;
+            add_once(&mut names, name);
         }
     }
     if pages == 0 {
         return Err("gh printed nothing".to_owned());
     }
-    Ok(private)
+    Ok(names)
 }
 
 /// Everything a line that goes to a repository that is not private may not
@@ -321,24 +335,38 @@ struct Deny {
 }
 
 impl DenyList {
-    /// The names of the person's private repositories but `own` (the name of
-    /// the repository the lines go to: no secret there), their home path,
-    /// their home folder's name (their account), and their login and name.
-    pub fn build(private: &Private, home: Option<&Path>, own: &str) -> DenyList {
+    /// For the repository `owner/name` the lines go to: the names of the
+    /// person's private repositories, their home path, their home folder's
+    /// name (their account), and their login and name. What that
+    /// repository's own URL says is no secret there: its name, and its owner
+    /// (the person's login, when it is theirs).
+    pub fn build(private: &Private, home: Option<&Path>, slug: &str) -> DenyList {
+        let (owner, own) = slug.split_once('/').unwrap_or(("", slug));
         let mut list = DenyList::default();
         for name in &private.repos {
             if !name.eq_ignore_ascii_case(own) {
                 list.add(name, "the name of a private repository of yours", true);
             }
         }
+        let account = home
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned());
         if let Some(home) = home {
             list.add(&home.to_string_lossy(), "your home path", false);
-            if let Some(name) = home.file_name() {
-                list.add(&name.to_string_lossy(), "your account's name", true);
-            }
         }
-        for person in &private.people {
-            list.add(person, "you, as GitHub names you", true);
+        let people = account
+            .iter()
+            .map(|account| (account, "your account's name"))
+            .chain(
+                private
+                    .people
+                    .iter()
+                    .map(|person| (person, "you, as GitHub names you")),
+            );
+        for (person, what) in people {
+            if !person.eq_ignore_ascii_case(owner) {
+                list.add(person, what, true);
+            }
         }
         list
     }
@@ -710,18 +738,11 @@ impl Asker {
     fn private(&mut self) -> Result<Private, String> {
         self.private
             .get_or_insert_with(|| {
-                gh(
-                    &[
-                        "api",
-                        "graphql",
-                        "--paginate",
-                        "-f",
-                        &format!("query={PRIVATE_QUERY}"),
-                    ],
-                    None,
-                    GH,
-                )
-                .and_then(|out| parse_private(out.as_bytes()))
+                let people =
+                    gh(&["api", "user"], None, GH).and_then(|out| parse_user(out.as_bytes()))?;
+                let repos = gh(&["api", PRIVATE_REPOS, "--paginate"], None, GH)
+                    .and_then(|out| parse_repos(out.as_bytes()))?;
+                Ok(Private { repos, people })
             })
             .clone()
     }
@@ -769,11 +790,10 @@ impl Asker {
                     visibility.to_ascii_lowercase()
                 )
             })?;
-            let own = slug.rsplit('/').next().unwrap_or(&slug);
             let home = std::env::var_os("HOME")
                 .filter(|home| !home.is_empty())
                 .map(PathBuf::from);
-            Some(DenyList::build(&private, home.as_deref(), own))
+            Some(DenyList::build(&private, home.as_deref(), &slug))
         };
         Ok(Ready {
             slug,
@@ -995,12 +1015,124 @@ pub fn untracked(checkout: &Path, said: &mut Vec<String>) -> Vec<Filed> {
         .collect()
 }
 
+/// What a clone's lessons should be: from the nodes in ohjaa's state and
+/// those still in the checkout.
+struct Wanted {
+    located: Vec<Located>,
+    /// The current nodes' lines, in briefing order.
+    lines: Vec<(String, String)>,
+    /// The ids no longer current: their lines are taken out.
+    gone: Vec<String>,
+}
+
+impl Wanted {
+    fn of(nodes: &[&Filed]) -> Wanted {
+        let located: Vec<Located> = nodes
+            .iter()
+            .map(|(node, _)| Located {
+                scope: Scope::Repo,
+                node: node.clone(),
+            })
+            .collect();
+        let lines = fk::briefing(&located)
+            .into_iter()
+            .map(|located| (located.node.id.clone(), line(&located.node)))
+            .collect();
+        let gone = located
+            .iter()
+            .filter(|located| located.node.status != Status::Current)
+            .map(|located| located.node.id.clone())
+            .collect();
+        Wanted {
+            located,
+            lines,
+            gone,
+        }
+    }
+}
+
+/// What a delivery sends besides the node lines: its commit message and,
+/// for a new pull request, its branch and body (the title is [`TITLE`]).
+struct Outgoing {
+    branch: String,
+    message: String,
+    body: String,
+}
+
+fn outgoing(
+    ready: &Ready,
+    plan: &Plan,
+    located: &[Located],
+    open: Option<&OpenPr>,
+    today: Date,
+) -> Outgoing {
+    let branch = open.map_or_else(
+        || {
+            format!(
+                "{BRANCH_PREFIX}{today}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            )
+        },
+        |pr| pr.branch.clone(),
+    );
+    Outgoing {
+        branch,
+        message: commit_message(&plan.changes),
+        body: pr_body(ready, plan, located),
+    }
+}
+
+/// For a repository that is not private: what of the deny list the rest of
+/// what would be sent names, besides the node lines [`plan`] checks: the
+/// section's other new lines (its heading and intro, when it is new), the
+/// commit message and, for a new pull request, its branch, title and body.
+fn names_private(
+    deny: &DenyList,
+    base: &str,
+    plan: &Plan,
+    out: &Outgoing,
+    new_pr: bool,
+) -> Vec<String> {
+    let before: BTreeSet<&str> = base.lines().collect();
+    let mut sent: Vec<&str> = plan
+        .text
+        .lines()
+        .filter(|line| marked(line).is_none() && !before.contains(line))
+        .collect();
+    sent.push(&out.message);
+    if new_pr {
+        sent.extend([out.branch.as_str(), TITLE, out.body.as_str()]);
+    }
+    let mut found: Vec<String> = Vec::new();
+    for text in sent {
+        for named in deny.matches(text) {
+            if !found.contains(&named) {
+                found.push(named);
+            }
+        }
+    }
+    found
+}
+
+/// A delivery made: what it was made against and where it went.
+struct Sent {
+    ready: Ready,
+    plan: Plan,
+    open: Option<OpenPr>,
+    url: Option<String>,
+    branch: Option<String>,
+}
+
 /// Bring the Lessons section of `checkout`'s repository in line with the
 /// repo knowledge ohjaa's state holds for its clone, and `extra` (nodes still
 /// in the checkout's `.ohjaa/knowledge/`, moved into ohjaa's state once
-/// delivered): one pull request, the open one of ohjaa's lessons, else a new
+/// delivered): one pull request, the open one of the lessons, else a new
 /// one. `ready` is what the delivery needs, or why it cannot be made. A dry
-/// run reads the branch as last fetched, and writes nothing.
+/// run reads the branch as last fetched, and fetches, writes and sends
+/// nothing.
 pub fn deliver(
     state: &Path,
     checkout: &Path,
@@ -1011,22 +1143,48 @@ pub fn deliver(
 ) -> Delivered {
     let dir = knowledge::accepted_dir(state, checkout);
     let mut said = Vec::new();
+    let stays = |extra: usize, said: &mut Vec<String>| {
+        if extra > 0 {
+            said.push(format!(
+                "{extra} file(s) stay in {}",
+                knowledge::repo_knowledge(checkout).display()
+            ));
+        }
+    };
+    // One delivery at a time changes this state, from its first read to its
+    // last write.
+    let _lock = if dry_run {
+        None
+    } else {
+        match process::lock_file(&state.join("lessons").join("lessons.lock"), LOCK_WAIT) {
+            Ok(lock) => Some(lock),
+            Err(why) => {
+                said.push(format!("not delivered: {why}"));
+                stays(extra.len(), &mut said);
+                return Delivered {
+                    said,
+                    complete: false,
+                };
+            }
+        }
+    };
     let mut record = match Record::read(&dir) {
         Ok(record) => record,
         Err(why) => {
             said.push(format!("not delivered: {why}; fix or remove it"));
+            stays(extra.len(), &mut said);
             return Delivered {
                 said,
                 complete: false,
             };
         }
     };
-    let held_in_state: Vec<Filed> = nodes_in(&dir, &mut said);
+    let in_state: Vec<Filed> = nodes_in(&dir, &mut said);
     // A node in both is ohjaa's already: its file in the checkout is left.
     let extra: Vec<Filed> = extra
         .into_iter()
         .filter(|(node, path)| {
-            let twice = held_in_state.iter().any(|(held, _)| held.id == node.id);
+            let twice = in_state.iter().any(|(held, _)| held.id == node.id);
             if twice {
                 said.push(format!(
                     "left {}: `{}` is in ohjaa's state already",
@@ -1037,246 +1195,75 @@ pub fn deliver(
             !twice
         })
         .collect();
-    let located: Vec<Located> = held_in_state
-        .iter()
-        .chain(&extra)
-        .map(|(node, _)| Located {
-            scope: Scope::Repo,
-            node: node.clone(),
-        })
-        .collect();
-    let lines: Vec<(String, String)> = fk::briefing(&located)
-        .into_iter()
-        .map(|located| (located.node.id.clone(), line(&located.node)))
-        .collect();
-    let gone: Vec<String> = located
-        .iter()
-        .filter(|located| located.node.status != Status::Current)
-        .map(|located| located.node.id.clone())
-        .collect();
-    let in_state: BTreeSet<&str> = held_in_state
-        .iter()
-        .map(|(node, _)| node.id.as_str())
-        .collect();
+    let wanted = Wanted::of(&in_state.iter().chain(&extra).collect::<Vec<_>>());
 
-    let not_delivered = |why: String, record: &mut Record, said: &mut Vec<String>| {
-        said.push(format!("not delivered: {why}"));
-        if !dry_run {
-            for (id, _) in &lines {
-                let delivered = record.nodes.get(id).is_some_and(Delivery::delivered);
-                if in_state.contains(id.as_str()) && !delivered {
-                    let mut delivery = Delivery::new(State::Undelivered, today);
-                    delivery.why = Some(why.clone());
-                    record.nodes.insert(id.clone(), delivery);
+    let sent = match attempt(
+        checkout, state, ready, &wanted, &extra, dry_run, today, &mut said,
+    ) {
+        Ok(Some(sent)) => sent,
+        Ok(None) => {
+            return Delivered {
+                complete: !said.iter().any(|line| line.starts_with("held back")),
+                said,
+            }
+        }
+        Err(why) => {
+            said.push(format!("not delivered: {why}"));
+            if !dry_run {
+                for (id, _) in &wanted.lines {
+                    let delivered = record.nodes.get(id).is_some_and(Delivery::delivered);
+                    if in_state.iter().any(|(node, _)| node.id == *id) && !delivered {
+                        let mut delivery = Delivery::new(State::Undelivered, today);
+                        delivery.why = Some(why.clone());
+                        record.nodes.insert(id.clone(), delivery);
+                    }
+                }
+                record.checkout = Some(checkout.to_path_buf());
+                if let Err(why) = record.write(&dir) {
+                    said.push(why);
                 }
             }
-            record.checkout = Some(checkout.to_path_buf());
-            if let Err(why) = record.write(&dir) {
-                said.push(why);
-            }
-        }
-        if !extra.is_empty() {
-            said.push(format!(
-                "{} file(s) stay in {}",
-                extra.len(),
-                knowledge::repo_knowledge(checkout).display()
-            ));
+            stays(extra.len(), &mut said);
+            return Delivered {
+                said,
+                complete: false,
+            };
         }
     };
 
-    let ready = match ready {
-        Ok(ready) => ready,
-        Err(why) => {
-            not_delivered(why, &mut record, &mut said);
-            return Delivered {
-                said,
-                complete: false,
-            };
-        }
-    };
-    let mut head = format!("{}, {}", ready.slug, ready.visibility.to_ascii_lowercase());
-    if let Some(deny) = &ready.deny {
-        let _ = write!(
-            head,
-            " ({}): each line checked first against {} names of what is yours and private",
-            ready.visibility,
-            deny.len()
-        );
-    }
-    said.push(head);
-    let open = match open_pr(&ready.slug) {
-        Ok(open) => open,
-        Err(why) => {
-            not_delivered(why, &mut record, &mut said);
-            return Delivered {
-                said,
-                complete: false,
-            };
-        }
-    };
-    let base_branch = open
-        .as_ref()
-        .map_or(ready.default_branch.clone(), |pr| pr.branch.clone());
-
-    if dry_run {
-        let show = |branch: &str| {
-            git_in(
-                checkout,
-                &["show", &format!("refs/remotes/origin/{branch}:AGENTS.md")],
-                process::LOCAL,
-            )
-        };
-        let tracked = |branch: &str| {
-            git_in(
-                checkout,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/remotes/origin/{branch}"),
-                ],
-                process::LOCAL,
-            )
-            .is_ok()
-        };
-        // The branch as last fetched here: a dry run fetches nothing.
-        let read_from = if tracked(&base_branch) {
-            base_branch.clone()
-        } else {
-            ready.default_branch.clone()
-        };
-        let base = show(&read_from).unwrap_or_default();
-        let plan = plan(&base, &lines, &gone, ready.deny.as_ref());
-        said.push(format!(
-            "AGENTS.md as of origin/{read_from}, as last fetched here"
-        ));
-        say_plan(&plan, &lines, &mut said);
-        let moving = extra
-            .iter()
-            .filter(|(node, _)| !plan.held.iter().any(|(id, _)| *id == node.id))
-            .count();
-        said.push(if plan.changes.is_empty() {
-            "nothing to write".to_owned()
-        } else {
-            match &open {
-                Some(pr) => format!("would add a commit to {} ({})", pr.url, pr.branch),
-                None => format!("would open a pull request onto {}", ready.default_branch),
-            }
-        });
-        if moving > 0 {
-            said.push(format!(
-                "would then move {moving} file(s) out of {} into ohjaa's state",
-                knowledge::repo_knowledge(checkout).display()
-            ));
-        }
-        return Delivered {
-            said,
-            complete: plan.held.is_empty(),
-        };
-    }
-
-    // One delivery at a time changes this state, held to the end.
-    let _lock = match process::lock_file(&state.join("lessons").join("lessons.lock"), LOCK_WAIT) {
-        Ok(lock) => lock,
-        Err(why) => {
-            not_delivered(why, &mut record, &mut said);
-            return Delivered {
-                said,
-                complete: false,
-            };
-        }
-    };
-    let result = write_and_push(
-        checkout,
-        state,
-        &ready,
-        open.as_ref(),
-        &base_branch,
-        &lines,
-        &gone,
-        today,
-    );
-    let (plan, pushed) = match result {
-        Ok(done) => done,
-        Err(why) => {
-            not_delivered(why, &mut record, &mut said);
-            return Delivered {
-                said,
-                complete: false,
-            };
-        }
-    };
-    say_plan(&plan, &lines, &mut said);
-    // The pull request: the open one, else a new one for what was pushed.
-    let (url, branch) = match (&open, &pushed) {
-        (Some(pr), Some(_)) => {
-            said.push(format!("added to {}", pr.url));
-            (Some(pr.url.clone()), Some(pr.branch.clone()))
-        }
-        (Some(pr), None) => {
-            said.push(format!("nothing new for {}", pr.url));
-            (Some(pr.url.clone()), Some(pr.branch.clone()))
-        }
-        (None, Some(branch)) => match create_pr(&ready, branch, &plan, &located) {
-            Ok(url) => {
-                said.push(format!(
-                    "opened {url}: AGENTS.md ({HEADING}); merge it like any change"
-                ));
-                (Some(url), Some(branch.clone()))
-            }
-            Err(why) => {
-                not_delivered(
-                    format!("{branch} is pushed, but no pull request was opened: {why}"),
-                    &mut record,
-                    &mut said,
-                );
-                return Delivered {
-                    said,
-                    complete: false,
-                };
-            }
-        },
-        (None, None) => {
-            said.push(format!(
-                "nothing new: AGENTS.md on {} holds it all",
-                ready.default_branch
-            ));
-            (None, None)
-        }
-    };
     // Each node as it now stands: a line the default branch held as it is
     // was merged; the others are in the pull request.
-    let sent: BTreeSet<&String> = plan.changes.sent().collect();
-    for (id, _) in &lines {
-        let delivery = if let Some((_, found)) = plan.held.iter().find(|(of, _)| of == id) {
+    let changed: BTreeSet<&String> = sent.plan.changes.sent().collect();
+    for (id, _) in &wanted.lines {
+        let delivery = if let Some((_, found)) = sent.plan.held.iter().find(|(of, _)| of == id) {
             let mut held = Delivery::new(State::Held, today);
             held.why = Some(format!(
                 "{} is {}, and it names {}",
-                ready.slug,
-                ready.visibility.to_ascii_lowercase(),
+                sent.ready.slug,
+                sent.ready.visibility.to_ascii_lowercase(),
                 found.join(", ")
             ));
             held
-        } else if open.is_none() && !sent.contains(id) {
+        } else if sent.open.is_none() && !changed.contains(id) {
             Delivery::new(State::Merged, today)
         } else {
             let mut pr = Delivery::new(State::Pr, today);
-            pr.url = url.clone();
-            pr.branch = branch.clone();
+            pr.url = sent.url.clone();
+            pr.branch = sent.branch.clone();
             pr
         };
         record.nodes.insert(id.clone(), delivery);
     }
-    for id in &gone {
+    for id in &wanted.gone {
         record.nodes.remove(id);
     }
     record.checkout = Some(checkout.to_path_buf());
-    record.slug = Some(ready.slug.clone());
+    record.slug = Some(sent.ready.slug.clone());
     // What came from the checkout and is delivered goes into ohjaa's state.
     let mut moved = 0;
     let mut stayed = 0;
     for (node, path) in &extra {
-        if plan.held.iter().any(|(id, _)| *id == node.id) {
+        if sent.plan.held.iter().any(|(id, _)| *id == node.id) {
             stayed += 1;
             continue;
         }
@@ -1287,7 +1274,7 @@ pub fn deliver(
                     node.id.clone(),
                     Moved {
                         from: path.clone(),
-                        url: url.clone(),
+                        url: sent.url.clone(),
                         at: today.to_string(),
                     },
                 );
@@ -1309,16 +1296,173 @@ pub fn deliver(
         ));
         remove_if_empty(checkout);
     }
-    if stayed > 0 {
-        said.push(format!(
-            "{stayed} file(s) stay in {}",
-            knowledge::repo_knowledge(checkout).display()
-        ));
-    }
+    stays(stayed, &mut said);
     Delivered {
         said,
-        complete: plan.held.is_empty() && stayed == 0,
+        complete: sent.plan.held.is_empty() && stayed == 0,
     }
+}
+
+/// The delivery itself: what it sends, checked first, then sent. `None` for
+/// a dry run, which only says what it would do; an error says why nothing
+/// was delivered.
+#[allow(clippy::too_many_arguments)]
+fn attempt(
+    checkout: &Path,
+    state: &Path,
+    ready: Result<Ready, String>,
+    wanted: &Wanted,
+    extra: &[Filed],
+    dry_run: bool,
+    today: Date,
+    said: &mut Vec<String>,
+) -> Result<Option<Sent>, String> {
+    let ready = ready?;
+    let mut head = format!("{}, {}", ready.slug, ready.visibility.to_ascii_lowercase());
+    if let Some(deny) = &ready.deny {
+        let _ = write!(
+            head,
+            " ({}): all it is sent is checked first against {} names of what is yours and private",
+            ready.visibility,
+            deny.len()
+        );
+    }
+    said.push(head);
+    let open = open_pr(&ready.slug)?;
+    let base_branch = open
+        .as_ref()
+        .map_or(ready.default_branch.clone(), |pr| pr.branch.clone());
+    let tracking = |branch: &str| format!("refs/remotes/origin/{branch}");
+    let show = |branch: &str| {
+        git_in(
+            checkout,
+            &["show", &format!("{}:AGENTS.md", tracking(branch))],
+            process::LOCAL,
+        )
+        .unwrap_or_default()
+    };
+    let read_from = if dry_run {
+        // The branch as last fetched here: a dry run fetches nothing.
+        let tracked = git_in(
+            checkout,
+            &["rev-parse", "--verify", "--quiet", &tracking(&base_branch)],
+            process::LOCAL,
+        )
+        .is_ok();
+        if tracked {
+            base_branch.clone()
+        } else {
+            ready.default_branch.clone()
+        }
+    } else {
+        git_in(
+            checkout,
+            &[
+                "fetch",
+                "--quiet",
+                "origin",
+                &format!("+refs/heads/{base_branch}:{}", tracking(&base_branch)),
+            ],
+            FETCH,
+        )?;
+        base_branch.clone()
+    };
+    let base = show(&read_from);
+    let plan = plan(&base, &wanted.lines, &wanted.gone, ready.deny.as_ref());
+    let out = outgoing(&ready, &plan, &wanted.located, open.as_ref(), today);
+    if let Some(deny) = &ready.deny {
+        let found = names_private(deny, &base, &plan, &out, open.is_none());
+        if !found.is_empty() {
+            return Err(format!(
+                "what ohjaa itself would send to {} names {}, so nothing {} sent",
+                ready.slug,
+                found.join(", "),
+                if dry_run { "would be" } else { "was" }
+            ));
+        }
+    }
+    if dry_run {
+        said.push(format!(
+            "AGENTS.md as of origin/{read_from}, as last fetched here"
+        ));
+    }
+    say_plan(&plan, &wanted.lines, said);
+    let unchanged = plan.text == base;
+    if dry_run {
+        said.push(match (&open, unchanged) {
+            (_, true) => "nothing to write".to_owned(),
+            (Some(pr), false) => format!("would add a commit to {} ({})", pr.url, pr.branch),
+            (None, false) => format!("would open a pull request onto {}", ready.default_branch),
+        });
+        let moving = extra
+            .iter()
+            .filter(|(node, _)| !plan.held.iter().any(|(id, _)| *id == node.id))
+            .count();
+        if moving > 0 {
+            said.push(format!(
+                "would then move {moving} file(s) out of {} into ohjaa's state",
+                knowledge::repo_knowledge(checkout).display()
+            ));
+        }
+        return Ok(None);
+    }
+    if unchanged {
+        said.push(match &open {
+            Some(pr) => format!("nothing new for {}", pr.url),
+            None => format!(
+                "nothing new: AGENTS.md on {} holds it all",
+                ready.default_branch
+            ),
+        });
+        return Ok(Some(Sent {
+            url: open.as_ref().map(|pr| pr.url.clone()),
+            branch: open.as_ref().map(|pr| pr.branch.clone()),
+            ready,
+            plan,
+            open,
+        }));
+    }
+    let work = Work::add(checkout, state, &tracking(&base_branch))?;
+    write_atomic(&work.path.join("AGENTS.md"), plan.text.as_bytes())?;
+    git_in(&work.path, &["add", "AGENTS.md"], process::LOCAL)?;
+    git_in(&work.path, &["commit", "--quiet", "-m", &out.message], PUSH)?;
+    // Never a force: on an open pull request's branch, a commit on its tip.
+    git_in(
+        &work.path,
+        &[
+            "push",
+            "--quiet",
+            "origin",
+            &format!("HEAD:refs/heads/{}", out.branch),
+        ],
+        PUSH,
+    )?;
+    drop(work);
+    let url = match &open {
+        Some(pr) => {
+            said.push(format!("added to {}", pr.url));
+            pr.url.clone()
+        }
+        None => {
+            let url = create_pr(&ready, &out).map_err(|why| {
+                format!(
+                    "{} is pushed, but no pull request was opened: {why}",
+                    out.branch
+                )
+            })?;
+            said.push(format!(
+                "opened {url}: AGENTS.md ({HEADING}); merge it like any change"
+            ));
+            url
+        }
+    };
+    Ok(Some(Sent {
+        ready,
+        plan,
+        open,
+        url: Some(url),
+        branch: Some(out.branch),
+    }))
 }
 
 /// What the plan adds, changes, takes out and holds back.
@@ -1343,75 +1487,11 @@ fn say_plan(plan: &Plan, lines: &[(String, String)], said: &mut Vec<String>) {
     }
 }
 
-/// Fetch the branch, write the section in a worktree off it, commit and
-/// push: the plan, and the branch pushed (`None` when nothing changed).
-#[allow(clippy::too_many_arguments)]
-fn write_and_push(
-    checkout: &Path,
-    state: &Path,
-    ready: &Ready,
-    open: Option<&OpenPr>,
-    base_branch: &str,
-    lines: &[(String, String)],
-    gone: &[String],
-    today: Date,
-) -> Result<(Plan, Option<String>), String> {
-    let tracking = format!("refs/remotes/origin/{base_branch}");
-    git_in(
-        checkout,
-        &[
-            "fetch",
-            "--quiet",
-            "origin",
-            &format!("+refs/heads/{base_branch}:{tracking}"),
-        ],
-        FETCH,
-    )?;
-    let base = git_in(
-        checkout,
-        &["show", &format!("{tracking}:AGENTS.md")],
-        process::LOCAL,
-    )
-    .unwrap_or_default();
-    let plan = plan(&base, lines, gone, ready.deny.as_ref());
-    if plan.text == base {
-        return Ok((plan, None));
-    }
-    let work = Work::add(checkout, state, &tracking)?;
-    let file = work.path.join("AGENTS.md");
-    write_atomic(&file, plan.text.as_bytes())?;
-    git_in(&work.path, &["add", "AGENTS.md"], process::LOCAL)?;
-    let message = commit_message(&plan.changes);
-    git_in(&work.path, &["commit", "--quiet", "-m", &message], PUSH)?;
-    let branch = match open {
-        Some(pr) => pr.branch.clone(),
-        None => format!(
-            "{BRANCH_PREFIX}{today}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        ),
-    };
-    // Never a force: on an open pull request's branch, a commit on its tip.
-    git_in(
-        &work.path,
-        &[
-            "push",
-            "--quiet",
-            "origin",
-            &format!("HEAD:refs/heads/{branch}"),
-        ],
-        PUSH,
-    )?;
-    drop(work);
-    Ok((plan, Some(branch)))
-}
-
+/// The commit: what changed, by id. It names no tool.
 fn commit_message(changes: &Changes) -> String {
     let mut message = format!(
-        "{TITLE}\n\nThe lines ohjaa writes in AGENTS.md's {HEADING}: repository knowledge a \
-         person accepted, one line per node.\n\n"
+        "{TITLE}\n\nThe lines in AGENTS.md's {HEADING}: repository knowledge a person accepted, \
+         one line per node.\n\n"
     );
     for id in &changes.added {
         let _ = writeln!(message, "+ {id}");
@@ -1425,19 +1505,16 @@ fn commit_message(changes: &Changes) -> String {
     message.trim_end().to_owned()
 }
 
-/// Open the pull request for `branch`, and say its URL.
-fn create_pr(
-    ready: &Ready,
-    branch: &str,
-    plan: &Plan,
-    located: &[Located],
-) -> Result<String, String> {
+/// A new pull request's body. For a private repository it says why each
+/// was accepted, and that ohjaa wrote it; for any other it names no tool and
+/// carries no reason.
+fn pr_body(ready: &Ready, plan: &Plan, located: &[Located]) -> String {
     let mut body = format!(
-        "Repository knowledge a person accepted in ohjaa, written into the `{HEADING}` section \
-         of AGENTS.md: one line per node (knowledge-node.v1), each marked with its id. Every \
-         agent reads AGENTS.md, so once this merges ohjaa's briefing here stops repeating them; \
-         until then it carries them, marked as pending this pull request. Merge it like any \
-         change; while it is open, ohjaa adds later lessons to it.\n\n"
+        "Repository knowledge a person accepted, written into the `{HEADING}` section of \
+         AGENTS.md: one line per node, each marked with its id. Every agent reads AGENTS.md, so \
+         once this merges the briefing agents get here stops repeating these lessons; until \
+         then it carries them, marked as pending this pull request. Merge it like any change; \
+         while it is open, later lessons are added to it.\n\n"
     );
     for id in plan.changes.sent() {
         let _ = writeln!(body, "+ `{id}`");
@@ -1448,20 +1525,25 @@ fn create_pr(
     if ready.deny.is_some() {
         let _ = write!(
             body,
-            "\nThis repository is {}: each line was checked against the names of your private \
-             repositories, your home path and your name before it was sent, and the reasons \
-             behind them stay in ohjaa.\n",
+            "\nThis repository is {}: each line, and all else sent here, was checked first \
+             against the names of your private repositories, your home path and your name, and \
+             the reasons behind the lessons are not sent here.\n",
             ready.visibility.to_ascii_lowercase()
         );
     } else {
-        body.push_str("\nWhy each was accepted:\n");
+        body.push_str("\nWritten by ohjaa. Why each was accepted:\n");
         for id in plan.changes.sent() {
             if let Some(located) = located.iter().find(|located| located.node.id == *id) {
                 let _ = writeln!(body, "- `{id}`: {}", located.node.origin.join("; "));
             }
         }
     }
-    let out = gh(
+    body
+}
+
+/// Open the pull request for what was pushed, and say its URL.
+fn create_pr(ready: &Ready, out: &Outgoing) -> Result<String, String> {
+    let printed = gh(
         &[
             "pr",
             "create",
@@ -1470,16 +1552,17 @@ fn create_pr(
             "--base",
             &ready.default_branch,
             "--head",
-            branch,
+            &out.branch,
             "--title",
             TITLE,
             "--body-file",
             "-",
         ],
-        Some(body.as_bytes()),
+        Some(out.body.as_bytes()),
         GH_CREATE,
     )?;
-    out.lines()
+    printed
+        .lines()
         .map(str::trim)
         .rfind(|line| line.starts_with("https://"))
         .map(str::to_owned)
@@ -1594,17 +1677,14 @@ mod tests {
         let multi = node("a-b", Kind::Lesson, "First\nsecond  line.\n\n  third.");
         assert_eq!(
             line(&multi),
-            "- <!-- ohjaa:lesson a-b --> **lesson**: First second line. third. (as of 2026-10-27)"
+            "- <!-- lesson: a-b --> **lesson**: First second line. third. (as of 2026-10-27)"
         );
         assert_eq!(marked(&line(&multi)), Some("a-b"));
-        assert_eq!(
-            marked("  - <!-- ohjaa:lesson x-1 --> anything\r"),
-            Some("x-1")
-        );
-        assert_eq!(marked("- <!-- ohjaa:lesson Not An Id --> x"), None);
+        assert_eq!(marked("  - <!-- lesson: x-1 --> anything\r"), Some("x-1"));
+        assert_eq!(marked("- <!-- lesson: Not An Id --> x"), None);
         assert_eq!(marked("- a person's line"), None);
         assert_eq!(
-            ids_in("x\n- <!-- ohjaa:lesson one --> a\n## Other\n- <!-- ohjaa:lesson two --> b\n"),
+            ids_in("x\n- <!-- lesson: one --> a\n## Other\n- <!-- lesson: two --> b\n"),
             ["one", "two"].iter().map(|s| s.to_string()).collect()
         );
     }
@@ -1728,7 +1808,7 @@ mod tests {
             ],
             people: vec!["octo-gh".to_owned(), "Octo Cat".to_owned()],
         };
-        let deny = DenyList::build(&private, Some(Path::new("/Users/octocat")), "widget");
+        let deny = DenyList::build(&private, Some(Path::new("/Users/octocat")), "acme/widget");
         assert!(
             deny.matches("a remote note, a quote").is_empty(),
             "inside words"
@@ -1751,6 +1831,10 @@ mod tests {
             ]
         );
         assert_eq!(deny.matches("Octo cat said").len(), 1);
+        assert_eq!(
+            deny.matches("octo-gh/tools"),
+            vec!["`octo-gh` (you, as GitHub names you)"]
+        );
         assert!(deny.matches("").is_empty());
         assert!(!names_word("é", "e"));
         assert!(names_word("x ote", "ote") && names_word("ote", "ote"));
@@ -1758,20 +1842,48 @@ mod tests {
     }
 
     #[test]
-    fn private_context_is_read_page_by_page() {
-        let pages = br#"{"data":{"viewer":{"login":"me","name":"Ann Bee Lee","repositories":{"nodes":[{"name":"a"},{"name":"b"}],"pageInfo":{"hasNextPage":true,"endCursor":"x"}}}}}
-{"data":{"viewer":{"login":"me","name":"Ann Bee Lee","repositories":{"nodes":[{"name":"c"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}"#;
-        let private = parse_private(pages).unwrap();
-        assert_eq!(private.repos, vec!["a", "b", "c"]);
+    fn the_owner_of_the_repository_is_no_secret_in_it() {
+        let private = Private {
+            repos: vec!["secret-thing".to_owned()],
+            people: vec!["octocat".to_owned(), "Octo Cat".to_owned()],
+        };
+        // The person's own public repository: their login is in its URL.
+        let deny = DenyList::build(&private, Some(Path::new("/Users/octocat")), "octocat/site");
+        assert!(deny.matches("a personal octocat repo").is_empty());
         assert_eq!(
-            private.people,
-            vec!["me", "Ann Bee Lee", "Ann", "Bee", "Lee"]
+            deny.matches("Octo Cat wrote it").len(),
+            1,
+            "their name is still theirs"
         );
-        assert!(parse_private(b"").is_err());
-        assert!(parse_private(br#"{"errors":[{"message":"no"}]}"#)
+        assert_eq!(
+            deny.matches("/Users/octocat/site").len(),
+            1,
+            "and their home path"
+        );
+        assert_eq!(deny.matches("uses secret-thing").len(), 1);
+    }
+
+    #[test]
+    fn private_context_is_read_as_gh_prints_it() {
+        assert_eq!(
+            parse_user(br#"{"login":"me","name":"Ann Bee Lo"}"#).unwrap(),
+            vec!["me", "Ann Bee Lo", "Ann", "Bee"]
+        );
+        assert_eq!(
+            parse_user(br#"{"login":"me","name":null}"#).unwrap(),
+            vec!["me"]
+        );
+        assert!(parse_user(br#"{"message":"Bad credentials"}"#).is_err());
+        // One array, as gh joins the pages, or one per page.
+        let joined = br#"[{"name":"a","full_name":"o/a"},{"name":"b"},{"name":"a"}]"#;
+        assert_eq!(parse_repos(joined).unwrap(), vec!["a", "b"]);
+        let pages = b"[{\"name\":\"a\"}]\n[{\"name\":\"c\"}]";
+        assert_eq!(parse_repos(pages).unwrap(), vec!["a", "c"]);
+        assert!(parse_repos(b"").is_err());
+        assert!(parse_repos(br#"{"message":"Not Found"}"#)
             .unwrap_err()
-            .contains("no"));
-        assert!(parse_private(br#"{"data":{"viewer":null}}"#).is_err());
+            .contains("Not Found"));
+        assert!(parse_repos(br#"[{"id":1}]"#).is_err());
     }
 
     #[test]
