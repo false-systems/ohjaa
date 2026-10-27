@@ -148,9 +148,11 @@ lenient, and its recall low, so it is never silent:
 
 **Secret-looking tokens are redacted before the drafter: a best effort over
 known shapes, not a guarantee.** People paste credentials to agents. As each
-prompt is made, the candidate's words and the agent's words before them
-(not the place, the author or the session id) are scrubbed, from every source,
-with the filter on or off. A token in one of these shapes becomes `[redacted]`:
+prompt is made, everything in it but ohjaa's own instructions is scrubbed,
+from every source, with the filter on or off: the knowledge it lists (each
+line whole, before it is cut to fit), and each candidate's time, source,
+place and author, its words and the agent's words before them. A token in one
+of these shapes becomes `[redacted]`, and is counted:
 - a known key prefix: `sk-`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`,
   `github_pat_`, `xoxb-`/`xoxp-`/`xoxa-`/`xoxs-`, `AKIA`/`ASIA`, `glpat-`,
   `AIza`;

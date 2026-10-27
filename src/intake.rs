@@ -1363,25 +1363,28 @@ Output ONLY a JSON array, no prose, no code fence. Each element:
  \"refines\": \"existing-id or null\", \"supersedes\": []}
 ";
 
-/// The prompt for one batch of candidates, every candidate's words and the
-/// agent's words before them scrubbed of secrets (see [`scrub`]), and how
-/// many secret-looking tokens were redacted from it. The knowledge already
-/// present comes first, within [`KNOWN_BUDGET`].
+/// The prompt for one batch of candidates, and how many secret-looking
+/// tokens were redacted from it. Everything in it but the instructions is
+/// scrubbed of secrets (see [`scrub`]) and counted: the knowledge already
+/// present (each line whole, before it is cut to fit [`KNOWN_BUDGET`]), and
+/// each candidate's time, source, place and author, its words and the
+/// agent's words before them.
 pub fn prompt(known: &Known, batch: &[Candidate]) -> (String, usize) {
     let mut out = String::from(INSTRUCTIONS);
     let mut redacted = 0;
-    known.render(&mut out);
+    known.render(&mut out, &mut redacted);
     out.push_str("\nCandidates:\n");
     for (index, candidate) in batch.iter().enumerate() {
-        let _ = writeln!(
-            out,
-            "\n[{}] {} · {} · {} · {}",
+        let (header, n) = scrub(&format!(
+            "[{}] {} · {} · {} · {}",
             index + 1,
             candidate.at,
             candidate.source,
             candidate.place,
             candidate.who
-        );
+        ));
+        redacted += n;
+        let _ = writeln!(out, "\n{}", header.replace('\n', " "));
         if !candidate.context.is_empty() {
             let (context, n) = scrub(&candidate.context);
             redacted += n;
@@ -1596,8 +1599,9 @@ impl Known {
     /// The list the drafter is shown, within [`KNOWN_BUDGET`] characters:
     /// current knowledge first, then what waits for a person, in the order
     /// they are stored; what does not fit is counted, and still checked
-    /// against by [`Known::repeated_by`].
-    fn render(&self, out: &mut String) {
+    /// against by [`Known::repeated_by`]. Each line is scrubbed whole, then
+    /// cut, then measured; only what is sent adds to `redacted`.
+    fn render(&self, out: &mut String, redacted: &mut usize) {
         let (waiting, other): (Vec<&Present>, Vec<&Present>) = self
             .nodes
             .iter()
@@ -1610,13 +1614,14 @@ impl Known {
             }
             let mut shown = 0;
             for present in nodes {
-                let mut summary: String = present.summary.chars().take(SUMMARY_CHARS).collect();
-                if summary.len() < present.summary.len() {
+                let (id, in_id) = scrub(&present.id);
+                let (first, in_first) = scrub(&present.summary);
+                let mut summary: String = first.chars().take(SUMMARY_CHARS).collect();
+                if summary.len() < first.len() {
                     summary.push('…');
                 }
                 let line = format!(
-                    "- {} [{}/{}/{}]: {summary}\n",
-                    present.id,
+                    "- {id} [{}/{}/{}]: {summary}\n",
                     present.scope.name(),
                     present.kind.name(),
                     present.status.name(),
@@ -1625,6 +1630,7 @@ impl Known {
                     break;
                 }
                 budget -= line.len();
+                *redacted += in_id + in_first;
                 out.push_str(&line);
                 shown += 1;
             }
@@ -3274,6 +3280,45 @@ mod tests {
             "{list}"
         );
         assert!(!list.contains(&"word ".repeat(21)), "a summary is cut");
+    }
+
+    #[test]
+    fn the_knowledge_shown_is_scrubbed_whole_before_it_is_cut_and_counted() {
+        // The review of #61: a token in a waiting proposal's first line
+        // reached the drafter verbatim, and the count stayed 0.
+        let key = fake(&["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"]);
+        let loaded = Loaded {
+            nodes: vec![faija_knowledge::Located {
+                scope: Scope::Mine,
+                node: lesson(
+                    "use-the-api",
+                    Status::Current,
+                    &format!("Call it with {key}."),
+                ),
+            }],
+            ..Loaded::default()
+        };
+        // Across the cut at 100 characters: cut first, a piece too short to
+        // look secret would go out.
+        let straddling = format!("{} {key} for the API.", "x".repeat(SUMMARY_CHARS - 10));
+        let waiting = [knowledge::Pending {
+            scope: Scope::Ours,
+            repo: None,
+            path: PathBuf::from("/proposals/ours/api-token.md"),
+            node: lesson("api-token", Status::Proposed, &straddling),
+            staged: true,
+        }];
+        let (text, redacted) = prompt(&Known::of(&loaded, &waiting), &[]);
+        assert!(!text.contains(&key[..8]), "{text}");
+        assert_eq!(redacted, 2, "{text}");
+        assert!(
+            text.contains("- use-the-api [mine/lesson/current]: Call it with [redacted]."),
+            "{text}"
+        );
+        assert!(
+            text.contains("- api-token [ours/lesson/proposed]: xxx"),
+            "{text}"
+        );
     }
 
     #[test]
