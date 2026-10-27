@@ -124,7 +124,7 @@ ohjaa intake --since 2026-10-01 --no-prefilter  # every message, not only likely
   its session. One longer than 1,500 characters is a pasted brief, and
   counted, never sent.
 - **Reviews:** human comments on pull requests and issues, through `gh`.
-- **Reverts:** reverted commits.
+- **Reverts:** reverted commits on each repository's current branch.
 - **Report:** what the bypass report finds (see below).
 
 **A local pre-filter comes first** (no network). Most of what people write
@@ -148,9 +148,11 @@ lenient, and its recall low, so it is never silent:
 
 **Secret-looking tokens are redacted before the drafter: a best effort over
 known shapes, not a guarantee.** People paste credentials to agents. As each
-prompt is made, the candidate's words and the agent's words before them
-(not the place, the author or the session id) are scrubbed, from every source,
-with the filter on or off. A token in one of these shapes becomes `[redacted]`:
+prompt is made, everything in it but ohjaa's own instructions is scrubbed,
+from every source, with the filter on or off: the knowledge it lists (each
+line whole, before it is cut to fit), and each candidate's time, source,
+place and author, its words and the agent's words before them. A token in one
+of these shapes becomes `[redacted]`, and is counted:
 - a known key prefix: `sk-`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`,
   `github_pat_`, `xoxb-`/`xoxp-`/`xoxa-`/`xoxs-`, `AKIA`/`ASIA`, `glpat-`,
   `AIza`;
@@ -177,10 +179,57 @@ machine at all.
 
 It sends them in batches to a **drafter**, an agent CLI that reads a prompt on
 stdin and prints a JSON array. The default is `claude -p`; override it with
-`--drafter` or `~/.config/ohjaa/drafter`. The drafter sees the existing
-Knowledge. When a correction repeats something already known, it drafts a
-**lesson** that refines that node rather than a duplicate, and that is how a
-node that is not reaching agents gets noticed.
+`--drafter` or `~/.config/ohjaa/drafter`. The drafter sees what is already
+present where the batch comes from: the existing Knowledge, then the
+proposals waiting for a person, of ours, mine and machine, and of each
+repository the batch's candidates come from. A candidate comes from a
+repository when its place (or, for a review, the repository it was read
+from) lies in it, or names a folder after it, as a pull request's URL and a
+worktree named `<repo>-<topic>` do. Each node is shown by its id, scope, kind
+and status (a repo one with its repository) and the first 100 characters of
+its body, in at most 24,000 characters; what does not fit is counted. On the
+131 nodes present after the first real run, every batch carried all of them
+(about 21,000 characters); now a batch from no repository carries 75 (12,011),
+most repositories add 1 to 3 (to about 12,600), habitat 14 (14,821) and
+valvo 24 (16,799). The drafter is told to return nothing for a lesson already
+present. When a correction shows that a present node is not reaching agents,
+or adds to it, it names that node in `refines` and says what was missed, and
+that is how such a node gets noticed.
+
+**A draft that may repeat what is present is written, and said to a
+person.** Every draft costs a person a review, and only a person decides
+what is Knowledge, so the drafter's answer is checked too, and nothing in it
+is dropped. A draft whose title says mostly what the title of a present node
+of its own scope says (for a repo one, of its own repository: the one it
+names, else the one intake runs in) is written like any other proposal, and
+said to be a *possible duplicate* of that node, the nearest one. Present
+means current, or proposed and waiting; a superseded or retired node is not.
+The node a draft refines, current or waiting, and those it supersedes, are
+not compared: a refinement says its base again by design, and is kept as
+refining it (one refining a proposal still waiting can be accepted once that
+one is).
+- A node's title is its id: its words, lowercased, without filler (`a`,
+  `the`, `and`, `with`, …), each with one common ending cut (`-ing`, `-ed`,
+  `-es`, `-s` but not `-ss`, `-e`).
+- Two titles are near when they share at least two words, and the shared
+  words are at least 60% of both: Dice's coefficient, 2·shared / (a + b) ≥
+  0.6.
+
+Nothing of it is stored: it is derived each time it is said. A run says
+`proposed <id>, a possible duplicate of <present id>`, and its summary counts
+them by what they may repeat; each draft written is present for every draft
+after it, in its answer and in the batches after. `ohjaa review` works it out
+again for every waiting proposal, against current knowledge and the
+proposals that came before it (older, or as old and stored first), so of two
+near ones only the later is said, and shows it right after the one it may
+repeat when that one waits too, with the first line of it when it is
+current. Among the 131 ids present after the first real run, 8 pairs are
+near, each one lesson; the review of #61 made up distinct lessons that are
+near too (`tapio-linux-only` and `rauha-linux-only`, two valvo LSM lessons, a
+correction that reuses the words of what it corrects), which is why a near
+draft is said, never refused. The same lesson in other words
+(`gate-before-pushing-main`, `prove-with-ohjaa-gate-before-merging`: 0.44)
+is the drafter's to see, shown both.
 
 Every draft is validated like any proposal, and an invalid one is refused out
 loud.
@@ -224,6 +273,16 @@ candidates that were handled, never back.
   warning that recurs on every run keeps the window growing until it is fixed.
 - With no repositories under the roots, reviews and reverts warn, and hold
   the cursor: nothing read is not nothing there.
+- A repository whose current branch was never committed to (one with no
+  commits yet, or a new orphan branch) has nothing to read: it is empty, not
+  unread, and holds nothing. git refuses it in words it also uses for a
+  branch whose ref was lost (a loose ref deleted, `packed-refs` cut short);
+  a lost ref keeps its reflog, so a branch with one is said as lost, warns
+  and holds the cursor. With reflogs off (`core.logAllRefUpdates`), a lost
+  ref reads as empty. git is asked in the C locale,
+  `LANGUAGE` removed, and no git process more is spent on this. One git
+  cannot read at all (its `.git` names nothing, a garbage ref, a missing
+  object) warns, and holds the cursor.
 - vessa's exit 4 (a partial list) names two kinds of reason, which intake
   treats apart. What it lists is drafted from either way.
   - A source it could not read (`warnings`), what a transcript leaves unknown
