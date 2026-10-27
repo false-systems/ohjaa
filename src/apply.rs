@@ -433,13 +433,13 @@ fn roots_text(roots: &[PathBuf]) -> String {
 #[derive(Default)]
 struct HomeLock {
     tried: bool,
-    _held: Option<crate::process::FileLock>,
+    held: Option<crate::process::FileLock>,
 }
 
 impl HomeLock {
     fn take(&mut self, home: &Path) {
         if !std::mem::replace(&mut self.tried, true) {
-            self._held = home::lock(home);
+            self.held = home::lock(home);
         }
     }
 }
@@ -834,10 +834,10 @@ pub fn apply(
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        home::commit_and_say(&home, &message, "ohjaa apply");
+        home::commit_and_say(&home, &message, "ohjaa apply", lock.held.as_ref());
         println!("ohjaa apply: {except}");
     } else {
-        home::commit_and_say(&home, &message, "ohjaa apply");
+        home::commit_and_say(&home, &message, "ohjaa apply", lock.held.as_ref());
     }
     Ok(code)
 }
@@ -1026,7 +1026,7 @@ fn as_it_was(text: String, newline: bool) -> String {
 /// what it generated. `repos/` entries and `roots` stay.
 pub fn undo(dry_run: bool) -> Result<i32> {
     let home = std::path::absolute(home::ohjaa_home()?)?;
-    let _lock = (!dry_run).then(|| home::lock(&home)).flatten();
+    let lock = (!dry_run).then(|| home::lock(&home)).flatten();
     let record = read_record(&home)?;
     let recorded = |key: &str| record.get(key).cloned();
     let yes = |key: &str| record.get(key).is_some_and(|value| value == "true");
@@ -1256,6 +1256,7 @@ pub fn undo(dry_run: bool) -> Result<i32> {
             &home,
             &history_message("apply --undo", &done),
             "ohjaa apply --undo",
+            lock.as_ref(),
         );
     }
     Ok(0)

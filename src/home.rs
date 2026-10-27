@@ -492,9 +492,19 @@ const REPOSITORY_VARS: &[&str] = &[
 /// `git <args>` in the home, unsigned and with no automatic maintenance (a
 /// commit would start one more git, detached, to outlive ohjaa); with
 /// `repository`, on the home's own repository whatever git would find from
-/// there (an enclosing dotfiles repository, say).
-fn home_git(home: &Path, args: &[&str], repository: bool) -> Result<()> {
+/// there (an enclosing dotfiles repository, say). It holds the home's lock
+/// too, when ohjaa holds it ([`process::FileLock::held_by`]): a git that
+/// outlives a killed ohjaa still commits under it.
+fn home_git(
+    home: &Path,
+    args: &[&str],
+    repository: bool,
+    lock: Option<&process::FileLock>,
+) -> Result<()> {
     let mut command = Command::new("git");
+    if let Some(lock) = lock {
+        lock.held_by(&mut command);
+    }
     if repository {
         command
             .arg("--git-dir")
@@ -531,7 +541,8 @@ fn home_git(home: &Path, args: &[&str], repository: bool) -> Result<()> {
 
 /// The home's history: what ohjaa keeps in the home (the allowlist in its
 /// `info/exclude`, never a stray file), committed as one commit with
-/// `message`, under the home's [`lock`], which the caller holds. The home is
+/// `message`, under the home's [`lock`], which the caller holds and passes
+/// (`None` when it went on without it), so each git here holds it too. The home is
 /// a local git repository (no remote; ohjaa never pushes), made by its first
 /// commit unless the home already is one. A
 /// commit is the person's, with the identity any commit of theirs takes from
@@ -540,13 +551,13 @@ fn home_git(home: &Path, args: &[&str], repository: bool) -> Result<()> {
 /// `commit`), and `init` once before the first; a history this small never
 /// needs git's maintenance. A failure is the caller's to say; what was
 /// changed stands either way.
-pub fn commit(home: &Path, message: &str) -> Result<()> {
+pub fn commit(home: &Path, message: &str, lock: Option<&process::FileLock>) -> Result<()> {
     let dot_git = home.join(".git");
     // A `.git` folder without HEAD holds only the home's lock: no repository yet.
     if !dot_git.is_file() && !dot_git.join("HEAD").exists() {
         std::fs::create_dir_all(home)
             .with_context(|| format!("cannot create {}", home.display()))?;
-        home_git(home, &["init", "-q"], false)?;
+        home_git(home, &["init", "-q"], false, lock)?;
     }
     let excludes =
         keep_out_strays(home)?.map(|file| format!("core.excludesFile={}", file.display()));
@@ -555,19 +566,20 @@ pub fn commit(home: &Path, message: &str) -> Result<()> {
         add.extend(["-c", excludes]);
     }
     add.extend(["add", "-A"]);
-    home_git(home, &add, true)?;
+    home_git(home, &add, true, lock)?;
     home_git(
         home,
         &["commit", "-q", "--allow-empty", "-m", message],
         true,
+        lock,
     )
 }
 
 /// [`commit`], said by `who`: what was committed on stdout, or on stderr why
 /// nothing was. Never an error: what was changed stands either way.
-pub fn commit_and_say(home: &Path, message: &str, who: &str) {
+pub fn commit_and_say(home: &Path, message: &str, who: &str, lock: Option<&process::FileLock>) {
     let subject = message.lines().next().unwrap_or_default();
-    match commit(home, message) {
+    match commit(home, message, lock) {
         Ok(()) => println!("{who}: committed in {}: {subject}", home.display()),
         Err(error) => eprintln!(
             "{who}: warning: \"{subject}\" stands, but is not in the history of {}: {error:#}; \

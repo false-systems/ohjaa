@@ -114,6 +114,9 @@ identity of delivered repo nodes; older records without that identity still read
   - One change at a time: each decision (its write, its commit and the
     agents' block below), apply and adopt holds the home's lock
     (`.git/ohjaa.lock`), so decisions made at once are a commit each, in turn.
+    The home's git holds it too, for as long as it runs: an ohjaa killed
+    while it commits leaves its git to finish (it runs in a process group of
+    its own), and the next change waits for that git, not only for the ohjaa.
   - Only what ohjaa keeps there is committed: `mine/`, `machine/`, `repos/`,
     `git/`, `roots`, `applied.toml`, `ours` and `drafter`, by an allowlist in
     the repository's own `.git/info/exclude` (the home holds no `.gitignore`).

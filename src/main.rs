@@ -1723,7 +1723,7 @@ fn decision_lock() -> Option<process::FileLock> {
 
 fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     knowledge::require_person(action)?;
-    let _lock = decision_lock();
+    let lock = decision_lock();
     let dirs = dirs()?;
     let today = knowledge::today();
     let (outcome, done) = match action {
@@ -1738,20 +1738,27 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     };
     println!("{done} {id}");
     report(&outcome);
-    after_decision(action, id, &outcome, why);
+    after_decision(action, id, &outcome, why, lock.as_ref());
     Ok(0)
 }
 
 /// What follows a person's decision, neither ever undoing it nor failing it:
 /// a decision on the home's own knowledge (mine, machine) is one commit in
-/// the home's history, and the agents' own instruction files get their
-/// knowledge block rewritten where it is.
-fn after_decision(action: &str, id: &str, outcome: &Outcome, why: Option<&str>) {
+/// the home's history, under the home's `lock` the decision holds, and the
+/// agents' own instruction files get their knowledge block rewritten where
+/// it is.
+fn after_decision(
+    action: &str,
+    id: &str,
+    outcome: &Outcome,
+    why: Option<&str>,
+    lock: Option<&process::FileLock>,
+) {
     if outcome.in_the_home() {
         let message = knowledge::decision_message(action, id, outcome, why);
         let subject = message.lines().next().unwrap_or_default();
         match home::ohjaa_home().map(home::absolute).and_then(|home| {
-            home::commit(&home, &message)?;
+            home::commit(&home, &message, lock)?;
             Ok(home)
         }) {
             Ok(home) => println!("  committed in {}: {subject}", home.display()),
@@ -1857,7 +1864,7 @@ fn cmd_review(list: bool) -> Result<i32> {
         let answer = lines.next().transpose()?.unwrap_or_default();
         let id = &pending.node.id;
         // Held for the decision, never while the person thinks.
-        let _lock = matches!(answer.trim(), "a" | "accept" | "r" | "reject")
+        let lock = matches!(answer.trim(), "a" | "accept" | "r" | "reject")
             .then(decision_lock)
             .flatten();
         let result = match answer.trim() {
@@ -1869,7 +1876,7 @@ fn cmd_review(list: bool) -> Result<i32> {
         match result {
             Ok(Some((action, outcome))) => {
                 report(&outcome);
-                after_decision(action, id, &outcome, None);
+                after_decision(action, id, &outcome, None, lock.as_ref());
             }
             Ok(None) => println!("  skipped"),
             Err(error) => println!("  refused: {error:#}"),
