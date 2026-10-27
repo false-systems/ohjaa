@@ -2923,7 +2923,11 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let orphaned_here: Vec<sessions::Session> = orphans.into_iter().filter(|s| here(s)).collect();
     let still_running_here: Vec<sessions::Session> =
         still_running.into_iter().filter(|s| here(s)).collect();
-    let started_ms = intake::now_seconds() * 1000;
+    // The launch's own instant, and its second: the session's id and its time
+    // windows are whole seconds; only the agent's own records are compared
+    // with the instant (`usage::Launch`).
+    let launched_ms = intake::now_ms();
+    let started_ms = launched_ms.div_euclid(1000) * 1000;
     let session_id = sessions::new_id(started_ms);
     let mut delivered = Vec::new();
     // What sykli says of the observed branch's tip (the integrated State)
@@ -3117,6 +3121,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         pgid: None,
         group_started_ms: None,
         started_ms,
+        launched_ms: Some(launched_ms),
         branch: in_repo.then(|| lifecycle::branch(&root)).flatten(),
         head_at_start: in_repo.then(|| lifecycle::head(&root)).flatten(),
         scoped: scoped_repos
@@ -3271,6 +3276,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 agent,
                 folder: &folder,
                 started_ms,
+                launched_ms,
                 // To the end of this second: times here are whole seconds.
                 last_seen_ms: (intake::now_seconds() + 1) * 1000,
                 unbriefed: briefing.is_none(),
@@ -3601,6 +3607,7 @@ fn close_orphans(dirs: &Dirs, write: bool) -> (Vec<sessions::Session>, Vec<sessi
                     agent: &session.agent,
                     folder: Path::new(&session.repo),
                     started_ms: session.started_ms,
+                    launched_ms: session.launch_instant_ms(),
                     // Not now: a fork made after it was last seen is not its.
                     last_seen_ms: session.last_seen_ms(),
                     unbriefed: false,

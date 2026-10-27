@@ -65,6 +65,13 @@ pub fn now_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Milliseconds since the epoch for `YYYY-MM-DD` (midnight UTC) or an RFC 3339
 /// time with `Z` or a `±HH:MM` offset and optional fraction of a second.
 pub fn parse_time(text: &str) -> Option<i64> {
@@ -3904,6 +3911,7 @@ mod tests {
             outside_repo: false,
             intent: "retry uploads".to_owned(),
             started_ms: 1_000,
+            launched_ms: None,
             branch: None,
             head_at_start: None,
             scoped: Vec::new(),
@@ -4251,6 +4259,7 @@ mod tests {
                 outside_repo: false,
                 intent: "model".to_owned(),
                 started_ms: self.started,
+                launched_ms: None,
                 branch: None,
                 head_at_start: None,
                 scoped: Vec::new(),

@@ -882,7 +882,11 @@ output or a paste. Time and folder alone name nothing.
   named, with `resumed: true`, when its launch prompt naming this session
   was said within a minute of the launch. A message into an older session
   later resumes nothing. Every session a native session ran in names it, so
-  its usage must not be added once per session.
+  its usage must not be added once per session. "Before the launch" is the
+  launch's own instant, to the millisecond (`launched_ms` in the record), as
+  the agents time their records: a session begun at 12:00:00.300 and resumed
+  at 12:00:00.900 is resumed, though both fall in the launch's second, the
+  one the session's id and its time windows are built on.
 - A fork is named, with `forked_from`, when its parent is named for this
   session and it began before the session was last seen. That is now at
   leaving, and at an orphan close the latest time the orphan's record
@@ -918,7 +922,8 @@ and for a session still open what its environment claimed so far.
 `usage export` emits `ohjaa-sessions.v1`, with `sessions` and `unreadable`.
 Each session is its record as the log holds it; what later versions added is
 additive and absent from older records: `intent_id` and `task`, `pgid` and
-`group_started_ms` (the session's process group), `native_env` and `left.native` (the agent's own sessions, above), `validations` (see
+`group_started_ms` (the session's process group), `launched_ms` (the launch's
+own instant; `started_ms` is its second), `native_env` and `left.native` (the agent's own sessions, above), `validations` (see
 `ohjaa gate`, and the integrated validations of "The integrated State",
 with `not_dispatched`), and a delivered node's `via`: the agent's own
 instruction file that held it at launch, so the briefing left it out (see

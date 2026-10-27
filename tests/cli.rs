@@ -3038,11 +3038,13 @@ fn leaving_picks_up_a_fresh_receipt_without_changing_the_agent_exit() {
 /// over with `$OHJAA_FAKE_OHJAA`, from a shell whose CLAUDE_CODE_SESSION_ID is
 /// that, as Claude Code's tool shells have it (`-`: none); two ids are a
 /// `/clear` between them. With OHJAA_FAKE_KILL_OHJAA set it then kills the
-/// ohjaa that launched it.
+/// ohjaa that launched it. Its records carry the time to the fraction of a
+/// second (`%N`), as Claude Code's do: leaving compares them with the
+/// launch's own instant.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 dir="$HOME/.claude/projects/-work"
 mkdir -p "$dir"
-now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+now=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
 if [ -n "${OHJAA_FAKE_NATIVE:-}" ]; then
 printf '{"type":"user","sessionId":"%s","cwd":"%s","timestamp":"%s","isSidechain":false,"message":{"role":"user","content":"How this session works (ohjaa):\\nThis session is %s; its intent is in-1, new."}}\n' \
   "$OHJAA_FAKE_NATIVE" "$(pwd -P)" "$now" "$OHJAA_SESSION" >> "$dir/$OHJAA_FAKE_NATIVE.jsonl"

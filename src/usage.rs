@@ -672,7 +672,7 @@ fn read_transcript(
                 Mode::Fork
             } else if transcript
                 .began_ms
-                .is_some_and(|began| began < launch.started_ms)
+                .is_some_and(|began| began < launch.launched_ms)
             {
                 Mode::Resumed
             } else {
@@ -703,7 +703,7 @@ fn read_transcript(
             Mode::Resumed => {
                 let at = time_of(&record["timestamp"]);
                 let resumed = at.is_some_and(|at| {
-                    at >= launch.started_ms && at <= launch.started_ms + RESUME_SLACK_MS
+                    at >= launch.launched_ms && at <= launch.launched_ms + RESUME_SLACK_MS
                 });
                 if !copied && resumed && names().iter().any(|s| s == launch.session) {
                     transcript.launched = Some(launch.session.to_owned());
@@ -798,7 +798,13 @@ pub struct Launch<'a> {
     pub agent: &'a str,
     /// The folder it was launched in.
     pub folder: &'a Path,
+    /// The second it was launched in: the transcripts written since are
+    /// read (a file's time may be kept in whole seconds).
     pub started_ms: i64,
+    /// The launch's own instant, in milliseconds: what a transcript's own
+    /// times are compared with. One begun before it was resumed by it, and
+    /// that one's launch prompt, or a fork's start, is at or after it.
+    pub launched_ms: i64,
     /// The last time it was seen active: at leaving, now; at an orphan close,
     /// the latest time its record shows. A fork begun after it is not its.
     pub last_seen_ms: i64,
@@ -862,7 +868,7 @@ fn search(launch: &Launch, stores: &Stores) -> (Native, Reads) {
         agent: agent.name().to_owned(),
         session_id: t.id.clone().unwrap_or_default(),
         source: path.display().to_string(),
-        resumed: t.began_ms.is_some_and(|b| b < launch.started_ms),
+        resumed: t.began_ms.is_some_and(|b| b < launch.launched_ms),
         forked_from: t.forked_from.clone(),
         env: false,
         testimony: false,
@@ -904,7 +910,7 @@ fn search(launch: &Launch, stores: &Stores) -> (Native, Reads) {
         .filter(|(_, t)| {
             let began = t
                 .began_ms
-                .is_some_and(|b| b >= launch.started_ms && b <= launch.last_seen_ms);
+                .is_some_and(|b| b >= launch.launched_ms && b <= launch.last_seen_ms);
             let theirs = t.launched.is_some() || t.fork_names.iter().any(|s| s != launch.session);
             t.forked_from.is_some() && began && !theirs
         })
@@ -1075,6 +1081,7 @@ mod tests {
                     agent,
                     folder: &self.folder,
                     started_ms: STARTED,
+                    launched_ms: STARTED,
                     last_seen_ms: STARTED + 3_600_000,
                     unbriefed: false,
                 },
@@ -1487,6 +1494,7 @@ mod tests {
                 agent: "claude",
                 folder: &sandbox.folder,
                 started_ms: STARTED,
+                launched_ms: STARTED + 900,
                 last_seen_ms: STARTED + 3_600_000,
                 unbriefed: false,
             },
@@ -1605,6 +1613,7 @@ mod tests {
                     agent: "claude",
                     folder: &sandbox.folder,
                     started_ms: STARTED,
+                    launched_ms: STARTED,
                     last_seen_ms,
                     unbriefed: false,
                 },
@@ -1680,6 +1689,7 @@ mod tests {
             agent,
             folder: &sandbox.folder,
             started_ms: STARTED,
+            launched_ms: STARTED,
             last_seen_ms: STARTED + 3_600_000,
             unbriefed: false,
         };
