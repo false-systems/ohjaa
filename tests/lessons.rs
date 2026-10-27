@@ -23,12 +23,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Never the real gh. Each call's arguments go to `$STUB_GH/calls`.
-/// `repo view` says the visibility in `$STUB_GH/visibility` (and `main`),
-/// or, with `$STUB_GH/signed-out`, that gh is not signed in; `api user`
-/// prints `$STUB_GH/user.json` and `api user/repos?…` `$STUB_GH/repos.json`;
-/// `pr list` prints `$STUB_GH/open.json`;
-/// `pr create` keeps its body (stdin) in `$STUB_GH/body-<n>`, its repo, base
-/// and head in `$STUB_GH/created`, makes it the open one and prints its URL.
+/// `repo view <owner>/<name>` says the visibility in
+/// `$STUB_GH/visibility.<owner>.<name>`, else `$STUB_GH/visibility` (and
+/// `main`), or, with `$STUB_GH/signed-out`, that gh is not signed in; `api
+/// user` prints `$STUB_GH/user.json` and `api user/repos?…`
+/// `$STUB_GH/repos.json`; `pr list` prints `$STUB_GH/open.json`; `pr create`
+/// keeps its body (stdin) in `$STUB_GH/body-<n>`, its repo, base and head in
+/// `$STUB_GH/created`, makes it the open one and prints its URL. With
+/// STUB_PROBE set, `pr create` first runs `$STUB_PROBE apply --undo` (an
+/// ohjaa change to the home: it waits while another holds the home's lock)
+/// into `$STUB_GH/probe`.
 const GH_STUB: &str = r#"#!/bin/sh
 d="$STUB_GH"
 printf '%s\n' "$*" >> "$d/calls"
@@ -38,12 +42,15 @@ case "$1 $2" in
       echo "To get started with GitHub CLI, please run:  gh auth login" >&2
       exit 4
     fi
-    printf '{"visibility":"%s","defaultBranchRef":{"name":"main"}}\n' "$(cat "$d/visibility")"
+    own="$d/visibility.$(printf '%s' "$3" | tr '/' '.')"
+    if [ -f "$own" ]; then visibility=$(cat "$own"); else visibility=$(cat "$d/visibility"); fi
+    printf '{"visibility":"%s","defaultBranchRef":{"name":"main"}}\n' "$visibility"
     exit 0;;
   "api user") cat "$d/user.json"; exit 0;;
   "api user/repos"*) cat "$d/repos.json"; exit 0;;
   "pr list") cat "$d/open.json"; exit 0;;
   "pr create")
+    if [ -n "${STUB_PROBE:-}" ]; then "$STUB_PROBE" apply --undo > "$d/probe" 2>&1; fi
     repo=""; head=""; base=""
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -68,12 +75,30 @@ exit 64
 /// The person, as gh is signed in.
 const USER: &str = r#"{"login":"octo-gh","name":"Octo Cat"}"#;
 
-/// The person's private repositories, as GitHub lists them to gh: two
-/// pages. `widget` is also the name of the repository the lessons go to:
-/// its own name is no secret there.
-const REPOS: &str = "[{\"name\":\"secret-thing\"},{\"name\":\"ote\"}]\n[{\"name\":\"widget\"},{\"name\":\"ohjaa\"}]\n";
+/// The person's repositories, as GitHub lists them to gh: two pages, with
+/// a public one. `widget` is also the name of the repository the lessons go
+/// to: its own name is no secret there.
+const REPOS: &str = concat!(
+    r#"[{"name":"secret-thing","full_name":"octo-gh/secret-thing","visibility":"private"},"#,
+    r#"{"name":"ote","full_name":"acme/ote","visibility":"internal"},"#,
+    r#"{"name":"open-thing","full_name":"acme/open-thing","visibility":"public"}]"#,
+    "\n",
+    r#"[{"name":"widget","full_name":"acme/widget"},"#,
+    r#"{"name":"ohjaa","full_name":"acme/ohjaa","visibility":"private"}]"#,
+    "\n"
+);
 
 const AGENTS: &str = "# Agent guide\n\nRead this first.\n\n## Languages\n\nRust.\n";
+
+/// Never the real toimija: no sessions anywhere, no context, and `run`
+/// ends at once, so `ohjaa run` records a session and its briefing.
+const TOIMIJA_STUB: &str = r#"#!/bin/sh
+case "$1" in
+  sessions) echo '{"sessions":[],"warnings":[],"coverage":{"status":"available"}}';;
+  context) echo '{}';;
+esac
+exit 0
+"#;
 
 /// Write an executable that no process holds open for writing when it runs:
 /// this process writes only the text, beside it, and `cp` writes the
@@ -154,6 +179,7 @@ impl World {
         )
         .unwrap();
         write_executable(&dir.join("bin/gh"), GH_STUB);
+        write_executable(&dir.join("bin/toimija"), TOIMIJA_STUB);
         write_executable(
             &dir.join("only-git/git"),
             &format!("#!/bin/sh\nexec {} \"$@\"\n", real_git().display()),
@@ -408,6 +434,59 @@ impl World {
         let mut out = Vec::new();
         walk(&self.dir, &self.dir.join("gh/calls"), &mut out);
         out
+    }
+
+    /// Delivered, merged into main and pulled into the checkout: AGENTS.md
+    /// as checked out holds the lines.
+    fn merged(&self) {
+        let (stdout, stderr, code) = self.publish(&[]);
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+        let branch = self.lessons_branch();
+        self.git(
+            &self.dir,
+            &[
+                "--git-dir",
+                self.remote.to_str().unwrap(),
+                "update-ref",
+                "refs/heads/main",
+                &format!("refs/heads/{branch}"),
+            ],
+        );
+        self.git(&self.checkout, &["pull", "-q", "--ff-only"]);
+    }
+
+    /// `ohjaa brief --knowledge-only [--agent <agent>]` in the checkout, with
+    /// `env` set: what it printed.
+    fn brief(&self, agent: Option<&str>, env: &[(&str, &str)]) -> String {
+        let mut brief = self.ohjaa(&self.checkout);
+        brief.args(["brief", "--knowledge-only"]);
+        if let Some(agent) = agent {
+            brief.args(["--agent", agent]);
+        }
+        for (key, value) in env {
+            brief.env(key, value);
+        }
+        let (briefing, stderr, code) = self.run(&mut brief);
+        assert_eq!(code, Some(0), "{stderr}");
+        briefing
+    }
+
+    /// `ohjaa run <agent> --dry-run -- <args>`: the briefing it would give,
+    /// which it says on stderr.
+    fn run_dry(&self, agent: &str, args: &[&str]) -> String {
+        let mut run = self.ohjaa(&self.checkout);
+        run.args(["run", agent, "--intent", "work", "--dry-run", "--"])
+            .args(args);
+        let (stdout, stderr, code) = self.run(&mut run);
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+        stderr
+    }
+
+    /// Write `text` at `path` in the checkout, its folders made.
+    fn put(&self, path: &str, text: &str) {
+        let file = self.checkout.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, text).unwrap();
     }
 
     fn worktrees(&self) -> usize {
@@ -1115,5 +1194,345 @@ fn retiring_an_untracked_node_at_a_terminal_takes_it_out_of_the_checkout() {
     assert!(
         !world.gh_calls().contains("pr create"),
         "a retired node that never had a line opens nothing"
+    );
+}
+
+/// The node every briefing test delivers, merges and pulls.
+const RUST: &str = "Widget code is Rust.";
+
+fn merged_world(tag: &str) -> World {
+    let world = World::new(tag);
+    world.legacy("widget-uses-rust", "decision", RUST);
+    world.merged();
+    world
+}
+
+/// Left to AGENTS.md: the briefing does not repeat the node, and says so.
+fn left(briefing: &str) -> bool {
+    !briefing.contains(RUST) && briefing.contains("are not repeated here")
+}
+
+/// Carried: the briefing holds the node, and says why in one line.
+fn carried(briefing: &str, why: &str) -> bool {
+    briefing.contains(RUST)
+        && briefing.contains("lessons are carried here, though its AGENTS.md holds 1 of them")
+        && briefing.contains(why)
+}
+
+#[test]
+fn claude_code_is_left_the_lessons_only_when_claude_md_imports_agents_md() {
+    let world = merged_world("claude");
+    // No CLAUDE.md: Claude Code 2.1.311 falls back to AGENTS.md only where no
+    // CLAUDE.md is found at the root or above, which ohjaa does not rely on.
+    let briefing = world.brief(Some("claude"), &[]);
+    assert!(carried(&briefing, "@AGENTS.md"), "{briefing}");
+    // Named in prose, or imported inside a fence: not read.
+    world.put("CLAUDE.md", "Read AGENTS.md before you start.\n");
+    let briefing = world.brief(Some("claude"), &[]);
+    assert!(carried(&briefing, "does not import"), "{briefing}");
+    world.put("CLAUDE.md", "# Notes\n\n```\n@AGENTS.md\n```\n");
+    let briefing = world.brief(Some("claude"), &[]);
+    assert!(carried(&briefing, "does not import"), "{briefing}");
+    // Imported: left to it.
+    world.put("CLAUDE.md", "# Notes\n\n@AGENTS.md\n");
+    let briefing = world.brief(Some("claude"), &[]);
+    assert!(left(&briefing), "{briefing}");
+    assert!(briefing.contains("Claude Code"), "{briefing}");
+    // But no project instructions load at all.
+    let briefing = world.brief(Some("claude"), &[("CLAUDE_CODE_SIMPLE", "1")]);
+    assert!(carried(&briefing, "CLAUDE_CODE_SIMPLE"), "{briefing}");
+    let briefing = world.run_dry("claude", &["--bare"]);
+    assert!(carried(&briefing, "--bare"), "{briefing}");
+    let briefing = world.run_dry("claude", &["--setting-sources", "user"]);
+    assert!(carried(&briefing, "project"), "{briefing}");
+    // Imported from .claude/CLAUDE.md, relative to it.
+    fs::remove_file(world.checkout.join("CLAUDE.md")).unwrap();
+    world.put(".claude/CLAUDE.md", "@../AGENTS.md\n");
+    assert!(left(&world.brief(Some("claude"), &[])));
+    fs::remove_file(world.checkout.join(".claude/CLAUDE.md")).unwrap();
+    // The person's setting loads AGENTS.md beside CLAUDE.md.
+    fs::create_dir_all(world.home.join(".claude")).unwrap();
+    fs::write(
+        world.home.join(".claude/settings.json"),
+        r#"{"pluginConfigs":{"cc-plugin-agents-md@builtin":{"options":{"instructionFiles":"claude-md-and-agents-md"}}}}"#,
+    )
+    .unwrap();
+    let briefing = world.brief(Some("claude"), &[]);
+    assert!(left(&briefing), "{briefing}");
+}
+
+#[test]
+fn codex_is_left_the_lessons_unless_an_override_or_its_byte_cap_hides_them() {
+    let world = merged_world("codex");
+    let briefing = world.brief(Some("codex"), &[]);
+    assert!(left(&briefing), "{briefing}");
+    world.put("AGENTS.override.md", "Read this instead.\n");
+    let briefing = world.brief(Some("codex"), &[]);
+    assert!(carried(&briefing, "AGENTS.override.md"), "{briefing}");
+    fs::remove_file(world.checkout.join("AGENTS.override.md")).unwrap();
+    // Past the bytes of project instructions Codex reads, the section is
+    // never read.
+    fs::create_dir_all(world.home.join(".codex")).unwrap();
+    fs::write(
+        world.home.join(".codex/config.toml"),
+        "model = \"x\"\nproject_doc_max_bytes = 64\n\n[profiles.x]\nmodel = \"y\"\n",
+    )
+    .unwrap();
+    let briefing = world.brief(Some("codex"), &[]);
+    assert!(carried(&briefing, "project_doc_max_bytes"), "{briefing}");
+}
+
+#[test]
+fn an_agent_not_known_to_read_agents_md_gets_the_lessons_carried() {
+    let world = merged_world("unknown");
+    assert!(carried(&world.brief(None, &[]), "no agent"));
+    assert!(carried(&world.brief(Some("gemini"), &[]), "gemini"));
+    assert!(left(&world.brief(Some("pi"), &[])));
+    assert!(carried(&world.run_dry("pi", &["-nc"]), "-nc"));
+    assert!(left(&world.brief(Some("opencode"), &[])));
+    assert!(carried(
+        &world.brief(
+            Some("opencode"),
+            &[("OPENCODE_DISABLE_PROJECT_CONFIG", "1")]
+        ),
+        "OPENCODE_DISABLE_PROJECT_CONFIG"
+    ));
+}
+
+#[test]
+fn the_session_log_says_via_agents_md_only_when_the_agent_reads_it() {
+    let world = merged_world("vialog");
+    let via = |agent: &str| -> serde_json::Value {
+        let mut run = world.ohjaa(&world.checkout);
+        run.args(["run", agent, "--intent", "work"]);
+        let (stdout, stderr, code) = world.run(&mut run);
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+        let mut export = world.ohjaa(&world.checkout);
+        export.args(["usage", "export"]);
+        let (export, _, _) = world.run(&mut export);
+        let export: serde_json::Value = serde_json::from_str(&export).unwrap();
+        let sessions = export["sessions"].as_array().unwrap();
+        let node = sessions.last().unwrap()["delivered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == "widget-uses-rust")
+            .cloned()
+            .unwrap_or_else(|| panic!("not delivered: {export}"));
+        node["via"].clone()
+    };
+    let agents = world.checkout.join("AGENTS.md");
+    assert_eq!(via("codex"), agents.to_str().unwrap());
+    assert_eq!(
+        via("claude"),
+        serde_json::Value::Null,
+        "carried by the briefing"
+    );
+}
+
+#[test]
+fn a_retired_or_superseded_line_still_in_agents_md_is_said_not_to_be_followed() {
+    let world = merged_world("stale");
+    let mut retire = world.ohjaa(&world.checkout);
+    retire.args(["retire", "widget-uses-rust", "--why", "the widget is gone"]);
+    let (said, code) = at_terminal(retire);
+    assert_eq!(code, Some(0), "{said}");
+    // The removal waits in a pull request: AGENTS.md still holds the line.
+    assert!(fs::read_to_string(world.checkout.join("AGENTS.md"))
+        .unwrap()
+        .contains("widget-uses-rust"));
+    let briefing = world.brief(Some("codex"), &[]);
+    assert!(
+        briefing.contains("AGENTS.md still says `widget-uses-rust`"),
+        "{briefing}"
+    );
+    assert!(briefing.contains("retired"), "{briefing}");
+    assert!(briefing.contains("do not follow it"), "{briefing}");
+    assert!(
+        briefing.contains("https://github.com/acme/widget/pull/4"),
+        "{briefing}"
+    );
+    // So does a claude session, which reads AGENTS.md only by chance.
+    let briefing = world.brief(Some("claude"), &[]);
+    assert!(briefing.contains("do not follow it"), "{briefing}");
+}
+
+#[test]
+fn a_superseded_line_still_in_agents_md_names_its_successor() {
+    let world = merged_world("superseded");
+    let mut propose = world.ohjaa(&world.checkout);
+    propose.args([
+        "propose",
+        "--scope",
+        "repo",
+        "--id",
+        "widget-uses-go",
+        "--kind",
+        "decision",
+        "--origin",
+        "a person said so",
+        "--supersedes",
+        "widget-uses-rust",
+        "Widget code is Go.",
+    ]);
+    let (stdout, stderr, code) = world.run(&mut propose);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let mut accept = world.ohjaa(&world.checkout);
+    accept.args(["accept", "widget-uses-go"]);
+    let (said, code) = at_terminal(accept);
+    assert_eq!(code, Some(0), "{said}");
+    let briefing = world.brief(Some("codex"), &[]);
+    assert!(
+        briefing.contains("AGENTS.md still says `widget-uses-rust`"),
+        "{briefing}"
+    );
+    assert!(
+        briefing.contains("superseded by `widget-uses-go`"),
+        "{briefing}"
+    );
+    assert!(briefing.contains("Widget code is Go."), "{briefing}");
+}
+
+#[test]
+fn an_empty_or_partial_list_of_private_repositories_sends_nothing_public() {
+    let world = World::new("emptylist");
+    world.set_visibility("PUBLIC");
+    let file = world.legacy("widget-calls-secret", "fact", "Widget calls secret-thing.");
+    fs::write(world.dir.join("gh/repos.json"), "[]\n").unwrap();
+    let (stdout, stderr, code) = world.publish(&[]);
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    assert!(stdout.contains("lists none"), "{stdout}");
+    assert_eq!(world.remote_heads(), vec!["main"], "nothing is pushed");
+    assert!(file.exists());
+
+    // A list without a private repository found under the roots.
+    fs::write(world.dir.join("gh/repos.json"), REPOS).unwrap();
+    let other = world.dir.join("projects/otherthing");
+    fs::create_dir_all(&other).unwrap();
+    world.git(&other, &["init", "-q"]);
+    world.git(
+        &other,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/otherthing.git",
+        ],
+    );
+    fs::write(world.dir.join("gh/visibility.acme.otherthing"), "PRIVATE").unwrap();
+    let (stdout, stderr, code) = world.publish(&[]);
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    assert!(stdout.contains("acme/otherthing"), "{stdout}");
+    assert!(stdout.contains("not complete"), "{stdout}");
+    assert_eq!(world.remote_heads(), vec!["main"]);
+    assert!(!world.gh_calls().contains("pr create"));
+}
+
+#[test]
+fn a_repository_under_the_roots_of_unknown_visibility_counts_as_private() {
+    let world = World::new("unknownvis");
+    world.set_visibility("PUBLIC");
+    // No remote at all: gh cannot say it is public.
+    let hidden = world.dir.join("projects/secret-proj");
+    fs::create_dir_all(&hidden).unwrap();
+    world.git(&hidden, &["init", "-q"]);
+    let held = world.legacy(
+        "widget-uses-proj",
+        "fact",
+        "Widget reads secret-proj's output.",
+    );
+    world.legacy("widget-uses-rust", "decision", RUST);
+    let (stdout, stderr, code) = world.publish(&[]);
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    assert!(stdout.contains("`secret-proj`"), "{stdout}");
+    assert!(held.exists());
+    let agents = world.remote_show(&world.lessons_branch());
+    assert!(
+        agents.contains(RUST) && !agents.contains("secret-proj"),
+        "{agents}"
+    );
+}
+
+#[test]
+fn a_node_in_both_the_checkout_and_ohjaas_state_is_ohjaas() {
+    let world = World::new("both");
+    let file = world.legacy("widget-uses-rust", "decision", RUST);
+    let text = fs::read_to_string(&file).unwrap();
+    let (stdout, stderr, code) = world.publish(&[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let mut retire = world.ohjaa(&world.checkout);
+    retire.args(["retire", "widget-uses-rust", "--why", "gone"]);
+    let (said, code) = at_terminal(retire);
+    assert_eq!(code, Some(0), "{said}");
+    // A move that was cut short: the checkout's copy back beside the state's.
+    world.put(".ohjaa/knowledge/widget-uses-rust.md", &text);
+    let mut brief = world.ohjaa(&world.checkout);
+    brief.args(["brief", "--knowledge-only", "--agent", "codex"]);
+    let (briefing, stderr, code) = world.run(&mut brief);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        !briefing.contains(RUST),
+        "the retired node stays retired: {briefing}"
+    );
+    assert!(!stderr.contains("duplicate"), "{stderr}");
+    let (stdout, stderr, code) = world.publish(&[]);
+    assert_eq!(
+        code,
+        Some(4),
+        "a file left is not delivered: {stdout}{stderr}"
+    );
+    assert!(stdout.contains("left"), "{stdout}");
+}
+
+#[test]
+fn a_failing_pre_push_hook_is_said_in_its_own_words() {
+    let world = World::new("prepush");
+    write_executable(
+        &world.checkout.join(".git/hooks/pre-push"),
+        "#!/bin/sh\necho 'pre-push says no: run the gate first' >&2\nexit 1\n",
+    );
+    let file = world.legacy("widget-uses-rust", "decision", RUST);
+    let (stdout, stderr, code) = world.publish(&[]);
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("pre-push says no: run the gate first"),
+        "{stdout}"
+    );
+    assert!(file.exists());
+}
+
+#[test]
+fn a_commit_that_holds_more_than_agents_md_is_never_pushed() {
+    let world = World::new("extra");
+    write_executable(
+        &world.checkout.join(".git/hooks/pre-commit"),
+        "#!/bin/sh\necho stray > stray.txt\ngit add stray.txt\n",
+    );
+    let file = world.legacy("widget-uses-rust", "decision", RUST);
+    let (stdout, stderr, code) = world.publish(&[]);
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    assert!(stdout.contains("more than AGENTS.md"), "{stdout}");
+    assert_eq!(world.remote_heads(), vec!["main"], "nothing is pushed");
+    assert!(file.exists());
+}
+
+#[test]
+fn an_accept_delivers_without_holding_the_homes_lock() {
+    let world = World::new("homelock");
+    propose(&world, "widget-uses-rust", RUST);
+    let mut accept = world.ohjaa(&world.checkout);
+    accept
+        .args(["accept", "widget-uses-rust"])
+        .env("STUB_PROBE", env!("CARGO_BIN_EXE_ohjaa"));
+    let (said, code) = at_terminal(accept);
+    assert_eq!(code, Some(0), "{said}");
+    let probe = fs::read_to_string(world.dir.join("gh/probe")).unwrap();
+    assert!(
+        !probe.contains("waiting for another ohjaa"),
+        "another change to the home waited on the delivery: {probe}"
+    );
+    assert!(
+        said.contains("opened https://github.com/acme/widget/pull/41"),
+        "{said}"
     );
 }

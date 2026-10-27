@@ -2001,6 +2001,62 @@ mod tests {
     }
 
     #[test]
+    fn spellings_that_hide_a_private_name_are_still_named() {
+        let private = Private {
+            repos: ["selko", "habitat", "toimija", "viemari"]
+                .map(str::to_owned)
+                .to_vec(),
+            people: Vec::new(),
+        };
+        let deny = DenyList::build(&private, None, "acme/widget");
+        for hidden in [
+            "tapio's events reach selkod",
+            "two habitats",
+            "the toimijas",
+            "selko2 is next",
+            "flagged UNPROVEN in viemäri",
+            "hab\u{200B}itat with a zero-width space",
+            "hab\u{00AD}itat with a soft hyphen",
+            "hab\u{2060}itat with a word joiner",
+            "h&#97;bitat as an entity",
+            "h&#x61;bitat as a hex entity",
+            "hab<!-- -->itat split by a comment",
+            "**hab**itat split by emphasis",
+            "`hab`itat split by code",
+            "ｈａｂｉｔａｔ in fullwidth",
+            "Ha\u{0308}bitat with a combining mark",
+        ] {
+            assert!(!deny.matches(hidden).is_empty(), "not named: {hidden}");
+        }
+        // A letter outside ASCII that no fold reads as one inside it could
+        // stand for another (a Cyrillic а, a Greek ο): such a line is held.
+        for odd in ["h\u{0430}bitat with a Cyrillic a", "an \u{3bf}dd letter"] {
+            let found = deny.matches(odd);
+            assert!(
+                found.iter().any(|named| named.contains("outside ASCII")),
+                "{odd}: {found:?}"
+            );
+        }
+        // What only looks like a name, or is plain text, is not.
+        for plain in ["a habit", "café au lait", "an em dash — and “quotes”"] {
+            assert!(
+                deny.matches(plain).is_empty(),
+                "{plain}: {:?}",
+                deny.matches(plain)
+            );
+        }
+    }
+
+    #[test]
+    fn a_marked_line_inside_a_fence_or_a_comment_is_not_held_by_the_file() {
+        let found = lines_in(
+            "```\n- <!-- lesson: fenced --> x\n```\n<!--\n- <!-- lesson: commented --> y\n-->\n\
+             - <!-- lesson: real --> z\n",
+        );
+        assert_eq!(found.keys().collect::<Vec<_>>(), vec!["real"]);
+    }
+
+    #[test]
     fn a_name_inside_camel_case_or_beyond_ascii_is_still_named() {
         assert!(
             names_word("SelkoClient", "selko"),
