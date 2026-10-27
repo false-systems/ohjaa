@@ -64,8 +64,10 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   commit (or uses the one the home already is), never gives it a remote and
   never pushes it, and commits there, with the person's git identity, each
   decision on mine or machine knowledge and each `apply`, `apply --undo` and
-  `adopt` (`git add -A`, then `git commit`); a commit that fails is said, and
-  the change stands. Outside the
+  `adopt` (`git add -A`, then `git commit`), each under the home's lock
+  (`.git/ohjaa.lock`) and holding only what ohjaa keeps there (an allowlist
+  in the repository's own `.git/info/exclude`); a commit that fails is said,
+  and the change stands. Outside the
   home, `ohjaa apply` changes only one `include.path` in git's global config,
   a marked block in git's global excludes file, one line of `~/.zshrc`, and a
   marked block of mine and machine knowledge (`ohjaa:knowledge`) in each
@@ -73,9 +75,10 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   repository (Claude Code's `~/.claude/CLAUDE.md`, Codex's
   `~/.codex/AGENTS.md`, pi's `~/.pi/agent/AGENTS.md`, opencode's
   `~/.config/opencode/AGENTS.md`, each where the agent finds it; none is
-  created, and no text around the block is touched), records each before
-  making it, and `apply --undo` puts them back; each decision rewrites that
-  block where it is, and nowhere else; `ohjaa
+  created, no text around the block is touched, and a block apply did not
+  write is the person's and stays), records each before making it, and
+  `apply --undo` puts them back; each decision rewrites that block where it
+  is, and nowhere else; `ohjaa
   adopt` writes only in the home. Nothing is installed on or written into a
   repository but what git keeps beside it: the clone's one validation
   checkout, a linked worktree kept in ohjaa's state

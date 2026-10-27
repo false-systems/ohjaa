@@ -108,6 +108,17 @@ identity of delivered repo nodes; older records without that identity still read
   A commit that fails (another git holding the index, no identity) is said,
   and the decision stands; the next commit takes it in. `git -C
   ~/.config/ohjaa log` is the history of what you decided.
+  - One change at a time: each decision (its write, its commit and the
+    agents' block below), apply and adopt holds the home's lock
+    (`.git/ohjaa.lock`), so decisions made at once are a commit each, in turn.
+  - Only what ohjaa keeps there is committed: `mine/`, `machine/`, `repos/`,
+    `git/`, `roots`, `applied.toml`, `ours` and `drafter`, by an allowlist in
+    the repository's own `.git/info/exclude` (the home holds no `.gitignore`).
+    A `.DS_Store`, an editor's swap or backup file, a half-done write's
+    temporary file, or a file of your own beside them never is.
+  - The `drafter` file, a command line, is in the history too. Nothing ohjaa
+    writes there is secret, but keep any key out of that line (give the
+    drafter its key from your environment).
 
 **How strong the person-only guard is:** it stops a careless agent, which is
 the kind the correction history shows. It does not stop a determined one. A
@@ -828,8 +839,12 @@ and names the rest by count, ``30 more: `ohjaa list` ``, and apply says so.
 After each decision the block is rewritten wherever it is (moved, or
 between your own lines), and only where it is: a block you take out stays
 out until the next apply. `apply --undo` takes it out and puts back exactly
-what was there, a final newline that was missing included. It is the same block `brief --write` writes, so a file
-holds one. Agents launched through ohjaa read this knowledge in their
+what was there, a final newline that was missing included. It is the same kind
+of block `brief --write` writes, so a file holds one; a block apply did not
+write (`brief --write`'s, or one you wrote) is yours: apply, each decision and
+undo leave it as it is and say so. An agent's file apply cannot read as a
+whole (two blocks, a marker without its partner) is said and skipped, and the
+rest is applied. Agents launched through ohjaa read this knowledge in their
 briefing too.
 
 ## The fleet and the perimeter
