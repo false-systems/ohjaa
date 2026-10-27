@@ -1590,6 +1590,34 @@ the work tree. A copy an entry still holds beside `repo.toml` is noted as
 never read. Adding the lines changes the gate's digest, so receipts from before read as another
 contract's; a run of the repository's own contract is still its own.
 
+## Tests
+
+`cargo test` runs against stand-ins for sykli, toimija, vessa, gh and the
+agents, in a sandboxed home, never the person's own. With `cargo fmt --check`
+and `cargo clippy --all-targets -- -D warnings`, it is what CI runs.
+
+Tests that need the real tools are ignored by default, since CI's runners
+have none of them:
+
+- `tests/config_home.rs`, `real_sykli_*`: what a flag says and what a mark
+  is, in the real sykli's judgement
+  (`OHJAA_TEST_SYKLI=<path> cargo test --test config_home -- --ignored`).
+- `tests/loop.rs`: the whole loop, walked once, in a sandbox of its own.
+  `ohjaa run` briefs a stand-in claude through the real toimija. The agent
+  reads back, commits in a worktree, proves it with `ohjaa gate` (the real
+  sykli), pushes to a bare origin's main and hands over. The marks say ✓,
+  and still ✓ once the worktree is removed. `ohjaa intake` drafts a proposal
+  (a stand-in drafter) from a correction the real vessa finds in the agent's
+  transcript. A person accepts it at a terminal, and the next briefing
+  carries it with the handover. Then a commit whose test fails is pushed:
+  it is marked ✗, and the next briefing opens with the flag. It takes 10 to
+  15 seconds:
+
+```bash
+OHJAA_TEST_SYKLI=$(command -v sykli) OHJAA_TEST_TOIMIJA=$(command -v toimija) \
+  OHJAA_TEST_VESSA=$(command -v vessa) cargo test --test loop -- --ignored
+```
+
 ## What it will never do
 
 - **No messaging between agents, no request/response, no presence.** A message

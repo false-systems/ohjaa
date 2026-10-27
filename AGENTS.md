@@ -125,6 +125,16 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+Optional, where sykli, toimija and vessa are installed (CI's runners have
+none): the whole loop once on the real tools, from `ohjaa run` to the next
+briefing (`tests/loop.rs`, 10 to 15 seconds; the README's "Tests" says what
+it walks):
+
+```bash
+OHJAA_TEST_SYKLI=$(command -v sykli) OHJAA_TEST_TOIMIJA=$(command -v toimija) \
+  OHJAA_TEST_VESSA=$(command -v vessa) cargo test --test loop -- --ignored
+```
+
 ## Working with other agents
 
 Several agents may work this repo at once. Coordinate through Git and GitHub
