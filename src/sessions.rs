@@ -50,6 +50,10 @@ pub struct Delivered {
     /// Repository identity for repo-scoped knowledge; older records omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// The agent's own instruction file that held it at launch, current, so
+    /// that the briefing left it out; absent when the briefing carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 /// The agent's read-back: "I know the state".
@@ -2252,6 +2256,7 @@ mod tests {
                 scope: "ours".to_owned(),
                 as_of: "2026-09-24".to_owned(),
                 repo: None,
+                via: None,
             }],
             readback: None,
             handover: None,

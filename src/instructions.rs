@@ -20,6 +20,10 @@
 //! out, and each decision rewrites it where it is (a block a person took out
 //! stays out). Each decision does so under the home's lock
 //! ([`home::lock`]), so the block holds what was last decided.
+//!
+//! An agent `ohjaa run` launches whose own file holds that block, current
+//! (byte for byte the one apply would write now), is not briefed with mine
+//! and machine a second time ([`source`]): the briefing says where they are.
 
 use std::path::{Path, PathBuf};
 
@@ -45,11 +49,36 @@ pub struct Target {
 
 /// Every agent's own instruction file, each where the agent finds it itself.
 pub fn targets() -> Vec<Target> {
+    table().into_iter().filter_map(target).collect()
+}
+
+/// The own instruction file of the agent `command` launches (its file name
+/// says which: `claude`, `codex`, `pi`, `opencode`), looked for where that
+/// agent finds it; `None` for any other command. No other agent's folder is
+/// looked in.
+pub fn target_of(command: &str) -> Option<Target> {
+    let key = Path::new(command).file_name()?.to_str()?;
+    table()
+        .into_iter()
+        .find(|(_, row_key, _, _)| *row_key == key)
+        .and_then(target)
+}
+
+type Row = (
+    &'static str,
+    &'static str,
+    Option<PathBuf>,
+    &'static [&'static str],
+);
+
+/// Each agent, its key, the folder its own file is in (from the environment
+/// alone) and the names it reads there, the first that exists.
+fn table() -> [Row; 4] {
     let stores = crate::usage::Stores::from_env();
     let opencode = knowledge::config_home()
         .ok()
         .map(|dir| dir.join("opencode"));
-    let table: [(&str, &str, Option<PathBuf>, &[&str]); 4] = [
+    [
         ("Claude Code", "claude", stores.claude, &["CLAUDE.md"]),
         (
             "Codex",
@@ -70,24 +99,100 @@ pub fn targets() -> Vec<Target> {
             ],
         ),
         ("opencode", "opencode", opencode, &["AGENTS.md"]),
-    ];
-    table
-        .into_iter()
-        .filter_map(|(agent, key, dir, names)| {
-            let dir = dir?;
-            let usual = dir.join(if names.len() > 1 { names[1] } else { names[0] });
-            Some(Target {
-                agent,
-                key,
-                file: names
-                    .iter()
-                    .map(|name| dir.join(name))
-                    .find(|path| path.is_file()),
-                usual,
-                installed: dir.is_dir(),
-            })
-        })
-        .collect()
+    ]
+}
+
+/// A row's target: the first of its names that is a file.
+fn target((agent, key, dir, names): Row) -> Option<Target> {
+    let dir = dir?;
+    let usual = dir.join(if names.len() > 1 { names[1] } else { names[0] });
+    Some(Target {
+        agent,
+        key,
+        file: names
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|path| path.is_file()),
+        usual,
+        installed: dir.is_dir(),
+    })
+}
+
+/// What an agent's own instruction file holds of mine and machine, against
+/// the block apply would write now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Block {
+    /// Apply's block, byte for byte the one it would write now.
+    Current,
+    /// Apply's block, and not the one it would write now.
+    Stale,
+    /// No block.
+    None,
+    /// A block apply did not write (`brief --write`'s, a person's).
+    Theirs,
+}
+
+/// What `text`, an agent's own file, holds, against `compact`: decided by
+/// the bytes alone, never by a time. A block that cannot be told from the
+/// rest (two, a marker without its partner) is an error.
+pub fn block_in(text: &str, compact: &Compact) -> Result<Block> {
+    Ok(match knowledge::held(text)? {
+        knowledge::Held::None => Block::None,
+        knowledge::Held::Other => Block::Theirs,
+        knowledge::Held::Applied => {
+            let (new, _) =
+                knowledge::with_block(text, knowledge::INSTRUCTIONS_BEGIN, &compact.text)?;
+            if new == text {
+                Block::Current
+            } else {
+                Block::Stale
+            }
+        }
+    })
+}
+
+/// Where the agent `ohjaa run` launches gets mine and machine from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// Its own instruction file holds them, current: the briefing leaves
+    /// them out.
+    OwnFile { agent: &'static str, file: PathBuf },
+    /// The briefing carries them, because of `why`.
+    Briefing { agent: &'static str, why: String },
+}
+
+/// For the agent `command` launches, whether its own instruction file holds
+/// `compact` (mine and machine, as apply would write them now) current.
+/// `None` for a command that is no agent ohjaa writes the own file of. One
+/// file is read, and no git runs.
+pub fn source(command: &str, compact: &Compact) -> Option<Source> {
+    let target = target_of(command)?;
+    let agent = target.agent;
+    let carried = |why: String| Some(Source::Briefing { agent, why });
+    let Some(file) = target.file else {
+        return carried(format!("{} does not exist", target.usual.display()));
+    };
+    let shown = file.display();
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(error) => return carried(format!("{shown} cannot be read ({error})")),
+    };
+    match block_in(&text, compact) {
+        Ok(Block::Current) => Some(Source::OwnFile { agent, file }),
+        Ok(Block::Stale) => carried(format!(
+            "the ohjaa block in {shown} is not the one `ohjaa apply` would write now"
+        )),
+        Ok(Block::None) => carried(format!(
+            "{shown} holds no ohjaa block (`ohjaa apply` writes it)"
+        )),
+        Ok(Block::Theirs) => carried(format!(
+            "the ohjaa block in {shown} is not apply's: `ohjaa brief --write` or the person \
+             wrote it"
+        )),
+        Err(error) => carried(format!(
+            "{shown} cannot be read as one ohjaa block ({error})"
+        )),
+    }
 }
 
 /// The repository a file is inside, from the file system (a `.git` beside

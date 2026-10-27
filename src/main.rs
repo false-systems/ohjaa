@@ -121,6 +121,12 @@ enum Cmd {
         /// Include knowledge and context for these repositories (repeatable).
         #[arg(long, value_name = "PATH", conflicts_with = "write")]
         scope: Vec<String>,
+        /// The agent the briefing is for, as `ohjaa run` names it (claude,
+        /// codex, pi, opencode): as run does, mine and machine are left out
+        /// when that agent's own instruction file holds them current, and
+        /// the briefing says where they come from.
+        #[arg(long, value_name = "COMMAND", conflicts_with = "write")]
+        agent: Option<String>,
         /// Write the knowledge as a generated block into this file (repeatable),
         /// keeping everything else in it.
         #[arg(long, value_name = "FILE")]
@@ -729,26 +735,23 @@ fn dirs() -> Result<Dirs> {
     Dirs::resolve(git_root().as_deref())
 }
 
-/// The knowledge section of the briefing for these scopes, and exactly which
-/// nodes it delivers. Broken files and flags are reported on stderr, out loud;
-/// they never make the briefing silently smaller.
-fn knowledge_briefing_for(
-    dirs: &Dirs,
-    scopes: &[Scope],
-) -> Result<(String, Vec<sessions::Delivered>)> {
+/// A knowledge section of a briefing.
+struct Briefed {
+    text: String,
+    /// Exactly which nodes it delivers, and those the agent's own file did.
+    delivered: Vec<sessions::Delivered>,
+    /// Where mine and machine come from, said once after all the knowledge.
+    source: Option<String>,
+}
+
+/// The knowledge section of the briefing for these scopes, within its
+/// budget, and exactly which nodes it delivers. For `agent`, the command
+/// `ohjaa run` launches: when its own instruction file holds mine and
+/// machine current, they are left out but for a flagged one; either way
+/// that is said, in one line. Broken files are reported on stderr, out loud,
+/// and so is a briefing the budget cut; a flag is shown beside its node.
+fn knowledge_briefing_for(dirs: &Dirs, scopes: &[Scope], agent: Option<&str>) -> Result<Briefed> {
     let loaded = knowledge::load(dirs)?;
-    let delivered = fk::briefing(&loaded.nodes)
-        .into_iter()
-        .filter(|located| scopes.contains(&located.scope))
-        .map(|located| sessions::Delivered {
-            id: located.node.id.clone(),
-            scope: located.scope.name().to_owned(),
-            as_of: located.node.as_of.to_string(),
-            repo: (located.scope == Scope::Repo)
-                .then(|| dirs.repo_root.as_ref().map(|p| repo_key(p)))
-                .flatten(),
-        })
-        .collect();
     for broken in &loaded.broken {
         eprintln!(
             "ohjaa: unreadable knowledge {}: {}",
@@ -760,29 +763,122 @@ fn knowledge_briefing_for(
         eprintln!("ohjaa: knowledge does not hold together: {error}");
     }
     let flags = knowledge::flags(&loaded, dirs.repo_root.as_deref(), knowledge::today());
-    let text = knowledge::render_scopes(&loaded, &flags, scopes);
-    if text.len() > knowledge::DEFAULT_BUDGET {
-        eprintln!(
-            "ohjaa: the knowledge briefing is {} characters, over the {} an agent will \
-             reliably read; merge or retire some (`ohjaa check`)",
-            text.len(),
-            knowledge::DEFAULT_BUDGET
-        );
+    let home = [Scope::Mine, Scope::Machine];
+    let current = knowledge::in_scopes(&loaded, scopes);
+    // Mine and machine, as the agent's own file would hold them now, and
+    // whether it does.
+    let own = agent
+        .filter(|_| current.iter().any(|located| home.contains(&located.scope)))
+        .and_then(|agent| {
+            let compact = knowledge::render_compact(&loaded, &home, knowledge::DEFAULT_BUDGET);
+            instructions::source(agent, &compact).map(|source| (source, compact))
+        });
+    let left_out = match &own {
+        Some((instructions::Source::OwnFile { file, .. }, compact)) => Some((file, compact)),
+        _ => None,
+    };
+    let flagged = |id: &str| flags.iter().any(|flag| flag.id() == id);
+    let shown: Vec<&fk::Located> = current
+        .iter()
+        .copied()
+        .filter(|located| {
+            left_out.is_none() || !home.contains(&located.scope) || flagged(&located.node.id)
+        })
+        .collect();
+    let within = knowledge::render_within(shown, &flags, knowledge::DEFAULT_BUDGET);
+    if let Some(over) = within.over(knowledge::DEFAULT_BUDGET) {
+        eprintln!("ohjaa: {over}");
     }
-    Ok((text, delivered))
+    let delivered = current
+        .iter()
+        .filter_map(|located| {
+            let via = if within.kept.iter().any(|kept| std::ptr::eq(*kept, *located)) {
+                None
+            } else {
+                // Left out: delivered by the agent's own file, if it holds it.
+                let (file, compact) = left_out.filter(|_| home.contains(&located.scope))?;
+                if !compact.held.contains(&located.node.id) {
+                    return None;
+                }
+                Some(file.to_string_lossy().into_owned())
+            };
+            Some(sessions::Delivered {
+                id: located.node.id.clone(),
+                scope: located.scope.name().to_owned(),
+                as_of: located.node.as_of.to_string(),
+                repo: (located.scope == Scope::Repo)
+                    .then(|| dirs.repo_root.as_ref().map(|p| repo_key(p)))
+                    .flatten(),
+                via,
+            })
+        })
+        .collect();
+    let source = own.map(|(source, compact)| match source {
+        instructions::Source::OwnFile { agent, file } => {
+            let count = match compact.more {
+                0 => format!(
+                    "{} node{}",
+                    compact.shown,
+                    if compact.shown == 1 { "" } else { "s" }
+                ),
+                more => format!(
+                    "{} of {} nodes; {more} more: `ohjaa list`",
+                    compact.shown,
+                    compact.shown + more
+                ),
+            };
+            let repeated: Vec<&str> = within
+                .kept
+                .iter()
+                .filter(|located| home.contains(&located.scope))
+                .map(|located| located.node.id.as_str())
+                .collect();
+            format!(
+                "Mine and machine ({count}) are not repeated here: {agent} has them from its \
+                 own instructions, {}, whose ohjaa block is current.{}",
+                file.display(),
+                if repeated.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Flagged, so repeated above: {}.", repeated.join(", "))
+                }
+            )
+        }
+        instructions::Source::Briefing { agent, why } => {
+            format!(
+                "Mine and machine are carried here, not left to {agent}'s own instructions: {why}."
+            )
+        }
+    });
+    Ok(Briefed {
+        text: within.text,
+        delivered,
+        source,
+    })
 }
 
-/// Shared/personal knowledge once, plus the complete knowledge of each named repo.
-/// No keyword filter is allowed to hide a binding decision.
+/// Shared/personal knowledge once, plus the knowledge of each named repo,
+/// then where mine and machine come from for `agent` (see
+/// [`knowledge_briefing_for`]). No keyword filter is allowed to hide a
+/// binding decision.
 fn knowledge_for_work(
     dirs: &Dirs,
     scoped: &[PathBuf],
+    agent: Option<&str>,
 ) -> Result<(String, Vec<sessions::Delivered>)> {
-    let (mut text, mut delivered) = knowledge_briefing_for(dirs, &Scope::ALL)?;
+    let Briefed {
+        mut text,
+        mut delivered,
+        source,
+    } = knowledge_briefing_for(dirs, &Scope::ALL, agent)?;
     for repo in scoped {
         let mut scoped_dirs = dirs.clone();
         scoped_dirs.repo_root = Some(repo.clone());
-        let (knowledge, nodes) = knowledge_briefing_for(&scoped_dirs, &[Scope::Repo])?;
+        let Briefed {
+            text: knowledge,
+            delivered: nodes,
+            ..
+        } = knowledge_briefing_for(&scoped_dirs, &[Scope::Repo], None)?;
         // The preamble is said once, before the first knowledge of all; each
         // repository adds its section.
         let knowledge = knowledge
@@ -802,7 +898,20 @@ fn knowledge_for_work(
         delivered.extend(nodes);
     }
     if !scoped.is_empty() && text.len() > knowledge::DEFAULT_BUDGET {
-        eprintln!("ohjaa: combined scoped knowledge briefing is {} characters, over {}; merge or retire nodes, never truncate", text.len(), knowledge::DEFAULT_BUDGET);
+        eprintln!(
+            "ohjaa: combined scoped knowledge briefing is {} characters, over {}: each \
+             repository's section keeps its decisions in full within a budget of its own; \
+             merge or retire nodes",
+            text.len(),
+            knowledge::DEFAULT_BUDGET
+        );
+    }
+    if let Some(source) = source {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&source);
+        text.push('\n');
     }
     Ok((text, delivered))
 }
@@ -903,6 +1012,7 @@ fn cmd_brief(
     knowledge_only: bool,
     write: &[PathBuf],
     scope: &[String],
+    agent: Option<&str>,
 ) -> Result<i32> {
     let dirs = dirs()?;
     if !write.is_empty() {
@@ -915,7 +1025,7 @@ fn cmd_brief(
             } else {
                 (&Scope::ALL, "all")
             };
-            let (knowledge, _) = knowledge_briefing_for(&dirs, scopes)?;
+            let knowledge = knowledge_briefing_for(&dirs, scopes, None)?.text;
             let text = if knowledge.is_empty() {
                 "No knowledge recorded yet.".to_owned()
             } else {
@@ -940,7 +1050,7 @@ fn cmd_brief(
         return Ok(0);
     }
     let (scoped, unscoped) = scoped_repos(scope, dirs.repo_root.as_deref());
-    let (knowledge, _) = knowledge_for_work(&dirs, &scoped)?;
+    let (knowledge, _) = knowledge_for_work(&dirs, &scoped, agent)?;
     for path in &unscoped {
         eprintln!("ohjaa: --scope {path} is not inside a Git repository; no repository knowledge or context was read there");
     }
@@ -2807,7 +2917,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let briefing = if no_briefing {
         None
     } else {
-        let (knowledge, nodes) = knowledge_for_work(&dirs, &scoped_repos)?;
+        let (knowledge, nodes) = knowledge_for_work(&dirs, &scoped_repos, Some(agent))?;
         delivered = nodes;
         // sykli is asked about each pending validation shown, once.
         let runs = lifecycle::RunStatus::default();
@@ -3879,7 +3989,8 @@ fn main() {
             knowledge_only,
             write,
             scope,
-        } => cmd_brief(&cli.root, *knowledge_only, write, scope),
+            agent,
+        } => cmd_brief(&cli.root, *knowledge_only, write, scope, agent.as_deref()),
         Cmd::Fleet { json } => cmd_fleet(&cli.root, *json),
         Cmd::System { json } => cmd_system(&cli.root, *json),
         Cmd::List { all } => cmd_list(*all),

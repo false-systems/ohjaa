@@ -69,35 +69,29 @@ fn check_instructions(found: &mut Findings) {
             ));
             continue;
         }
-        let read = read_or_empty(&file).and_then(|now| {
-            let held = crate::knowledge::held(&now)?;
-            let (new, _) = crate::knowledge::with_block(
-                &now,
-                crate::knowledge::INSTRUCTIONS_BEGIN,
-                &compact.text,
-            )?;
-            Ok((held, new == now))
-        });
+        use crate::instructions::Block;
+        let read =
+            read_or_empty(&file).and_then(|now| crate::instructions::block_in(&now, &compact));
         match read {
             Err(error) => found.drift(format!(
                 "{} ({agent}'s own instructions): apply cannot write the knowledge block there: \
                  {error:#} (fix it by hand, then ohjaa apply)",
                 file.display()
             )),
-            Ok((crate::knowledge::Held::Other, _)) => found.note(format!(
+            Ok(Block::Theirs) => found.note(format!(
                 "{} ({agent}'s own instructions) holds a knowledge block apply did not write: \
                  the person's",
                 file.display()
             )),
-            Ok((crate::knowledge::Held::None, _)) => found.drift(format!(
+            Ok(Block::None) => found.drift(format!(
                 "{} ({agent}'s own instructions) has no knowledge block (ohjaa apply)",
                 file.display()
             )),
-            Ok((crate::knowledge::Held::Applied, true)) => found.ok(format!(
+            Ok(Block::Current) => found.ok(format!(
                 "{} ({agent}'s own instructions) holds the current knowledge block",
                 file.display()
             )),
-            Ok((crate::knowledge::Held::Applied, false)) => found.drift(format!(
+            Ok(Block::Stale) => found.drift(format!(
                 "{} ({agent}'s own instructions): its knowledge block is not current (ohjaa apply)",
                 file.display()
             )),

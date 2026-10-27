@@ -28,7 +28,10 @@ use faija_knowledge::{self as fk, Date, Kind, Located, Node, Predicate, Scope, S
 pub const FACT_TTL_DAYS: i64 = 90;
 
 /// The briefing is read before every action; past this size it stops being
-/// read. Going over is a signal to merge and prune, never to truncate.
+/// read. Going over is a signal to merge and prune. Past it, the briefing and
+/// the agents' block keep every decision in full and the rest by
+/// priority (`keep_rank`) for as long as it fits, and name what is left by count: a
+/// degrade, never a node cut short.
 pub const DEFAULT_BUDGET: usize = 8_000;
 
 fn nonempty_env(name: &str) -> Option<PathBuf> {
@@ -408,19 +411,143 @@ pub const PREAMBLE: &str =
      wrong or stale, say so instead of quietly working around it. Propose new\n\
      knowledge with `ohjaa propose`; only a person makes it current.\n";
 
-/// The briefing limited to some scopes: a file other people read gets only
-/// shared Knowledge, never one person's `mine` or `machine`.
+/// The briefing limited to some scopes, in full: a file other people read
+/// gets only shared Knowledge, never one person's `mine` or `machine`.
 pub fn render_scopes(loaded: &Loaded, flags: &[Flag], scopes: &[Scope]) -> String {
-    let current: Vec<&Located> = fk::briefing(&loaded.nodes)
+    render_nodes(&in_scopes(loaded, scopes), flags, 0)
+}
+
+/// The current nodes of `scopes`, in briefing order.
+pub fn in_scopes<'a>(loaded: &'a Loaded, scopes: &[Scope]) -> Vec<&'a Located> {
+    fk::briefing(&loaded.nodes)
         .into_iter()
         .filter(|located| scopes.contains(&located.scope))
+        .collect()
+}
+
+/// What a rendering within a budget holds.
+#[derive(Debug)]
+pub struct Within<'a> {
+    pub text: String,
+    /// The nodes it shows, in briefing order.
+    pub kept: Vec<&'a Located>,
+    /// The nodes it names only by count.
+    pub more: usize,
+    /// How long the rendering of every node would be.
+    pub full: usize,
+}
+
+impl Within<'_> {
+    /// What is said on stderr when the budget cut it, or its decisions
+    /// alone are over it.
+    pub fn over(&self, budget: usize) -> Option<String> {
+        if self.more > 0 {
+            let rest = self
+                .kept
+                .iter()
+                .filter(|located| located.node.kind != Kind::Decision)
+                .count();
+            Some(format!(
+                "the knowledge is {} characters, over the {budget} an agent will reliably read: \
+                 the briefing holds every decision and {rest} more, and names the other {} by \
+                 count; merge or retire some (`ohjaa check`)",
+                self.full, self.more
+            ))
+        } else if self.text.len() > budget {
+            Some(format!(
+                "the knowledge's decisions alone are {} characters, over the {budget} an agent \
+                 will reliably read; merge or retire some (`ohjaa check`)",
+                self.text.len()
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// The briefing of `nodes` (in briefing order) within `budget` characters.
+pub fn render_within<'a>(nodes: Vec<&'a Located>, flags: &[Flag], budget: usize) -> Within<'a> {
+    within(nodes, budget, |kept, more| render_nodes(kept, flags, more))
+}
+
+/// Past the decisions, which node is kept first when not all fit: taste
+/// (how the person works, in every session), then lesson (what a correction
+/// taught), then fact (the state of the world: the nearest to what can be
+/// found out again, and the first to go stale); within a kind, the one last
+/// confirmed (`as_of`) first. Ties keep briefing order.
+fn keep_rank(located: &Located) -> (u8, std::cmp::Reverse<Date>) {
+    let kind = match located.node.kind {
+        Kind::Decision => 0,
+        Kind::Taste => 1,
+        Kind::Lesson => 2,
+        Kind::Fact => 3,
+    };
+    (kind, std::cmp::Reverse(located.node.as_of))
+}
+
+/// `nodes` (in briefing order), rendered by `render` (what it shows, and
+/// how many it names only by count) within `budget`: all of them when they
+/// fit; else every decision, then the rest by [`keep_rank`] for as long as
+/// the rendering, with the count of what is left, still fits. The filling
+/// stops at the first that does not fit: a later, shorter one never jumps it.
+fn within<'a>(
+    nodes: Vec<&'a Located>,
+    budget: usize,
+    render: impl Fn(&[&'a Located], usize) -> String,
+) -> Within<'a> {
+    let text = render(&nodes, 0);
+    let full = text.len();
+    if full <= budget {
+        return Within {
+            text,
+            kept: nodes,
+            more: 0,
+            full,
+        };
+    }
+    let mut keep: Vec<bool> = nodes
+        .iter()
+        .map(|located| located.node.kind == Kind::Decision)
         .collect();
-    if current.is_empty() {
+    let mut rest: Vec<usize> = (0..nodes.len()).filter(|&at| !keep[at]).collect();
+    rest.sort_by_key(|&at| keep_rank(nodes[at]));
+    let chosen = |keep: &[bool]| -> Vec<&'a Located> {
+        nodes
+            .iter()
+            .zip(keep)
+            .filter(|(_, kept)| **kept)
+            .map(|(located, _)| *located)
+            .collect()
+    };
+    let mut more = rest.len();
+    let mut text = render(&chosen(&keep), more);
+    for at in rest {
+        keep[at] = true;
+        let candidate = render(&chosen(&keep), more - 1);
+        if candidate.len() > budget {
+            keep[at] = false;
+            break;
+        }
+        more -= 1;
+        text = candidate;
+    }
+    Within {
+        text,
+        kept: chosen(&keep),
+        more,
+        full,
+    }
+}
+
+/// These nodes as the briefing shows them, then the count of those it does
+/// not. Empty when there are none of either.
+fn render_nodes(nodes: &[&Located], flags: &[Flag], more: usize) -> String {
+    if nodes.is_empty() && more == 0 {
         return String::new();
     }
     let mut out = String::from(PREAMBLE);
     let mut scope = None;
-    for located in current {
+    for located in nodes {
         if scope != Some(located.scope) {
             scope = Some(located.scope);
             let _ = write!(out, "\n{}:\n", scope_heading(located.scope));
@@ -444,6 +571,9 @@ pub fn render_scopes(loaded: &Loaded, flags: &[Flag], scopes: &[Scope]) -> Strin
         for flag in flags.iter().filter(|flag| flag.id() == node.id) {
             let _ = writeln!(out, "  ! {}", flag.describe());
         }
+    }
+    if more > 0 {
+        let _ = write!(out, "\n{more} more: `ohjaa list`\n");
     }
     out
 }
@@ -613,6 +743,8 @@ pub struct Compact {
     pub shown: usize,
     /// The nodes it names only by count, being over the budget.
     pub more: usize,
+    /// The ids of the nodes it holds, in briefing order.
+    pub held: Vec<String>,
 }
 
 impl Compact {
@@ -624,56 +756,51 @@ impl Compact {
                 if self.shown == 1 { "" } else { "s" }
             ),
             more => format!(
-                "{} decision{} and {more} more by count: over the {DEFAULT_BUDGET}-character \
+                "{} of {} nodes, the other {more} by count: over the {DEFAULT_BUDGET}-character \
                  budget, merge or retire some",
                 self.shown,
-                if self.shown == 1 { "" } else { "s" }
+                self.shown + more
             ),
         }
     }
 }
 
 /// The current knowledge of `scopes`, compactly, in briefing order: one
-/// line per node, `kind: text`, no origins. Over `budget` characters, the
-/// decisions in full, and the rest by count: never a decision cut short.
+/// line per node, `kind: text`, no origins. Over `budget` characters, every
+/// decision in full and the rest by priority while it fits ([`within`]),
+/// then the count of what is left: never a node cut short.
 pub fn render_compact(loaded: &Loaded, scopes: &[Scope], budget: usize) -> Compact {
-    let current: Vec<&Located> = fk::briefing(&loaded.nodes)
-        .into_iter()
-        .filter(|located| scopes.contains(&located.scope))
-        .collect();
-    let line = |located: &Located| {
-        let text: Vec<&str> = located.node.body.split_whitespace().collect();
-        format!("- {}: {}\n", located.node.kind.name(), text.join(" "))
-    };
-    let mut text = format!("{INSTRUCTIONS_PREAMBLE}\n");
+    let current = in_scopes(loaded, scopes);
     if current.is_empty() {
-        text.push_str("None recorded yet (`ohjaa propose`, then `ohjaa review`).\n");
         return Compact {
-            text,
+            text: format!(
+                "{INSTRUCTIONS_PREAMBLE}\nNone recorded yet (`ohjaa propose`, then `ohjaa review`).\n"
+            ),
             shown: 0,
             more: 0,
+            held: Vec::new(),
         };
     }
-    let all: String = current.iter().map(|located| line(located)).collect();
-    if text.len() + all.len() <= budget {
-        text.push_str(&all);
-        return Compact {
-            text,
-            shown: current.len(),
-            more: 0,
-        };
-    }
-    let (decisions, rest): (Vec<&Located>, Vec<&Located>) = current
-        .into_iter()
-        .partition(|located| located.node.kind == Kind::Decision);
-    text.extend(decisions.iter().map(|located| line(located)));
-    if !rest.is_empty() {
-        let _ = writeln!(text, "{} more: `ohjaa list`", rest.len());
-    }
+    let within = within(current, budget, |kept, more| {
+        let mut text = format!("{INSTRUCTIONS_PREAMBLE}\n");
+        for located in kept {
+            let words: Vec<&str> = located.node.body.split_whitespace().collect();
+            let _ = writeln!(text, "- {}: {}", located.node.kind.name(), words.join(" "));
+        }
+        if more > 0 {
+            let _ = writeln!(text, "{more} more: `ohjaa list`");
+        }
+        text
+    });
     Compact {
-        text,
-        shown: decisions.len(),
-        more: rest.len(),
+        text: within.text,
+        shown: within.kept.len(),
+        more: within.more,
+        held: within
+            .kept
+            .iter()
+            .map(|located| located.node.id.clone())
+            .collect(),
     }
 }
 
