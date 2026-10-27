@@ -117,7 +117,11 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 
 - Never run `ohjaa accept`, `reject`, `retire`, `confirm` or `review` on a
   person's behalf, and never fake a terminal to get past that refusal. Propose
-  with `ohjaa propose` and say so.
+  with `ohjaa propose` and say so. The one exception is a test that plays the
+  person in a world it made: an emptied environment whose HOME,
+  XDG_CONFIG_HOME, XDG_STATE_HOME and OHJAA_OURS are all in its own temporary
+  directory, as `tests/loop.rs` does. Faking a terminal against any other
+  state, the person's own or a repository's, is deciding on their behalf.
 - Inside an `ohjaa run` session: read back with `ohjaa oriented` before your
   first change, and write the handover with `ohjaa handover` before you finish.
   Never write another session's testimony.
@@ -139,6 +143,16 @@ Before claiming completion, run:
 cargo fmt
 cargo clippy --all-targets -- -D warnings
 cargo test
+```
+
+Optional, where sykli, toimija and vessa are installed (CI's runners have
+none): the whole loop once on the real tools, from `ohjaa run` to the next
+briefing (`tests/loop.rs`; measured on 2026-10-27, it takes 8 to 16 seconds
+on macOS and 3 to 8 on Linux; the README's "Tests" says what it walks):
+
+```bash
+OHJAA_TEST_SYKLI=$(command -v sykli) OHJAA_TEST_TOIMIJA=$(command -v toimija) \
+  OHJAA_TEST_VESSA=$(command -v vessa) cargo test --test loop -- --ignored
 ```
 
 ## Working with other agents
