@@ -6032,29 +6032,34 @@ fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
     // commit there, one after the other (`after`: the mark it waits for).
     // Never at once: two `git worktree add`s in one repository race in git
     // itself, each reading the other's admin folder while it is written
-    // ("fatal: failed to read .git/worktrees/y/commondir"). An agent that
-    // stops early still says it is done, so the other one, and this test,
-    // never wait for it for ever: the test fails, with both records,
-    // instead of hanging.
+    // ("fatal: failed to read .git/worktrees/y/commondir"). Neither agent
+    // waits for the other for ever: one that stops early still says it is
+    // done, and each gives up on a mark that is not there within two minutes
+    // (the other's `ohjaa run` never started it), so the test fails, with
+    // both records, instead of hanging.
     let agent = |me: &str, other: &str, after: Option<&str>| {
         let turn = after.map_or_else(String::new, |after| {
-            format!(
-                "while [ ! -e '{}' ]; do sleep 0.1; done",
-                mark(after).display()
-            )
+            format!("wait_for '{}'", mark(after).display())
         });
         format!(
             "set -e
             trap \"touch '{done}'\" EXIT
+            deadline=$(( $(date +%s) + 120 ))
+            wait_for() {{
+              while [ ! -e \"$1\" ]; do
+                [ \"$(date +%s)\" -lt \"$deadline\" ] || {{ echo \"{me}: no $1 within 120 s\" >&2; exit 1; }}
+                sleep 0.1
+              done
+            }}
             touch '{started}'
-            while [ ! -e '{their_start}' ]; do sleep 0.1; done
+            wait_for '{their_start}'
             sleep 1
             {turn}
             git worktree add -q -b {me} '{wt}'
             cd '{wt}' && echo {me} > {me}.txt && git add {me}.txt && git commit -q -m {me}
             git rev-parse --short=7 HEAD > '{sha}'
             touch '{done}'
-            while [ ! -e '{their_done}' ]; do sleep 0.1; done",
+            wait_for '{their_done}'",
             started = mark(&format!("{me}-started")).display(),
             their_start = mark(&format!("{other}-started")).display(),
             wt = fixture.dir.join("_worktrees").join(me).display(),
@@ -6103,7 +6108,7 @@ fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
         let phases = record
             .lines()
             .find(|l| l.starts_with("phases"))
-            .expect(record);
+            .unwrap_or_else(|| panic!("a record without phases:\n{}", records.join("\n")));
         assert!(
             !phases.contains(&sha(theirs)),
             "a session never claims the other's commit: {phases}\n{record}"
