@@ -1992,6 +1992,112 @@ mod tests {
         assert_eq!(read.full_from(NOW).sessions_ms, NOW + HOUR_MS);
     }
 
+    /// Second review of #63, finding 2: what a day's digest left out stays
+    /// where `ohjaa digest` begins until it is read in full, whatever the
+    /// days' digests after it leave out or not.
+    #[test]
+    fn what_a_days_digest_left_out_stays_until_it_is_read_in_full() {
+        let snap = snapshot(NOW);
+        let view = view(&[], Some(&snap));
+        let day = |n: i64| NOW + n * DAY_MS;
+        let first = advance(
+            &view,
+            &Seen::first(day(0)),
+            Some(&snap),
+            day(0),
+            Shown::Daily {
+                from: Window::at(day(-1)),
+                cut: true,
+            },
+            "d0",
+        );
+        assert_eq!(first.full_from(day(0)), Window::at(day(-1)));
+        let whole = advance(
+            &view,
+            &first,
+            Some(&snap),
+            day(1),
+            Shown::Daily {
+                from: first.daily_from(day(1)),
+                cut: false,
+            },
+            "d1",
+        );
+        assert_eq!(
+            whole.full_from(day(1)),
+            Window::at(day(-1)),
+            "a whole digest the next day drops nothing left out before"
+        );
+        let cut_again = advance(
+            &view,
+            &whole,
+            Some(&snap),
+            day(2),
+            Shown::Daily {
+                from: whole.daily_from(day(2)),
+                cut: true,
+            },
+            "d2",
+        );
+        assert_eq!(
+            cut_again.full_from(day(2)),
+            Window::at(day(-1)),
+            "the earliest is kept"
+        );
+        let seen = advance(&view, &cut_again, Some(&snap), day(2), Shown::Line, "d2");
+        assert_eq!(
+            seen.full_from(day(2)),
+            Window::at(day(-1)),
+            "a line moves none"
+        );
+        let read = advance(&view, &seen, Some(&snap), day(3), Shown::Full, "d3");
+        assert_eq!(read.unseen, None, "read in full");
+    }
+
+    /// Second review of #63, a nit: a source is said in the line for each
+    /// failure, not once while the first stands; the same failure with its
+    /// numbers moved (a count, a time) is the same.
+    #[test]
+    fn another_failure_of_a_source_is_said_again_and_the_same_one_is_not() {
+        let mut collected = snapshot(NOW);
+        collected.github.error = Some("gh api graphql: not logged in".into());
+        collected.local.gaps = vec!["false-systems/valvo: not marked: no clone".into()];
+        let first = view(&[], Some(&collected));
+        let seen = advance(
+            &first,
+            &Seen::first(NOW),
+            Some(&collected),
+            NOW,
+            Shown::Line,
+            "d",
+        );
+        assert_eq!(one_line(&news(&first, &seen)), None);
+        collected.github.error = Some("gh api graphql: connection refused".into());
+        let other = view(&[], Some(&collected));
+        let line = one_line(&news(&other, &seen)).expect("another failure");
+        assert!(line.contains("GitHub: unavailable"), "{line}");
+        assert!(!line.contains("marks"), "the marks failed the same: {line}");
+        let seen = advance(&other, &seen, Some(&collected), NOW, Shown::Line, "d");
+        collected
+            .local
+            .gaps
+            .push("false-systems/habitat: not marked: no clone".into());
+        let more = view(&[], Some(&collected));
+        let line = one_line(&news(&more, &seen)).expect("one more could not be read");
+        assert!(line.contains("marks: 2 could not be read"), "{line}");
+        let seen = advance(&more, &seen, Some(&collected), NOW, Shown::Line, "d");
+        // The same cap, read later: its count and time moved, nothing new.
+        collected.github.error = None;
+        collected.github.gaps =
+            vec!["250 pull requests were updated since 2026-10-26 08:00 UTC; only 200 read".into()];
+        let capped = view(&[], Some(&collected));
+        let seen = advance(&capped, &seen, Some(&collected), NOW, Shown::Line, "d");
+        collected.github.gaps =
+            vec!["261 pull requests were updated since 2026-10-26 08:15 UTC; only 200 read".into()];
+        let later = view(&[], Some(&collected));
+        assert_eq!(one_line(&news(&later, &seen)), None);
+    }
+
     /// Finding 5: a window longer than GitHub was read says so.
     #[test]
     fn a_window_longer_than_github_was_read_says_so() {
