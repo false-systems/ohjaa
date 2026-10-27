@@ -829,32 +829,70 @@ pub fn github_slug(url: &str) -> Option<String> {
         .then(|| format!("{owner}/{name}"))
 }
 
+/// `git <args>` in `repo`, in the C locale, so that its refusals read the
+/// same on every machine: `LANGUAGE` is removed too, since a git built with
+/// GNU gettext (Homebrew's, on macOS) honours it over `LC_ALL=C`.
+fn git_command(repo: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("LC_ALL", "C")
+        .env_remove("LANGUAGE");
+    command
+}
+
 /// What `git <args>` printed in `repo`, or `Ok(None)` when its current
-/// branch has no commits yet: a repository created and never committed to
-/// has no history to read, which is empty, not failed. That is known from
-/// git's own refusal (in the C locale, so it reads the same on every
-/// machine), at no process more; a branch git calls broken, or a repository
-/// it cannot read, is still an error.
+/// branch was never committed to: a repository created and not yet
+/// committed to, or a new orphan branch, has no history to read, which is
+/// empty, not failed. git refuses both with the words it also uses for a
+/// branch whose ref was lost (a loose ref deleted, `packed-refs` cut short);
+/// a lost ref leaves its reflog behind ([`had_commits`]), and is an error,
+/// as is every other refusal. All of it at no git process more.
 fn git(repo: &Path, args: &[&str]) -> Result<Option<String>> {
-    let output = process::run(
-        Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .env("LC_ALL", "C"),
-        None,
-        Duration::from_secs(30),
-    )?;
+    let output = process::run(&mut git_command(repo, args), None, Duration::from_secs(30))?;
     if !output.status.success() {
         let detail = output.failure_detail();
-        if detail.starts_with("fatal: your current branch '")
-            && detail.ends_with("' does not have any commits yet")
+        if let Some(branch) = detail
+            .strip_prefix("fatal: your current branch '")
+            .and_then(|rest| rest.strip_suffix("' does not have any commits yet"))
         {
-            return Ok(None);
+            if !had_commits(repo, branch) {
+                return Ok(None);
+            }
+            bail!(
+                "git {}: {detail}, yet it has a reflog, so it had some: its ref is lost",
+                args.join(" ")
+            );
         }
         bail!("git {}: {detail}", args.join(" "));
     }
     Ok(Some(output.stdout_text()))
+}
+
+/// Whether `branch` of `repo` was ever committed to, read from the files:
+/// git keeps a reflog of each branch beside the refs (unless
+/// `core.logAllRefUpdates` is off), written with its first commit and kept
+/// when its ref is lost. A repository whose refs live in a reftable has no
+/// such file, and reads as never committed to.
+fn had_commits(repo: &Path, branch: &str) -> bool {
+    common_dir(repo).is_some_and(|common| common.join("logs/refs/heads").join(branch).is_file())
+}
+
+/// The folder that holds a repository's refs and their logs: its `.git`,
+/// or for a linked worktree, the one its `.git` file leads to.
+fn common_dir(repo: &Path) -> Option<PathBuf> {
+    let dot = repo.join(".git");
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    let text = std::fs::read_to_string(&dot).ok()?;
+    let gitdir = repo.join(text.strip_prefix("gitdir:")?.trim());
+    Some(match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(common) => gitdir.join(common.trim()),
+        Err(_) => gitdir,
+    })
 }
 
 /// Human comments on pull requests and issues since `since`, through `gh`.
@@ -3319,6 +3357,16 @@ mod tests {
             text.contains("- api-token [ours/lesson/proposed]: xxx"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn git_is_asked_in_the_c_locale_whatever_language_is_set() {
+        use std::ffi::OsStr;
+        let command = git_command(Path::new("/r"), &["log"]);
+        let envs: Vec<(&OsStr, Option<&OsStr>)> = command.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new("LC_ALL"), Some(OsStr::new("C")))));
+        // Homebrew's git, with macOS libintl, honours LANGUAGE over LC_ALL=C.
+        assert!(envs.contains(&(OsStr::new("LANGUAGE"), None)), "{envs:?}");
     }
 
     #[test]

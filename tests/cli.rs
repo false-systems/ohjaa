@@ -1549,6 +1549,69 @@ fn a_repository_with_no_commits_yet_is_empty_and_does_not_hold_the_cursor() {
     fixture.cleanup();
 }
 
+#[test]
+fn only_a_branch_never_committed_to_is_empty_not_one_whose_ref_was_lost() {
+    // The review of #61: git says "does not have any commits yet" for a
+    // branch never committed to, and also for one whose ref was lost (a
+    // loose ref deleted, `packed-refs` cut short). Only the first is empty.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("intakelost");
+    let committed = |name: &str| {
+        let repo = fixture.make_repo(name);
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "ohjaa@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Ohjaa Test"]);
+        run_git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        repo
+    };
+    let repo = committed("work");
+    // A new branch with no history of its own, in a repository with some.
+    let orphan = committed("orphan");
+    run_git(&orphan, &["checkout", "-q", "--orphan", "fresh"]);
+    let intake = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args(["intake", "--since", "2026-09-01", "--drafter", "exit 1"])
+                .current_dir(&repo),
+        )
+    };
+    let (_, stderr, code) = intake();
+    assert_eq!(
+        code,
+        Some(0),
+        "a branch never committed to is empty: {stderr}"
+    );
+
+    // Lost refs exist only where refs are files.
+    let lost = committed("lost");
+    let loose = lost.join(".git/refs/heads/main");
+    if !loose.is_file() {
+        fixture.cleanup();
+        return;
+    }
+    fs::remove_file(&loose).unwrap();
+    let truncated = committed("truncated");
+    run_git(&truncated, &["pack-refs", "--all"]);
+    let packed = truncated.join(".git/packed-refs");
+    let header = fs::read_to_string(&packed).unwrap();
+    fs::write(&packed, format!("{}\n", header.lines().next().unwrap())).unwrap();
+    let (_, stderr, code) = intake();
+    assert_eq!(code, Some(4), "{stderr}");
+    for broken in [&lost, &truncated] {
+        assert!(
+            stderr.contains(&format!("{}: ", broken.display()))
+                && stderr.contains("its ref is lost"),
+            "{} warns: {stderr}",
+            broken.display()
+        );
+    }
+    assert!(!stderr.contains(&orphan.display().to_string()), "{stderr}");
+    fixture.cleanup();
+}
+
 /// A drafter as the drafter answers it.
 fn drafted(scope: &str, id: &str, refines: Option<&str>) -> serde_json::Value {
     serde_json::json!({

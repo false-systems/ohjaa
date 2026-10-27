@@ -256,10 +256,16 @@ candidates that were handled, never back.
   warning that recurs on every run keeps the window growing until it is fixed.
 - With no repositories under the roots, reviews and reverts warn, and hold
   the cursor: nothing read is not nothing there.
-- A repository with no commits yet has nothing to read: it is empty, not
-  unread, and holds nothing (known from git's own refusal, at no git process
-  more). One git cannot read (its `.git` names nothing, or its current branch
-  is broken) warns, and holds the cursor.
+- A repository whose current branch was never committed to (one with no
+  commits yet, or a new orphan branch) has nothing to read: it is empty, not
+  unread, and holds nothing. git refuses it in words it also uses for a
+  branch whose ref was lost (a loose ref deleted, `packed-refs` cut short);
+  a lost ref keeps its reflog, so a branch with one is said as lost, warns
+  and holds the cursor. With reflogs off (`core.logAllRefUpdates`), or refs
+  in a reftable, a lost ref reads as empty. git is asked in the C locale,
+  `LANGUAGE` removed, and no git process more is spent on this. One git
+  cannot read at all (its `.git` names nothing, a garbage ref, a missing
+  object) warns, and holds the cursor.
 - vessa's exit 4 (a partial list) names two kinds of reason, which intake
   treats apart. What it lists is drafted from either way.
   - A source it could not read (`warnings`), what a transcript leaves unknown
