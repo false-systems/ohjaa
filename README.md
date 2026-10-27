@@ -1605,13 +1605,15 @@ have none of them:
 - `tests/loop.rs`: the whole loop, walked once, in a sandbox of its own.
   `ohjaa run` briefs a stand-in claude through the real toimija. The agent
   reads back, commits in a worktree, proves it with `ohjaa gate` (the real
-  sykli), pushes to a bare origin's main and hands over. The marks say ✓,
-  and still ✓ once the worktree is removed. `ohjaa intake` drafts a proposal
+  sykli), pushes to a bare origin's main and hands over. sykli's pre-push
+  hook accepts the push, and the marks say ✓. Once the worktree is removed
+  and the hook's copy is set aside, they still say ✓, from the receipt sykli
+  kept of the run. `ohjaa intake` drafts a proposal
   (a stand-in drafter) from a correction the real vessa finds in the agent's
   transcript. A person accepts it at a terminal, and the next briefing
   carries it with the handover. Then a commit whose test fails is pushed:
-  it is marked ✗, and the next briefing opens with the flag. It takes 10 to
-  15 seconds:
+  it is marked ✗, and the next briefing opens with the flag. Measured on
+  2026-10-27, it takes 8 to 16 seconds on macOS and 3 to 8 on Linux:
 
 ```bash
 OHJAA_TEST_SYKLI=$(command -v sykli) OHJAA_TEST_TOIMIJA=$(command -v toimija) \
