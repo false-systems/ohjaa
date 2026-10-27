@@ -429,6 +429,14 @@ fn copy_executable(from: &Path, to: &Path) {
     fs::set_permissions(to, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// The real git, as found on the test's own PATH.
+fn system_git() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("git"))
+        .find(|git| git.is_file())
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/git"))
+}
+
 /// The lines a child writes to `pipe`, as it writes them.
 fn lines_of(pipe: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<String> {
     let (send, lines) = std::sync::mpsc::channel();
@@ -527,9 +535,7 @@ impl Sandbox {
         write_executable(&bin.join("codex"), CODEX_STUB);
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ohjaa"), bin.join("ohjaa")).unwrap();
         // Only the stubs and the system: no real sykli, cargo, agent or ohjaa.
-        let git_dir = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .find(|dir| dir.join("git").is_file())
-            .unwrap_or_else(|| PathBuf::from("/usr/bin"));
+        let git_dir = system_git().parent().unwrap().to_path_buf();
         let path = format!(
             "{}:{}:/usr/bin:/bin:/usr/sbin:/sbin",
             bin.display(),
@@ -1578,7 +1584,17 @@ fn a_home_that_is_a_linked_worktree_keeps_its_allowlist_to_itself() {
         ],
     );
     knowledge_node(&config.join("mine"), "lima", "fact", "Lima is here.");
-    for stray in [".DS_Store", "notes.txt", "mine/lima.md~"] {
+    // The person's own global excludes still keep out what they name (the
+    // review of #68, L1): a merge tool's `.orig` here.
+    fs::create_dir_all(sandbox.dir.join("config/git")).unwrap();
+    fs::write(sandbox.dir.join("config/git/ignore"), "*.orig\n").unwrap();
+    let strays = [
+        ".DS_Store",
+        "notes.txt",
+        "mine/lima.md~",
+        "mine/lima.md.orig",
+    ];
+    for stray in strays {
         fs::write(config.join(stray), "stray\n").unwrap();
     }
     sandbox.repo("acme", "widget", &[("sykli.json", "{}\n")]);
@@ -1590,7 +1606,7 @@ fn a_home_that_is_a_linked_worktree_keeps_its_allowlist_to_itself() {
             "{owned}: {tracked}"
         );
     }
-    for stray in [".DS_Store", "notes.txt", "mine/lima.md~"] {
+    for stray in strays {
         assert!(
             !tracked.lines().any(|line| line == stray),
             "{stray}: {tracked}"
@@ -1609,7 +1625,8 @@ fn a_home_that_is_a_linked_worktree_keeps_its_allowlist_to_itself() {
 /// #65's re-review, L1: ohjaa is killed while the home's git commits. That
 /// git goes on (it runs in a process group of its own), and it holds the
 /// home's lock until it ends: the next change waits for it, and each commit
-/// holds its own change, never another's.
+/// holds its own change, never another's. The home runs no hook, so the
+/// commit is held up by a `git` first on PATH, the git ohjaa runs.
 #[test]
 fn a_commit_its_ohjaa_was_killed_in_holds_the_homes_lock_until_it_ends() {
     let sandbox = Sandbox::new("killed-commit");
@@ -1617,12 +1634,19 @@ fn a_commit_its_ohjaa_was_killed_in_holds_the_homes_lock_until_it_ends() {
     let (second, _) = sandbox.repo("acme", "second", &[("sykli.json", "{}\n")]);
     sandbox.apply();
     let config = sandbox.config();
-    // The first commit after `hold` is made says it began, and waits while
-    // `hold` exists; any later one goes on.
+    // The home's first commit after `hold` is made says it began, and waits
+    // while `hold` exists, before it is git's; every other git is git's.
     write_executable(
-        &config.join(".git/hooks/pre-commit"),
-        "#!/bin/sh\n[ -e \"$SANDBOX/hold\" ] && [ ! -e \"$SANDBOX/in-commit\" ] || exit 0\n\
-         touch \"$SANDBOX/in-commit\"\nwhile [ -e \"$SANDBOX/hold\" ]; do sleep 0.05; done\n",
+        &sandbox.dir.join("bin/git"),
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" {home}/.git \"*\" commit \"*)\n    \
+             if [ -e \"$SANDBOX/hold\" ] && [ ! -e \"$SANDBOX/in-commit\" ]; then\n      \
+             touch \"$SANDBOX/in-commit\"\n      \
+             while [ -e \"$SANDBOX/hold\" ]; do sleep 0.05; done\n    fi;;\nesac\n\
+             exec '{git}' \"$@\"\n",
+            home = config.display(),
+            git = system_git().display()
+        ),
     );
     let hold = sandbox.dir.join("hold");
     fs::write(&hold, "").unwrap();
@@ -1673,6 +1697,82 @@ fn a_commit_its_ohjaa_was_killed_in_holds_the_homes_lock_until_it_ends() {
     assert!(before.starts_with("adopt acme/first"), "{before}");
     assert!(before.contains("repos/acme/first/repo.toml"), "{before}");
     assert!(!before.contains("repos/acme/second/"), "{before}");
+}
+
+/// The review of #68, M1: nothing the home's git can leave running holds
+/// the home's lock. The person's config turns on what git starts beside
+/// itself: an fsmonitor (`core.fsmonitor`, here as a command, which git runs
+/// on every platform; `true` starts git's own daemon, which lives on), hooks
+/// from a template (`init.templateDir`) and from config (`hook.<name>`), and
+/// a hook in the home's own hooks folder. Each one that runs leaves a process
+/// behind, with whatever it was given open. Once the home's commit is done,
+/// its lock is free, and the next change does not wait.
+#[test]
+fn nothing_the_homes_git_leaves_running_holds_the_homes_lock() {
+    let sandbox = Sandbox::new("lingering");
+    let (first, _) = sandbox.repo("acme", "first", &[("sykli.json", "{}\n")]);
+    let (second, _) = sandbox.repo("acme", "second", &[("sykli.json", "{}\n")]);
+    let linger = |name: &str| {
+        format!("#!/bin/sh\ntouch \"$SANDBOX/ran-{name}\"\nsleep 15 >/dev/null 2>&1 &\nexit 1\n")
+    };
+    let template = sandbox.dir.join("template");
+    fs::create_dir_all(template.join("hooks")).unwrap();
+    let events = [
+        "pre-commit",
+        "prepare-commit-msg",
+        "commit-msg",
+        "post-commit",
+        "post-index-change",
+        "reference-transaction",
+    ];
+    for event in events {
+        write_executable(&template.join("hooks").join(event), &linger(event));
+    }
+    write_executable(&sandbox.dir.join("bin/fsmonitor"), &linger("fsmonitor"));
+    write_executable(&sandbox.dir.join("bin/config-hook"), &linger("config-hook"));
+    for (key, value) in [
+        ("core.fsmonitor", sandbox.dir.join("bin/fsmonitor")),
+        ("init.templateDir", template),
+        ("hook.linger.command", sandbox.dir.join("bin/config-hook")),
+    ] {
+        sandbox.git(
+            &sandbox.dir,
+            &["config", "--global", key, &value.to_string_lossy()],
+        );
+    }
+    for event in events {
+        sandbox.git(
+            &sandbox.dir,
+            &["config", "--global", "--add", "hook.linger.event", event],
+        );
+    }
+    // The home's first commit: init, then add and commit.
+    sandbox.apply();
+    let config = sandbox.config();
+    drop(hold_the_homes_lock(&config));
+    assert!(
+        !config.join(".git/hooks/pre-commit").exists(),
+        "no hook is copied from a template"
+    );
+    fs::create_dir_all(config.join(".git/hooks")).unwrap();
+    write_executable(&config.join(".git/hooks/post-commit"), &linger("home"));
+    sandbox.adopt(&first);
+    drop(hold_the_homes_lock(&config));
+    for event in events {
+        assert!(
+            !sandbox.dir.join(format!("ran-{event}")).exists(),
+            "{event}: a template's hook ran"
+        );
+    }
+    assert!(
+        !sandbox.dir.join("ran-home").exists(),
+        "the home's own hook ran"
+    );
+    let output = sandbox.ohjaa(&["adopt", &second.to_string_lossy()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(!stderr.contains("waiting"), "{stderr}");
+    drop(hold_the_homes_lock(&config));
 }
 
 /// A knowledge block apply did not write (`brief --write`'s, or one the
@@ -1773,6 +1873,49 @@ fn undo_takes_back_every_file_apply_wrote_a_block_into() {
             "{stdout}"
         );
     }
+}
+
+/// The review of #68, L2: one file named two ways (`~/.claude` a link to
+/// the folder a later `CLAUDE_CONFIG_DIR` names) is one file to apply and to
+/// undo: recorded once, and put back byte for byte.
+#[test]
+fn a_file_named_two_ways_is_recorded_once_and_undone_exactly() {
+    let sandbox = Sandbox::new("two-spellings");
+    let mine = sandbox.config().join("mine");
+    knowledge_node(&mine, "rust", "decision", "Rust.");
+    let real = sandbox.home().join("real-claude");
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, sandbox.home().join(".claude")).unwrap();
+    let before = "# Claude\nmy own text, no final newline";
+    fs::write(real.join("CLAUDE.md"), before).unwrap();
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    knowledge_node(&mine, "lima", "fact", "Lima is here.");
+    let output = sandbox
+        .command("ohjaa", &sandbox.dir)
+        .env("CLAUDE_CONFIG_DIR", &real)
+        .args(["apply", "--root", &sandbox.projects()])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        fs::read_to_string(real.join("CLAUDE.md"))
+            .unwrap()
+            .contains("- fact: Lima is here.\n"),
+        "rewritten through the other name"
+    );
+    let record = fs::read_to_string(sandbox.config().join("applied.toml")).unwrap();
+    assert!(!record.contains("instructions_claude_2"), "{record}");
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(
+        fs::read_to_string(real.join("CLAUDE.md")).unwrap(),
+        before,
+        "{stdout}"
+    );
 }
 
 /// One agent's file apply cannot read as a whole (two blocks in it) is said
