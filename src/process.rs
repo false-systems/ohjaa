@@ -286,6 +286,26 @@ impl Drop for Conversation {
     }
 }
 
+/// Whether no process runs as `pid` (kill(2) with signal 0 says ESRCH).
+/// Only what the kernel says: anything else, a pid it cannot be asked about
+/// included, is not gone.
+pub fn gone(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(pid) = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0) else {
+            return false;
+        };
+        // SAFETY: signal 0 sends nothing.
+        let refused = unsafe { libc::kill(pid, 0) } != 0;
+        refused && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Whether the ohjaa that started a session at `started_ms` still runs as
 /// `pid`. A pid is reused, so the process there must also be an `ohjaa` that
 /// was already running then (a couple of seconds of slack for the clock

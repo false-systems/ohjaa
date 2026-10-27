@@ -614,6 +614,7 @@ impl Store {
     /// unreadable file is reported, never replaced: redb would treat an empty
     /// file as a fresh database and the history would silently vanish.
     pub fn open(path: &Path) -> Result<Store, StoreError> {
+        remove_left_beside(&made_at(path));
         retrying(|| Self::open_once(path))
     }
 
@@ -622,23 +623,27 @@ impl Store {
             path: path.to_path_buf(),
             why,
         };
-        let db = match std::fs::metadata(path) {
+        match std::fs::metadata(path) {
             Ok(meta) if meta.len() == 0 => return Err(broken("the file is empty".to_owned())),
-            Ok(_) => Database::open(path).map_err(|error| match error {
-                DatabaseError::DatabaseAlreadyOpen => StoreError::Locked,
-                other => broken(other.to_string()),
-            })?,
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(other)?;
                 }
-                Database::create(path).map_err(|error| match error {
-                    DatabaseError::DatabaseAlreadyOpen => StoreError::Locked,
-                    error => other(error),
-                })?
+                match create_whole(&made_at(path)) {
+                    // Made here, or by another ohjaa first: opened as made.
+                    Ok(Made::Whole) => {}
+                    Ok(Made::InPlace(why)) => said_in_place(path, &why),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(other(error)),
+                }
             }
             Err(error) => return Err(other(error)),
-        };
+        }
+        let db = Database::open(path).map_err(|error| match error {
+            DatabaseError::DatabaseAlreadyOpen => StoreError::Locked,
+            other => broken(other.to_string()),
+        })?;
         let store = Store { db };
         // Every table exists from the first writable open, so a reader of a
         // log this ohjaa wrote never has to tell "empty" from "missing". A
@@ -826,6 +831,193 @@ impl PrivateCopy {
 impl Drop for PrivateCopy {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Make a new log at `path`, which does not exist: whole beside it first,
+/// then put in place, so the log is never at its path half made. redb makes
+/// a database in the file it is given, which is empty until its header is
+/// written, and another ohjaa opening the log in that moment (the first two
+/// launches on a machine, at once) would take it for a broken one.
+/// `AlreadyExists` when another ohjaa put its log there first.
+fn create_whole(path: &Path) -> std::io::Result<Made> {
+    create_whole_by(path, &PLACING)
+}
+
+/// How a new log came to be at its path.
+#[derive(Debug, PartialEq)]
+enum Made {
+    /// Made whole beside it, then put in place.
+    Whole,
+    /// Made in place: the folder's filesystem can put no whole file at a
+    /// path without the risk of replacing one (why).
+    InPlace(String),
+}
+
+/// How a whole log made beside its path is put there, never over a file:
+/// a hard link, else an exclusive rename (FAT has no hard links).
+struct Placing {
+    link: fn(&Path, &Path) -> std::io::Result<()>,
+    rename: fn(&Path, &Path) -> std::io::Result<()>,
+}
+
+const PLACING: Placing = Placing {
+    link: |from, to| std::fs::hard_link(from, to),
+    rename: rename_exclusive,
+};
+
+/// rename(2) that fails with `AlreadyExists` where `to` exists, never
+/// replacing it.
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = |path: &Path| {
+            std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        };
+        let (from, to) = (c(from)?, c(to)?);
+        // SAFETY: two NUL-terminated paths that outlive the call.
+        #[cfg(target_vendor = "apple")]
+        let done = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0;
+        // The system call itself: glibc wraps it only from 2.28.
+        // SAFETY: as above.
+        #[cfg(target_os = "linux")]
+        let done = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } == 0;
+        if done {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    {
+        let _ = (from, to);
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// The name a log being made beside `path` has: its maker's pid, and a
+/// count within that maker.
+fn private_name(path: &Path, pid: u32, n: u64) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{name}.new-{pid}-{n}"))
+}
+
+fn create_whole_by(path: &Path, placing: &Placing) -> std::io::Result<Made> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let fresh = private_name(
+        path,
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    );
+    // One left by an ohjaa stopped while making it, whose pid this one has.
+    let _ = std::fs::remove_file(&fresh);
+    let made = Database::create(&fresh)
+        .map(drop)
+        .map_err(std::io::Error::other)
+        // Neither a link nor an exclusive rename is ever made over an
+        // existing file: the first log made stays, and every other is dropped.
+        .and_then(|()| match (placing.link)(&fresh, path) {
+            Err(link) if link.kind() != std::io::ErrorKind::AlreadyExists => {
+                match (placing.rename)(&fresh, path) {
+                    Ok(()) => Ok(None),
+                    Err(rename) if rename.kind() == std::io::ErrorKind::AlreadyExists => {
+                        Err(rename)
+                    }
+                    Err(rename) => Ok(Some(format!(
+                        "no hard link ({link}) and no exclusive rename ({rename})"
+                    ))),
+                }
+            }
+            linked => linked.map(|()| None),
+        });
+    let _ = std::fs::remove_file(&fresh);
+    let Some(why) = made? else {
+        return Ok(Made::Whole);
+    };
+    // Made in place, as redb would make it, but never over an existing file.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    if let Err(error) = redb::Builder::new().create_file(file) {
+        // Ours, and never a log: the next launch makes it again.
+        let _ = std::fs::remove_file(path);
+        return Err(std::io::Error::other(error));
+    }
+    Ok(Made::InPlace(why))
+}
+
+/// Say once in a launch why its log was made in place: a launch opening it
+/// in that moment may have taken it for a broken one.
+fn said_in_place(path: &Path, why: &str) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "ohjaa: the session log {} was made in place: its filesystem has {why}, so a \
+             launch opening it as it was made may have found it half made",
+            path.display()
+        );
+    }
+}
+
+/// Where a log at `path` is made: `path`, or the end of the links there
+/// when they name no file yet (as redb makes it, through them).
+fn made_at(path: &Path) -> PathBuf {
+    let mut at = path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(next) = std::fs::read_link(&at) else {
+            break;
+        };
+        at = match at.parent() {
+            Some(folder) => folder.join(next),
+            None => next,
+        };
+    }
+    at
+}
+
+/// Remove what makers stopped while making a log left beside `path`: a
+/// private log whose maker is gone, or one older than a minute (no making
+/// takes that long, so its pid is another process's now). One a live maker
+/// is making is never touched in its first minute. Whatever cannot be read
+/// or removed is left.
+fn remove_left_beside(path: &Path) {
+    let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let prefix = format!(".{}.new-", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let Some(rest) = file.to_str().and_then(|file| file.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let gone = rest
+            .split('-')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .is_some_and(crate::process::gone);
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > Duration::from_secs(60)));
+        if gone || old {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -2520,6 +2712,207 @@ mod tests {
         );
         drop(holder);
         assert!(Reader::open(&path).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn launches_that_make_the_log_together_never_find_it_half_made() {
+        // The first launches on a machine make the log at once (two `ohjaa
+        // run`s in one checkout). One that opens it while another is still
+        // making it must never take the file for a broken log: an empty one.
+        for round in 0..40 {
+            let dir = temp(&format!("made-together-{round}"));
+            let path = store_path(&dir.join("ohjaa"));
+            let together = std::sync::Barrier::new(6);
+            let found: Vec<String> = std::thread::scope(|scope| {
+                let opens: Vec<_> = (0..6)
+                    .map(|n| {
+                        let (path, together) = (&path, &together);
+                        scope.spawn(move || {
+                            together.wait();
+                            let error = if n % 2 == 0 {
+                                Store::open(path).err()
+                            } else {
+                                Reader::open(path).err()
+                            };
+                            // Busy beside a writer is said as busy, not broken.
+                            error.filter(|error| !matches!(error, StoreError::Locked))
+                        })
+                    })
+                    .collect();
+                opens
+                    .into_iter()
+                    .filter_map(|open| open.join().unwrap())
+                    .map(|error| error.to_string())
+                    .collect()
+            });
+            assert!(found.is_empty(), "round {round}: {found:?}");
+            assert!(Reader::open(&path).is_ok(), "round {round}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// What a filesystem without the call says, as FAT and exFAT do.
+    fn unsupported(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
+    }
+
+    /// The private logs beside `path`, by name.
+    fn private_beside(path: &Path) -> Vec<String> {
+        let prefix = format!(".{}.new-", path.file_name().unwrap().to_string_lossy());
+        let mut found: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// `placing` makes a log at `path` that records, and a second maker
+    /// finds it there and leaves it as it was.
+    fn made_once_never_over(path: &Path, placing: &Placing) -> Made {
+        let made = create_whole_by(path, placing).unwrap();
+        assert!(
+            private_beside(path).is_empty(),
+            "{:?}",
+            private_beside(path)
+        );
+        Store::open(path)
+            .unwrap()
+            .put(&session("oh-1", "/r/a", 1_000))
+            .unwrap();
+        let before = std::fs::read(path).unwrap();
+        let again = create_whole_by(path, placing).unwrap_err();
+        assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists, "{again}");
+        assert_eq!(std::fs::read(path).unwrap(), before, "never made over");
+        assert!(
+            private_beside(path).is_empty(),
+            "{:?}",
+            private_beside(path)
+        );
+        let reader = Reader::open(path).unwrap();
+        assert_eq!(reader.get("oh-1").unwrap().unwrap().id, "oh-1");
+        made
+    }
+
+    #[test]
+    fn an_exclusive_rename_never_replaces_a_file() {
+        let dir = temp("rename-exclusive");
+        let (from, to) = (dir.join("from"), dir.join("to"));
+        std::fs::write(&from, "new").unwrap();
+        std::fs::write(&to, "old").unwrap();
+        let refused = rename_exclusive(&from, &to).unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "{refused}"
+        );
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "old");
+        assert!(from.is_file());
+        std::fs::remove_file(&to).unwrap();
+        rename_exclusive(&from, &to).unwrap();
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "new");
+        assert!(!from.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn without_hard_links_the_log_is_renamed_into_place_whole() {
+        // FAT on macOS and vfat on Linux: no hard links, an exclusive rename.
+        let dir = temp("no-links");
+        let placing = Placing {
+            link: unsupported,
+            rename: PLACING.rename,
+        };
+        assert_eq!(
+            made_once_never_over(&store_path(&dir), &placing),
+            Made::Whole
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn without_links_or_an_exclusive_rename_the_log_is_made_in_place_and_says_why() {
+        // exFAT on macOS: neither. The log is made in place, never over one,
+        // and the launch is told why it may be found half made.
+        let dir = temp("no-links-no-rename");
+        let placing = Placing {
+            link: unsupported,
+            rename: unsupported,
+        };
+        let made = made_once_never_over(&store_path(&dir), &placing);
+        let Made::InPlace(why) = &made else {
+            panic!("{made:?}");
+        };
+        assert!(
+            why.contains("no hard link") && why.contains("no exclusive rename"),
+            "{why}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_log_behind_a_link_that_names_no_file_yet_is_made_where_it_points() {
+        let dir = temp("linked-log");
+        let path = store_path(&dir);
+        let real = dir.join("elsewhere").join("log.redb");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("elsewhere/log.redb", &path).unwrap();
+        Store::open(&path)
+            .unwrap()
+            .put(&session("oh-1", "/r/a", 1_000))
+            .unwrap();
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(real.is_file());
+        let reader = Reader::open(&path).unwrap();
+        assert_eq!(reader.get("oh-1").unwrap().unwrap().id, "oh-1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn what_a_stopped_maker_left_beside_the_log_goes_and_one_being_made_stays() {
+        let dir = temp("left-beside");
+        let path = store_path(&dir);
+        drop(Store::open(&path).unwrap());
+        let beside = |pid: u32, n: u32| dir.join(format!(".sessions.redb.new-{pid}-{n}"));
+        // Its maker is gone.
+        let gone = {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        std::fs::write(beside(gone, 0), vec![0; 4096]).unwrap();
+        // A second name of the log itself: its maker stopped between the
+        // link and the removal.
+        std::fs::hard_link(&path, beside(gone, 1)).unwrap();
+        // Its maker's pid runs, but no making takes a minute: not its maker.
+        let old = beside(std::process::id(), 7);
+        std::fs::write(&old, b"").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        // Being made now.
+        let making = beside(std::process::id(), 8);
+        std::fs::write(&making, b"").unwrap();
+        Store::open(&path)
+            .unwrap()
+            .put(&session("oh-1", "/r/a", 1_000))
+            .unwrap();
+        assert_eq!(
+            private_beside(&path),
+            [format!(".sessions.redb.new-{}-8", std::process::id())],
+            "only the one being made stays"
+        );
+        let reader = Reader::open(&path).unwrap();
+        assert_eq!(reader.get("oh-1").unwrap().unwrap().id, "oh-1");
         let _ = std::fs::remove_dir_all(dir);
     }
 
