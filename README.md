@@ -19,6 +19,7 @@ ohjaa brief --scope ../other-repo       # retrieve context after expanding scope
 ohjaa propose --scope ours --id rust-only --kind decision \
       --origin "2026-09-16: 'we dont do python'" "Code is Rust or Elixir/Erlang."
 ohjaa review                           # a person decides what becomes current
+ohjaa lessons publish --dry-run        # repo knowledge into each repository's own AGENTS.md
 ohjaa intake                           # draft proposals from what people said
 ohjaa report                           # what went around the workflow this week
 ohjaa line                             # for a terminal's opening: what is new since you looked
@@ -71,7 +72,7 @@ A node's scope, meaning whose it is, is the directory it lives in:
 | Scope | Lives in | Changes by |
 |---|---|---|
 | ours | `<shared checkout>/knowledge/`, set by `OHJAA_OURS` or `~/.config/ohjaa/ours` | pull request |
-| repo | `<repo>/.ohjaa/knowledge/` | pull request |
+| repo | `<repo>/AGENTS.md`, its `## Lessons` section; ohjaa keeps each node, with its why, in `~/.local/state/ohjaa/lessons/` | a pull request ohjaa opens |
 | mine | `~/.config/ohjaa/mine/` | you |
 | machine | `~/.config/ohjaa/machine/` | you |
 
@@ -81,11 +82,15 @@ shared Knowledge never builds on personal Knowledge. Those rules come from
 faija's contract, and ohjaa carries its reference implementation in
 `vendor/faija-knowledge`.
 
-Every explicitly scoped repository also contributes its repo knowledge,
-labelled with its path, within a budget of its own (every decision in full;
-see "Keeping it true"). Global knowledge is delivered once, not repeated for each
-repo. No keyword matcher drops a decision. Session records preserve the repository
-identity of delivered repo nodes; older records without that identity still read.
+The launch repository's own knowledge that its AGENTS.md holds, as checked
+out, is left to that file, which the agent reads (see "Repo knowledge: the
+repository's own AGENTS.md"). Every explicitly scoped repository also
+contributes its repo knowledge, all of it, labelled with its path, within a
+budget of its own (every decision in full; see "Keeping it true"): the agent
+is not working there, and need not read that AGENTS.md. Global knowledge is
+delivered once, not repeated for each repo. No keyword matcher drops a
+decision. Session records preserve the repository identity of delivered repo
+nodes; older records without that identity still read.
 
 ## Agents propose, a person decides
 
@@ -98,8 +103,11 @@ identity of delivered repo nodes; older records without that identity still read
   the same step, and refuses outright if the result would not hold together.
   Nothing is deleted: retired and superseded Knowledge keeps its time and its
   why.
-- Shared Knowledge (ours, repo) is then committed and reviewed in a pull
-  request, like code. For shared scopes that review is the real gate.
+- Shared Knowledge is then reviewed in a pull request, like code. For shared
+  scopes that review is the real gate. Ours is committed in its checkout by
+  the person. Repo knowledge goes into the repository's own AGENTS.md
+  through a pull request ohjaa opens, and the person merges it like any
+  change: see "Repo knowledge: the repository's own AGENTS.md".
 - Personal Knowledge (mine, machine) is versioned in the home itself:
   `~/.config/ohjaa` is a local git repository, with no remote and never
   pushed, made by its first commit (or the repository the home already is).
@@ -1062,6 +1070,100 @@ The line is part of the knowledge section, and counts toward its budget.
 `ohjaa brief --agent <command>` prints the briefing that agent gets; it
 knows the environment, not the arguments `ohjaa run … -- <args>` would pass.
 
+## Repo knowledge: the repository's own AGENTS.md
+
+Every agent reads the repository's AGENTS.md, so that is where repo
+knowledge goes. When you accept a repo proposal (`ohjaa accept`, or `a` in
+`ohjaa review`), ohjaa writes its line into the `## Lessons` section of
+that repository's AGENTS.md, through a pull request it opens, and you merge
+it like any change. Nothing is written into your checkout:
+
+- **The node** is kept in ohjaa's state, with its why:
+  `~/.local/state/ohjaa/lessons/<clone>/<id>.md`, where `<clone>` is the
+  clone's common git directory (read from git's layout), so every worktree
+  of it shares them. Beside them, `delivery.json` (`ohjaa-lessons.v1`) says
+  where each line went: `pr` (its URL and branch), `merged` (on the
+  default branch when ohjaa last looked), `undelivered` or `held`, each
+  with why. It is knowledge, not a cache: deleting it loses what is not
+  delivered yet, and the why behind what is.
+- **The line**, one per node, its body on one line, marked with its id:
+
+  ```
+  ## Lessons
+
+  <!-- This repository's accepted knowledge: one line per node, each marked with its id, … -->
+
+  - <!-- lesson: widget-uses-rust --> **decision**: Widget code is Rust. (as of 2026-10-27)
+  ```
+
+  A line is replaced by its id wherever it is (a confirmation moves its
+  date, a second line of the same id goes), a superseded or retired one is
+  taken out, and a new one goes after the last of the section's, else
+  after what the section holds; the section is added at the end of the
+  file when there is none, and AGENTS.md is made when there is none. Your
+  own lines, and a line of an id ohjaa does not know, stay as they are.
+  Writing the same nodes again changes nothing. What ohjaa writes into a
+  repository names no tool: not its marks, its words, its branch, its
+  commit or (but in a private repository's pull request, which also says
+  why each was accepted) its pull request.
+- **The pull request.** From the clone, never in your checkout: `gh repo
+  view` (its visibility and default branch), `gh pr list` (an open pull
+  request of the lessons, from a branch `agents-md-lessons/…`, gets the next
+  commit, on its tip, never a force), `git fetch origin <branch>`, a
+  worktree off it in `~/.local/state/ohjaa/lessons/.work/`, `git commit`
+  (with your identity, and the repository's own hooks), `git push origin
+  HEAD:refs/heads/agents-md-lessons/<date>-<n>`, `gh pr create`, and the
+  worktree removed however it ends. One delivery at a time
+  (`lessons/lessons.lock`). `retire` and `confirm` of a node ohjaa holds
+  deliver the same way.
+- **When it cannot be delivered** (no remote named origin, an origin not on
+  GitHub, no gh, gh signed out, a fetch or push that fails), the decision
+  stands: it is said, `delivery.json` keeps why, `ohjaa list` shows it under
+  the node, the briefing marks it, and `ohjaa lessons publish` delivers it
+  once that is fixed. It is never dropped.
+
+**A repository that is not private** (public, or internal) gets nothing
+that names what is. Everything it would be sent is checked first against a
+deny list built from your private context, asked of gh once a run: the names
+of every private repository you can see (GitHub's REST `user/repos`,
+`visibility=private`, as owner, collaborator and organisation member, every
+page), your home path (anywhere), your home folder's name, and your GitHub
+login and name, as words, letter case not told apart. What that repository's
+own URL says is no secret in it: its name, and its owner. A line that names
+something on the list is held back and said, with what it named, and its
+text goes nowhere: at `accept`, the accept is refused and the proposal stays
+waiting; at `publish`, the node waits where it is. The rest of what would
+be sent (the section's heading and intro when they are new, the commit
+message, and for a new pull request its branch, title and body) is checked
+too, and a match there stops the delivery whole. No why is ever sent to a
+repository that is not private.
+
+**The briefing** reads the launch repository's AGENTS.md as checked out
+(the file, no git). The nodes it holds are left to it, but a flagged one,
+and one line says so:
+
+```
+This repository's lessons (14 nodes) are not repeated here: its AGENTS.md (/Users/you/projects/widget/AGENTS.md) holds them, in its ## Lessons section.
+```
+
+Until a line is on the checked-out commit, the briefing carries the node,
+marked beside its id: `pending PR <url>`, `not delivered: <why>`, `held
+back from AGENTS.md: <why>`, or, for one still untracked in the checkout,
+`not yet in AGENTS.md`. A scoped repository's knowledge is carried as before.
+`ohjaa list` says, under each current repo node, where it is.
+
+**Nodes accepted before** sit untracked in `<repo>/.ohjaa/knowledge/`.
+`ohjaa lessons publish [<repo>…]` delivers them, and every accepted node not
+delivered: per repository, one pull request; once it is open, each file
+moves out of the checkout into ohjaa's state, recorded in `delivery.json`
+with where it came from and the pull request's URL, and an emptied
+`.ohjaa/` is removed. A held one stays where it is. Without a repository
+named, it takes each repository under the roots with a `.ohjaa/knowledge/`,
+and each with accepted lessons not delivered. `--dry-run` says, per
+repository, its visibility, each line it would add and what a line would
+name, from AGENTS.md as last fetched there, and fetches, writes and sends
+nothing. It exits 4 while anything is not delivered.
+
 ## The fleet and the perimeter
 
 `ohjaa system` derives what every tool in the fleet is, from each repo's own
@@ -1890,6 +1992,10 @@ contract's; a run of the repository's own contract is still its own.
 `cargo test` runs against stand-ins for sykli, toimija, vessa, gh and the
 agents, in a sandboxed home, never the person's own. With `cargo fmt --check`
 and `cargo clippy --all-targets -- -D warnings`, it is what CI runs.
+`tests/lessons.rs` delivers repo knowledge to a local bare repository as the
+remote: git's `insteadOf` turns the GitHub URL the checkout names into it,
+and `GIT_ALLOW_PROTOCOL=file` keeps git off the network should that fail; a
+person's accept and retire run on a pty of their own.
 
 Tests that need the real tools are ignored by default, since CI's runners
 have none of them:

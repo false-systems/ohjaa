@@ -789,6 +789,53 @@ fn a_public_repository_gets_no_line_that_names_something_private() {
         .checkout
         .join(".ohjaa/knowledge/widget-uses-rust.md")
         .exists());
+    // `list` says why it waits.
+    let mut list = world.ohjaa(&world.checkout);
+    list.arg("list");
+    let (listed, _, _) = world.run(&mut list);
+    let held = listed
+        .lines()
+        .skip_while(|line| !line.contains("widget-calls-secret"))
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        held.contains("held back") && held.contains("`secret-thing`"),
+        "{listed}"
+    );
+}
+
+#[test]
+fn a_scoped_repositorys_lessons_are_carried_though_its_agents_md_holds_them() {
+    let world = World::new("scoped");
+    world.legacy("widget-uses-rust", "decision", "Widget code is Rust.");
+    let (stdout, stderr, code) = world.publish(&[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let branch = world.lessons_branch();
+    world.git(
+        &world.dir,
+        &[
+            "--git-dir",
+            world.remote.to_str().unwrap(),
+            "update-ref",
+            "refs/heads/main",
+            &format!("refs/heads/{branch}"),
+        ],
+    );
+    world.git(&world.checkout, &["pull", "-q", "--ff-only"]);
+    // Briefed from elsewhere, with the repository in scope: the agent is not
+    // working there, and need not read its AGENTS.md.
+    let mut brief = world.ohjaa(&world.dir);
+    brief.args([
+        "brief",
+        "--knowledge-only",
+        "--scope",
+        world.checkout.to_str().unwrap(),
+    ]);
+    let (briefing, stderr, code) = world.run(&mut brief);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(briefing.contains("Widget code is Rust."), "{briefing}");
+    assert!(briefing.contains("in AGENTS.md too"), "{briefing}");
 }
 
 #[test]

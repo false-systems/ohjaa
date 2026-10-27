@@ -29,8 +29,14 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   toimija derives — shell out to its CLI and consume its `--json`.
 - **Ohjaa stores two things.** Knowledge, as knowledge-node.v1 files in the
   scope directories plus proposals waiting for a person, is the truth and lives
-  in git: ours and repo in their repositories, mine and machine in the home's
-  own history. The **session log**, in redb at `$XDG_STATE_HOME/ohjaa/sessions.redb`,
+  in git: ours in its repository, repo in the repository's own AGENTS.md (its
+  `## Lessons`, one line per node, through a pull request ohjaa opens), mine
+  and machine in the home's own history. Each accepted repo node is kept with
+  its why, and where its line went, in `$XDG_STATE_HOME/ohjaa/lessons/<clone>/`
+  (the nodes and `delivery.json`; `<clone>` the clone's common git directory),
+  beside the worktrees a delivery writes in while it runs (`lessons/.work/`)
+  and its lock (`lessons.lock`): knowledge, not a cache. The **session log**,
+  in redb at `$XDG_STATE_HOME/ohjaa/sessions.redb`,
   is machine-local history of what each session was briefed, read back,
   committed, finished and handed over, plus explicitly attributed usage receipts, the ids of the agent's own sessions found at leaving in its transcripts (read, never written) and those its environment claimed from inside the session while it was open (the agent's testimony, never outranking what was found), and references to the validations `ohjaa gate` and ohjaa itself requested (sykli's run ids and receipts, never outcomes) — deleting it loses no knowledge, it never
   blocks a launch, and a broken log is reported, never replaced. Beside it,
@@ -100,8 +106,12 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   repository but what git keeps beside it: the clone's one validation
   checkout, a linked worktree kept in ohjaa's state
   directory (`$XDG_STATE_HOME/ohjaa/integrated/<clone>/checkout`, whose admin
-  folder git keeps in the clone's `.git/worktrees/`). No file, hook or config
-  of a repository is written, and
+  folder git keeps in the clone's `.git/worktrees/`), and, while repo
+  knowledge is delivered, a worktree off the remote's branch
+  (`$XDG_STATE_HOME/ohjaa/lessons/.work/`), removed once its branch is pushed.
+  No file, hook or config of a repository's checkout is written; `ohjaa
+  lessons publish` takes out of it the `.ohjaa/knowledge/` files a person
+  accepted before, once they are in a pull request, and
   the dispatcher always runs a repository's own hooks after observing.
 - **Observe, mark and flag; never refuse for the workflow.** A push to an
   entry's branch is handed to sykli and, when sykli does not prove it,
@@ -118,9 +128,15 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   and handover (`ohjaa handover`). Imported usage is separately labelled source
   testimony; it never becomes observed work or authoritative billing.
 - **Agents propose; only a person makes Knowledge current**, retires it or
-  rejects it. Shared Knowledge (ours, repo) is reviewed in a pull request
-  before any agent reads it. A proposal never lands in a shared repository by
-  itself.
+  rejects it. Ours is reviewed in a pull request before any agent reads it.
+  Repo knowledge a person accepts goes into the repository's AGENTS.md
+  through a pull request ohjaa opens and the person merges; until its line is
+  on the checked-out commit, the briefing carries it, marked. What ohjaa
+  writes into a repository names no tool, and a repository that is not
+  private is sent nothing that names what is (the person's private
+  repositories, home path, account, login or name): a line that would is held
+  back, anything else that would stops the delivery, and no why is sent. A
+  proposal never lands in a shared repository by itself.
 - **Cross-repo yes, messaging no.** Permanently refused: request/response
   between agents, presence, and dispatch (assigning work to an agent).
   Knowledge is not a message — it carries its time, its why and whose it is. A
@@ -128,12 +144,17 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   briefing, never a message to a particular agent. The human view (`ohjaa
   line`, `ohjaa digest`) is a record a person reads at their own terminal,
   never a notification.
-- **Network only through `gh` and the drafter** — in `ohjaa intake` (review
-  comments, drafting), when a session leaves (its branch's pull request,
-  bounded, recorded as unknown when gh cannot say), and in `ohjaa collect`
-  (one search for the pull requests of the entries' owners, at most two
-  calls). Every other command works from the filesystem and local CLIs, and
-  `ohjaa line` starts no git process either.
+- **Network only through `gh`, the drafter and, to deliver repo knowledge,
+  the repository's origin** — in `ohjaa intake` (review comments, drafting),
+  when a session leaves (its branch's pull request, bounded, recorded as
+  unknown when gh cannot say), in `ohjaa collect` (one search for the pull
+  requests of the entries' owners, at most two calls), and after a person's
+  decision on repo knowledge and in `ohjaa lessons publish` (gh: the
+  repository's visibility, the person's private repositories and name once a
+  run, its open lessons pull request, `pr create`; git: one fetch and one push
+  of its origin; a dry run fetches and pushes nothing). Every other command
+  works from the filesystem and local CLIs, and `ohjaa line` starts no git
+  process either.
 - Failed coverage is never rendered as an empty result. If a scan could not
   look, it says so and exits non-zero.
 

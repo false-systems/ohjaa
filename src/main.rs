@@ -187,7 +187,9 @@ enum Cmd {
         #[arg(long)]
         list: bool,
     },
-    /// Make a proposal current. A person only.
+    /// Make a proposal current. A person only. A repo proposal's line then
+    /// goes into its repository's AGENTS.md, through a pull request ohjaa
+    /// opens (`ohjaa lessons publish` delivers it later when it cannot now).
     Accept { id: String },
     /// Drop a proposal. A person only.
     Reject { id: String },

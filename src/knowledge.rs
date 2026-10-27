@@ -1580,6 +1580,45 @@ mod tests {
     }
 
     #[test]
+    fn a_successor_takes_the_untracked_node_it_supersedes_out_of_the_checkout() {
+        let sandbox = Sandbox::new("supersede-untracked");
+        let root = sandbox.dirs.repo_root.clone().unwrap();
+        let untracked = repo_knowledge(&root);
+        std::fs::create_dir_all(&untracked).unwrap();
+        let old = Node {
+            id: "old-way".to_owned(),
+            kind: Kind::Decision,
+            status: Status::Current,
+            as_of: date("2026-09-01"),
+            origin: vec!["accepted before".to_owned()],
+            supersedes: Vec::new(),
+            refines: None,
+            holds_while: Vec::new(),
+            body: "The old way.".to_owned(),
+        };
+        std::fs::write(untracked.join("old-way.md"), fk::to_text(&old)).unwrap();
+        let mut successor = sandbox.proposal(Scope::Repo, "new-way");
+        successor.supersedes = vec!["old-way".to_owned()];
+        sandbox.propose(successor).unwrap();
+
+        let outcome = accept(&sandbox.dirs, "new-way", date("2026-09-24")).unwrap();
+        let accepted = accepted_dir(&sandbox.dirs.state, &root);
+        assert!(
+            !untracked.join("old-way.md").exists(),
+            "out of the checkout"
+        );
+        assert!(outcome.removed.contains(&untracked.join("old-way.md")));
+        assert!(outcome.written.contains(&accepted.join("old-way.md")));
+        let loaded = load(&sandbox.dirs).unwrap();
+        assert_eq!(
+            loaded.get("old-way").unwrap().node.status,
+            Status::Superseded
+        );
+        assert_eq!(loaded.get("new-way").unwrap().node.status, Status::Current);
+        assert_eq!(outcome.repo.as_deref(), Some(root.as_path()));
+    }
+
+    #[test]
     fn retire_keeps_the_node_and_its_why() {
         let sandbox = Sandbox::new("retire");
         sandbox
