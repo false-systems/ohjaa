@@ -79,18 +79,26 @@ fn kill_group(child: &mut std::process::Child) {
 /// Run `command` with `input` on stdin, killing it and everything it started
 /// once `timeout` has passed.
 pub fn run(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
+    command.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    run_as_given(command, input, timeout)
+}
+
+/// [`run`], with `stdin` (a lock, [`FileLock::as_stdin`]) for its stdin.
+pub fn run_with_stdin(command: &mut Command, stdin: Stdio, timeout: Duration) -> Result<Output> {
+    command.stdin(stdin);
+    run_as_given(command, None, timeout)
+}
+
+fn run_as_given(command: &mut Command, input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
     let program = command.get_program().to_string_lossy().into_owned();
     if cancelled() {
         anyhow::bail!("{program} was not started: interrupted");
     }
-    command
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     own_group(command);
     let mut child = command
         .spawn()
@@ -466,36 +474,15 @@ pub struct FileLock {
 }
 
 impl FileLock {
-    /// Have the process `command` starts hold this lock too, for as long as
-    /// it runs: its copy of the descriptor stays open across its exec (only
-    /// in the child is close-on-exec cleared). The lock is then let go only
-    /// once this process and that one have both ended, so what it does under
-    /// the lock is never cut loose by this process being killed: a commit
-    /// whose ohjaa is killed goes on (it runs in a process group of its own)
-    /// and still holds the lock until it is done. The caller keeps this lock
-    /// until `command` is spawned.
-    pub fn held_by(&self, command: &mut Command) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd as _;
-            use std::os::unix::process::CommandExt as _;
-            let fd = self._file.as_raw_fd();
-            // SAFETY: only fcntl(2), which is async-signal-safe, runs in the
-            // child between fork and exec, on its copy of a descriptor that
-            // stays open until the command is spawned (the caller keeps the
-            // lock until then).
-            unsafe {
-                command.pre_exec(move || {
-                    let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = command;
+    /// This lock as the stdin of a process ohjaa starts ([`run_with_stdin`]):
+    /// a copy of the same open file, so that process holds the lock too, for
+    /// as long as it runs, and it is let go only once both have ended. What
+    /// that process does under the lock is then never cut loose by ohjaa being
+    /// killed. Only its stdin holds it: what it starts with a stdin of its
+    /// own (git gives its hooks /dev/null, a daemon closes it) does not. The
+    /// file is empty and open to read, so a read from it is at its end.
+    pub fn as_stdin(&self) -> std::io::Result<Stdio> {
+        Ok(Stdio::from(self._file.try_clone()?))
     }
 }
 
@@ -509,6 +496,7 @@ pub fn lock_file(path: &std::path::Path, wait: Duration) -> Result<FileLock, Str
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
+        .read(true)
         .write(true)
         .open(path)
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;

@@ -387,6 +387,17 @@ pub fn lock(home: &Path) -> Option<process::FileLock> {
     match taken {
         Ok(lock) => Some(lock),
         Err(why) => {
+            // Its holder is another ohjaa, or the git that one runs here.
+            let why = if why.contains("held by another") {
+                format!(
+                    "{} is still held after {}s, by another ohjaa's change to the home (that \
+                     ohjaa, or the git it runs there)",
+                    path.display(),
+                    LOCK_WAIT.as_secs()
+                )
+            } else {
+                why
+            };
             eprintln!(
                 "ohjaa: warning: {why}; going on without the home's lock, so this change may \
                  share a commit with another"
@@ -489,12 +500,44 @@ const REPOSITORY_VARS: &[&str] = &[
     "GIT_PREFIX",
 ];
 
-/// `git <args>` in the home, unsigned and with no automatic maintenance (a
-/// commit would start one more git, detached, to outlive ohjaa); with
-/// `repository`, on the home's own repository whatever git would find from
-/// there (an enclosing dotfiles repository, say). It holds the home's lock
-/// too, when ohjaa holds it ([`process::FileLock::held_by`]): a git that
-/// outlives a killed ohjaa still commits under it.
+/// What the home's git is run with, every time, so that nothing it can start
+/// beside itself outlives it: the home's lock is held by that git
+/// ([`home_git`]), and a process left running would hold up every later
+/// change to the home. Nothing here changes what is committed.
+const HOME_GIT: &[&str] = &[
+    // No signing: gpg starts its agent, which lives on, and a prompt must
+    // not hold up a decision. Nothing verifies a local history.
+    "commit.gpgsign=false",
+    // No fsmonitor: git's own daemon (`core.fsmonitor=true`) detaches and
+    // lives on, and a command there is run with git's stdin, the lock.
+    "core.fsmonitor=false",
+    // No hook from a hooks folder: the home's own, one a template copied,
+    // or one git's config names. (The home is made with no template.)
+    "core.hooksPath=/dev/null",
+    // No automatic gc or maintenance, which run detached by default
+    // (gc.autoDetach, maintenance.autoDetach). Turned off, not kept in the
+    // foreground: a history this small never needs either, and a run in the
+    // foreground would hold the lock for as long as it takes.
+    "gc.auto=0",
+    "maintenance.auto=false",
+    // No hook from git's config (`hook.<name>.command`) for any event an
+    // init, an add or a commit fires, where git has this switch (after
+    // 2.54). An older git runs such a hook with /dev/null as its stdin, so
+    // nothing it leaves holds the lock.
+    "hook.pre-commit.enabled=false",
+    "hook.prepare-commit-msg.enabled=false",
+    "hook.commit-msg.enabled=false",
+    "hook.post-commit.enabled=false",
+    "hook.post-index-change.enabled=false",
+    "hook.reference-transaction.enabled=false",
+];
+
+/// `git <args>` in the home, with [`HOME_GIT`]; with `repository`, on the
+/// home's own repository whatever git would find from there (an enclosing
+/// dotfiles repository, say). It holds the home's lock too, when ohjaa
+/// holds it, as its stdin ([`process::FileLock::as_stdin`]): a git that
+/// outlives a killed ohjaa still commits under it, and what git starts with
+/// a stdin of its own does not hold it.
 fn home_git(
     home: &Path,
     args: &[&str],
@@ -502,9 +545,6 @@ fn home_git(
     lock: Option<&process::FileLock>,
 ) -> Result<()> {
     let mut command = Command::new("git");
-    if let Some(lock) = lock {
-        lock.held_by(&mut command);
-    }
     if repository {
         command
             .arg("--git-dir")
@@ -512,18 +552,21 @@ fn home_git(
             .arg("--work-tree")
             .arg(home);
     }
-    for setting in [
-        "commit.gpgsign=false",
-        "maintenance.auto=false",
-        "gc.auto=0",
-    ] {
+    for setting in HOME_GIT {
         command.args(["-c", setting]);
     }
     command.args(args).current_dir(home);
     for var in REPOSITORY_VARS {
         command.env_remove(var);
     }
-    let output = process::run(&mut command, None, process::LOCAL).context("cannot run git")?;
+    let output = match lock {
+        Some(lock) => {
+            let stdin = lock.as_stdin().context("cannot give git the home's lock")?;
+            process::run_with_stdin(&mut command, stdin, process::LOCAL)
+        }
+        None => process::run(&mut command, None, process::LOCAL),
+    }
+    .context("cannot run git")?;
     if !output.status.success() {
         // Named by its subcommand, after any `-c <setting>`.
         let mut named = args;
@@ -557,7 +600,8 @@ pub fn commit(home: &Path, message: &str, lock: Option<&process::FileLock>) -> R
     if !dot_git.is_file() && !dot_git.join("HEAD").exists() {
         std::fs::create_dir_all(home)
             .with_context(|| format!("cannot create {}", home.display()))?;
-        home_git(home, &["init", "-q"], false, lock)?;
+        // No template (`init.templateDir`): no hook is copied in.
+        home_git(home, &["init", "-q", "--template="], false, lock)?;
     }
     let excludes =
         keep_out_strays(home)?.map(|file| format!("core.excludesFile={}", file.display()));

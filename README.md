@@ -114,9 +114,17 @@ identity of delivered repo nodes; older records without that identity still read
   - One change at a time: each decision (its write, its commit and the
     agents' block below), apply and adopt holds the home's lock
     (`.git/ohjaa.lock`), so decisions made at once are a commit each, in turn.
-    The home's git holds it too, for as long as it runs: an ohjaa killed
-    while it commits leaves its git to finish (it runs in a process group of
-    its own), and the next change waits for that git, not only for the ohjaa.
+    The home's git holds it too, for as long as it runs (the lock is its
+    stdin): an ohjaa killed while it commits leaves its git to finish (it
+    runs in a process group of its own), and the next change waits for that
+    git, not only for the ohjaa. Nothing that git could start beside itself
+    is left running to hold the lock after it: the home's git runs no hook
+    (`core.hooksPath=/dev/null`, `hook.<event>.enabled=false` where git has
+    it, and the home is made with no template), no fsmonitor
+    (`core.fsmonitor=false`), no automatic gc or maintenance, and no
+    signing. A hook git's config defines by name (`hook.<name>.command`)
+    still runs under git 2.54, which has no switch for all of them, but git
+    gives it /dev/null for its stdin, so nothing it leaves holds the lock.
   - Only what ohjaa keeps there is committed: `mine/`, `machine/`, `repos/`,
     `git/`, `roots`, `applied.toml`, `ours` and `drafter`, by an allowlist in
     the repository's own `.git/info/exclude` (the home holds no `.gitignore`).
