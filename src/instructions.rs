@@ -10,13 +10,16 @@
 //! |             | `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`                |
 //! | opencode    | `$XDG_CONFIG_HOME` (else `~/.config`)`/opencode/AGENTS.md`        |
 //!
-//! ohjaa writes only inside its marked block (the one `brief --write`
+//! ohjaa writes only inside its marked block (the kind `brief --write`
 //! writes, opened by [`knowledge::INSTRUCTIONS_BEGIN`]), never the text
 //! around it, and never creates a file: an agent whose file does not exist is
 //! said so. A file inside a git repository gets no block either, since one
-//! person's knowledge never goes into a file a repository shares. `ohjaa
-//! apply` adds the block, `apply --undo` takes it out, and each decision
-//! rewrites it where it is (a block a person took out stays out).
+//! person's knowledge never goes into a file a repository shares, and a
+//! block apply did not write (`brief --write`'s, a person's) is theirs: left
+//! as it is, and said. `ohjaa apply` adds the block, `apply --undo` takes it
+//! out, and each decision rewrites it where it is (a block a person took out
+//! stays out). Each decision does so under the home's lock
+//! ([`home::lock`]), so the block holds what was last decided.
 
 use std::path::{Path, PathBuf};
 
@@ -131,13 +134,14 @@ pub fn sync() -> Vec<String> {
             continue;
         };
         match rewrite(&file, &compact) {
-            Ok(true) => said.push(format!(
+            Ok(Rewrite::Rewritten) => said.push(format!(
                 "rewrote the knowledge block in {} ({}'s own instructions; {})",
                 file.display(),
                 target.agent,
                 compact.summary()
             )),
-            Ok(false) => {}
+            Ok(Rewrite::Theirs) => said.push(left_theirs(&file)),
+            Ok(Rewrite::Unchanged) => {}
             Err(error) => eprintln!(
                 "ohjaa: warning: the knowledge block in {} is not rewritten: {error:#}",
                 file.display()
@@ -147,13 +151,31 @@ pub fn sync() -> Vec<String> {
     said
 }
 
-/// The block rewritten in `file` if it holds one and it differs; whether
-/// it was. A file inside a repository is never written.
-fn rewrite(file: &Path, compact: &Compact) -> Result<bool> {
+/// What is said of a block apply did not write, wherever it is left.
+pub fn left_theirs(file: &Path) -> String {
+    format!(
+        "left the knowledge block in {}: apply did not write it (`ohjaa brief --write` or the \
+         person did), so it is theirs",
+        file.display()
+    )
+}
+
+enum Rewrite {
+    Rewritten,
+    Unchanged,
+    /// A block apply did not write: the person's, left as it is.
+    Theirs,
+}
+
+/// The block rewritten in `file` if it holds the one apply wrote and it
+/// differs. A file inside a repository is never written.
+fn rewrite(file: &Path, compact: &Compact) -> Result<Rewrite> {
     let now =
         std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
-    if !knowledge::has_block(&now)? {
-        return Ok(false);
+    match knowledge::held(&now)? {
+        knowledge::Held::None => return Ok(Rewrite::Unchanged),
+        knowledge::Held::Other => return Ok(Rewrite::Theirs),
+        knowledge::Held::Applied => {}
     }
     if let Some(root) = inside_repository(file) {
         anyhow::bail!(
@@ -164,10 +186,10 @@ fn rewrite(file: &Path, compact: &Compact) -> Result<bool> {
     }
     let (new, _) = knowledge::with_block(&now, knowledge::INSTRUCTIONS_BEGIN, &compact.text)?;
     if new == now {
-        return Ok(false);
+        return Ok(Rewrite::Unchanged);
     }
     home::write_file(file, &new, None)?;
-    Ok(true)
+    Ok(Rewrite::Rewritten)
 }
 
 #[cfg(test)]

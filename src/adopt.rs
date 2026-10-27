@@ -118,6 +118,8 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
         );
         return Ok(REFUSED);
     }
+    // What adopt writes and commits is one change to the home.
+    let _lock = home::lock(&home);
     // The env a derived gate gives cargo tasks: KATANA D10's lines, only
     // when every sykli that runs the gate expands `${worktree_cache}`.
     let expands = sykli_expands_worktree_cache(&home);

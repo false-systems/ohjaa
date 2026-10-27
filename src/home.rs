@@ -339,6 +339,91 @@ pub fn unset_global(key: &str, value: Option<&str>) -> Result<()> {
     }
 }
 
+/// How long a change to the home waits for another ohjaa's to finish.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The home's lock, in its repository's own folder (made, when missing,
+/// before the repository is): one ohjaa at a time changes the home and
+/// commits it, so each decision, apply and adopt is one commit holding its
+/// own change, and the agents' block is rendered from what was just decided.
+/// Not taken in time, it is said and the change goes on without it: nothing
+/// waits on another ohjaa for good.
+pub fn lock(home: &Path) -> Option<process::FileLock> {
+    let dot_git = home.join(".git");
+    let path = if dot_git.is_file() {
+        home.join(".ohjaa.lock")
+    } else {
+        dot_git.join("ohjaa.lock")
+    };
+    match process::lock_file(&path, LOCK_WAIT) {
+        Ok(lock) => Some(lock),
+        Err(why) => {
+            eprintln!(
+                "ohjaa: warning: {why}; going on without the home's lock, so this change may \
+                 share a commit with another"
+            );
+            None
+        }
+    }
+}
+
+const EXCLUDE_BEGIN: &str = "# >>> ohjaa: the home's history holds only what ohjaa keeps here";
+const EXCLUDE_END: &str = "# <<< ohjaa";
+/// Everything is left out, then what ohjaa keeps in the home is let in
+/// (the knowledge scopes, the entries, the generated git config, the roots,
+/// apply's record, and the `ours` and `drafter` settings), and what an
+/// editor, the Finder or a half-done write leaves among those is left out
+/// again.
+const EXCLUDE: &[&str] = &[
+    "/*",
+    "!/mine/",
+    "!/machine/",
+    "!/repos/",
+    "!/git/",
+    "!/roots",
+    "!/applied.toml",
+    "!/ours",
+    "!/drafter",
+    "*.tmp",
+    ".*.ohjaa-*",
+    ".*.sw?",
+    "*~",
+    ".#*",
+    "\\#*#",
+    ".DS_Store",
+];
+
+/// The allowlist in the home's repository's own `info/exclude` (git keeps
+/// it untracked, so the home needs no file of its own), as a marked block
+/// beside anything else there. A home whose `.git` is a file (a worktree)
+/// keeps its own excludes.
+fn keep_out_strays(home: &Path) -> Result<()> {
+    let dot_git = home.join(".git");
+    if !dot_git.is_dir() {
+        return Ok(());
+    }
+    let path = dot_git.join("info").join("exclude");
+    let now = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let block = format!("{EXCLUDE_BEGIN}\n{}\n{EXCLUDE_END}\n", EXCLUDE.join("\n"));
+    let new = match (now.find(EXCLUDE_BEGIN), now.find(EXCLUDE_END)) {
+        (Some(start), Some(end)) if end > start => {
+            let after = &now[end + EXCLUDE_END.len()..];
+            let after = after.strip_prefix('\n').unwrap_or(after);
+            format!("{}{block}{after}", &now[..start])
+        }
+        _ if now.is_empty() || now.ends_with('\n') => format!("{now}{block}"),
+        _ => format!("{now}\n{block}"),
+    };
+    if new != now {
+        write_file(&path, &new, None)?;
+    }
+    Ok(())
+}
+
 /// The variables that would point git at another repository than the home.
 const REPOSITORY_VARS: &[&str] = &[
     "GIT_DIR",
@@ -386,9 +471,11 @@ fn home_git(home: &Path, args: &[&str], repository: bool) -> Result<()> {
     Ok(())
 }
 
-/// The home's history: everything in the home, committed as one commit with
-/// `message`. The home is a local git repository (no remote; ohjaa never
-/// pushes), made by its first commit unless the home already is one. A
+/// The home's history: what ohjaa keeps in the home (the allowlist in its
+/// `info/exclude`, never a stray file), committed as one commit with
+/// `message`, under the home's [`lock`], which the caller holds. The home is
+/// a local git repository (no remote; ohjaa never pushes), made by its first
+/// commit unless the home already is one. A
 /// commit is the person's, with the identity any commit of theirs takes from
 /// git's config, and never signed: nothing verifies a local history, and a
 /// signing prompt must not hold up a decision. Two git processes (`add -A`,
@@ -396,11 +483,14 @@ fn home_git(home: &Path, args: &[&str], repository: bool) -> Result<()> {
 /// needs git's maintenance. A failure is the caller's to say; what was
 /// changed stands either way.
 pub fn commit(home: &Path, message: &str) -> Result<()> {
-    if !home.join(".git").exists() {
+    let dot_git = home.join(".git");
+    // A `.git` folder without HEAD holds only the home's lock: no repository yet.
+    if !dot_git.is_file() && !dot_git.join("HEAD").exists() {
         std::fs::create_dir_all(home)
             .with_context(|| format!("cannot create {}", home.display()))?;
         home_git(home, &["init", "-q"], false)?;
     }
+    keep_out_strays(home)?;
     home_git(home, &["add", "-A"], true)?;
     home_git(
         home,

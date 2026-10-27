@@ -565,6 +565,10 @@ pub fn apply(
         );
         return Ok(REFUSED);
     }
+    // Past every refusal: what apply plans, makes and commits is one change
+    // to the home, never interleaved with a decision's or an adopt's. A dry
+    // run writes nothing, the lock's file included.
+    let _lock = (!options.dry_run).then(|| home::lock(&home)).flatten();
     if !configured {
         if repos.is_empty() {
             eprintln!(
@@ -831,17 +835,42 @@ fn instruction_steps() -> Result<Vec<Step>> {
             );
             continue;
         }
-        let now = read_or_empty(&file)?;
-        let (new, placed) =
-            crate::knowledge::with_block(&now, crate::knowledge::INSTRUCTIONS_BEGIN, &compact.text)
-                .with_context(|| format!("not writing {}", file.display()))?;
-        if new == now {
-            continue;
-        }
-        let (verb, what) = if crate::knowledge::has_block(&now)? {
-            (("rewrite", "rewrote"), "in")
-        } else {
-            (("write", "wrote"), "into")
+        // A file that cannot be read, or whose block cannot be told, is said
+        // and skipped: one agent's file never stops the rest of apply.
+        let planned = read_or_empty(&file).and_then(|now| {
+            let held = crate::knowledge::held(&now)?;
+            let (new, placed) = crate::knowledge::with_block(
+                &now,
+                crate::knowledge::INSTRUCTIONS_BEGIN,
+                &compact.text,
+            )?;
+            Ok((now, held, new, placed))
+        });
+        let (now, held, new, placed) = match planned {
+            Ok(planned) => planned,
+            Err(error) => {
+                eprintln!(
+                    "ohjaa apply: warning: not writing {} ({}'s own instructions): {error:#}; \
+                     the rest is applied",
+                    file.display(),
+                    target.agent
+                );
+                continue;
+            }
+        };
+        let (verb, what) = match held {
+            crate::knowledge::Held::Other => {
+                println!(
+                    "ohjaa apply: {} holds a knowledge block apply did not write (`ohjaa brief \
+                     --write`'s, or the person's): it is theirs, so apply leaves it and writes \
+                     none there (take it out, then apply again, for apply's)",
+                    file.display()
+                );
+                continue;
+            }
+            _ if new == now => continue,
+            crate::knowledge::Held::Applied => (("rewrite", "rewrote"), "in"),
+            crate::knowledge::Held::None => (("write", "wrote"), "into"),
         };
         let key = target.key;
         let record = vec![
@@ -878,6 +907,7 @@ fn as_it_was(text: String, newline: bool) -> String {
 /// what it generated. `repos/` entries and `roots` stay.
 pub fn undo(dry_run: bool) -> Result<i32> {
     let home = std::path::absolute(home::ohjaa_home()?)?;
+    let _lock = (!dry_run).then(|| home::lock(&home)).flatten();
     let record = read_record(&home)?;
     let recorded = |key: &str| record.get(key).cloned();
     let yes = |key: &str| record.get(key).is_some_and(|value| value == "true");
@@ -970,9 +1000,12 @@ pub fn undo(dry_run: bool) -> Result<i32> {
         ));
     }
 
-    // The knowledge block, from each agent's own file: the one apply wrote
-    // into (recorded), and the one the agent reads now.
-    let mut files: Vec<(PathBuf, crate::knowledge::Placed)> = Vec::new();
+    // The knowledge block apply wrote, from each agent's own file: the one
+    // it wrote into (recorded), and the one the agent reads now. A block apply
+    // did not write is the person's, and stays. The recorded file, unreadable
+    // as a whole, refuses undo, as any change it cannot take back exactly; any
+    // other is said and skipped.
+    let mut files: Vec<(PathBuf, crate::knowledge::Placed, bool)> = Vec::new();
     for target in crate::instructions::targets() {
         let key = target.key;
         let placed = crate::knowledge::Placed {
@@ -981,20 +1014,43 @@ pub fn undo(dry_run: bool) -> Result<i32> {
         };
         let recorded_file = recorded(&format!("instructions_{key}")).map(PathBuf::from);
         if let Some(file) = &recorded_file {
-            files.push((file.clone(), placed));
+            files.push((file.clone(), placed, true));
         }
         if let Some(file) = target
             .file
             .filter(|file| Some(file) != recorded_file.as_ref())
         {
-            files.push((file, crate::knowledge::Placed::IN_PLACE));
+            files.push((file, crate::knowledge::Placed::IN_PLACE, false));
         }
     }
-    for (file, placed) in files {
-        let now = read_or_empty(&file)?;
-        if let Some(without) = crate::knowledge::without_block(&now, placed)
-            .with_context(|| format!("not changing {}", file.display()))?
-        {
+    for (file, placed, recorded) in files {
+        let planned = read_or_empty(&file).and_then(|now| {
+            Ok(match crate::knowledge::held(&now)? {
+                crate::knowledge::Held::Applied => crate::knowledge::without_block(&now, placed)?,
+                crate::knowledge::Held::Other => {
+                    println!(
+                        "ohjaa apply --undo: {}",
+                        crate::instructions::left_theirs(&file)
+                    );
+                    None
+                }
+                crate::knowledge::Held::None => None,
+            })
+        });
+        let without = match planned {
+            Ok(without) => without,
+            Err(error) if recorded => {
+                return Err(error).with_context(|| format!("not changing {}", file.display()))
+            }
+            Err(error) => {
+                eprintln!(
+                    "ohjaa apply --undo: warning: not changing {}: {error:#}; the rest is undone",
+                    file.display()
+                );
+                None
+            }
+        };
+        if let Some(without) = without {
             steps.push(step(
                 ("remove", "removed"),
                 format!("the knowledge block from {}", file.display()),

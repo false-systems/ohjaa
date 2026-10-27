@@ -457,6 +457,35 @@ const BLOCK_PREFIX: &str = "<!-- ohjaa:knowledge begin";
 pub const INSTRUCTIONS_BEGIN: &str = "<!-- ohjaa:knowledge begin: mine and machine, written by \
      `ohjaa apply` and after each decision, removed by `ohjaa apply --undo`; edit the nodes \
      (`ohjaa list`), not this block -->";
+/// What every begin line apply writes starts with, whatever its words after:
+/// a block opened otherwise (`brief --write`'s, a person's) is not apply's.
+const INSTRUCTIONS_PREFIX: &str = "<!-- ohjaa:knowledge begin: mine and machine";
+
+/// Whose the generated block in a file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    /// No block.
+    None,
+    /// One apply wrote ([`INSTRUCTIONS_BEGIN`]).
+    Applied,
+    /// Another: `brief --write`'s, or one a person wrote. It is theirs.
+    Other,
+}
+
+/// Whose the generated block in `text` is (a broken one is refused).
+pub fn held(text: &str) -> Result<Held> {
+    Ok(match find_block(text)? {
+        None => Held::None,
+        Some(range)
+            if text[range.clone()]
+                .trim_start()
+                .starts_with(INSTRUCTIONS_PREFIX) =>
+        {
+            Held::Applied
+        }
+        Some(_) => Held::Other,
+    })
+}
 
 /// The generated block's lines in `text`: from the start of its begin line
 /// to the end of its end line (its newline too, when it has one). A marker
@@ -486,11 +515,6 @@ fn find_block(text: &str) -> Result<Option<std::ops::Range<usize>>> {
          fix it by hand"
             .to_owned(),
     )
-}
-
-/// Whether `text` holds the generated block (a broken one is refused).
-pub fn has_block(text: &str) -> Result<bool> {
-    Ok(find_block(text)?.is_some())
 }
 
 /// What went in around a block that was not there before, so that taking it
@@ -1475,6 +1499,17 @@ mod tests {
                 assert!(error.downcast_ref::<Refused>().is_some(), "{error}");
             }
         }
+    }
+
+    #[test]
+    fn a_block_is_applys_only_when_apply_opened_it() {
+        assert!(INSTRUCTIONS_BEGIN.starts_with(INSTRUCTIONS_PREFIX));
+        assert_eq!(held("# Mine\n").unwrap(), Held::None);
+        let (applied, _) = with_block("# Mine\n", INSTRUCTIONS_BEGIN, "x").unwrap();
+        assert_eq!(held(&applied).unwrap(), Held::Applied);
+        let briefed = write_block("# Mine\n", "x").unwrap();
+        assert_eq!(held(&briefed).unwrap(), Held::Other);
+        assert!(held(&format!("{applied}{applied}")).is_err());
     }
 
     fn located(scope: Scope, id: &str, kind: Kind, body: &str) -> Located {

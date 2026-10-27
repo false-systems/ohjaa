@@ -1491,8 +1491,21 @@ fn report(outcome: &Outcome) {
     }
 }
 
+/// The home's lock, held across a decision: its write, its commit and the
+/// agents' block, so decisions made at once are a commit each, in turn.
+fn decision_lock() -> Option<process::FileLock> {
+    match home::ohjaa_home() {
+        Ok(home) => home::lock(&home::absolute(home)),
+        Err(error) => {
+            eprintln!("ohjaa: warning: no home to lock: {error:#}");
+            None
+        }
+    }
+}
+
 fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     knowledge::require_person(action)?;
+    let _lock = decision_lock();
     let dirs = dirs()?;
     let today = knowledge::today();
     let (outcome, done) = match action {
@@ -1625,6 +1638,10 @@ fn cmd_review(list: bool) -> Result<i32> {
         std::io::stdout().flush()?;
         let answer = lines.next().transpose()?.unwrap_or_default();
         let id = &pending.node.id;
+        // Held for the decision, never while the person thinks.
+        let _lock = matches!(answer.trim(), "a" | "accept" | "r" | "reject")
+            .then(decision_lock)
+            .flatten();
         let result = match answer.trim() {
             "a" | "accept" => knowledge::accept(&dirs, id, today).map(|o| Some(("accept", o))),
             "r" | "reject" => knowledge::reject(&dirs, id).map(|o| Some(("reject", o))),
