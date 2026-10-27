@@ -1,6 +1,6 @@
 //! `ohjaa collect`: what the human view cannot work out while a terminal
 //! opens, gathered into one snapshot that `ohjaa line` and `ohjaa digest`
-//! read. Four parts, each asked once, at the same time:
+//! read. Three parts, each asked once, at the same time:
 //!
 //! - `local`: the marks on each entry's branch and the open sessions as ohjaa
 //!   finds them now (the marks' git and sykli, and `ps`), from
@@ -8,12 +8,13 @@
 //! - `github`: the pull requests updated in the entries' owners, one search
 //!   through `gh api graphql`, at most [`MAX_GH_CALLS`] calls;
 //! - `usage`: what vessa reads in the transcripts of the sessions ended
-//!   lately, joined by the agent's own session ids ohjaa found at leaving;
-//! - `fleet`: who is live, as toimija says ([`scan::scan_fleet`]).
+//!   lately, joined by the agent's own session ids ohjaa found at leaving.
 //!
 //! The session log and the proposals are not in it: the view reads them
-//! itself, as it speaks. Each part says when it was read and, when it could
-//! not be, why; a part that failed keeps what it held before, as of then.
+//! itself, as it speaks, and `ohjaa digest` asks for the fleet itself. Each
+//! part says when it was read, what it could not read, and, when it could
+//! not answer, why; a part that failed keeps what it held before, as of
+//! then, and so does a branch whose marks could not be read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -26,7 +27,7 @@ use serde_json::Value;
 
 use crate::knowledge::Dirs;
 use crate::sessions::{self, Check, Session};
-use crate::{home, intake, mark, process, report, scan, usage};
+use crate::{home, intake, mark, process, report, usage};
 
 pub const SCHEMA: &str = "ohjaa-collected.v1";
 
@@ -51,7 +52,6 @@ const SEARCH: &str = "query($q: String!, $after: String) {
         number title url createdAt closedAt mergedAt baseRefName
         author { login }
         mergedBy { login }
-        mergeCommit { oid }
         repository { nameWithOwner defaultBranchRef { name } }
       }
     }
@@ -83,41 +83,51 @@ pub struct Collected {
     /// By ohjaa session id.
     #[serde(default)]
     pub usage: Part<BTreeMap<String, Cost>>,
-    #[serde(default)]
-    pub fleet: Part<Vec<Live>>,
 }
 
-/// One source's answer, when it was read, and why not.
+/// One source's answer, when it was read, what it could not read, and why
+/// it did not answer.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Part<T> {
     /// When it last answered; `None`: never.
     pub as_of_ms: Option<i64>,
+    /// What it covers from: GitHub's and vessa's window start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_ms: Option<i64>,
     #[serde(default)]
     pub value: T,
     /// Why it did not answer this time: what it holds is as of `as_of_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// What it said beside its answer: a gap, a page it did not read.
+    /// What it could not read in an answer that otherwise stands: an entry
+    /// that could not be marked, a page not asked for. Never an all-clear.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub notes: Vec<String>,
+    pub gaps: Vec<String>,
 }
 
 impl<T: Clone> Part<T> {
-    fn read(answer: Result<(T, Vec<String>), String>, before: &Part<T>, now_ms: i64) -> Part<T> {
+    fn read(answer: Answer<T>, before: &Part<T>, now_ms: i64, from_ms: Option<i64>) -> Part<T> {
         match answer {
-            Ok((value, notes)) => Part {
+            Ok((value, gaps)) => Part {
                 as_of_ms: Some(now_ms),
+                from_ms,
                 value,
                 error: None,
-                notes,
+                gaps,
             },
             Err(why) => Part {
                 as_of_ms: before.as_of_ms,
+                from_ms: before.from_ms,
                 value: before.value.clone(),
                 error: Some(why),
-                notes: Vec::new(),
+                gaps: Vec::new(),
             },
         }
+    }
+
+    /// It did not answer, or could not read all it asked.
+    pub fn failed(&self) -> bool {
+        self.error.is_some() || !self.gaps.is_empty()
     }
 }
 
@@ -150,7 +160,10 @@ pub struct Branch {
     pub oldest: Option<String>,
     /// The walk stopped before a proven commit: more may lie below.
     pub more: bool,
-    /// Why it has no marks.
+    /// When its marks were last read: what it says is as of then.
+    #[serde(default)]
+    pub as_of_ms: Option<i64>,
+    /// Why its marks could not be read this time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -188,16 +201,12 @@ impl Pr {
 /// only when vessa priced all of it. An estimate, never a bill.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cost {
+    /// Input, output and cache writes.
     pub tokens: Option<u64>,
+    /// Said apart: most of a session's tokens are reads of its cache.
+    #[serde(default)]
+    pub cache_reads: Option<u64>,
     pub usd_micros: Option<u64>,
-}
-
-/// A session toimija says may still be working.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Live {
-    pub repo: String,
-    pub agent: String,
-    pub intent: String,
 }
 
 /// The last snapshot, unless there is none or it cannot be read as one.
@@ -223,29 +232,26 @@ pub fn write(dirs: &Dirs, collected: &Collected) -> Result<()> {
 
 /// Ask every source, each on its own thread, and keep what a failed one
 /// held before. `repos` are the git repositories under the roots (for the
-/// marks), `fleet` those toimija knows; GitHub and vessa are asked about
-/// what happened since `from_ms`.
+/// marks); GitHub and vessa are asked about what happened since `from_ms`.
 pub fn collect(
     dirs: &Dirs,
     repos: Result<Vec<PathBuf>, String>,
-    fleet: Result<Vec<PathBuf>, String>,
     from_ms: i64,
     now_ms: i64,
 ) -> Collected {
     let before = read(dirs).unwrap_or_default();
     let owners = owners();
+    let known = &before.local.value.branches;
     std::thread::scope(|scope| {
-        let local = scope.spawn(|| repos.map(|repos| local(dirs, &repos, now_ms)));
+        let local = scope.spawn(|| repos.map(|repos| local(dirs, &repos, known, now_ms)));
         let github = scope.spawn(|| github(&owners?, from_ms));
         let usage = scope.spawn(|| usage(dirs, from_ms));
-        let fleet = scope.spawn(|| fleet.map(|repos| live(&repos)));
         Collected {
             schema: SCHEMA.to_owned(),
             at_ms: now_ms,
-            local: Part::read(joined(local), &before.local, now_ms),
-            github: Part::read(joined(github), &before.github, now_ms),
-            usage: Part::read(joined(usage), &before.usage, now_ms),
-            fleet: Part::read(joined(fleet), &before.fleet, now_ms),
+            local: Part::read(joined(local), &before.local, now_ms, None),
+            github: Part::read(joined(github), &before.github, now_ms, Some(from_ms)),
+            usage: Part::read(joined(usage), &before.usage, now_ms, Some(from_ms)),
         }
     })
 }
@@ -259,13 +265,14 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, Answer<T>>) -> Answer<T> 
 }
 
 /// The marks and the open sessions, as `ohjaa report --marks` finds them;
-/// what it could not read is said beside them.
-fn local(dirs: &Dirs, repos: &[PathBuf], now_ms: i64) -> (Local, Vec<String>) {
+/// what it could not read is said beside them, and a branch whose marks
+/// could not be read keeps what `known` said of it.
+fn local(dirs: &Dirs, repos: &[PathBuf], known: &[Branch], now_ms: i64) -> (Local, Vec<String>) {
     let report = report::build_marks(dirs, repos, now_ms - report::WEEK_MS, now_ms);
     let branches = report
         .marks
         .iter()
-        .map(|(slug, marked)| branch(slug, marked))
+        .map(|(slug, marked)| branch(slug, marked, known, now_ms))
         .collect();
     let open = |pick: fn(&report::Untold) -> bool| {
         report
@@ -283,15 +290,26 @@ fn local(dirs: &Dirs, repos: &[PathBuf], now_ms: i64) -> (Local, Vec<String>) {
     (local, report.gaps)
 }
 
-fn branch(slug: &str, marked: &Result<mark::Marks, String>) -> Branch {
+/// An entry's branch now, or, when its marks cannot be read, as it was last
+/// read: a branch that failed stays failed until a read says otherwise.
+pub fn branch(
+    slug: &str,
+    marked: &Result<mark::Marks, String>,
+    known: &[Branch],
+    now_ms: i64,
+) -> Branch {
     let marks = match marked {
         Ok(marks) => marks,
         Err(why) => {
+            let last = known
+                .iter()
+                .find(|b| b.slug == slug && b.as_of_ms.is_some())
+                .cloned();
             return Branch {
                 slug: slug.to_owned(),
                 error: Some(why.clone()),
-                ..Branch::default()
-            }
+                ..last.unwrap_or_default()
+            };
         }
     };
     let unproven = marks.unproven();
@@ -305,6 +323,7 @@ fn branch(slug: &str, marked: &Result<mark::Marks, String>) -> Branch {
         unknown: count(|c| matches!(c, Check::Unverified { .. })),
         oldest: unproven.last().map(|w| w.commit.clone()),
         more: matches!(marks.ended, mark::Ended::Cap | mark::Ended::NotAsked),
+        as_of_ms: Some(now_ms),
         error: None,
     }
 }
@@ -335,12 +354,12 @@ fn github(owners: &[String], from_ms: i64) -> Result<(Vec<Pr>, Vec<String>), Str
     if owners.is_empty() {
         return Ok((
             Vec::new(),
-            vec!["the workflow home has no entries: no owner to ask GitHub about".to_owned()],
+            vec!["the workflow home has no entries, so no owner to ask GitHub about".to_owned()],
         ));
     }
     let search = search(owners, from_ms);
     let mut prs = Vec::new();
-    let mut notes = Vec::new();
+    let mut gaps = Vec::new();
     let mut after: Option<String> = None;
     for call in 1..=MAX_GH_CALLS {
         let found = gh_page(&search, after.as_deref())?;
@@ -353,8 +372,8 @@ fn github(owners: &[String], from_ms: i64) -> Result<(Vec<Pr>, Vec<String>), Str
             break;
         }
         if call == MAX_GH_CALLS {
-            notes.push(format!(
-                "{} pull requests were updated since {}; the {} updated last are kept",
+            gaps.push(format!(
+                "{} pull requests were updated since {}; only the {} updated last were read",
                 field("issueCount").as_u64().unwrap_or(0),
                 sessions::clock(from_ms),
                 prs.len()
@@ -366,7 +385,7 @@ fn github(owners: &[String], from_ms: i64) -> Result<(Vec<Pr>, Vec<String>), Str
             break;
         }
     }
-    Ok((prs, notes))
+    Ok((prs, gaps))
 }
 
 fn gh_page(search: &str, after: Option<&str>) -> Result<Value, String> {
@@ -467,16 +486,16 @@ fn usage(dirs: &Dirs, from_ms: i64) -> Result<(BTreeMap<String, Cost>, Vec<Strin
     }
     let answer: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("vessa usage --json printed no report: {error}"))?;
-    let mut notes = Vec::new();
+    let mut gaps = Vec::new();
     if code == Some(4) {
-        notes.push("vessa says its usage evidence is partial".to_owned());
+        gaps.push("vessa says its usage evidence is partial".to_owned());
     }
-    let read = read_usage(&answer, &mut notes)?;
+    let read = read_usage(&answer, &mut gaps)?;
     let costs = logged
         .iter()
         .map(|s| (s.id.clone(), cost_of(s, &read)))
         .collect();
-    Ok((costs, notes))
+    Ok((costs, gaps))
 }
 
 fn natives(session: &Session) -> impl Iterator<Item = &usage::NativeSession> {
@@ -492,10 +511,9 @@ fn has_transcript(native: &usage::NativeSession) -> bool {
     !native.testimony && native.source != usage::ENV_SOURCE && !native.source.is_empty()
 }
 
-/// What vessa read of one native session: its tokens, its estimate, and
-/// whether every entry was priced. `None`: its id is in vessa's answer twice,
-/// so it is no one's.
-type Read = BTreeMap<(String, String), Option<(Option<u64>, Option<u64>)>>;
+/// What vessa read of one native session, as a [`Cost`]. `None`: its id is
+/// in vessa's answer twice, so it is no one's.
+type Read = BTreeMap<(String, String), Option<Cost>>;
 
 /// All of them, or unknown when one is.
 fn sum(mut values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
@@ -503,7 +521,7 @@ fn sum(mut values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
 }
 
 /// `vessa-usage.v1`, by agent and native session id.
-pub fn read_usage(answer: &Value, notes: &mut Vec<String>) -> Result<Read, String> {
+pub fn read_usage(answer: &Value, gaps: &mut Vec<String>) -> Result<Read, String> {
     match answer["schema"].as_str() {
         Some("vessa-usage.v1") => {}
         other => {
@@ -519,7 +537,7 @@ pub fn read_usage(answer: &Value, notes: &mut Vec<String>) -> Result<Read, Strin
             return Err("vessa's usage names a session without its agent or id".to_owned());
         };
         for why in session["limitations"].as_array().into_iter().flatten() {
-            notes.push(format!("{agent} {id}: {}", why.as_str().unwrap_or("?")));
+            gaps.push(format!("{agent} {id}: {}", why.as_str().unwrap_or("?")));
         }
         // A session's usage is its subagents' too.
         let entries = match session["totals_with_subagents"].as_array() {
@@ -529,26 +547,23 @@ pub fn read_usage(answer: &Value, notes: &mut Vec<String>) -> Result<Read, Strin
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
         };
-        let tokens = (!entries.is_empty())
-            .then(|| {
-                sum(entries.iter().map(|entry| {
-                    sum([
-                        "input_tokens",
-                        "output_tokens",
-                        "cache_read_tokens",
-                        "cache_write_tokens",
-                    ]
-                    .iter()
-                    .map(|name| entry[*name].as_u64()))
-                }))
-            })
-            .flatten();
-        let priced = (!entries.is_empty())
-            .then(|| sum(entries.iter().map(|e| e["estimated_usd_micros"].as_u64())))
-            .flatten();
+        let all = |names: &[&str]| {
+            (!entries.is_empty())
+                .then(|| {
+                    sum(entries
+                        .iter()
+                        .map(|entry| sum(names.iter().map(|name| entry[*name].as_u64()))))
+                })
+                .flatten()
+        };
+        let cost = Cost {
+            tokens: all(&["input_tokens", "output_tokens", "cache_write_tokens"]),
+            cache_reads: all(&["cache_read_tokens"]),
+            usd_micros: all(&["estimated_usd_micros"]),
+        };
         let key = (agent.to_owned(), id.to_owned());
-        if read.insert(key, Some((tokens, priced))).is_some() {
-            notes.push(format!(
+        if read.insert(key, Some(cost)).is_some() {
+            gaps.push(format!(
                 "{agent} {id} is in vessa's usage twice: no usage is joined to it"
             ));
             read.insert((agent.to_owned(), id.to_owned()), None);
@@ -560,50 +575,34 @@ pub fn read_usage(answer: &Value, notes: &mut Vec<String>) -> Result<Read, Strin
 /// The cost of one ohjaa session: known only when each of its agent's own
 /// sessions has a transcript and vessa read it once.
 pub fn cost_of(session: &Session, read: &Read) -> Cost {
-    let mut tokens = Some(0u64);
-    let mut usd = Some(0u64);
-    for native in natives(session) {
-        let found = has_transcript(native)
-            .then(|| read.get(&(native.agent.clone(), native.session_id.clone())))
-            .flatten()
-            .copied()
-            .flatten();
-        let (t, u) = found.unwrap_or((None, None));
-        tokens = tokens.zip(t).and_then(|(a, b)| a.checked_add(b));
-        usd = usd.zip(u).and_then(|(a, b)| a.checked_add(b));
-    }
+    let found: Vec<Option<&Cost>> = natives(session)
+        .map(|native| {
+            has_transcript(native)
+                .then(|| read.get(&(native.agent.clone(), native.session_id.clone())))
+                .flatten()
+                .and_then(Option::as_ref)
+        })
+        .collect();
+    let total = |of: fn(&Cost) -> Option<u64>| {
+        found
+            .iter()
+            .try_fold(0u64, |total, cost| total.checked_add(of((*cost)?)?))
+    };
+    let tokens = total(|c| c.tokens);
+    let cache_reads = total(|c| c.cache_reads).filter(|_| tokens.is_some());
     Cost {
-        usd_micros: usd.filter(|_| tokens.is_some()),
+        usd_micros: total(|c| c.usd_micros).filter(|_| tokens.is_some()),
+        cache_reads,
         tokens,
     }
 }
 
-fn live(repos: &[PathBuf]) -> (Vec<Live>, Vec<String>) {
-    let scans = scan::scan_fleet(repos);
-    let failed = scans.iter().filter(|scan| scan.error.is_some()).count();
-    let live = scans
-        .iter()
-        .flat_map(|scan| {
-            scan.occupying().map(|session| Live {
-                repo: scan.name(),
-                agent: session.agent.clone(),
-                intent: session.intent.clone(),
-            })
-        })
-        .collect();
-    let notes = (failed > 0)
-        .then(|| format!("{failed} repositories could not be scanned"))
-        .into_iter()
-        .collect();
-    (live, notes)
-}
-
-/// Where GitHub and vessa are read from: since the digest was last shown
-/// (and a little before, for what is indexed late), at least a day, at most
-/// a week.
-pub fn from_ms(digest_ms: Option<i64>, now_ms: i64) -> i64 {
+/// Where GitHub and vessa are read from: where the next digest begins, by
+/// GitHub's clock (and a little before, for what is indexed late), at least
+/// a day back, at most a week.
+pub fn from_ms(next_digest_ms: Option<i64>, now_ms: i64) -> i64 {
     let day = 86_400_000;
-    digest_ms
+    next_digest_ms
         .map(|at| at - 2 * 3_600_000)
         .unwrap_or(now_ms - day)
         .clamp(now_ms - 7 * day, now_ms - day)
@@ -635,9 +634,18 @@ mod tests {
         json!({"schema": "vessa-usage.v1", "sessions": sessions, "warnings": []})
     }
 
-    fn entry(tokens: u64, usd: Option<u64>) -> Value {
-        json!({"input_tokens": tokens, "output_tokens": 0, "cache_read_tokens": 0,
+    /// `tokens` of input and `cached` cache reads.
+    fn entry(tokens: u64, cached: u64, usd: Option<u64>) -> Value {
+        json!({"input_tokens": tokens, "output_tokens": 0, "cache_read_tokens": cached,
                "cache_write_tokens": 0, "estimated_usd_micros": usd})
+    }
+
+    fn cost(tokens: Option<u64>, cache_reads: Option<u64>, usd_micros: Option<u64>) -> Cost {
+        Cost {
+            tokens,
+            cache_reads,
+            usd_micros,
+        }
     }
 
     #[test]
@@ -660,31 +668,26 @@ mod tests {
             ]),
         );
         let answer = vessa(json!([
-            {"agent": "claude", "id": "c1", "totals": [entry(1_000, None)],
-             "totals_with_subagents": [entry(1_500, None)]},
-            {"agent": "codex", "id": "x1", "totals": [entry(500, None)]},
+            {"agent": "claude", "id": "c1", "totals": [entry(1_000, 9, None)],
+             "totals_with_subagents": [entry(1_500, 90_000, None)]},
+            {"agent": "codex", "id": "x1", "totals": [entry(500, 10_000, None)]},
         ]));
         let read = read_usage(&answer, &mut Vec::new()).unwrap();
-        // A session's usage is its subagents' too; nothing priced, no estimate.
-        assert_eq!(
-            cost_of(&s, &read),
-            Cost {
-                tokens: Some(2_000),
-                usd_micros: None
-            }
-        );
+        // A session's usage is its subagents' too; cache reads apart;
+        // nothing priced, no estimate.
+        assert_eq!(cost_of(&s, &read), cost(Some(2_000), Some(100_000), None));
     }
 
     #[test]
     fn usage_never_joins_another_agent_an_ambiguous_id_or_a_claim() {
         let answer = vessa(json!([
-            {"agent": "codex", "id": "c1", "totals": [entry(1_000, Some(5))]},
-            {"agent": "claude", "id": "dup", "totals": [entry(1, Some(1))]},
-            {"agent": "claude", "id": "dup", "totals": [entry(2, Some(2))]},
+            {"agent": "codex", "id": "c1", "totals": [entry(1_000, 0, Some(5))]},
+            {"agent": "claude", "id": "dup", "totals": [entry(1, 0, Some(1))]},
+            {"agent": "claude", "id": "dup", "totals": [entry(2, 0, Some(2))]},
         ]));
-        let mut notes = Vec::new();
-        let read = read_usage(&answer, &mut notes).unwrap();
-        assert!(notes
+        let mut gaps = Vec::new();
+        let read = read_usage(&answer, &mut gaps).unwrap();
+        assert!(gaps
             .iter()
             .any(|n| n.contains("dup") && n.contains("twice")));
         let unknown = Cost::default();
@@ -702,12 +705,12 @@ mod tests {
     #[test]
     fn missing_or_partly_priced_usage_stays_unknown_never_zero() {
         let answer = vessa(json!([
-            {"agent": "claude", "id": "a", "totals": [entry(10, Some(7)), entry(5, None)]},
+            {"agent": "claude", "id": "a", "totals": [entry(10, 1, Some(7)), entry(5, 1, None)]},
             {"agent": "claude", "id": "b", "totals": []},
-            {"agent": "claude", "id": "c", "totals": [entry(3, Some(2))]},
+            {"agent": "claude", "id": "c", "totals": [entry(3, 4, Some(2))]},
         ]));
         let read = read_usage(&answer, &mut Vec::new()).unwrap();
-        let cost = |ids: &[&str]| {
+        let of = |ids: &[&str]| {
             let natives: Vec<Value> = ids
                 .iter()
                 .map(|id| native("claude", id, &format!("/t/{id}.jsonl")))
@@ -715,22 +718,13 @@ mod tests {
             cost_of(&session("oh", json!(natives)), &read)
         };
         assert_eq!(
-            cost(&["a"]),
-            Cost {
-                tokens: Some(15),
-                usd_micros: None
-            },
+            of(&["a"]),
+            cost(Some(15), Some(2), None),
             "a part unpriced is no estimate"
         );
-        assert_eq!(cost(&["b"]), Cost::default(), "no totals is unknown");
-        assert_eq!(cost(&["c", "missing"]), Cost::default(), "one not found");
-        assert_eq!(
-            cost(&["c"]),
-            Cost {
-                tokens: Some(3),
-                usd_micros: Some(2)
-            }
-        );
+        assert_eq!(of(&["b"]), Cost::default(), "no totals is unknown");
+        assert_eq!(of(&["c", "missing"]), Cost::default(), "one not found");
+        assert_eq!(of(&["c"]), cost(Some(3), Some(4), Some(2)));
         let wrong = json!({"schema": "vessa-other.v1", "sessions": []});
         assert!(read_usage(&wrong, &mut Vec::new()).is_err());
     }
@@ -739,16 +733,48 @@ mod tests {
     fn a_failed_part_keeps_what_it_held_as_of_then() {
         let before = Part {
             as_of_ms: Some(5),
+            from_ms: Some(1),
             value: vec![1],
             error: None,
-            notes: vec!["old".into()],
+            gaps: vec!["old".into()],
         };
-        let failed = Part::read(Err("gh: no network".into()), &before, 9);
-        assert_eq!(failed.as_of_ms, Some(5));
+        let failed = Part::read(Err("gh: no network".into()), &before, 9, Some(8));
+        assert_eq!((failed.as_of_ms, failed.from_ms), (Some(5), Some(1)));
         assert_eq!(failed.value, vec![1]);
         assert_eq!(failed.error.as_deref(), Some("gh: no network"));
-        let answered = Part::read(Ok((vec![2], Vec::new())), &before, 9);
-        assert_eq!((answered.as_of_ms, answered.value), (Some(9), vec![2]));
+        assert!(failed.failed());
+        let answered = Part::read(Ok((vec![2], Vec::new())), &before, 9, Some(8));
+        assert_eq!((answered.as_of_ms, &answered.value), (Some(9), &vec![2]));
+        assert!(!answered.failed());
+        let partly = Part::read(Ok((vec![3], vec!["a page".into()])), &before, 9, None);
+        assert!(partly.failed(), "a gap is no all-clear");
+    }
+
+    /// Review of #63, finding 2: a branch whose marks cannot be read stays
+    /// as it was last read, with its time and why, until a read says
+    /// otherwise.
+    #[test]
+    fn a_branch_that_cannot_be_read_stays_as_it_was_last_read() {
+        let known = vec![Branch {
+            slug: "false-systems/habitat".into(),
+            branch: "main".into(),
+            tip: Some("86bd44c0".into()),
+            unproven: 3,
+            failed: 1,
+            oldest: Some("1a2b3c4d".into()),
+            as_of_ms: Some(5_000),
+            ..Branch::default()
+        }];
+        let unread = Err("git: cannot run".to_owned());
+        let kept = branch("false-systems/habitat", &unread, &known, 9_000);
+        assert_eq!(
+            (kept.unproven, kept.failed, kept.as_of_ms),
+            (3, 1, Some(5_000))
+        );
+        assert_eq!(kept.error.as_deref(), Some("git: cannot run"));
+        let never = branch("false-systems/valvo", &unread, &known, 9_000);
+        assert_eq!((never.unproven, never.as_of_ms), (0, None));
+        assert!(never.error.is_some());
     }
 
     #[test]
@@ -768,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn github_and_vessa_read_since_the_last_digest_a_day_to_a_week() {
+    fn github_and_vessa_read_since_the_next_digest_a_day_to_a_week() {
         let day = 86_400_000;
         let now = 100 * day;
         assert_eq!(from_ms(None, now), now - day);

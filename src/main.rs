@@ -258,21 +258,23 @@ enum Cmd {
     #[command(
         after_help = "Prints, reads and moves nothing unless stdout is a terminal and no agent \
         session's marker is set (OHJAA_SESSION, TOIMIJA_SESSION, TOIMIJA_RUN, CLAUDECODE, \
-        CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, CODEX_SANDBOX, \
-        CODEX_SANDBOX_NETWORK_DISABLED, CODEX_MANAGED_BY_NPM, PI_SESSION_ID, OPENCODE, AI_AGENT): \
-        an agent's shell reads ~/.zshrc too.\n\n\
+        CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, CODEX_SESSION_ID, \
+        CODEX_CI, CODEX_SANDBOX, CODEX_SANDBOX_NETWORK_DISABLED, CODEX_MANAGED_BY_NPM, \
+        PI_SESSION_ID, PI_CODING_AGENT, OPENCODE, OPENCODE_SESSION_ID, AI_AGENT): an agent's \
+        shell reads ~/.zshrc too. Terminals opened together say a line once.\n\n\
         Starts no git and touches no network: it reads the session log and the proposals, and \
-        the rest from the snapshot `ohjaa collect` writes. When that is older than 15 minutes \
-        it starts one `ohjaa collect` in the background, unless one runs. The day's digest \
-        waits for a fresh snapshot. Always exits 0."
+        the rest from the snapshot `ohjaa collect` writes, said with its age when it is older \
+        than 15 minutes. Then it starts one `ohjaa collect` in the background, unless one \
+        runs; the day's digest never waits for it. Always exits 0."
     )]
     Line,
-    /// What happened since the digest was last shown, what stays until it
-    /// is resolved, and today's proposal. Shown to you, it moves your cursor.
+    /// What the person has not seen in full (what the day's digest left
+    /// out, or since the last digest), what stays until it is resolved,
+    /// today's proposal and who is live. Shown to you, it moves your cursor.
     #[command(
         after_help = "When the snapshot is more than 5 minutes old it starts a collect \
         and waits for it at most 10 s; past that it shows the snapshot it has, and the collect \
-        goes on in the background.\n\n\
+        goes on in the background. Who is live is asked now, as `ohjaa fleet` asks.\n\n\
         Exit codes:\n  \
         0  everything could be read\n  \
         4  something could not be read (it says what), or nothing was collected yet"
@@ -288,17 +290,17 @@ enum Cmd {
     },
     /// Gather what `ohjaa line` cannot work out at a terminal's opening into
     /// its snapshot: the marks and open sessions, GitHub's pull requests,
-    /// vessa's usage of recent sessions, and the fleet.
+    /// and vessa's usage of recent sessions.
     #[command(after_help = "Each part asked once, at the same time:\n  \
         marks   as `ohjaa report --marks` finds them (git, sykli, ps)\n  \
         github  gh api graphql: the pull requests updated in the entries' owners, at most 2 calls\n  \
-        vessa   vessa usage --json --input <transcript>…: only the sessions ended lately\n  \
-        fleet   toimija sessions --json, as `ohjaa fleet`\n\
-        A part that fails keeps what it held before, said as of then. Writes\n\
-        $XDG_STATE_HOME/ohjaa/human/collected.json, holding human/collect.lock while it runs.\n\n\
+        vessa   vessa usage --json --input <transcript>…: only the sessions ended lately\n\
+        A part that fails keeps what it held before, said as of then, and so does a branch\n\
+        whose marks cannot be read. Writes $XDG_STATE_HOME/ohjaa/human/collected.json,\n\
+        holding human/collect.lock while it runs.\n\n\
         Exit codes:\n  \
-        0  every part answered\n  \
-        4  a part did not (the snapshot says why)\n  \
+        0  every part answered, and read all it asked for\n  \
+        4  a part did not, or could not read all of it (the snapshot says what)\n  \
         1  the snapshot could not be written")]
     Collect {
         /// Started by `line` or `digest`: says nothing.
@@ -3865,11 +3867,9 @@ fn main() {
             Ok(0)
         }
         Cmd::Digest { since, no_collect } => {
-            human::digest(&cli.root, since.as_deref(), *no_collect)
+            human::digest(&cli.root, repos(&cli.root), since.as_deref(), *no_collect)
         }
-        Cmd::Collect { background } => {
-            human::collect_now(report_repos(&cli.root), repos(&cli.root), *background)
-        }
+        Cmd::Collect { background } => human::collect_now(report_repos(&cli.root), *background),
         Cmd::Graph { id } => cmd_graph(id),
         Cmd::Apply {
             dry_run,

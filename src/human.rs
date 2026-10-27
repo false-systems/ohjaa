@@ -14,13 +14,14 @@
 //! `line` starts no git and touches no network. It reads the session log
 //! and the proposals itself, and the rest from the snapshot `ohjaa collect`
 //! writes ([`crate::collect`]), which it starts in the background when the
-//! snapshot is old.
+//! snapshot is old. What the snapshot says is said with how old it is, and
+//! what it could not read is said as that, never as an all-clear.
 //!
 //! What stays until it is resolved comes first, in this order: a branch
-//! with a failed commit; what is unknown (a session whose ohjaa is gone, an
-//! orphan, a commit sykli could say nothing about); a branch whose commits
-//! lack evidence; what waits for a person (a session open a day, the
-//! proposals).
+//! with a failed commit; what is unknown (a source that could not be read,
+//! a session whose ohjaa is gone, an orphan, a commit sykli could say
+//! nothing about); a branch whose commits lack evidence; what waits for a
+//! person (a session open a day).
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -32,11 +33,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::collect::{self, Collected, Cost, Pr};
+use crate::collect::{self, Collected, Cost, Part, Pr};
 use crate::knowledge::{self, Dirs};
-use crate::process;
 use crate::report::{self, Waiting};
 use crate::sessions::{self, clock, Exit, Finished, Left, Session};
+use crate::{process, scan};
 
 const MINUTE_MS: i64 = 60_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
@@ -48,7 +49,8 @@ const DAY_MS: i64 = 24 * HOUR_MS;
 /// apart by its key, never missed for its time.
 const OVERLAP_MS: i64 = 2 * HOUR_MS;
 
-/// `line` starts a collect in the background past this age.
+/// `line` starts a collect in the background past this age, and what the
+/// snapshot says is said with its age past it.
 const LINE_COLLECTS_AFTER_MS: i64 = 15 * MINUTE_MS;
 
 /// `digest` collects first past this age, and waits for it this long.
@@ -67,7 +69,7 @@ const DAILY_LINES: usize = 15;
 /// What the shells an agent runs its tools in carry, each set by the agent
 /// (or by `ohjaa run` and `toimija run` around it), never by a person's own
 /// startup files. A variable a person may set (`CODEX_HOME`) is not one.
-pub const AGENT_MARKERS: [&str; 13] = [
+pub const AGENT_MARKERS: [&str; 17] = [
     "OHJAA_SESSION",
     "TOIMIJA_SESSION",
     "TOIMIJA_RUN",
@@ -75,14 +77,21 @@ pub const AGENT_MARKERS: [&str; 13] = [
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_SESSION_ID",
-    // Codex: its thread, its sandbox, and the launcher npm installs.
+    // Codex: its thread and session, its CI mode and sandbox, and the
+    // launcher npm installs.
     "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "CODEX_CI",
     "CODEX_SANDBOX",
     "CODEX_SANDBOX_NETWORK_DISABLED",
     "CODEX_MANAGED_BY_NPM",
+    // pi.
     "PI_SESSION_ID",
+    "PI_CODING_AGENT",
+    // opencode.
     "OPENCODE",
-    // What Claude Code and opencode set for any tool to read.
+    "OPENCODE_SESSION_ID",
+    // What Claude Code, pi and opencode set for any tool to read.
     "AI_AGENT",
 ];
 
@@ -136,15 +145,56 @@ fn local_offset_s(_now_ms: i64) -> i64 {
     0
 }
 
+/// `08:12 UTC` within the day, else `10-26 08:12 UTC`: ohjaa's times are
+/// UTC, and say so.
+fn short_clock(at_ms: i64, now_ms: i64) -> String {
+    let full = clock(at_ms);
+    if (now_ms - at_ms).abs() < 20 * HOUR_MS {
+        full[11..].to_owned()
+    } else {
+        full[5..].to_owned()
+    }
+}
+
+/// `as of 08:12 UTC`, or `never read`.
+fn as_of(at_ms: Option<i64>, now_ms: i64) -> String {
+    match at_ms {
+        Some(at) => format!("as of {}", short_clock(at, now_ms)),
+        None => "never read".to_owned(),
+    }
+}
+
+/// Read longer ago than a fresh snapshot is: said with its age.
+fn old(at_ms: Option<i64>, now_ms: i64) -> bool {
+    at_ms.is_none_or(|at| now_ms - at > LINE_COLLECTS_AFTER_MS)
+}
+
 // ---- what the person saw ----------------------------------------------------
 
 const SEEN_SCHEMA: &str = "ohjaa-seen.v1";
+
+/// Where a stretch of what happened begins, by each source's own clock:
+/// the session log is read now, GitHub as far as the snapshot read it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Window {
+    sessions_ms: i64,
+    github_ms: i64,
+}
+
+impl Window {
+    fn at(ms: i64) -> Window {
+        Window {
+            sessions_ms: ms,
+            github_ms: ms,
+        }
+    }
+}
 
 /// The cursor: what the person last saw, and when.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Seen {
     schema: String,
-    /// When they last saw a line or the digest.
+    /// When they last saw a line or a digest.
     at_ms: i64,
     /// How far GitHub had been read by then (the snapshot's own time).
     github_ms: i64,
@@ -152,13 +202,35 @@ struct Seen {
     events: BTreeSet<String>,
     /// What stood, and the proposals that waited, when they saw it.
     items: BTreeSet<String>,
-    /// When the digest was last shown, and on which day of theirs.
-    digest_ms: Option<i64>,
+    /// Where the next day's digest begins: where the last digest ended.
+    digest: Option<Window>,
+    /// Where what the day's digest left out begins: `ohjaa digest` shows
+    /// it. `None` when nothing was left out.
+    unseen: Option<Window>,
+    /// The person's day the last digest was shown on.
     day: Option<String>,
 }
 
 fn seen_path(dirs: &Dirs) -> PathBuf {
     collect::dir(dirs).join("seen.json")
+}
+
+/// Held while a terminal works out and says its line: terminals opened
+/// together say it once.
+fn claim_path(dirs: &Dirs) -> PathBuf {
+    collect::dir(dirs).join("seen.lock")
+}
+
+/// What the person was shown.
+#[derive(Debug, Clone, Copy)]
+enum Shown {
+    Line,
+    /// The day's digest, from `from`; `cut`: it left some out.
+    Daily {
+        from: Window,
+        cut: bool,
+    },
+    Full,
 }
 
 impl Seen {
@@ -170,6 +242,16 @@ impl Seen {
             github_ms: now_ms - DAY_MS,
             ..Seen::default()
         }
+    }
+
+    /// Where the day's digest begins.
+    fn daily_from(&self, now_ms: i64) -> Window {
+        self.digest.unwrap_or(Window::at(now_ms - DAY_MS))
+    }
+
+    /// Where `ohjaa digest` begins: what the person has not seen in full.
+    fn full_from(&self, now_ms: i64) -> Window {
+        self.unseen.unwrap_or(self.daily_from(now_ms))
     }
 
     fn read(dirs: &Dirs) -> Option<Seen> {
@@ -208,6 +290,8 @@ enum Class {
 enum Kind {
     // What stands until it is resolved.
     Main,
+    /// A source that could not be read, or not all of it.
+    Source,
     Gone,
     Orphaned,
     OpenLong,
@@ -232,6 +316,8 @@ struct Item {
     github: bool,
     repo: String,
     text: String,
+    /// What a line says of it, when that is not just counted.
+    brief: Option<String>,
 }
 
 struct View {
@@ -242,12 +328,27 @@ struct View {
     /// The proposals waiting for a person, oldest first, and today's.
     waiting: Vec<Waiting>,
     today: Option<usize>,
-    live: Vec<collect::Live>,
-    /// What could not be read, or is said as of an earlier time.
-    sources: Vec<String>,
-    /// What the sources said beside their answers.
-    notes: Vec<String>,
+    /// Each part of the snapshot: its name, when it was read, and from when
+    /// it covers what happened.
+    parts: Vec<(&'static str, Option<i64>, Option<i64>)>,
+    /// Everything that could not be read, each in full.
+    unread: Vec<String>,
     collected_ms: Option<i64>,
+}
+
+impl View {
+    /// Something could not be read: never shown as all clear.
+    fn incomplete(&self) -> bool {
+        !self.unread.is_empty()
+    }
+
+    /// When GitHub was read from, as far as the snapshot covers it.
+    fn github_from(&self) -> Option<i64> {
+        self.parts
+            .iter()
+            .find(|(name, _, _)| *name == "GitHub")
+            .and_then(|(_, _, from)| *from)
+    }
 }
 
 /// Text from outside (an intent, a title, a tool's words) made safe for a
@@ -305,14 +406,26 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+fn amount(n: u64) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        n if n >= 1_000 => format!("{}k", n / 1_000),
+        n => n.to_string(),
+    }
+}
+
+/// `est. $1.20`, or `115k tokens + 2.9M cache reads`: most of a session's
+/// tokens are reads of its cache, said apart.
 fn cost(cost: &Cost) -> Option<String> {
     if let Some(usd) = cost.usd_micros {
         return Some(format!("est. ${:.2}", usd as f64 / 1e6));
     }
-    cost.tokens.map(|n| match n {
-        n if n >= 1_000_000 => format!("{:.1}M tokens", n as f64 / 1e6),
-        n if n >= 1_000 => format!("{}k tokens", n / 1_000),
-        n => format!("{n} tokens"),
+    let tokens = cost.tokens?;
+    Some(match cost.cache_reads {
+        Some(cached) if cached > 0 => {
+            format!("{} tokens + {} cache reads", amount(tokens), amount(cached))
+        }
+        _ => format!("{} tokens", amount(tokens)),
     })
 }
 
@@ -329,6 +442,7 @@ fn standing(kind: Kind, class: Class, key: String, repo: &str, text: String) -> 
         github: false,
         repo: clean(&name(repo)),
         text,
+        brief: None,
     }
 }
 
@@ -341,6 +455,7 @@ fn event(kind: Kind, key: String, at_ms: i64, github: bool, repo: &str, text: St
         github,
         repo: clean(&name(repo)),
         text,
+        brief: None,
     }
 }
 
@@ -425,6 +540,36 @@ fn pr_events(pr: &Pr, out: &mut Vec<Item>) {
     }
 }
 
+/// A part of the snapshot that could not be read, or not all of it: said
+/// as that, with how old what it holds is, and never as an all-clear.
+fn source<T>(name: &str, part: &Part<T>, now_ms: i64, unread: &mut Vec<String>) -> Option<Item> {
+    let age = as_of(part.as_of_ms, now_ms);
+    unread.extend(
+        part.error
+            .iter()
+            .map(|why| format!("{name} unavailable, {age}: {}", clean(why))),
+    );
+    unread.extend(
+        part.gaps
+            .iter()
+            .map(|gap| format!("{name}: {}", clean(gap))),
+    );
+    let (what, why) = match (&part.error, part.gaps.as_slice()) {
+        (Some(why), _) => ("unavailable".to_owned(), why),
+        (None, [first, ..]) => (format!("{} could not be read", part.gaps.len()), first),
+        (None, []) => return None,
+    };
+    let mut item = standing(
+        Kind::Source,
+        Class::Unknown,
+        format!("source:{name}"),
+        name,
+        format!("{what}, {age}: {}", clean(why)),
+    );
+    item.brief = Some(format!("{name}: {what}"));
+    Some(item)
+}
+
 /// Everything the view can say now: from the session log, the proposals
 /// and the snapshot (when there is one), at `now_ms` on the person's day
 /// number `day`.
@@ -438,11 +583,11 @@ fn build(
     let none = Collected::default();
     let snapshot = collected.unwrap_or(&none);
     let local = &snapshot.local.value;
+    let mut unread = Vec::new();
     let mut standing_items = Vec::new();
-    for branch in local.branches.iter().filter(|b| b.error.is_none()) {
-        if branch.unproven == 0 {
-            continue;
-        }
+    // A branch is said as it was last read, with its age when that is not
+    // now: one that could not be read stays until a read resolves it.
+    for branch in local.branches.iter().filter(|b| b.unproven > 0) {
         let class = if branch.failed > 0 {
             Class::Failed
         } else if branch.unknown > 0 {
@@ -454,7 +599,18 @@ fn build(
             0 => String::new(),
             n => format!(" ({n} failed)"),
         };
-        standing_items.push(standing(
+        let said = format!(
+            "{}: {}{} unproven{failed}",
+            clean(&branch.branch),
+            branch.unproven,
+            if branch.more { "+" } else { "" },
+        );
+        let age = match (&branch.error, old(branch.as_of_ms, now_ms)) {
+            (Some(_), _) => format!(", {} (unread since)", as_of(branch.as_of_ms, now_ms)),
+            (None, true) => format!(", {}", as_of(branch.as_of_ms, now_ms)),
+            (None, false) => String::new(),
+        };
+        let mut item = standing(
             Kind::Main,
             class,
             format!(
@@ -464,15 +620,41 @@ fn build(
             ),
             &branch.slug,
             format!(
-                "{}: {}{} unproven{failed} since {}. Prove it: ohjaa gate",
-                clean(&branch.branch),
-                branch.unproven,
-                if branch.more { "+" } else { "" },
+                "{said} since {}{age}. Prove it: ohjaa gate",
                 short(branch.oldest.as_deref().unwrap_or("?"))
             ),
-        ));
+        );
+        item.brief = Some(format!("{} {said}", item.repo));
+        standing_items.push(item);
     }
-    // Open in the log now: what the snapshot found of them, when it did.
+    match collected {
+        None => {
+            let mut item = standing(
+                Kind::Source,
+                Class::Unknown,
+                "source:snapshot".to_owned(),
+                "snapshot",
+                "nothing collected yet: `ohjaa collect` reads it".to_owned(),
+            );
+            item.brief = Some("nothing collected yet".to_owned());
+            standing_items.push(item);
+            unread.push(
+                "nothing collected yet: `ohjaa collect` reads the marks, GitHub and vessa"
+                    .to_owned(),
+            );
+        }
+        Some(snapshot) => {
+            standing_items.extend(source("marks", &snapshot.local, now_ms, &mut unread));
+            standing_items.extend(source("GitHub", &snapshot.github, now_ms, &mut unread));
+            standing_items.extend(source("vessa", &snapshot.usage, now_ms, &mut unread));
+        }
+    }
+    // Open in the log now: what the snapshot found of them, as of when.
+    let found = if old(snapshot.local.as_of_ms, now_ms) {
+        format!(", {}", as_of(snapshot.local.as_of_ms, now_ms))
+    } else {
+        String::new()
+    };
     for session in logged.iter().filter(|s| s.left.is_none()) {
         let who = format!(
             "{} \"{}\"",
@@ -486,7 +668,7 @@ fn build(
                 Class::Unknown,
                 format!("gone:{id}"),
                 &session.repo,
-                format!("still running, its ohjaa gone: {who} ({id})"),
+                format!("still running, its ohjaa gone{found}: {who} ({id})"),
             ));
         } else if local.orphaned.contains(id) {
             standing_items.push(standing(
@@ -494,7 +676,7 @@ fn build(
                 Class::Unknown,
                 format!("orphaned:{id}"),
                 &session.repo,
-                format!("orphaned, nothing after its ohjaa went is observed: {who} ({id})"),
+                format!("orphaned{found}, nothing after its ohjaa went is observed: {who} ({id})"),
             ));
         } else if now_ms - session.started_ms > OPEN_TOO_LONG_MS {
             standing_items.push(standing(
@@ -506,7 +688,6 @@ fn build(
             ));
         }
     }
-    standing_items.sort_by_key(|item| item.class);
 
     let mut events = Vec::new();
     for session in logged {
@@ -519,7 +700,6 @@ fn build(
     }
     events.sort_by_key(|item| std::cmp::Reverse(item.at_ms));
 
-    let mut sources = Vec::new();
     let (waiting, today) = match waiting {
         Ok(mut waiting) => {
             waiting
@@ -529,62 +709,36 @@ fn build(
             (waiting, today)
         }
         Err(why) => {
-            sources.push(format!("the proposals could not be read: {}", clean(&why)));
+            let mut item = standing(
+                Kind::Source,
+                Class::Unknown,
+                "source:proposals".to_owned(),
+                "proposals",
+                format!("could not be read: {}", clean(&why)),
+            );
+            item.brief = Some("proposals: could not be read".to_owned());
+            standing_items.push(item);
+            unread.push(format!("the proposals could not be read: {}", clean(&why)));
             (Vec::new(), None)
         }
     };
-    let mut notes = Vec::new();
-    match collected {
-        None => sources.push(
-            "nothing collected yet: `ohjaa collect` reads the marks, GitHub, vessa and the fleet"
-                .to_owned(),
-        ),
-        Some(snapshot) => {
-            let parts = [
-                (
-                    "marks",
-                    &snapshot.local.error,
-                    snapshot.local.as_of_ms,
-                    &snapshot.local.notes,
-                ),
-                (
-                    "GitHub",
-                    &snapshot.github.error,
-                    snapshot.github.as_of_ms,
-                    &snapshot.github.notes,
-                ),
-                (
-                    "vessa",
-                    &snapshot.usage.error,
-                    snapshot.usage.as_of_ms,
-                    &snapshot.usage.notes,
-                ),
-                (
-                    "fleet",
-                    &snapshot.fleet.error,
-                    snapshot.fleet.as_of_ms,
-                    &snapshot.fleet.notes,
-                ),
-            ];
-            for (part, error, as_of, said) in parts {
-                if let Some(why) = error {
-                    sources.push(match as_of {
-                        Some(at) => format!("{part} as of {}: {}", clock(at), clean(why)),
-                        None => format!("{part} unavailable: {}", clean(why)),
-                    });
-                }
-                notes.extend(said.iter().map(|note| format!("{part}: {}", clean(note))));
-            }
-        }
-    }
+    standing_items.sort_by_key(|item| item.class);
+    let parts = collected
+        .map(|c| {
+            vec![
+                ("marks", c.local.as_of_ms, c.local.from_ms),
+                ("GitHub", c.github.as_of_ms, c.github.from_ms),
+                ("vessa", c.usage.as_of_ms, c.usage.from_ms),
+            ]
+        })
+        .unwrap_or_default();
     View {
         standing: standing_items,
         events,
         waiting,
         today,
-        live: snapshot.fleet.value.clone(),
-        sources,
-        notes,
+        parts,
+        unread,
         collected_ms: collected.map(|c| c.at_ms),
     }
 }
@@ -624,14 +778,15 @@ fn news<'a>(view: &'a View, seen: &Seen) -> News<'a> {
     }
 }
 
-/// The cursor once the person has seen `view` at `now_ms`; with `day`, the
-/// digest was shown that day.
+/// The cursor once the person was shown `shown` of `view` at `now_ms`, on
+/// their day `today`.
 fn advance(
     view: &View,
     old: &Seen,
     collected: Option<&Collected>,
     now_ms: i64,
-    day: Option<&str>,
+    shown: Shown,
+    today: &str,
 ) -> Seen {
     let github_ms = collected
         .and_then(|c| c.github.as_of_ms)
@@ -652,18 +807,28 @@ fn advance(
         .map(|item| item.key.clone())
         .chain(view.waiting.iter().map(proposal_key))
         .collect();
+    // A digest ends where GitHub was read to, by GitHub's clock: what the
+    // next collect reads from before then is still the next digest's.
+    let here = Window {
+        sessions_ms: now_ms,
+        github_ms: collected
+            .and_then(|c| c.github.as_of_ms)
+            .unwrap_or(old.daily_from(now_ms).github_ms),
+    };
+    let (digest, unseen, day) = match shown {
+        Shown::Line => (old.digest, old.unseen, old.day.clone()),
+        Shown::Daily { from, cut } => (Some(here), cut.then_some(from), Some(today.to_owned())),
+        Shown::Full => (Some(here), None, Some(today.to_owned())),
+    };
     Seen {
         schema: SEEN_SCHEMA.to_owned(),
         at_ms: now_ms,
         github_ms,
         events,
         items,
-        digest_ms: if day.is_some() {
-            Some(now_ms)
-        } else {
-            old.digest_ms
-        },
-        day: day.map(str::to_owned).or_else(|| old.day.clone()),
+        digest,
+        unseen,
+        day,
     }
 }
 
@@ -682,20 +847,27 @@ fn folded(events: Vec<&Item>) -> Vec<&Item> {
         .collect()
 }
 
-/// What happened from the second of `since_ms` on (a session's record and
-/// GitHub keep whole seconds): my sessions, then what landed, then the other
-/// pull requests, each newest first.
-fn after(view: &View, since_ms: i64) -> Vec<&Item> {
+/// What happened from `from` on, each source by its own clock and from the
+/// second (a session's record and GitHub keep whole seconds): my sessions,
+/// then what landed, then the other pull requests, each newest first.
+fn after(view: &View, from: Window) -> Vec<&Item> {
     let group = |kind: Kind| match kind {
         Kind::Ended { .. } => 0,
         Kind::Merged => 1,
         _ => 2,
     };
-    let from = since_ms - since_ms.rem_euclid(1000);
+    let second = |ms: i64| ms - ms.rem_euclid(1000);
     let mut events = folded(
         view.events
             .iter()
-            .filter(|item| item.at_ms >= from)
+            .filter(|item| {
+                let since = if item.github {
+                    from.github_ms
+                } else {
+                    from.sessions_ms
+                };
+                item.at_ms >= second(since)
+            })
             .collect(),
     );
     events.sort_by_key(|item| group(item.kind));
@@ -740,6 +912,7 @@ fn pull_requests(events: &[&Item]) -> Option<String> {
 /// at most [`WIDTH`] characters; `None` when nothing is.
 fn one_line(news: &News) -> Option<String> {
     let mut parts = Vec::new();
+    // `sykli main: 2 unproven (1 failed)`, as the digest says it.
     let mains: Vec<&&Item> = news
         .standing
         .iter()
@@ -747,14 +920,15 @@ fn one_line(news: &News) -> Option<String> {
         .collect();
     match mains.as_slice() {
         [] => {}
-        // `sykli main: 2 unproven (1 failed)`, as the digest says it.
-        [one] => parts.push(format!(
-            "{} {}",
-            one.repo,
-            one.text.split(" since ").next().unwrap_or(&one.text)
-        )),
+        [one] => parts.extend(one.brief.clone()),
         many => parts.push(format!("{} branches not proven", many.len())),
     }
+    parts.extend(
+        news.standing
+            .iter()
+            .filter(|item| item.kind == Kind::Source)
+            .filter_map(|item| item.brief.clone()),
+    );
     for (kind, one, many) in [
         (
             Kind::Gone,
@@ -840,30 +1014,24 @@ fn proposal_line(view: &View) -> Option<String> {
     Some(cut(&format!("{head}{said}{tail}"), WIDTH))
 }
 
-/// The day's digest: what stands, today's proposal and what happened since
-/// `since_ms`, at most [`DAILY_LINES`] lines. `None` when there is nothing.
-fn daily(view: &View, since_ms: i64) -> Option<String> {
-    let events = after(view, since_ms);
+/// The day's digest: what stands, today's proposal and what happened from
+/// `from`, at most [`DAILY_LINES`] lines, and whether it left any out.
+/// `None` when there is nothing.
+fn daily(view: &View, from: Window, now_ms: i64) -> Option<(String, bool)> {
+    let events = after(view, from);
     let proposal = proposal_line(view);
     if view.standing.is_empty() && events.is_empty() && proposal.is_none() {
         return None;
     }
-    let mut summary = vec![format!("since {}", clock(since_ms))];
+    let mut summary = vec![format!("since {}", clock(from.sessions_ms))];
     summary.extend(sessions_ended(&events, false));
     summary.extend(pull_requests(&events));
     let mut lines = vec![cut(&format!("ohjaa · {}", summary.join(" · ")), WIDTH)];
-    // Only which sources failed: why is in `ohjaa digest`.
-    if !view.sources.is_empty() {
-        lines.push(cut(
-            &format!(
-                "  {}; more: ohjaa digest",
-                plural(
-                    view.sources.len(),
-                    "source could not be read",
-                    "sources could not be read"
-                )
-            ),
-            WIDTH,
+    // An old snapshot is said, never waited for: a collect runs beside it.
+    if let Some(at) = view.collected_ms.filter(|at| old(Some(*at), now_ms)) {
+        lines.push(format!(
+            "  snapshot as of {}; a fresh collect runs in the background",
+            short_clock(at, now_ms)
         ));
     }
     let width = repo_width(view.standing.iter().chain(events.iter().copied()));
@@ -882,18 +1050,57 @@ fn daily(view: &View, since_ms: i64) -> Option<String> {
     if more > 0 {
         lines.push(format!("  … {} more: ohjaa digest", more + 1));
     }
-    Some(lines.join("\n") + "\n")
+    Some((lines.join("\n") + "\n", more > 0))
 }
 
-/// All of it: what stands, what happened since `since_ms`, today's
-/// proposal, who is live, and what could not be read.
-fn full(view: &View, since_ms: i64, pending: Option<&str>) -> String {
-    let events = after(view, since_ms);
-    let mut out = format!("ohjaa digest · since {}", clock(since_ms));
+/// Who is live, as `ohjaa fleet` finds them now, and how many scans could
+/// not look.
+pub struct Fleet {
+    live: Vec<String>,
+    scanned: usize,
+    failed: usize,
+}
+
+fn fleet(repos: &[PathBuf]) -> Fleet {
+    let scans = scan::scan_fleet(repos);
+    Fleet {
+        live: scans
+            .iter()
+            .flat_map(|scan| {
+                scan.occupying()
+                    .map(|s| format!("{} ({})", clean(&scan.name()), clean(&s.agent)))
+            })
+            .collect(),
+        scanned: scans.len(),
+        failed: scans.iter().filter(|scan| scan.error.is_some()).count(),
+    }
+}
+
+/// All of it: what stands, what happened from `from`, today's proposal, who
+/// is live, and how old each source is, with what could not be read.
+fn full(
+    view: &View,
+    from: Window,
+    fleet: Option<&Result<Fleet, String>>,
+    pending: Option<&str>,
+    now_ms: i64,
+) -> String {
+    let events = after(view, from);
+    let mut out = format!("ohjaa digest · since {}", clock(from.sessions_ms));
     if let Some(at) = view.collected_ms {
-        out.push_str(&format!(" · collected {}", clock(at)));
+        out.push_str(&format!(" · collected {}", short_clock(at, now_ms)));
     }
     out.push('\n');
+    // GitHub was read from where the snapshot asked, not from `since`.
+    let pull_requests_from = view
+        .github_from()
+        .map_or(from.github_ms, |read| read.max(from.github_ms));
+    if pull_requests_from > from.sessions_ms + MINUTE_MS {
+        out.push_str(&format!(
+            "pull requests only since {}: GitHub was read from there\n",
+            clock(pull_requests_from)
+        ));
+    }
     if let Some(pending) = pending {
         out.push_str(&format!("{pending}\n"));
     }
@@ -924,7 +1131,7 @@ fn full(view: &View, since_ms: i64, pending: Option<&str>) -> String {
     if events.is_empty() {
         out.push_str(&format!(
             "\nNothing new happened since {}.\n",
-            clock(since_ms)
+            clock(from.sessions_ms)
         ));
     }
     if let Some(today) = view.today {
@@ -946,25 +1153,34 @@ fn full(view: &View, since_ms: i64, pending: Option<&str>) -> String {
             view.waiting.len()
         ));
     }
-    if view.collected_ms.is_some() {
-        let live: Vec<String> = view
-            .live
-            .iter()
-            .map(|live| format!("{} ({})", clean(&live.repo), clean(&live.agent)))
-            .collect();
+    if let Some(fleet) = fleet {
         out.push_str("\nNow\n");
-        out.push_str(&cut(
-            &match live.len() {
-                0 => "  nobody is live".to_owned(),
-                n => format!("  {} live: {}", n, live.join(", ")),
-            },
-            WIDTH,
-        ));
+        let said = match fleet {
+            Err(why) => format!("  the fleet could not be read: {}", clean(why)),
+            Ok(fleet) if fleet.failed > 0 => format!(
+                "  {} live; {} of {} repositories could not be scanned",
+                fleet.live.len(),
+                fleet.failed,
+                fleet.scanned
+            ),
+            Ok(fleet) if fleet.live.is_empty() => "  nobody is live".to_owned(),
+            Ok(fleet) => format!("  {} live: {}", fleet.live.len(), fleet.live.join(", ")),
+        };
+        out.push_str(&cut(&said, WIDTH));
         out.push('\n');
     }
-    if !view.sources.is_empty() || !view.notes.is_empty() {
+    if !view.parts.is_empty() || !view.unread.is_empty() {
         out.push_str("\nSources\n");
-        for said in view.sources.iter().chain(&view.notes) {
+        let ages: Vec<String> = view
+            .parts
+            .iter()
+            .map(|(name, at, _)| format!("{name} {}", as_of(*at, now_ms)))
+            .collect();
+        if !ages.is_empty() {
+            out.push_str(&cut(&format!("  {}", ages.join(" · ")), WIDTH));
+            out.push('\n');
+        }
+        for said in &view.unread {
             out.push_str(&cut(&format!("  {said}"), WIDTH));
             out.push('\n');
         }
@@ -974,15 +1190,26 @@ fn full(view: &View, since_ms: i64, pending: Option<&str>) -> String {
 
 // ---- the commands -------------------------------------------------------------
 
+/// What became of asking for a collect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Collecting {
+    Started,
+    /// One runs already: it is the one to wait for.
+    Running,
+    Failed(String),
+}
+
 /// Start one `ohjaa collect` in the background, detached from this terminal,
-/// unless one is running. Whether it started one.
-fn start_collect(dirs: &Dirs, roots: &[PathBuf]) -> bool {
+/// unless one is running.
+fn start_collect(dirs: &Dirs, roots: &[PathBuf]) -> Collecting {
     match process::lock_file(&collect::lock_path(dirs), Duration::ZERO) {
         Ok(free) => drop(free),
-        Err(_) => return false,
+        Err(why) if why.contains("held by another") => return Collecting::Running,
+        Err(why) => return Collecting::Failed(why),
     }
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => return Collecting::Failed(error.to_string()),
     };
     let mut command = Command::new(exe);
     command.args(["collect", "--background"]);
@@ -997,7 +1224,10 @@ fn start_collect(dirs: &Dirs, roots: &[PathBuf]) -> bool {
         .stderr(Stdio::null())
         .current_dir(collect::dir(dirs));
     detach(&mut command);
-    command.spawn().is_ok()
+    match command.spawn() {
+        Ok(_) => Collecting::Started,
+        Err(error) => Collecting::Failed(error.to_string()),
+    }
 }
 
 #[cfg(unix)]
@@ -1027,12 +1257,14 @@ pub fn line(roots: &[PathBuf]) {
 
 fn say_line(roots: &[PathBuf]) -> Result<()> {
     let dirs = Dirs::resolve(None)?;
+    // Terminals opened together: the one that claims the line says it, and
+    // the others say nothing rather than the same again.
+    let Ok(_claim) = process::lock_file(&claim_path(&dirs), Duration::ZERO) else {
+        return Ok(());
+    };
     let now = now_ms();
     let collected = collect::read(&dirs);
-    let fresh = collected
-        .as_ref()
-        .is_some_and(|c| now - c.at_ms <= LINE_COLLECTS_AFTER_MS);
-    if !fresh {
+    if old(collected.as_ref().map(|c| c.at_ms), now) {
         start_collect(&dirs, roots);
     }
     // A log a writer holds now is read at the next terminal: a terminal
@@ -1048,31 +1280,49 @@ fn say_line(roots: &[PathBuf]) -> Result<()> {
         now,
         day,
     );
-    let old = Seen::read(&dirs).unwrap_or_else(|| Seen::first(now));
+    let old_seen = Seen::read(&dirs).unwrap_or_else(|| Seen::first(now));
     let mut out = std::io::stdout().lock();
-    // The day's digest waits for a fresh snapshot: last night's would miss
-    // the night. It is marked shown before it is shown: where it cannot be
-    // marked, it is never shown, rather than at every terminal.
-    if fresh && old.day.as_deref() != Some(today.as_str()) {
-        let since = old.digest_ms.unwrap_or(now - DAY_MS);
-        advance(&view, &old, collected.as_ref(), now, Some(&today)).write(&dirs)?;
-        if let Some(text) = daily(&view, since) {
+    // The day's digest, from the snapshot there is (said as of when it was
+    // collected; a fresh one is on its way). It is marked shown before it is
+    // shown: where it cannot be marked, it is never shown, rather than at
+    // every terminal.
+    if old_seen.day.as_deref() != Some(today.as_str()) {
+        let from = old_seen.daily_from(now);
+        let said = daily(&view, from, now);
+        let cut = said.as_ref().is_some_and(|(_, cut)| *cut);
+        let shown = Shown::Daily { from, cut };
+        advance(&view, &old_seen, collected.as_ref(), now, shown, &today).write(&dirs)?;
+        if let Some((text, _)) = said {
             out.write_all(text.as_bytes())?;
         }
         return Ok(());
     }
-    if let Some(text) = one_line(&news(&view, &old)) {
+    if let Some(text) = one_line(&news(&view, &old_seen)) {
         out.write_all(text.as_bytes())?;
         out.flush()?;
-        advance(&view, &old, collected.as_ref(), now, None).write(&dirs)?;
+        advance(
+            &view,
+            &old_seen,
+            collected.as_ref(),
+            now,
+            Shown::Line,
+            &today,
+        )
+        .write(&dirs)?;
     }
     Ok(())
 }
 
-/// `ohjaa digest`: everything since the digest was last shown (or since
-/// `since`), collecting first when the snapshot is old. Shown to a person,
-/// it moves the cursor; with `since` it never does.
-pub fn digest(roots: &[PathBuf], since: Option<&str>, no_collect: bool) -> Result<i32> {
+/// `ohjaa digest`: everything the person has not seen in full (or since
+/// `since`), collecting first when the snapshot is old, and who is live,
+/// asked now. Shown to a person, it moves the cursor; with `since` it never
+/// does. Exits 4 when anything could not be read.
+pub fn digest(
+    roots: &[PathBuf],
+    fleet_repos: Result<Vec<PathBuf>>,
+    since: Option<&str>,
+    no_collect: bool,
+) -> Result<i32> {
     let dirs = Dirs::resolve(None)?;
     let now = now_ms();
     let window = since
@@ -1080,13 +1330,14 @@ pub fn digest(roots: &[PathBuf], since: Option<&str>, no_collect: bool) -> Resul
         .transpose()?;
     let mut collected = collect::read(&dirs);
     let mut pending = None;
-    let old = collected
-        .as_ref()
-        .is_none_or(|c| now - c.at_ms > DIGEST_COLLECTS_AFTER_MS);
-    if old && !no_collect {
+    if !no_collect
+        && collected
+            .as_ref()
+            .is_none_or(|c| now - c.at_ms > DIGEST_COLLECTS_AFTER_MS)
+    {
         // Detached, like `line`'s: it finishes whether or not this waits.
         let before = collected.as_ref().map(|c| c.at_ms);
-        start_collect(&dirs, roots);
+        let asked = start_collect(&dirs, roots);
         let terminal = std::io::stderr().is_terminal();
         if terminal {
             eprint!("ohjaa: collecting…\r");
@@ -1098,8 +1349,18 @@ pub fn digest(roots: &[PathBuf], since: Option<&str>, no_collect: bool) -> Resul
                 collected = read;
                 break;
             }
+            let snapshot = as_of(before, now);
+            if let Collecting::Failed(why) = &asked {
+                pending = Some(format!(
+                    "no collect could be started ({}); the snapshot is {snapshot}",
+                    clean(why)
+                ));
+                break;
+            }
             if Instant::now() >= deadline {
-                pending = Some("a fresh collect goes on in the background".to_owned());
+                pending = Some(format!(
+                    "a collect goes on in the background; the snapshot is {snapshot}"
+                ));
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -1126,11 +1387,21 @@ pub fn digest(roots: &[PathBuf], since: Option<&str>, no_collect: bool) -> Resul
             Vec::new()
         }
     };
+    let live = fleet_repos
+        .map(|repos| fleet(&repos))
+        .map_err(|error| format!("{error:#}"));
+    match &live {
+        Err(why) => unread.push(format!("the fleet could not be read: {}", clean(why))),
+        Ok(live) if live.failed > 0 => unread.push(format!(
+            "fleet: {} of {} repositories could not be scanned",
+            live.failed, live.scanned
+        )),
+        Ok(_) => {}
+    }
     let seen = Seen::read(&dirs);
-    let since_ms = window.unwrap_or_else(|| {
+    let from = window.map(Window::at).unwrap_or_else(|| {
         seen.as_ref()
-            .and_then(|seen| seen.digest_ms)
-            .unwrap_or(now - DAY_MS)
+            .map_or(Window::at(now - DAY_MS), |seen| seen.full_from(now))
     });
     let (today, day) = local_day(now);
     let mut view = build(
@@ -1140,28 +1411,32 @@ pub fn digest(roots: &[PathBuf], since: Option<&str>, no_collect: bool) -> Resul
         now,
         day,
     );
-    view.sources.extend(unread);
+    view.unread.extend(unread);
     let mut out = std::io::stdout().lock();
-    out.write_all(full(&view, since_ms, pending.as_deref()).as_bytes())?;
+    out.write_all(full(&view, from, Some(&live), pending.as_deref(), now).as_bytes())?;
     out.flush()?;
     if window.is_none() && person_watching() {
-        let old = seen.unwrap_or_else(|| Seen::first(now));
-        advance(&view, &old, collected.as_ref(), now, Some(&today)).write(&dirs)?;
+        let old_seen = seen.unwrap_or_else(|| Seen::first(now));
+        advance(
+            &view,
+            &old_seen,
+            collected.as_ref(),
+            now,
+            Shown::Full,
+            &today,
+        )
+        .write(&dirs)?;
     }
-    Ok(if view.sources.is_empty() {
-        0
-    } else {
+    Ok(if view.incomplete() {
         crate::INCOMPLETE
+    } else {
+        0
     })
 }
 
 /// `ohjaa collect`: one collect at a time; one started by `line` or
 /// `digest` (`background`) says nothing.
-pub fn collect_now(
-    repos: Result<Vec<PathBuf>>,
-    fleet: Result<Vec<PathBuf>>,
-    background: bool,
-) -> Result<i32> {
+pub fn collect_now(repos: Result<Vec<PathBuf>>, background: bool) -> Result<i32> {
     let dirs = Dirs::resolve(None)?;
     let _lock = match process::lock_file(&collect::lock_path(&dirs), Duration::ZERO) {
         Ok(lock) => lock,
@@ -1175,63 +1450,60 @@ pub fn collect_now(
     };
     let started = Instant::now();
     let now = now_ms();
-    let from = collect::from_ms(Seen::read(&dirs).and_then(|seen| seen.digest_ms), now);
-    let error = |error: anyhow::Error| format!("{error:#}");
-    let collected = collect::collect(&dirs, repos.map_err(error), fleet.map_err(error), from, now);
+    let next = Seen::read(&dirs).map(|seen| seen.full_from(now).github_ms);
+    let from = collect::from_ms(next, now);
+    let collected = collect::collect(&dirs, repos.map_err(|e| format!("{e:#}")), from, now);
     collect::write(&dirs, &collected)?;
-    let failed = [
-        &collected.local.error,
-        &collected.github.error,
-        &collected.usage.error,
-        &collected.fleet.error,
-    ]
-    .iter()
-    .filter(|error| error.is_some())
-    .count();
     if !background {
-        let say = |part: &str, error: &Option<String>, answer: String| match error {
-            Some(why) => println!("  {part:<7} unavailable: {}", clean(why)),
-            None => println!("  {part:<7} {answer}"),
-        };
         println!(
-            "ohjaa: collected in {:.1}s, since {}",
+            "ohjaa: collected in {:.1}s, from {}",
             started.elapsed().as_secs_f64(),
             clock(from)
         );
         let local = &collected.local.value;
-        say(
+        say_part(
             "marks",
-            &collected.local.error,
+            &collected.local,
             format!(
                 "{}, {} not proven at the tip",
                 plural(local.branches.len(), "entry", "entries"),
                 local.branches.iter().filter(|b| b.unproven > 0).count()
             ),
         );
-        say(
+        say_part(
             "github",
-            &collected.github.error,
+            &collected.github,
             plural(
                 collected.github.value.len(),
                 "pull request",
                 "pull requests",
             ),
         );
-        say(
+        say_part(
             "vessa",
-            &collected.usage.error,
+            &collected.usage,
             format!(
                 "{} costed",
                 plural(collected.usage.value.len(), "session", "sessions")
             ),
         );
-        say(
-            "fleet",
-            &collected.fleet.error,
-            format!("{} live", collected.fleet.value.len()),
-        );
     }
-    Ok(if failed == 0 { 0 } else { crate::INCOMPLETE })
+    let failed = collected.local.failed() || collected.github.failed() || collected.usage.failed();
+    Ok(if failed { crate::INCOMPLETE } else { 0 })
+}
+
+/// `  marks   10 entries, 1 not proven at the tip; 1 could not be read: …`.
+fn say_part<T>(name: &str, part: &Part<T>, answer: String) {
+    let said = match (&part.error, part.gaps.first()) {
+        (Some(why), _) => format!("unavailable: {}", clean(why)),
+        (None, Some(first)) => format!(
+            "{answer}; {} could not be read: {}",
+            part.gaps.len(),
+            clean(first)
+        ),
+        (None, None) => answer,
+    };
+    println!("{}", cut(&format!("  {name:<7} {said}"), WIDTH));
 }
 
 #[cfg(test)]
@@ -1288,10 +1560,6 @@ mod tests {
                 as_of_ms: Some(at_ms),
                 ..Part::default()
             },
-            fleet: Part {
-                as_of_ms: Some(at_ms),
-                ..Part::default()
-            },
         }
     }
 
@@ -1344,7 +1612,7 @@ mod tests {
             line.contains("2 sessions ended (1 without read-back/handover)"),
             "{line}"
         );
-        let seen = advance(&view, &first, None, NOW, None);
+        let seen = advance(&view, &first, None, NOW, Shown::Line, "d");
         assert_eq!(one_line(&news(&view, &seen)), None, "seen is not new");
         // The record of a session that ended before the person looked, read
         // after: new once.
@@ -1353,7 +1621,7 @@ mod tests {
         let view = build(&later, Ok(Vec::new()), None, NOW + MINUTE_MS, 0);
         let line = one_line(&news(&view, &seen)).expect("the late record is new");
         assert!(line.contains("1 session ended (1 without"), "{line}");
-        let seen = advance(&view, &seen, None, NOW + MINUTE_MS, None);
+        let seen = advance(&view, &seen, None, NOW + MINUTE_MS, Shown::Line, "d");
         assert_eq!(one_line(&news(&view, &seen)), None);
     }
 
@@ -1367,7 +1635,8 @@ mod tests {
             &Seen::first(NOW),
             Some(&old),
             NOW,
-            None,
+            Shown::Line,
+            "d",
         );
         assert_eq!(seen.github_ms, NOW - 5 * HOUR_MS);
         let mut fresh = snapshot(NOW + MINUTE_MS);
@@ -1395,6 +1664,7 @@ mod tests {
                     unproven: 2,
                     failed: 1,
                     oldest: Some("093dfc5a".into()),
+                    as_of_ms: Some(NOW),
                     ..Branch::default()
                 })
                 .collect(),
@@ -1419,13 +1689,13 @@ mod tests {
         assert!(line.trim_end().ends_with("· ohjaa digest"), "{line}");
         // No ids in the line, and nothing raw from outside.
         assert!(!line.contains("oh-") && !line.contains("s1"), "{line}");
-        let daily = daily(&view, NOW - DAY_MS).unwrap();
+        let daily = daily(&view, Window::at(NOW - DAY_MS), NOW).unwrap().0;
         assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
         for row in daily.lines() {
             assert!(row.chars().count() <= WIDTH, "{row}");
         }
         assert!(daily.contains("more: ohjaa digest"), "{daily}");
-        for row in full(&view, NOW - DAY_MS, None).lines() {
+        for row in full(&view, Window::at(NOW - DAY_MS), None, None, NOW).lines() {
             assert!(row.chars().count() <= WIDTH, "{row}");
         }
     }
@@ -1448,6 +1718,7 @@ mod tests {
             failed,
             unknown,
             oldest: Some("093dfc5a".into()),
+            as_of_ms: Some(NOW),
             ..Branch::default()
         };
         collected.local.value = Local {
@@ -1480,14 +1751,21 @@ mod tests {
                 ("long", Some(Class::Person)),
             ]
         );
-        let full = full(&view, NOW - DAY_MS, None);
+        let full = full(&view, Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(
             full.contains("main: 1 unproven (1 failed) since 093dfc5. Prove it: ohjaa gate"),
             "{full}"
         );
         assert!(full.contains("still running, its ohjaa gone"), "{full}");
         // A new tip is a new item: said again.
-        let seen = advance(&view, &Seen::first(NOW), Some(&collected), NOW, None);
+        let seen = advance(
+            &view,
+            &Seen::first(NOW),
+            Some(&collected),
+            NOW,
+            Shown::Line,
+            "d",
+        );
         collected.local.value.branches[2].tip = Some("newer".into());
         let view = build(&logged, Ok(Vec::new()), Some(&collected), NOW, 0);
         let line = one_line(&news(&view, &seen)).unwrap();
@@ -1505,7 +1783,7 @@ mod tests {
             .collect();
         let today = |day: i64| {
             let view = build(&[], Ok(proposals.clone()), Some(&snapshot(NOW)), NOW, day);
-            let daily = daily(&view, NOW - DAY_MS).unwrap();
+            let daily = daily(&view, Window::at(NOW - DAY_MS), NOW).unwrap().0;
             let line = daily
                 .lines()
                 .find(|line| line.contains("today's proposal"))
@@ -1521,7 +1799,7 @@ mod tests {
         assert!(today(2).contains("today's proposal c (ours)"));
         assert!(today(3).contains("today's proposal a (ours)"));
         let view = build(&[], Ok(proposals), Some(&snapshot(NOW)), NOW, 4);
-        let full = full(&view, NOW - DAY_MS, None);
+        let full = full(&view, Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(full.contains("Proposal of the day\n  b (ours, since 2026-10-20)"));
         assert!(full.contains("3 wait. Decide: ohjaa review"), "{full}");
     }
@@ -1532,7 +1810,7 @@ mod tests {
         let view = build(&[], Ok(proposals.clone()), None, NOW, 0);
         let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
         assert!(line.contains("1 new proposal"), "{line}");
-        let seen = advance(&view, &Seen::first(NOW), None, NOW, None);
+        let seen = advance(&view, &Seen::first(NOW), None, NOW, Shown::Line, "d");
         assert_eq!(one_line(&news(&view, &seen)), None);
         proposals.push(waiting("b", "2026-10-21"));
         proposals.push(waiting("c", "2026-10-21"));
@@ -1554,7 +1832,8 @@ mod tests {
         collected.usage.value.insert(
             "costed".into(),
             Cost {
-                tokens: Some(3_040_000),
+                tokens: Some(115_248),
+                cache_reads: Some(2_923_935),
                 usd_micros: None,
             },
         );
@@ -1577,8 +1856,158 @@ mod tests {
         );
         assert_eq!(
             said("costed"),
-            "claude \"fix the parser\" · exit 0 · 60m · no read-back · 3.0M tokens"
+            "claude \"fix the parser\" · exit 0 · 60m · no read-back · 115k tokens + 2.9M cache \
+             reads"
         );
+    }
+
+    /// Review of #63, finding 1: what could not be read is said where the
+    /// view is read, and makes the digest incomplete; never an all-clear.
+    #[test]
+    fn what_could_not_be_read_is_said_and_never_an_all_clear() {
+        let mut collected = snapshot(NOW);
+        collected.local.gaps = vec!["false-systems/valvo: not marked: no clone".into()];
+        collected.github.error = Some("gh api graphql: not logged in".into());
+        let view = view(&[], Some(&collected));
+        assert!(view.incomplete());
+        let rows: Vec<&str> = view
+            .standing
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                "1 could not be read, as of 08:00 UTC: false-systems/valvo: not marked: no clone",
+                "unavailable, as of 08:00 UTC: gh api graphql: not logged in",
+            ]
+        );
+        let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
+        assert!(
+            line.contains("marks: 1 could not be read · GitHub: unavailable"),
+            "{line}"
+        );
+        let full = full(&view, Window::at(NOW - DAY_MS), None, None, NOW);
+        assert!(full.contains("! marks"), "{full}");
+        assert!(
+            full.contains("Sources\n  marks as of 08:00 UTC · GitHub as of 08:00 UTC"),
+            "{full}"
+        );
+        // Nothing collected yet is unknown too, not nothing.
+        let none = view_of_nothing();
+        assert!(none.incomplete());
+        assert_eq!(
+            none.standing[0].brief.as_deref(),
+            Some("nothing collected yet")
+        );
+        // And all clear only when everything was read.
+        assert!(!view_ok().incomplete());
+    }
+
+    fn view_of_nothing() -> View {
+        build(&[], Ok(Vec::new()), None, NOW, 0)
+    }
+
+    fn view_ok() -> View {
+        build(&[], Ok(Vec::new()), Some(&snapshot(NOW)), NOW, 0)
+    }
+
+    /// Finding 2: a branch whose marks could not be read stays open as it
+    /// was last read, said with that time.
+    #[test]
+    fn a_branch_that_could_not_be_read_stays_open_as_of_its_last_read() {
+        let mut collected = snapshot(NOW);
+        collected.local.value.branches = vec![Branch {
+            slug: "false-systems/habitat".into(),
+            branch: "main".into(),
+            tip: Some("86bd44c0".into()),
+            unproven: 3,
+            failed: 1,
+            oldest: Some("1a2b3c4d".into()),
+            as_of_ms: Some(NOW - 3 * HOUR_MS),
+            error: Some("git: cannot run".into()),
+            ..Branch::default()
+        }];
+        collected.local.gaps = vec!["false-systems/habitat: not marked: git: cannot run".into()];
+        let failed = view(&[], Some(&collected));
+        assert_eq!(failed.standing[0].class, Some(Class::Failed));
+        assert_eq!(
+            failed.standing[0].text,
+            "main: 3 unproven (1 failed) since 1a2b3c4, as of 05:00 UTC (unread since). Prove \
+             it: ohjaa gate"
+        );
+        assert!(failed.incomplete());
+        // An old read, not a failed one, is said with its age too.
+        collected.local.value.branches[0].error = None;
+        collected.local.gaps.clear();
+        let view = view(&[], Some(&collected));
+        assert!(
+            view.standing[0].text.contains(", as of 05:00 UTC."),
+            "{}",
+            view.standing[0].text
+        );
+    }
+
+    /// Finding 3: what the day's digest left out is where `ohjaa digest`
+    /// starts; once read in full, the next starts after it. GitHub's part of
+    /// a window is by GitHub's clock: the snapshot's time.
+    #[test]
+    fn what_the_days_digest_left_out_is_where_ohjaa_digest_starts() {
+        let old = snapshot(NOW - 3 * HOUR_MS);
+        let view = view(&[], Some(&old));
+        let from = Window::at(NOW - DAY_MS);
+        let first = Seen::first(NOW);
+        let cut = advance(
+            &view,
+            &first,
+            Some(&old),
+            NOW,
+            Shown::Daily { from, cut: true },
+            "d",
+        );
+        assert_eq!(
+            cut.full_from(NOW),
+            from,
+            "the full digest shows what was left out"
+        );
+        assert_eq!(
+            cut.daily_from(NOW),
+            Window {
+                sessions_ms: NOW,
+                github_ms: NOW - 3 * HOUR_MS
+            },
+            "the next day's starts where GitHub was read to"
+        );
+        let whole = advance(
+            &view,
+            &first,
+            Some(&old),
+            NOW,
+            Shown::Daily { from, cut: false },
+            "d",
+        );
+        assert_eq!(whole.full_from(NOW), whole.daily_from(NOW));
+        let read = advance(&view, &cut, Some(&old), NOW + HOUR_MS, Shown::Full, "d");
+        assert_eq!(read.unseen, None);
+        assert_eq!(read.full_from(NOW).sessions_ms, NOW + HOUR_MS);
+    }
+
+    /// Finding 5: a window longer than GitHub was read says so.
+    #[test]
+    fn a_window_longer_than_github_was_read_says_so() {
+        let mut collected = snapshot(NOW);
+        collected.github.from_ms = Some(NOW - DAY_MS);
+        let view = view(&[], Some(&collected));
+        let week = full(&view, Window::at(NOW - 7 * DAY_MS), None, None, NOW);
+        assert!(
+            week.contains(&format!(
+                "pull requests only since {}: GitHub was read from there",
+                clock(NOW - DAY_MS)
+            )),
+            "{week}"
+        );
+        let day = full(&view, Window::at(NOW - DAY_MS), None, None, NOW);
+        assert!(!day.contains("only since"), "{day}");
     }
 
     #[test]
@@ -1596,8 +2025,8 @@ mod tests {
         let mut intent = session("s", 2 * HOUR_MS, Some(HOUR_MS), true);
         intent.intent = "\u{1b}]0;title\u{7}".into();
         let view = view(&[intent], Some(&collected));
-        let said = full(&view, NOW - DAY_MS, None)
-            + &daily(&view, NOW - DAY_MS).unwrap()
+        let said = full(&view, Window::at(NOW - DAY_MS), None, None, NOW)
+            + &daily(&view, Window::at(NOW - DAY_MS), NOW).unwrap().0
             + &one_line(&news(&view, &Seen::first(NOW))).unwrap();
         assert!(
             said.chars().all(|c| c == '\n' || !c.is_control()),
@@ -1617,10 +2046,17 @@ mod tests {
             state: dir.clone(),
         };
         let view = view(&[session("a", 2 * HOUR_MS, Some(HOUR_MS), true)], None);
-        let seen = advance(&view, &Seen::first(NOW), None, NOW, Some("2026-10-27"));
+        let seen = advance(
+            &view,
+            &Seen::first(NOW),
+            None,
+            NOW,
+            Shown::Full,
+            "2026-10-27",
+        );
         seen.write(&dirs).unwrap();
         assert_eq!(Seen::read(&dirs), Some(seen.clone()));
-        assert_eq!(seen.digest_ms, Some(NOW));
+        assert_eq!(seen.digest.map(|w| w.sessions_ms), Some(NOW));
         std::fs::write(seen_path(&dirs), json!({"schema": "other"}).to_string()).unwrap();
         assert_eq!(Seen::read(&dirs), None);
         std::fs::remove_dir_all(&dir).unwrap();
