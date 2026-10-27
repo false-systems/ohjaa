@@ -212,7 +212,10 @@ enum Kind {
     Orphaned,
     OpenLong,
     // What happened.
-    Ended { readback: bool, handover: bool },
+    /// `told`: it read back and handed over.
+    Ended {
+        told: bool,
+    },
     Merged,
     Opened,
     Closed,
@@ -372,7 +375,9 @@ fn ended(session: &Session, left: &Left, costed: Option<&Cost>) -> Item {
     }
     parts.extend(costed.and_then(cost));
     event(
-        Kind::Ended { readback, handover },
+        Kind::Ended {
+            told: readback && handover,
+        },
         format!("session:{}", session.id),
         left.ended_ms,
         false,
@@ -583,11 +588,6 @@ fn build(
                 }
                 notes.extend(said.iter().map(|note| format!("{part}: {}", clean(note))));
             }
-            for branch in local.branches.iter() {
-                if let Some(why) = &branch.error {
-                    notes.push(format!("marks: {}: {}", clean(&branch.slug), clean(why)));
-                }
-            }
         }
     }
     View {
@@ -616,18 +616,19 @@ fn news<'a>(view: &'a View, seen: &Seen) -> News<'a> {
             .iter()
             .filter(|item| !seen.items.contains(&item.key))
             .collect(),
-        events: view
-            .events
-            .iter()
-            .filter(|item| {
-                let from = if item.github {
-                    seen.github_ms
-                } else {
-                    seen.at_ms
-                };
-                item.at_ms > from - OVERLAP_MS && !seen.events.contains(&item.key)
-            })
-            .collect(),
+        events: folded(
+            view.events
+                .iter()
+                .filter(|item| {
+                    let from = if item.github {
+                        seen.github_ms
+                    } else {
+                        seen.at_ms
+                    };
+                    item.at_ms > from - OVERLAP_MS && !seen.events.contains(&item.key)
+                })
+                .collect(),
+        ),
         proposals: view
             .waiting
             .iter()
@@ -679,42 +680,54 @@ fn advance(
     }
 }
 
+/// A pull request opened and then merged or closed in the same stretch is
+/// said once, as what became of it.
+fn folded(events: Vec<&Item>) -> Vec<&Item> {
+    let pr = |item: &&Item| item.key.rsplit_once(':').map(|(pr, _)| pr.to_owned());
+    let ended: BTreeSet<String> = events
+        .iter()
+        .filter(|item| matches!(item.kind, Kind::Merged | Kind::Closed))
+        .filter_map(pr)
+        .collect();
+    events
+        .into_iter()
+        .filter(|item| item.kind != Kind::Opened || !pr(item).is_some_and(|pr| ended.contains(&pr)))
+        .collect()
+}
+
+/// What happened after `since_ms`: my sessions, then what landed, then the
+/// other pull requests, each newest first.
+fn after(view: &View, since_ms: i64) -> Vec<&Item> {
+    let group = |kind: Kind| match kind {
+        Kind::Ended { .. } => 0,
+        Kind::Merged => 1,
+        _ => 2,
+    };
+    let mut events = folded(
+        view.events
+            .iter()
+            .filter(|item| item.at_ms > since_ms)
+            .collect(),
+    );
+    events.sort_by_key(|item| group(item.kind));
+    events
+}
+
 fn count(items: &[&Item], of: impl Fn(Kind) -> bool) -> usize {
     items.iter().filter(|item| of(item.kind)).count()
 }
 
-/// `3 sessions ended (1 no read-back, 2 no handover)`.
-fn sessions_ended(events: &[&Item]) -> Option<String> {
+/// `3 sessions ended (1 without read-back/handover)`: with `gaps`, how many
+/// of them left no read-back or no handover.
+fn sessions_ended(events: &[&Item], gaps: bool) -> Option<String> {
     let ended = count(events, |k| matches!(k, Kind::Ended { .. }));
     if ended == 0 {
         return None;
     }
-    let readback = count(events, |k| {
-        matches!(
-            k,
-            Kind::Ended {
-                readback: false,
-                ..
-            }
-        )
-    });
-    let handover = count(events, |k| {
-        matches!(
-            k,
-            Kind::Ended {
-                handover: false,
-                ..
-            }
-        )
-    });
-    let gaps: Vec<String> = [(readback, "no read-back"), (handover, "no handover")]
-        .into_iter()
-        .filter(|(n, _)| *n > 0)
-        .map(|(n, what)| format!("{n} {what}"))
-        .collect();
+    let untold = count(events, |k| k == Kind::Ended { told: false });
     let mut text = plural(ended, "session ended", "sessions ended");
-    if !gaps.is_empty() {
-        text.push_str(&format!(" ({})", gaps.join(", ")));
+    if gaps && untold > 0 {
+        text.push_str(&format!(" ({untold} without read-back/handover)"));
     }
     Some(text)
 }
@@ -769,7 +782,7 @@ fn one_line(news: &News) -> Option<String> {
             n => parts.push(plural(n, one, many)),
         }
     }
-    parts.extend(sessions_ended(&news.events));
+    parts.extend(sessions_ended(&news.events, true));
     parts.extend(pull_requests(&news.events));
     if news.proposals > 0 {
         parts.push(plural(news.proposals, "new proposal", "new proposals"));
@@ -838,17 +851,13 @@ fn proposal_line(view: &View) -> Option<String> {
 /// The day's digest: what stands, today's proposal and what happened since
 /// `since_ms`, at most [`DAILY_LINES`] lines. `None` when there is nothing.
 fn daily(view: &View, since_ms: i64) -> Option<String> {
-    let events: Vec<&Item> = view
-        .events
-        .iter()
-        .filter(|item| item.at_ms > since_ms)
-        .collect();
+    let events = after(view, since_ms);
     let proposal = proposal_line(view);
     if view.standing.is_empty() && events.is_empty() && proposal.is_none() {
         return None;
     }
     let mut summary = vec![format!("since {}", clock(since_ms))];
-    summary.extend(sessions_ended(&events));
+    summary.extend(sessions_ended(&events, false));
     summary.extend(pull_requests(&events));
     let mut lines = vec![cut(&format!("ohjaa · {}", summary.join(" · ")), WIDTH)];
     // Only which sources failed: why is in `ohjaa digest`.
@@ -887,11 +896,7 @@ fn daily(view: &View, since_ms: i64) -> Option<String> {
 /// All of it: what stands, what happened since `since_ms`, today's
 /// proposal, who is live, and what could not be read.
 fn full(view: &View, since_ms: i64, pending: Option<&str>) -> String {
-    let events: Vec<&Item> = view
-        .events
-        .iter()
-        .filter(|item| item.at_ms > since_ms)
-        .collect();
+    let events = after(view, since_ms);
     let mut out = format!("ohjaa digest · since {}", clock(since_ms));
     if let Some(at) = view.collected_ms {
         out.push_str(&format!(" · collected {}", clock(at)));
@@ -1233,4 +1238,397 @@ pub fn collect_now(
         );
     }
     Ok(if failed == 0 { 0 } else { crate::INCOMPLETE })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collect::{Branch, Local, Part};
+    use serde_json::json;
+
+    const NOW: i64 = 1_800_000_000_000;
+
+    /// A session that started `ago_ms` before NOW and ended `ended_ago`
+    /// before it (`None`: still open), with or without its testimony.
+    fn session(id: &str, ago_ms: i64, ended_ago: Option<i64>, told: bool) -> Session {
+        let mut value = json!({
+            "id": id, "agent": "claude", "repo": "/r/ohjaa", "intent": "fix the parser",
+            "started_ms": NOW - ago_ms, "delivered": [],
+        });
+        if let Some(ended) = ended_ago {
+            value["left"] = json!({
+                "ended_ms": NOW - ended, "exit": {"how": "code", "code": 0},
+                "finished": {"kind": "no_pull_request"},
+            });
+        }
+        if told {
+            value["readback"] = json!({"at_ms": NOW - ago_ms, "text": "goal"});
+            value["handover"] = json!({"at_ms": NOW - ago_ms, "next": "more"});
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn waiting(name: &str, since: &str) -> Waiting {
+        Waiting {
+            scope: "ours".into(),
+            name: name.into(),
+            title: format!("What {name} says, at some length so that it has to be cut short"),
+            since: since.into(),
+            repo: None,
+        }
+    }
+
+    fn snapshot(at_ms: i64) -> Collected {
+        Collected {
+            schema: collect::SCHEMA.into(),
+            at_ms,
+            local: Part {
+                as_of_ms: Some(at_ms),
+                ..Part::default()
+            },
+            github: Part {
+                as_of_ms: Some(at_ms),
+                ..Part::default()
+            },
+            usage: Part {
+                as_of_ms: Some(at_ms),
+                ..Part::default()
+            },
+            fleet: Part {
+                as_of_ms: Some(at_ms),
+                ..Part::default()
+            },
+        }
+    }
+
+    fn pr(number: u64, created_ago: i64, merged_ago: Option<i64>) -> Pr {
+        Pr {
+            repo: "false-systems/sykli".into(),
+            number,
+            title: "Ask git once".into(),
+            url: format!("https://github.com/false-systems/sykli/pull/{number}"),
+            author: Some("yairfalse".into()),
+            created_ms: NOW - created_ago,
+            merged_ms: merged_ago.map(|ago| NOW - ago),
+            merged_by: merged_ago.map(|_| "yairfalse".into()),
+            closed_ms: merged_ago.map(|ago| NOW - ago),
+            base: Some("main".into()),
+            default_branch: Some("main".into()),
+        }
+    }
+
+    fn view(logged: &[Session], collected: Option<&Collected>) -> View {
+        build(logged, Ok(Vec::new()), collected, NOW, 0)
+    }
+
+    #[test]
+    fn every_agent_marker_silences_the_line_and_a_persons_own_variables_do_not() {
+        for marker in AGENT_MARKERS {
+            let env = |name: &str| (name == marker).then(|| OsString::from("1"));
+            assert_eq!(agent_marker(env), Some(marker));
+        }
+        // Set but empty is not set; what a person exports is no agent's.
+        let env = |name: &str| match name {
+            "CLAUDECODE" => Some(OsString::new()),
+            "CODEX_HOME" | "CLAUDE_CONFIG_DIR" | "TERM_PROGRAM" => Some("x".into()),
+            _ => None,
+        };
+        assert_eq!(agent_marker(env), None);
+    }
+
+    #[test]
+    fn a_line_says_what_is_new_once_and_seeing_it_moves_the_cursor() {
+        let logged = [
+            session("a", 3 * HOUR_MS, Some(HOUR_MS), true),
+            session("b", 3 * HOUR_MS, Some(HOUR_MS), false),
+            session("old", 9 * DAY_MS, Some(8 * DAY_MS), false),
+        ];
+        let view = view(&logged, None);
+        let first = Seen::first(NOW);
+        let line = one_line(&news(&view, &first)).expect("something is new");
+        assert!(
+            line.contains("2 sessions ended (1 without read-back/handover)"),
+            "{line}"
+        );
+        let seen = advance(&view, &first, None, NOW, None);
+        assert_eq!(one_line(&news(&view, &seen)), None, "seen is not new");
+        // The record of a session that ended before the person looked, read
+        // after: new once.
+        let mut later = logged.to_vec();
+        later.push(session("late", 2 * HOUR_MS, Some(MINUTE_MS), false));
+        let view = build(&later, Ok(Vec::new()), None, NOW + MINUTE_MS, 0);
+        let line = one_line(&news(&view, &seen)).expect("the late record is new");
+        assert!(line.contains("1 session ended (1 without"), "{line}");
+        let seen = advance(&view, &seen, None, NOW + MINUTE_MS, None);
+        assert_eq!(one_line(&news(&view, &seen)), None);
+    }
+
+    #[test]
+    fn what_github_said_before_an_old_snapshot_was_read_is_never_lost() {
+        // The person saw a line at NOW from a snapshot collected 5 h before:
+        // GitHub is seen only as far as it was read.
+        let old = snapshot(NOW - 5 * HOUR_MS);
+        let seen = advance(
+            &view(&[], Some(&old)),
+            &Seen::first(NOW),
+            Some(&old),
+            NOW,
+            None,
+        );
+        assert_eq!(seen.github_ms, NOW - 5 * HOUR_MS);
+        let mut fresh = snapshot(NOW + MINUTE_MS);
+        fresh.github.value = vec![pr(7, 4 * HOUR_MS, Some(4 * HOUR_MS))];
+        let view = build(&[], Ok(Vec::new()), Some(&fresh), NOW + MINUTE_MS, 0);
+        let line = one_line(&news(&view, &seen)).expect("merged after the snapshot");
+        assert!(line.contains("PRs: 1 merged"), "{line}");
+        // Opened and merged in the same stretch: said once, as merged.
+        assert!(!line.contains("opened"), "{line}");
+    }
+
+    #[test]
+    fn a_line_is_short_and_plain_however_much_is_new() {
+        let logged: Vec<Session> = (0..40)
+            .map(|i| session(&format!("s{i}"), 2 * HOUR_MS, Some(HOUR_MS), i % 2 == 0))
+            .collect();
+        let mut collected = snapshot(NOW);
+        collected.local.value = Local {
+            branches: ["sykli", "ohjaa", "habitat"]
+                .iter()
+                .map(|name| Branch {
+                    slug: format!("false-systems/{name}"),
+                    branch: "main".into(),
+                    tip: Some("5fcdeef0".into()),
+                    unproven: 2,
+                    failed: 1,
+                    oldest: Some("093dfc5a".into()),
+                    ..Branch::default()
+                })
+                .collect(),
+            gone: vec!["s1".into()],
+            orphaned: Vec::new(),
+        };
+        collected.github.value = (1..60)
+            .map(|n| pr(n, HOUR_MS, (n % 3 == 0).then_some(HOUR_MS / 2)))
+            .collect();
+        let view = build(
+            &logged,
+            Ok((0..115)
+                .map(|i| waiting(&format!("p{i}"), "2026-10-20"))
+                .collect()),
+            Some(&collected),
+            NOW,
+            0,
+        );
+        let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
+        assert!(line.chars().count() <= WIDTH + 1, "{line}");
+        assert!(
+            line.starts_with("ohjaa · main unproven in 3 repos"),
+            "{line}"
+        );
+        assert!(line.trim_end().ends_with("· ohjaa digest"), "{line}");
+        // No ids in the line, and nothing raw from outside.
+        assert!(!line.contains("oh-") && !line.contains("s1"), "{line}");
+        let daily = daily(&view, NOW - DAY_MS).unwrap();
+        assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
+        for row in daily.lines() {
+            assert!(row.chars().count() <= WIDTH, "{row}");
+        }
+        assert!(daily.contains("more: ohjaa digest"), "{daily}");
+        for row in full(&view, NOW - DAY_MS, None).lines() {
+            assert!(row.chars().count() <= WIDTH, "{row}");
+        }
+    }
+
+    #[test]
+    fn what_stands_comes_in_the_order_a_person_must_see_it() {
+        let logged = [
+            session("gone", HOUR_MS, None, false),
+            session("orphan", HOUR_MS, None, false),
+            session("long", 2 * DAY_MS, None, true),
+            // Closed since the snapshot found its ohjaa gone: no longer open.
+            session("closed", 3 * HOUR_MS, Some(HOUR_MS), true),
+        ];
+        let mut collected = snapshot(NOW);
+        let main = |name: &str, failed, unknown| Branch {
+            slug: format!("false-systems/{name}"),
+            branch: "main".into(),
+            tip: Some(format!("{name}-tip")),
+            unproven: 1,
+            failed,
+            unknown,
+            oldest: Some("093dfc5a".into()),
+            ..Branch::default()
+        };
+        collected.local.value = Local {
+            branches: vec![
+                main("evidence", 0, 0),
+                main("unknown", 0, 1),
+                main("failed", 1, 0),
+                Branch {
+                    slug: "false-systems/proven".into(),
+                    ..Branch::default()
+                },
+            ],
+            gone: vec!["gone".into(), "closed".into()],
+            orphaned: vec!["orphan".into()],
+        };
+        let view = view(&logged, Some(&collected));
+        let said: Vec<(&str, Option<Class>)> = view
+            .standing
+            .iter()
+            .map(|item| (item.key.split(':').nth(1).unwrap(), item.class))
+            .collect();
+        assert_eq!(
+            said,
+            vec![
+                ("false-systems/failed", Some(Class::Failed)),
+                ("false-systems/unknown", Some(Class::Unknown)),
+                ("gone", Some(Class::Unknown)),
+                ("orphan", Some(Class::Unknown)),
+                ("false-systems/evidence", Some(Class::Evidence)),
+                ("long", Some(Class::Person)),
+            ]
+        );
+        let full = full(&view, NOW - DAY_MS, None);
+        assert!(
+            full.contains("main: 1 unproven (1 failed) since 093dfc5. Prove it: ohjaa gate"),
+            "{full}"
+        );
+        assert!(full.contains("still running, its ohjaa gone"), "{full}");
+        // A new tip is a new item: said again.
+        let seen = advance(&view, &Seen::first(NOW), Some(&collected), NOW, None);
+        collected.local.value.branches[2].tip = Some("newer".into());
+        let view = build(&logged, Ok(Vec::new()), Some(&collected), NOW, 0);
+        let line = one_line(&news(&view, &seen)).unwrap();
+        assert!(line.contains("failed main failed"), "{line}");
+    }
+
+    #[test]
+    fn one_proposal_a_day_with_its_id_and_the_command_that_decides_it() {
+        let proposals: Vec<Waiting> = ["b", "a", "c"]
+            .iter()
+            .map(|name| waiting(name, "2026-10-20"))
+            .collect();
+        let today = |day: i64| {
+            let view = build(&[], Ok(proposals.clone()), Some(&snapshot(NOW)), NOW, day);
+            let daily = daily(&view, NOW - DAY_MS).unwrap();
+            let line = daily
+                .lines()
+                .find(|line| line.contains("today's proposal"))
+                .unwrap()
+                .to_owned();
+            assert!(line.ends_with("· 3 wait · ohjaa review"), "{line}");
+            assert!(line.chars().count() <= WIDTH, "{line}");
+            line
+        };
+        // Oldest first, then by name; one a day, in turn.
+        assert!(today(0).contains("today's proposal a (ours): What a says"));
+        assert!(today(1).contains("today's proposal b (ours)"));
+        assert!(today(2).contains("today's proposal c (ours)"));
+        assert!(today(3).contains("today's proposal a (ours)"));
+        let view = build(&[], Ok(proposals), Some(&snapshot(NOW)), NOW, 4);
+        let full = full(&view, NOW - DAY_MS, None);
+        assert!(full.contains("Proposal of the day\n  b (ours, since 2026-10-20)"));
+        assert!(full.contains("3 wait. Decide: ohjaa review"), "{full}");
+    }
+
+    #[test]
+    fn new_proposals_are_news_once() {
+        let mut proposals = vec![waiting("a", "2026-10-20")];
+        let view = build(&[], Ok(proposals.clone()), None, NOW, 0);
+        let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
+        assert!(line.contains("1 new proposal"), "{line}");
+        let seen = advance(&view, &Seen::first(NOW), None, NOW, None);
+        assert_eq!(one_line(&news(&view, &seen)), None);
+        proposals.push(waiting("b", "2026-10-21"));
+        proposals.push(waiting("c", "2026-10-21"));
+        let view = build(&[], Ok(proposals), None, NOW, 0);
+        assert!(one_line(&news(&view, &seen))
+            .unwrap()
+            .contains("2 new proposals"));
+    }
+
+    #[test]
+    fn a_session_says_how_it_ended_what_it_left_out_and_what_it_cost() {
+        let mut gone = session("killed", 2 * HOUR_MS, Some(HOUR_MS), false);
+        gone.left.as_mut().unwrap().exit = Exit::Signal { signal: 9 };
+        let mut orphan = session("orphan", 2 * HOUR_MS, Some(HOUR_MS), false);
+        orphan.left.as_mut().unwrap().orphaned = true;
+        let mut costed = session("costed", 2 * HOUR_MS, Some(HOUR_MS), true);
+        costed.readback = None;
+        let mut collected = snapshot(NOW);
+        collected.usage.value.insert(
+            "costed".into(),
+            Cost {
+                tokens: Some(3_040_000),
+                usd_micros: None,
+            },
+        );
+        let view = view(&[gone, orphan, costed], Some(&collected));
+        let said = |id: &str| {
+            view.events
+                .iter()
+                .find(|item| item.key == format!("session:{id}"))
+                .unwrap()
+                .text
+                .clone()
+        };
+        assert_eq!(
+            said("killed"),
+            "claude \"fix the parser\" · killed (signal 9) · 60m · no read-back or handover"
+        );
+        assert_eq!(
+            said("orphan"),
+            "claude \"fix the parser\" · orphaned · no read-back or handover"
+        );
+        assert_eq!(
+            said("costed"),
+            "claude \"fix the parser\" · exit 0 · 60m · no read-back · 3.0M tokens"
+        );
+    }
+
+    #[test]
+    fn text_from_outside_never_reaches_the_terminal_raw() {
+        let dirty = "a\u{1b}]52;c;x\u{7}b\u{9b}31m\u{7f}c\u{202e}d\u{2066}e\u{200f}f\tg\nh";
+        let cleaned = clean(dirty);
+        assert!(cleaned.chars().all(|c| !c.is_control()), "{cleaned:?}");
+        assert!(!cleaned.contains('\u{202e}') && !cleaned.contains('\u{2066}'));
+        let mut collected = snapshot(NOW);
+        let mut hostile = pr(9, HOUR_MS, None);
+        hostile.title = dirty.into();
+        hostile.author = Some("\u{1b}[2Jx".into());
+        collected.github.value = vec![hostile];
+        collected.github.error = Some("gh: \u{1b}[31mno".into());
+        let mut intent = session("s", 2 * HOUR_MS, Some(HOUR_MS), true);
+        intent.intent = "\u{1b}]0;title\u{7}".into();
+        let view = view(&[intent], Some(&collected));
+        let said = full(&view, NOW - DAY_MS, None)
+            + &daily(&view, NOW - DAY_MS).unwrap()
+            + &one_line(&news(&view, &Seen::first(NOW))).unwrap();
+        assert!(
+            said.chars().all(|c| c == '\n' || !c.is_control()),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn the_cursor_reads_back_as_written_and_an_unknown_one_is_none() {
+        let dir = std::env::temp_dir().join(format!("ohjaa-seen-{}", std::process::id()));
+        let dirs = Dirs {
+            ours_checkout: None,
+            repo_root: None,
+            mine: dir.join("mine"),
+            machine: dir.join("machine"),
+            proposals: dir.join("proposals"),
+            state: dir.clone(),
+        };
+        let view = view(&[session("a", 2 * HOUR_MS, Some(HOUR_MS), true)], None);
+        let seen = advance(&view, &Seen::first(NOW), None, NOW, Some("2026-10-27"));
+        seen.write(&dirs).unwrap();
+        assert_eq!(Seen::read(&dirs), Some(seen.clone()));
+        assert_eq!(seen.digest_ms, Some(NOW));
+        std::fs::write(seen_path(&dirs), json!({"schema": "other"}).to_string()).unwrap();
+        assert_eq!(Seen::read(&dirs), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

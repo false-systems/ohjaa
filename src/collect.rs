@@ -619,7 +619,8 @@ mod tests {
             "id": id, "agent": "claude", "repo": "/r/ohjaa", "intent": "x",
             "started_ms": 1_000, "delivered": [],
             "left": {
-                "ended_ms": 2_000, "exit": {"code": 0}, "finished": "no_pull_request",
+                "ended_ms": 2_000, "exit": {"how": "code", "code": 0},
+                "finished": {"kind": "no_pull_request"},
                 "native": {"sessions": natives},
             },
         }))
