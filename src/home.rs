@@ -422,30 +422,59 @@ const EXCLUDE: &[&str] = &[
     ".DS_Store",
 ];
 
-/// The allowlist in the home's repository's own `info/exclude` (git keeps
-/// it untracked, so the home needs no file of its own), as a marked block
-/// beside anything else there; in the common folder a `.git` file names.
-fn keep_out_strays(home: &Path) -> Result<()> {
-    let path = repository_dirs(home).1.join("info").join("exclude");
-    let now = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
-    };
-    let block = format!("{EXCLUDE_BEGIN}\n{}\n{EXCLUDE_END}\n", EXCLUDE.join("\n"));
-    let new = match (now.find(EXCLUDE_BEGIN), now.find(EXCLUDE_END)) {
+fn read_or_empty(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+/// `now` with the allowlist's marked block taken out (and the newline after
+/// it), and where it was; `None` when there is none.
+fn without_allowlist(now: &str) -> Option<(String, usize)> {
+    match (now.find(EXCLUDE_BEGIN), now.find(EXCLUDE_END)) {
         (Some(start), Some(end)) if end > start => {
             let after = &now[end + EXCLUDE_END.len()..];
             let after = after.strip_prefix('\n').unwrap_or(after);
-            format!("{}{block}{after}", &now[..start])
+            Some((format!("{}{after}", &now[..start]), start))
         }
-        _ if now.is_empty() || now.ends_with('\n') => format!("{now}{block}"),
-        _ => format!("{now}\n{block}"),
+        _ => None,
+    }
+}
+
+/// The allowlist, as a marked block beside anything else in the file git
+/// reads it from, kept untracked so the home needs no file of its own: the
+/// home's repository's own `info/exclude`. A home that is a linked worktree
+/// keeps it in its own worktree folder instead (`ohjaa.exclude`), and that
+/// file is returned, to give `git add` as its excludes file: git reads the
+/// common folder's `info/exclude` for every worktree of the repository, and
+/// the allowlist begins by leaving out everything. A block an earlier ohjaa
+/// wrote there is taken out.
+fn keep_out_strays(home: &Path) -> Result<Option<PathBuf>> {
+    let (git_dir, common) = repository_dirs(home);
+    let shared = common.join("info").join("exclude");
+    let linked = git_dir != common;
+    let path = if linked {
+        let now = read_or_empty(&shared)?;
+        if let Some((without, _)) = without_allowlist(&now) {
+            write_file(&shared, &without, None)?;
+        }
+        git_dir.join("ohjaa.exclude")
+    } else {
+        shared
+    };
+    let now = read_or_empty(&path)?;
+    let block = format!("{EXCLUDE_BEGIN}\n{}\n{EXCLUDE_END}\n", EXCLUDE.join("\n"));
+    let new = match without_allowlist(&now) {
+        Some((without, at)) => format!("{}{block}{}", &without[..at], &without[at..]),
+        None if now.is_empty() || now.ends_with('\n') => format!("{now}{block}"),
+        None => format!("{now}\n{block}"),
     };
     if new != now {
         write_file(&path, &new, None)?;
     }
-    Ok(())
+    Ok(linked.then_some(path))
 }
 
 /// The variables that would point git at another repository than the home.
@@ -486,9 +515,14 @@ fn home_git(home: &Path, args: &[&str], repository: bool) -> Result<()> {
     }
     let output = process::run(&mut command, None, process::LOCAL).context("cannot run git")?;
     if !output.status.success() {
+        // Named by its subcommand, after any `-c <setting>`.
+        let mut named = args;
+        while let ["-c", _, rest @ ..] = named {
+            named = rest;
+        }
         bail!(
             "git {} failed: {}",
-            args.first().copied().unwrap_or_default(),
+            named.first().copied().unwrap_or_default(),
             output.failure_detail()
         );
     }
@@ -514,8 +548,14 @@ pub fn commit(home: &Path, message: &str) -> Result<()> {
             .with_context(|| format!("cannot create {}", home.display()))?;
         home_git(home, &["init", "-q"], false)?;
     }
-    keep_out_strays(home)?;
-    home_git(home, &["add", "-A"], true)?;
+    let excludes =
+        keep_out_strays(home)?.map(|file| format!("core.excludesFile={}", file.display()));
+    let mut add: Vec<&str> = Vec::new();
+    if let Some(excludes) = &excludes {
+        add.extend(["-c", excludes]);
+    }
+    add.extend(["add", "-A"]);
+    home_git(home, &add, true)?;
     home_git(
         home,
         &["commit", "-q", "--allow-empty", "-m", message],

@@ -1004,7 +1004,12 @@ rest is applied, but apply is not done: it ends with `applied, except 1
 agent file not written: <file> (<why>)` and exits 4, its commit names the
 file, and every later apply and dry run, and `ohjaa doctor`, say so again
 until you fix the file by hand. A home whose `.git` is a file (a worktree)
-keeps the lock and the allowlist in the folders that file names. A bare
+keeps the lock in the folder that file names. A linked worktree keeps the
+allowlist there too, as `ohjaa.exclude`, which the home's `git add` is given
+as its excludes file (in place of the global one, for that one command):
+git reads the common folder's `info/exclude` for every worktree of the
+repository, and the allowlist begins by leaving out everything, which
+would hide the other worktrees' new files. A bare
 dotfiles repository (`git --git-dir=~/.dotfiles --work-tree=~`) has no `.git`
 above the file, so ohjaa cannot see that a file is in it: give such an
 agent's file no block by putting one of your own there.
