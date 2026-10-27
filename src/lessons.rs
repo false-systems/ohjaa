@@ -884,8 +884,32 @@ fn git_bytes(dir: &Path, args: &[&str], timeout: Duration) -> Result<Vec<u8>, St
     if output.status.success() {
         Ok(output.stdout)
     } else {
-        Err(format!("{what}: {}", output.failure_detail()))
+        Err(format!("{what}: {}", git_reason(&output)))
     }
+}
+
+/// Why git failed, in the words of what made it fail: a repository's own
+/// hook speaks on git's stderr before git's own closing lines ("error:
+/// failed to push some refs", "To <url>", "hint: …"), which say only that
+/// it failed. The last three lines that are not git's own, else git's last.
+fn git_reason(output: &process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let own: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            !line.starts_with("error: failed to push some refs")
+                && !line.starts_with("To ")
+                && !line.starts_with("hint:")
+                && !line.starts_with("! [remote rejected]")
+                && !line.starts_with("error: failed to run")
+        })
+        .collect();
+    if own.is_empty() {
+        return output.failure_detail();
+    }
+    own[own.len().saturating_sub(3)..].join("; ")
 }
 
 /// AGENTS.md as `rev` holds it: empty when it holds none. Anything else that
@@ -1540,13 +1564,16 @@ pub fn deliver(
     };
     let in_state: Vec<Filed> = nodes_in(&dir, &mut said);
     // A node in both is ohjaa's already: its file in the checkout is left.
+    let mut left = 0;
     let extra: Vec<Filed> = extra
         .into_iter()
         .filter(|(node, path)| {
             let twice = in_state.iter().any(|(held, _)| held.id == node.id);
             if twice {
+                left += 1;
                 said.push(format!(
-                    "left {}: `{}` is in ohjaa's state already",
+                    "left {}: `{}` is in ohjaa's state already, which is the copy read; take \
+                     this one out of the checkout",
                     path.display(),
                     node.id
                 ));
@@ -1562,7 +1589,7 @@ pub fn deliver(
         Ok(Some(sent)) => sent,
         Ok(None) => {
             return Delivered {
-                complete: !said.iter().any(|line| line.starts_with("held back")),
+                complete: left == 0 && !said.iter().any(|line| line.starts_with("held back")),
                 said,
             }
         }
@@ -1669,7 +1696,7 @@ pub fn deliver(
     stays(stayed, &mut said);
     Delivered {
         said,
-        complete: sent.plan.held.is_empty() && stayed == 0,
+        complete: sent.plan.held.is_empty() && stayed == 0 && left == 0,
     }
 }
 
@@ -1790,11 +1817,43 @@ fn attempt(
     let work = Work::add(checkout, state, &tracking(&base_branch))?;
     write_atomic(&work.path.join("AGENTS.md"), plan.text.as_bytes())?;
     git_in(&work.path, &["add", "AGENTS.md"], process::LOCAL)?;
+    eprintln!(
+        "ohjaa: committing for {} in a worktree, where its own hooks run",
+        ready.slug
+    );
     git_in(
         &work.path,
         &["commit", "--quiet", "-m", &out.message],
         HOOKS,
     )?;
+    // What is pushed is what was checked: AGENTS.md alone, in ohjaa's words.
+    // A hook that changed or added a file stops the delivery.
+    let changed = git_in(
+        &work.path,
+        &["diff", "--name-only", &tracking(&base_branch), "HEAD"],
+        process::LOCAL,
+    )?;
+    let files: Vec<&str> = changed.lines().filter(|line| !line.is_empty()).collect();
+    if files != ["AGENTS.md"] {
+        return Err(format!(
+            "the commit holds more than AGENTS.md ({}): a hook of the repository's changed it, \
+             so nothing was pushed",
+            files.join(", ")
+        ));
+    }
+    let committed = git_bytes(
+        &work.path,
+        &["cat-file", "blob", "HEAD:AGENTS.md"],
+        process::LOCAL,
+    )?;
+    if committed != plan.text.as_bytes() {
+        return Err(
+            "AGENTS.md in the commit is not what ohjaa wrote and checked (a hook of the \
+             repository's changed it), so nothing was pushed"
+                .to_owned(),
+        );
+    }
+    eprintln!("ohjaa: pushing to {} (its pre-push hook runs)", ready.slug);
     // Never a force: on an open pull request's branch, a commit on its tip.
     let refspec = format!("HEAD:refs/heads/{}", out.branch);
     git_in(

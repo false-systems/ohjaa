@@ -835,6 +835,13 @@ fn knowledge_briefing_for(
             broken.reason
         );
     }
+    for left in &loaded.shadowed {
+        eprintln!(
+            "ohjaa: left {}: ohjaa's state holds that node, so this copy is not read \
+             (`ohjaa lessons publish` names it until it is taken out)",
+            left.display()
+        );
+    }
     for error in fk::validate_set(&loaded.nodes) {
         eprintln!("ohjaa: knowledge does not hold together: {error}");
     }
@@ -1907,7 +1914,9 @@ fn screen_accept(
 /// brought in line with it through the pull request (`lessons::deliver`),
 /// with `ready` when it was asked before the decision. It never undoes or
 /// fails the decision: what could not be delivered is said, and `ohjaa
-/// list` says it after, until `ohjaa lessons publish` delivers it.
+/// list` says it after, until `ohjaa lessons publish` delivers it. Called
+/// once the home's lock is let go: the delivery holds only the lessons lock
+/// (`lessons::deliver`), so no other change to the home waits on it.
 fn deliver_decided(
     dirs: &Dirs,
     outcome: &Outcome,
@@ -1932,6 +1941,10 @@ fn deliver_decided(
         return;
     }
     let ready = ready.unwrap_or_else(|| asker.ready(repo));
+    println!(
+        "  lessons: delivering, with the home's lock let go: no other change to the home waits \
+         on the repository's hooks"
+    );
     let delivered = lessons::deliver(&dirs.state, repo, ready, Vec::new(), false, today);
     for line in &delivered.said {
         println!("  lessons: {line}");
@@ -1967,6 +1980,9 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     println!("{done} {id}");
     report(&outcome);
     after_decision(action, id, &outcome, why, lock.as_ref());
+    // The decision is made and recorded: the home's lock goes before a
+    // delivery, which may run a repository's hooks for minutes.
+    drop(lock);
     if action != "reject" {
         deliver_decided(&dirs, &outcome, ready, &mut asker, today);
     }
@@ -2113,6 +2129,7 @@ fn cmd_review(list: bool) -> Result<i32> {
             Ok(Some((action, outcome))) => {
                 report(&outcome);
                 after_decision(action, id, &outcome, None, lock.as_ref());
+                drop(lock);
                 if action == "accept" {
                     deliver_decided(&dirs, &outcome, ready.take(), &mut asker, today);
                 }
@@ -2177,6 +2194,12 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
     for broken in &loaded.broken {
         println!("error    {}: {}", broken.path.display(), broken.reason);
         errors += 1;
+    }
+    for left in &loaded.shadowed {
+        println!(
+            "flag     {}: left beside ohjaa's state's copy of the node, which is read",
+            left.display()
+        );
     }
     for error in fk::validate_set(&loaded.nodes) {
         println!("error    {error}");

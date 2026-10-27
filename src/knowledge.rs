@@ -212,6 +212,9 @@ pub struct Loaded {
     /// The file each node was read from, index for index with `nodes`.
     pub files: Vec<PathBuf>,
     pub broken: Vec<Broken>,
+    /// Files untracked in a checkout's `.ohjaa/knowledge/` of a node ohjaa's
+    /// state holds too (a move cut short): left, the state's copy read.
+    pub shadowed: Vec<PathBuf>,
 }
 
 impl Loaded {
@@ -267,13 +270,26 @@ fn read_node(path: &Path) -> std::result::Result<Node, String> {
 pub fn load(dirs: &Dirs) -> Result<Loaded> {
     let mut loaded = Loaded::default();
     for scope in Scope::ALL {
-        let mut homes: Vec<PathBuf> = dirs.scope_dir(scope).into_iter().collect();
+        let mut homes: Vec<PathBuf> = Vec::new();
+        // ohjaa's state for a repository first: a node it holds is the one,
+        // and a copy of it left untracked in the checkout is shadowed.
         if let (Scope::Repo, Some(root)) = (scope, &dirs.repo_root) {
             homes.push(accepted_dir(&dirs.state, root));
         }
-        for dir in homes {
+        homes.extend(dirs.scope_dir(scope));
+        let accepted = homes.len() > 1;
+        for (at, dir) in homes.into_iter().enumerate() {
+            let held: Vec<String> = loaded
+                .nodes
+                .iter()
+                .filter(|located| located.scope == scope)
+                .map(|located| located.node.id.clone())
+                .collect();
             for path in markdown_files(&dir)? {
                 match read_node(&path) {
+                    Ok(node) if accepted && at > 0 && held.contains(&node.id) => {
+                        loaded.shadowed.push(path);
+                    }
                     Ok(node) => {
                         loaded.nodes.push(Located { scope, node });
                         loaded.files.push(path);
