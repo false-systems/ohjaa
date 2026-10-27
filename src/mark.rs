@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(
             flag(&regated).unwrap(),
             "FLAG: main of acme/widget has never been proven against its current gate (2 \
-             commits: ? 0000000, ? 1111111; 1 passed under another contract; origin/main, its \
+             commits: ? 0000000, ? 1111111; 1 ran under another contract; origin/main, its \
              update time unknown). Start by running `ohjaa gate` on main and fix forward what \
              fails."
         );
@@ -651,7 +651,7 @@ mod tests {
         assert_eq!(code(&other), "other_contract");
         assert_eq!(
             why(&other).unwrap(),
-            "passed under another contract than the gate's (refused: contract expected a but \
+            "ran under another contract than the gate's (refused: contract expected a but \
              got b)"
         );
         assert_eq!(why(&Check::Passed), None);

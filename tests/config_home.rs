@@ -160,6 +160,10 @@ case "$1" in
     if [ -f "$SANDBOX/init-fails" ]; then
       echo "nothing to declare: no Cargo.toml, package.json or go.mod" >&2; exit 1
     fi
+    # With $SANDBOX/init-blocks, it hangs (its pid in $SANDBOX/init-pid).
+    if [ -f "$SANDBOX/init-blocks" ]; then
+      echo $$ > "$SANDBOX/init-pid"; exec sleep 30
+    fi
     # With $SANDBOX/init-lists, as sykli init declares them: one task whose
     # inputs are every file the tree tracks (one `git ls-files`).
     if [ "$2" = --contract ] && [ -f "$SANDBOX/init-lists" ]; then
@@ -1358,6 +1362,12 @@ fn adopt_keeps_no_gate_for_a_repository_without_one_and_refuses_when_sykli_canno
         ) && stdout.contains("; the copy kept before (sykli.json, sykli.lock) is removed"),
         "{stdout}"
     );
+    // The review of #60, finding 4: one "so", said once.
+    let said = stdout
+        .lines()
+        .find(|line| line.contains("has no sykli.json"))
+        .unwrap_or_default();
+    assert_eq!(said.matches(", so ").count(), 1, "{said}");
     assert!(
         !names_in(&entry)
             .iter()
@@ -3494,14 +3504,30 @@ fn receipt(path: &Path, tree: &str, outcome: &str, at_ms: u64) {
 
 /// A receipt of a run that passed under another contract than the gate's.
 fn receipt_under_another_contract(path: &Path, tree: &str, at_ms: u64) {
-    receipt(path, tree, "passed", at_ms);
+    receipt_hashed(path, tree, "passed", "other-contract", at_ms);
+}
+
+/// A receipt of `tree` that says `outcome`, of a run under the contract
+/// whose hash is `hash`, as sykli names it.
+fn receipt_hashed(path: &Path, tree: &str, outcome: &str, hash: &str, at_ms: u64) {
+    receipt(path, tree, outcome, at_ms);
     let text = fs::read_to_string(path).unwrap();
     let text = text.replacen(
         "\"schema\"",
-        "\"contract_hash\":\"other-contract\",\"schema\"",
+        &format!("\"contract_hash\":\"{hash}\",\"schema\""),
         1,
     );
     fs::write(path, text).unwrap();
+}
+
+/// What the stub's `init --contract` writes when no test says otherwise:
+/// the gate of a commit with no contract of its own.
+const STUB_INIT: &str = "{\"version\":\"1\",\"tasks\":{}}\n";
+
+/// The hash sykli gives `contract` (and names in a receipt of a run under
+/// it): the SHA-256 of its JSON, keys sorted, no blanks.
+fn hash_of(contract: &str) -> String {
+    sha256_hex(canonical(contract).as_bytes())
 }
 
 fn short(commit: &str) -> &str {
@@ -3719,13 +3745,14 @@ fn marks_are_derived_from_receipts_tip_first() {
         "passed",
         1_000,
     );
-    // Failed: its run in this worktree.
+    // Failed: its run of the gate in this worktree.
     let c2 = sandbox.commit(&repo, "two");
     let t2 = sandbox.tree(&repo, "HEAD");
-    receipt(
+    receipt_hashed(
         &repo.join(".sykli/receipts/rcpt_2.json"),
         &t2,
         "failed",
+        &hash_of(STUB_INIT),
         2_000,
     );
     // Never run.
@@ -3974,7 +4001,7 @@ fn a_run_that_passed_under_another_contract_is_unproven_not_failed() {
     assert_eq!(tip["code"], "other_contract", "{json:#}");
     assert_eq!(
         tip["why"],
-        "passed under another contract than the gate's (refused: contract expected 1111 but \
+        "ran under another contract than the gate's (refused: contract expected 1111 but \
          got 2222)"
     );
     assert_eq!(json["entries"][0]["commits"][1]["code"], "no_receipt");
@@ -3986,7 +4013,7 @@ fn a_run_that_passed_under_another_contract_is_unproven_not_failed() {
     assert!(
         stdout.starts_with(&format!(
             "FLAG: main of acme/widget has never been proven against its current gate (2 \
-             commits: ? {}, ? {}; 1 passed under another contract; origin/main as of a push at \
+             commits: ? {}, ? {}; 1 ran under another contract; origin/main as of a push at \
              <time>). Start by running `ohjaa gate` on main and fix forward what fails.\n",
             short(&c1),
             short(&init)
@@ -3994,12 +4021,13 @@ fn a_run_that_passed_under_another_contract_is_unproven_not_failed() {
         "{stdout}"
     );
 
-    // A run that failed is ✗, still.
+    // A run of the gate that failed is ✗, still.
     let c2 = sandbox.commit(&repo, "two");
-    receipt(
+    receipt_hashed(
         &repo.join(".sykli/receipts/rcpt_2.json"),
         &sandbox.tree(&repo, "HEAD"),
         "failed",
+        &hash_of(STUB_INIT),
         2_000,
     );
     sandbox.git(&repo, &["push", "-q", "origin", "main"]);
@@ -4011,6 +4039,37 @@ fn a_run_that_passed_under_another_contract_is_unproven_not_failed() {
             short(&c1),
             short(&init)
         )),
+        "{report}"
+    );
+
+    // The review of #60, finding 1: a run under any other contract that
+    // failed says nothing of the gate, as one that passed says nothing: ?,
+    // never ✗. Kept with its run under the common dir, it outlives the
+    // worktree it ran in, so it must never stand for the gate.
+    let c3 = sandbox.commit(&repo, "three");
+    let foreign = format!("rcpt_{}.json", "f".repeat(64));
+    receipt_hashed(
+        &repo.join(".git/sykli/runs/elsewhere").join(&foreign),
+        &sandbox.tree(&repo, "HEAD"),
+        "failed",
+        "another-contract",
+        3_000,
+    );
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+    let json = sandbox.report_json(&repo);
+    let tip = &json["entries"][0]["commits"][0];
+    assert_eq!(tip["sha"], c3.as_str(), "{json:#}");
+    assert_eq!(tip["mark"], "unproven", "{json:#}");
+    assert_eq!(tip["code"], "other_contract", "{json:#}");
+    assert!(
+        tip["why"].as_str().is_some_and(|why| why.starts_with(
+            "ran under another contract than the gate's (its receipt says the run failed"
+        )),
+        "{json:#}"
+    );
+    let report = sandbox.report(&repo);
+    assert!(
+        report.contains(&format!(": ? {} ✗ {}", short(&c3), short(&c2))),
         "{report}"
     );
 }
@@ -4201,11 +4260,109 @@ fn a_proof_outlives_the_worktree_ohjaa_gate_ran_in() {
         "the receipt kept with its run: {verified}"
     );
 
+    // The review of #60, finding 2: a file cut short under the same name in
+    // the main checkout never hides it, and is said as a gap.
+    let name = PathBuf::from(verified.split(' ').nth(1).unwrap_or_default());
+    let name = name.file_name().unwrap().to_owned();
+    let cut = repo.join(".sykli/receipts").join(&name);
+    fs::create_dir_all(cut.parent().unwrap()).unwrap();
+    fs::write(&cut, "{\"truncated").unwrap();
+    let json = sandbox.report_json(&repo);
+    assert_eq!(json["entries"][0]["commits"][0]["mark"], "proven", "{json:#}");
+    assert_eq!(json["complete"], false, "{json:#}");
+    let report = sandbox.report(&repo);
+    assert!(
+        report.contains(&format!(
+            "acme/widget: a receipt cannot be read: {}",
+            fs::canonicalize(&cut).unwrap().display()
+        )),
+        "{report}"
+    );
+    fs::remove_file(&cut).unwrap();
+
     // That copy is what proves it: without it, nothing is left of the run.
     fs::remove_dir_all(&runs).unwrap();
     let gone = tip(&sandbox);
     assert_eq!(gone["mark"], "unproven", "{gone:#}");
     assert_eq!(gone["code"], "no_receipt", "{gone:#}");
+}
+
+/// The review of #60, finding 3: an ohjaa killed while sykli init runs (a
+/// report, a hook or a gate, which keep the default disposition) leaves its
+/// scratch checkout of the tree behind. The next ohjaa that makes a folder
+/// of its own removes every one whose ohjaa is gone, and only those.
+#[test]
+fn a_scratch_checkout_a_killed_ohjaa_left_is_removed_by_the_next() {
+    let mut sandbox = Sandbox::new("init-killed");
+    sandbox.stub_contract = "1";
+    let (repo, _) = sandbox.repo("acme", "widget", &[]);
+    sandbox.apply();
+    sandbox.adopt(&repo);
+    sandbox.commit(&repo, "one");
+    let tree = sandbox.tree(&repo, "HEAD");
+    // A receipt of its tree that passed: the marks ask for its gate.
+    receipt(
+        &repo.join(".git/sykli/receipts/rcpt_1.json"),
+        &tree,
+        "passed",
+        1_000,
+    );
+    sandbox.git(
+        &repo,
+        &["-c", "core.hooksPath=/dev/null", "push", "-q", "origin", "main"],
+    );
+    let root = sandbox.projects();
+    let report = ["report", "--json", "--marks", "--root", root.as_str()];
+    fs::write(sandbox.dir.join("init-blocks"), "").unwrap();
+    let mut running = sandbox
+        .command("ohjaa", &repo)
+        .args(report)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while sandbox.read("init-pid").trim().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "sykli init never ran");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let killed = running.id();
+    let signal = |signal: &str, pid: &str| {
+        Command::new("kill")
+            .args([signal, pid])
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(signal("-TERM", &killed.to_string()));
+    running.wait().unwrap();
+    signal("-KILL", sandbox.read("init-pid").trim());
+    fs::remove_file(sandbox.dir.join("init-blocks")).unwrap();
+    let tmp = sandbox.dir.join("tmp");
+    let of = |pid: u32| {
+        names_in(&tmp)
+            .into_iter()
+            .filter(|name| name.starts_with(&format!("ohjaa-gates-{pid}-")))
+            .collect::<Vec<_>>()
+    };
+    let left = of(killed);
+    assert_eq!(left.len(), 1, "{:?}", names_in(&tmp));
+    assert!(
+        tmp.join(&left[0])
+            .join(format!("init-{tree}/tree/.git/objects/info/alternates"))
+            .is_file(),
+        "the killed ohjaa's scratch checkout of the tree is left"
+    );
+    // One whose ohjaa still runs (this test's own pid) stays.
+    let live = tmp.join(format!("ohjaa-gates-{}-0", std::process::id()));
+    fs::create_dir_all(live.join("in-use")).unwrap();
+
+    let output = sandbox.ohjaa_in(&repo, &report);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["entries"][0]["commits"][0]["mark"], "proven", "{json:#}");
+    assert!(of(killed).is_empty(), "{:?}", names_in(&tmp));
+    assert!(live.join("in-use").is_dir(), "a live ohjaa's folder stays");
+    fs::remove_dir_all(&live).unwrap();
 }
 
 /// G1c: a repository with no sykli.json of its own adds a source file, and
@@ -5230,7 +5387,7 @@ fn real_sykli_a_proof_under_a_copy_no_longer_read_is_unproven_not_failed() {
     assert!(
         stdout.starts_with(&format!(
             "FLAG: main of acme/widget has never been proven against its current gate (2 \
-             commits: ? {}, ? {}; 1 passed under another contract; ",
+             commits: ? {}, ? {}; 1 ran under another contract; ",
             short(&c1),
             short(&init)
         )),
