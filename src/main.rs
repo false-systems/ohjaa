@@ -21,6 +21,7 @@ mod instructions;
 mod intake;
 mod integrated;
 mod knowledge;
+mod lessons;
 mod lifecycle;
 mod mark;
 mod process;
@@ -198,6 +199,11 @@ enum Cmd {
     },
     /// Re-confirm that knowledge still holds, as of today. A person only.
     Confirm { id: String },
+    /// Repository knowledge, in each repository's own AGENTS.md.
+    Lessons {
+        #[command(subcommand)]
+        action: LessonsCmd,
+    },
     /// Validate every node and flag what may no longer hold.
     Check {
         /// Briefing size, in characters, past which it is too long to be read.
@@ -491,6 +497,41 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum LessonsCmd {
+    /// Deliver repo knowledge accepted but not in its repository's AGENTS.md
+    /// yet: each `<repo>/.ohjaa/knowledge/` file, and each accepted node not
+    /// delivered. One pull request per repository adds their lines to the
+    /// `## Lessons` section of its AGENTS.md; once it is open, each file moves
+    /// out of the checkout into ohjaa's state, recorded with its URL.
+    #[command(after_help = "Exit codes:\n  \
+        0  every line is delivered: in a pull request, or in AGENTS.md already\n  \
+        4  some are not: no GitHub remote, no gh, gh or git could not, or a line held back\n  \
+        1  it could not run\n\n\
+        Per repository, from a checkout of it, never in it:\n  \
+        gh repo view <owner/repo> --json visibility,defaultBranchRef\n  \
+        gh api graphql --paginate   for a repository that is not private, once a run: the\n                              \
+        names of your private repositories, your login and name\n  \
+        gh pr list -R <owner/repo>  an open pull request of ohjaa's lessons gets the next commit\n  \
+        git fetch origin <branch>, then a worktree off it in $XDG_STATE_HOME/ohjaa/lessons/.work/,\n  \
+        git commit, git push origin HEAD:refs/heads/ohjaa/lessons-<date>-<n>, gh pr create,\n  \
+        and the worktree removed\n\
+        A line that would go to a repository that is not private and names one of your private\n\
+        repositories, your home path, your account or your name is held back and said, and its\n\
+        text goes nowhere; its file stays. A dry run reads AGENTS.md as last fetched here, and\n\
+        fetches, writes and sends nothing.")]
+    Publish {
+        /// The repositories (any directory inside each). Default: every
+        /// repository under the roots with a `.ohjaa/knowledge/`, and every
+        /// one with accepted lessons not delivered.
+        repos: Vec<PathBuf>,
+        /// Say, per repository, its visibility, each line it would add and
+        /// what a line names that is private; fetch, write and send nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum UsageCmd {
     /// Attach a native-session snapshot. Reimports replace, never add totals.
     Import {
@@ -742,8 +783,21 @@ struct Briefed {
     text: String,
     /// Exactly which nodes it delivers, and those the agent's own file did.
     delivered: Vec<sessions::Delivered>,
-    /// Where mine and machine come from, said once after all the knowledge.
+    /// Where mine and machine come from, and where this repository's lessons
+    /// are, said once after all the knowledge.
     source: Option<String>,
+}
+
+/// The line that says the repository's AGENTS.md holds `count` of its
+/// lessons, so the briefing does not repeat them.
+fn lessons_line(count: usize, agents_md: &Path) -> String {
+    format!(
+        "This repository's lessons ({count} node{}) are not repeated here: its AGENTS.md ({}) \
+         holds them, in its {} section.",
+        if count == 1 { "" } else { "s" },
+        agents_md.display(),
+        lessons::HEADING
+    )
 }
 
 /// The knowledge section of the briefing for these scopes, within its
@@ -754,11 +808,15 @@ struct Briefed {
 /// what the file holds, but for a flagged node, and carries what it does
 /// not; either way that is said, in one line. Broken files are reported on
 /// stderr, out loud, and so is a briefing the budget cut; a flag is shown
-/// beside its node.
+/// beside its node. With `in_agents_md`, the repository's own lessons that
+/// its AGENTS.md holds as checked out are left to it, but for a flagged
+/// one, and that is said in one line too; every other repo node says why it
+/// is not left to AGENTS.md (a pull request pending, not delivered).
 fn knowledge_briefing_for(
     dirs: &Dirs,
     scopes: &[Scope],
     agent: Option<(&str, &[String])>,
+    in_agents_md: bool,
 ) -> Result<Briefed> {
     let loaded = knowledge::load(dirs)?;
     for broken in &loaded.broken {
@@ -793,13 +851,40 @@ fn knowledge_briefing_for(
             home.contains(&located.scope) && compact.held.contains(&located.node.id)
         })
     };
+    // Where each of this repository's own nodes stands: in its AGENTS.md as
+    // checked out, which the agent reads, or not yet.
+    let standing = scopes
+        .contains(&Scope::Repo)
+        .then(|| lessons::Standing::read(dirs, &loaded))
+        .flatten();
+    let in_lessons = |located: &fk::Located| {
+        in_agents_md
+            && located.scope == Scope::Repo
+            && standing
+                .as_ref()
+                .is_some_and(|standing| standing.in_agents_md(&located.node.id))
+    };
     let shown: Vec<&fk::Located> = current
         .iter()
         .copied()
         .filter(|located| !held(located) || flagged(&located.node.id))
+        .filter(|located| !in_lessons(located) || flagged(&located.node.id))
         .collect();
-    // The line is part of the section, so its room is kept first: as long
-    // as the longest it can come to.
+    let notes: Vec<(String, String)> = shown
+        .iter()
+        .filter(|located| located.scope == Scope::Repo)
+        .filter_map(|located| {
+            let note = standing.as_ref()?.note(&located.node.id)?;
+            Some((located.node.id.clone(), note))
+        })
+        .collect();
+    let in_file = current.iter().filter(|located| in_lessons(located)).count();
+    let lessons = standing
+        .as_ref()
+        .filter(|_| in_file > 0)
+        .map(|standing| lessons_line(in_file, &standing.agents_md));
+    // The lines are part of the section, so their room is kept first: as
+    // long as the longest they can come to.
     let repeatable: Vec<&str> = shown
         .iter()
         .filter(|located| held(located))
@@ -807,10 +892,11 @@ fn knowledge_briefing_for(
         .collect();
     let room = own.as_ref().map_or(0, |(source, compact)| {
         source_line(source, compact, &repeatable, compact.more).len() + 2
-    });
+    }) + lessons.as_ref().map_or(0, |line| line.len() + 2);
     let within = knowledge::render_within(
         shown,
         &flags,
+        &notes,
         knowledge::DEFAULT_BUDGET.saturating_sub(room),
     );
     if let Some(over) = within.over(knowledge::DEFAULT_BUDGET) {
@@ -825,6 +911,11 @@ fn knowledge_briefing_for(
             } else if held(located) {
                 // Delivered by the agent's own file.
                 left_out.map(|(file, _)| file.to_string_lossy().into_owned())
+            } else if in_lessons(located) {
+                // Delivered by the repository's AGENTS.md.
+                standing
+                    .as_ref()
+                    .map(|standing| standing.agents_md.to_string_lossy().into_owned())
             } else {
                 // Named only by count.
                 return None;
@@ -853,6 +944,10 @@ fn knowledge_briefing_for(
             .count();
         source_line(source, compact, &repeated, counted)
     });
+    let source = match (lessons, source) {
+        (Some(lessons), Some(source)) => Some(format!("{lessons}\n{source}")),
+        (lessons, source) => lessons.or(source),
+    };
     Ok(Briefed {
         text: within.text,
         delivered,
@@ -908,7 +1003,10 @@ fn source_line(
 /// Shared/personal knowledge once, plus the knowledge of each named repo,
 /// then where mine and machine come from for `agent` (see
 /// [`knowledge_briefing_for`]). No keyword filter is allowed to hide a
-/// binding decision.
+/// binding decision. The launch repository's lessons its AGENTS.md holds
+/// are left to it, which the agent reads; a scoped repository's are
+/// carried, since the agent is not working there and need not read its
+/// AGENTS.md.
 fn knowledge_for_work(
     dirs: &Dirs,
     scoped: &[PathBuf],
@@ -918,7 +1016,7 @@ fn knowledge_for_work(
         mut text,
         mut delivered,
         source,
-    } = knowledge_briefing_for(dirs, &Scope::ALL, agent)?;
+    } = knowledge_briefing_for(dirs, &Scope::ALL, agent, true)?;
     for repo in scoped {
         let mut scoped_dirs = dirs.clone();
         scoped_dirs.repo_root = Some(repo.clone());
@@ -926,7 +1024,7 @@ fn knowledge_for_work(
             text: knowledge,
             delivered: nodes,
             ..
-        } = knowledge_briefing_for(&scoped_dirs, &[Scope::Repo], None)?;
+        } = knowledge_briefing_for(&scoped_dirs, &[Scope::Repo], None, false)?;
         // The preamble is said once, before the first knowledge of all; each
         // repository adds its section.
         let knowledge = knowledge
@@ -1073,7 +1171,7 @@ fn cmd_brief(
             } else {
                 (&Scope::ALL, "all")
             };
-            let knowledge = knowledge_briefing_for(&dirs, scopes, None)?.text;
+            let knowledge = knowledge_briefing_for(&dirs, scopes, None, false)?.text;
             let text = if knowledge.is_empty() {
                 "No knowledge recorded yet.".to_owned()
             } else {
@@ -1630,6 +1728,9 @@ fn cmd_list(all: bool) -> Result<i32> {
     nodes.sort_by(|a, b| {
         (a.scope, a.node.kind, &a.node.id).cmp(&(b.scope, b.node.kind, &b.node.id))
     });
+    // Where each of this repository's own current nodes stands: in its
+    // AGENTS.md, in a pull request, or not delivered, and why.
+    let standing = lessons::Standing::read(&dirs, &loaded);
     for located in &nodes {
         let node = &located.node;
         println!(
@@ -1641,6 +1742,12 @@ fn cmd_list(all: bool) -> Result<i32> {
             node.as_of,
             node.body.lines().next().unwrap_or("")
         );
+        let status = (located.scope == Scope::Repo && node.status == Status::Current)
+            .then(|| standing.as_ref()?.status(&node.id))
+            .flatten();
+        if let Some(status) = status {
+            println!("{:<8} {status}", "");
+        }
     }
     if nodes.is_empty() {
         println!("no knowledge here yet");
@@ -1721,11 +1828,81 @@ fn decision_lock() -> Option<process::FileLock> {
     }
 }
 
+/// Before a repo proposal is accepted: what delivering it needs, asked now.
+/// Refused, so that nothing is accepted and it stays waiting, when its line
+/// would go to a repository that is not private and names something private.
+/// `None` for any other proposal.
+fn screen_accept(
+    dirs: &Dirs,
+    id: &str,
+    asker: &mut lessons::Asker,
+) -> Result<Option<Result<lessons::Ready, String>>> {
+    let loaded = knowledge::load(dirs)?;
+    let (waiting, _) = knowledge::pending(dirs, &loaded)?;
+    let Some(pending) = waiting
+        .iter()
+        .find(|pending| pending.node.id == id && pending.scope == Scope::Repo)
+    else {
+        return Ok(None);
+    };
+    let Some(checkout) = pending.repo.clone().or_else(|| dirs.repo_root.clone()) else {
+        return Ok(None);
+    };
+    lessons::screen(asker, &checkout, &pending.node).map(Some)
+}
+
+/// After a person's decision on repo knowledge ohjaa's state holds (an
+/// accept, a retirement, a confirmation): its repository's AGENTS.md is
+/// brought in line with it through the pull request (`lessons::deliver`),
+/// with `ready` when it was asked before the decision. It never undoes or
+/// fails the decision: what could not be delivered is said, and `ohjaa
+/// list` says it after, until `ohjaa lessons publish` delivers it.
+fn deliver_decided(
+    dirs: &Dirs,
+    outcome: &Outcome,
+    ready: Option<Result<lessons::Ready, String>>,
+    asker: &mut lessons::Asker,
+    today: fk::Date,
+) {
+    let Some(repo) = outcome.repo.as_deref() else {
+        return;
+    };
+    let accepted = knowledge::accepted_dir(&dirs.state, repo);
+    if !outcome
+        .written
+        .iter()
+        .any(|path| path.starts_with(&accepted))
+    {
+        println!(
+            "  lessons: it is still untracked in {}; `ohjaa lessons publish` delivers it to \
+             AGENTS.md",
+            knowledge::repo_knowledge(repo).display()
+        );
+        return;
+    }
+    let ready = ready.unwrap_or_else(|| asker.ready(repo));
+    let delivered = lessons::deliver(&dirs.state, repo, ready, Vec::new(), false, today);
+    for line in &delivered.said {
+        println!("  lessons: {line}");
+    }
+    if !delivered.complete {
+        println!(
+            "  lessons: the decision stands; `ohjaa list` says where its line is, and `ohjaa \
+             lessons publish` delivers it once that is fixed"
+        );
+    }
+}
+
 fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     knowledge::require_person(action)?;
     let _lock = decision_lock();
     let dirs = dirs()?;
     let today = knowledge::today();
+    let mut asker = lessons::Asker::default();
+    let ready = match action {
+        "accept" => screen_accept(&dirs, id, &mut asker)?,
+        _ => None,
+    };
     let (outcome, done) = match action {
         "accept" => (knowledge::accept(&dirs, id, today)?, "accepted"),
         "reject" => (knowledge::reject(&dirs, id)?, "rejected"),
@@ -1739,6 +1916,9 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     println!("{done} {id}");
     report(&outcome);
     after_decision(action, id, &outcome, why);
+    if action != "reject" {
+        deliver_decided(&dirs, &outcome, ready, &mut asker, today);
+    }
     Ok(0)
 }
 
@@ -1850,6 +2030,7 @@ fn cmd_review(list: bool) -> Result<i32> {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     let today = knowledge::today();
+    let mut asker = lessons::Asker::default();
     for (pending, of) in &reviewed {
         show_pending(pending, of.as_deref(), &loaded, &waiting);
         print!("  [a]ccept  [r]eject  [s]kip  [q]uit > ");
@@ -1860,8 +2041,12 @@ fn cmd_review(list: bool) -> Result<i32> {
         let _lock = matches!(answer.trim(), "a" | "accept" | "r" | "reject")
             .then(decision_lock)
             .flatten();
+        let mut ready = None;
         let result = match answer.trim() {
-            "a" | "accept" => knowledge::accept(&dirs, id, today).map(|o| Some(("accept", o))),
+            "a" | "accept" => screen_accept(&dirs, id, &mut asker).and_then(|screened| {
+                ready = screened;
+                knowledge::accept(&dirs, id, today).map(|o| Some(("accept", o)))
+            }),
             "r" | "reject" => knowledge::reject(&dirs, id).map(|o| Some(("reject", o))),
             "q" | "quit" => break,
             _ => Ok(None),
@@ -1870,12 +2055,61 @@ fn cmd_review(list: bool) -> Result<i32> {
             Ok(Some((action, outcome))) => {
                 report(&outcome);
                 after_decision(action, id, &outcome, None);
+                if action == "accept" {
+                    deliver_decided(&dirs, &outcome, ready.take(), &mut asker, today);
+                }
             }
             Ok(None) => println!("  skipped"),
             Err(error) => println!("  refused: {error:#}"),
         }
     }
     Ok(0)
+}
+
+/// `ohjaa lessons publish`: per repository, its accepted lessons not in its
+/// AGENTS.md yet, delivered through one pull request (`lessons::deliver`).
+fn cmd_lessons_publish(roots: &[PathBuf], repos: &[PathBuf], dry_run: bool) -> Result<i32> {
+    let dirs = dirs()?;
+    let today = knowledge::today();
+    let mut checkouts = Vec::new();
+    let mut complete = true;
+    if repos.is_empty() {
+        let roots = roots::load(roots, dirs.repo_root.as_deref());
+        checkouts = lessons::waiting(&dirs.state, &roots::git_repos(&roots)?);
+    } else {
+        for repo in repos {
+            match gitconfig::repo_at(repo) {
+                Ok((top, _)) => checkouts.push(top),
+                Err(error) => {
+                    eprintln!("ohjaa: {error:#}");
+                    complete = false;
+                }
+            }
+        }
+    }
+    if checkouts.is_empty() && complete {
+        println!(
+            "nothing waits to be delivered: no repository under the roots has a \
+             .ohjaa/knowledge/, and every accepted lesson is delivered"
+        );
+        return Ok(0);
+    }
+    let mut asker = lessons::Asker::default();
+    for checkout in &checkouts {
+        let mut said = Vec::new();
+        let extra = lessons::untracked(checkout, &mut said);
+        let ready = asker.ready(checkout);
+        let delivered = lessons::deliver(&dirs.state, checkout, ready, extra, dry_run, today);
+        println!("{}", checkout.display());
+        for line in said.iter().chain(&delivered.said) {
+            println!("  {line}");
+        }
+        complete &= delivered.complete;
+    }
+    if dry_run {
+        println!("(a dry run: nothing was fetched, written or sent)");
+    }
+    Ok(if complete { 0 } else { INCOMPLETE })
 }
 
 fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
@@ -1914,9 +2148,26 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
         .filter(|l| l.node.status == Status::Current)
         .count();
     for scope in Scope::ALL {
-        match dirs.scope_dir(scope) {
-            Some(dir) => println!("scope    {:<8} {}", scope.name(), dir.display()),
-            None => println!("scope    {:<8} (no home here)", scope.name()),
+        match (scope, dirs.scope_dir(scope), dirs.repo_root.as_deref()) {
+            (Scope::Repo, Some(legacy), Some(root)) => {
+                println!(
+                    "scope    {:<8} {} ({}), accepted in {}",
+                    scope.name(),
+                    root.join("AGENTS.md").display(),
+                    lessons::HEADING,
+                    knowledge::accepted_dir(&dirs.state, root).display()
+                );
+                if legacy.is_dir() {
+                    println!(
+                        "scope    {:<8} {} (accepted before, not yet in AGENTS.md: `ohjaa \
+                         lessons publish`)",
+                        scope.name(),
+                        legacy.display()
+                    );
+                }
+            }
+            (_, Some(dir), _) => println!("scope    {:<8} {}", scope.name(), dir.display()),
+            (_, None, _) => println!("scope    {:<8} (no home here)", scope.name()),
         }
     }
     println!(
@@ -4070,6 +4321,9 @@ fn main() {
         Cmd::Retire { id, why } => cmd_decide("retire", id, Some(why)),
         Cmd::Confirm { id } => cmd_decide("confirm", id, None),
         Cmd::Check { budget, strict } => cmd_check(*budget, *strict),
+        Cmd::Lessons {
+            action: LessonsCmd::Publish { repos, dry_run },
+        } => cmd_lessons_publish(&cli.root, repos, *dry_run),
         Cmd::Oriented { readback } => cmd_oriented(readback),
         Cmd::Handover {
             unfinished,
