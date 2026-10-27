@@ -181,6 +181,10 @@ pub struct Report {
     pub natives: Result<Natives, String>,
     /// The marks on each entry's branch, or why it has none, by `owner/name`.
     pub marks: Vec<(String, Result<mark::Marks, String>)>,
+    /// Why no entry could be listed, when none could (the workflow home
+    /// cannot be found, or its entries cannot be read): then `marks` is
+    /// empty, and no entry's absence from it says anything.
+    pub unlisted: Option<String>,
     /// What waits for a person's decision, or why it could not be listed.
     pub proposals: Result<Vec<Waiting>, String>,
     /// Sessions in the log that are still open, and those closed as orphaned
@@ -284,11 +288,16 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
     } else {
         (Vec::new(), Judged::default())
     };
-    let marks = match crate::home::ohjaa_home() {
-        Ok(home) => mark::of_entries(&crate::home::absolute(home), repos, &sykli),
-        Err(error) => {
-            gaps.push(format!("the workflow home cannot be found: {error:#}"));
-            Vec::new()
+    let listed = match crate::home::ohjaa_home() {
+        Ok(home) => mark::of_entries(&crate::home::absolute(home), repos, &sykli)
+            .map_err(|why| format!("the entries cannot be listed: {why}")),
+        Err(error) => Err(format!("the workflow home cannot be found: {error:#}")),
+    };
+    let (marks, unlisted) = match listed {
+        Ok(marks) => (marks, None),
+        Err(why) => {
+            gaps.push(why.clone());
+            (Vec::new(), Some(why))
         }
     };
     for (slug, marked) in &marks {
@@ -342,6 +351,7 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
         judged,
         natives,
         marks,
+        unlisted,
         proposals,
         open,
         gaps,
@@ -1003,7 +1013,14 @@ pub fn render(report: &Report) -> String {
             }
         }
         if report.marks.is_empty() {
-            let _ = writeln!(out, "- no repository has an entry (ohjaa adopt <repo>)");
+            match &report.unlisted {
+                Some(why) => {
+                    let _ = writeln!(out, "- none marked: {why}");
+                }
+                None => {
+                    let _ = writeln!(out, "- no repository has an entry (ohjaa adopt <repo>)");
+                }
+            }
         }
     }
     if !report.window {
@@ -1254,6 +1271,9 @@ pub fn to_json(report: &Report) -> Value {
         "schema": "ohjaa-marks.v1",
         "generated": rfc(report.until_ms),
         "complete": report.complete(),
+        // Additive (review of #67): why no entry is listed, when none could
+        // be; `entries` is then empty, and says nothing.
+        "unlisted": report.unlisted,
         "entries": entries,
         "proposals": match &report.proposals {
             Ok(waiting) => json!({
@@ -2140,6 +2160,7 @@ mod tests {
             judged: Judged::default(),
             natives,
             marks: Vec::new(),
+            unlisted: None,
             proposals: Ok(Vec::new()),
             open: Vec::new(),
             gaps: Vec::new(),
@@ -2263,8 +2284,10 @@ mod tests {
         assert_eq!(json["schema"], "ohjaa-marks.v1");
         assert_eq!(
             keys(&json),
-            "complete,entries,generated,proposals,report,schema,sessions"
+            "complete,entries,generated,proposals,report,schema,sessions,unlisted"
         );
+        // Additive (review of #67): why no entry is listed, when none is.
+        assert_eq!(json["unlisted"], Value::Null);
         let entry = &json["entries"][0];
         assert_eq!(
             keys(entry),
@@ -2373,6 +2396,25 @@ mod tests {
         assert_eq!(keys(&marks_only), keys(&json));
         assert_eq!(marks_only["report"], Value::Null);
         assert_eq!(marks_only["entries"], json["entries"]);
+    }
+
+    /// Review of #67, finding 3: when the entries cannot be listed, the
+    /// marks say why in their own key, beside no entry and `complete` false.
+    #[test]
+    fn the_marks_json_says_why_no_entry_is_listed() {
+        let why = "the entries cannot be listed: cannot read /h/repos/acme";
+        let mut report = sample(Ok(Natives::default()));
+        report.unlisted = Some(why.to_owned());
+        report.gaps.push(why.to_owned());
+        let json = to_json(&report);
+        assert_eq!(json["unlisted"], why);
+        assert_eq!(json["entries"], json!([]));
+        assert_eq!(json["complete"], false);
+        // `--marks`: never "no repository has an entry" then.
+        report.window = false;
+        let text = render(&report);
+        assert!(text.contains(&format!("- none marked: {why}")), "{text}");
+        assert!(!text.contains("no repository has an entry"), "{text}");
     }
 
     #[test]

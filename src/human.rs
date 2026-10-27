@@ -57,6 +57,10 @@ const LINE_COLLECTS_AFTER_MS: i64 = 15 * MINUTE_MS;
 const DIGEST_COLLECTS_AFTER_MS: i64 = 5 * MINUTE_MS;
 const DIGEST_WAITS: Duration = Duration::from_secs(10);
 
+/// How long `digest` waits for the cursor's claim: a terminal's line holds
+/// it a fraction of a second.
+const CLAIM_WAITS: Duration = Duration::from_secs(2);
+
 /// An open session older than this waits for a person to look at it.
 const OPEN_TOO_LONG_MS: i64 = DAY_MS;
 
@@ -175,10 +179,17 @@ const SEEN_SCHEMA: &str = "ohjaa-seen.v1";
 
 /// Where a stretch of what happened begins, by each source's own clock:
 /// the session log is read now, GitHub as far as the snapshot read it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// GitHub's begins [`OVERLAP_MS`] earlier, for what its search indexes
+/// late: what the digest that ended here said of those two hours (`said`)
+/// is not said again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Window {
     sessions_ms: i64,
     github_ms: i64,
+    /// The keys of what GitHub said from the overlap before `github_ms` on,
+    /// its very end included, as the digest that ended here had it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    said: BTreeSet<String>,
 }
 
 impl Window {
@@ -186,7 +197,21 @@ impl Window {
         Window {
             sessions_ms: ms,
             github_ms: ms,
+            said: BTreeSet::new(),
         }
+    }
+
+    /// `item` happened in the stretch from here, by its source's own clock
+    /// and from the second (a session's record and GitHub keep whole
+    /// seconds); GitHub's from the overlap on, but what the digest that
+    /// ended here said. That holds what it said of the very end too: what
+    /// merged in the second GitHub was read, or while its search ran.
+    fn holds(&self, item: &Item) -> bool {
+        let second = |ms: i64| ms - ms.rem_euclid(1000);
+        if !item.github {
+            return item.at_ms >= second(self.sessions_ms);
+        }
+        item.at_ms >= second(self.github_ms - OVERLAP_MS) && !self.said.contains(&item.key)
     }
 }
 
@@ -204,8 +229,9 @@ struct Seen {
     items: BTreeSet<String>,
     /// Where the next day's digest begins: where the last digest ended.
     digest: Option<Window>,
-    /// Where what the day's digest left out begins: `ohjaa digest` shows
-    /// it. `None` when nothing was left out.
+    /// Where what a day's digest left out begins, the earliest one's when
+    /// several were cut: `ohjaa digest` shows it, and it stays until a
+    /// person reads that in full. `None` when nothing was left out.
     unseen: Option<Window>,
     /// The person's day the last digest was shown on.
     day: Option<String>,
@@ -215,14 +241,15 @@ fn seen_path(dirs: &Dirs) -> PathBuf {
     collect::dir(dirs).join("seen.json")
 }
 
-/// Held while a terminal works out and says its line: terminals opened
-/// together say it once.
+/// Held while a terminal works out and says its line, so terminals opened
+/// together say it once, and while `ohjaa digest` reads and moves the
+/// cursor.
 fn claim_path(dirs: &Dirs) -> PathBuf {
     collect::dir(dirs).join("seen.lock")
 }
 
 /// What the person was shown.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Shown {
     Line,
     /// The day's digest, from `from`; `cut`: it left some out.
@@ -246,12 +273,16 @@ impl Seen {
 
     /// Where the day's digest begins.
     fn daily_from(&self, now_ms: i64) -> Window {
-        self.digest.unwrap_or(Window::at(now_ms - DAY_MS))
+        self.digest
+            .clone()
+            .unwrap_or_else(|| Window::at(now_ms - DAY_MS))
     }
 
     /// Where `ohjaa digest` begins: what the person has not seen in full.
     fn full_from(&self, now_ms: i64) -> Window {
-        self.unseen.unwrap_or(self.daily_from(now_ms))
+        self.unseen
+            .clone()
+            .unwrap_or_else(|| self.daily_from(now_ms))
     }
 
     fn read(dirs: &Dirs) -> Option<Seen> {
@@ -559,15 +590,32 @@ fn source<T>(name: &str, part: &Part<T>, now_ms: i64, unread: &mut Vec<String>) 
         (None, [first, ..]) => (format!("{} could not be read", part.gaps.len()), first),
         (None, []) => return None,
     };
+    let failures: Vec<&String> = part.error.iter().chain(&part.gaps).collect();
     let mut item = standing(
         Kind::Source,
         Class::Unknown,
-        format!("source:{name}"),
+        source_key(name, &failures),
         name,
         format!("{what}, {age}: {}", clean(why)),
     );
     item.brief = Some(format!("{name}: {what}"));
     Some(item)
+}
+
+/// A source's failure is said in the line once, and another failure of it
+/// again: its key is the failure's own words, but for their numbers, so a
+/// count or a time that moved is the same failure.
+fn source_key(name: &str, failures: &[&String]) -> String {
+    let words: Vec<String> = failures
+        .iter()
+        .map(|failure| {
+            failure
+                .chars()
+                .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                .collect()
+        })
+        .collect();
+    format!("source:{name}:{}", words.join(" | "))
 }
 
 /// Everything the view can say now: from the session log, the proposals
@@ -712,7 +760,7 @@ fn build(
             let mut item = standing(
                 Kind::Source,
                 Class::Unknown,
-                "source:proposals".to_owned(),
+                source_key("proposals", &[&why]),
                 "proposals",
                 format!("could not be read: {}", clean(&why)),
             );
@@ -808,16 +856,33 @@ fn advance(
         .chain(view.waiting.iter().map(proposal_key))
         .collect();
     // A digest ends where GitHub was read to, by GitHub's clock: what the
-    // next collect reads from before then is still the next digest's.
+    // next collect reads from before then is still the next digest's. Each
+    // pull request event in the overlap before that end is in this digest's
+    // stretch or was said by the one before it: the next leaves them out of
+    // its overlap, and says only what GitHub indexed late.
+    let github_end = collected
+        .and_then(|c| c.github.as_of_ms)
+        .unwrap_or(old.daily_from(now_ms).github_ms);
+    let overlap = github_end - OVERLAP_MS;
     let here = Window {
         sessions_ms: now_ms,
-        github_ms: collected
-            .and_then(|c| c.github.as_of_ms)
-            .unwrap_or(old.daily_from(now_ms).github_ms),
+        github_ms: github_end,
+        said: view
+            .events
+            .iter()
+            .filter(|item| item.github && item.at_ms >= overlap - overlap.rem_euclid(1000))
+            .map(|item| item.key.clone())
+            .collect(),
     };
     let (digest, unseen, day) = match shown {
-        Shown::Line => (old.digest, old.unseen, old.day.clone()),
-        Shown::Daily { from, cut } => (Some(here), cut.then_some(from), Some(today.to_owned())),
+        Shown::Line => (old.digest.clone(), old.unseen.clone(), old.day.clone()),
+        // What an earlier digest left out begins earlier still: kept, so
+        // nothing the person has not seen is dropped.
+        Shown::Daily { from, cut } => (
+            Some(here),
+            old.unseen.clone().or(cut.then_some(from)),
+            Some(today.to_owned()),
+        ),
         Shown::Full => (Some(here), None, Some(today.to_owned())),
     };
     Seen {
@@ -847,29 +912,15 @@ fn folded(events: Vec<&Item>) -> Vec<&Item> {
         .collect()
 }
 
-/// What happened from `from` on, each source by its own clock and from the
-/// second (a session's record and GitHub keep whole seconds): my sessions,
-/// then what landed, then the other pull requests, each newest first.
-fn after(view: &View, from: Window) -> Vec<&Item> {
+/// What happened from `from` on ([`Window::holds`]): my sessions, then what
+/// landed, then the other pull requests, each newest first.
+fn after<'a>(view: &'a View, from: &Window) -> Vec<&'a Item> {
     let group = |kind: Kind| match kind {
         Kind::Ended { .. } => 0,
         Kind::Merged => 1,
         _ => 2,
     };
-    let second = |ms: i64| ms - ms.rem_euclid(1000);
-    let mut events = folded(
-        view.events
-            .iter()
-            .filter(|item| {
-                let since = if item.github {
-                    from.github_ms
-                } else {
-                    from.sessions_ms
-                };
-                item.at_ms >= second(since)
-            })
-            .collect(),
-    );
+    let mut events = folded(view.events.iter().filter(|item| from.holds(item)).collect());
     events.sort_by_key(|item| group(item.kind));
     events
 }
@@ -1016,11 +1067,17 @@ fn proposal_line(view: &View) -> Option<String> {
 
 /// The day's digest: what stands, today's proposal and what happened from
 /// `from`, at most [`DAILY_LINES`] lines, and whether it left any out.
-/// `None` when there is nothing.
-fn daily(view: &View, from: Window, now_ms: i64) -> Option<(String, bool)> {
+/// `left_out`: where what an earlier one left out begins, still unread in
+/// full; the last line points to it. `None` when there is nothing.
+fn daily(
+    view: &View,
+    from: &Window,
+    left_out: Option<&Window>,
+    now_ms: i64,
+) -> Option<(String, bool)> {
     let events = after(view, from);
     let proposal = proposal_line(view);
-    if view.standing.is_empty() && events.is_empty() && proposal.is_none() {
+    if view.standing.is_empty() && events.is_empty() && proposal.is_none() && left_out.is_none() {
         return None;
     }
     let mut summary = vec![format!("since {}", clock(from.sessions_ms))];
@@ -1038,17 +1095,31 @@ fn daily(view: &View, from: Window, now_ms: i64) -> Option<(String, bool)> {
     let mut rows: Vec<String> = view.standing.iter().map(|item| row(item, width)).collect();
     let after_standing = rows.len();
     rows.extend(events.iter().map(|item| row(item, width)));
-    let room = DAILY_LINES - lines.len() - usize::from(proposal.is_some());
-    let more = rows.len().saturating_sub(room);
-    if more > 0 {
-        rows.truncate(room - 1);
+    // The last line points to `ohjaa digest`, for what this one leaves out
+    // and for what an earlier one did.
+    let mut room = DAILY_LINES - lines.len() - usize::from(proposal.is_some());
+    if rows.len() > room || left_out.is_some() {
+        room -= 1;
     }
+    let more = rows.len().saturating_sub(room);
+    rows.truncate(room);
     if let Some(proposal) = proposal {
         rows.insert(after_standing.min(rows.len()), proposal);
     }
     lines.extend(rows);
-    if more > 0 {
-        lines.push(format!("  … {} more: ohjaa digest", more + 1));
+    let earlier = left_out.map(|at| {
+        format!(
+            "what an earlier digest left out, since {}",
+            short_clock(at.sessions_ms, now_ms)
+        )
+    });
+    match (more, earlier) {
+        (0, None) => {}
+        (0, Some(earlier)) => lines.push(format!("  … and {earlier}: ohjaa digest")),
+        (more, None) => lines.push(format!("  … {more} more: ohjaa digest")),
+        (more, Some(earlier)) => {
+            lines.push(format!("  … {more} more, and {earlier}: ohjaa digest"))
+        }
     }
     Some((lines.join("\n") + "\n", more > 0))
 }
@@ -1080,7 +1151,7 @@ fn fleet(repos: &[PathBuf]) -> Fleet {
 /// is live, and how old each source is, with what could not be read.
 fn full(
     view: &View,
-    from: Window,
+    from: &Window,
     fleet: Option<&Result<Fleet, String>>,
     pending: Option<&str>,
     now_ms: i64,
@@ -1288,7 +1359,7 @@ fn say_line(roots: &[PathBuf]) -> Result<()> {
     // every terminal.
     if old_seen.day.as_deref() != Some(today.as_str()) {
         let from = old_seen.daily_from(now);
-        let said = daily(&view, from, now);
+        let said = daily(&view, &from, old_seen.unseen.as_ref(), now);
         let cut = said.as_ref().is_some_and(|(_, cut)| *cut);
         let shown = Shown::Daily { from, cut };
         advance(&view, &old_seen, collected.as_ref(), now, shown, &today).write(&dirs)?;
@@ -1315,8 +1386,9 @@ fn say_line(roots: &[PathBuf]) -> Result<()> {
 
 /// `ohjaa digest`: everything the person has not seen in full (or since
 /// `since`), collecting first when the snapshot is old, and who is live,
-/// asked now. Shown to a person, it moves the cursor; with `since` it never
-/// does. Exits 4 when anything could not be read.
+/// asked now. Shown to a person, it moves the cursor, under the claim a
+/// terminal's line takes; with `since` it never does. Exits 4 when anything
+/// could not be read.
 pub fn digest(
     roots: &[PathBuf],
     fleet_repos: Result<Vec<PathBuf>>,
@@ -1398,6 +1470,21 @@ pub fn digest(
         )),
         Ok(_) => {}
     }
+    // The cursor is read and moved under the claim a terminal's line takes:
+    // a line said between the two would be said again, or undo this. One
+    // that cannot be claimed in a moment leaves the cursor where it was:
+    // the next digest shows this again, and loses none of it.
+    let claim = (window.is_none() && person_watching())
+        .then(|| process::lock_file(&claim_path(&dirs), CLAIM_WAITS));
+    let unmoved = match &claim {
+        Some(Err(why)) if why.contains("held by another") => {
+            eprintln!("ohjaa: the cursor stays where it was: {}", clean(why));
+            None
+        }
+        // It cannot be claimed at all: the cursor cannot be moved, as before.
+        Some(Err(why)) => Some(why.clone()),
+        _ => None,
+    };
     let seen = Seen::read(&dirs);
     let from = window.map(Window::at).unwrap_or_else(|| {
         seen.as_ref()
@@ -1413,9 +1500,12 @@ pub fn digest(
     );
     view.unread.extend(unread);
     let mut out = std::io::stdout().lock();
-    out.write_all(full(&view, from, Some(&live), pending.as_deref(), now).as_bytes())?;
+    out.write_all(full(&view, &from, Some(&live), pending.as_deref(), now).as_bytes())?;
     out.flush()?;
-    if window.is_none() && person_watching() {
+    if let Some(why) = unmoved {
+        anyhow::bail!("the cursor cannot be moved: {why}");
+    }
+    if matches!(claim, Some(Ok(_))) {
         let old_seen = seen.unwrap_or_else(|| Seen::first(now));
         advance(
             &view,
@@ -1689,13 +1779,15 @@ mod tests {
         assert!(line.trim_end().ends_with("· ohjaa digest"), "{line}");
         // No ids in the line, and nothing raw from outside.
         assert!(!line.contains("oh-") && !line.contains("s1"), "{line}");
-        let daily = daily(&view, Window::at(NOW - DAY_MS), NOW).unwrap().0;
+        let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
         assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
         for row in daily.lines() {
             assert!(row.chars().count() <= WIDTH, "{row}");
         }
         assert!(daily.contains("more: ohjaa digest"), "{daily}");
-        for row in full(&view, Window::at(NOW - DAY_MS), None, None, NOW).lines() {
+        for row in full(&view, &Window::at(NOW - DAY_MS), None, None, NOW).lines() {
             assert!(row.chars().count() <= WIDTH, "{row}");
         }
     }
@@ -1751,7 +1843,7 @@ mod tests {
                 ("long", Some(Class::Person)),
             ]
         );
-        let full = full(&view, Window::at(NOW - DAY_MS), None, None, NOW);
+        let full = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(
             full.contains("main: 1 unproven (1 failed) since 093dfc5. Prove it: ohjaa gate"),
             "{full}"
@@ -1783,7 +1875,9 @@ mod tests {
             .collect();
         let today = |day: i64| {
             let view = build(&[], Ok(proposals.clone()), Some(&snapshot(NOW)), NOW, day);
-            let daily = daily(&view, Window::at(NOW - DAY_MS), NOW).unwrap().0;
+            let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+                .unwrap()
+                .0;
             let line = daily
                 .lines()
                 .find(|line| line.contains("today's proposal"))
@@ -1799,7 +1893,7 @@ mod tests {
         assert!(today(2).contains("today's proposal c (ours)"));
         assert!(today(3).contains("today's proposal a (ours)"));
         let view = build(&[], Ok(proposals), Some(&snapshot(NOW)), NOW, 4);
-        let full = full(&view, Window::at(NOW - DAY_MS), None, None, NOW);
+        let full = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(full.contains("Proposal of the day\n  b (ours, since 2026-10-20)"));
         assert!(full.contains("3 wait. Decide: ohjaa review"), "{full}");
     }
@@ -1887,7 +1981,7 @@ mod tests {
             line.contains("marks: 1 could not be read · GitHub: unavailable"),
             "{line}"
         );
-        let full = full(&view, Window::at(NOW - DAY_MS), None, None, NOW);
+        let full = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(full.contains("! marks"), "{full}");
         assert!(
             full.contains("Sources\n  marks as of 08:00 UTC · GitHub as of 08:00 UTC"),
@@ -1962,7 +2056,10 @@ mod tests {
             &first,
             Some(&old),
             NOW,
-            Shown::Daily { from, cut: true },
+            Shown::Daily {
+                from: from.clone(),
+                cut: true,
+            },
             "d",
         );
         assert_eq!(
@@ -1974,7 +2071,8 @@ mod tests {
             cut.daily_from(NOW),
             Window {
                 sessions_ms: NOW,
-                github_ms: NOW - 3 * HOUR_MS
+                github_ms: NOW - 3 * HOUR_MS,
+                said: BTreeSet::new(),
             },
             "the next day's starts where GitHub was read to"
         );
@@ -1992,13 +2090,232 @@ mod tests {
         assert_eq!(read.full_from(NOW).sessions_ms, NOW + HOUR_MS);
     }
 
+    /// Second review of #63, finding 2: what a day's digest left out stays
+    /// where `ohjaa digest` begins until it is read in full, whatever the
+    /// days' digests after it leave out or not.
+    #[test]
+    fn what_a_days_digest_left_out_stays_until_it_is_read_in_full() {
+        let snap = snapshot(NOW);
+        let view = view(&[], Some(&snap));
+        let day = |n: i64| NOW + n * DAY_MS;
+        let first = advance(
+            &view,
+            &Seen::first(day(0)),
+            Some(&snap),
+            day(0),
+            Shown::Daily {
+                from: Window::at(day(-1)),
+                cut: true,
+            },
+            "d0",
+        );
+        assert_eq!(first.full_from(day(0)), Window::at(day(-1)));
+        let whole = advance(
+            &view,
+            &first,
+            Some(&snap),
+            day(1),
+            Shown::Daily {
+                from: first.daily_from(day(1)),
+                cut: false,
+            },
+            "d1",
+        );
+        assert_eq!(
+            whole.full_from(day(1)),
+            Window::at(day(-1)),
+            "a whole digest the next day drops nothing left out before"
+        );
+        let cut_again = advance(
+            &view,
+            &whole,
+            Some(&snap),
+            day(2),
+            Shown::Daily {
+                from: whole.daily_from(day(2)),
+                cut: true,
+            },
+            "d2",
+        );
+        assert_eq!(
+            cut_again.full_from(day(2)),
+            Window::at(day(-1)),
+            "the earliest is kept"
+        );
+        let seen = advance(&view, &cut_again, Some(&snap), day(2), Shown::Line, "d2");
+        assert_eq!(
+            seen.full_from(day(2)),
+            Window::at(day(-1)),
+            "a line moves none"
+        );
+        let read = advance(&view, &seen, Some(&snap), day(3), Shown::Full, "d3");
+        assert_eq!(read.unseen, None, "read in full");
+    }
+
+    /// Second review of #63, finding 2: the day's digest points to what an
+    /// earlier one left out while it is unread, within its lines.
+    #[test]
+    fn the_days_digest_points_to_what_an_earlier_one_left_out() {
+        let earlier = Window::at(NOW - 2 * DAY_MS);
+        let quiet = build(&[], Ok(Vec::new()), Some(&snapshot(NOW)), NOW, 0);
+        let (said, cut) = daily(&quiet, &Window::at(NOW - DAY_MS), Some(&earlier), NOW)
+            .expect("said, though nothing else is");
+        assert!(!cut);
+        assert!(
+            said.trim_end().ends_with(&format!(
+                "  … and what an earlier digest left out, since {}: ohjaa digest",
+                short_clock(NOW - 2 * DAY_MS, NOW)
+            )),
+            "{said}"
+        );
+        let mut busy = snapshot(NOW);
+        busy.github.value = (1..40).map(|n| pr(n, HOUR_MS, Some(HOUR_MS / 2))).collect();
+        let view = build(&[], Ok(Vec::new()), Some(&busy), NOW, 0);
+        let (said, cut) = daily(&view, &Window::at(NOW - DAY_MS), Some(&earlier), NOW).unwrap();
+        assert!(cut);
+        assert_eq!(said.lines().count(), DAILY_LINES, "{said}");
+        let last = said.lines().last().unwrap();
+        assert!(
+            last.starts_with("  … 26 more, and what an earlier digest left out, since "),
+            "{said}"
+        );
+        assert!(last.chars().count() <= WIDTH, "{last}");
+    }
+
+    /// Second review of #63, finding 3: a pull request GitHub indexes late,
+    /// merged before the snapshot the last digest was shown from, is in the
+    /// next digest, and what that digest said is not said again.
+    #[test]
+    fn a_pull_request_indexed_late_is_in_the_next_digest_and_nothing_twice() {
+        let mut before = snapshot(NOW);
+        before.github.value = vec![pr(79, 3 * HOUR_MS, Some(30 * MINUTE_MS))];
+        let shown = view(&[], Some(&before));
+        let first = Window::at(NOW - DAY_MS);
+        assert_eq!(after(&shown, &first).len(), 1, "#79 merged");
+        let seen = advance(
+            &shown,
+            &Seen::first(NOW),
+            Some(&before),
+            NOW,
+            Shown::Full,
+            "d",
+        );
+        // #80 merged 20 minutes before that snapshot, and is found only now.
+        let mut later = snapshot(NOW + HOUR_MS);
+        later.github.value = vec![
+            pr(79, 3 * HOUR_MS, Some(30 * MINUTE_MS)),
+            pr(80, 2 * HOUR_MS, Some(20 * MINUTE_MS)),
+        ];
+        let view = build(&[], Ok(Vec::new()), Some(&later), NOW + HOUR_MS, 0);
+        let next = seen.full_from(NOW + HOUR_MS);
+        let keys: Vec<&str> = after(&view, &next)
+            .iter()
+            .map(|item| item.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["pr:false-systems/sykli#80:merged"]);
+        // Once said, it is not said again; the day's digest is the same.
+        let seen = advance(&view, &seen, Some(&later), NOW + HOUR_MS, Shown::Full, "d");
+        assert!(after(&view, &seen.full_from(NOW + HOUR_MS)).is_empty());
+        assert!(after(&view, &seen.daily_from(NOW + HOUR_MS)).is_empty());
+        // What lies before the overlap is never in it.
+        let mut long_ago = pr(81, 5 * HOUR_MS, Some(150 * MINUTE_MS));
+        long_ago.title = "merged before the overlap".into();
+        let mut stale = later.clone();
+        stale.github.value.push(long_ago);
+        let view = build(&[], Ok(Vec::new()), Some(&stale), NOW + HOUR_MS, 0);
+        assert!(after(&view, &seen.full_from(NOW + HOUR_MS)).is_empty());
+    }
+
+    /// Review of #67, finding 1: a pull request at the very end of a
+    /// digest's GitHub stretch (merged in the second GitHub was read, or
+    /// while its search ran) is said by that digest and not by the next.
+    #[test]
+    fn a_pull_request_at_the_end_of_a_digests_stretch_is_said_once() {
+        // Read at 700 ms into the second #79 merged in; #78 merged while
+        // the search ran, two seconds after the read began.
+        let mut read = snapshot(NOW + 700);
+        read.github.value = vec![pr(79, HOUR_MS, Some(0)), pr(78, HOUR_MS, Some(-2_000))];
+        let shown = build(&[], Ok(Vec::new()), Some(&read), NOW + 5_000, 0);
+        let keys = |view: &View, from: &Window| -> Vec<String> {
+            after(view, from)
+                .iter()
+                .map(|item| item.key.clone())
+                .collect()
+        };
+        assert_eq!(
+            keys(&shown, &Window::at(NOW - DAY_MS)),
+            vec![
+                "pr:false-systems/sykli#78:merged",
+                "pr:false-systems/sykli#79:merged"
+            ]
+        );
+        let seen = advance(
+            &shown,
+            &Seen::first(NOW + 5_000),
+            Some(&read),
+            NOW + 5_000,
+            Shown::Full,
+            "d",
+        );
+        let mut later = read.clone();
+        later.at_ms = NOW + HOUR_MS;
+        later.github.as_of_ms = Some(NOW + HOUR_MS);
+        let view = build(&[], Ok(Vec::new()), Some(&later), NOW + HOUR_MS, 0);
+        assert!(keys(&view, &seen.full_from(NOW + HOUR_MS)).is_empty());
+        assert!(keys(&view, &seen.daily_from(NOW + HOUR_MS)).is_empty());
+    }
+
+    /// Second review of #63, a nit: a source is said in the line for each
+    /// failure, not once while the first stands; the same failure with its
+    /// numbers moved (a count, a time) is the same.
+    #[test]
+    fn another_failure_of_a_source_is_said_again_and_the_same_one_is_not() {
+        let mut collected = snapshot(NOW);
+        collected.github.error = Some("gh api graphql: not logged in".into());
+        collected.local.gaps = vec!["false-systems/valvo: not marked: no clone".into()];
+        let first = view(&[], Some(&collected));
+        let seen = advance(
+            &first,
+            &Seen::first(NOW),
+            Some(&collected),
+            NOW,
+            Shown::Line,
+            "d",
+        );
+        assert_eq!(one_line(&news(&first, &seen)), None);
+        collected.github.error = Some("gh api graphql: connection refused".into());
+        let other = view(&[], Some(&collected));
+        let line = one_line(&news(&other, &seen)).expect("another failure");
+        assert!(line.contains("GitHub: unavailable"), "{line}");
+        assert!(!line.contains("marks"), "the marks failed the same: {line}");
+        let seen = advance(&other, &seen, Some(&collected), NOW, Shown::Line, "d");
+        collected
+            .local
+            .gaps
+            .push("false-systems/habitat: not marked: no clone".into());
+        let more = view(&[], Some(&collected));
+        let line = one_line(&news(&more, &seen)).expect("one more could not be read");
+        assert!(line.contains("marks: 2 could not be read"), "{line}");
+        let seen = advance(&more, &seen, Some(&collected), NOW, Shown::Line, "d");
+        // The same cap, read later: its count and time moved, nothing new.
+        collected.github.error = None;
+        collected.github.gaps =
+            vec!["250 pull requests were updated since 2026-10-26 08:00 UTC; only 200 read".into()];
+        let capped = view(&[], Some(&collected));
+        let seen = advance(&capped, &seen, Some(&collected), NOW, Shown::Line, "d");
+        collected.github.gaps =
+            vec!["261 pull requests were updated since 2026-10-26 08:15 UTC; only 200 read".into()];
+        let later = view(&[], Some(&collected));
+        assert_eq!(one_line(&news(&later, &seen)), None);
+    }
+
     /// Finding 5: a window longer than GitHub was read says so.
     #[test]
     fn a_window_longer_than_github_was_read_says_so() {
         let mut collected = snapshot(NOW);
         collected.github.from_ms = Some(NOW - DAY_MS);
         let view = view(&[], Some(&collected));
-        let week = full(&view, Window::at(NOW - 7 * DAY_MS), None, None, NOW);
+        let week = full(&view, &Window::at(NOW - 7 * DAY_MS), None, None, NOW);
         assert!(
             week.contains(&format!(
                 "pull requests only since {}: GitHub was read from there",
@@ -2006,7 +2323,7 @@ mod tests {
             )),
             "{week}"
         );
-        let day = full(&view, Window::at(NOW - DAY_MS), None, None, NOW);
+        let day = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(!day.contains("only since"), "{day}");
     }
 
@@ -2025,8 +2342,10 @@ mod tests {
         let mut intent = session("s", 2 * HOUR_MS, Some(HOUR_MS), true);
         intent.intent = "\u{1b}]0;title\u{7}".into();
         let view = view(&[intent], Some(&collected));
-        let said = full(&view, Window::at(NOW - DAY_MS), None, None, NOW)
-            + &daily(&view, Window::at(NOW - DAY_MS), NOW).unwrap().0
+        let said = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW)
+            + &daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+                .unwrap()
+                .0
             + &one_line(&news(&view, &Seen::first(NOW))).unwrap();
         assert!(
             said.chars().all(|c| c == '\n' || !c.is_control()),
