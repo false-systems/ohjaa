@@ -449,6 +449,62 @@ fn rewrite(file: &Path, compact: &Compact) -> Result<Rewrite> {
 mod tests {
     use super::*;
 
+    /// The review of #66: without `--standalone`, opencode hands the session
+    /// to its background service, which reads its own AGENTS.md with the
+    /// environment it was started with. Where this environment moves that
+    /// file (OPENCODE_CONFIG_DIR, XDG_CONFIG_HOME), the file ohjaa checks may
+    /// not be the one the session gets, so the briefing carries the knowledge.
+    #[test]
+    fn opencode_without_standalone_and_a_moved_folder_carries_the_knowledge() {
+        let file = Path::new("/c/opencode/AGENTS.md");
+        let ask = |args: &[&str], vars: &[(&str, &str)]| {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            let vars: Vec<(String, String)> = vars
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect();
+            not_read("opencode", &args, file, |name| {
+                vars.iter()
+                    .find(|(known, _)| known == name)
+                    .map(|(_, value)| value.into())
+            })
+        };
+        let service = |vars: &str| {
+            Some(format!(
+                "opencode hands the session to its background service unless `--standalone` is \
+                 passed, and the service reads its own instructions with the environment it was \
+                 started with, which may not set {vars} as this one does"
+            ))
+        };
+        assert_eq!(ask(&[], &[]), None, "neither is set: the usual file");
+        assert_eq!(ask(&[], &[("XDG_CONFIG_HOME", "")]), None, "empty is unset");
+        assert_eq!(
+            ask(&["--model", "m"], &[("XDG_CONFIG_HOME", "/c")]),
+            service("XDG_CONFIG_HOME")
+        );
+        assert_eq!(
+            ask(&[], &[("OPENCODE_CONFIG_DIR", "/c/opencode")]),
+            service("OPENCODE_CONFIG_DIR")
+        );
+        assert_eq!(
+            ask(
+                &[],
+                &[("OPENCODE_CONFIG_DIR", "/o"), ("XDG_CONFIG_HOME", "/c")]
+            ),
+            service("OPENCODE_CONFIG_DIR and XDG_CONFIG_HOME")
+        );
+        assert_eq!(
+            ask(&["--standalone"], &[("OPENCODE_CONFIG_DIR", "/o")]),
+            None,
+            "standalone: opencode reads the file itself"
+        );
+        assert_eq!(
+            ask(&["--", "--standalone"], &[("XDG_CONFIG_HOME", "/c")]),
+            service("XDG_CONFIG_HOME"),
+            "after opencode's own `--` it is no option"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_file_is_inside_the_repository_a_git_folder_above_it_names() {

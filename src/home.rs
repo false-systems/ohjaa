@@ -707,18 +707,28 @@ mod tests {
         }
     }
 
-    /// A home whose `.git` is a file (a worktree of another repository): the
-    /// lock goes in the folder it names, and the allowlist where git reads
-    /// it, the common folder; neither is ever in the files the history holds.
+    /// A home whose `.git` is a file (a linked worktree of another
+    /// repository): the lock goes in the folder it names, and so does the
+    /// allowlist, since the common folder's `info/exclude` is read for every
+    /// worktree of that repository (#65's re-review); a block an earlier
+    /// ohjaa left there is taken out, and the person's own lines stay.
+    /// Neither is ever in the files the history holds.
     #[test]
     fn a_home_whose_git_is_a_file_keeps_its_lock_and_allowlist_out_of_its_files() {
         let dir = std::env::temp_dir().join(format!("ohjaa-gitfile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (home, store) = (dir.join("home"), dir.join("store"));
         std::fs::create_dir_all(store.join("worktrees/home")).unwrap();
+        std::fs::create_dir_all(store.join("info")).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join(".git"), "gitdir: ../store/worktrees/home\n").unwrap();
         std::fs::write(store.join("worktrees/home/commondir"), "../..\n").unwrap();
+        let earlier = format!("{EXCLUDE_BEGIN}\n{}\n{EXCLUDE_END}\n", EXCLUDE.join("\n"));
+        std::fs::write(
+            store.join("info/exclude"),
+            format!("# the person's\n*.log\n{earlier}build/\n"),
+        )
+        .unwrap();
         let (git_dir, common) = repository_dirs(&home);
         assert_eq!(git_dir, home.join("../store/worktrees/home"));
         assert_eq!(common, home.join("../store/worktrees/home").join("../.."));
@@ -727,7 +737,9 @@ mod tests {
         drop(lock);
         keep_out_strays(&home).unwrap();
         keep_out_strays(&home).unwrap();
-        let exclude = std::fs::read_to_string(store.join("info/exclude")).unwrap();
+        let shared = std::fs::read_to_string(store.join("info/exclude")).unwrap();
+        assert_eq!(shared, "# the person's\n*.log\nbuild/\n");
+        let exclude = std::fs::read_to_string(store.join("worktrees/home/ohjaa.exclude")).unwrap();
         assert_eq!(exclude.matches(EXCLUDE_BEGIN).count(), 1, "{exclude}");
         let names: Vec<_> = std::fs::read_dir(&home)
             .unwrap()

@@ -1745,8 +1745,25 @@ fn every_agents_own_switch_and_a_relative_folder_carry_mine_and_machine() {
         );
     }
     assert_eq!(run("pi", &["--", "-nc"], &[]), (left_out("pi", &pi), false));
+    // Without `--standalone`, opencode's background service reads its own
+    // instructions, with the environment it was started with: here
+    // XDG_CONFIG_HOME (the fixture's) moves the file, so it is carried.
+    let service = |vars: &str| {
+        carried(
+            "opencode",
+            &format!(
+                "opencode hands the session to its background service unless `--standalone` is \
+                 passed, and the service reads its own instructions with the environment it was \
+                 started with, which may not set {vars} as this one does"
+            ),
+        )
+    };
     assert_eq!(
         run("opencode", &[], &[]),
+        (service("XDG_CONFIG_HOME"), true)
+    );
+    assert_eq!(
+        run("opencode", &["--standalone"], &[]),
         (left_out("opencode", &opencode), false)
     );
     for (args, said) in [
@@ -1778,16 +1795,17 @@ fn every_agents_own_switch_and_a_relative_folder_carry_mine_and_machine() {
     let moved = fixture.dir.join("opencode-config/AGENTS.md");
     fs::create_dir_all(moved.parent().unwrap()).unwrap();
     fs::write(&moved, &current).unwrap();
+    let moved_dir = [(
+        "OPENCODE_CONFIG_DIR",
+        moved.parent().unwrap().to_str().unwrap(),
+    )];
     assert_eq!(
-        run(
-            "opencode",
-            &[],
-            &[(
-                "OPENCODE_CONFIG_DIR",
-                moved.parent().unwrap().to_str().unwrap()
-            )]
-        ),
+        run("opencode", &["--standalone"], &moved_dir),
         (left_out("opencode", &moved), false)
+    );
+    assert_eq!(
+        run("opencode", &[], &moved_dir),
+        (service("OPENCODE_CONFIG_DIR and XDG_CONFIG_HOME"), true)
     );
     // A folder that is not an absolute path: carried.
     for (agent, name, key, value, vars) in [
@@ -5165,11 +5183,20 @@ fn what_no_later_run_can_find_again_is_forgotten() {
     fixture.cleanup();
 }
 
+/// Intake's progress is replaced whole, written aside and renamed into
+/// place, never truncated and written where it is, so a run killed while it
+/// writes leaves the last whole file. The file the first run left is held
+/// open across the second: a file held open keeps its inode, so the one the
+/// second run writes cannot be handed that number again (ext4 hands a freed
+/// one straight back, and a run writes its progress twice). The path then
+/// naming another file, and the held one still saying what the first run
+/// wrote, show that it was replaced, not written in place.
 #[test]
 fn progress_is_replaced_whole_never_written_in_place() {
     if !git_available() {
         return;
     }
+    use std::io::Read as _;
     use std::os::unix::fs::MetadataExt;
     let fixture = Fixture::new("intakewhole");
     let repo = fixture.make_git_repo("work");
@@ -5188,10 +5215,18 @@ fn progress_is_replaced_whole_never_written_in_place() {
         )
     };
     one_batch();
-    let first = fs::metadata(&handled).unwrap().ino();
+    let mut held = fs::File::open(&handled).unwrap();
+    let first = fs::read_to_string(&handled).unwrap();
+    assert!(first.ends_with("end 1\n"), "{first}");
     one_batch();
-    let second = fs::metadata(&handled).unwrap().ino();
-    assert_ne!(first, second, "written aside and renamed into place");
+    assert_ne!(
+        fs::metadata(&handled).unwrap().ino(),
+        held.metadata().unwrap().ino(),
+        "written aside and renamed into place"
+    );
+    let mut kept = String::new();
+    held.read_to_string(&mut kept).unwrap();
+    assert_eq!(kept, first, "the first file was never written in place");
     assert!(!handled.with_extension("partial").exists());
     assert!(fs::read_to_string(&handled).unwrap().ends_with("end 2\n"));
     fixture.cleanup();

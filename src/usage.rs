@@ -1457,6 +1457,45 @@ mod tests {
         assert_eq!(Sandbox::ids(&sandbox.find("codex")), [id]);
     }
 
+    /// ohjaa#64's review: a session begun at 12:00:00.300 and resumed by a
+    /// launch at 12:00:00.900. The session's second (`started_ms`, in its id)
+    /// is 12:00:00.000, before the transcript began; only the launch's own
+    /// instant says the transcript began before it, so it was resumed.
+    #[test]
+    fn a_session_resumed_in_the_second_it_began_is_named_resumed() {
+        let sandbox = Sandbox::new("resumed-same-second");
+        let id = "b4e4122a-0000-41f2-b642-c1a5632a7f0d";
+        let record = |kind: &str, ms: i64, content: Value| {
+            json!({"type": kind, "sessionId": id, "cwd": sandbox.cwd(), "timestamp": at(ms),
+                   "isSidechain": false, "message": {"role": kind, "content": content}})
+        };
+        sandbox.write(
+            &format!("claude/projects/-work/{id}.jsonl"),
+            &[
+                record("user", 300, json!("a question asked without ohjaa")),
+                record(
+                    "assistant",
+                    400,
+                    json!([{"type": "text", "text": "an answer"}]),
+                ),
+                record("user", 950, json!(prompt(OURS))),
+            ],
+        );
+        let native = find_native(
+            &Launch {
+                session: OURS,
+                agent: "claude",
+                folder: &sandbox.folder,
+                started_ms: STARTED,
+                last_seen_ms: STARTED + 3_600_000,
+                unbriefed: false,
+            },
+            &sandbox.stores,
+        );
+        assert_eq!(Sandbox::ids(&native), [id], "{native:#?}");
+        assert!(native.sessions[0].resumed, "{native:#?}");
+    }
+
     /// A transcript begun before the launch is this session's only when the
     /// launch resumed it: its prompt said at the launch, not a message into
     /// an older session long after.

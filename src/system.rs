@@ -352,6 +352,34 @@ mod tests {
         assert!(parse_context(Path::new("/fleet/x"), "not json").is_none());
     }
 
+    /// toimija writes `"role": null` for a repo.yaml that declares no role
+    /// (its `RepoInfo.role` is an `Option`): the repo keeps its name and what
+    /// it is not, and only its role is unknown. This is toimija's own output,
+    /// byte for byte, for `name: teko` and `not: [inbox]`.
+    #[test]
+    fn a_repo_that_declares_no_role_keeps_its_name_and_what_it_is_not() {
+        const NO_ROLE: &str = r#"{
+  "schema": "toimija-identity.v1",
+  "repo": {
+    "name": "teko",
+    "role": null,
+    "not_roles": [
+      "inbox"
+    ],
+    "important_docs": [
+      "README.md"
+    ],
+    "boundaries": []
+  }
+}
+"#;
+        let tool = parse_context(Path::new("/fleet/teko-checkout"), NO_ROLE)
+            .expect("an identity with no role is still an identity");
+        assert_eq!(tool.name, "teko");
+        assert_eq!(tool.role, None);
+        assert_eq!(tool.not, vec!["inbox".to_string()]);
+    }
+
     #[test]
     fn the_briefing_preserves_session_liveness_and_marks_home() {
         let mut view = SystemView {
