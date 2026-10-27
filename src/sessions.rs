@@ -614,6 +614,7 @@ impl Store {
     /// unreadable file is reported, never replaced: redb would treat an empty
     /// file as a fresh database and the history would silently vanish.
     pub fn open(path: &Path) -> Result<Store, StoreError> {
+        remove_left_beside(&made_at(path));
         retrying(|| Self::open_once(path))
     }
 
@@ -985,6 +986,38 @@ fn made_at(path: &Path) -> PathBuf {
         };
     }
     at
+}
+
+/// Remove what makers stopped while making a log left beside `path`: a
+/// private log whose maker is gone, or one older than a minute (no making
+/// takes that long, so its pid is another process's now). One a live maker
+/// is making is never touched. Whatever cannot be read or removed is left.
+fn remove_left_beside(path: &Path) {
+    let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let prefix = format!(".{}.new-", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let Some(rest) = file.to_str().and_then(|file| file.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let gone = rest
+            .split('-')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .is_some_and(crate::process::gone);
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > Duration::from_secs(60)));
+        if gone || old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Run `open` until it is not [`StoreError::Locked`], for at most about a
@@ -2834,6 +2867,49 @@ mod tests {
             .file_type()
             .is_symlink());
         assert!(real.is_file());
+        let reader = Reader::open(&path).unwrap();
+        assert_eq!(reader.get("oh-1").unwrap().unwrap().id, "oh-1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn what_a_stopped_maker_left_beside_the_log_goes_and_one_being_made_stays() {
+        let dir = temp("left-beside");
+        let path = store_path(&dir);
+        drop(Store::open(&path).unwrap());
+        let beside = |pid: u32, n: u32| dir.join(format!(".sessions.redb.new-{pid}-{n}"));
+        // Its maker is gone.
+        let gone = {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        std::fs::write(beside(gone, 0), vec![0; 4096]).unwrap();
+        // A second name of the log itself: its maker stopped between the
+        // link and the removal.
+        std::fs::hard_link(&path, beside(gone, 1)).unwrap();
+        // Its maker's pid runs, but no making takes a minute: not its maker.
+        let old = beside(std::process::id(), 7);
+        std::fs::write(&old, b"").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        // Being made now.
+        let making = beside(std::process::id(), 8);
+        std::fs::write(&making, b"").unwrap();
+        Store::open(&path)
+            .unwrap()
+            .put(&session("oh-1", "/r/a", 1_000))
+            .unwrap();
+        assert_eq!(
+            private_beside(&path),
+            [format!(".sessions.redb.new-{}-8", std::process::id())],
+            "only the one being made stays"
+        );
         let reader = Reader::open(&path).unwrap();
         assert_eq!(reader.get("oh-1").unwrap().unwrap().id, "oh-1");
         let _ = std::fs::remove_dir_all(dir);
