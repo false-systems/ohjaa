@@ -991,7 +991,8 @@ fn made_at(path: &Path) -> PathBuf {
 /// Remove what makers stopped while making a log left beside `path`: a
 /// private log whose maker is gone, or one older than a minute (no making
 /// takes that long, so its pid is another process's now). One a live maker
-/// is making is never touched. Whatever cannot be read or removed is left.
+/// is making is never touched in its first minute. Whatever cannot be read
+/// or removed is left.
 fn remove_left_beside(path: &Path) {
     let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
         return;

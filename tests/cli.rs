@@ -6407,34 +6407,30 @@ fn a_hand_push_during_a_root_session_is_never_credited_to_it() {
     fixture.cleanup();
 }
 
-#[test]
-fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
-    if !git_available() {
-        return;
-    }
-    let fixture = Fixture::new("shared-checkout");
+/// Two sessions launched at once in one checkout of a new repository, x
+/// and y, each making a worktree and a commit there while the other is in
+/// the checkout, one after the other (`after`: the mark it waits for).
+/// Never at once: two `git worktree add`s in one repository race in git
+/// itself, each reading the other's admin folder while it is written
+/// ("fatal: failed to read .git/worktrees/y/commondir"). Neither agent
+/// waits for the other for ever: one that stops early still says it is
+/// done, and each gives up on a mark that is not there `deadline` seconds
+/// after it started (the other's `ohjaa run` never started it). y waits
+/// `y_late` seconds more before its git. The two runs' outputs, x's first.
+fn shared_checkout(fixture: &Fixture, deadline: u64, y_late: u64) -> [std::process::Output; 2] {
     let repo = fixture.make_git_repo("work");
     let mark = |name: &str| fixture.dir.join(name);
-    // Both sessions are in the checkout while each makes a worktree and a
-    // commit there, one after the other (`after`: the mark it waits for).
-    // Never at once: two `git worktree add`s in one repository race in git
-    // itself, each reading the other's admin folder while it is written
-    // ("fatal: failed to read .git/worktrees/y/commondir"). Neither agent
-    // waits for the other for ever: one that stops early still says it is
-    // done, and each gives up on a mark that is not there within two minutes
-    // (the other's `ohjaa run` never started it), so the test fails, with
-    // both records, instead of hanging.
-    let agent = |me: &str, other: &str, after: Option<&str>| {
+    let agent = |me: &str, other: &str, after: Option<&str>, late: u64| {
         let turn = after.map_or_else(String::new, |after| {
             format!("wait_for '{}'", mark(after).display())
         });
         format!(
             "set -e
             trap \"touch '{done}'\" EXIT
-            deadline=$(( $(date +%s) + 120 ))
+            deadline=$(( $(date +%s) + {deadline} ))
             wait_for() {{
               while [ ! -e \"$1\" ]; do
-                [ \"$(date +%s)\" -lt \"$deadline\" ] || {{ echo \"{me}: no $1 within 120 s\" >&2; exit 1; }}
+                [ \"$(date +%s)\" -lt \"$deadline\" ] || {{ echo \"{me}: no $1 within {deadline} s\" >&2; exit 1; }}
                 sleep 0.1
               done
             }}
@@ -6442,20 +6438,23 @@ fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
             wait_for '{their_start}'
             sleep 1
             {turn}
+            sleep {late}
             git worktree add -q -b {me} '{wt}'
             cd '{wt}' && echo {me} > {me}.txt && git add {me}.txt && git commit -q -m {me}
             git rev-parse --short=7 HEAD > '{sha}'
             touch '{done}'
-            wait_for '{their_done}'",
+            wait_for '{their_done}'
+            touch '{end}'",
             started = mark(&format!("{me}-started")).display(),
             their_start = mark(&format!("{other}-started")).display(),
             wt = fixture.dir.join("_worktrees").join(me).display(),
             sha = mark(&format!("{me}-sha")).display(),
             done = mark(&format!("{me}-done")).display(),
             their_done = mark(&format!("{other}-done")).display(),
+            end = mark(&format!("{me}-end")).display(),
         )
     };
-    let launch = |me: &str, other: &str, after: Option<&str>| {
+    let launch = |me: &str, other: &str, after: Option<&str>, late: u64| {
         fixture
             .ohjaa()
             .args([
@@ -6466,7 +6465,7 @@ fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
                 "--no-briefing",
                 "--",
                 "-c",
-                &agent(me, other, after),
+                &agent(me, other, after, late),
             ])
             .env("OHJAA_STUB_RUN_AGENT", "1")
             .current_dir(&repo)
@@ -6475,16 +6474,32 @@ fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
             .spawn()
             .unwrap()
     };
-    let x = launch("x", "y", None);
-    let y = launch("y", "x", Some("x-done"));
-    let records: Vec<String> = [x, y]
-        .into_iter()
-        .map(|child| {
-            String::from_utf8_lossy(&child.wait_with_output().unwrap().stderr).into_owned()
-        })
+    let x = launch("x", "y", None, 0);
+    let y = launch("y", "x", Some("x-done"), y_late);
+    [x, y].map(|child| child.wait_with_output().unwrap())
+}
+
+/// What the two sessions of [`shared_checkout`] must have recorded: neither
+/// claims the other's commit, and each says why. Only for two agents that
+/// did all their work: both runs exited 0 (`ohjaa run` returns its agent's
+/// exit) and both agents got to their last step, past every wait. One that
+/// gave up waiting left before the other's commit, which then proves
+/// nothing.
+fn neither_claims_the_others_commit(fixture: &Fixture, outputs: &[std::process::Output; 2]) {
+    let records: Vec<String> = outputs
+        .iter()
+        .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
         .collect();
+    for (output, me) in outputs.iter().zip(["x", "y"]) {
+        assert!(
+            output.status.success() && fixture.dir.join(format!("{me}-end")).exists(),
+            "{me} did not do all its work ({}):\n{}",
+            output.status,
+            records.join("\n")
+        );
+    }
     let sha = |me: &str| {
-        fs::read_to_string(mark(&format!("{me}-sha")))
+        fs::read_to_string(fixture.dir.join(format!("{me}-sha")))
             .unwrap_or_else(|error| {
                 panic!("{me} made no commit ({error}):\n{}", records.join("\n"))
             })
@@ -6505,6 +6520,39 @@ fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
             "and says why: {record}"
         );
     }
+}
+
+#[test]
+fn two_sessions_in_one_checkout_never_claim_each_others_commits() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("shared-checkout");
+    let outputs = shared_checkout(&fixture, 120, 0);
+    neither_claims_the_others_commit(&fixture, &outputs);
+    fixture.cleanup();
+}
+
+#[test]
+fn a_wait_that_ran_out_in_the_two_sessions_test_never_passes_it() {
+    if !git_available() {
+        return;
+    }
+    // y is later than x's deadline (the re-review of #59, 130 s against
+    // 120): x gives up waiting for y to be done, after its own commit, and
+    // leaves; y commits once x is gone. The commits were not made while
+    // both sessions were there, so this must not pass.
+    let fixture = Fixture::new("shared-late");
+    let outputs = shared_checkout(&fixture, 3, 6);
+    let judged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        neither_claims_the_others_commit(&fixture, &outputs)
+    }));
+    assert!(
+        judged.is_err(),
+        "x gave up and left before y's commit, and the test passed:\n{}\n{}",
+        String::from_utf8_lossy(&outputs[0].stderr),
+        String::from_utf8_lossy(&outputs[1].stderr)
+    );
     fixture.cleanup();
 }
 
