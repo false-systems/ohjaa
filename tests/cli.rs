@@ -9744,12 +9744,10 @@ fn a_git_that_fails_is_said_as_that_never_as_a_missing_clone() {
     let broken = fixture.dir.join("broken-git");
     fs::create_dir_all(&broken).unwrap();
     let git = broken.join("git");
-    fs::write(
+    write_executable(
         &git,
         "#!/bin/sh\necho 'fatal: git is broken here' >&2\nexit 128\n",
-    )
-    .unwrap();
-    make_executable(&git);
+    );
     let path = std::env::join_paths(
         [broken, fixture.stub_dir.clone()]
             .into_iter()
