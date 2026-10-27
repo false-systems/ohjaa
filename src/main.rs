@@ -8,6 +8,7 @@
 
 mod adopt;
 mod apply;
+mod collect;
 mod derived;
 mod doctor;
 mod flat_toml;
@@ -15,6 +16,7 @@ mod gate;
 mod gitconfig;
 mod home;
 mod hook;
+mod human;
 mod intake;
 mod integrated;
 mod knowledge;
@@ -249,6 +251,59 @@ enum Cmd {
         /// sykli verify only where a receipt says it passed.
         #[arg(long)]
         marks: bool,
+    },
+    /// For a terminal's opening: one line when something happened since you
+    /// last saw it, otherwise nothing. The first `line` of each local day
+    /// prints the day's digest instead. Seeing it moves your cursor.
+    #[command(
+        after_help = "Prints, reads and moves nothing unless stdout is a terminal and no agent \
+        session's marker is set (OHJAA_SESSION, TOIMIJA_SESSION, TOIMIJA_RUN, CLAUDECODE, \
+        CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, CODEX_SANDBOX, \
+        CODEX_SANDBOX_NETWORK_DISABLED, CODEX_MANAGED_BY_NPM, PI_SESSION_ID, OPENCODE, AI_AGENT): \
+        an agent's shell reads ~/.zshrc too.\n\n\
+        Starts no git and touches no network: it reads the session log and the proposals, and \
+        the rest from the snapshot `ohjaa collect` writes. When that is older than 15 minutes \
+        it starts one `ohjaa collect` in the background, unless one runs. The day's digest \
+        waits for a fresh snapshot. Always exits 0."
+    )]
+    Line,
+    /// What happened since the digest was last shown, what stays until it
+    /// is resolved, and today's proposal. Shown to you, it moves your cursor.
+    #[command(
+        after_help = "When the snapshot is more than 5 minutes old it starts a collect \
+        and waits for it at most 10 s; past that it shows the snapshot it has, and the collect \
+        goes on in the background.\n\n\
+        Exit codes:\n  \
+        0  everything could be read\n  \
+        4  something could not be read (it says what), or nothing was collected yet"
+    )]
+    Digest {
+        /// Show everything since then instead (`7d`, `24h`, a date or an RFC
+        /// 3339 time); the cursor does not move.
+        #[arg(long)]
+        since: Option<String>,
+        /// Use the snapshot as it is, however old.
+        #[arg(long)]
+        no_collect: bool,
+    },
+    /// Gather what `ohjaa line` cannot work out at a terminal's opening into
+    /// its snapshot: the marks and open sessions, GitHub's pull requests,
+    /// vessa's usage of recent sessions, and the fleet.
+    #[command(after_help = "Each part asked once, at the same time:\n  \
+        marks   as `ohjaa report --marks` finds them (git, sykli, ps)\n  \
+        github  gh api graphql: the pull requests updated in the entries' owners, at most 2 calls\n  \
+        vessa   vessa usage --json --input <transcript>…: only the sessions ended lately\n  \
+        fleet   toimija sessions --json, as `ohjaa fleet`\n\
+        A part that fails keeps what it held before, said as of then. Writes\n\
+        $XDG_STATE_HOME/ohjaa/human/collected.json, holding human/collect.lock while it runs.\n\n\
+        Exit codes:\n  \
+        0  every part answered\n  \
+        4  a part did not (the snapshot says why)\n  \
+        1  the snapshot could not be written")]
+    Collect {
+        /// Started by `line` or `digest`: says nothing.
+        #[arg(long, hide = true)]
+        background: bool,
     },
     /// State 2, from inside a session: read back what you know before the
     /// first change. The goal in one line, the rules that apply, who else is
@@ -3805,6 +3860,16 @@ fn main() {
         Cmd::Session { id } => cmd_session(id.as_deref()),
         Cmd::Usage { action } => cmd_usage(action),
         Cmd::Report { since, json, marks } => cmd_report(&cli.root, since, *json, *marks),
+        Cmd::Line => {
+            human::line(&cli.root);
+            Ok(0)
+        }
+        Cmd::Digest { since, no_collect } => {
+            human::digest(&cli.root, since.as_deref(), *no_collect)
+        }
+        Cmd::Collect { background } => {
+            human::collect_now(report_repos(&cli.root), repos(&cli.root), *background)
+        }
         Cmd::Graph { id } => cmd_graph(id),
         Cmd::Apply {
             dry_run,

@@ -352,7 +352,7 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
 
 /// What waits for a person: every proposal, and every proposed node in a
 /// scope directory. Files only.
-fn waiting(dirs: &Dirs) -> Result<Vec<Waiting>, String> {
+pub fn waiting(dirs: &Dirs) -> Result<Vec<Waiting>, String> {
     let loaded = knowledge::load(dirs).map_err(|error| format!("{error:#}"))?;
     let (pending, _) = knowledge::pending(dirs, &loaded).map_err(|error| format!("{error:#}"))?;
     Ok(pending
