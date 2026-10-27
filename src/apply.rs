@@ -882,10 +882,14 @@ fn instruction_slots(record: &Record, key: &str) -> Vec<(String, PathBuf)> {
 }
 
 /// The slot that records `file` for the agent `key`: the one that already
-/// names it, else the next free one.
+/// names it, by whatever name (a link to its folder, or the folder a
+/// variable names: [`home::same_path`]), else the next free one.
 fn instruction_slot(record: &Record, key: &str, file: &Path) -> String {
     let slots = instruction_slots(record, key);
-    if let Some((slot, _)) = slots.iter().find(|(_, recorded)| recorded == file) {
+    if let Some((slot, _)) = slots
+        .iter()
+        .find(|(_, recorded)| home::same_path(recorded, file))
+    {
         return slot.clone();
     }
     let first = format!("instructions_{key}");
@@ -1126,18 +1130,23 @@ pub fn undo(dry_run: bool) -> Result<i32> {
     // change it cannot take back exactly; any other is said and skipped.
     let mut files: Vec<(PathBuf, crate::knowledge::Placed, bool)> = Vec::new();
     for target in crate::instructions::targets() {
-        let slots = instruction_slots(&record, target.key);
-        for (slot, file) in &slots {
+        // One file is taken back once, by the first name it was recorded
+        // under (a record from before slots were matched by the file itself
+        // may name it twice).
+        let known = |files: &[(PathBuf, crate::knowledge::Placed, bool)], file: &Path| {
+            files.iter().any(|(known, ..)| home::same_path(known, file))
+        };
+        for (slot, file) in instruction_slots(&record, target.key) {
+            if known(&files, &file) {
+                continue;
+            }
             let placed = crate::knowledge::Placed {
                 blank: yes(&format!("{slot}_blank")),
                 newline: newline(&format!("{slot}_newline")),
             };
-            files.push((file.clone(), placed, true));
+            files.push((file, placed, true));
         }
-        if let Some(file) = target
-            .file
-            .filter(|file| !slots.iter().any(|(_, recorded)| recorded == file))
-        {
+        if let Some(file) = target.file.filter(|file| !known(&files, file)) {
             files.push((file, crate::knowledge::Placed::IN_PLACE, false));
         }
     }
