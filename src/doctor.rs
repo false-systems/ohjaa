@@ -153,10 +153,10 @@ fn say_derived(found: &mut Findings, slug: &str, tip: &str, derived: &crate::der
             format!("{tip}'s own sykli.json"),
             "its sykli.json".to_owned(),
         ),
-        Some(inferred) => (
+        Some(tree) => (
             format!(
                 "what sykli init writes for {tip}'s tree ({}), which has no sykli.json of its own",
-                inferred.tree.get(..7).unwrap_or(&inferred.tree)
+                tree.get(..7).unwrap_or(tree)
             ),
             "the contract sykli init wrote".to_owned(),
         ),
@@ -473,9 +473,8 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
                     .and_then(|clone| gitconfig::repo_at(&clone.path).ok());
                 // Which contract judges its branch's tip: derived from the
                 // tip's own sykli.json, else from what sykli init writes for
-                // its tree (as a run kept it, else asked of sykli in a scratch
-                // checkout of the tree, two git processes more). One git
-                // process for the clone.
+                // its tree (asked of sykli in a scratch checkout of the tree,
+                // two git processes more). One git process for the clone.
                 let at = clone.as_ref().map(|(_, common)| {
                     crate::derived::Objects::of_clone(common).and_then(|mut objects| {
                         let tip = format!("refs/remotes/origin/{}", read.branch);

@@ -470,7 +470,7 @@ sykli lists it as established or not:
 | exit 0; with `--json`, a verdict that judged the commit, verified it, established its schema, contract, source and consistency, and that says the receipt claims `passed` or `cached` | `verified: passed` | no |
 | exit 0 with `--json`, but a verdict that does not prove it (another schema, another subject, an identity tier not established, no claimed pass) | `unverified: …` | no |
 | exit 1 or 3: refused the commit (another tree, a dirty run, an input the commit does not have, a failed outcome, contradictory records) | `FAILED sykli verify: …` | **yes** |
-| exit 4: it passed under another contract or lock than the one it is judged by now | `unproven: it passed under another contract than the gate's (…)` | **yes** where it is `origin/<default>`'s tip; otherwise no |
+| exit 4: it passed under another contract or lock than the one it is judged by now | `unproven: it ran under another contract than the gate's (…)` | **yes** where it is `origin/<default>`'s tip; otherwise no |
 | exit 2: it could not verify (a bad revision, arguments, not a receipt) | `unverified: sykli verify could not verify: …` | no |
 | any other end: a crash, a kill, no answer in time | `unverified: …` | no |
 | no `--commit` (`sykli verify --help` lists no such flag) | `unverified: sykli has no --commit` | no |
@@ -944,11 +944,16 @@ a pending run starts none;
 includes) and at most two per clone (its config, with `insteadOf` applied in
 Rust, and for an entry's clone the tip's gate);
 adopt asks sykli only for its `--help`. A gate `sykli init` writes for a tree (a commit with no
-contract of its own, see "The gate of a commit") costs, wherever it is
-needed and only while no run has kept it, two more (its scratch checkout's
-`git init` and `git read-tree -u`) and one `sykli init` (which asks git
-twice, `rev-parse` and `ls-files`, in the scratch checkout): about 0.2 s for
-ohjaa's tree, once per tree per process, and nothing once a run kept it.
+contract of its own, see "The gate of a commit") costs, every time a commit
+is judged by it (once per tree in one ohjaa process, never kept), two more
+(its scratch checkout's `git init` and `git read-tree -u`) and one `sykli
+init`, which asks git twice more (`rev-parse` and `ls-files`, in the scratch
+checkout): about 0.2 s for ohjaa's tree. `report --json --marks` on the
+home of 2026-10-27 (three such entries, ohjaa, vessa and faija, each asked
+for its tip) starts about 12 git processes more than it would without them
+(43 against 31), and takes about 0.7 s more (1.8–2.0 s against 1.1–1.25 s),
+each time it runs; so does each briefing in such a repository, for its tip
+and HEAD.
 The briefing's flag costs at most three (the clone's config, which the drift
 warnings share, and the clone's `git cat-file --batch`, which walks the branch
 and reads the gate of each commit sykli is asked about) and one `sykli
@@ -1095,18 +1100,21 @@ work tree (`git init`, then `git read-tree -u`; no hook runs, nothing is
 fetched), then `sykli init --contract <folder>/sykli.json`, handed that
 checkout's facts; the folder goes when the process ends. Nothing is written
 into the clone (no linked worktree), the config home or the state, so the
-marks and the report can ask it. Each tree is asked once per process. Once a
-run is judged by it (`ohjaa gate`, an integrated validation), what sykli
-init wrote is kept by tree, `$XDG_STATE_HOME/ohjaa/inferred/<tree>/sykli.json`
-and `sykli.lock` (made whole aside and moved into place; the first kept
-stays), beside the gate itself in `derived/<digest>/`, and every later reader
-takes it from there with no process: sykli init is deterministic for a tree
-and a sykli, and this keeps the tree's gate what it was when a run was judged
-by it, whatever sykli is installed later. Deleting it loses no knowledge: the
-next reader asks sykli init again. No receipt proves such a commit but one
-of a run under that gate: there is no contract of its own to verify one
-against. What sykli init cannot write a gate for (no `Cargo.toml`,
-`package.json` or `go.mod`) has none, in sykli's words.
+marks and the report can ask it. sykli init is asked again every time the
+commit is judged (once per tree in one ohjaa process, in memory), and what it
+writes is never kept to be read back: a run that outlives ohjaa (`ohjaa
+gate`, an integrated validation) names its gate in `derived/<digest>/` as
+any other, and that file is read only where it is, byte for byte, the gate
+derived now. A sykli whose init writes another contract for a tree gives the
+tree another gate, and a run under the one before reads as another
+contract's. No receipt proves such a commit but one of a run under its
+gate: there is no contract of its own to verify one against. What sykli init
+cannot write a gate for (no `Cargo.toml`, `package.json` or `go.mod`) has
+none, in sykli's words. An ohjaa killed while sykli init runs (a report, a
+hook or a gate keep the default disposition) leaves its private folder,
+scratch checkout and all; the next ohjaa that makes one first removes those
+of every ohjaa that is gone (`ohjaa-gates-<pid>-<n>`, this user's, its pid
+unknown to kill(2)).
 
 An entry adopted before keeps working with no adopt: the copy it holds
 (`sykli.json` and `sykli.lock` beside `repo.toml`) is never read, doctor
@@ -1190,7 +1198,9 @@ the common dir, which outlives every worktree (`<common>/sykli/receipts/`,
 what its hook kept for accepted pushes, and `<common>/sykli/runs/<run>/`, the
 receipt each run concluded with), and, in every worktree, `.sykli/receipts/`
 and `.sykli/receipt.json`; a receipt kept in two places under its digest's
-name is read once. A forge's merge of an up-to-date pull request has the tree
+name is read once, the same bytes being the same receipt (another file under
+that name never hides it, and one sykli named that cannot be read is a gap
+in the report). A forge's merge of an up-to-date pull request has the tree
 of its head, so a receipt of the head proves the merge, also once the
 worktree the head was proven in is removed. The marks are as of the last update of `origin/<branch>`
 here, which its reflog dates and says the kind of (a fetch, or a push from
@@ -1210,9 +1220,11 @@ before anything else, and the launch says it on stderr:
 FLAG: main of false-systems/taso is unproven since 77a1f0e (2 commits: ? 4be01c2, ✗ 77a1f0e; origin/main as of a fetch at 2026-10-13 09:12 UTC). Start by running `ohjaa gate` on main and fix forward what fails.
 ```
 
-When some of those commits passed under another contract, it says the branch
+When some of those commits ran under another contract, it says the branch
 is "not proven against its current gate" (or "has never been proven against
-its current gate"), and how many passed under another one.
+its current gate"), and how many ran under another one. A failed run counts
+as the commit's failure only under its gate (or its own contract), as a
+pass does: one under any other contract is `other_contract`, never ✗.
 
 The flags a session's record raises at leaving (a broken `origin/main`, its
 own refused work) judge a repository with an entry by its gate too.
@@ -1501,7 +1513,7 @@ in `repo.toml`, and says so.
 `ohjaa doctor` says, for each entry with a clone under the roots, which
 contract judges its branch's tip: the gate derived from the tip's own
 `sykli.json`, or from what `sykli init` writes for its tree (asked in a
-scratch checkout unless a run kept it; doctor keeps nothing), and the tasks
+scratch checkout; doctor keeps nothing), and the tasks
 given lines. It flags (drift) a tip whose `sykli.lock` does not pin its `sykli.json`
 (sykli refuses the gate, as it refuses the repository's own); an empty
 `[cargo_env]` while every sykli knows the placeholder and the gate has cargo

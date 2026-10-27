@@ -1183,9 +1183,7 @@ fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Rec
                 .map(str::to_owned);
             let unreadable = |found: &mut Receipts, why: String| {
                 if named.is_some() {
-                    found
-                        .unreadable
-                        .push(format!("{} ({why})", path.display()));
+                    found.unreadable.push(format!("{} ({why})", path.display()));
                 }
             };
             let bytes = match std::fs::read(&path) {
@@ -1196,10 +1194,13 @@ fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Rec
                     continue;
                 }
             };
-            let same = named.as_ref().and_then(|name| named_at.get(name)).is_some_and(|read| {
-                read.iter()
-                    .any(|seen| std::fs::read(seen).is_ok_and(|seen| seen == bytes))
-            });
+            let same = named
+                .as_ref()
+                .and_then(|name| named_at.get(name))
+                .is_some_and(|read| {
+                    read.iter()
+                        .any(|seen| std::fs::read(seen).is_ok_and(|seen| seen == bytes))
+                });
             if same {
                 continue;
             }
@@ -2828,17 +2829,16 @@ impl Sykli {
                 Ok(answer) => answer,
                 Err(why) => return Check::Unverified { why },
             };
-            let facts: Vec<&std::ffi::OsStr> =
-                if self.takes_facts.get().copied().unwrap_or(false) {
-                    vec![
-                        "--repo-root".as_ref(),
-                        gate.top.as_os_str(),
-                        "--git-common-dir".as_ref(),
-                        gate.common.as_os_str(),
-                    ]
-                } else {
-                    Vec::new()
-                };
+            let facts: Vec<&std::ffi::OsStr> = if self.takes_facts.get().copied().unwrap_or(false) {
+                vec![
+                    "--repo-root".as_ref(),
+                    gate.top.as_os_str(),
+                    "--git-common-dir".as_ref(),
+                    gate.common.as_os_str(),
+                ]
+            } else {
+                Vec::new()
+            };
             let mut written = None;
             for receipt in passing.iter().take(MAX_ASKED) {
                 if !self.may_verify() {
@@ -2863,19 +2863,20 @@ impl Sykli {
                 });
                 let (contract, under) = match own {
                     Some(_) => (PathBuf::from("sykli.json"), crate::derived::Under::Own),
-                    None => match written.get_or_insert_with(|| at.contract(&self.derived, false))
-                    {
-                        Ok(path) => (path.clone(), crate::derived::Under::Derived),
-                        Err(why) => {
-                            verdicts.push((
-                                receipt.at,
-                                Check::Unverified {
-                                    why: format!("its gate cannot be written: {why}"),
-                                },
-                            ));
-                            break;
+                    None => {
+                        match written.get_or_insert_with(|| at.contract(&self.derived, false)) {
+                            Ok(path) => (path.clone(), crate::derived::Under::Derived),
+                            Err(why) => {
+                                verdicts.push((
+                                    receipt.at,
+                                    Check::Unverified {
+                                        why: format!("its gate cannot be written: {why}"),
+                                    },
+                                ));
+                                break;
+                            }
                         }
-                    },
+                    }
                 };
                 let mut command = self.command();
                 command
@@ -2909,8 +2910,8 @@ impl Sykli {
                 receipt.evidence.outcome,
                 receipt.path.display()
             );
-            let ours =
-                derived.ran(hash, lock) || derived.own.as_ref().is_some_and(|own| own.ran(hash, lock));
+            let ours = derived.ran(hash, lock)
+                || derived.own.as_ref().is_some_and(|own| own.ran(hash, lock));
             verdicts.push((
                 receipt.at,
                 if ours {
@@ -3511,7 +3512,10 @@ mod tests {
             std::fs::write(path, text).unwrap();
         };
         // Cut short in the worktree, whole with its run.
-        put(main.join(".sykli/receipts").join(named('a')), "{\"truncated");
+        put(
+            main.join(".sykli/receipts").join(named('a')),
+            "{\"truncated",
+        );
         put(
             common.join("sykli/runs/run1").join(named('a')),
             &body("cut", "passed"),
@@ -3526,7 +3530,10 @@ mod tests {
             &body("other", "passed"),
         );
         // The same bytes twice: one receipt.
-        put(main.join(".sykli/receipts").join(named('c')), &body("same", "passed"));
+        put(
+            main.join(".sykli/receipts").join(named('c')),
+            &body("same", "passed"),
+        );
         put(
             common.join("sykli/runs/run3").join(named('c')),
             &body("same", "passed"),

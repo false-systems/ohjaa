@@ -1986,11 +1986,12 @@ impl Sandbox {
 /// writes for its tree, given its lines as a repository's own contract is
 /// (KATANA D10): declared for each cargo task that lacks them, and locked as
 /// sykli init locked it. sykli is asked in a scratch checkout of exactly
-/// that tree, outside the repository; `--print` keeps nothing, and `ohjaa
-/// gate` keeps the gate and, by tree, what sykli init wrote, which every
-/// later reader takes from there with no sykli init.
+/// that tree, outside the repository, each time the commit is judged:
+/// `--print` keeps nothing, `ohjaa gate` keeps only the gate its run names,
+/// and a later reader asks sykli init again, never reading that back as the
+/// tree's gate (what sykli init writes then is a gate of its own).
 #[test]
-fn a_gate_sykli_init_writes_for_a_tree_gets_its_lines_and_is_kept_by_tree() {
+fn a_gate_sykli_init_writes_for_a_tree_gets_its_lines_and_is_derived_each_time() {
     let mut sandbox = Sandbox::new("d10-init");
     sandbox.stub_contract = "1";
     fs::write(sandbox.dir.join("worktree-cache"), "").unwrap();
@@ -2003,7 +2004,6 @@ fn a_gate_sykli_init_writes_for_a_tree_gets_its_lines_and_is_kept_by_tree() {
     sandbox.adopt(&rusty);
     let before = sandbox.status(&rusty);
     let tree = sandbox.tree(&rusty, "HEAD");
-    let inferred = sandbox.dir.join("state/ohjaa/inferred").join(&tree);
     let inits = |sandbox: &Sandbox| {
         sandbox
             .read("sykli-calls")
@@ -2020,10 +2020,7 @@ fn a_gate_sykli_init_writes_for_a_tree_gets_its_lines_and_is_kept_by_tree() {
         )) && said.contains("ohjaa gate: it is not written yet"),
         "{said}"
     );
-    assert!(
-        !named.exists() && !inferred.exists(),
-        "--print keeps nothing"
-    );
+    assert!(!named.exists(), "--print keeps nothing");
     assert_eq!(inits(&sandbox), 1);
     // Asked in a scratch checkout of the tree, outside the repository and
     // the state, gone since.
@@ -2043,14 +2040,6 @@ fn a_gate_sykli_init_writes_for_a_tree_gets_its_lines_and_is_kept_by_tree() {
     let (gate, said) = sandbox.gate_kept(&rusty);
     assert_eq!(gate, named, "{said}");
     assert!(said.contains("it proves HEAD as committed"), "{said}");
-    assert_eq!(
-        fs::read_to_string(inferred.join("sykli.json")).unwrap(),
-        RUST_GATE
-    );
-    assert_eq!(
-        fs::read_to_string(inferred.join("sykli.lock")).unwrap(),
-        sykli_lock(RUST_GATE)
-    );
     let bytes = fs::read(&gate).unwrap();
     assert_eq!(
         String::from_utf8_lossy(&bytes),
@@ -2059,11 +2048,21 @@ fn a_gate_sykli_init_writes_for_a_tree_gets_its_lines_and_is_kept_by_tree() {
     let lock: serde_json::Value =
         serde_json::from_slice(&fs::read(gate.with_file_name("sykli.lock")).unwrap()).unwrap();
     assert_eq!(lock["contracts"]["sykli.json"], sha256_hex(&bytes));
-    assert_eq!(inits(&sandbox), 2, "a process asks once");
-    // Kept: every later reader takes it from there, with no sykli init, and
-    // it is the same gate.
+    assert_eq!(inits(&sandbox), 2, "asked again");
+    assert_eq!(
+        names_in(&sandbox.dir.join("state/ohjaa")),
+        ["derived"],
+        "only the gate its run names is kept"
+    );
+    // Asked again by every later reader: the same gate while sykli init
+    // writes the same, and another once it writes another.
     assert_eq!(sandbox.gate_named(&rusty).0, gate);
-    assert_eq!(inits(&sandbox), 2);
+    assert_eq!(inits(&sandbox), 3);
+    fs::write(sandbox.dir.join("init-gate"), ERLANG_GATE).unwrap();
+    fs::write(sandbox.dir.join("init-lock"), sykli_lock(ERLANG_GATE)).unwrap();
+    let (other, said) = sandbox.gate_named(&rusty);
+    assert_ne!(other, gate, "never the gate kept for a run: {said}");
+    assert!(said.contains("ohjaa gate: it is not written yet"), "{said}");
     assert_eq!(
         sandbox.status_but_sykli(&rusty),
         before,
@@ -2259,7 +2258,7 @@ fn doctor_says_a_tip_with_no_contract_is_judged_by_what_sykli_init_writes() {
         assert!(stdout.contains(&line), "missing {line:?} in:\n{stdout}");
     }
     assert!(
-        !sandbox.dir.join("state/ohjaa/inferred").exists(),
+        !sandbox.dir.join("state/ohjaa/derived").exists(),
         "doctor keeps nothing"
     );
 }
@@ -2431,11 +2430,10 @@ fn a_run_of_the_repositorys_own_contract_proves_the_commit() {
 /// its budgets: `ohjaa gate` derives from the checkout's files, and each
 /// commit's own contract is read in the clone's one `git cat-file --batch`,
 /// which walks the marks too. G1c: an entry with no sykli.json of its own is
-/// judged by what sykli init writes for each tree, which costs, for a tree
-/// whose gate is not kept yet, two git processes more (the scratch
-/// checkout's `init` and `read-tree -u`) and a `sykli init`; `ohjaa gate`
-/// also reads HEAD (one more), and keeps the gate by tree, so every later
-/// reader of that tree starts none.
+/// judged by what sykli init writes for each tree, asked each time a
+/// commit is judged: two git processes more (the scratch checkout's `init`
+/// and `read-tree -u`) and a `sykli init`, every time; `ohjaa gate` also
+/// reads HEAD (one more).
 #[test]
 fn the_gate_and_the_marks_stay_within_their_git_budget_on_both_paths() {
     let mut sandbox = Sandbox::new("budget-g1a");
@@ -2479,12 +2477,19 @@ fn the_gate_and_the_marks_stay_within_their_git_budget_on_both_paths() {
         .unwrap()
         .to_owned();
 
-    // (its config; for inferred, HEAD and a scratch checkout of its tree:
-    // a new commit's, not kept yet), then the same inside a session (its
-    // gate kept by then), and a push of a commit no gate ran on.
-    for (name, repo, bare, outside, hook) in [
-        ("inferred", &inferred, &inferred_bare, 1 + 1 + 2, 1 + 2),
-        ("derived", &derived, &derived_bare, 1, 1),
+    // (its config; for inferred, HEAD and a scratch checkout of its tree,
+    // each time), then the same inside a session, and a push of a commit no
+    // gate ran on.
+    for (name, repo, bare, outside, inside, hook) in [
+        (
+            "inferred",
+            &inferred,
+            &inferred_bare,
+            1 + 1 + 2,
+            2 + 2,
+            1 + 2,
+        ),
+        ("derived", &derived, &derived_bare, 1, 2, 1),
     ] {
         sandbox.commit(repo, &format!("{name}-gated"));
         fs::write(sandbox.dir.join("tree"), sandbox.tree(repo, "HEAD")).unwrap();
@@ -2506,7 +2511,7 @@ fn the_gate_and_the_marks_stay_within_their_git_budget_on_both_paths() {
         budget(
             &format!("ohjaa gate ({name}, inside a session)"),
             starts.len(),
-            2,
+            inside,
         );
 
         // A push of a commit no worktree proves, through the dispatcher,
@@ -2572,41 +2577,26 @@ fn the_gate_and_the_marks_stay_within_their_git_budget_on_both_paths() {
         .iter()
         .filter(|line| line.contains("\"config\",\"-z\",\"--list\""))
         .count();
+    // The inferred entry's proven commit is asked of sykli init again, in a
+    // scratch checkout of its tree (two git processes), at every report.
+    assert!(
+        started(&starts, "read-tree"),
+        "a scratch checkout of its tree"
+    );
     budget(
         "ohjaa report --json --marks (a derived and an inferred entry)",
         starts.len(),
-        2 * 2 + 1,
+        2 * 2 + 1 + 2,
     );
     budget(
         "  of which the marks: configs and walks",
         listings + walks_in(&starts),
         2 * 2,
     );
-    // The same, on a machine where no run kept what sykli init wrote for
-    // the proven commit's tree: asked in a scratch checkout, kept nowhere.
-    fs::remove_dir_all(sandbox.dir.join("state/ohjaa/inferred")).unwrap();
-    let clock = std::time::Instant::now();
-    let (starts, output) = sandbox.git_starts(
-        sandbox
-            .command("ohjaa", &derived)
-            .args(["report", "--json", "--marks", "--root", &root]),
-    );
-    let took = clock.elapsed();
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["entries"][1]["ended"], "proven", "{json:#}");
-    assert!(
-        started(&starts, "read-tree"),
-        "a scratch checkout of its tree"
-    );
-    assert!(
-        !sandbox.dir.join("state/ohjaa/inferred").exists(),
-        "kept nowhere"
-    );
-    eprintln!("(that report took {took:?}, sykli init a stub)");
-    budget(
-        "ohjaa report --json --marks (its tree's gate not kept here)",
-        starts.len(),
-        2 * 2 + 1 + 2,
+    assert_eq!(
+        names_in(&sandbox.dir.join("state/ohjaa/derived")).len(),
+        2,
+        "the report keeps nothing: the two gates are those `ohjaa gate` ran"
     );
 
     let over: Vec<_> = report
@@ -2713,7 +2703,6 @@ fn report_json_and_gate_print_write_nothing_even_with_a_read_only_config_home() 
     // state wiped since): the report must write it to read it, and ask
     // sykli init again for the tree with no contract of its own.
     fs::remove_dir_all(sandbox.dir.join("state/ohjaa/derived")).unwrap();
-    fs::remove_dir_all(sandbox.dir.join("state/ohjaa/inferred")).unwrap();
     let config = sandbox.config();
     let state = sandbox.dir.join("state");
     let before = (files_under(&config), files_under(&state));
@@ -4268,7 +4257,10 @@ fn a_proof_outlives_the_worktree_ohjaa_gate_ran_in() {
     fs::create_dir_all(cut.parent().unwrap()).unwrap();
     fs::write(&cut, "{\"truncated").unwrap();
     let json = sandbox.report_json(&repo);
-    assert_eq!(json["entries"][0]["commits"][0]["mark"], "proven", "{json:#}");
+    assert_eq!(
+        json["entries"][0]["commits"][0]["mark"], "proven",
+        "{json:#}"
+    );
     assert_eq!(json["complete"], false, "{json:#}");
     let report = sandbox.report(&repo);
     assert!(
@@ -4309,7 +4301,14 @@ fn a_scratch_checkout_a_killed_ohjaa_left_is_removed_by_the_next() {
     );
     sandbox.git(
         &repo,
-        &["-c", "core.hooksPath=/dev/null", "push", "-q", "origin", "main"],
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "-q",
+            "origin",
+            "main",
+        ],
     );
     let root = sandbox.projects();
     let report = ["report", "--json", "--marks", "--root", root.as_str()];
@@ -4359,7 +4358,10 @@ fn a_scratch_checkout_a_killed_ohjaa_left_is_removed_by_the_next() {
 
     let output = sandbox.ohjaa_in(&repo, &report);
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["entries"][0]["commits"][0]["mark"], "proven", "{json:#}");
+    assert_eq!(
+        json["entries"][0]["commits"][0]["mark"], "proven",
+        "{json:#}"
+    );
     assert!(of(killed).is_empty(), "{:?}", names_in(&tmp));
     assert!(live.join("in-use").is_dir(), "a live ohjaa's folder stays");
     fs::remove_dir_all(&live).unwrap();
@@ -4389,12 +4391,8 @@ fn a_file_added_to_a_repository_without_a_contract_is_declared_by_its_next_gate(
         assert_eq!(tip["sha"], head.as_str(), "{tip:#}");
         assert_eq!(tip["mark"], "proven", "{tip:#}");
         assert_eq!(tip["contract"], "derived", "{tip:#}");
-        let gate = sandbox
-            .dir
-            .join("state/ohjaa/inferred")
-            .join(&tree)
-            .join("sykli.json");
-        fs::read_to_string(&gate).unwrap()
+        // The gate the run was judged by, as `ohjaa gate` names it.
+        fs::read_to_string(named_gate(&said)).unwrap()
     };
     let before = land(&sandbox, "one.rs");
     assert!(
@@ -5565,13 +5563,8 @@ fn real_sykli_a_repository_without_a_contract_adds_a_file_and_its_next_landing_i
             )),
             "{report}"
         );
-        let tree = sandbox.tree(&repo, "HEAD");
-        let kept = sandbox.dir.join("state/ohjaa/inferred").join(&tree);
-        (
-            head,
-            fs::read_to_string(kept.join("sykli.json")).unwrap(),
-            named_gate(&said),
-        )
+        let gate = named_gate(&said);
+        (head, fs::read_to_string(&gate).unwrap(), gate)
     };
     let (_, before, _) = land("notes.md", "the first landing\n");
     assert!(
@@ -5583,6 +5576,30 @@ fn real_sykli_a_repository_without_a_contract_adds_a_file_and_its_next_landing_i
         after.contains("\"util.rs\""),
         "the file added is declared by its commit's gate: {after}"
     );
+    // What each report costs for it, with the real sykli: the report's own
+    // one, the clone's config and walk, the scratch checkout (`init`,
+    // `read-tree -u`), sykli init's own two (`rev-parse`, `ls-files`) and
+    // sykli verify's one, every time: four of them for the gate sykli init
+    // writes.
+    let root = sandbox.projects();
+    for _ in 0..2 {
+        let (starts, output) = sandbox.git_starts(
+            sandbox
+                .command("ohjaa", &repo)
+                .args(["report", "--json", "--marks", "--root", &root]),
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            json["entries"][0]["commits"][0]["mark"], "proven",
+            "{json:#}"
+        );
+        assert!(started(&starts, "read-tree"), "asked again: {starts:#?}");
+        assert!(
+            starts.len() <= 1 + 2 + 2 + 2 + 1,
+            "{} git processes: {starts:#?}",
+            starts.len()
+        );
+    }
     // The lines went to the cargo tasks sykli init wrote.
     let ran = fs::read_to_string(sandbox.home().join("cargo-env")).unwrap_or_default();
     assert!(

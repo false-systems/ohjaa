@@ -63,7 +63,7 @@ struct Read {
 /// none has HEAD's gate, derived as every commit's is: from HEAD's own
 /// `sykli.json`, else from what `sykli init` writes for HEAD's tree (read
 /// through the checkout's one git process, and asked of sykli in a scratch
-/// checkout of the tree unless a run kept it). Kept in ohjaa's state for a
+/// checkout of the tree). Kept in ohjaa's state for a
 /// run (`keep`), else in a folder of this process's own.
 fn gate_of(
     top: &Path,
@@ -421,8 +421,7 @@ fn kept_receipt(top: &Path, printed: &Value, since_ms: i64) -> Option<ReceiptRef
 /// judged, and leave the receipt that proves HEAD. One git process (the
 /// repository's config), and inside a session, or in a checkout with no
 /// `sykli.json`, one more (HEAD and its tree); for a tree whose gate sykli
-/// init writes and no run kept yet, two more (its scratch checkout); the
-/// rest is sykli's.
+/// init writes, two more (its scratch checkout); the rest is sykli's.
 pub fn gate_here(print_only: bool, wait: Duration) -> Result<i32> {
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let (top, common) = repo_at(&cwd)?;

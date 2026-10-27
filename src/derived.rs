@@ -10,11 +10,10 @@
 //! function of C and the entry alone: the same C always gives the same gate,
 //! and a contract changed at C gives another. A commit with no contract of
 //! its own (no `sykli.json`, and no `sykli.rs`) is judged by what `sykli
-//! init` writes for its tree ([`Inferred`]), given the same lines: asked of
-//! sykli in a scratch checkout of the tree outside every repository
-//! ([`Gates::inferred`]), and kept by tree in ohjaa's state once a run is
-//! judged by it (`$XDG_STATE_HOME/ohjaa/inferred/<tree>/`), so it is asked
-//! once. sykli's `init` declares every file the tree tracks, so a file added
+//! init` writes for its tree ([`derive_inferred`]), given the same lines:
+//! asked of sykli in a scratch checkout of the tree outside every
+//! repository ([`Gates::inferred`]) each time the commit is judged, and
+//! never kept to be read back. sykli's `init` declares every file the tree tracks, so a file added
 //! is declared by the next commit's gate, with no adopt in between. An
 //! entry's stored copy (`sykli.json` beside `repo.toml`, which adopt once
 //! wrote) is never read: it drifted whenever a file was added.
@@ -256,31 +255,23 @@ pub struct Derived {
     pub unread: Option<String>,
     /// SHA-256 of the contract and the lock: the folder it is kept in.
     pub digest: String,
-    /// For a commit with no contract of its own: what `sykli init` wrote
-    /// for its tree, the gate before the lines.
-    pub inferred: Option<Inferred>,
-}
-
-/// What `sykli init` writes for a tree: the contract of a commit with no
-/// `sykli.json` (and no `sykli.rs`) of its own, before the entry's lines.
-/// sykli init declares every file the tree tracks (sykli#89), so it is a
-/// function of the tree (and of the sykli that wrote it: once kept, it is
-/// what the tree's gate is).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Inferred {
-    pub tree: String,
-    pub init: Own,
+    /// For a commit with no contract of its own: the tree `sykli init` was
+    /// asked about, whose answer is the gate before the lines.
+    pub inferred: Option<String>,
 }
 
 /// The gate of a commit with no contract of its own: what `sykli init`
-/// wrote for its tree, given the entry's lines as a repository's own
-/// contract is, and locked as sykli init locked it. No receipt proves the
-/// commit but one of a run under this gate: there is no contract of the
-/// repository's own to verify one against.
-pub fn derive_inferred(inferred: Inferred, overlay: &Overlay) -> Derived {
-    let mut derived = derive(&inferred.init, overlay);
+/// wrote for its tree (`init`), given the entry's lines as a repository's
+/// own contract is, and locked as sykli init locked it. sykli init declares
+/// every file the tree tracks (sykli#89). It is asked again each time the
+/// commit is judged, and never kept for that: a gate kept for a run is
+/// written, never read back as the tree's. No receipt proves the commit but
+/// one of a run under this gate: there is no contract of the repository's
+/// own to verify one against.
+pub fn derive_inferred(tree: String, init: &Own, overlay: &Overlay) -> Derived {
+    let mut derived = derive(init, overlay);
     derived.own = None;
-    derived.inferred = Some(inferred);
+    derived.inferred = Some(tree);
     derived
 }
 
@@ -399,28 +390,25 @@ impl Derived {
 /// the `sykli.lock` beside it, from their files (it takes no contract on
 /// stdin). A gate a run that outlives this ohjaa names (`ohjaa gate`, an
 /// integrated validation) is kept in ohjaa's state, `$XDG_STATE_HOME/
-/// ohjaa/derived/<digest>/`, beside the clones' validation folders, and,
-/// for a commit with no contract of its own, what `sykli init` wrote for
-/// its tree beside it (`inferred/<tree>/`), so the tree's gate is never
-/// asked of sykli again. Every other gate sykli only reads now (to verify a
-/// receipt, judge a push, say what applies to a commit, print a plan) is
-/// read from there when it is kept, else written into a folder of this
-/// process's own under `$TMPDIR`, removed when this is dropped (and so is
-/// the scratch checkout `sykli init` is asked in): the marks, the report and
-/// `ohjaa gate --print` write nothing that stays, and never into the config
-/// home.
+/// ohjaa/derived/<digest>/`, beside the clones' validation folders. Every
+/// other gate sykli only reads now (to verify a receipt, judge a push, say
+/// what applies to a commit, print a plan) is read from there when what is
+/// kept is the gate derived now, byte for byte, else written into a folder
+/// of this process's own under `$TMPDIR`, removed when this is dropped (and
+/// so is the scratch checkout `sykli init` is asked in): the marks, the
+/// report and `ohjaa gate --print` write nothing that stays, and never into
+/// the config home. A kept gate is never read as a commit's gate: each one
+/// is derived from the commit first.
 #[derive(Debug, Default)]
 pub struct Gates {
     /// `$XDG_STATE_HOME/ohjaa/derived`; `None` when there is no state home.
     kept: Option<PathBuf>,
-    /// `$XDG_STATE_HOME/ohjaa/inferred`: what `sykli init` wrote for each
-    /// tree a run was judged by.
-    trees: Option<PathBuf>,
     /// This process's own folder, made the first time a gate is written
     /// there.
     scratch: std::cell::RefCell<Option<PathBuf>>,
     /// What `sykli init` wrote for each tree this process asked it about,
-    /// or why it wrote nothing: each tree is asked once.
+    /// or why it wrote nothing, in memory only: a process asks once per
+    /// tree, and the next one asks again.
     inferred: std::cell::RefCell<std::collections::HashMap<String, Result<Own, String>>>,
     /// `sykli init --help`, asked once: whether it takes `--contract`, and
     /// the repository's facts.
@@ -430,10 +418,6 @@ pub struct Gates {
 impl Gates {
     pub fn new(kept: Option<PathBuf>) -> Gates {
         Gates {
-            trees: kept
-                .as_deref()
-                .and_then(Path::parent)
-                .map(|state| state.join("inferred")),
             kept,
             scratch: Default::default(),
             inferred: Default::default(),
@@ -461,19 +445,13 @@ impl Gates {
         ))
     }
 
-    /// For a run that outlives this ohjaa: kept in the state, and, for a
-    /// commit with no contract of its own, what `sykli init` wrote for its
-    /// tree beside it.
+    /// For a run that outlives this ohjaa: kept in the state.
     pub fn keep(&self, derived: &Derived) -> Result<PathBuf, String> {
         let kept = self
             .kept
             .as_deref()
             .ok_or("there is no state directory to keep the gate in (XDG_STATE_HOME, HOME)")?;
-        let path = derived.write(kept)?;
-        if let (Some(inferred), Some(trees)) = (&derived.inferred, self.trees.as_deref()) {
-            keep_inferred(trees, inferred)?;
-        }
-        Ok(path)
+        derived.write(kept)
     }
 
     /// For sykli to read now: where a run kept it, else in this process's
@@ -495,9 +473,8 @@ impl Gates {
     }
 
     /// What `sykli init` writes for `tree`, of the clone whose common git
-    /// dir is `common`: as a run kept it, in the state (no process); else
-    /// asked of `sykli` (each call at most `limit`) in a scratch checkout of
-    /// the tree, once per process, and kept only by [`Gates::keep`]. The
+    /// dir is `common`, asked of `sykli` (each call at most `limit`) in a
+    /// scratch checkout of the tree: once per process, kept nowhere. The
     /// scratch checkout is a repository of its own under this process's
     /// folder, borrowing the clone's objects (`objects/info/alternates`):
     /// two git processes (`init`, `read-tree -u`) and nothing written into
@@ -511,13 +488,6 @@ impl Gates {
     ) -> Result<Own, String> {
         if tree.is_empty() || !tree.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(format!("{tree:?} is not a tree id"));
-        }
-        if let Some(own) = self
-            .trees
-            .as_deref()
-            .and_then(|trees| read_inferred(trees, tree))
-        {
-            return Ok(own);
         }
         if let Some(known) = self.inferred.borrow().get(tree) {
             return known.clone();
@@ -677,49 +647,6 @@ fn init_in(
     })
 }
 
-/// What a run kept of `sykli init`'s contract for `tree`, in `trees`.
-fn read_inferred(trees: &Path, tree: &str) -> Option<Own> {
-    let dir = trees.join(tree);
-    let contract = std::fs::read(dir.join("sykli.json")).ok()?;
-    Some(Own {
-        contract,
-        lock: std::fs::read(dir.join("sykli.lock")).ok(),
-    })
-}
-
-/// Keep what `sykli init` wrote for a tree, `<trees>/<tree>/sykli.json` and
-/// the `sykli.lock` beside it: made whole aside, then moved into place, so
-/// a reader finds both or neither. The first one kept stays.
-fn keep_inferred(trees: &Path, inferred: &Inferred) -> Result<(), String> {
-    let dir = trees.join(&inferred.tree);
-    if dir.join("sykli.json").is_file() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(trees)
-        .map_err(|error| format!("cannot create {}: {error}", trees.display()))?;
-    let aside = trees.join(format!(".{}.ohjaa-{}", inferred.tree, std::process::id()));
-    let _ = std::fs::remove_dir_all(&aside);
-    let made = std::fs::create_dir(&aside)
-        .and_then(|()| std::fs::write(aside.join("sykli.json"), &inferred.init.contract))
-        .and_then(|()| match &inferred.init.lock {
-            Some(lock) => std::fs::write(aside.join("sykli.lock"), lock),
-            None => Ok(()),
-        })
-        .and_then(|()| std::fs::rename(&aside, &dir));
-    match made {
-        Ok(()) => Ok(()),
-        // Another ohjaa kept it first.
-        Err(_) if dir.join("sykli.json").is_file() => {
-            let _ = std::fs::remove_dir_all(&aside);
-            Ok(())
-        }
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&aside);
-            Err(format!("cannot keep {}: {error}", dir.display()))
-        }
-    }
-}
-
 impl Drop for Gates {
     fn drop(&mut self) {
         if let Some(scratch) = self.scratch.get_mut().take() {
@@ -851,9 +778,7 @@ impl GateAt {
                 short(commit)
             )),
             Holds::Neither { tree } => match infer(&tree) {
-                Ok(init) => {
-                    GateAt::Derived(Box::new(derive_inferred(Inferred { tree, init }, overlay)))
-                }
+                Ok(init) => GateAt::Derived(Box::new(derive_inferred(tree, &init, overlay))),
                 Err(why) => GateAt::Missing(format!(
                     "no sykli contract (sykli.json) in {}, and sykli init writes none for its \
                      tree: {why}",
@@ -905,10 +830,10 @@ impl GateAt {
                 };
                 let from = match &derived.inferred {
                     None => format!("derived from the repository's own sykli.json {at}"),
-                    Some(inferred) => format!(
+                    Some(tree) => format!(
                         "derived from what sykli init writes for the tree {at} ({}), which has no \
                          sykli.json of its own",
-                        short(&inferred.tree)
+                        short(tree)
                     ),
                 };
                 format!("{from}{given}{pinned}")
@@ -1366,10 +1291,10 @@ mod tests {
     /// a scratch checkout of exactly that tree (a repository of its own under
     /// this process's folder, borrowing the clone's objects): what the clone's
     /// work tree holds beside it never reaches it. Each tree is asked once
-    /// per process; nothing is kept but by `keep`, which keeps it by tree,
-    /// and every later reader takes it from there without asking sykli.
+    /// per process, in memory; `keep` keeps the gate a run names and never
+    /// what sykli init wrote, so the next process asks again.
     #[test]
-    fn a_tree_is_asked_of_sykli_init_in_a_scratch_checkout_once_and_kept_by_tree() {
+    fn a_tree_is_asked_of_sykli_init_in_a_scratch_checkout_once_per_process_and_kept_nowhere() {
         let base = std::env::temp_dir().join(format!("ohjaa-inferred-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let clone = base.join("clone");
@@ -1423,35 +1348,31 @@ mod tests {
         assert_eq!(gates.inferred(&common, &tree, &sykli, limit).unwrap(), own);
         let calls = std::fs::read_to_string(base.join("calls")).unwrap();
         assert_eq!(calls.matches("|init --contract ").count(), 1, "{calls}");
-        assert!(!state.parent().unwrap().join("inferred").exists());
         assert!(gates
             .inferred(&common, "not a tree", &sykli, limit)
             .is_err());
-        let derived = derive_inferred(
-            Inferred {
-                tree: tree.clone(),
-                init: own.clone(),
-            },
-            &Overlay::standard(),
-        );
+        let derived = derive_inferred(tree.clone(), &own, &Overlay::standard());
         assert_eq!(
             derived.own, None,
             "no contract of its own to verify against"
         );
+        // Kept for a run: the gate alone, never what sykli init wrote.
         gates.keep(&derived).unwrap();
-        let kept = state.parent().unwrap().join("inferred").join(&tree);
-        assert_eq!(
-            std::fs::read(kept.join("sykli.json")).unwrap(),
-            own.contract
-        );
+        let ohjaa = state.parent().unwrap();
+        let kept: Vec<String> = std::fs::read_dir(ohjaa)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept, ["derived"], "nothing kept by tree");
         let scratch = gates.scratch.borrow().clone().unwrap();
         drop(gates);
         assert!(!scratch.exists(), "the scratch checkout went with it");
-        // Kept: another process reads it, never asking sykli.
+        // Another process asks sykli init again: nothing is read back.
         let again = Gates::new(Some(state));
-        let gone = base.join("no-sykli");
-        assert_eq!(again.inferred(&common, &tree, &gone, limit).unwrap(), own);
-        assert!(again.scratch.borrow().is_none());
+        assert_eq!(again.inferred(&common, &tree, &sykli, limit).unwrap(), own);
+        let calls = std::fs::read_to_string(base.join("calls")).unwrap();
+        assert_eq!(calls.matches("|init --contract ").count(), 2, "{calls}");
         drop(again);
         std::fs::remove_dir_all(&base).unwrap();
     }

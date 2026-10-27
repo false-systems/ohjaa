@@ -16,8 +16,8 @@ proposing structure for it.
 
 An entry's gate is derived from each commit's own `sykli.json`
 (`src/derived.rs`; the README's "The gate of a commit"), and a commit with no
-contract of its own by what `sykli init` writes for its tree (kept by tree,
-never by entry). Never bring back an entry's copy of a gate: a copy drifts.
+contract of its own by what `sykli init` writes for its tree, derived again
+each time it is judged. Never bring back a copy of a gate: a copy drifts.
 What ohjaa reads of a clone's commits goes through its one `git cat-file --batch`
 (`Sykli::ask_objects`); a git process more on a hot path needs its budget in
 `tests/config_home.rs`.
