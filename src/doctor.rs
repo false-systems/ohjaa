@@ -38,6 +38,73 @@ impl Findings {
     }
 }
 
+/// Each agent's own instruction file, as apply would make it: the current
+/// knowledge block, in each that exists outside every repository. One apply
+/// cannot write (a block it cannot tell from the rest) is drift until a
+/// person fixes it; a block apply did not write is the person's.
+fn check_instructions(found: &mut Findings) {
+    let compact = match crate::instructions::home_knowledge() {
+        Ok((compact, _)) => compact,
+        Err(error) => {
+            found.drift(format!("cannot read mine and machine knowledge: {error:#}"));
+            return;
+        }
+    };
+    for target in crate::instructions::targets() {
+        let Some(file) = target.file else {
+            if target.installed {
+                found.note(format!(
+                    "{} reads {}, which does not exist: it gets no knowledge block",
+                    target.agent,
+                    target.usual.display()
+                ));
+            }
+            continue;
+        };
+        let agent = target.agent;
+        if crate::instructions::inside_repository(&file).is_some() {
+            found.note(format!(
+                "{} ({agent}'s own instructions) is inside a repository: it gets no knowledge block",
+                file.display()
+            ));
+            continue;
+        }
+        let read = read_or_empty(&file).and_then(|now| {
+            let held = crate::knowledge::held(&now)?;
+            let (new, _) = crate::knowledge::with_block(
+                &now,
+                crate::knowledge::INSTRUCTIONS_BEGIN,
+                &compact.text,
+            )?;
+            Ok((held, new == now))
+        });
+        match read {
+            Err(error) => found.drift(format!(
+                "{} ({agent}'s own instructions): apply cannot write the knowledge block there: \
+                 {error:#} (fix it by hand, then ohjaa apply)",
+                file.display()
+            )),
+            Ok((crate::knowledge::Held::Other, _)) => found.note(format!(
+                "{} ({agent}'s own instructions) holds a knowledge block apply did not write: \
+                 the person's",
+                file.display()
+            )),
+            Ok((crate::knowledge::Held::None, _)) => found.drift(format!(
+                "{} ({agent}'s own instructions) has no knowledge block (ohjaa apply)",
+                file.display()
+            )),
+            Ok((crate::knowledge::Held::Applied, true)) => found.ok(format!(
+                "{} ({agent}'s own instructions) holds the current knowledge block",
+                file.display()
+            )),
+            Ok((crate::knowledge::Held::Applied, false)) => found.drift(format!(
+                "{} ({agent}'s own instructions): its knowledge block is not current (ohjaa apply)",
+                file.display()
+            )),
+        }
+    }
+}
+
 /// An entry's hooks folder: which dispatchers there are, which are edited,
 /// which are missing or spare, and whether what they run is still there.
 fn check_dispatchers(
@@ -448,6 +515,7 @@ pub fn doctor(explicit_roots: &[PathBuf], git_root: Option<&Path>) -> Result<i32
         }
         Err(error) => found.drift(format!("cannot read ~/.zshrc: {error:#}")),
     }
+    check_instructions(&mut found);
 
     println!("entries ({}):", home.join("repos").display());
     let mut readable = 0;

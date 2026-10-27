@@ -29,7 +29,8 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   toimija derives — shell out to its CLI and consume its `--json`.
 - **Ohjaa stores two things.** Knowledge, as knowledge-node.v1 files in the
   scope directories plus proposals waiting for a person, is the truth and lives
-  in git. The **session log**, in redb at `$XDG_STATE_HOME/ohjaa/sessions.redb`,
+  in git: ours and repo in their repositories, mine and machine in the home's
+  own history. The **session log**, in redb at `$XDG_STATE_HOME/ohjaa/sessions.redb`,
   is machine-local history of what each session was briefed, read back,
   committed, finished and handed over, plus explicitly attributed usage receipts, the ids of the agent's own sessions found at leaving in its transcripts (read, never written) and those its environment claimed from inside the session while it was open (the agent's testimony, never outranking what was found), and references to the validations `ohjaa gate` and ohjaa itself requested (sykli's run ids and receipts, never outcomes) — deleting it loses no knowledge, it never
   blocks a launch, and a broken log is reported, never replaced. Beside it,
@@ -70,10 +71,26 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   config and `roots`. Only
   repositories whose remote names an entry run ohjaa's hooks, and only the
   hooks that entry needs; no other git command anywhere starts ohjaa, and
-  ohjaa works its git facts out once instead of asking git again. Outside the
+  ohjaa works its git facts out once instead of asking git again. The home
+  is also a local git repository, its history: ohjaa makes it with its first
+  commit (or uses the one the home already is), never gives it a remote and
+  never pushes it, and commits there, with the person's git identity, each
+  decision on mine or machine knowledge and each `apply`, `apply --undo` and
+  `adopt` (`git add -A`, then `git commit`), each under the home's lock
+  (`.git/ohjaa.lock`) and holding only what ohjaa keeps there (an allowlist
+  in the repository's own `.git/info/exclude`); a commit that fails is said,
+  and the change stands. Outside the
   home, `ohjaa apply` changes only one `include.path` in git's global config,
-  a marked block in git's global excludes file and one line of `~/.zshrc`,
-  records each before making it, and `apply --undo` puts them back; `ohjaa
+  a marked block in git's global excludes file, one line of `~/.zshrc`, and a
+  marked block of mine and machine knowledge (`ohjaa:knowledge`) in each
+  agent's own global instruction file that already exists outside every
+  repository (Claude Code's `~/.claude/CLAUDE.md`, Codex's
+  `~/.codex/AGENTS.md`, pi's `~/.pi/agent/AGENTS.md`, opencode's
+  `~/.config/opencode/AGENTS.md`, each where the agent finds it; none is
+  created, no text around the block is touched, and a block apply did not
+  write is the person's and stays), records each before making it, and
+  `apply --undo` puts them back; each decision rewrites that block where it
+  is, and nowhere else; `ohjaa
   adopt` writes only in the home. Nothing is installed on or written into a
   repository but what git keeps beside it: the clone's one validation
   checkout, a linked worktree kept in ohjaa's state
@@ -133,7 +150,9 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   sandbox `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `OHJAA_OURS`. The
   workflow-home tests (`tests/config_home.rs`) empty the environment and also
   sandbox `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`, `CARGO_HOME`, `TMPDIR`
-  and `PATH`: `apply` writes git's global config and `~/.zshrc`.
+  and `PATH`: `apply` writes git's global config, `~/.zshrc` and the agents'
+  own instruction files, and commits in the home. A person's decisions are
+  tested at a real terminal (`tests/terminal.rs`), sandboxed the same way.
 
 ## Validation
 

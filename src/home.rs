@@ -16,10 +16,14 @@
 //!   git/config                       includeIf per entry remote -> its gated.config
 //!   roots                            where apply and doctor look
 //!   applied.toml                     what apply changed, for `apply --undo`
+//!   .git/                            the home's history: a local repository, never
+//!                                    pushed, one commit per decision on mine or
+//!                                    machine and per apply and adopt ([`commit`])
 //! ```
 //!
 //! The knowledge scopes (`mine/`, `machine/`) and the `ours` and `drafter`
-//! files live in the same directory and are not touched here.
+//! files live in the same directory and are not touched here; the history
+//! holds them too.
 //!
 //! A repository is found by its remote: `git@github.com:o/r.git`,
 //! `https://github.com/o/r` and `ssh://git@github.com/o/r.git` are all
@@ -335,6 +339,204 @@ pub fn unset_global(key: &str, value: Option<&str>) -> Result<()> {
     }
 }
 
+/// How long a change to the home waits for another ohjaa's to finish.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The home's repository folders, from the file system: where its own
+/// files go (`git dir`) and where git reads its excludes (`common dir`).
+/// `.git` itself, or, when `.git` is a file (a worktree, a submodule), the
+/// folder it names and, for a worktree, the common folder that one names.
+fn repository_dirs(home: &Path) -> (PathBuf, PathBuf) {
+    let dot_git = home.join(".git");
+    let named = |base: &Path, file: &Path, prefix: &str| -> Option<PathBuf> {
+        let text = std::fs::read_to_string(file).ok()?;
+        let named = text
+            .trim()
+            .strip_prefix(prefix)
+            .unwrap_or(text.trim())
+            .trim();
+        (!named.is_empty()).then(|| base.join(named))
+    };
+    let Some(git_dir) = dot_git
+        .is_file()
+        .then(|| named(home, &dot_git, "gitdir:"))
+        .flatten()
+    else {
+        return (dot_git.clone(), dot_git);
+    };
+    let common = named(&git_dir, &git_dir.join("commondir"), "").unwrap_or_else(|| git_dir.clone());
+    (git_dir, common)
+}
+
+/// The home's lock, in its repository's own folder (made, when missing,
+/// before the repository is), never in the files the history holds: one
+/// ohjaa at a time changes the home and commits it, so each decision, apply
+/// and adopt is one commit holding its own change, and the agents' block is
+/// rendered from what was just decided. A change that has to wait says so;
+/// one that cannot take it in time says that, and goes on without it:
+/// nothing waits on another ohjaa for good.
+pub fn lock(home: &Path) -> Option<process::FileLock> {
+    let path = repository_dirs(home).0.join("ohjaa.lock");
+    let taken = process::lock_file(&path, std::time::Duration::ZERO).or_else(|_| {
+        eprintln!(
+            "ohjaa: waiting for another ohjaa's change to the home ({}) to finish",
+            path.display()
+        );
+        process::lock_file(&path, LOCK_WAIT)
+    });
+    match taken {
+        Ok(lock) => Some(lock),
+        Err(why) => {
+            eprintln!(
+                "ohjaa: warning: {why}; going on without the home's lock, so this change may \
+                 share a commit with another"
+            );
+            None
+        }
+    }
+}
+
+const EXCLUDE_BEGIN: &str = "# >>> ohjaa: the home's history holds only what ohjaa keeps here";
+const EXCLUDE_END: &str = "# <<< ohjaa";
+/// Everything is left out, then what ohjaa keeps in the home is let in
+/// (the knowledge scopes, the entries, the generated git config, the roots,
+/// apply's record, and the `ours` and `drafter` settings), and what an
+/// editor, the Finder or a half-done write leaves among those is left out
+/// again.
+const EXCLUDE: &[&str] = &[
+    "/*",
+    "!/mine/",
+    "!/machine/",
+    "!/repos/",
+    "!/git/",
+    "!/roots",
+    "!/applied.toml",
+    "!/ours",
+    "!/drafter",
+    "*.tmp",
+    ".*.ohjaa-*",
+    ".*.sw?",
+    "*~",
+    ".#*",
+    "\\#*#",
+    ".DS_Store",
+];
+
+/// The allowlist in the home's repository's own `info/exclude` (git keeps
+/// it untracked, so the home needs no file of its own), as a marked block
+/// beside anything else there; in the common folder a `.git` file names.
+fn keep_out_strays(home: &Path) -> Result<()> {
+    let path = repository_dirs(home).1.join("info").join("exclude");
+    let now = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let block = format!("{EXCLUDE_BEGIN}\n{}\n{EXCLUDE_END}\n", EXCLUDE.join("\n"));
+    let new = match (now.find(EXCLUDE_BEGIN), now.find(EXCLUDE_END)) {
+        (Some(start), Some(end)) if end > start => {
+            let after = &now[end + EXCLUDE_END.len()..];
+            let after = after.strip_prefix('\n').unwrap_or(after);
+            format!("{}{block}{after}", &now[..start])
+        }
+        _ if now.is_empty() || now.ends_with('\n') => format!("{now}{block}"),
+        _ => format!("{now}\n{block}"),
+    };
+    if new != now {
+        write_file(&path, &new, None)?;
+    }
+    Ok(())
+}
+
+/// The variables that would point git at another repository than the home.
+const REPOSITORY_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
+/// `git <args>` in the home, unsigned and with no automatic maintenance (a
+/// commit would start one more git, detached, to outlive ohjaa); with
+/// `repository`, on the home's own repository whatever git would find from
+/// there (an enclosing dotfiles repository, say).
+fn home_git(home: &Path, args: &[&str], repository: bool) -> Result<()> {
+    let mut command = Command::new("git");
+    if repository {
+        command
+            .arg("--git-dir")
+            .arg(home.join(".git"))
+            .arg("--work-tree")
+            .arg(home);
+    }
+    for setting in [
+        "commit.gpgsign=false",
+        "maintenance.auto=false",
+        "gc.auto=0",
+    ] {
+        command.args(["-c", setting]);
+    }
+    command.args(args).current_dir(home);
+    for var in REPOSITORY_VARS {
+        command.env_remove(var);
+    }
+    let output = process::run(&mut command, None, process::LOCAL).context("cannot run git")?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or_default(),
+            output.failure_detail()
+        );
+    }
+    Ok(())
+}
+
+/// The home's history: what ohjaa keeps in the home (the allowlist in its
+/// `info/exclude`, never a stray file), committed as one commit with
+/// `message`, under the home's [`lock`], which the caller holds. The home is
+/// a local git repository (no remote; ohjaa never pushes), made by its first
+/// commit unless the home already is one. A
+/// commit is the person's, with the identity any commit of theirs takes from
+/// git's config, and never signed: nothing verifies a local history, and a
+/// signing prompt must not hold up a decision. Two git processes (`add -A`,
+/// `commit`), and `init` once before the first; a history this small never
+/// needs git's maintenance. A failure is the caller's to say; what was
+/// changed stands either way.
+pub fn commit(home: &Path, message: &str) -> Result<()> {
+    let dot_git = home.join(".git");
+    // A `.git` folder without HEAD holds only the home's lock: no repository yet.
+    if !dot_git.is_file() && !dot_git.join("HEAD").exists() {
+        std::fs::create_dir_all(home)
+            .with_context(|| format!("cannot create {}", home.display()))?;
+        home_git(home, &["init", "-q"], false)?;
+    }
+    keep_out_strays(home)?;
+    home_git(home, &["add", "-A"], true)?;
+    home_git(
+        home,
+        &["commit", "-q", "--allow-empty", "-m", message],
+        true,
+    )
+}
+
+/// [`commit`], said by `who`: what was committed on stdout, or on stderr why
+/// nothing was. Never an error: what was changed stands either way.
+pub fn commit_and_say(home: &Path, message: &str, who: &str) {
+    let subject = message.lines().next().unwrap_or_default();
+    match commit(home, message) {
+        Ok(()) => println!("{who}: committed in {}: {subject}", home.display()),
+        Err(error) => eprintln!(
+            "{who}: warning: \"{subject}\" stands, but is not in the history of {}: {error:#}; \
+             the next commit there takes it in",
+            home.display()
+        ),
+    }
+}
+
 /// zsh's startup file: `$ZDOTDIR/.zshrc`, else `~/.zshrc`.
 pub fn zshrc() -> Result<PathBuf> {
     let dir = std::env::var_os("ZDOTDIR")
@@ -503,6 +705,42 @@ mod tests {
             let error = parse_repo_toml(text).unwrap_err();
             assert!(error.contains(why), "{text:?}: {error}");
         }
+    }
+
+    /// A home whose `.git` is a file (a worktree of another repository): the
+    /// lock goes in the folder it names, and the allowlist where git reads
+    /// it, the common folder; neither is ever in the files the history holds.
+    #[test]
+    fn a_home_whose_git_is_a_file_keeps_its_lock_and_allowlist_out_of_its_files() {
+        let dir = std::env::temp_dir().join(format!("ohjaa-gitfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (home, store) = (dir.join("home"), dir.join("store"));
+        std::fs::create_dir_all(store.join("worktrees/home")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".git"), "gitdir: ../store/worktrees/home\n").unwrap();
+        std::fs::write(store.join("worktrees/home/commondir"), "../..\n").unwrap();
+        let (git_dir, common) = repository_dirs(&home);
+        assert_eq!(git_dir, home.join("../store/worktrees/home"));
+        assert_eq!(common, home.join("../store/worktrees/home").join("../.."));
+        let lock = lock(&home).expect("the lock");
+        assert!(store.join("worktrees/home/ohjaa.lock").is_file());
+        drop(lock);
+        keep_out_strays(&home).unwrap();
+        keep_out_strays(&home).unwrap();
+        let exclude = std::fs::read_to_string(store.join("info/exclude")).unwrap();
+        assert_eq!(exclude.matches(EXCLUDE_BEGIN).count(), 1, "{exclude}");
+        let names: Vec<_> = std::fs::read_dir(&home)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [".git"], "nothing of ohjaa's among the home's files");
+        // A plain home: both are its `.git`.
+        let plain = dir.join("plain");
+        assert_eq!(
+            repository_dirs(&plain),
+            (plain.join(".git"), plain.join(".git"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// `sharing.toml` said how `ohjaa judge` shared its notes; with the
