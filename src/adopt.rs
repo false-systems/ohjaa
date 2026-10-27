@@ -162,17 +162,12 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
     for said in &regenerated {
         println!("  {said}");
     }
-    home::commit_and_say(
-        &home,
-        &format!(
-            "adopt {}: observe {branch}\n\n{source}\n{}",
-            id.slug(),
-            regenerated.join("\n")
-        )
-        .trim_end()
-        .to_owned(),
-        "ohjaa adopt",
+    let message = format!(
+        "adopt {}: observe {branch}\n\n{source}\n{}",
+        id.slug(),
+        regenerated.join("\n")
     );
+    home::commit_and_say(&home, message.trim_end(), "ohjaa adopt");
     match gitconfig::gated_clone(&home, &top)? {
         Some(clone) => {
             let drift = gitconfig::clone_drift(&home, &clone);
