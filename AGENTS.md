@@ -50,10 +50,11 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   is derived now and stored never. No knowledge index, no cache, no daemon.
 - **The workflow lives in the home, outside every repository.**
   `~/.config/ohjaa` holds each repository's entry (`repos/<owner>/<repo>/`:
-  `repo.toml`, the branch ohjaa observes and the env its gate gives cargo
-  tasks, the gate of each commit being derived from the commit's own
-  `sykli.json`; a stored gate only for a repository with none; plus its
-  generated hooks folder and `gated.config`), the generated `git/`
+  `repo.toml`, the branch ohjaa observes and the env lines its gate gives
+  cargo tasks, plus its generated hooks folder and `gated.config`; every
+  commit's gate is derived, from its own `sykli.json` and `sykli.lock`, or
+  from `sykli init` on its tree for a repository with none, plus the
+  entry's env lines, and ohjaa keeps no stored gate), the generated `git/`
   config and `roots`. Only
   repositories whose remote names an entry run ohjaa's hooks, and only the
   hooks that entry needs; no other git command anywhere starts ohjaa, and

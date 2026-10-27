@@ -1076,7 +1076,7 @@ pub fn describe_check(check: &Check) -> String {
             format!("stale: sykli checked the checkout, not the commit ({why})")
         }
         Check::OtherContract { why } => {
-            format!("unproven: it passed under another contract than the gate's ({why})")
+            format!("unproven: it ran under another contract than the gate's ({why})")
         }
     }
 }

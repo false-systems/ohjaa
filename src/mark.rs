@@ -16,13 +16,17 @@
 //! commits, tip first. The commits, and the gate of each commit sykli is
 //! asked about, come from one git process (the clone's `git cat-file
 //! --batch`); receipts are
-//! read as files, from the layout: those sykli keeps for every push it
-//! accepted (`<common>/sykli/receipts`) and, in every worktree, those `sykli
-//! run` writes (`.sykli/receipts/`) and the one `ohjaa gate` saves
+//! read as files, from the layout: those sykli keeps under the clone's
+//! common dir, which outlive the worktree that ran them (the receipt of
+//! every push its hook accepted, `<common>/sykli/receipts`, and the receipt
+//! each run concluded with, in the run's own folder, `<common>/sykli/runs/
+//! <run>/`) and, in every worktree, those `sykli run` writes
+//! (`.sykli/receipts/`) and the one `ohjaa gate` saves
 //! (`.sykli/receipt.json`). sykli is asked only about a commit with a receipt
 //! of its tree that says it passed. A merge commit a forge made from an
 //! up-to-date pull request has the tree of the pull request's head, so a
-//! receipt of the head proves the merge.
+//! receipt of the head proves the merge, also once the worktree it was
+//! proven in is removed.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -107,7 +111,7 @@ pub struct Walked {
     /// how many tasks it records, and how many it reused from the cache.
     pub proof: Option<sessions::Evidence>,
     /// For a proven commit, the contract that receipt ran under: the gate
-    /// derived from the commit, its own `sykli.json`, or the entry's copy.
+    /// derived from the commit, or its own `sykli.json`.
     pub under: Option<Under>,
 }
 
@@ -144,6 +148,9 @@ pub struct Marks {
     /// Tip first.
     pub commits: Vec<Walked>,
     pub ended: Ended,
+    /// The receipts sykli named by their digest that could not be read,
+    /// each a path and why: a gap in the marks, never a receipt.
+    pub unreadable: Vec<String>,
 }
 
 impl Marks {
@@ -201,7 +208,7 @@ pub fn why(check: &Check) -> Option<String> {
         Check::Passed => return None,
         Check::Failed { why } => why.clone(),
         Check::OtherContract { why } => {
-            format!("passed under another contract than the gate's ({why})")
+            format!("ran under another contract than the gate's ({why})")
         }
         Check::Unchecked => "no receipt of its tree here".to_owned(),
         Check::UncheckedGone => {
@@ -333,6 +340,7 @@ pub fn walk(gate: &Gate, sykli: &Sykli, receipts: &Receipts) -> Result<Marks, St
         updated: updated(&gate.common, &gate.branch),
         commits,
         ended,
+        unreadable: receipts.unreadable().to_vec(),
     })
 }
 
@@ -367,7 +375,7 @@ pub fn flag(marks: &Marks) -> Option<String> {
     if n > 5 {
         listed.push("…".to_owned());
     }
-    // Runs that passed under another contract are not proven against the
+    // Runs under another contract are not proven against the
     // gate as it is now: said so, never as if nothing had ever passed.
     let other = unproven
         .iter()
@@ -395,7 +403,7 @@ pub fn flag(marks: &Marks) -> Option<String> {
         format!("{n} {commits}: ")
     };
     let passed = if other > 0 {
-        format!("; {other} passed under another contract")
+        format!("; {other} ran under another contract")
     } else {
         String::new()
     };
@@ -578,6 +586,7 @@ mod tests {
                 })
                 .collect(),
             ended,
+            unreadable: Vec::new(),
         }
     }
 
@@ -631,7 +640,7 @@ mod tests {
         assert_eq!(
             flag(&regated).unwrap(),
             "FLAG: main of acme/widget has never been proven against its current gate (2 \
-             commits: ? 0000000, ? 1111111; 1 passed under another contract; origin/main, its \
+             commits: ? 0000000, ? 1111111; 1 ran under another contract; origin/main, its \
              update time unknown). Start by running `ohjaa gate` on main and fix forward what \
              fails."
         );
@@ -647,7 +656,7 @@ mod tests {
         assert_eq!(code(&other), "other_contract");
         assert_eq!(
             why(&other).unwrap(),
-            "passed under another contract than the gate's (refused: contract expected a but \
+            "ran under another contract than the gate's (refused: contract expected a but \
              got b)"
         );
         assert_eq!(why(&Check::Passed), None);

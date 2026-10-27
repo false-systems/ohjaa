@@ -9,8 +9,7 @@
 //!   repos/<owner>/<repo>/            lower case
 //!     repo.toml    branch = "main"   the branch ohjaa observes, and [cargo_env]: the env
 //!                                    each cargo task of the gate is given (KATANA D10)
-//!     sykli.json   a stored gate, only for a repository with no sykli.json of its own
-//!     sykli.lock
+//!     sykli.json   a gate an earlier adopt stored: never read (adopt --force removes it)
 //!     hooks/<name>                   exec <ohjaa> hook <name> "$@", for pre-push
 //!                                    and each hook the entry's clones have
 //!     gated.config                   core.hooksPath = that hooks/ folder
@@ -114,10 +113,9 @@ impl RepoId {
 }
 
 /// A repository's entry: the branch ohjaa observes and the env its gate
-/// gives cargo tasks. The gate for a commit is derived from the commit's own
-/// `sykli.json` ([`crate::derived`]); the entry keeps a gate of its own (a
-/// stored copy, `sykli.json` beside `repo.toml`) only for a repository that
-/// has none.
+/// gives cargo tasks. The gate for a commit is derived from the commit: its
+/// own `sykli.json`, else what `sykli init` writes for its tree
+/// ([`crate::derived`]). The entry keeps no gate of its own.
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub dir: PathBuf,
@@ -128,8 +126,8 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// The stored copy, `sykli.json` beside `repo.toml`: the gate of a
-    /// commit with no `sykli.json` of its own.
+    /// The copy an earlier adopt stored, `sykli.json` beside `repo.toml`:
+    /// never read (no gate is a copy), and removed by `adopt --force`.
     pub fn stored(&self) -> PathBuf {
         self.dir.join("sykli.json")
     }
@@ -153,7 +151,7 @@ pub fn repo_toml(id: &RepoId, branch: &str, overlay: &Overlay, none: Option<&str
     format!(
         "# ohjaa's entry for {}, written by `ohjaa adopt`. ohjaa observes this branch. Each\n\
          # commit is judged by the gate derived from its own sykli.json (and sykli.lock), with\n\
-         # [cargo_env] below; a commit without one, by the gate beside this file (sykli.json).\n\
+         # [cargo_env] below; a commit without one, by what sykli init writes for its tree.\n\
          branch = {}\n{}",
         id.slug(),
         flat_toml::quote(branch),

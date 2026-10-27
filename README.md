@@ -470,7 +470,7 @@ sykli lists it as established or not:
 | exit 0; with `--json`, a verdict that judged the commit, verified it, established its schema, contract, source and consistency, and that says the receipt claims `passed` or `cached` | `verified: passed` | no |
 | exit 0 with `--json`, but a verdict that does not prove it (another schema, another subject, an identity tier not established, no claimed pass) | `unverified: …` | no |
 | exit 1 or 3: refused the commit (another tree, a dirty run, an input the commit does not have, a failed outcome, contradictory records) | `FAILED sykli verify: …` | **yes** |
-| exit 4: it passed under another contract or lock than the one it is judged by now | `unproven: it passed under another contract than the gate's (…)` | **yes** where it is `origin/<default>`'s tip; otherwise no |
+| exit 4: it passed under another contract or lock than the one it is judged by now | `unproven: it ran under another contract than the gate's (…)` | **yes** where it is `origin/<default>`'s tip; otherwise no |
 | exit 2: it could not verify (a bad revision, arguments, not a receipt) | `unverified: sykli verify could not verify: …` | no |
 | any other end: a crash, a kill, no answer in time | `unverified: …` | no |
 | no `--commit` (`sykli verify --help` lists no such flag) | `unverified: sykli has no --commit` | no |
@@ -873,8 +873,6 @@ starts it.
   repos/<owner>/<repo>/             lower case
     repo.toml     branch = "main"   the branch ohjaa observes, and [cargo_env]: what each
                                     cargo task of its gate is given (KATANA D10)
-    sykli.json    a stored gate, only for a repository with no sykli.json of its own
-    sykli.lock
     hooks/pre-push, hooks/<name>    exec '<ohjaa>' hook <name> "$@": pre-push, and each
                                     hook this entry's clones have of their own
     gated.config                    core.hooksPath = that hooks/ folder
@@ -939,13 +937,23 @@ and, when sykli does not accept the push and the clone holds receipts, its
 tree, for one `sykli verify`; it hands sykli `--repo-root` and
 `--git-common-dir` when sykli takes them.
 `ohjaa gate` starts one (the repository's config; its gate is derived from the
-checkout's files), and inside a session that one more (HEAD, its tree and the
-branch tip, for the request); asking sykli about a pending run starts none;
+checkout's files), and inside a session, or in a checkout with no
+`sykli.json`, one more (HEAD, its tree and the branch tip); asking sykli about
+a pending run starts none;
 `doctor` two for the machine (`git --version`, the global config with
 includes) and at most two per clone (its config, with `insteadOf` applied in
 Rust, and for an entry's clone the tip's gate);
-the `sykli validate` it asks of a stored gate's lock, and the `sykli validate`
-and `sykli lock` of adopt, are handed the clone's facts and start none.
+adopt asks sykli only for its `--help`. A gate `sykli init` writes for a tree (a commit with no
+contract of its own, see "The gate of a commit") costs, every time a commit
+is judged by it (once per tree in one ohjaa process, never kept), two more
+(its scratch checkout's `git init` and `git read-tree -u`) and one `sykli
+init`, which asks git twice more (`rev-parse` and `ls-files`, in the scratch
+checkout): about 0.2 s for ohjaa's tree. `report --json --marks` on the
+home of 2026-10-27 (three such entries, ohjaa, vessa and faija, each asked
+for its tip) starts about 12 git processes more than it would without them
+(43 against 31), and takes about 0.7 s more (1.8–2.0 s against 1.1–1.25 s),
+each time it runs; so does each briefing in such a repository, for its tip
+and HEAD.
 The briefing's flag costs at most three (the clone's config, which the drift
 warnings share, and the clone's `git cat-file --batch`, which walks the branch
 and reads the gate of each commit sykli is asked about) and one `sykli
@@ -967,8 +975,11 @@ repository root: `mkdir -p .sykli && sykli run <contract> --json >
 .sykli/receipt.json && sykli verify .sykli/receipt.json --contract <contract>
 --commit HEAD`, where the contract is the gate of what the checkout runs (see
 "The gate of a commit"): derived from the checkout's own `sykli.json` and
-`sykli.lock`, read as files, else the entry's stored gate; or the
-repository's own `sykli.json` when origin names no entry. When those two
+`sykli.lock`, read as files; in a checkout with no `sykli.json`, HEAD's gate,
+derived as every commit's is (what `sykli init` writes for HEAD's tree, when
+HEAD has no contract of its own: it declares what HEAD tracks, so it proves
+HEAD as committed, and the gate says to commit first); or the repository's
+own `sykli.json` when origin names no entry. When those two
 files are HEAD's, that is exactly HEAD's gate; when they are edited (an input
 added, as one must before committing it), it is the gate the commit they
 will be in has, so the receipt proves that commit (a receipt names the
@@ -978,12 +989,16 @@ differ from the commit's, and such a receipt reads as another contract's:
 unproven, never a false pass. It prints the contract, where it comes from, and every command, and
 exits with sykli's status; `--print` runs nothing and writes nothing (it names
 where the run keeps the gate, and says when it is not written yet). The
-receipt stays in that worktree
-(`.sykli/receipt.json`, and the copy `sykli run` writes under
-`.sykli/receipts/`), where the push and the marks find it; sykli has no
-command that keeps a receipt anywhere else, but `sykli hook pre-push` copies
-the one that proved a push into `<git common dir>/sykli/receipts/`, which
-outlives the worktree. Agents are taught this one command.
+receipt is in that worktree (`.sykli/receipt.json`, and the copy `sykli run`
+writes under `.sykli/receipts/`), and sykli keeps it, too, in the run's own
+folder under the clone's common dir (`<git common dir>/sykli/runs/<run>/
+rcpt_<sha256>.json`; `sykli status --run` names it, and `verify --commit`
+judges it from any worktree of the clone), and `sykli hook pre-push` copies
+the one that proved a push into `<git common dir>/sykli/receipts/`. Those two
+outlive the worktree: the push and the marks find the proof there once the
+worktree is removed, as it is after its pull request merges (sykli keeps at
+most `SYKLI_RUN_BUDGET` runs per clone, 100 by default, the oldest pruned
+first). Agents are taught this one command.
 
 Inside an `ohjaa run` session (`OHJAA_SESSION`), the gate first writes the
 request into the session's record (`validations`, in `ohjaa-sessions.v1`),
@@ -1070,15 +1085,46 @@ adopt in between. `ohjaa gate`, the pre-push hook, the marks, the flags a
 session's record raises at leaving and the integrated validation all judge C
 by it, and it is the same bytes wherever and whenever it is written.
 
-A commit with no `sykli.json` of its own is judged by the entry's stored gate,
-`sykli.json` beside `repo.toml`, which adopt has `sykli init --contract` write
-for a repository without one (ohjaa, vessa and faija today), and which gets
-its lines when it is written. An entry adopted before keeps working: the copy
-it holds is ignored for every commit that has its own contract, and `ohjaa
-adopt --force` removes it. A commit from before its repository had a
-`sykli.json` (one with only `sykli.rs`, as toimija's first ones) is then
-judged by nothing: it is marked unproven (`could_not_say`, "no sykli contract
-(sykli.json) in …"), never failed.
+**A commit with no contract of its own** (no `sykli.json`, and no
+`sykli.rs`: ohjaa, vessa and faija today) is judged by what `sykli init`
+writes for its tree, given the entry's lines as a repository's own contract
+is, and locked as sykli init locked it. sykli init declares every file the
+tree tracks (sykli#89), so a file added is declared by the gate of the commit
+that adds it, with no adopt in between: a copy kept beside `repo.toml`, as
+adopt once wrote with `sykli init --contract`, drifted the moment a file was
+added. sykli is asked, by the sykli that judges the commit, in a **scratch
+checkout** of exactly that tree: a repository of its own in a folder of the
+ohjaa process's own under `$TMPDIR`, borrowing the clone's objects
+(`objects/info/alternates`, read only), the tree read into its index and
+work tree (`git init`, then `git read-tree -u`; no hook runs, nothing is
+fetched), then `sykli init --contract <folder>/sykli.json`, handed that
+checkout's facts; the folder goes when the process ends. Nothing is written
+into the clone (no linked worktree), the config home or the state, so the
+marks and the report can ask it. sykli init is asked again every time the
+commit is judged (once per tree in one ohjaa process, in memory), and what it
+writes is never kept to be read back: a run that outlives ohjaa (`ohjaa
+gate`, an integrated validation) names its gate in `derived/<digest>/` as
+any other, and that file is read only where it is, byte for byte, the gate
+derived now. A sykli whose init writes another contract for a tree gives the
+tree another gate, and a run under the one before reads as another
+contract's. No receipt proves such a commit but one of a run under its
+gate: there is no contract of its own to verify one against. What sykli init
+cannot write a gate for (no `Cargo.toml`, `package.json` or `go.mod`) has
+none, in sykli's words. An ohjaa killed while sykli init runs (a report, a
+hook or a gate keep the default disposition) leaves its private folder,
+scratch checkout and all; the next ohjaa that makes one first removes those
+of every ohjaa that is gone (`ohjaa-gates-<pid>-<n>`, this user's, its pid
+unknown to kill(2)).
+
+An entry adopted before keeps working with no adopt: the copy it holds
+(`sykli.json` and `sykli.lock` beside `repo.toml`) is never read, doctor
+notes it, and `ohjaa adopt --force` removes it. A receipt of a run under
+that copy proves a commit only where the copy is the gate derived now (as
+when it was written by `sykli init` for that commit's files); else it reads
+as another contract's: unproven, never failed. A commit with only a
+`sykli.rs` (as toimija's first ones) has a contract of its own that no gate
+is derived from: it is judged by nothing, and marked unproven
+(`could_not_say`, "no sykli contract (sykli.json) in …"), never failed.
 
 **A pass under the repository's own contract proves C too.** A run of C's own
 `sykli.json` and lock, as they are (CI's `sykli run sykli.json`, or an
@@ -1128,8 +1174,8 @@ cannot read), the push goes on with `ohjaa: UNOBSERVED push to <owner/repo>:
   or sykli refused it for its outcome or evidence);
 - ? **unproven**: no receipt of its tree here; or it passed under another
   contract or lock than the commit's gate and its own (a copy kept from
-  before, a stored gate edited and locked again since); or sykli could not
-  say, or no gate judges it (no `sykli.json` of its own, and no stored gate).
+  before, the gate of an older contract); or sykli could not say, or no gate
+  judges it (only a `sykli.rs`, or a tree sykli init writes no gate for).
 
 ✓ means exactly that sykli accepted a receipt for this tree against the
 commit's gate or its own contract, and says which: `(own sykli.json)` after
@@ -1147,11 +1193,16 @@ The walk starts where the clone last saw origin (`refs/remotes/origin/
 first proven commit, at most 50, tip first. The commits, and the gate of each
 one sykli is asked about, come from the clone's one `git cat-file --batch`
 (first parent by first parent; a shallow clone ends where its history does);
-receipts are read as files, from the clone's layout:
-`<common>/sykli/receipts/` (what sykli kept for accepted pushes) and, in
-every worktree, `.sykli/receipts/` and `.sykli/receipt.json`. A forge's merge
-of an up-to-date pull request has the tree of its head, so a receipt of the
-head proves the merge. The marks are as of the last update of `origin/<branch>`
+receipts are read as files, from the clone's layout: what sykli keeps under
+the common dir, which outlives every worktree (`<common>/sykli/receipts/`,
+what its hook kept for accepted pushes, and `<common>/sykli/runs/<run>/`, the
+receipt each run concluded with), and, in every worktree, `.sykli/receipts/`
+and `.sykli/receipt.json`; a receipt kept in two places under its digest's
+name is read once, the same bytes being the same receipt (another file under
+that name never hides it, and one sykli named that cannot be read is a gap
+in the report). A forge's merge of an up-to-date pull request has the tree
+of its head, so a receipt of the head proves the merge, also once the
+worktree the head was proven in is removed. The marks are as of the last update of `origin/<branch>`
 here, which its reflog dates and says the kind of (a fetch, or a push from
 this clone). `ohjaa report` shows the marks of every entry, and `ohjaa report
 --marks` only them:
@@ -1169,9 +1220,11 @@ before anything else, and the launch says it on stderr:
 FLAG: main of false-systems/taso is unproven since 77a1f0e (2 commits: ? 4be01c2, ✗ 77a1f0e; origin/main as of a fetch at 2026-10-13 09:12 UTC). Start by running `ohjaa gate` on main and fix forward what fails.
 ```
 
-When some of those commits passed under another contract, it says the branch
+When some of those commits ran under another contract, it says the branch
 is "not proven against its current gate" (or "has never been proven against
-its current gate"), and how many passed under another one.
+its current gate"), and how many ran under another one. A failed run counts
+as the commit's failure only under its gate (or its own contract), as a
+pass does: one under any other contract is `other_contract`, never ✗.
 
 The flags a session's record raises at leaving (a broken `origin/main`, its
 own refused work) judge a repository with an entry by its gate too.
@@ -1276,9 +1329,9 @@ config of every folder above the one it runs in, and a deeper one wins over
 checkout. A repository's own `.cargo/config.toml` still wins, as it would
 anywhere.
 
-(sykli keeps a detached run's journal in the clone's common dir, and its
-receipt in the checkout it ran in; keeping that receipt beside the journal
-is a sykli change, not made here.) Leaving never reads the validation
+(sykli keeps a run's journal in the clone's common dir, and its receipt both
+in the checkout it ran in and beside the journal, which the marks read: the
+copy in ohjaa's state is kept all the same.) Leaving never reads the validation
 checkout's reflog (nothing is made in it), and it is not counted as a
 sibling checkout. A sykli without `status --commit` or `run --detach` is
 asked for nothing, and the line says so.
@@ -1346,9 +1399,11 @@ no window, no vessa.
             | "no_receipt_checkout_gone" | "could_not_say" | "stale",
       "why": "…" | null,                 // for a person; null when proven
       "author": "…", "authored": "<RFC 3339>", "subject": "…",
-      "contract": "derived" | "own" | "stored" | null, // a proven commit: the contract its
-                                         // receipt ran under: the commit's gate, its own
-                                         // sykli.json, or the entry's stored gate
+      "contract": "derived" | "own" | null, // a proven commit: the contract its receipt
+                                         // ran under: the commit's gate (from its own
+                                         // sykli.json, or what sykli init writes for its
+                                         // tree), or its own sykli.json; "stored", the
+                                         // entry's copy, is no longer given (2026-10-27)
       "tasks": 3 | null, "cached": 1 | null // a proven commit: the accepted receipt's tasks, and
                                          // how many it reused from sykli's cache
     }],
@@ -1402,9 +1457,11 @@ shell-init zsh)"`.
 one, else `--branch`) and `[cargo_env]` (below). It keeps no copy of a
 contract the repository has at that branch (not the working tree, which
 another session may be editing): every commit's gate is derived from the
-commit, and a copy an earlier adopt kept is removed. For a repository with no
-`sykli.json` of its own, it asks `sykli init --contract <entry>/sykli.json`
-for a stored gate. Then it regenerates `git/` and writes the entry's
+commit, and a copy an earlier adopt kept is removed. That holds for a
+repository with no `sykli.json` of its own as well: each commit's gate is
+what `sykli init` writes for its tree, asked when it is needed, so adopt only
+checks that the sykli on PATH can write a contract outside a repository
+(`sykli init --help` names `--contract`) and refuses when it cannot. Then it regenerates `git/` and writes the entry's
 dispatchers. It never touches git's global config, and takes no lock in the
 repository.
 
@@ -1445,42 +1502,27 @@ settings for complex commands. Tasks with no Cargo word are untouched.
 Only the gate changes, never the repository's contract or an agent's own
 Cargo commands. A derived gate is locked as "The gate of a commit" says.
 
-A stored gate that came with a `sykli.lock` is locked again (`sykli lock
-<entry>/sykli.json`), and only when sykli validates the contract and lock written, which
-adopt asks first (`sykli validate <entry>/sykli.json`). Both run in the
-repository, handed `--repo-root` and `--git-common-dir` when sykli takes them,
-so they start no git. If validation fails, adopt keeps the gate as written
-and prints sykli's diagnostic
-without guessing the cause from its wording. Validate and lock the contract
-in the repository, land both on its observed branch, then adopt again.
-A successful validation is reported as `sykli validate accepts its sykli.lock`,
-not as an independent claim that Ohjaa verified every lock entry.
-
 The lines are given only when every sykli that runs the gate expands the
 placeholder: the one on PATH and the one the pre-push dispatcher runs (as
 `apply` recorded it). A sykli that does names `${worktree_cache}` in `sykli
 run --help`, matched as that token, never as a sentence. An older one passes
 it on as written, and cargo would build in a `${worktree_cache}/` folder
 inside the work tree, so then adopt writes an empty `[cargo_env]`, saying why
-in `repo.toml`, and says so. When `sykli lock` fails, a stored gate is kept as
-written, with a warning.
+in `repo.toml`, and says so.
 
 `ohjaa doctor` says, for each entry with a clone under the roots, which
 contract judges its branch's tip: the gate derived from the tip's own
-`sykli.json` (and the tasks given lines), or the stored gate. For a derived
-one it flags (drift) a tip whose `sykli.lock` does not pin its `sykli.json`
+`sykli.json`, or from what `sykli init` writes for its tree (asked in a
+scratch checkout; doctor keeps nothing), and the tasks
+given lines. It flags (drift) a tip whose `sykli.lock` does not pin its `sykli.json`
 (sykli refuses the gate, as it refuses the repository's own); an empty
 `[cargo_env]` while every sykli knows the placeholder and the gate has cargo
 tasks ("gate runs may share a target dir across worktrees"; `ohjaa adopt
 --force` writes the lines; a note while one does not); and lines, or a task of
 the repository's own, naming `${worktree_cache}` while a sykli that runs the
 gate does not expand it, by its path: a sykli downgraded after adopt builds in
-the work tree. A copy an entry still holds beside a derived gate is noted.
-For a stored gate it checks, as before, its cargo tasks' lines and whether its
-`sykli.lock` pins it (`sykli validate`, from the entry's clone and handed its
-facts when one is under the roots, else from the entry, where sykli asks git
-once), which an adopt cut short between writing the two leaves behind. Adding
-the lines changes the gate's digest, so receipts from before read as another
+the work tree. A copy an entry still holds beside `repo.toml` is noted as
+never read. Adding the lines changes the gate's digest, so receipts from before read as another
 contract's; a run of the repository's own contract is still its own.
 
 ## What it will never do
