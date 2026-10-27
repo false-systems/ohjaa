@@ -14,7 +14,7 @@ fleet remains available on demand.
 ```bash
 ohjaa run claude --intent "…"          # brief the agent, then hand off to toimija
 ohjaa run claude --intent-id in-…      # continue that Intent in a new session
-ohjaa brief                            # the briefing an agent gets here
+ohjaa brief --agent claude             # the briefing an agent gets here
 ohjaa brief --scope ../other-repo       # retrieve context after expanding scope
 ohjaa propose --scope ours --id rust-only --kind decision \
       --origin "2026-09-16: 'we dont do python'" "Code is Rust or Elixir/Erlang."
@@ -81,8 +81,9 @@ shared Knowledge never builds on personal Knowledge. Those rules come from
 faija's contract, and ohjaa carries its reference implementation in
 `vendor/faija-knowledge`.
 
-Every explicitly scoped repository also contributes its complete repo knowledge,
-labelled with its path. Global knowledge is delivered once, not repeated for each
+Every explicitly scoped repository also contributes its repo knowledge,
+labelled with its path, within a budget of its own (every decision in full;
+see "Keeping it true"). Global knowledge is delivered once, not repeated for each
 repo. No keyword matcher drops a decision. Session records preserve the repository
 identity of delivered repo nodes; older records without that identity still read.
 
@@ -917,9 +918,11 @@ and for a session still open what its environment claimed so far.
 `usage export` emits `ohjaa-sessions.v1`, with `sessions` and `unreadable`.
 Each session is its record as the log holds it; what later versions added is
 additive and absent from older records: `intent_id` and `task`, `pgid` and
-`group_started_ms` (the session's process group), `native_env` and `left.native` (the agent's own sessions, above), and `validations` (see
+`group_started_ms` (the session's process group), `native_env` and `left.native` (the agent's own sessions, above), `validations` (see
 `ohjaa gate`, and the integrated validations of "The integrated State",
-with `not_dispatched`). A log an ohjaa with `ohjaa judge` wrote (removed
+with `not_dispatched`), and a delivered node's `via`: the agent's own
+instruction file that held it at launch, so the briefing left it out (see
+"Keeping it true"). A node the budget left out is not in `delivered`. A log an ohjaa with `ohjaa judge` wrote (removed
 2026-10-26) still holds that command's tables, `judgements` and
 `judgement_responses`; it opens and is written as any other, and those
 tables are never read and left as they were. Unreadable records produce exit 4. `--session ID` selects one record. Existing
@@ -934,9 +937,19 @@ what may no longer hold:
 - a `holds_while` predicate that is false right now;
 - a **fact** not re-confirmed for 90 days (`ohjaa confirm <id>`);
 - a briefing longer than an agent will reliably read (8,000 characters). The
-  fix is to merge or retire nodes, never to truncate.
+  fix is to merge or retire nodes.
 
 A flag never hides a node. The briefing shows it with the flag beside it.
+
+Until the knowledge is merged or retired back under the budget, the briefing
+degrades rather than falls off a cliff, and says so on stderr. It keeps every
+decision in full, then the rest by priority while it fits: taste (how you
+work, in every session), then lesson (what a correction taught), then fact
+(the nearest to what can be found out again, and the first to go stale),
+each the one last confirmed (`as_of`) first. The filling stops at the first
+node that does not fit, and the briefing ends with the count of the rest,
+``3 more: `ohjaa list` ``. No node is ever cut short. `ohjaa check` still
+measures all of it.
 
 For agents not launched through ohjaa, `ohjaa brief --write <file>` writes the
 Knowledge as a generated block into an instruction file such as `CLAUDE.md` or
@@ -952,7 +965,7 @@ agent itself finds it, and creates none:
 | Claude Code | `$CLAUDE_CONFIG_DIR` (else `~/.claude`)`/CLAUDE.md` |
 | Codex | `$CODEX_HOME` (else `~/.codex`)`/AGENTS.override.md`, `AGENTS.md` |
 | pi | `$PI_CODING_AGENT_DIR` (else `~/.pi/agent`)`/AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md` |
-| opencode | `$XDG_CONFIG_HOME` (else `~/.config`)`/opencode/AGENTS.md` |
+| opencode | `$OPENCODE_CONFIG_DIR` (else `$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`)`/AGENTS.md` |
 
 An agent that is set up but has no such file is said so (create the file,
 even empty, and apply again), and a file inside a git repository gets no
@@ -968,8 +981,9 @@ Knowledge (ohjaa, mine and machine): what the person you work for has decided an
 <!-- ohjaa:knowledge end -->
 ```
 
-Past the briefing's budget (8,000 characters) it holds the decisions in full
-and names the rest by count, ``30 more: `ohjaa list` ``, and apply says so.
+Past the briefing's budget (8,000 characters) it degrades as the briefing
+does: every decision in full, then taste, lesson and fact while they fit,
+then the rest by count, ``30 more: `ohjaa list` ``, and apply says so.
 After each decision the block is rewritten wherever it is (moved, or
 between your own lines), and only where it is: a block you take out stays
 out until the next apply. `apply --undo` takes it out and puts back exactly
@@ -985,8 +999,54 @@ until you fix the file by hand. A home whose `.git` is a file (a worktree)
 keeps the lock and the allowlist in the folders that file names. A bare
 dotfiles repository (`git --git-dir=~/.dotfiles --work-tree=~`) has no `.git`
 above the file, so ohjaa cannot see that a file is in it: give such an
-agent's file no block by putting one of your own there. Agents launched
-through ohjaa read this knowledge in their briefing too.
+agent's file no block by putting one of your own there.
+
+An agent launched through ohjaa is not given this knowledge twice. `ohjaa run
+<agent>` reads that one agent's own file (no git), found where the agent
+itself finds it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR`
+and `OPENCODE_CONFIG_DIR` move it), and compares its block with the block
+apply would write now, byte for byte, never by a time. When the two are the
+same, the briefing leaves out what the block holds and says where it is, in
+one line, with the file's full path:
+
+```
+Mine and machine (41 nodes) are not repeated here: Claude Code has them from its own instructions, /Users/you/.claude/CLAUDE.md, whose ohjaa block is current.
+```
+
+A block over its own budget holds every decision and the rest by priority,
+as above. The nodes it names only by count are then carried by the briefing,
+within the briefing's budget, and the line says so (`Mine and machine:
+Claude Code has 41 of their 42 nodes from its own instructions, …, whose
+ohjaa block is current; the other 1 is above.`). A flagged node is still
+repeated, with its flag, since the block carries no flags (`Flagged, so
+repeated above: <id>.`).
+
+The briefing carries mine and machine, within its budget, and its one line
+says why (`Mine and machine are carried here, not left to Codex's own
+instructions: /Users/you/.codex/AGENTS.md does not exist.`), when:
+
+- the file is missing, holds no block, holds a block apply did not write, holds
+  a stale one, or cannot be read;
+- the agent will not read the file, by its own options (before its own `--`)
+  or variables:
+  - Claude Code 2.1.311 given `--bare` or `--safe-mode`, or with
+    `CLAUDE_CODE_SIMPLE` or `CLAUDE_CODE_SAFE_MODE` set truthy, reads no
+    CLAUDE.md; given `--setting-sources` without `user`, or an empty
+    `CLAUDE_CONFIG_DIR`, it does not read that one;
+  - pi 1.2.0 given `--no-context-files` or `-nc` reads no AGENTS.md or
+    CLAUDE.md;
+  - opencode 2.1.4 given `--server <url>` leaves its instructions to that
+    server;
+  - Codex 0.164.0 has no option that skips its own `AGENTS.md`;
+- the folder the file is in is not an absolute path (a relative
+  `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR` or
+  `OPENCODE_CONFIG_DIR`): the agent resolves it where it starts, so which file
+  it reads cannot be told.
+
+For any command but `claude`, `codex`, `pi` and `opencode` nothing is said.
+The line is part of the knowledge section, and counts toward its budget.
+`ohjaa brief --agent <command>` prints the briefing that agent gets; it
+knows the environment, not the arguments `ohjaa run … -- <args>` would pass.
 
 ## The fleet and the perimeter
 
@@ -1011,8 +1071,9 @@ Missing scope repositories produce exit 4 from `brief`, never an empty success.
 The briefing tells an agent to use delivered facts instead of repeating discovery.
 With no concrete task, it acknowledges and waits: the wrapper already recorded
 entry. Orientation precedes the first task change; handover belongs at work
-completion or session exit, not after every conversational reply. No knowledge
-is truncated to save tokens, and no new index, database or model call is needed.
+completion or session exit, not after every conversational reply. No node is
+cut short to save tokens: past the budget the briefing names what it leaves
+out by count, and no new index, database or model call is needed.
 
 The root list is derived as the sibling directories of your git root (outside
 a repo, the folder you are in), unless `~/.config/ohjaa/roots` or `--root`
@@ -1040,8 +1101,9 @@ ohjaa run codex --intent "change the parser" -- --model o3
   `<!-- ohjaa-briefing v1 -->`. It says where ohjaa's words begin, so a
   reader of transcripts can tell a launch's task from the briefing toimija
   appends after it (vessa cuts there). It is matched byte for byte: a change
-  is a new version, never an edit. `ohjaa brief` prints the same briefing
-  without it, and `brief --write` never writes it into a file.
+  is a new version, never an edit. `ohjaa brief --agent <command>` prints
+  the same briefing without it, and `brief --write` never writes it into a
+  file.
 - `--dry-run` prints the exact command it would exec, without launching.
 - If toimija cannot fully read the sessions, or does not report its coverage,
   ohjaa refuses to launch blind.
