@@ -447,7 +447,12 @@ here. It records only: nothing is sent to anyone, decided or refused.
   `seen.lock` says it.
 - **`ohjaa digest`** shows what the person has not seen in full: what the
   day's digest left out (`… 44 more: ohjaa digest`), else what happened
-  since the last digest. Who is live it asks now, as `ohjaa fleet` does.
+  since the last digest. What a day's digest left out stays there until it
+  is read in full, the earliest kept when several were cut, and each day's
+  digest points to it (`… and what an earlier digest left out, since …:
+  ohjaa digest`). Who is live it asks now, as `ohjaa fleet` does. It moves
+  the cursor under `seen.lock`; one that cannot claim it within 2 s shows
+  all the same and leaves the cursor, so nothing is said twice or lost.
 - **Only a person sees it.** `line` prints, reads, writes and starts nothing
   unless stdout is a terminal and no agent session's marker is set:
   `OHJAA_SESSION`, `TOIMIJA_SESSION`, `TOIMIJA_RUN`, `CLAUDECODE`,
@@ -470,12 +475,17 @@ here. It records only: nothing is sent to anyone, decided or refused.
 - **`ohjaa collect`** asks three sources once, at the same time. A source
   that fails keeps what it held before, and is said to be as of then.
   - The marks and the open sessions, as `ohjaa report --marks` finds them. A
-    branch whose marks cannot be read keeps what it was last read as.
+    branch whose marks cannot be read keeps what it was last read as, and so
+    does every branch when the entries themselves cannot be listed. An entry
+    whose clone git could not read is said as that, never as one with no
+    clone.
   - GitHub: one `gh api graphql` search for the pull requests updated in the
     owners of the workflow home's entries, at most 2 calls. It reads from
     where the next digest begins, by GitHub's clock (2 hours earlier, for
     what is indexed late), at least a day back and at most a week. A digest
-    whose window starts earlier says `pull requests only since …`.
+    whose window starts earlier says `pull requests only since …`. A
+    digest's pull requests begin those 2 hours earlier too, without what the
+    last digest said of them, so one GitHub indexed late is said once.
   - vessa: `vessa usage --json --input <transcript>…` over the transcripts of
     the sessions that ended since then, found at leaving (`left.native`). It
     never reads every transcript.
@@ -484,7 +494,8 @@ here. It records only: nothing is sent to anyone, decided or refused.
   marked, a page of pull requests not asked for, vessa's partial usage, the
   fleet's failed scans), is said where the view is read, with how old what
   it holds is: `! marks  1 could not be read, as of 08:12 UTC: …`. `ohjaa
-  collect` and `ohjaa digest` then exit 4, as `ohjaa report` does.
+  collect` and `ohjaa digest` then exit 4, as `ohjaa report` does. The line
+  says each failure of a source once, and a different failure of it again.
 
 What stays until it is resolved comes first, in this order:
 
@@ -525,8 +536,11 @@ control replaced with U+FFFD before it reaches the terminal.
 **State**, in `$XDG_STATE_HOME/ohjaa/human/`:
 - `seen.json`, the cursor: when the person last saw the view, the keys of
   what they saw then (within the overlap), where the next digest begins and
-  where what the day's digest left out begins, and the day it was shown;
-- `seen.lock`, which the terminal saying the line holds with `flock(2)`;
+  where the earliest of what a day's digest left out begins (each with the
+  keys of what GitHub said in the 2 hours before it), and the day it was
+  shown;
+- `seen.lock`, which the terminal saying the line, and `ohjaa digest`
+  moving the cursor, hold with `flock(2)`;
 - `collected.json`, the snapshot: the marks and open sessions, GitHub's pull
   requests and vessa's usage, each with when it was read and what it could
   not read;
@@ -1724,7 +1738,11 @@ no window, no vessa.
   "schema": "ohjaa-marks.v1",
   "generated": "<RFC 3339>",
   "complete": true,                      // false: something could not be read
-  "entries": [{                          // every entry in the home
+  "unlisted": null | "<why>",            // why no entry could be listed (the workflow home
+                                         // cannot be found, or its entries cannot be read)
+  "entries": [{                          // every entry in the home; none, with complete
+                                         // false and unlisted saying why, when they cannot
+                                         // be listed
     "repo": "owner/name",
     "branch": "main", "ref": "origin/main",
     "tip": "<sha>" | null,               // where origin/main is here
@@ -1768,7 +1786,8 @@ no window, no vessa.
 
 The keys `ohjaa-marks.v1` had when viemäri was built on it (2026-10-13)
 never go; `integrated` (per entry and per commit) and, on 2026-10-26, the
-commits' `contract` were added since, so a
+commits' `contract` were added since, and on 2026-10-27 the top-level
+`unlisted`, so a
 reader of the earlier shape keeps working. `judgements` was added on
 2026-10-14 (#46) and removed with `ohjaa judge` on 2026-10-26: nothing ever
 read it and no Judgement was ever recorded, so the schema kept its name.

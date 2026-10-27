@@ -8341,10 +8341,13 @@ fn report_json_is_ohjaa_marks_v1_and_writes_nothing() {
             "proposals",
             "report",
             "schema",
-            "sessions"
+            "sessions",
+            "unlisted"
         ]
     );
     assert_eq!(json["entries"], serde_json::json!([]), "no entries here");
+    // No entries, and listed: none in the home, not none read.
+    assert_eq!(json["unlisted"], serde_json::Value::Null);
     assert_eq!(json["proposals"]["listed"], true);
     let waiting = &json["proposals"]["waiting"][0];
     assert_eq!(keys(waiting), ["name", "repo", "scope", "since", "title"]);
@@ -8963,11 +8966,21 @@ const AGENT_MARKERS: [&str; 17] = [
 /// ago and one opened then, in false-systems.
 /// With `extra`, that many more merged into sykli's main half an hour ago.
 fn graphql_page(more: bool, extra: u64) -> String {
+    graphql_page_at(unix_seconds(), more, extra)
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// [`graphql_page`], its times counted back from `now` (unix seconds): two
+/// answers from one base differ in what they hold, never in when a pull
+/// request happened, however long apart they are written.
+fn graphql_page_at(now: i64, more: bool, extra: u64) -> String {
     let at = |ago_s: i64| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
         let (days, s) = (
             (now - ago_s).div_euclid(86_400),
             (now - ago_s).rem_euclid(86_400),
@@ -9648,5 +9661,217 @@ fn terminals_opened_together_say_a_line_once() {
     drop(held);
     assert!(line().contains("1 session ended"));
     assert_eq!(line(), "");
+    fixture.cleanup();
+}
+
+// ---- the second review of #63 -------------------------------------------------
+
+/// Hold the flock(2) on `path` until the file is dropped.
+fn hold(path: &Path) -> fs::File {
+    use std::os::fd::AsRawFd;
+    let held = fs::File::create(path).unwrap();
+    // SAFETY: flock(2) on a descriptor this function owns.
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+    held
+}
+
+/// Finding 1: when the entries themselves cannot be listed, every branch
+/// stays as it was last read, said with that time, and nothing like an
+/// entry named `(entries)` takes their place.
+#[test]
+fn a_branch_stays_as_last_read_when_the_entries_cannot_be_listed() {
+    if !git_available() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("human-unlisted");
+    fixture.human_view(false);
+    let (stdout, stderr, code) = output_of(fixture.person().arg("collect"));
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let owner = fixture.dir.join("config/ohjaa/repos/false-systems");
+    fs::set_permissions(&owner, fs::Permissions::from_mode(0o000)).unwrap();
+    let unlisted = output_of(fixture.person().arg("collect"));
+    let marks = output_of(fixture.person().args(["report", "--json", "--marks"]));
+    fs::set_permissions(&owner, fs::Permissions::from_mode(0o755)).unwrap();
+    let (stdout, stderr, code) = unlisted;
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    // Review of #67, finding 3: `ohjaa-marks.v1` says why no entry is
+    // listed, in its own key.
+    let (stdout, stderr, code) = marks;
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        (&json["complete"], &json["entries"]),
+        (&serde_json::json!(false), &serde_json::json!([]))
+    );
+    assert!(
+        json["unlisted"]
+            .as_str()
+            .is_some_and(|why| why.starts_with("the entries cannot be listed: cannot read")),
+        "{stdout}"
+    );
+    let snapshot = fs::read_to_string(fixture.human_dir().join("collected.json")).unwrap();
+    assert!(!snapshot.contains("(entries)"), "{snapshot}");
+    let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(4), "{digest}");
+    let still_open = digest
+        .lines()
+        .find(|line| line.contains("! sykli"))
+        .unwrap_or_else(|| panic!("sykli dropped from what stays: {digest}"));
+    assert!(
+        still_open.contains("main: 1 unproven since") && still_open.contains("(unread since)"),
+        "{digest}"
+    );
+    fixture.cleanup();
+}
+
+/// The nit: a git that fails is no missing clone. The branch stays as it
+/// was last read (the first review's finding 2, at the CLI), and the reason
+/// says the clone could not be read.
+#[test]
+fn a_git_that_fails_is_said_as_that_never_as_a_missing_clone() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("human-git-fails");
+    fixture.human_view(false);
+    let (stdout, stderr, code) = output_of(fixture.person().arg("collect"));
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let broken = fixture.dir.join("broken-git");
+    fs::create_dir_all(&broken).unwrap();
+    let git = broken.join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\necho 'fatal: git is broken here' >&2\nexit 128\n",
+    )
+    .unwrap();
+    make_executable(&git);
+    let path = std::env::join_paths(
+        [broken, fixture.stub_dir.clone()]
+            .into_iter()
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let (stdout, stderr, code) = output_of(fixture.person().arg("collect").env("PATH", &path));
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    let snapshot = fs::read_to_string(fixture.human_dir().join("collected.json")).unwrap();
+    assert!(
+        !snapshot.contains("no clone under the roots has it as origin"),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot.contains("may have it as origin could not be read")
+            && snapshot.contains("git is broken here"),
+        "{snapshot}"
+    );
+    let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(4), "{digest}");
+    assert!(
+        digest.contains("main: 1 unproven since") && digest.contains("(unread since)"),
+        "{digest}"
+    );
+    fixture.cleanup();
+}
+
+/// Finding 2: what a day's digest left out stays until the person reads it
+/// in full: the next day's digest points to it, and `ohjaa digest` shows it.
+#[test]
+fn what_a_days_digest_left_out_is_kept_past_the_next_day() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("human-kept");
+    fixture.human_view_with(false, 20);
+    output_of(fixture.person().arg("collect"));
+    let day = |date: &str| on_a_terminal(fixture.person().arg("line").env("OHJAA_TODAY", date)).0;
+    let first = day("2026-10-27");
+    assert!(first.contains("more: ohjaa digest"), "{first}");
+    let next = day("2026-10-28");
+    assert!(next.starts_with("ohjaa · since "), "{next}");
+    assert!(
+        next.contains("what an earlier digest left out") && next.contains("ohjaa digest"),
+        "{next}"
+    );
+    let (digest, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
+    for number in [76, 100, 119] {
+        assert!(
+            digest.contains(&format!("#{number} merged by yairfalse")),
+            "#{number}: {digest}"
+        );
+    }
+    let (again, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
+    assert!(again.contains("Nothing new happened"), "{again}");
+    let after = day("2026-10-29");
+    assert!(!after.contains("left out"), "read in full: {after}");
+    fixture.cleanup();
+}
+
+/// Finding 3: a pull request GitHub indexes late, merged before the
+/// snapshot a digest was shown from, is in the next digest; what the last
+/// digest said already is not said again.
+#[test]
+fn a_pull_request_github_indexes_late_is_in_the_next_digest_once() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("human-late");
+    fixture.human_view(false);
+    // Both of GitHub's answers count back from one time: a pull request
+    // happened when it happened, whenever its answer is written.
+    let base = unix_seconds();
+    let page = |extra: u64| {
+        fs::write(
+            fixture.dir.join("graphql.json"),
+            graphql_page_at(base, false, extra),
+        )
+        .unwrap();
+    };
+    page(0);
+    // Review of #67, finding 2: a second or more between writing GitHub's
+    // answer and reading it moves no pull request across the overlap's edge.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    output_of(fixture.person().arg("collect"));
+    let (first, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
+    assert!(first.contains("#76 merged by yairfalse"), "{first}");
+    assert!(!first.contains("#100"), "{first}");
+    // #100 merged half an hour ago, before that snapshot, and is only now
+    // in GitHub's search.
+    page(1);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    output_of(fixture.person().arg("collect"));
+    assert_eq!(fixture.graphql_calls(), 2, "no call more for the overlap");
+    let (next, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
+    assert!(next.contains("#100 merged by yairfalse"), "{next}");
+    assert!(!next.contains("#76"), "said already: {next}");
+    assert!(!next.contains("#16"), "said already: {next}");
+    fixture.cleanup();
+}
+
+/// The nit: `digest` moves the cursor under the claim a terminal's line
+/// takes. One it cannot claim shows all the same and moves nothing, so
+/// nothing is said twice or lost.
+#[test]
+fn a_digest_moves_the_cursor_only_under_the_claim() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("human-digest-claim");
+    fixture.human_view(false);
+    output_of(fixture.person().arg("collect"));
+    let held = hold(&fixture.human_dir().join("seen.lock"));
+    let (said, code) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.contains("#76 merged by yairfalse"), "{said}");
+    assert!(
+        !fixture.human_dir().join("seen.json").exists(),
+        "moved without the claim"
+    );
+    drop(held);
+    let (said, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
+    assert!(
+        said.contains("#76 merged by yairfalse"),
+        "shown again: {said}"
+    );
+    assert!(fixture.human_dir().join("seen.json").is_file());
     fixture.cleanup();
 }

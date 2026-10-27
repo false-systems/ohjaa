@@ -2525,8 +2525,9 @@ pub struct Sykli {
     /// Where entries are looked up; `None` judges every repository by its
     /// own contract.
     home: Option<PathBuf>,
-    /// Each repository's gate, by its canonical path.
-    gates: std::cell::RefCell<HashMap<PathBuf, Option<Gate>>>,
+    /// Each repository's gate, by its canonical path, or why a clone that
+    /// may be an entry's could not say.
+    gates: std::cell::RefCell<HashMap<PathBuf, Result<Option<Gate>, crate::mark::Unasked>>>,
     /// What a gate said of a commit: (entry, commit) to the verdict.
     judged: std::cell::RefCell<HashMap<(PathBuf, String), Check>>,
     /// One `git cat-file --batch` per clone, by its common dir: every
@@ -2676,12 +2677,20 @@ impl Sykli {
     /// The gate an entry gives `repo`: one git process (its config) the
     /// first time it is asked, none when the home has no entries.
     pub fn gate_for(&self, repo: &Path) -> Option<Gate> {
-        let home = self.home.as_deref()?;
+        self.gate_asked(repo).ok().flatten()
+    }
+
+    /// [`Sykli::gate_for`], with why a clone that may be an entry's could
+    /// not say ([`crate::mark::gate_asked`]).
+    pub fn gate_asked(&self, repo: &Path) -> Result<Option<Gate>, crate::mark::Unasked> {
+        let Some(home) = self.home.as_deref() else {
+            return Ok(None);
+        };
         let key = canonical(repo);
         if let Some(known) = self.gates.borrow().get(&key) {
             return known.clone();
         }
-        let gate = crate::mark::gate_here(home, &key);
+        let gate = crate::mark::gate_asked(home, &key);
         self.gates.borrow_mut().insert(key, gate.clone());
         gate
     }
