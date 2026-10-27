@@ -1002,23 +1002,41 @@ above the file, so ohjaa cannot see that a file is in it: give such an
 agent's file no block by putting one of your own there.
 
 An agent launched through ohjaa is not given this knowledge twice. `ohjaa run
-<agent>` reads that one agent's own file (no git) and compares its block with
-the block apply would write now, byte for byte, never by a time. When the two
-are the same, the briefing leaves mine and machine out and says where they
-are, in one line:
+<agent>` reads that one agent's own file (no git), found where the agent
+itself finds it (`CLAUDE_CONFIG_DIR` and `CODEX_HOME` move it), and compares
+its block with the block apply would write now, byte for byte, never by a
+time. When the two are the same, the briefing leaves out what the block
+holds and says where it is, in one line, with the file's full path:
 
 ```
-Mine and machine (41 nodes) are not repeated here: Claude Code has them from its own instructions, ~/.claude/CLAUDE.md, whose ohjaa block is current.
+Mine and machine (41 nodes) are not repeated here: Claude Code has them from its own instructions, /Users/you/.claude/CLAUDE.md, whose ohjaa block is current.
 ```
 
-A flagged node is still repeated, with its flag, since the block carries no
-flags (`Flagged, so repeated above: <id>.`). When the file is missing, holds
-no block, holds a block apply did not write, holds a stale one or cannot be
-read, the briefing carries mine and machine as before, and its one line says
-why (`Mine and machine are carried here, not left to Codex's own
-instructions: ~/.codex/AGENTS.md does not exist.`). For any command but
-`claude`, `codex`, `pi` and `opencode` nothing is said. `ohjaa brief --agent
-<command>` prints the briefing that agent gets.
+A block over its own budget holds every decision and the rest by priority,
+as above. The nodes it names only by count are then carried by the briefing,
+within the briefing's budget, and the line says so (`Mine and machine:
+Claude Code has 41 of their 42 nodes from its own instructions, …, whose
+ohjaa block is current; the other 1 is above.`). A flagged node is still
+repeated, with its flag, since the block carries no flags (`Flagged, so
+repeated above: <id>.`).
+
+The briefing carries mine and machine, within its budget, and its one line
+says why (`Mine and machine are carried here, not left to Codex's own
+instructions: /Users/you/.codex/AGENTS.md does not exist.`), when:
+
+- the file is missing, holds no block, holds a block apply did not write, holds
+  a stale one, or cannot be read;
+- the agent will not read the file: Claude Code given `--bare` or
+  `--safe-mode` before its own `--`, or `CLAUDE_CODE_SIMPLE` or
+  `CLAUDE_CODE_SAFE_MODE` set truthy, reads no CLAUDE.md; given
+  `--setting-sources` without `user`, or an empty `CLAUDE_CONFIG_DIR`, it
+  does not read that one. Codex 0.164 has no option that skips its own
+  `AGENTS.md`.
+
+For any command but `claude`, `codex`, `pi` and `opencode` nothing is said.
+The line is part of the knowledge section, and counts toward its budget.
+`ohjaa brief --agent <command>` prints the briefing that agent gets; it
+knows the environment, not the arguments `ohjaa run … -- <args>` would pass.
 
 ## The fleet and the perimeter
 
