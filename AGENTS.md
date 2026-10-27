@@ -46,19 +46,20 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   the lock that lets one intake run at a time (`intake.lock`), the
   report's two times (`report-at`, `report-shown-at`), and the human view's
   folder (`human/`: `seen.json`, what the person last saw and when, the keys
-  of what was said in the last two hours and the day and time of the last
-  digest; `collected.json`, the snapshot `ohjaa collect` writes of what
-  `ohjaa line` cannot derive without git or the network, namely the marks and
-  open sessions, GitHub's pull requests, vessa's usage of the sessions ended
-  lately and the fleet, each with when it was read and why not; and
-  `collect.lock`, held by the one collect that runs). Deleting them loses no
-  knowledge: intake then reads its default window again, and sends once more
-  what is still in it, and the human view starts from the last day.
-  Everything else — fleet, perimeter, coverage, marks — is derived now and
-  stored never, but in the human view's snapshot: a copy that says how old it
-  is, read only by `ohjaa line` and `ohjaa digest`, never by a briefing, a
-  gate or a report. No knowledge index and no daemon; that snapshot is the
-  one cache.
+  of what was said in the last two hours, where the next digest begins and
+  where what the day's digest left out begins; `seen.lock`, held by the
+  terminal saying the line; `collected.json`, the snapshot `ohjaa collect`
+  writes of what `ohjaa line` cannot derive without git or the network,
+  namely the marks and open sessions, GitHub's pull requests and vessa's
+  usage of the sessions ended lately, each with when it was read and what it
+  could not read; and `collect.lock`, held by the one collect that runs).
+  Deleting them loses no knowledge: intake then reads its default window
+  again, and sends once more what is still in it, and the human view starts
+  from the last day. Everything else — fleet, perimeter, coverage, marks —
+  is derived now and stored never, but in the human view's snapshot: a copy
+  that is said with its age wherever it is shown, read only by `ohjaa line`
+  and `ohjaa digest`, never by a briefing, a gate or a report. No knowledge
+  index and no daemon; that snapshot is the one cache.
 - **The workflow lives in the home, outside every repository.**
   `~/.config/ohjaa` holds each repository's entry (`repos/<owner>/<repo>/`:
   `repo.toml`, the branch ohjaa observes and the env lines its gate gives
