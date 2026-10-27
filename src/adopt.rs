@@ -242,9 +242,8 @@ fn write_entry(
         }
         format!(
             "{rev} {commit} has no sykli.json: the gate of a commit with none of its own is \
-             derived from what sykli init writes for its tree (asked when it is needed, and \
-             kept by tree in ohjaa's state once a run is judged by it), so a file added is \
-             declared with no adopt"
+             derived from what sykli init writes for its tree, each time it is judged, and \
+             declares a file added with no adopt"
         )
     };
     // No copy is kept, and one an earlier adopt kept is dead.

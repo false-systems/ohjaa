@@ -728,13 +728,20 @@ impl Drop for Gates {
     }
 }
 
-/// A new folder under `$TMPDIR` that only this process writes in.
+/// A new folder under `$TMPDIR` that only this process writes in,
+/// `ohjaa-gates-<pid>-<n>`: the gates sykli reads now, and the scratch
+/// checkout of each tree sykli init is asked about. An ohjaa killed with
+/// one (a report, a hook or a gate keeps the default disposition) leaves it
+/// behind, so the first one a process makes first removes those
+/// ([`sweep_left`]).
 fn private_folder() -> Result<PathBuf, String> {
     static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static SWEPT: std::sync::Once = std::sync::Once::new();
     let tmp = std::env::temp_dir();
+    SWEPT.call_once(|| sweep_left(&tmp));
     for _ in 0..100 {
         let n = MADE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = tmp.join(format!("ohjaa-gates-{}-{n}", std::process::id()));
+        let dir = tmp.join(format!("{PRIVATE}{}-{n}", std::process::id()));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
@@ -748,6 +755,48 @@ fn private_folder() -> Result<PathBuf, String> {
         "cannot make a folder of its own in {}",
         tmp.display()
     ))
+}
+
+/// What a private folder's name starts with, before the pid of the ohjaa it
+/// belongs to.
+const PRIVATE: &str = "ohjaa-gates-";
+
+/// Remove from `tmp` the private folders of every ohjaa that is gone: named
+/// `ohjaa-gates-<pid>-<n>`, owned by this user, and whose pid kill(2) says
+/// no process has. One whose pid lives (the ohjaa itself, or a process that
+/// took its pid since) or that another user owns is left alone.
+fn sweep_left(tmp: &Path) {
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return;
+    };
+    // SAFETY: geteuid(2) cannot fail and touches no memory.
+    let me = unsafe { libc::geteuid() };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(PRIVATE))
+            .and_then(|rest| rest.split_once('-'))
+            .filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|(pid, _)| pid.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_dir() || std::os::unix::fs::MetadataExt::uid(&meta) != me {
+            continue;
+        }
+        // SAFETY: signal 0 sends nothing; kill(2) only says whether the pid
+        // exists.
+        let gone = unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Make `path` hold exactly `bytes` (no file for `None`), without a moment
