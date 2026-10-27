@@ -737,10 +737,8 @@ fn publish_opens_one_pull_request_then_moves_each_file_out_of_the_checkout() {
         ],
     );
     world.git(&world.checkout, &["pull", "-q", "--ff-only"]);
-    let mut brief = world.ohjaa(&world.checkout);
-    brief.args(["brief", "--knowledge-only"]);
-    let (briefing, stderr, code) = world.run(&mut brief);
-    assert_eq!(code, Some(0), "{stderr}");
+    // For an agent that reads AGENTS.md (Codex).
+    let briefing = world.brief(Some("codex"), &[]);
     assert!(!briefing.contains("Widget code is Rust."), "{briefing}");
     assert!(!briefing.contains("failing test"), "{briefing}");
     assert!(briefing.contains("AGENTS.md"), "{briefing}");
@@ -765,9 +763,7 @@ fn publish_opens_one_pull_request_then_moves_each_file_out_of_the_checkout() {
         .unwrap()
         .replace("Widget code is Rust.", "Widget code is anything.");
     fs::write(&agents, edited).unwrap();
-    let mut brief = world.ohjaa(&world.checkout);
-    brief.args(["brief", "--knowledge-only"]);
-    let (briefing, _, _) = world.run(&mut brief);
+    let briefing = world.brief(Some("codex"), &[]);
     assert!(briefing.contains("Widget code is Rust."), "{briefing}");
     assert!(
         briefing.contains("AGENTS.md holds another line of it"),

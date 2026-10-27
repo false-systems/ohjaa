@@ -691,6 +691,17 @@ impl Standing {
             .is_some_and(|lines| lines.iter().any(|held| held.text == line(node)))
     }
 
+    /// Where `node`'s line, as it is now, ends in AGENTS.md: the byte after
+    /// it, when the file holds it.
+    pub fn end_of(&self, node: &Node) -> Option<usize> {
+        let line = line(node);
+        self.in_file
+            .get(&node.id)?
+            .iter()
+            .find(|held| held.text == line)
+            .map(|held| held.end)
+    }
+
     /// What the briefing says beside a repo node it carries: why it is not
     /// left to AGENTS.md.
     pub fn note(&self, node: &Node) -> Option<String> {

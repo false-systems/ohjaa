@@ -25,6 +25,7 @@ mod lessons;
 mod lifecycle;
 mod mark;
 mod process;
+mod repo_docs;
 mod report;
 mod roots;
 mod scan;
@@ -796,11 +797,12 @@ struct Briefed {
 }
 
 /// The line that says the repository's AGENTS.md holds `count` of its
-/// lessons, so the briefing does not repeat them.
-fn lessons_line(count: usize, agents_md: &Path) -> String {
+/// lessons, and `agent` reads it (`how`), so the briefing does not repeat
+/// them.
+fn lessons_line(count: usize, agents_md: &Path, agent: &str, how: &str) -> String {
     format!(
-        "This repository's lessons ({count} node{}) are not repeated here: its AGENTS.md ({}) \
-         holds them, in its {} section.",
+        "This repository's lessons ({count} node{}) are not repeated here: {agent} reads its \
+         AGENTS.md ({}), which holds them in its {} section ({how}).",
         if count == 1 { "" } else { "s" },
         agents_md.display(),
         lessons::HEADING
@@ -864,12 +866,33 @@ fn knowledge_briefing_for(
         .contains(&Scope::Repo)
         .then(|| lessons::Standing::read(dirs, &loaded))
         .flatten();
+    let in_file: Vec<&fk::Located> = current
+        .iter()
+        .copied()
+        .filter(|located| {
+            located.scope == Scope::Repo
+                && standing
+                    .as_ref()
+                    .is_some_and(|standing| standing.in_agents_md(&located.node))
+        })
+        .collect();
+    // Whether the agent is shown to read that file: only then are they left
+    // to it (repo_docs). An agent not named, or not known to, gets them.
+    let reads = (in_agents_md && !in_file.is_empty())
+        .then(|| {
+            let root = dirs.repo_root.as_deref()?;
+            let launch = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
+            let end = in_file
+                .iter()
+                .filter_map(|located| standing.as_ref()?.end_of(&located.node))
+                .max()
+                .unwrap_or(0);
+            Some(repo_docs::reads(agent, root, &launch, end))
+        })
+        .flatten();
+    let left_to_file = matches!(reads, Some(repo_docs::Reads::Yes { .. }));
     let in_lessons = |located: &fk::Located| {
-        in_agents_md
-            && located.scope == Scope::Repo
-            && standing
-                .as_ref()
-                .is_some_and(|standing| standing.in_agents_md(&located.node))
+        left_to_file && in_file.iter().any(|held| std::ptr::eq(*held, located))
     };
     let shown: Vec<&fk::Located> = current
         .iter()
@@ -885,11 +908,17 @@ fn knowledge_briefing_for(
             Some((located.node.id.clone(), note))
         })
         .collect();
-    let in_file = current.iter().filter(|located| in_lessons(located)).count();
-    let lessons = standing
-        .as_ref()
-        .filter(|_| in_file > 0)
-        .map(|standing| lessons_line(in_file, &standing.agents_md));
+    let lessons = match (&reads, standing.as_ref()) {
+        (Some(repo_docs::Reads::Yes { agent, how }), Some(standing)) => {
+            Some(lessons_line(in_file.len(), &standing.agents_md, agent, how))
+        }
+        (Some(repo_docs::Reads::No { why }), _) => Some(format!(
+            "This repository's lessons are carried here, though its AGENTS.md holds {} of them: \
+             {why}.",
+            in_file.len()
+        )),
+        _ => None,
+    };
     // The lines are part of the section, so their room is kept first: as
     // long as the longest they can come to.
     let repeatable: Vec<&str> = shown
