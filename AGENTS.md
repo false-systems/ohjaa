@@ -131,13 +131,16 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   rejects it. Ours is reviewed in a pull request before any agent reads it.
   Repo knowledge a person accepts goes into the repository's AGENTS.md
   through a pull request ohjaa opens and the person merges; until its line is
-  on the checked-out commit, the briefing carries it, marked. What ohjaa
-  writes into a repository names no tool, and a repository that is not
-  private is sent nothing that names what is (this tool, the person's
-  private or internal repositories, home path, account, login or name): a
-  line that would is held back, anything else that would stops the delivery,
-  and no why is sent. A proposal never lands in a shared repository by
-  itself.
+  on the checked-out commit, the briefing carries it, marked, and after, it
+  leaves it to AGENTS.md only for an agent shown to read that file (`repo_docs`).
+  What ohjaa writes into a repository names no tool, and a repository that
+  is not private is sent nothing that names what is (this tool, the
+  person's private or internal repositories, those under their roots gh
+  does not show as public, home path, account, login or name; never on
+  gh's list alone, which must hold every repository under the roots): a
+  line that would is held back, anything else that would stops the
+  delivery, and no why is sent. A proposal never lands in a shared
+  repository by itself.
 - **Cross-repo yes, messaging no.** Permanently refused: request/response
   between agents, presence, and dispatch (assigning work to an agent).
   Knowledge is not a message — it carries its time, its why and whose it is. A

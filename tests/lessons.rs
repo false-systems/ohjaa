@@ -613,6 +613,15 @@ fn a_dry_run_says_what_it_would_write_and_changes_nothing() {
         assert!(stdout.contains(line), "the line it would add: {stdout}");
     }
     assert!(stdout.contains("would open a pull request"), "{stdout}");
+    // What each agent would get once it merges: no CLAUDE.md imports it here.
+    assert!(
+        stdout.contains("once merged, claude: carried in the briefing"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("once merged, Codex: left to AGENTS.md"),
+        "{stdout}"
+    );
     assert!(
         world.snapshot() == before,
         "a dry run writes nothing: no state, no file, no ref, no worktree"

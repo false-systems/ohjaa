@@ -276,20 +276,27 @@ fn imports_agents_md(
     launch: &Path,
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<PathBuf, String> {
-    let agents = std::fs::canonicalize(root.join("AGENTS.md"))
-        .map_err(|_| format!("{} has no AGENTS.md", root.display()))?;
+    // The root's AGENTS.md, named by its folder and its name: a CLAUDE.md
+    // may import it before the file exists (a dry run, before the merge).
+    let root_real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let is_agents_md = |path: &Path| {
+        path.file_name().is_some_and(|name| name == "AGENTS.md")
+            && path
+                .parent()
+                .and_then(|folder| std::fs::canonicalize(folder).ok())
+                .is_some_and(|folder| folder == root_real)
+    };
     let home = var("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from);
     let launch = std::fs::canonicalize(launch).unwrap_or_else(|_| launch.to_path_buf());
-    let root_real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut folders: Vec<PathBuf> = launch
         .ancestors()
         .take_while(|folder| folder.starts_with(&root_real))
         .map(Path::to_path_buf)
         .collect();
     if folders.is_empty() {
-        folders.push(root_real);
+        folders.push(root_real.clone());
     }
     let mut seen: Vec<String> = Vec::new();
     for folder in folders {
@@ -305,7 +312,7 @@ fn imports_agents_md(
                     (Some(rest), Some(home)) => home.join(rest),
                     _ => base.join(&path),
                 };
-                std::fs::canonicalize(resolved).is_ok_and(|real| real == agents)
+                is_agents_md(&resolved)
             });
             if names_it {
                 return Ok(file);

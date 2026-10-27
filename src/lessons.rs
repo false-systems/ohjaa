@@ -1781,6 +1781,35 @@ fn attempt(
     say_plan(&plan, &wanted.lines, said);
     let unchanged = plan.text == base;
     if dry_run {
+        // What an agent would get once this merges: the lessons left to the
+        // AGENTS.md it reads, or carried in its briefing, and why.
+        let after = lines_in(&plan.text);
+        let end = wanted
+            .lines
+            .iter()
+            .filter_map(|(id, line)| {
+                after
+                    .get(id)?
+                    .iter()
+                    .find(|held| held.text == *line)
+                    .map(|held| held.end)
+            })
+            .max();
+        if let Some(end) = end {
+            for command in ["claude", "codex"] {
+                said.push(
+                    match crate::repo_docs::reads(Some((command, &[][..])), checkout, checkout, end)
+                    {
+                        crate::repo_docs::Reads::Yes { agent, how } => {
+                            format!("once merged, {agent}: left to AGENTS.md ({how})")
+                        }
+                        crate::repo_docs::Reads::No { why } => {
+                            format!("once merged, {command}: carried in the briefing ({why})")
+                        }
+                    },
+                );
+            }
+        }
         said.push(match (&open, unchanged) {
             (_, true) => "nothing to write".to_owned(),
             (Some(pr), false) => format!("would add a commit to {} ({})", pr.url, pr.branch),

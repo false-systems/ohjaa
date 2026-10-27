@@ -1154,8 +1154,12 @@ it like any change. Nothing is written into your checkout:
   it up, and your `insteadOf` rules still apply. The origin names the
   repository; it must be on GitHub. One delivery at a time
   (`lessons/lessons.lock`), which first takes out what a delivery that did
-  not end (killed mid-push) left in `lessons/.work/`. `retire` and `confirm` of a node ohjaa holds
-  deliver the same way.
+  not end (killed mid-push) left in `lessons/.work/`. Before the push, the
+  commit must change AGENTS.md alone, and its blob be the text ohjaa wrote
+  and checked: a hook that changed either stops the delivery. A hook that
+  refuses is said in its own words. A decision lets the home's lock go
+  before it delivers, so nothing else waits on the repository's hooks.
+  `retire` and `confirm` of a node ohjaa holds deliver the same way.
 - **When it cannot be delivered** (no remote named origin, an origin not on
   GitHub, no gh, gh signed out, a fetch or push that fails), the decision
   stands: it is said, `delivery.json` keeps why, `ohjaa list` shows it under
@@ -1164,16 +1168,33 @@ it like any change. Nothing is written into your checkout:
 
 **A repository that is not private** (public, or internal) gets nothing
 that names what is. Everything it would be sent is checked first against a
-deny list built from your private context, asked of gh once a run: the names
-of every repository you can see that is not public (GitHub's REST
-`user/repos` as owner, collaborator and organisation member, every page,
-keeping the private and internal ones), your home path, your home folder's
-name, and your GitHub login and name; and always `ohjaa`, this tool's own
-name, whatever gh lists. Names match as words, letter case not told apart
-(Unicode's), a capital after a small letter starting a word (`SelkoClient`
-names `selko`); the home path and `ohjaa` match anywhere (`.ohjaa/`).
-What that repository's own URL says is no secret in it: its name, and its
-owner. A line that names
+deny list built from your private context, asked of gh once a run, and
+never from gh alone:
+
+- the names of every repository you can see that is not public (GitHub's
+  REST `user/repos` as owner, collaborator and organisation member, every
+  page, keeping the private and internal ones). A list that holds no
+  private repository sends nothing, and so does one that lacks a
+  repository under your roots that `gh repo view` does not show as public:
+  it is not complete (a fine-grained token, another account);
+- the name of every repository under your roots, as its folder and its
+  remote name it, that gh does not show as public (no GitHub remote, not
+  listed);
+- your home path, your home folder's name, and your GitHub login and name;
+- always `ohjaa`, this tool's own name, whatever gh lists.
+
+A line is read before it is matched: entities decoded, invisible
+characters (zero-width spaces, soft hyphens, joiners) taken out, fullwidth
+forms and the Latin letters with diacritics folded to ASCII (`viemäri`
+reads `viemari`), combining marks dropped, and, a second time, HTML comments
+and Markdown's `*`, `_`, `` ` ``, `~` taken out, so a split name joins
+(`hab<!-- -->itat`, `**hab**itat`). A name matches at the start of a word,
+whatever follows (`selkod`, `habitats`, `SelkoClient`), letter case not
+told apart; the home path and `ohjaa` match anywhere (`.ohjaa/`). A letter
+outside ASCII left after that (a Cyrillic а, a Greek ο), or an entity not
+read, holds the line too, since it could stand for a letter of a name. A
+false match only holds a line back, to be reworded. What that repository's
+own URL says is no secret in it: its name, and its owner. A line that names
 something on the list is held back and said, with what it named, and its
 text goes nowhere: at `accept`, the accept is refused and the proposal stays
 waiting; at `publish`, the node waits where it is. The rest of what would
@@ -1183,14 +1204,42 @@ too, and a match there stops the delivery whole. No why is ever sent to a
 repository that is not private.
 
 **The briefing** reads the launch repository's AGENTS.md as checked out
-(the file, no git). The nodes whose lines it holds, as they are now, are
-left to it, but a flagged one, and one line says so (a line of a node's id
-in other words, older or edited by hand, does not count, and the node is
-carried, marked `AGENTS.md holds another line of it`):
+(the file, no git; a line inside a fence or an HTML comment does not
+count). The nodes whose lines it holds, as they are now, are left to it,
+but a flagged one, **only for an agent shown to read that file**, and one
+line says so (a line of a node's id in other words, older or edited by
+hand, does not count, and the node is carried, marked `AGENTS.md holds
+another line of it`):
 
 ```
-This repository's lessons (14 nodes) are not repeated here: its AGENTS.md (/Users/you/projects/widget/AGENTS.md) holds them, in its ## Lessons section.
+This repository's lessons (14 nodes) are not repeated here: Codex reads its AGENTS.md (/Users/you/projects/widget/AGENTS.md), which holds them in its ## Lessons section (its lessons end within the 32768 bytes of project instructions Codex reads).
 ```
+
+Any other agent gets them carried, and the line says why:
+
+```
+This repository's lessons are carried here, though its AGENTS.md holds 14 of them: /Users/you/projects/widget/CLAUDE.md does not import AGENTS.md (an `.md` line), and Claude Code reads it then only where no CLAUDE.md is found.
+```
+
+| agent | left to AGENTS.md when | carried when |
+|---|---|---|
+| Claude Code 2.1.311 | a `CLAUDE.md`, `.claude/CLAUDE.md` or `CLAUDE.local.md` of the root, or of a folder between it and the launch folder, imports the root's AGENTS.md (`.md`, outside fences and code); or `pluginConfigs` of your or your organisation's settings set the built-in `cc-plugin-agents-md` plugin's `instructionFiles` to `claude-md-and-agents-md` | otherwise: no CLAUDE.md (its fallback reads AGENTS.md only where no CLAUDE.md is found at the root or above, and one above every checkout defeats it), a prose mention, `--bare`, `--safe-mode`, `CLAUDE_CODE_SIMPLE` or `CLAUDE_CODE_SAFE_MODE`, `--setting-sources` without `project`, `--settings`, `managed-only` |
+| Codex 0.164.0 | always, within its cap | an `AGENTS.override.md` at the root; the last lesson's line ending past `project_doc_max_bytes` (a `-c`, else `/config.toml`, else 32768) |
+| pi 1.2.0 | always | `-nc`, `--no-context-files`; an `AGENTS.override.md` at the root |
+| opencode 2.1.4 | always | `OPENCODE_DISABLE_PROJECT_CONFIG` or `OPENCODE_CONFIG_PROJECT_DISABLE` set; `--server` |
+| any other, or `brief` without `--agent` | never | always |
+
+The session log records a node as delivered through AGENTS.md only when it
+was left to it. A line the checked-out AGENTS.md still holds of a node
+retired or superseded, while its removal waits, is said, whatever the
+agent, and for a scoped repository too:
+
+```
+AGENTS.md still says `X`, but it was retired on 2026-10-28 (the widget is gone); its removal is pending in https://github.com/acme/widget/pull/41: do not follow it.
+```
+
+A copy of a node left untracked in the checkout beside the one ohjaa's
+state holds (a move cut short) is not read, and is said.
 
 Until a line is on the checked-out commit, the briefing carries the node,
 marked beside its id: `pending PR <url>`, `not delivered: <why>`, `held
