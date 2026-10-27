@@ -153,6 +153,11 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   and `PATH`: `apply` writes git's global config, `~/.zshrc` and the agents'
   own instruction files, and commits in the home. A person's decisions are
   tested at a real terminal (`tests/terminal.rs`), sandboxed the same way.
+- A test writes a file it will run (a stand-in, a hook, a copied binary)
+  only through its crate's `write_executable` (`process::write_executable`
+  in unit tests), never with `fs::write` or `fs::copy`: on Linux a sibling
+  test's forked child can hold the test process's write descriptor, and the
+  run fails with `Text file busy` (the README's "Tests").
 
 ## Validation
 

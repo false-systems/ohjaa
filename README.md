@@ -1891,6 +1891,14 @@ contract's; a run of the repository's own contract is still its own.
 agents, in a sandboxed home, never the person's own. With `cargo fmt --check`
 and `cargo clippy --all-targets -- -D warnings`, it is what CI runs.
 
+A test writes a stand-in, or any file it then runs, only through its
+crate's `write_executable` (`process::write_executable` in the unit tests),
+which has `cp` write it. Linux refuses to run a file any process holds open
+for writing (`Text file busy`), and a child another test thread forks
+holds a copy of every descriptor the test process has open until that child
+execs, so a file the test process wrote itself, closed and even renamed
+can still be open for writing in such a child at the moment it runs.
+
 Tests that need the real tools are ignored by default, since CI's runners
 have none of them:
 
