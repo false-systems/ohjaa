@@ -965,7 +965,7 @@ agent itself finds it, and creates none:
 | Claude Code | `$CLAUDE_CONFIG_DIR` (else `~/.claude`)`/CLAUDE.md` |
 | Codex | `$CODEX_HOME` (else `~/.codex`)`/AGENTS.override.md`, `AGENTS.md` |
 | pi | `$PI_CODING_AGENT_DIR` (else `~/.pi/agent`)`/AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md` |
-| opencode | `$XDG_CONFIG_HOME` (else `~/.config`)`/opencode/AGENTS.md` |
+| opencode | `$OPENCODE_CONFIG_DIR` (else `$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`)`/AGENTS.md` |
 
 An agent that is set up but has no such file is said so (create the file,
 even empty, and apply again), and a file inside a git repository gets no
@@ -1003,10 +1003,11 @@ agent's file no block by putting one of your own there.
 
 An agent launched through ohjaa is not given this knowledge twice. `ohjaa run
 <agent>` reads that one agent's own file (no git), found where the agent
-itself finds it (`CLAUDE_CONFIG_DIR` and `CODEX_HOME` move it), and compares
-its block with the block apply would write now, byte for byte, never by a
-time. When the two are the same, the briefing leaves out what the block
-holds and says where it is, in one line, with the file's full path:
+itself finds it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR`
+and `OPENCODE_CONFIG_DIR` move it), and compares its block with the block
+apply would write now, byte for byte, never by a time. When the two are the
+same, the briefing leaves out what the block holds and says where it is, in
+one line, with the file's full path:
 
 ```
 Mine and machine (41 nodes) are not repeated here: Claude Code has them from its own instructions, /Users/you/.claude/CLAUDE.md, whose ohjaa block is current.
@@ -1026,12 +1027,21 @@ instructions: /Users/you/.codex/AGENTS.md does not exist.`), when:
 
 - the file is missing, holds no block, holds a block apply did not write, holds
   a stale one, or cannot be read;
-- the agent will not read the file: Claude Code given `--bare` or
-  `--safe-mode` before its own `--`, or `CLAUDE_CODE_SIMPLE` or
-  `CLAUDE_CODE_SAFE_MODE` set truthy, reads no CLAUDE.md; given
-  `--setting-sources` without `user`, or an empty `CLAUDE_CONFIG_DIR`, it
-  does not read that one. Codex 0.164 has no option that skips its own
-  `AGENTS.md`.
+- the agent will not read the file, by its own options (before its own `--`)
+  or variables:
+  - Claude Code 2.1.311 given `--bare` or `--safe-mode`, or with
+    `CLAUDE_CODE_SIMPLE` or `CLAUDE_CODE_SAFE_MODE` set truthy, reads no
+    CLAUDE.md; given `--setting-sources` without `user`, or an empty
+    `CLAUDE_CONFIG_DIR`, it does not read that one;
+  - pi 1.2.0 given `--no-context-files` or `-nc` reads no AGENTS.md or
+    CLAUDE.md;
+  - opencode 2.1.4 given `--server <url>` leaves its instructions to that
+    server;
+  - Codex 0.164.0 has no option that skips its own `AGENTS.md`;
+- the folder the file is in is not an absolute path (a relative
+  `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR` or
+  `OPENCODE_CONFIG_DIR`): the agent resolves it where it starts, so which file
+  it reads cannot be told.
 
 For any command but `claude`, `codex`, `pi` and `opencode` nothing is said.
 The line is part of the knowledge section, and counts toward its budget.
