@@ -1902,7 +1902,7 @@ fn deliver_decided(
 
 fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     knowledge::require_person(action)?;
-    let _lock = decision_lock();
+    let lock = decision_lock();
     let dirs = dirs()?;
     let today = knowledge::today();
     let mut asker = lessons::Asker::default();
@@ -1922,7 +1922,7 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     };
     println!("{done} {id}");
     report(&outcome);
-    after_decision(action, id, &outcome, why);
+    after_decision(action, id, &outcome, why, lock.as_ref());
     if action != "reject" {
         deliver_decided(&dirs, &outcome, ready, &mut asker, today);
     }
@@ -1931,14 +1931,21 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
 
 /// What follows a person's decision, neither ever undoing it nor failing it:
 /// a decision on the home's own knowledge (mine, machine) is one commit in
-/// the home's history, and the agents' own instruction files get their
-/// knowledge block rewritten where it is.
-fn after_decision(action: &str, id: &str, outcome: &Outcome, why: Option<&str>) {
+/// the home's history, under the home's `lock` the decision holds, and the
+/// agents' own instruction files get their knowledge block rewritten where
+/// it is.
+fn after_decision(
+    action: &str,
+    id: &str,
+    outcome: &Outcome,
+    why: Option<&str>,
+    lock: Option<&process::FileLock>,
+) {
     if outcome.in_the_home() {
         let message = knowledge::decision_message(action, id, outcome, why);
         let subject = message.lines().next().unwrap_or_default();
         match home::ohjaa_home().map(home::absolute).and_then(|home| {
-            home::commit(&home, &message)?;
+            home::commit(&home, &message, lock)?;
             Ok(home)
         }) {
             Ok(home) => println!("  committed in {}: {subject}", home.display()),
@@ -2045,7 +2052,7 @@ fn cmd_review(list: bool) -> Result<i32> {
         let answer = lines.next().transpose()?.unwrap_or_default();
         let id = &pending.node.id;
         // Held for the decision, never while the person thinks.
-        let _lock = matches!(answer.trim(), "a" | "accept" | "r" | "reject")
+        let lock = matches!(answer.trim(), "a" | "accept" | "r" | "reject")
             .then(decision_lock)
             .flatten();
         let mut ready = None;
@@ -2061,7 +2068,7 @@ fn cmd_review(list: bool) -> Result<i32> {
         match result {
             Ok(Some((action, outcome))) => {
                 report(&outcome);
-                after_decision(action, id, &outcome, None);
+                after_decision(action, id, &outcome, None, lock.as_ref());
                 if action == "accept" {
                     deliver_decided(&dirs, &outcome, ready.take(), &mut asker, today);
                 }
@@ -3181,7 +3188,11 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
     let orphaned_here: Vec<sessions::Session> = orphans.into_iter().filter(|s| here(s)).collect();
     let still_running_here: Vec<sessions::Session> =
         still_running.into_iter().filter(|s| here(s)).collect();
-    let started_ms = intake::now_seconds() * 1000;
+    // The launch's own instant, and its second: the session's id and its time
+    // windows are whole seconds; only the agent's own records are compared
+    // with the instant (`usage::Launch`).
+    let launched_ms = intake::now_ms();
+    let started_ms = launched_ms.div_euclid(1000) * 1000;
     let session_id = sessions::new_id(started_ms);
     let mut delivered = Vec::new();
     // What sykli says of the observed branch's tip (the integrated State)
@@ -3375,6 +3386,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
         pgid: None,
         group_started_ms: None,
         started_ms,
+        launched_ms: Some(launched_ms),
         branch: in_repo.then(|| lifecycle::branch(&root)).flatten(),
         head_at_start: in_repo.then(|| lifecycle::head(&root)).flatten(),
         scoped: scoped_repos
@@ -3529,6 +3541,7 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
                 agent,
                 folder: &folder,
                 started_ms,
+                launched_ms,
                 // To the end of this second: times here are whole seconds.
                 last_seen_ms: (intake::now_seconds() + 1) * 1000,
                 unbriefed: briefing.is_none(),
@@ -3859,6 +3872,7 @@ fn close_orphans(dirs: &Dirs, write: bool) -> (Vec<sessions::Session>, Vec<sessi
                     agent: &session.agent,
                     folder: Path::new(&session.repo),
                     started_ms: session.started_ms,
+                    launched_ms: session.launch_instant_ms(),
                     // Not now: a fork made after it was last seen is not its.
                     last_seen_ms: session.last_seen_ms(),
                     unbriefed: false,

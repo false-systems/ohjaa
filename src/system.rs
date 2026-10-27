@@ -67,7 +67,7 @@ fn parse_context(repo: &Path, stdout: &str) -> Option<Tool> {
     Some(Tool {
         path: repo.to_path_buf(),
         name: repo_section.name,
-        role: Some(repo_section.role).filter(|role| !role.is_empty()),
+        role: repo_section.role.filter(|role| !role.is_empty()),
         not: repo_section.not_roles,
     })
 }
@@ -80,8 +80,9 @@ struct ContextPayload {
 #[derive(Debug, Deserialize)]
 struct RepoSection {
     name: String,
+    /// toimija writes `null` for a repo.yaml that declares no role.
     #[serde(default)]
-    role: String,
+    role: Option<String>,
     #[serde(default)]
     not_roles: Vec<String>,
 }
@@ -350,6 +351,34 @@ mod tests {
         // all — both fall back to an unknown role in `Tool::derive`.
         assert!(parse_context(Path::new("/fleet/x"), "{}").is_none());
         assert!(parse_context(Path::new("/fleet/x"), "not json").is_none());
+    }
+
+    /// toimija writes `"role": null` for a repo.yaml that declares no role
+    /// (its `RepoInfo.role` is an `Option`): the repo keeps its name and what
+    /// it is not, and only its role is unknown. This is toimija's own output,
+    /// byte for byte, for `name: teko` and `not: [inbox]`.
+    #[test]
+    fn a_repo_that_declares_no_role_keeps_its_name_and_what_it_is_not() {
+        const NO_ROLE: &str = r#"{
+  "schema": "toimija-identity.v1",
+  "repo": {
+    "name": "teko",
+    "role": null,
+    "not_roles": [
+      "inbox"
+    ],
+    "important_docs": [
+      "README.md"
+    ],
+    "boundaries": []
+  }
+}
+"#;
+        let tool = parse_context(Path::new("/fleet/teko-checkout"), NO_ROLE)
+            .expect("an identity with no role is still an identity");
+        assert_eq!(tool.name, "teko");
+        assert_eq!(tool.role, None);
+        assert_eq!(tool.not, vec!["inbox".to_string()]);
     }
 
     #[test]

@@ -428,13 +428,33 @@ fn roots_text(roots: &[PathBuf]) -> String {
     text
 }
 
+/// The home's lock for one apply: taken once, when apply first changes the
+/// home (flock would block on a second take in the same process).
+#[derive(Default)]
+struct HomeLock {
+    tried: bool,
+    held: Option<crate::process::FileLock>,
+}
+
+impl HomeLock {
+    fn take(&mut self, home: &Path) {
+        if !std::mem::replace(&mut self.tried, true) {
+            self.held = home::lock(home);
+        }
+    }
+}
+
 /// Read git's global config once; when an unreadable generated file breaks
 /// that (every git command fails then, apply's own among them), remove what
-/// git cannot read and read again: apply writes it anew below.
-fn global_facts(home: &Path, repair: bool) -> Result<gitconfig::GlobalFacts> {
+/// git cannot read and read again: apply writes it anew below. The removal
+/// changes the home, so it is made under the home's lock (`lock`), taken
+/// here before any refusal: that home exists already, since a file apply
+/// generated is in it.
+fn global_facts(home: &Path, repair: bool, lock: &mut HomeLock) -> Result<gitconfig::GlobalFacts> {
     match gitconfig::GlobalFacts::read() {
         Ok(facts) => Ok(facts),
         Err(error) if repair => {
+            lock.take(home);
             let mut generated = vec![gitconfig::include_file(home)];
             generated.extend(
                 gitconfig::entry_names(home)?
@@ -488,7 +508,8 @@ pub fn apply(
         return Ok(2);
     }
     let version = gitconfig::require_git()?;
-    let global = global_facts(&home, !options.dry_run)?;
+    let mut lock = HomeLock::default();
+    let global = global_facts(&home, !options.dry_run, &mut lock)?;
     let mut steps: Vec<Step> = Vec::new();
 
     let ohjaa = match chosen_ohjaa(options.bin) {
@@ -567,8 +588,11 @@ pub fn apply(
     }
     // Past every refusal: what apply plans, makes and commits is one change
     // to the home, never interleaved with a decision's or an adopt's. A dry
-    // run writes nothing, the lock's file included.
-    let _lock = (!options.dry_run).then(|| home::lock(&home)).flatten();
+    // run writes nothing, the lock's file included. (A repair above took
+    // the lock already.)
+    if !options.dry_run {
+        lock.take(&home);
+    }
     if !configured {
         if repos.is_empty() {
             eprintln!(
@@ -742,7 +766,7 @@ pub fn apply(
 
     // Each agent's file apply could not write: the rest is applied, but
     // apply is not done while one stays unwritten, and every run says so.
-    let (instruction, not_written) = instruction_steps()?;
+    let (instruction, not_written) = instruction_steps(&read_record(&home)?)?;
     steps.extend(instruction);
     let except = (!not_written.is_empty()).then(|| {
         format!(
@@ -810,10 +834,10 @@ pub fn apply(
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        home::commit_and_say(&home, &message, "ohjaa apply");
+        home::commit_and_say(&home, &message, "ohjaa apply", lock.held.as_ref());
         println!("ohjaa apply: {except}");
     } else {
-        home::commit_and_say(&home, &message, "ohjaa apply");
+        home::commit_and_say(&home, &message, "ohjaa apply", lock.held.as_ref());
     }
     Ok(code)
 }
@@ -828,12 +852,68 @@ fn history_message(what: &str, done: &[String]) -> String {
     )
 }
 
+/// The record's slots for the agent `key`'s files, in the order they were
+/// recorded: `instructions_<key>` for the first file apply wrote a block
+/// into, then `instructions_<key>_2`, `_3`, … for each other one (the agent's
+/// folder moved by its variable between applies). Each slot keeps its own
+/// `_blank` and `_newline`.
+fn instruction_slots(record: &Record, key: &str) -> Vec<(String, PathBuf)> {
+    let first = format!("instructions_{key}");
+    let mut slots: Vec<(u32, String, PathBuf)> = record
+        .iter()
+        .filter_map(|(slot, file)| {
+            let n = if *slot == first {
+                1
+            } else {
+                let n = slot.strip_prefix(&first)?.strip_prefix('_')?;
+                if !n.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                n.parse().ok()?
+            };
+            Some((n, slot.clone(), PathBuf::from(file)))
+        })
+        .collect();
+    slots.sort();
+    slots
+        .into_iter()
+        .map(|(_, slot, file)| (slot, file))
+        .collect()
+}
+
+/// The slot that records `file` for the agent `key`: the one that already
+/// names it, by whatever name (a link to its folder, or the folder a
+/// variable names: [`home::same_path`]), else the next free one.
+fn instruction_slot(record: &Record, key: &str, file: &Path) -> String {
+    let slots = instruction_slots(record, key);
+    if let Some((slot, _)) = slots
+        .iter()
+        .find(|(_, recorded)| home::same_path(recorded, file))
+    {
+        return slot.clone();
+    }
+    let first = format!("instructions_{key}");
+    (1..)
+        .map(|n| {
+            if n == 1 {
+                first.clone()
+            } else {
+                format!("{first}_{n}")
+            }
+        })
+        .find(|slot| !record.contains_key(slot))
+        .unwrap_or(first)
+}
+
 /// The knowledge block in each agent's own instruction file: added, or
 /// rewritten where it is, in each file that exists outside every repository.
 /// Where an agent is set up but has no such file, or its file is inside a
 /// repository, that is said, and nothing is written. Also each file apply
 /// should write and cannot (`<file> (<agent>'s own instructions: <why>)`).
-fn instruction_steps() -> Result<(Vec<Step>, Vec<String>)> {
+/// Every file a block is written into is recorded, each in a slot of its own
+/// ([`instruction_slots`]), so undo takes each back wherever the agent's
+/// folder is when it runs.
+fn instruction_steps(record: &Record) -> Result<(Vec<Step>, Vec<String>)> {
     let (compact, broken) = crate::instructions::home_knowledge()?;
     for broken in &broken {
         eprintln!(
@@ -918,14 +998,11 @@ fn instruction_steps() -> Result<(Vec<Step>, Vec<String>)> {
             crate::knowledge::Held::Applied => (("rewrite", "rewrote"), "in"),
             crate::knowledge::Held::None => (("write", "wrote"), "into"),
         };
-        let key = target.key;
+        let slot = instruction_slot(record, target.key, &file);
         let record = vec![
-            (
-                format!("instructions_{key}"),
-                file.to_string_lossy().into_owned(),
-            ),
-            (format!("instructions_{key}_blank"), flag(placed.blank)),
-            (format!("instructions_{key}_newline"), flag(placed.newline)),
+            (slot.clone(), file.to_string_lossy().into_owned()),
+            (format!("{slot}_blank"), flag(placed.blank)),
+            (format!("{slot}_newline"), flag(placed.newline)),
         ];
         let said = format!(
             "the knowledge block ({}) {what} {}, {}'s own instructions",
@@ -953,7 +1030,7 @@ fn as_it_was(text: String, newline: bool) -> String {
 /// what it generated. `repos/` entries and `roots` stay.
 pub fn undo(dry_run: bool) -> Result<i32> {
     let home = std::path::absolute(home::ohjaa_home()?)?;
-    let _lock = (!dry_run).then(|| home::lock(&home)).flatten();
+    let lock = (!dry_run).then(|| home::lock(&home)).flatten();
     let record = read_record(&home)?;
     let recorded = |key: &str| record.get(key).cloned();
     let yes = |key: &str| record.get(key).is_some_and(|value| value == "true");
@@ -1046,26 +1123,30 @@ pub fn undo(dry_run: bool) -> Result<i32> {
         ));
     }
 
-    // The knowledge block apply wrote, from each agent's own file: the one
-    // it wrote into (recorded), and the one the agent reads now. A block apply
-    // did not write is the person's, and stays. The recorded file, unreadable
-    // as a whole, refuses undo, as any change it cannot take back exactly; any
-    // other is said and skipped.
+    // The knowledge block apply wrote, from each agent's own file: each one
+    // it wrote into (recorded, wherever the agent's folder was then), and the
+    // one the agent reads now. A block apply did not write is the person's,
+    // and stays. A recorded file, unreadable as a whole, refuses undo, as any
+    // change it cannot take back exactly; any other is said and skipped.
     let mut files: Vec<(PathBuf, crate::knowledge::Placed, bool)> = Vec::new();
     for target in crate::instructions::targets() {
-        let key = target.key;
-        let placed = crate::knowledge::Placed {
-            blank: yes(&format!("instructions_{key}_blank")),
-            newline: newline(&format!("instructions_{key}_newline")),
+        // One file is taken back once, by the first name it was recorded
+        // under (a record from before slots were matched by the file itself
+        // may name it twice).
+        let known = |files: &[(PathBuf, crate::knowledge::Placed, bool)], file: &Path| {
+            files.iter().any(|(known, ..)| home::same_path(known, file))
         };
-        let recorded_file = recorded(&format!("instructions_{key}")).map(PathBuf::from);
-        if let Some(file) = &recorded_file {
-            files.push((file.clone(), placed, true));
+        for (slot, file) in instruction_slots(&record, target.key) {
+            if known(&files, &file) {
+                continue;
+            }
+            let placed = crate::knowledge::Placed {
+                blank: yes(&format!("{slot}_blank")),
+                newline: newline(&format!("{slot}_newline")),
+            };
+            files.push((file, placed, true));
         }
-        if let Some(file) = target
-            .file
-            .filter(|file| Some(file) != recorded_file.as_ref())
-        {
+        if let Some(file) = target.file.filter(|file| !known(&files, file)) {
             files.push((file, crate::knowledge::Placed::IN_PLACE, false));
         }
     }
@@ -1184,6 +1265,7 @@ pub fn undo(dry_run: bool) -> Result<i32> {
             &home,
             &history_message("apply --undo", &done),
             "ohjaa apply --undo",
+            lock.as_ref(),
         );
     }
     Ok(0)

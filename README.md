@@ -122,6 +122,17 @@ nodes; older records without that identity still read.
   - One change at a time: each decision (its write, its commit and the
     agents' block below), apply and adopt holds the home's lock
     (`.git/ohjaa.lock`), so decisions made at once are a commit each, in turn.
+    The home's git holds it too, for as long as it runs (the lock is its
+    stdin): an ohjaa killed while it commits leaves its git to finish (it
+    runs in a process group of its own), and the next change waits for that
+    git, not only for the ohjaa. Nothing that git could start beside itself
+    is left running to hold the lock after it: the home's git runs no hook
+    (`core.hooksPath=/dev/null`, `hook.<event>.enabled=false` where git has
+    it, and the home is made with no template), no fsmonitor
+    (`core.fsmonitor=false`), no automatic gc or maintenance, and no
+    signing. A hook git's config defines by name (`hook.<name>.command`)
+    still runs under git 2.54, which has no switch for all of them, but git
+    gives it /dev/null for its stdin, so nothing it leaves holds the lock.
   - Only what ohjaa keeps there is committed: `mine/`, `machine/`, `repos/`,
     `git/`, `roots`, `applied.toml`, `ours` and `drafter`, by an allowlist in
     the repository's own `.git/info/exclude` (the home holds no `.gitignore`).
@@ -904,7 +915,11 @@ output or a paste. Time and folder alone name nothing.
   named, with `resumed: true`, when its launch prompt naming this session
   was said within a minute of the launch. A message into an older session
   later resumes nothing. Every session a native session ran in names it, so
-  its usage must not be added once per session.
+  its usage must not be added once per session. "Before the launch" is the
+  launch's own instant, to the millisecond (`launched_ms` in the record), as
+  the agents time their records: a session begun at 12:00:00.300 and resumed
+  at 12:00:00.900 is resumed, though both fall in the launch's second, the
+  one the session's id and its time windows are built on.
 - A fork is named, with `forked_from`, when its parent is named for this
   session and it began before the session was last seen. That is now at
   leaving, and at an orphan close the latest time the orphan's record
@@ -940,7 +955,8 @@ and for a session still open what its environment claimed so far.
 `usage export` emits `ohjaa-sessions.v1`, with `sessions` and `unreadable`.
 Each session is its record as the log holds it; what later versions added is
 additive and absent from older records: `intent_id` and `task`, `pgid` and
-`group_started_ms` (the session's process group), `native_env` and `left.native` (the agent's own sessions, above), `validations` (see
+`group_started_ms` (the session's process group), `launched_ms` (the launch's
+own instant; `started_ms` is its second), `native_env` and `left.native` (the agent's own sessions, above), `validations` (see
 `ohjaa gate`, and the integrated validations of "The integrated State",
 with `not_dispatched`), and a delivered node's `via`: the agent's own
 instruction file that held it at launch, so the briefing left it out (see
@@ -1009,7 +1025,10 @@ then the rest by count, ``30 more: `ohjaa list` ``, and apply says so.
 After each decision the block is rewritten wherever it is (moved, or
 between your own lines), and only where it is: a block you take out stays
 out until the next apply. `apply --undo` takes it out and puts back exactly
-what was there, a final newline that was missing included. It is the same kind
+what was there, a final newline that was missing included. Every file apply
+writes a block into is recorded, so undo takes back each, also one written
+while a variable (`CLAUDE_CONFIG_DIR`, `OPENCODE_CONFIG_DIR`, …) moved the
+agent's folder, whatever the variables say when undo runs. It is the same kind
 of block `brief --write` writes, so a file holds one; a block apply did not
 write (`brief --write`'s, or one you wrote) is yours: apply, each decision and
 undo leave it as it is and say so. An agent's file apply cannot read as a
@@ -1018,7 +1037,17 @@ rest is applied, but apply is not done: it ends with `applied, except 1
 agent file not written: <file> (<why>)` and exits 4, its commit names the
 file, and every later apply and dry run, and `ohjaa doctor`, say so again
 until you fix the file by hand. A home whose `.git` is a file (a worktree)
-keeps the lock and the allowlist in the folders that file names. A bare
+keeps the lock in the folder that file names. A linked worktree keeps the
+allowlist there too, as `ohjaa.exclude`, which the home's `git add` is given
+as its excludes file: git reads the common folder's `info/exclude` for every
+worktree of the repository, and the allowlist begins by leaving out
+everything, which would hide the other worktrees' new files. That file
+takes the global excludes file's place for that one command, so it holds
+your own excludes file's lines (`core.excludesFile`, else
+`~/.config/git/ignore`), read for each commit, and then the allowlist: the
+allowlist decides wherever it matches, and your patterns (a merge tool's
+`*.orig`) everywhere else, as they do below `info/exclude` in a plain home.
+The repository's shared `info/exclude` is still read above both. A bare
 dotfiles repository (`git --git-dir=~/.dotfiles --work-tree=~`) has no `.git`
 above the file, so ohjaa cannot see that a file is in it: give such an
 agent's file no block by putting one of your own there.
@@ -1058,7 +1087,10 @@ instructions: /Users/you/.codex/AGENTS.md does not exist.`), when:
   - pi 1.2.0 given `--no-context-files` or `-nc` reads no AGENTS.md or
     CLAUDE.md;
   - opencode 2.1.4 given `--server <url>` leaves its instructions to that
-    server;
+    server; without `--standalone` it leaves them to its background
+    service, which reads them with the environment it was started with, so
+    when `OPENCODE_CONFIG_DIR` or `XDG_CONFIG_HOME` is set (they move the
+    file) the service may read another file than the one ohjaa checked;
   - Codex 0.164.0 has no option that skips its own `AGENTS.md`;
 - the folder the file is in is not an absolute path (a relative
   `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR` or
@@ -2010,6 +2042,14 @@ and `cargo clippy --all-targets -- -D warnings`, it is what CI runs.
 remote: git's `insteadOf` turns the GitHub URL the checkout names into it,
 and `GIT_ALLOW_PROTOCOL=file` keeps git off the network should that fail; a
 person's accept and retire run on a pty of their own.
+
+A test writes a stand-in, or any file it then runs, only through its
+crate's `write_executable` (`process::write_executable` in the unit tests),
+which has `cp` write it. Linux refuses to run a file any process holds open
+for writing (`Text file busy`), and a child another test thread forks
+holds a copy of every descriptor the test process has open until that child
+execs, so a file the test process wrote itself, closed and even renamed
+can still be open for writing in such a child at the moment it runs.
 
 Tests that need the real tools are ignored by default, since CI's runners
 have none of them:

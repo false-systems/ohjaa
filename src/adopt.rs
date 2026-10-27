@@ -119,7 +119,7 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
         return Ok(REFUSED);
     }
     // What adopt writes and commits is one change to the home.
-    let _lock = home::lock(&home);
+    let lock = home::lock(&home);
     // The env a derived gate gives cargo tasks: KATANA D10's lines, only
     // when every sykli that runs the gate expands `${worktree_cache}`.
     let expands = sykli_expands_worktree_cache(&home);
@@ -169,7 +169,7 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
         id.slug(),
         regenerated.join("\n")
     );
-    home::commit_and_say(&home, message.trim_end(), "ohjaa adopt");
+    home::commit_and_say(&home, message.trim_end(), "ohjaa adopt", lock.as_ref());
     match gitconfig::gated_clone(&home, &top)? {
         Some(clone) => {
             let drift = gitconfig::clone_drift(&home, &clone);
@@ -1219,15 +1219,12 @@ echo "target=${{target:-no}} build=${{build:-no}}" >> '{}'
     /// command's own setting.)
     #[test]
     fn what_adopt_counts_as_said_holds_under_sh() {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = std::env::temp_dir().join(format!("ohjaa-under-sh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (bin, work, log) = (dir.join("bin"), dir.join("work"), dir.join("cargo-log"));
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(work.join("sub")).unwrap();
-        std::fs::write(bin.join("cargo"), fake_cargo(&log)).unwrap();
-        std::fs::set_permissions(bin.join("cargo"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        crate::process::write_executable(&bin.join("cargo"), &fake_cargo(&log));
         let runs = REVIEW_48
             .iter()
             .map(|(_, _, run, _)| *run)

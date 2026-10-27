@@ -387,6 +387,17 @@ pub fn lock(home: &Path) -> Option<process::FileLock> {
     match taken {
         Ok(lock) => Some(lock),
         Err(why) => {
+            // Its holder is another ohjaa, or the git that one runs here.
+            let why = if why.contains("held by another") {
+                format!(
+                    "{} is still held after {}s, by another ohjaa's change to the home (that \
+                     ohjaa, or the git it runs there)",
+                    path.display(),
+                    LOCK_WAIT.as_secs()
+                )
+            } else {
+                why
+            };
             eprintln!(
                 "ohjaa: warning: {why}; going on without the home's lock, so this change may \
                  share a commit with another"
@@ -422,30 +433,109 @@ const EXCLUDE: &[&str] = &[
     ".DS_Store",
 ];
 
-/// The allowlist in the home's repository's own `info/exclude` (git keeps
-/// it untracked, so the home needs no file of its own), as a marked block
-/// beside anything else there; in the common folder a `.git` file names.
-fn keep_out_strays(home: &Path) -> Result<()> {
-    let path = repository_dirs(home).1.join("info").join("exclude");
-    let now = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
-    };
-    let block = format!("{EXCLUDE_BEGIN}\n{}\n{EXCLUDE_END}\n", EXCLUDE.join("\n"));
-    let new = match (now.find(EXCLUDE_BEGIN), now.find(EXCLUDE_END)) {
+fn read_or_empty(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+/// `now` with the allowlist's marked block taken out (and the newline after
+/// it), and where it was; `None` when there is none.
+fn without_allowlist(now: &str) -> Option<(String, usize)> {
+    match (now.find(EXCLUDE_BEGIN), now.find(EXCLUDE_END)) {
         (Some(start), Some(end)) if end > start => {
             let after = &now[end + EXCLUDE_END.len()..];
             let after = after.strip_prefix('\n').unwrap_or(after);
-            format!("{}{block}{after}", &now[..start])
+            Some((format!("{}{after}", &now[..start]), start))
         }
-        _ if now.is_empty() || now.ends_with('\n') => format!("{now}{block}"),
-        _ => format!("{now}\n{block}"),
+        _ => None,
+    }
+}
+
+/// The allowlist, as a marked block beside anything else in the file git
+/// reads it from, kept untracked so the home needs no file of its own: the
+/// home's repository's own `info/exclude`, which outranks the person's own
+/// excludes file, read below it. A home that is a linked worktree keeps it in
+/// its own worktree folder instead (`ohjaa.exclude`), and that file is
+/// returned, to give `git add` as its excludes file: git reads the common
+/// folder's `info/exclude` for every worktree of the repository, and the
+/// allowlist begins by leaving out everything. That file holds the person's
+/// own excludes (`person`, read for each commit) and then the allowlist: as
+/// the last pattern that matches decides, the allowlist decides wherever it
+/// matches, and the person's patterns everywhere else, as they would below
+/// `info/exclude`. A block an earlier ohjaa wrote in the shared file is
+/// taken out.
+fn keep_out_strays(
+    home: &Path,
+    person: impl FnOnce() -> Result<String>,
+) -> Result<Option<PathBuf>> {
+    let (git_dir, common) = repository_dirs(home);
+    let shared = common.join("info").join("exclude");
+    let block = format!("{EXCLUDE_BEGIN}\n{}\n{EXCLUDE_END}\n", EXCLUDE.join("\n"));
+    if git_dir != common {
+        let now = read_or_empty(&shared)?;
+        if let Some((without, _)) = without_allowlist(&now) {
+            write_file(&shared, &without, None)?;
+        }
+        let path = git_dir.join("ohjaa.exclude");
+        let mut person = person()?;
+        if !person.is_empty() && !person.ends_with('\n') {
+            person.push('\n');
+        }
+        let new = format!(
+            "# Written by ohjaa for each commit in its home: the person's own excludes, then\n\
+             # the allowlist, which decides wherever it matches.\n{person}{block}"
+        );
+        if read_or_empty(&path)? != new {
+            write_file(&path, &new, None)?;
+        }
+        return Ok(Some(path));
+    }
+    let now = read_or_empty(&shared)?;
+    let new = match without_allowlist(&now) {
+        Some((without, at)) => format!("{}{block}{}", &without[..at], &without[at..]),
+        None if now.is_empty() || now.ends_with('\n') => format!("{now}{block}"),
+        None => format!("{now}\n{block}"),
     };
     if new != now {
-        write_file(&path, &new, None)?;
+        write_file(&shared, &new, None)?;
     }
-    Ok(())
+    Ok(None)
+}
+
+/// The person's own excludes file, as git finds it for the home: its
+/// `core.excludesFile` (from any of git's configs), else git's default,
+/// `$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`; its text, or
+/// nothing when there is none. One git process.
+fn person_excludes(home: &Path) -> Result<String> {
+    let args = ["config", "--path", "--get", "core.excludesFile"];
+    let mut command = Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(home.join(".git"))
+        .args(args)
+        .current_dir(home);
+    for var in REPOSITORY_VARS {
+        command.env_remove(var);
+    }
+    let file = match value_of(&mut command, &args)? {
+        Some(file) => Some(PathBuf::from(file)),
+        None => std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|home| !home.is_empty())
+                    .map(|home| PathBuf::from(home).join(".config"))
+            })
+            .map(|dir| dir.join("git").join("ignore")),
+    };
+    match file {
+        Some(file) => read_or_empty(&file),
+        None => Ok(String::new()),
+    }
 }
 
 /// The variables that would point git at another repository than the home.
@@ -460,11 +550,50 @@ const REPOSITORY_VARS: &[&str] = &[
     "GIT_PREFIX",
 ];
 
-/// `git <args>` in the home, unsigned and with no automatic maintenance (a
-/// commit would start one more git, detached, to outlive ohjaa); with
-/// `repository`, on the home's own repository whatever git would find from
-/// there (an enclosing dotfiles repository, say).
-fn home_git(home: &Path, args: &[&str], repository: bool) -> Result<()> {
+/// What the home's git is run with, every time, so that nothing it can start
+/// beside itself outlives it: the home's lock is held by that git
+/// ([`home_git`]), and a process left running would hold up every later
+/// change to the home. Nothing here changes what is committed.
+const HOME_GIT: &[&str] = &[
+    // No signing: gpg starts its agent, which lives on, and a prompt must
+    // not hold up a decision. Nothing verifies a local history.
+    "commit.gpgsign=false",
+    // No fsmonitor: git's own daemon (`core.fsmonitor=true`) detaches and
+    // lives on, and a command there is run with git's stdin, the lock.
+    "core.fsmonitor=false",
+    // No hook from a hooks folder: the home's own, one a template copied,
+    // or one git's config names. (The home is made with no template.)
+    "core.hooksPath=/dev/null",
+    // No automatic gc or maintenance, which run detached by default
+    // (gc.autoDetach, maintenance.autoDetach). Turned off, not kept in the
+    // foreground: a history this small never needs either, and a run in the
+    // foreground would hold the lock for as long as it takes.
+    "gc.auto=0",
+    "maintenance.auto=false",
+    // No hook from git's config (`hook.<name>.command`) for any event an
+    // init, an add or a commit fires, where git has this switch (after
+    // 2.54). An older git runs such a hook with /dev/null as its stdin, so
+    // nothing it leaves holds the lock.
+    "hook.pre-commit.enabled=false",
+    "hook.prepare-commit-msg.enabled=false",
+    "hook.commit-msg.enabled=false",
+    "hook.post-commit.enabled=false",
+    "hook.post-index-change.enabled=false",
+    "hook.reference-transaction.enabled=false",
+];
+
+/// `git <args>` in the home, with [`HOME_GIT`]; with `repository`, on the
+/// home's own repository whatever git would find from there (an enclosing
+/// dotfiles repository, say). It holds the home's lock too, when ohjaa
+/// holds it, as its stdin ([`process::FileLock::as_stdin`]): a git that
+/// outlives a killed ohjaa still commits under it, and what git starts with
+/// a stdin of its own does not hold it.
+fn home_git(
+    home: &Path,
+    args: &[&str],
+    repository: bool,
+    lock: Option<&process::FileLock>,
+) -> Result<()> {
     let mut command = Command::new("git");
     if repository {
         command
@@ -473,22 +602,30 @@ fn home_git(home: &Path, args: &[&str], repository: bool) -> Result<()> {
             .arg("--work-tree")
             .arg(home);
     }
-    for setting in [
-        "commit.gpgsign=false",
-        "maintenance.auto=false",
-        "gc.auto=0",
-    ] {
+    for setting in HOME_GIT {
         command.args(["-c", setting]);
     }
     command.args(args).current_dir(home);
     for var in REPOSITORY_VARS {
         command.env_remove(var);
     }
-    let output = process::run(&mut command, None, process::LOCAL).context("cannot run git")?;
+    let output = match lock {
+        Some(lock) => {
+            let stdin = lock.as_stdin().context("cannot give git the home's lock")?;
+            process::run_with_stdin(&mut command, stdin, process::LOCAL)
+        }
+        None => process::run(&mut command, None, process::LOCAL),
+    }
+    .context("cannot run git")?;
     if !output.status.success() {
+        // Named by its subcommand, after any `-c <setting>`.
+        let mut named = args;
+        while let ["-c", _, rest @ ..] = named {
+            named = rest;
+        }
         bail!(
             "git {} failed: {}",
-            args.first().copied().unwrap_or_default(),
+            named.first().copied().unwrap_or_default(),
             output.failure_detail()
         );
     }
@@ -497,7 +634,8 @@ fn home_git(home: &Path, args: &[&str], repository: bool) -> Result<()> {
 
 /// The home's history: what ohjaa keeps in the home (the allowlist in its
 /// `info/exclude`, never a stray file), committed as one commit with
-/// `message`, under the home's [`lock`], which the caller holds. The home is
+/// `message`, under the home's [`lock`], which the caller holds and passes
+/// (`None` when it went on without it), so each git here holds it too. The home is
 /// a local git repository (no remote; ohjaa never pushes), made by its first
 /// commit unless the home already is one. A
 /// commit is the person's, with the identity any commit of theirs takes from
@@ -506,28 +644,36 @@ fn home_git(home: &Path, args: &[&str], repository: bool) -> Result<()> {
 /// `commit`), and `init` once before the first; a history this small never
 /// needs git's maintenance. A failure is the caller's to say; what was
 /// changed stands either way.
-pub fn commit(home: &Path, message: &str) -> Result<()> {
+pub fn commit(home: &Path, message: &str, lock: Option<&process::FileLock>) -> Result<()> {
     let dot_git = home.join(".git");
     // A `.git` folder without HEAD holds only the home's lock: no repository yet.
     if !dot_git.is_file() && !dot_git.join("HEAD").exists() {
         std::fs::create_dir_all(home)
             .with_context(|| format!("cannot create {}", home.display()))?;
-        home_git(home, &["init", "-q"], false)?;
+        // No template (`init.templateDir`): no hook is copied in.
+        home_git(home, &["init", "-q", "--template="], false, lock)?;
     }
-    keep_out_strays(home)?;
-    home_git(home, &["add", "-A"], true)?;
+    let excludes = keep_out_strays(home, || person_excludes(home))?
+        .map(|file| format!("core.excludesFile={}", file.display()));
+    let mut add: Vec<&str> = Vec::new();
+    if let Some(excludes) = &excludes {
+        add.extend(["-c", excludes]);
+    }
+    add.extend(["add", "-A"]);
+    home_git(home, &add, true, lock)?;
     home_git(
         home,
         &["commit", "-q", "--allow-empty", "-m", message],
         true,
+        lock,
     )
 }
 
 /// [`commit`], said by `who`: what was committed on stdout, or on stderr why
 /// nothing was. Never an error: what was changed stands either way.
-pub fn commit_and_say(home: &Path, message: &str, who: &str) {
+pub fn commit_and_say(home: &Path, message: &str, who: &str, lock: Option<&process::FileLock>) {
     let subject = message.lines().next().unwrap_or_default();
-    match commit(home, message) {
+    match commit(home, message, lock) {
         Ok(()) => println!("{who}: committed in {}: {subject}", home.display()),
         Err(error) => eprintln!(
             "{who}: warning: \"{subject}\" stands, but is not in the history of {}: {error:#}; \
@@ -707,28 +853,47 @@ mod tests {
         }
     }
 
-    /// A home whose `.git` is a file (a worktree of another repository): the
-    /// lock goes in the folder it names, and the allowlist where git reads
-    /// it, the common folder; neither is ever in the files the history holds.
+    /// A home whose `.git` is a file (a linked worktree of another
+    /// repository): the lock goes in the folder it names, and so does the
+    /// allowlist, since the common folder's `info/exclude` is read for every
+    /// worktree of that repository (#65's re-review); a block an earlier
+    /// ohjaa left there is taken out, and the person's own lines stay.
+    /// Neither is ever in the files the history holds.
     #[test]
     fn a_home_whose_git_is_a_file_keeps_its_lock_and_allowlist_out_of_its_files() {
         let dir = std::env::temp_dir().join(format!("ohjaa-gitfile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (home, store) = (dir.join("home"), dir.join("store"));
         std::fs::create_dir_all(store.join("worktrees/home")).unwrap();
+        std::fs::create_dir_all(store.join("info")).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join(".git"), "gitdir: ../store/worktrees/home\n").unwrap();
         std::fs::write(store.join("worktrees/home/commondir"), "../..\n").unwrap();
+        let earlier = format!("{EXCLUDE_BEGIN}\n{}\n{EXCLUDE_END}\n", EXCLUDE.join("\n"));
+        std::fs::write(
+            store.join("info/exclude"),
+            format!("# the person's\n*.log\n{earlier}build/\n"),
+        )
+        .unwrap();
         let (git_dir, common) = repository_dirs(&home);
         assert_eq!(git_dir, home.join("../store/worktrees/home"));
         assert_eq!(common, home.join("../store/worktrees/home").join("../.."));
         let lock = lock(&home).expect("the lock");
         assert!(store.join("worktrees/home/ohjaa.lock").is_file());
         drop(lock);
-        keep_out_strays(&home).unwrap();
-        keep_out_strays(&home).unwrap();
-        let exclude = std::fs::read_to_string(store.join("info/exclude")).unwrap();
+        for _ in 0..2 {
+            let given = keep_out_strays(&home, || Ok("*.orig".to_owned())).unwrap();
+            assert_eq!(given, Some(git_dir.join("ohjaa.exclude")));
+        }
+        let shared = std::fs::read_to_string(store.join("info/exclude")).unwrap();
+        assert_eq!(shared, "# the person's\n*.log\nbuild/\n");
+        // The person's own excludes, then the allowlist, which decides
+        // wherever it matches.
+        let exclude = std::fs::read_to_string(store.join("worktrees/home/ohjaa.exclude")).unwrap();
         assert_eq!(exclude.matches(EXCLUDE_BEGIN).count(), 1, "{exclude}");
+        let (person, allowlist) = exclude.split_once(EXCLUDE_BEGIN).unwrap();
+        assert!(person.ends_with("\n*.orig\n"), "{exclude}");
+        assert!(allowlist.trim_end().ends_with(EXCLUDE_END), "{exclude}");
         let names: Vec<_> = std::fs::read_dir(&home)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())

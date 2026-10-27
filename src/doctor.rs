@@ -75,7 +75,7 @@ fn check_instructions(found: &mut Findings) {
         match read {
             Err(error) => found.drift(format!(
                 "{} ({agent}'s own instructions): apply cannot write the knowledge block there: \
-                 {error:#} (fix it by hand, then ohjaa apply)",
+                 {error:#} (once it is fixed, ohjaa apply)",
                 file.display()
             )),
             Ok(Block::Theirs) => found.note(format!(
