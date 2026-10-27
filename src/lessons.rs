@@ -39,6 +39,8 @@ use serde_json::Value;
 use crate::knowledge::{self, Dirs, Loaded, Refused};
 use crate::{gitconfig, home, process};
 
+mod spelling;
+
 /// The heading of the section ohjaa writes in AGENTS.md.
 pub const HEADING: &str = "## Lessons";
 /// What a line of the section begins with, after its `- `: the node's id
@@ -93,18 +95,52 @@ fn marked(line: &str) -> Option<&str> {
     fk::is_valid_id(id).then_some(id)
 }
 
-/// Every marked line in `text`, wherever it is, trimmed, by the id it marks.
-pub fn lines_in(text: &str) -> BTreeMap<String, Vec<String>> {
-    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for text in text.lines() {
-        if let Some(id) = marked(text) {
-            found
-                .entry(id.to_owned())
-                .or_default()
-                .push(text.trim().to_owned());
+/// A marked line as a file holds it: trimmed, and the byte offset its end
+/// is at in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    pub text: String,
+    pub end: usize,
+}
+
+/// Every marked line in `text` that a reader reads as text, by the id it
+/// marks: wherever it is, but inside a fenced block or an HTML comment
+/// (where an agent reads it as code, or not at all).
+pub fn lines_in(text: &str) -> BTreeMap<String, Vec<Held>> {
+    let mut found: BTreeMap<String, Vec<Held>> = BTreeMap::new();
+    let (mut fence, mut comment) = (false, false);
+    let mut end = 0;
+    for raw in text.split_inclusive('\n') {
+        end += raw.len();
+        let line = raw.trim_end_matches(['\n', '\r']);
+        if comment {
+            comment =
+                !line.contains("-->") || opens_comment(&line[line.rfind("-->").unwrap_or(0)..]);
+            continue;
         }
+        let bare = line.trim_start();
+        if bare.starts_with("```") || bare.starts_with("~~~") {
+            fence = !fence;
+            continue;
+        }
+        if fence {
+            continue;
+        }
+        if let Some(id) = marked(line) {
+            found.entry(id.to_owned()).or_default().push(Held {
+                text: line.trim().to_owned(),
+                end: end - (raw.len() - line.len()),
+            });
+        }
+        comment = opens_comment(line);
     }
     found
+}
+
+/// Whether `line` opens an HTML comment it does not close.
+fn opens_comment(line: &str) -> bool {
+    line.rfind("<!--")
+        .is_some_and(|at| !line[at + 4..].contains("-->"))
 }
 
 /// What [`with_lessons`] changed, by id.
@@ -345,6 +381,9 @@ pub fn parse_repos(output: &[u8]) -> Result<Vec<String>, String> {
 #[derive(Debug, Clone, Default)]
 pub struct DenyList {
     entries: Vec<Deny>,
+    /// Words a name may begin but that are no secret where the lines go:
+    /// the repository's own name and its owner, folded to lower case.
+    allowed: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -364,7 +403,14 @@ impl DenyList {
     /// (the person's login, when it is theirs).
     pub fn build(private: &Private, home: Option<&Path>, slug: &str) -> DenyList {
         let (owner, own) = slug.split_once('/').unwrap_or(("", slug));
-        let mut list = DenyList::default();
+        let mut list = DenyList {
+            allowed: [own, owner]
+                .iter()
+                .filter(|word| !word.is_empty())
+                .map(|word| word.to_lowercase())
+                .collect(),
+            ..DenyList::default()
+        };
         // This tool is private, whatever gh lists: never named, even inside a
         // word (`.ohjaa/`, `OhjaaCli`), but in its own repository.
         if !own.eq_ignore_ascii_case(TOOL) {
@@ -418,57 +464,40 @@ impl DenyList {
         self.entries.len()
     }
 
-    /// What of the list `text` names, each as "`entry` (what it is)";
-    /// letter case is not told apart.
+    /// What of the list `text` names, each as "`entry` (what it is)", read
+    /// every way [`spelling::readings`] reads it: letter case, diacritics,
+    /// invisible characters, entities, comments and emphasis are seen
+    /// through, and a name is matched at the start of a word, whatever
+    /// follows. A letter outside ASCII left after that, or an entity not
+    /// read, is said too: it could stand for a letter of a name.
     pub fn matches(&self, text: &str) -> Vec<String> {
-        self.entries
+        let readings = spelling::readings(text);
+        let mut found: Vec<String> = self
+            .entries
             .iter()
             .filter(|entry| {
-                if entry.word {
-                    names_word(text, &entry.text)
-                } else {
-                    names_anywhere(text, &entry.text)
-                }
+                readings.iter().any(|reading| {
+                    if entry.word {
+                        spelling::names_word(reading, &entry.text, &self.allowed)
+                    } else {
+                        spelling::names_anywhere(reading, &entry.text)
+                    }
+                })
             })
             .map(|entry| format!("`{}` ({})", entry.text, entry.what))
-            .collect()
+            .collect();
+        if let Some(odd) = spelling::odd_letter(&readings[0]) {
+            found.push(format!(
+                "`{odd}` (a letter outside ASCII, which could stand for one inside it)"
+            ));
+        }
+        if let Some(entity) = spelling::unread_entity(&readings[0]) {
+            found.push(format!(
+                "`{entity}` (an HTML entity ohjaa does not read, which could stand for a letter)"
+            ));
+        }
+        found
     }
-}
-
-/// One character as matching compares it: lower case (its first, where
-/// lowering makes more than one).
-fn fold(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
-}
-
-/// Whether `haystack` holds `needle` anywhere, letter case not told apart.
-fn names_anywhere(haystack: &str, needle: &str) -> bool {
-    let hay: String = haystack.chars().map(fold).collect();
-    let needle: String = needle.chars().map(fold).collect();
-    !needle.is_empty() && hay.contains(&needle)
-}
-
-/// Whether `haystack` holds `needle` as a word of its own, letter case not
-/// told apart: what is on either side of it is no letter or digit, or a
-/// change from a lower-case letter to a capital (`myOte`, `SelkoClient`).
-fn names_word(haystack: &str, needle: &str) -> bool {
-    let hay: Vec<char> = haystack.chars().collect();
-    let folded: Vec<char> = hay.iter().copied().map(fold).collect();
-    let needle: Vec<char> = needle.chars().map(fold).collect();
-    if needle.is_empty() || needle.len() > hay.len() {
-        return false;
-    }
-    let apart = |left: char, right: char| {
-        !left.is_alphanumeric()
-            || !right.is_alphanumeric()
-            || (left.is_lowercase() && right.is_uppercase())
-    };
-    (0..=hay.len() - needle.len()).any(|start| {
-        let end = start + needle.len();
-        folded[start..end] == needle[..]
-            && (start == 0 || apart(hay[start - 1], hay[start]))
-            && (end == hay.len() || apart(hay[end - 1], hay[end]))
-    })
 }
 
 // ---- the record ---------------------------------------------------------------
@@ -583,7 +612,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 pub struct Standing {
     pub agents_md: PathBuf,
     /// The marked lines the file holds, by id.
-    in_file: BTreeMap<String, Vec<String>>,
+    in_file: BTreeMap<String, Vec<Held>>,
     record: Record,
     /// Ids still in the checkout's `.ohjaa/knowledge/`.
     untracked: BTreeSet<String>,
@@ -631,7 +660,7 @@ impl Standing {
     pub fn in_agents_md(&self, node: &Node) -> bool {
         self.in_file
             .get(&node.id)
-            .is_some_and(|lines| lines.contains(&line(node)))
+            .is_some_and(|lines| lines.iter().any(|held| held.text == line(node)))
     }
 
     /// What the briefing says beside a repo node it carries: why it is not
@@ -1823,8 +1852,12 @@ mod tests {
         let found =
             lines_in("x\n- <!-- lesson: one --> a\r\n## Other\n  - <!-- lesson: two --> b\n");
         assert_eq!(found.len(), 2);
-        assert_eq!(found["one"], vec!["- <!-- lesson: one --> a"]);
-        assert_eq!(found["two"], vec!["- <!-- lesson: two --> b"]);
+        let text = "x\n- <!-- lesson: one --> a\r\n## Other\n  - <!-- lesson: two --> b\n";
+        assert_eq!(found["one"][0].text, "- <!-- lesson: one --> a");
+        assert_eq!(found["two"][0].text, "- <!-- lesson: two --> b");
+        // Where each ends in the file, its line ending left out.
+        assert_eq!(&text[..found["one"][0].end], "x\n- <!-- lesson: one --> a");
+        assert!(text[..found["two"][0].end].ends_with("--> b"));
     }
 
     #[test]
@@ -1995,9 +2028,11 @@ mod tests {
             vec!["`octo-gh` (you, as GitHub names you)"]
         );
         assert!(deny.matches("").is_empty());
-        assert!(!names_word("é", "e"));
-        assert!(names_word("x ote", "ote") && names_word("ote", "ote"));
-        assert!(!names_word("noted", "ote"));
+        assert!(spelling::names_word("é", "e", &[]), "a diacritic is folded");
+        assert!(
+            spelling::names_word("x ote", "ote", &[]) && spelling::names_word("ote", "ote", &[])
+        );
+        assert!(!spelling::names_word("noted", "ote", &[]));
     }
 
     #[test]
@@ -2059,14 +2094,17 @@ mod tests {
     #[test]
     fn a_name_inside_camel_case_or_beyond_ascii_is_still_named() {
         assert!(
-            names_word("SelkoClient", "selko"),
+            spelling::names_word("SelkoClient", "selko", &[]),
             "a capital starts a word"
         );
-        assert!(names_word("myOteThing", "ote"));
-        assert!(!names_word("remote", "ote") && !names_word("Xote", "ote"));
-        assert!(names_word("ask Étienne", "étienne"));
-        assert!(names_word("ÉTIENNE said", "Étienne"));
-        assert!(names_anywhere("/HOME/Ünal/x", "/home/ünal"));
+        assert!(spelling::names_word("myOteThing", "ote", &[]));
+        assert!(
+            !spelling::names_word("remote", "ote", &[])
+                && !spelling::names_word("Xote", "ote", &[])
+        );
+        assert!(spelling::names_word("ask Étienne", "étienne", &[]));
+        assert!(spelling::names_word("ÉTIENNE said", "Étienne", &[]));
+        assert!(spelling::names_anywhere("/HOME/Ünal/x", "/home/ünal"));
     }
 
     #[test]
