@@ -363,6 +363,16 @@ pub fn derive(own: &Own, overlay: &Overlay) -> Derived {
 }
 
 impl Derived {
+    /// Whether a receipt naming the contract hash `hash` (and the lock
+    /// digest `lock`, when it names one) ran under this gate: what a failing
+    /// receipt must name to be a failure of the commit, as a passing one
+    /// must for `sykli verify` to accept it. One that names no contract
+    /// never did.
+    pub fn ran(&self, hash: Option<&str>, lock: Option<&str>) -> bool {
+        hash.is_some_and(|hash| contract_hash(&self.contract).as_deref() == Some(hash))
+            && lock.is_none_or(|lock| self.lock.as_deref().map(sha256).as_deref() == Some(lock))
+    }
+
     /// Its file under `base`, `<base>/<digest>/sykli.json`, written there
     /// (and its lock beside it) unless it already is: the same bytes
     /// whenever it is written.

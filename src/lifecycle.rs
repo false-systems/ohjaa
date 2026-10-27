@@ -959,36 +959,49 @@ pub struct Receipt {
 /// Sykli receipts keyed by the tree that ran: every one of each tree, best
 /// first (a passing run, then a clean one, then the newest). A newer run of
 /// the same tree, under another contract or failing, never hides a pass.
+/// Beside them, what could not be read of the receipts sykli named by
+/// their digest: said, never taken for a receipt.
 #[derive(Debug, Clone, Default)]
-pub struct Receipts(std::collections::HashMap<String, Vec<Receipt>>);
+pub struct Receipts {
+    by_tree: std::collections::HashMap<String, Vec<Receipt>>,
+    /// Each a path, and why it cannot be read.
+    unreadable: Vec<String>,
+}
 
 impl Receipts {
     /// The best receipt of `tree`: the receipt's word a phase shows.
     pub fn get(&self, tree: &str) -> Option<&Receipt> {
-        self.0.get(tree).and_then(|all| all.first())
+        self.by_tree.get(tree).and_then(|all| all.first())
     }
 
     /// Every receipt of `tree`, best first.
     pub fn of(&self, tree: &str) -> &[Receipt] {
-        self.0.get(tree).map_or(&[], Vec::as_slice)
+        self.by_tree.get(tree).map_or(&[], Vec::as_slice)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.by_tree.is_empty()
+    }
+
+    /// The receipts sykli named by their digest (`rcpt_<sha256>.json`) that
+    /// could not be read, each a path and why: a gap, never a receipt.
+    pub fn unreadable(&self) -> &[String] {
+        &self.unreadable
     }
 
     /// Every receipt of `other` too.
     pub fn extend(&mut self, other: Receipts) {
-        for (tree, all) in other.0 {
+        for (tree, all) in other.by_tree {
             for receipt in all {
                 self.add(&tree, receipt);
             }
         }
+        self.unreadable.extend(other.unreadable);
     }
 
     fn add(&mut self, tree: &str, receipt: Receipt) {
         let rank = |r: &Receipt| (r.evidence.outcome == "passed", !r.evidence.dirty, r.at);
-        let all = self.0.entry(tree.to_owned()).or_default();
+        let all = self.by_tree.entry(tree.to_owned()).or_default();
         let at = all
             .iter()
             .position(|seen| rank(seen) < rank(&receipt))
@@ -1137,11 +1150,17 @@ pub fn layout_checkouts(common: &Path) -> Vec<PathBuf> {
 ///
 /// sykli names a receipt it keeps by the SHA-256 of its bytes
 /// (`rcpt_<sha256>.json`), so one kept in several places (a worktree's
-/// `.sykli/receipts/` and its run's folder) is the same receipt: it is read
-/// once, where it is first found, and never asked about twice.
+/// `.sykli/receipts/` and its run's folder) is the same receipt, read once,
+/// where it is first found, and never asked about twice. Only the same
+/// bytes are the same receipt: another file under that name (another
+/// receipt, or one cut short) never hides it. A file so named that cannot
+/// be read as a receipt is said ([`Receipts::unreadable`]), never taken for
+/// one; one gone between the listing and the reading (sykli pruned it) is
+/// no receipt at all.
 fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Receipts {
     let mut found = Receipts::default();
-    let mut seen = std::collections::HashSet::new();
+    // Every path a receipt was read from, by the name sykli gave it.
+    let mut named_at: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for (dir, checkout) in dirs {
         // A folder of receipts, or one receipt file (`.sykli/receipt.json`).
         let paths: Vec<PathBuf> = if dir.is_file() {
@@ -1162,16 +1181,34 @@ fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Rec
                 .and_then(|name| name.strip_prefix("rcpt_")?.strip_suffix(".json"))
                 .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
                 .map(str::to_owned);
-            if let Some(named) = named {
-                if !seen.insert(named) {
+            let unreadable = |found: &mut Receipts, why: String| {
+                if named.is_some() {
+                    found
+                        .unreadable
+                        .push(format!("{} ({why})", path.display()));
+                }
+            };
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    unreadable(&mut found, error.to_string());
                     continue;
                 }
-            }
-            let Some(receipt) = std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            else {
+            };
+            let same = named.as_ref().and_then(|name| named_at.get(name)).is_some_and(|read| {
+                read.iter()
+                    .any(|seen| std::fs::read(seen).is_ok_and(|seen| seen == bytes))
+            });
+            if same {
                 continue;
+            }
+            let receipt = match serde_json::from_slice::<Value>(&bytes) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    unreadable(&mut found, format!("not JSON: {error}"));
+                    continue;
+                }
             };
             if receipt["schema"] != "sykli-receipt.v1" {
                 continue;
@@ -1182,8 +1219,15 @@ fn receipts_from<'a>(dirs: impl IntoIterator<Item = (PathBuf, &'a Path)>) -> Rec
                 receipt["subject"]["tree_oid"].as_str(),
                 receipt["outcome"].as_str(),
             ) else {
+                unreadable(
+                    &mut found,
+                    "a sykli-receipt.v1 that names no tree or no outcome".to_owned(),
+                );
                 continue;
             };
+            if let Some(name) = &named {
+                named_at.entry(name.clone()).or_default().push(path.clone());
+            }
             let at = receipt["started_at_ms"].as_i64().unwrap_or(0);
             let head = receipt["subject"]["head_tree_oid"].as_str();
             // sykli calls a run dirty when the tree that ran is not HEAD's, or
@@ -2755,37 +2799,9 @@ impl Sykli {
                 Check::UncheckedGone
             };
         }
-        let passing: Vec<&Receipt> = candidates
-            .iter()
-            .filter(|receipt| matches!(receipt.evidence.outcome.as_str(), "passed" | "cached"))
-            .collect();
-        if passing.is_empty() {
-            let newest = &candidates[0];
-            return Check::Failed {
-                why: format!(
-                    "its receipt says the run {} ({})",
-                    newest.evidence.outcome,
-                    newest.path.display()
-                ),
-            };
-        }
-        let answer = match self.answer() {
-            Ok(answer) => answer,
-            Err(why) => return Check::Unverified { why },
-        };
-        let facts: Vec<&std::ffi::OsStr> = if self.takes_facts.get().copied().unwrap_or(false) {
-            vec![
-                "--repo-root".as_ref(),
-                gate.top.as_os_str(),
-                "--git-common-dir".as_ref(),
-                gate.common.as_os_str(),
-            ]
-        } else {
-            Vec::new()
-        };
         // The commit's gate: derived from its own sykli.json, else from what
-        // sykli init writes for its tree. Read only now, when a receipt asks
-        // sykli.
+        // sykli init writes for its tree. Read only now, when a receipt of
+        // its tree is here: a pass or a failure counts only under it.
         let at = match self.gate_at(gate, commit) {
             Ok(at) => at,
             Err(why) => {
@@ -2794,79 +2810,118 @@ impl Sykli {
                 }
             }
         };
-        if let crate::derived::GateAt::Missing(why) = &at {
-            return Check::Unverified {
-                why: format!("no gate judges it: {why}"),
-            };
-        }
-        let mut written = None;
-        let mut verdicts = Vec::new();
-        for receipt in passing.iter().take(MAX_ASKED) {
-            if !self.may_verify() {
-                if verdicts.is_empty() {
-                    verdicts.push((
-                        receipt.at,
-                        Check::Unverified {
-                            why: "sykli was not asked again".to_owned(),
-                        },
-                    ));
+        let derived = match &at {
+            crate::derived::GateAt::Derived(derived) => derived,
+            crate::derived::GateAt::Missing(why) => {
+                return Check::Unverified {
+                    why: format!("no gate judges it: {why}"),
                 }
-                break;
             }
-            // A run under the repository's own contract at the commit (CI's
-            // `sykli run sykli.json`) is verified against it, read from the
-            // commit; every other against the gate.
-            let own = match &at {
-                crate::derived::GateAt::Derived(derived) => derived.own.as_ref().filter(|own| {
+        };
+        let passing: Vec<&Receipt> = candidates
+            .iter()
+            .filter(|receipt| matches!(receipt.evidence.outcome.as_str(), "passed" | "cached"))
+            .collect();
+        let mut verdicts = Vec::new();
+        if !passing.is_empty() {
+            let answer = match self.answer() {
+                Ok(answer) => answer,
+                Err(why) => return Check::Unverified { why },
+            };
+            let facts: Vec<&std::ffi::OsStr> =
+                if self.takes_facts.get().copied().unwrap_or(false) {
+                    vec![
+                        "--repo-root".as_ref(),
+                        gate.top.as_os_str(),
+                        "--git-common-dir".as_ref(),
+                        gate.common.as_os_str(),
+                    ]
+                } else {
+                    Vec::new()
+                };
+            let mut written = None;
+            for receipt in passing.iter().take(MAX_ASKED) {
+                if !self.may_verify() {
+                    if verdicts.is_empty() {
+                        verdicts.push((
+                            receipt.at,
+                            Check::Unverified {
+                                why: "sykli was not asked again".to_owned(),
+                            },
+                        ));
+                    }
+                    break;
+                }
+                // A run under the repository's own contract at the commit
+                // (CI's `sykli run sykli.json`) is verified against it, read
+                // from the commit; every other against the gate.
+                let own = derived.own.as_ref().filter(|own| {
                     own.ran(
                         receipt.contract_hash.as_deref(),
                         receipt.lock_digest.as_deref(),
                     )
-                }),
-                _ => None,
-            };
-            let (contract, under) = match own {
-                Some(_) => (PathBuf::from("sykli.json"), crate::derived::Under::Own),
-                None => match written.get_or_insert_with(|| at.contract(&self.derived, false)) {
-                    Ok(path) => (path.clone(), crate::derived::Under::Derived),
-                    Err(why) => {
-                        verdicts.push((
-                            receipt.at,
-                            Check::Unverified {
-                                why: format!("its gate cannot be written: {why}"),
-                            },
-                        ));
-                        break;
-                    }
-                },
-            };
-            let mut command = self.command();
-            command
-                .arg("verify")
-                .arg(&receipt.path)
-                .arg("--contract")
-                .arg(&contract)
-                .args(&facts)
-                .args(["--commit", commit])
-                .current_dir(&gate.top);
-            match self.verify(answer, command, commit, receipt, under) {
-                Check::Passed => return Check::Passed,
-                check => verdicts.push((receipt.at, check)),
+                });
+                let (contract, under) = match own {
+                    Some(_) => (PathBuf::from("sykli.json"), crate::derived::Under::Own),
+                    None => match written.get_or_insert_with(|| at.contract(&self.derived, false))
+                    {
+                        Ok(path) => (path.clone(), crate::derived::Under::Derived),
+                        Err(why) => {
+                            verdicts.push((
+                                receipt.at,
+                                Check::Unverified {
+                                    why: format!("its gate cannot be written: {why}"),
+                                },
+                            ));
+                            break;
+                        }
+                    },
+                };
+                let mut command = self.command();
+                command
+                    .arg("verify")
+                    .arg(&receipt.path)
+                    .arg("--contract")
+                    .arg(&contract)
+                    .args(&facts)
+                    .args(["--commit", commit])
+                    .current_dir(&gate.top);
+                match self.verify(answer, command, commit, receipt, under) {
+                    Check::Passed => return Check::Passed,
+                    check => verdicts.push((receipt.at, check)),
+                }
             }
         }
-        // The runs that failed are their receipts' word, unasked.
+        // The runs that failed are their receipts' word, unasked, and a
+        // failure of the commit only under its gate or its own contract, as
+        // a pass is: a run under any other contract (a copy from before, a
+        // contract elsewhere) that failed says nothing of the gate.
         for receipt in candidates
             .iter()
             .filter(|receipt| !matches!(receipt.evidence.outcome.as_str(), "passed" | "cached"))
         {
+            let (hash, lock) = (
+                receipt.contract_hash.as_deref(),
+                receipt.lock_digest.as_deref(),
+            );
+            let said = format!(
+                "its receipt says the run {} ({})",
+                receipt.evidence.outcome,
+                receipt.path.display()
+            );
+            let ours =
+                derived.ran(hash, lock) || derived.own.as_ref().is_some_and(|own| own.ran(hash, lock));
             verdicts.push((
                 receipt.at,
-                Check::Failed {
-                    why: format!(
-                        "its receipt says the run {} ({})",
-                        receipt.evidence.outcome,
-                        receipt.path.display()
-                    ),
+                if ours {
+                    Check::Failed { why: said }
+                } else {
+                    Check::OtherContract {
+                        why: match hash {
+                            Some(hash) => format!("{said}, under the contract {hash}"),
+                            None => format!("{said}, under no contract it names"),
+                        },
+                    }
                 },
             ));
         }
@@ -3432,6 +3487,71 @@ mod tests {
         );
         assert_eq!(at_leaving.of("landed").len(), 1);
         assert_eq!(at_leaving.of("here").len(), 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The review of #60, finding 2: a file under a kept receipt's name that
+    /// is not that receipt (cut short, or another receipt) never hides it:
+    /// only the same bytes are the same receipt. One that cannot be read is
+    /// said, never taken for the receipt.
+    #[test]
+    fn a_copy_under_a_receipts_name_that_is_not_it_never_hides_it() {
+        let root = std::env::temp_dir().join(format!("ohjaa-layout-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let main = root.join("main");
+        let common = main.join(".git");
+        let body = |tree: &str, outcome: &str| {
+            format!(
+                r#"{{"schema":"sykli-receipt.v1","outcome":"{outcome}","started_at_ms":1,"subject":{{"tree_oid":"{tree}","dirty":false}}}}"#
+            )
+        };
+        let named = |n: char| format!("rcpt_{}.json", n.to_string().repeat(64));
+        let put = |path: PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        // Cut short in the worktree, whole with its run.
+        put(main.join(".sykli/receipts").join(named('a')), "{\"truncated");
+        put(
+            common.join("sykli/runs/run1").join(named('a')),
+            &body("cut", "passed"),
+        );
+        // Another receipt under the same name in the worktree.
+        put(
+            main.join(".sykli/receipts").join(named('b')),
+            &body("other", "failed"),
+        );
+        put(
+            common.join("sykli/runs/run2").join(named('b')),
+            &body("other", "passed"),
+        );
+        // The same bytes twice: one receipt.
+        put(main.join(".sykli/receipts").join(named('c')), &body("same", "passed"));
+        put(
+            common.join("sykli/runs/run3").join(named('c')),
+            &body("same", "passed"),
+        );
+        let found = receipts_of_layout(&common);
+        assert_eq!(found.of("cut").len(), 1);
+        assert_eq!(
+            found["cut"].path,
+            common.join("sykli/runs/run1").join(named('a'))
+        );
+        let outcomes: Vec<&str> = found
+            .of("other")
+            .iter()
+            .map(|receipt| receipt.evidence.outcome.as_str())
+            .collect();
+        assert_eq!(outcomes, ["passed", "failed"], "both kept, best first");
+        assert_eq!(found.of("same").len(), 1);
+        let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
+        let unreadable = canonical(&main).join(".sykli/receipts").join(named('a'));
+        assert_eq!(found.unreadable().len(), 1, "{:?}", found.unreadable());
+        assert!(
+            found.unreadable()[0].starts_with(&unreadable.display().to_string()),
+            "{:?}",
+            found.unreadable()
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

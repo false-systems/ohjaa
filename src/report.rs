@@ -292,8 +292,15 @@ fn build_with(dirs: &Dirs, repos: &[PathBuf], since_ms: i64, now_ms: i64, window
         }
     };
     for (slug, marked) in &marks {
-        if let Err(why) = marked {
-            gaps.push(format!("{slug}: not marked: {why}"));
+        match marked {
+            Err(why) => gaps.push(format!("{slug}: not marked: {why}")),
+            // A receipt sykli named that cannot be read: never taken for one.
+            Ok(marked) => gaps.extend(
+                marked
+                    .unreadable
+                    .iter()
+                    .map(|why| format!("{slug}: a receipt cannot be read: {why}")),
+            ),
         }
     }
     let proposals = waiting(dirs);
@@ -2195,6 +2202,7 @@ mod tests {
                         },
                     ],
                     ended: mark::Ended::Proven,
+                    unreadable: Vec::new(),
                 }),
             ),
             (

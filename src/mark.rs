@@ -148,6 +148,9 @@ pub struct Marks {
     /// Tip first.
     pub commits: Vec<Walked>,
     pub ended: Ended,
+    /// The receipts sykli named by their digest that could not be read,
+    /// each a path and why: a gap in the marks, never a receipt.
+    pub unreadable: Vec<String>,
 }
 
 impl Marks {
@@ -205,7 +208,7 @@ pub fn why(check: &Check) -> Option<String> {
         Check::Passed => return None,
         Check::Failed { why } => why.clone(),
         Check::OtherContract { why } => {
-            format!("passed under another contract than the gate's ({why})")
+            format!("ran under another contract than the gate's ({why})")
         }
         Check::Unchecked => "no receipt of its tree here".to_owned(),
         Check::UncheckedGone => {
@@ -337,6 +340,7 @@ pub fn walk(gate: &Gate, sykli: &Sykli, receipts: &Receipts) -> Result<Marks, St
         updated: updated(&gate.common, &gate.branch),
         commits,
         ended,
+        unreadable: receipts.unreadable().to_vec(),
     })
 }
 
@@ -371,7 +375,7 @@ pub fn flag(marks: &Marks) -> Option<String> {
     if n > 5 {
         listed.push("…".to_owned());
     }
-    // Runs that passed under another contract are not proven against the
+    // Runs under another contract are not proven against the
     // gate as it is now: said so, never as if nothing had ever passed.
     let other = unproven
         .iter()
@@ -399,7 +403,7 @@ pub fn flag(marks: &Marks) -> Option<String> {
         format!("{n} {commits}: ")
     };
     let passed = if other > 0 {
-        format!("; {other} passed under another contract")
+        format!("; {other} ran under another contract")
     } else {
         String::new()
     };
@@ -582,6 +586,7 @@ mod tests {
                 })
                 .collect(),
             ended,
+            unreadable: Vec::new(),
         }
     }
 
