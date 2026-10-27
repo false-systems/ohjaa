@@ -919,6 +919,16 @@ fn knowledge_briefing_for(
         )),
         _ => None,
     };
+    // What AGENTS.md as checked out still says of a node retired or
+    // superseded, while its removal waits: said, whatever reads the file.
+    let still = standing
+        .as_ref()
+        .map(|standing| standing.still_said(&loaded))
+        .unwrap_or_default();
+    let lessons = {
+        let lines: Vec<String> = lessons.into_iter().chain(still).collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    };
     // The lines are part of the section, so their room is kept first: as
     // long as the longest they can come to.
     let repeatable: Vec<&str> = shown
@@ -1059,15 +1069,20 @@ fn knowledge_for_work(
         let Briefed {
             text: knowledge,
             delivered: nodes,
-            ..
+            source: still,
         } = knowledge_briefing_for(&scoped_dirs, &[Scope::Repo], None, false)?;
         // The preamble is said once, before the first knowledge of all; each
-        // repository adds its section.
-        let knowledge = knowledge
+        // repository adds its section, with what its AGENTS.md still says of
+        // a lesson no longer current.
+        let mut knowledge = knowledge
             .strip_prefix(knowledge::PREAMBLE)
             .unwrap_or(&knowledge)
             .trim_start_matches('\n')
             .to_owned();
+        if let Some(still) = still {
+            knowledge.push_str(&still);
+            knowledge.push('\n');
+        }
         if !knowledge.is_empty() {
             if text.is_empty() {
                 text.push_str(knowledge::PREAMBLE);

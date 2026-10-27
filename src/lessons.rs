@@ -751,6 +751,59 @@ impl Standing {
         })
     }
 
+    /// What AGENTS.md, as checked out, still says of nodes no longer
+    /// current (`loaded` holds them, retired or superseded): one line each,
+    /// saying what became of it, where its removal is, and not to follow it.
+    pub fn still_said(&self, loaded: &Loaded) -> Vec<String> {
+        let mut said = Vec::new();
+        for id in self.in_file.keys() {
+            let Some(located) = loaded
+                .nodes
+                .iter()
+                .find(|located| located.scope == Scope::Repo && located.node.id == *id)
+            else {
+                continue;
+            };
+            let what = match located.node.status {
+                Status::Retired => {
+                    // retire's own origin: `<date>: retired: <why>`.
+                    let retired = located
+                        .node
+                        .origin
+                        .iter()
+                        .rev()
+                        .find_map(|origin| origin.split_once(": retired: "));
+                    match retired {
+                        Some((date, why)) => format!("it was retired on {date} ({why})"),
+                        None => "it was retired".to_owned(),
+                    }
+                }
+                Status::Superseded => {
+                    let successor = loaded.nodes.iter().find(|later| {
+                        later.scope == Scope::Repo && later.node.supersedes.contains(id)
+                    });
+                    match successor {
+                        Some(later) => format!("it was superseded by `{}`", later.node.id),
+                        None => "it was superseded".to_owned(),
+                    }
+                }
+                _ => continue,
+            };
+            let removal = match self.record.nodes.get(id) {
+                Some(Delivery {
+                    state: State::Pr,
+                    url: Some(url),
+                    ..
+                }) => format!("its removal is pending in {url}"),
+                _ => "its removal is not delivered yet (`ohjaa lessons publish`)".to_owned(),
+            };
+            said.push(format!(
+                "AGENTS.md still says `{id}`, but {what}; {removal}: do not follow it."
+            ));
+        }
+        said
+    }
+
     /// What `ohjaa list` says under a current repo node.
     pub fn status(&self, node: &Node) -> Option<String> {
         if self.in_agents_md(node) {
@@ -1560,8 +1613,19 @@ pub fn deliver(
         };
         record.nodes.insert(id.clone(), delivery);
     }
+    // A node no longer current whose line this delivery takes out: its
+    // removal is pending in the pull request, which the briefing names
+    // while AGENTS.md as checked out still holds the line. One whose line
+    // was taken out before keeps what it had; one never delivered, nothing.
     for id in &wanted.gone {
-        record.nodes.remove(id);
+        if sent.plan.changes.removed.contains(id) {
+            let mut removal = Delivery::new(State::Pr, today);
+            removal.url = sent.url.clone();
+            removal.branch = sent.branch.clone();
+            record.nodes.insert(id.clone(), removal);
+        } else if !record.nodes.get(id).is_some_and(Delivery::delivered) {
+            record.nodes.remove(id);
+        }
     }
     record.checkout = Some(checkout.to_path_buf());
     record.slug = Some(sent.ready.slug.clone());
