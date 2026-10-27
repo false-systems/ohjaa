@@ -1158,8 +1158,8 @@ fn undo_puts_back_exactly_what_apply_changed() {
     assert_eq!(sandbox.read("config/git/ignore"), "*.swp");
     assert_eq!(
         names_in(&sandbox.config()),
-        ["repos", "roots"],
-        "entries and roots kept"
+        [".git", "repos", "roots"],
+        "entries, roots and the home's history kept"
     );
     // Its gate is derived from the repository's own sykli.json: the entry
     // keeps no copy of it.
@@ -1187,10 +1187,10 @@ fn undo_removes_the_files_apply_created() {
         !sandbox.dir.join("gitconfig").exists(),
         "a global config apply created is removed, not left empty"
     );
-    assert!(
-        names_in(&sandbox.config()).is_empty(),
-        "{:?}",
-        names_in(&sandbox.config())
+    assert_eq!(
+        names_in(&sandbox.config()),
+        [".git"],
+        "only the home's history is kept"
     );
 }
 
@@ -1230,6 +1230,238 @@ fn apply_writes_the_ignore_block_where_core_excludes_file_points() {
         .unwrap()
         .contains(".sykli/"));
     assert!(!sandbox.dir.join("config/git/ignore").exists());
+}
+
+/// A current node of the home's own knowledge, as a person's accept leaves it.
+fn knowledge_node(dir: &Path, id: &str, kind: &str, body: &str) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join(format!("{id}.md")),
+        format!(
+            "+++\nid = \"{id}\"\nkind = \"{kind}\"\nstatus = \"current\"\n\
+             as_of = 2026-10-27\norigin = [\"the origin, never in the block\"]\n+++\n{body}\n"
+        ),
+    )
+    .unwrap();
+}
+
+impl Sandbox {
+    /// The home's history, newest first: each commit's subject and body.
+    fn history(&self) -> Vec<String> {
+        let output = self.git_out(&self.config(), &["log", "--format=%B%x00"]);
+        if !output.status.success() {
+            return Vec::new();
+        }
+        text(&output)
+            .0
+            .split('\0')
+            .map(|commit| commit.trim().to_owned())
+            .filter(|commit| !commit.is_empty())
+            .collect()
+    }
+}
+
+/// The person's general knowledge (mine, machine) reaches each agent's own
+/// global instruction file, in a block apply writes, rewrites where it is
+/// and `--undo` takes out, leaving every hand-written byte as it was. No
+/// file is created, and none inside a repository is written. What apply and
+/// adopt change in the home is a commit in its history each.
+#[test]
+fn apply_writes_the_knowledge_block_into_each_agents_own_file_and_undo_takes_it_out() {
+    let sandbox = Sandbox::new("instructions");
+    let claude = sandbox.home().join(".claude/CLAUDE.md");
+    let codex = sandbox.home().join(".codex/AGENTS.md");
+    // Hand-written, as the person's are; one ends without a newline.
+    let claude_text = "# Global instructions\n\nCode is Rust, or Elixir/Erlang.";
+    let codex_text = "# Codex\n\nKeep me.\n";
+    for (file, text) in [(&claude, claude_text), (&codex, codex_text)] {
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, text).unwrap();
+    }
+    // pi is set up and has no instruction file; opencode's is in a repository.
+    fs::create_dir_all(sandbox.home().join(".pi/agent")).unwrap();
+    let opencode = sandbox.dir.join("config/opencode");
+    fs::create_dir_all(&opencode).unwrap();
+    sandbox.git(&opencode, &["init", "-q"]);
+    fs::write(opencode.join("AGENTS.md"), "# opencode\n").unwrap();
+    let mine = sandbox.config().join("mine");
+    knowledge_node(
+        &mine,
+        "code-is-rust",
+        "decision",
+        "Code is Rust\nor Elixir.",
+    );
+    knowledge_node(&mine, "answer-first", "taste", "Answer first.");
+    knowledge_node(
+        &sandbox.config().join("machine"),
+        "lima",
+        "fact",
+        "Lima is here.",
+    );
+    let lines = "- decision: Code is Rust or Elixir.\n- taste: Answer first.\n\
+                 - fact: Lima is here.\n<!-- ohjaa:knowledge end -->\n";
+
+    let output = sandbox.ohjaa(&["apply", "--dry-run", "--root", &sandbox.projects()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    for file in [&claude, &codex] {
+        assert!(
+            stdout.contains(&format!(
+                "would write the knowledge block (3 nodes) into {}",
+                file.display()
+            )),
+            "{stdout}"
+        );
+    }
+    assert_eq!(fs::read_to_string(&claude).unwrap(), claude_text);
+    assert!(sandbox.history().is_empty(), "a dry run commits nothing");
+
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let written = fs::read_to_string(&claude).unwrap();
+    assert!(
+        written.starts_with(&format!(
+            "{claude_text}\n\n<!-- ohjaa:knowledge begin: mine and machine"
+        )) && written.ends_with(lines),
+        "{written}"
+    );
+    assert!(!written.contains("the origin"), "{written}");
+    let written = fs::read_to_string(&codex).unwrap();
+    assert!(
+        written.starts_with(&format!("{codex_text}\n<!-- ohjaa:knowledge begin"))
+            && written.ends_with(lines),
+        "{written}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "pi reads {}, which does not exist; apply creates no instruction file",
+            sandbox.home().join(".pi/agent/AGENTS.md").display()
+        )),
+        "{stdout}"
+    );
+    assert!(!sandbox.home().join(".pi/agent/AGENTS.md").exists());
+    assert!(
+        stdout.contains(&format!(
+            "{} (opencode's own instructions) is inside the repository {}",
+            opencode.join("AGENTS.md").display(),
+            opencode.display()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(opencode.join("AGENTS.md")).unwrap(),
+        "# opencode\n"
+    );
+    let history = sandbox.history();
+    assert_eq!(history.len(), 1, "{history:#?}");
+    assert!(
+        history[0].starts_with("apply: ")
+            && history[0].contains(&format!(
+                "\nwrote the knowledge block (3 nodes) into {}",
+                claude.display()
+            )),
+        "{history:#?}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "ohjaa apply: committed in {}: apply: ",
+            sandbox.config().display()
+        )),
+        "{stdout}"
+    );
+
+    // Applied again: nothing to change, and no commit.
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    assert!(text(&output).0.contains("nothing to change"), "{output:?}");
+    assert_eq!(sandbox.history().len(), 1);
+
+    // Knowledge changed by hand: the block is rewritten where it is.
+    knowledge_node(&mine, "short", "taste", "Short answers.");
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    let (stdout, _) = text(&output);
+    assert!(
+        stdout.contains(&format!(
+            "rewrote the knowledge block (4 nodes) in {}",
+            claude.display()
+        )),
+        "{stdout}"
+    );
+    assert!(fs::read_to_string(&claude)
+        .unwrap()
+        .contains("- taste: Answer first.\n- taste: Short answers.\n"));
+    assert_eq!(sandbox.history().len(), 2);
+
+    // adopt commits what it changed in the home.
+    let (repo, _) = sandbox.repo("acme", "widget", &[("sykli.json", "{}\n")]);
+    sandbox.adopt(&repo);
+    let history = sandbox.history();
+    assert!(
+        history[0].starts_with("adopt acme/widget: observe main\n\n"),
+        "{history:#?}"
+    );
+    let tracked = sandbox.git(&sandbox.config(), &["ls-files"]);
+    for file in [
+        "repos/acme/widget/repo.toml",
+        "mine/short.md",
+        "applied.toml",
+    ] {
+        assert!(tracked.lines().any(|line| line == file), "{tracked}");
+    }
+
+    // Undone: every byte as it was, the history kept and told.
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "removed the knowledge block from {}",
+            claude.display()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(fs::read_to_string(&claude).unwrap(), claude_text);
+    assert_eq!(fs::read_to_string(&codex).unwrap(), codex_text);
+    assert_eq!(
+        fs::read_to_string(opencode.join("AGENTS.md")).unwrap(),
+        "# opencode\n"
+    );
+    let history = sandbox.history();
+    assert_eq!(history.len(), 4, "{history:#?}");
+    assert!(history[0].starts_with("apply --undo: "), "{history:#?}");
+}
+
+/// A commit that fails is said, and what apply did stands.
+#[test]
+fn a_failed_commit_in_the_home_is_said_and_apply_stands() {
+    let sandbox = Sandbox::new("commit-fails");
+    sandbox.apply();
+    assert_eq!(sandbox.history().len(), 1);
+    // Another git holds the home's index: `git add` cannot take it.
+    fs::write(sandbox.config().join(".git/index.lock"), "").unwrap();
+    let claude = sandbox.home().join(".claude/CLAUDE.md");
+    fs::create_dir_all(claude.parent().unwrap()).unwrap();
+    fs::write(&claude, "# Mine\n").unwrap();
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stderr.contains(
+            "ohjaa apply: warning: \"apply: 1 change\" stands, but is not in the history of"
+        ),
+        "{stderr}"
+    );
+    assert!(fs::read_to_string(&claude)
+        .unwrap()
+        .contains("<!-- ohjaa:knowledge end -->"));
+    // Once git can, the next commit takes it in.
+    fs::remove_file(sandbox.config().join(".git/index.lock")).unwrap();
+    fs::write(&claude, "# Mine, edited\n").unwrap();
+    sandbox.apply();
+    let history = sandbox.history();
+    assert_eq!(history.len(), 2, "{history:#?}");
+    let tracked = sandbox.git(&sandbox.config(), &["show", "--stat", "--format=", "HEAD"]);
+    assert!(tracked.contains("applied.toml"), "{tracked}");
 }
 
 #[test]
@@ -6272,7 +6504,8 @@ fn every_command_stays_within_its_git_budget() {
 
     // apply before any entry: git's version and global config, no clone read
     // (nothing can be gated yet), the include added and git/config checked
-    // before it is written.
+    // before it is written; then what it changed, the home's first commit
+    // (its `init`, `add -A` and `commit`, and no maintenance after it).
     let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&["apply", "--root", &root]));
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
     assert!(
@@ -6284,10 +6517,15 @@ fn every_command_stays_within_its_git_budget() {
         started(&starts, "--version") && started(&starts, "--global"),
         "{starts:#?}"
     );
+    assert!(
+        started(&starts, "init") && started(&starts, "commit"),
+        "{starts:#?}"
+    );
+    assert!(!started(&starts, "maintenance"), "{starts:#?}");
     budget(
         "ohjaa apply (no entries yet, first run)",
         starts.len(),
-        2 + 2,
+        2 + 2 + 3,
     );
     let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&["apply"]));
     assert!(
@@ -6299,7 +6537,8 @@ fn every_command_stays_within_its_git_budget() {
     budget("ohjaa apply (no entries yet, no change)", starts.len(), 2);
 
     // adopt: the repository's config and objects, git's global config, its
-    // config again once gated, and a check per file it writes (2).
+    // config again once gated, and a check per file it writes (2); then the
+    // home's commit (`add -A` and `commit`).
     let (starts, output) =
         sandbox.git_starts(&mut ohjaa_here(&["adopt", &gated.to_string_lossy()]));
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
@@ -6313,7 +6552,8 @@ fn every_command_stays_within_its_git_budget() {
         .join("repos/acme/gated/repo.toml")
         .is_file());
     assert!(started(&starts, "cat-file"), "{starts:#?}");
-    budget("ohjaa adopt", starts.len(), 4 + 2);
+    assert!(started(&starts, "commit"), "{starts:#?}");
+    budget("ohjaa adopt", starts.len(), 4 + 2 + 2);
 
     // adopt again once origin's gate has cargo tasks and a lock that pins
     // it, with a sykli that expands ${worktree_cache}: the gate is derived
@@ -6366,7 +6606,7 @@ fn every_command_stays_within_its_git_budget() {
     budget(
         "ohjaa adopt --force (cargo tasks, a lock)",
         relocked.len(),
-        4 + 2,
+        4 + 2 + 2,
     );
     sandbox.adopt(&own);
 

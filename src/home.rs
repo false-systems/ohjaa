@@ -16,10 +16,14 @@
 //!   git/config                       includeIf per entry remote -> its gated.config
 //!   roots                            where apply and doctor look
 //!   applied.toml                     what apply changed, for `apply --undo`
+//!   .git/                            the home's history: a local repository, never
+//!                                    pushed, one commit per decision on mine or
+//!                                    machine and per apply and adopt ([`commit`])
 //! ```
 //!
 //! The knowledge scopes (`mine/`, `machine/`) and the `ours` and `drafter`
-//! files live in the same directory and are not touched here.
+//! files live in the same directory and are not touched here; the history
+//! holds them too.
 //!
 //! A repository is found by its remote: `git@github.com:o/r.git`,
 //! `https://github.com/o/r` and `ssh://git@github.com/o/r.git` are all
@@ -332,6 +336,90 @@ pub fn unset_global(key: &str, value: Option<&str>) -> Result<()> {
         // Exit 5: nothing to unset, which is what was wanted.
         Some(0 | 5) => Ok(()),
         _ => bail!("git {} failed: {}", full.join(" "), output.failure_detail()),
+    }
+}
+
+/// The variables that would point git at another repository than the home.
+const REPOSITORY_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
+/// `git <args>` in the home, unsigned and with no automatic maintenance (a
+/// commit would start one more git, detached, to outlive ohjaa); with
+/// `repository`, on the home's own repository whatever git would find from
+/// there (an enclosing dotfiles repository, say).
+fn home_git(home: &Path, args: &[&str], repository: bool) -> Result<()> {
+    let mut command = Command::new("git");
+    if repository {
+        command
+            .arg("--git-dir")
+            .arg(home.join(".git"))
+            .arg("--work-tree")
+            .arg(home);
+    }
+    for setting in [
+        "commit.gpgsign=false",
+        "maintenance.auto=false",
+        "gc.auto=0",
+    ] {
+        command.args(["-c", setting]);
+    }
+    command.args(args).current_dir(home);
+    for var in REPOSITORY_VARS {
+        command.env_remove(var);
+    }
+    let output = process::run(&mut command, None, process::LOCAL).context("cannot run git")?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or_default(),
+            output.failure_detail()
+        );
+    }
+    Ok(())
+}
+
+/// The home's history: everything in the home, committed as one commit with
+/// `message`. The home is a local git repository (no remote; ohjaa never
+/// pushes), made by its first commit unless the home already is one. A
+/// commit is the person's, with the identity any commit of theirs takes from
+/// git's config, and never signed: nothing verifies a local history, and a
+/// signing prompt must not hold up a decision. Two git processes (`add -A`,
+/// `commit`), and `init` once before the first; a history this small never
+/// needs git's maintenance. A failure is the caller's to say; what was
+/// changed stands either way.
+pub fn commit(home: &Path, message: &str) -> Result<()> {
+    if !home.join(".git").exists() {
+        std::fs::create_dir_all(home)
+            .with_context(|| format!("cannot create {}", home.display()))?;
+        home_git(home, &["init", "-q"], false)?;
+    }
+    home_git(home, &["add", "-A"], true)?;
+    home_git(
+        home,
+        &["commit", "-q", "--allow-empty", "-m", message],
+        true,
+    )
+}
+
+/// [`commit`], said by `who`: what was committed on stdout, or on stderr why
+/// nothing was. Never an error: what was changed stands either way.
+pub fn commit_and_say(home: &Path, message: &str, who: &str) {
+    let subject = message.lines().next().unwrap_or_default();
+    match commit(home, message) {
+        Ok(()) => println!("{who}: committed in {}: {subject}", home.display()),
+        Err(error) => eprintln!(
+            "{who}: warning: \"{subject}\" stands, but is not in the history of {}: {error:#}; \
+             the next commit there takes it in",
+            home.display()
+        ),
     }
 }
 

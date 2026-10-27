@@ -1,13 +1,16 @@
 //! `ohjaa apply` and `ohjaa apply --undo`.
 //!
 //! `apply` writes the home's generated files (each entry's `hooks/` and
-//! `gated.config`, `git/config`, and `roots` on a first run) and changes three
-//! things outside it, and only those: one `include.path` in git's global
-//! config, a marked block in git's global excludes file, and the launcher line
-//! in `~/.zshrc`. Each is recorded in `applied.toml` before it is made (what
-//! the zshrc line replaced, whether a file, a blank line or a final newline
-//! was there), so `--undo` puts back exactly what was there, even after an
-//! apply that failed midway.
+//! `gated.config`, `git/config`, and `roots` on a first run) and changes
+//! these things outside it, and only those: one `include.path` in git's
+//! global config, a marked block in git's global excludes file, the launcher
+//! line in `~/.zshrc`, and the knowledge block in each agent's own global
+//! instruction file that exists ([`crate::instructions`]). Each is recorded in
+//! `applied.toml` before it is made (what the zshrc line replaced, whether a
+//! file, a blank line or a final newline was there), so `--undo` puts back
+//! exactly what was there, even after an apply that failed midway. What it
+//! changed is then one commit in the home's history ([`home::commit`]); a
+//! failed commit is said, and the change stands.
 //!
 //! Every change is planned before any is made: a refusal leaves nothing half
 //! applied, and `--dry-run` prints the same plan. Dispatchers are only ever
@@ -733,6 +736,8 @@ pub fn apply(
         ));
     }
 
+    steps.extend(instruction_steps()?);
+
     // Which ohjaa and sykli the dispatchers run: adopt writes an entry's
     // dispatchers with them, whatever else this run changes.
     if !options.dry_run {
@@ -758,13 +763,106 @@ pub fn apply(
         println!("ohjaa apply: dry run; nothing was changed");
         return Ok(0);
     }
+    let mut done = Vec::new();
     for step in steps {
         // Recorded before it is made: a failure after it can still be undone.
         keep_record(&home, &step.record)?;
         (step.run)()?;
         println!("ohjaa apply: {}", step.did);
+        done.push(step.did);
     }
+    home::commit_and_say(&home, &history_message("apply", &done), "ohjaa apply");
     Ok(0)
+}
+
+/// The commit that records what apply (or `--undo`) did, change by change.
+fn history_message(what: &str, done: &[String]) -> String {
+    format!(
+        "{what}: {} change{}\n\n{}",
+        done.len(),
+        if done.len() == 1 { "" } else { "s" },
+        done.join("\n")
+    )
+}
+
+/// The knowledge block in each agent's own instruction file: added, or
+/// rewritten where it is, in each file that exists outside every repository.
+/// Where an agent is set up but has no such file, or its file is inside a
+/// repository, that is said, and nothing is written.
+fn instruction_steps() -> Result<Vec<Step>> {
+    let (compact, broken) = crate::instructions::home_knowledge()?;
+    for broken in &broken {
+        eprintln!(
+            "ohjaa apply: warning: unreadable knowledge {}: {}; it is not in the agents' block",
+            broken.path.display(),
+            broken.reason
+        );
+    }
+    if compact.more > 0 || compact.text.len() > crate::knowledge::DEFAULT_BUDGET {
+        eprintln!(
+            "ohjaa apply: warning: mine and machine knowledge is over the {} characters an \
+             agent's own instruction file holds; the block holds {}",
+            crate::knowledge::DEFAULT_BUDGET,
+            compact.summary()
+        );
+    }
+    let mut steps = Vec::new();
+    for target in crate::instructions::targets() {
+        let Some(file) = target.file.clone() else {
+            if target.installed {
+                println!(
+                    "ohjaa apply: {} reads {}, which does not exist; apply creates no \
+                     instruction file (create it, then apply again, to give {} the knowledge too)",
+                    target.agent,
+                    target.usual.display(),
+                    target.agent
+                );
+            }
+            continue;
+        };
+        if let Some(root) = crate::instructions::inside_repository(&file) {
+            println!(
+                "ohjaa apply: {} ({}'s own instructions) is inside the repository {}; one \
+                 person's knowledge never goes into a file a repository shares, so it gets no \
+                 block",
+                file.display(),
+                target.agent,
+                root.display()
+            );
+            continue;
+        }
+        let now = read_or_empty(&file)?;
+        let (new, placed) =
+            crate::knowledge::with_block(&now, crate::knowledge::INSTRUCTIONS_BEGIN, &compact.text)
+                .with_context(|| format!("not writing {}", file.display()))?;
+        if new == now {
+            continue;
+        }
+        let (verb, what) = if crate::knowledge::has_block(&now)? {
+            (("rewrite", "rewrote"), "in")
+        } else {
+            (("write", "wrote"), "into")
+        };
+        let key = target.key;
+        let record = vec![
+            (
+                format!("instructions_{key}"),
+                file.to_string_lossy().into_owned(),
+            ),
+            (format!("instructions_{key}_blank"), flag(placed.blank)),
+            (format!("instructions_{key}_newline"), flag(placed.newline)),
+        ];
+        let said = format!(
+            "the knowledge block ({}) {what} {}, {}'s own instructions",
+            compact.summary(),
+            file.display(),
+            target.agent
+        );
+        steps.push(step(verb, said, record, move || {
+            home::write_file(&file, &new, None)
+        }));
+    }
+    Ok(steps)
 }
 
 /// Text as it was before apply: without a final newline when it had none.
@@ -872,6 +970,40 @@ pub fn undo(dry_run: bool) -> Result<i32> {
         ));
     }
 
+    // The knowledge block, from each agent's own file: the one apply wrote
+    // into (recorded), and the one the agent reads now.
+    let mut files: Vec<(PathBuf, crate::knowledge::Placed)> = Vec::new();
+    for target in crate::instructions::targets() {
+        let key = target.key;
+        let placed = crate::knowledge::Placed {
+            blank: yes(&format!("instructions_{key}_blank")),
+            newline: newline(&format!("instructions_{key}_newline")),
+        };
+        let recorded_file = recorded(&format!("instructions_{key}")).map(PathBuf::from);
+        if let Some(file) = &recorded_file {
+            files.push((file.clone(), placed));
+        }
+        if let Some(file) = target
+            .file
+            .filter(|file| Some(file) != recorded_file.as_ref())
+        {
+            files.push((file, crate::knowledge::Placed::IN_PLACE));
+        }
+    }
+    for (file, placed) in files {
+        let now = read_or_empty(&file)?;
+        if let Some(without) = crate::knowledge::without_block(&now, placed)
+            .with_context(|| format!("not changing {}", file.display()))?
+        {
+            steps.push(step(
+                ("remove", "removed"),
+                format!("the knowledge block from {}", file.display()),
+                Vec::new(),
+                move || home::write_file(&file, &without, None),
+            ));
+        }
+    }
+
     // What apply generated: each entry's dispatchers (only files that still
     // are one) and gated.config, the git config, the record; then the
     // folders, if nothing else is in them.
@@ -929,6 +1061,7 @@ pub fn undo(dry_run: bool) -> Result<i32> {
         println!("ohjaa apply --undo: nothing to undo");
         return Ok(0);
     }
+    let mut done = Vec::new();
     for step in steps {
         if dry_run {
             println!("ohjaa apply --undo: {}", step.will);
@@ -936,13 +1069,19 @@ pub fn undo(dry_run: bool) -> Result<i32> {
         }
         (step.run)()?;
         println!("ohjaa apply --undo: {}", step.did);
+        done.push(step.did);
     }
     if dry_run {
         println!("ohjaa apply --undo: dry run; nothing was changed");
     } else {
         println!(
-            "ohjaa apply --undo: kept the entries in {} and the roots",
+            "ohjaa apply --undo: kept the entries in {}, the roots and the home's history",
             home.join("repos").display()
+        );
+        home::commit_and_say(
+            &home,
+            &history_message("apply --undo", &done),
+            "ohjaa apply --undo",
         );
     }
     Ok(0)

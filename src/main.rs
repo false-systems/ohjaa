@@ -15,6 +15,7 @@ mod gate;
 mod gitconfig;
 mod home;
 mod hook;
+mod instructions;
 mod intake;
 mod integrated;
 mod knowledge;
@@ -299,18 +300,25 @@ enum Cmd {
         repos/<o>/<r>/gated.config    core.hooksPath = that entry's hooks/\n  \
         git/config                    includeIf \"hasconfig:remote.*.url:<pattern>\" per entry\n  \
         roots                         from --root on the first run: where the repositories are\n  \
-        applied.toml                  what apply changes outside the home, kept before each change\n\
+        applied.toml                  what apply changes outside the home, kept before each change\n  \
+        .git/                         the home's history: what apply changed, one commit (made\n                                \
+        on the home's first commit; never pushed)\n\
         Changes outside it, and nothing else:\n  \
         git's global config    [include] path = <home>/git/config (once)\n  \
         git's global excludes  a block marked \"ohjaa apply\" holding .sykli/ .teko/\n  \
         ~/.zshrc               [[ -x <ohjaa> ]] && eval \"$(<ohjaa> shell-init zsh)\", in place\n                         \
-        of a line that sources ~/projects/ohjaa-launch.zsh\n\
+        of a line that sources ~/projects/ohjaa-launch.zsh\n  \
+        each agent's own       a block marked \"ohjaa:knowledge\" holding mine and machine\n  \
+        instruction file       knowledge, in each that exists outside every repository:\n                         \
+        ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.pi/agent/AGENTS.md,\n                         \
+        ~/.config/opencode/AGENTS.md (none is created); each decision\n                         \
+        rewrites it where it is\n\
         <ohjaa> is the ohjaa on PATH (or --bin), and the pre-push dispatchers name\n\
         the sykli on PATH, both by absolute path. Dispatchers are only added;\n\
-        --prune removes the ones no clone needs. --undo puts the three changes back\n\
+        --prune removes the ones no clone needs. --undo puts the changes back\n\
         as they were (a hooksPath --force removed comes back at the end of [core],\n\
         a global config apply created is removed), and removes what apply wrote\n\
-        in the home except the entries and the roots.")]
+        in the home except the entries, the roots and the history.")]
     Apply {
         /// Print every change, and make none.
         #[arg(long)]
@@ -1499,7 +1507,32 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     };
     println!("{done} {id}");
     report(&outcome);
+    after_decision(action, id, &outcome, why);
     Ok(0)
+}
+
+/// What follows a person's decision, neither ever undoing it nor failing it:
+/// a decision on the home's own knowledge (mine, machine) is one commit in
+/// the home's history, and the agents' own instruction files get their
+/// knowledge block rewritten where it is.
+fn after_decision(action: &str, id: &str, outcome: &Outcome, why: Option<&str>) {
+    if outcome.in_the_home() {
+        let message = knowledge::decision_message(action, id, outcome, why);
+        let subject = message.lines().next().unwrap_or_default();
+        match home::ohjaa_home().map(home::absolute).and_then(|home| {
+            home::commit(&home, &message)?;
+            Ok(home)
+        }) {
+            Ok(home) => println!("  committed in {}: {subject}", home.display()),
+            Err(error) => eprintln!(
+                "ohjaa: warning: the decision stands, but \"{subject}\" is not in the home's \
+                 history: {error:#}; the next commit there takes it in"
+            ),
+        }
+    }
+    for said in instructions::sync() {
+        println!("  {said}");
+    }
 }
 
 fn show_pending(
@@ -1591,14 +1624,18 @@ fn cmd_review(list: bool) -> Result<i32> {
         print!("  [a]ccept  [r]eject  [s]kip  [q]uit > ");
         std::io::stdout().flush()?;
         let answer = lines.next().transpose()?.unwrap_or_default();
+        let id = &pending.node.id;
         let result = match answer.trim() {
-            "a" | "accept" => knowledge::accept(&dirs, &pending.node.id, today).map(Some),
-            "r" | "reject" => knowledge::reject(&dirs, &pending.node.id).map(Some),
+            "a" | "accept" => knowledge::accept(&dirs, id, today).map(|o| Some(("accept", o))),
+            "r" | "reject" => knowledge::reject(&dirs, id).map(|o| Some(("reject", o))),
             "q" | "quit" => break,
             _ => Ok(None),
         };
         match result {
-            Ok(Some(outcome)) => report(&outcome),
+            Ok(Some((action, outcome))) => {
+                report(&outcome);
+                after_decision(action, id, &outcome, None);
+            }
             Ok(None) => println!("  skipped"),
             Err(error) => println!("  refused: {error:#}"),
         }

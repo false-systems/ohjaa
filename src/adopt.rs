@@ -1,9 +1,9 @@
 //! `ohjaa adopt`: write a repository's entry into the home (`repo.toml`: the
 //! branch and `[cargo_env]`; no copy of a gate, every commit's gate being
 //! derived from the commit: from its own `sykli.json`, else from what `sykli
-//! init` writes for its tree) and regenerate the home's git config. It never touches git's
-//! global config, and never writes into a repository (it takes no lock there
-//! either: no `git status`).
+//! init` writes for its tree) and regenerate the home's git config, then commit
+//! that in the home's history. It never touches git's global config, and never
+//! writes into a repository (it takes no lock there either: no `git status`).
 
 use std::path::Path;
 use std::process::Command;
@@ -158,9 +158,21 @@ pub fn adopt(path: &Path, branch: Option<&str>, force: bool) -> Result<i32> {
     // config is not touched (it includes the home's file once, from apply).
     let global = gitconfig::GlobalFacts::read()?;
     let own = gitconfig::own_hooks_in(&common);
-    for said in crate::apply::regenerate(&home, &dir, &own, &global.rewrites())? {
+    let regenerated = crate::apply::regenerate(&home, &dir, &own, &global.rewrites())?;
+    for said in &regenerated {
         println!("  {said}");
     }
+    home::commit_and_say(
+        &home,
+        &format!(
+            "adopt {}: observe {branch}\n\n{source}\n{}",
+            id.slug(),
+            regenerated.join("\n")
+        )
+        .trim_end()
+        .to_owned(),
+        "ohjaa adopt",
+    );
     match gitconfig::gated_clone(&home, &top)? {
         Some(clone) => {
             let drift = gitconfig::clone_drift(&home, &clone);
