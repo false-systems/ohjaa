@@ -695,18 +695,20 @@ fn folded(events: Vec<&Item>) -> Vec<&Item> {
         .collect()
 }
 
-/// What happened after `since_ms`: my sessions, then what landed, then the
-/// other pull requests, each newest first.
+/// What happened from the second of `since_ms` on (a session's record and
+/// GitHub keep whole seconds): my sessions, then what landed, then the other
+/// pull requests, each newest first.
 fn after(view: &View, since_ms: i64) -> Vec<&Item> {
     let group = |kind: Kind| match kind {
         Kind::Ended { .. } => 0,
         Kind::Merged => 1,
         _ => 2,
     };
+    let from = since_ms - since_ms.rem_euclid(1000);
     let mut events = folded(
         view.events
             .iter()
-            .filter(|item| item.at_ms > since_ms)
+            .filter(|item| item.at_ms >= from)
             .collect(),
     );
     events.sort_by_key(|item| group(item.kind));
@@ -966,7 +968,7 @@ fn full(view: &View, since_ms: i64, pending: Option<&str>) -> String {
             },
             WIDTH,
         ));
-        out.push_str("\n");
+        out.push('\n');
     }
     if !view.sources.is_empty() || !view.notes.is_empty() {
         out.push_str("\nSources\n");

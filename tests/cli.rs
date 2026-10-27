@@ -55,10 +55,17 @@ exit "${OHJAA_STUB_EXIT:-0}"
 /// commit here; `pr view` with no branch asks about the one checked out.
 /// `pr list --search <sha>` finds a merged pull request for
 /// OHJAA_STUB_GH_PR_SEARCH only (or the sha in the file
-/// OHJAA_STUB_GH_PR_SEARCH_FILE names).
+/// OHJAA_STUB_GH_PR_SEARCH_FILE names). `api graphql` answers with the file
+/// OHJAA_STUB_GH_GRAPHQL names, each call counted in `$HOME/gh-graphql-calls`;
+/// without it, gh is not logged in.
 const GH_STUB: &str = r#"#!/bin/sh
 if [ -n "${OHJAA_STUB_GH_SLEEP:-}" ]; then sleep "$OHJAA_STUB_GH_SLEEP"; fi
 printf '%s|%s\n' "$PWD" "$*" >> "${OHJAA_STUB_GH_CALLS:-/dev/null}"
+if [ "$1 $2" = "api graphql" ] && [ -n "${OHJAA_STUB_GH_GRAPHQL:-}" ]; then
+  echo "api graphql" >> "$HOME/gh-graphql-calls"
+  cat "$OHJAA_STUB_GH_GRAPHQL"
+  exit 0
+fi
 if [ "$1 $2" = "pr list" ]; then
   sha=""
   while [ $# -gt 0 ]; do case "$1" in --search) sha="$2"; shift;; esac; shift; done
@@ -130,7 +137,8 @@ exit 0
 /// `$HOME/vessa-calls`. With `$HOME/vessa-gap` or `$HOME/vessa-warning` (each
 /// a JSON string) the list is partial, with that gap (a store vessa does not
 /// read) or source warning (one it could not read), and it exits 4. With
-/// `$HOME/vessa-old` it is a vessa older than `messages`.
+/// `$HOME/vessa-old` it is a vessa older than `messages`. `usage` prints
+/// `$HOME/vessa-usage.json`, else no sessions, its arguments logged too.
 const VESSA_STUB: &str = r#"#!/bin/sh
 if [ "$1" = messages ]; then
   printf '%s\n' "$*" >> "$HOME/vessa-calls"
@@ -147,6 +155,12 @@ if [ "$1" = messages ]; then
   printf '],\n"sessions":[],\n"coverage":{"excluded":{},"gaps":[%s],"limitations":[]},\n"warnings":[%s]}\n' "$gaps" "$warnings"
   [ "$code" = 4 ] && echo "vessa: partial message list (exit 4): 1 source warning, 0 limitations" >&2
   exit "$code"
+fi
+if [ "$1" = usage ]; then
+  printf '%s\n' "$*" >> "$HOME/vessa-calls"
+  if [ -f "$HOME/vessa-usage.json" ]; then cat "$HOME/vessa-usage.json"
+  else echo '{"schema":"vessa-usage.v1","sessions":[],"warnings":[]}'; fi
+  exit 0
 fi
 [ "$*" = "sessions --json --headers" ] || { echo "vessa stub: not the header listing: $*" >&2; exit 64; }
 if [ -n "${OHJAA_STUB_VESSA_JSON:-}" ]; then
@@ -7942,6 +7956,469 @@ fn a_receipt_that_reused_cached_tasks_is_said_so() {
             "- work: 2 commit(s), 1 whose sykli receipt says passed (1 reusing cached tasks), \
              1 whose receipt says cached (no task run)"
         ),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
+
+// ---- the human view: `ohjaa line`, `ohjaa digest`, `ohjaa collect` --------
+
+/// What an agent's shell carries (the list `ohjaa line --help` names): a
+/// person's terminal has none, and these tests may run in an agent's.
+const AGENT_MARKERS: [&str; 13] = [
+    "OHJAA_SESSION",
+    "TOIMIJA_SESSION",
+    "TOIMIJA_RUN",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "CODEX_MANAGED_BY_NPM",
+    "PI_SESSION_ID",
+    "OPENCODE",
+    "AI_AGENT",
+];
+
+/// One page of GitHub's search: a pull request merged into main an hour
+/// ago and one opened then, in false-systems.
+fn graphql_page(more: bool) -> String {
+    let at = |ago_s: i64| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let (days, s) = (
+            (now - ago_s).div_euclid(86_400),
+            (now - ago_s).rem_euclid(86_400),
+        );
+        // Civil from days (Howard Hinnant), as the binary does.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            s / 3600,
+            s % 3600 / 60,
+            s % 60
+        )
+    };
+    let repo = |name: &str| {
+        serde_json::json!({"nameWithOwner": format!("false-systems/{name}"),
+                           "defaultBranchRef": {"name": "main"}})
+    };
+    serde_json::json!({"data": {"search": {
+        "issueCount": if more { 250 } else { 2 },
+        "pageInfo": {"hasNextPage": more, "endCursor": if more { "next" } else { "" }},
+        "nodes": [
+            {"number": 76, "title": "Ask git once", "url": "https://github.com/x/76",
+             "createdAt": at(7200), "mergedAt": at(3600), "closedAt": at(3600),
+             "baseRefName": "main", "author": {"login": "yairfalse"},
+             "mergedBy": {"login": "yairfalse"}, "repository": repo("sykli")},
+            {"number": 16, "title": "docs: nothing refuses \u{1b}[2J", "url": "https://github.com/x/16",
+             "createdAt": at(3600), "mergedAt": null, "closedAt": null,
+             "baseRefName": "main", "author": {"login": "yairfalse"}, "mergedBy": null,
+             "repository": repo("faija")},
+            {},
+        ],
+    }}})
+    .to_string()
+}
+
+impl Fixture {
+    /// The workflow home with an entry of false-systems (whose pull
+    /// requests are asked for), and GitHub's answer for the search.
+    fn human_view(&self, more: bool) {
+        fs::create_dir_all(self.dir.join("config/ohjaa/repos/false-systems/sykli")).unwrap();
+        fs::write(self.dir.join("graphql.json"), graphql_page(more)).unwrap();
+    }
+
+    /// The real binary as a person's terminal runs it: no agent's markers,
+    /// gh answering the search.
+    fn person(&self) -> Command {
+        let mut command = self.ohjaa();
+        for marker in AGENT_MARKERS {
+            command.env_remove(marker);
+        }
+        command
+            .current_dir(self.dir.join("home"))
+            .env("OHJAA_STUB_GH_GRAPHQL", self.dir.join("graphql.json"))
+            .env("TZ", "UTC");
+        command
+    }
+
+    fn human_dir(&self) -> PathBuf {
+        self.dir.join("state/ohjaa/human")
+    }
+
+    fn graphql_calls(&self) -> usize {
+        fs::read_to_string(self.dir.join("home/gh-graphql-calls"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    /// Wait for the background collect a line started: its snapshot
+    /// written, and its lock let go.
+    fn collected(&self) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            let written = self.human_dir().join("collected.json").is_file();
+            if written && !lock_held(&self.human_dir().join("collect.lock")) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    }
+}
+
+/// Whether another process holds the flock(2) on `path`.
+fn lock_held(path: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = fs::OpenOptions::new().write(true).open(path) else {
+        return false;
+    };
+    // SAFETY: flock(2) on a descriptor this function owns.
+    let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    !free
+}
+
+/// Run `command` with its stdout on a pseudo-terminal, as a terminal's
+/// opening runs it: what it printed there (line breaks as `\n`), and its
+/// exit.
+fn on_a_terminal(command: &mut Command) -> (String, Option<i32>) {
+    use std::io::Read as _;
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain pty calls on descriptors this function owns.
+    let (mut master, slave) = unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(master >= 0, "no pty");
+        assert!(libc::grantpt(master) == 0 && libc::unlockpt(master) == 0);
+        let name = std::ffi::CStr::from_ptr(libc::ptsname(master)).to_owned();
+        let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        assert!(slave >= 0, "no pty slave");
+        (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave))
+    };
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(slave))
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // A pty holds little: read while it writes.
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut buffer = [0u8; 4096];
+        while let Ok(n) = master.read(&mut buffer) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buffer[..n]);
+        }
+        out
+    });
+    let status = child.wait().unwrap();
+    // Dropping `command`'s copy of the slave closes the last one.
+    drop(std::mem::replace(command, Command::new("true")));
+    let out = reader.join().unwrap();
+    (
+        String::from_utf8_lossy(&out).replace('\r', ""),
+        status.code(),
+    )
+}
+
+/// Audit finding: agent shells used up the digest. Without a terminal, or
+/// in an agent's shell at one, `line` prints, reads, writes and starts
+/// nothing.
+#[test]
+fn line_says_nothing_and_moves_nothing_without_a_person_at_a_terminal() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("line-guard");
+    fixture.human_view(false);
+    let repo = fixture.make_git_repo("work");
+    run_session(&fixture, &repo, "exit 0");
+    let (stdout, _, code) = output_of(fixture.person().arg("line"));
+    assert_eq!((stdout.as_str(), code), ("", Some(0)), "piped: nothing");
+    for marker in ["OHJAA_SESSION", "CLAUDECODE", "CODEX_THREAD_ID", "AI_AGENT"] {
+        let (said, code) = on_a_terminal(fixture.person().arg("line").env(marker, "1"));
+        assert_eq!((said.as_str(), code), ("", Some(0)), "{marker}: nothing");
+    }
+    assert!(!fixture.human_dir().exists(), "nothing written, no collect");
+    assert_eq!(fixture.graphql_calls(), 0);
+    // A person at a terminal: a collect starts, and what is new is said.
+    let (said, _) = on_a_terminal(fixture.person().arg("line"));
+    assert!(said.contains("1 session ended"), "{said}");
+    assert!(fixture.collected());
+    assert!(fixture.human_dir().join("seen.json").is_file());
+    fixture.cleanup();
+}
+
+/// The ruling: the first `line` of each local day prints the day's digest,
+/// then one line only when something is new. Audit findings: seeing a line
+/// moves the cursor, and sessions without read-back or handover are said.
+#[test]
+fn the_days_first_line_is_its_digest_then_a_line_only_for_what_is_new() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("line-day");
+    fixture.human_view(false);
+    let repo = fixture.make_git_repo("work");
+    run_session(&fixture, &repo, "exit 0");
+    let (_, stderr, code) = output_of(fixture.person().arg("collect"));
+    assert_eq!(code, Some(0), "{stderr}");
+    let day = |date: &str| {
+        let (said, code) = on_a_terminal(fixture.person().arg("line").env("OHJAA_TODAY", date));
+        assert_eq!(code, Some(0));
+        said
+    };
+    let digest = day("2026-10-27");
+    assert!(digest.starts_with("ohjaa · since "), "{digest}");
+    for said in [
+        "1 session ended · PRs: 1 merged, 1 opened",
+        "sh \"retry uploads\" · exit 0",
+        "no read-back or handover",
+        "#76 merged by yairfalse: Ask git once",
+        "#16 opened by yairfalse: docs: nothing refuses \u{fffd}[2J",
+    ] {
+        assert!(digest.contains(said), "missing `{said}`: {digest}");
+    }
+    assert!(!digest.contains("#76 opened"), "said once: {digest}");
+    assert_eq!(day("2026-10-27"), "", "nothing new since");
+    // Something new: one line, once.
+    run_session(&fixture, &repo, "exit 2");
+    let line = day("2026-10-27");
+    assert_eq!(
+        line,
+        "ohjaa · 1 session ended (1 without read-back/handover) · ohjaa digest\n"
+    );
+    assert_eq!(day("2026-10-27"), "", "seen");
+    // The next day: its digest, since the last one.
+    let next = day("2026-10-28");
+    assert!(next.starts_with("ohjaa · since "), "{next}");
+    assert!(next.contains("sh \"retry uploads\" · exit 2"), "{next}");
+    assert!(!next.contains("#76"), "shown the day before: {next}");
+    assert_eq!(day("2026-10-28"), "");
+    fixture.cleanup();
+}
+
+/// The ruling: `line` makes no network call and starts no git process; with
+/// a fresh snapshot it starts nothing at all.
+#[test]
+fn line_starts_no_git_and_touches_no_network() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("line-quiet");
+    fixture.human_view(false);
+    let repo = fixture.make_git_repo("work");
+    run_session(&fixture, &repo, "exit 0");
+    output_of(fixture.person().arg("collect"));
+    // Every program it could start, each logging that it was started.
+    let shims = fixture.dir.join("shims");
+    fs::create_dir_all(&shims).unwrap();
+    for program in ["git", "gh", "vessa", "sykli", "toimija", "ps", "kill", "sh"] {
+        let path = shims.join(program);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho {program} >> '{}'\n",
+                fixture.dir.join("started").display()
+            ),
+        )
+        .unwrap();
+        make_executable(&path);
+    }
+    let trace = fixture.dir.join("git-trace");
+    let mut command = fixture.person();
+    command
+        .arg("line")
+        .current_dir(&repo)
+        .env("PATH", &shims)
+        .env("GIT_TRACE2_EVENT", &trace)
+        .env("OHJAA_TODAY", "2026-10-27");
+    let (said, code) = on_a_terminal(&mut command);
+    assert_eq!(code, Some(0));
+    assert!(
+        said.starts_with("ohjaa · since"),
+        "the day's digest: {said}"
+    );
+    assert!(!fixture.dir.join("started").exists(), "started a process");
+    assert!(!trace.exists(), "started git");
+    fixture.cleanup();
+}
+
+/// A stale snapshot starts one collect in the background, never one per
+/// terminal; a running one is never joined by a second.
+#[test]
+fn a_stale_snapshot_starts_exactly_one_background_collect() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("line-collect");
+    fixture.human_view(false);
+    fs::create_dir_all(fixture.human_dir()).unwrap();
+    // A collect runs: the lock is held, so no line starts another.
+    let lock = fixture.human_dir().join("collect.lock");
+    let held = fs::File::create(&lock).unwrap();
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock(2) on a descriptor this test owns.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+    }
+    on_a_terminal(fixture.person().arg("line"));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!fixture.human_dir().join("collected.json").exists());
+    drop(held);
+    on_a_terminal(fixture.person().arg("line"));
+    assert!(fixture.collected(), "the line's collect wrote a snapshot");
+    assert_eq!(fixture.graphql_calls(), 1);
+    // Fresh now: no collect.
+    on_a_terminal(fixture.person().arg("line"));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(fixture.graphql_calls(), 1);
+    fixture.cleanup();
+}
+
+/// viemari's, ported: GitHub is asked at most twice, and a source that
+/// fails never fails the collect: it is said, as of when it last answered.
+#[test]
+fn collect_asks_github_at_most_twice_and_says_what_failed() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("collect-gh");
+    fixture.human_view(true);
+    let (stdout, stderr, code) = output_of(fixture.person().arg("collect"));
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert_eq!(fixture.graphql_calls(), 2, "never a third page");
+    let (digest, _, _) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert!(
+        digest.contains("250 pull requests were updated since"),
+        "{digest}"
+    );
+    // gh cannot be used: the collect says so and exits 4, keeping what
+    // GitHub said before.
+    let (stdout, _, code) = output_of(
+        fixture
+            .person()
+            .arg("collect")
+            .env_remove("OHJAA_STUB_GH_GRAPHQL"),
+    );
+    assert_eq!(code, Some(4), "{stdout}");
+    assert!(
+        stdout.contains("github  unavailable: gh api graphql: gh: To get started"),
+        "{stdout}"
+    );
+    let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(4), "{digest}");
+    assert!(digest.contains("GitHub as of "), "{digest}");
+    assert!(digest.contains("#76 merged by yairfalse"), "kept: {digest}");
+    fixture.cleanup();
+}
+
+/// viemari's, ported: a state directory the cursor cannot be written to
+/// never repeats the day's digest at every terminal.
+#[test]
+fn a_cursor_that_cannot_be_written_never_repeats_the_days_digest() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("line-readonly");
+    fixture.human_view(false);
+    output_of(fixture.person().arg("collect"));
+    use std::os::unix::fs::PermissionsExt;
+    let dir = fixture.human_dir();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let (said, code) = on_a_terminal(fixture.person().arg("line"));
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!((said.as_str(), code), ("", Some(0)));
+    fixture.cleanup();
+}
+
+/// The digest moves the cursor only when a person reads it; `--since`
+/// never does. What a session cost is from vessa, by the agent's own
+/// session ohjaa found at leaving.
+#[test]
+fn the_digest_says_what_a_session_cost_and_moves_the_cursor_only_for_a_person() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("digest");
+    fixture.human_view(false);
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    fake_claude(&fixture);
+    let native = "5e1976e4-71c3-407c-9533-0be05b7e1b70";
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "claude", "--intent", "costed"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_FAKE_NATIVE", native)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    fs::write(
+        fixture.dir.join("home/vessa-usage.json"),
+        serde_json::json!({"schema": "vessa-usage.v1", "warnings": [], "sessions": [
+            {"agent": "claude", "id": native, "limitations": [],
+             "totals": [{"input_tokens": 62, "output_tokens": 20305,
+                         "cache_read_tokens": 2923935, "cache_write_tokens": 94881,
+                         "estimated_usd_micros": null}]}]})
+        .to_string(),
+    )
+    .unwrap();
+    let (stdout, stderr, code) = output_of(fixture.person().arg("collect"));
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let calls = fs::read_to_string(fixture.dir.join("home/vessa-calls")).unwrap();
+    let usage: Vec<&str> = calls.lines().filter(|l| l.starts_with("usage")).collect();
+    assert_eq!(usage.len(), 1, "{calls}");
+    assert!(
+        usage[0].starts_with("usage --json --input ")
+            && usage[0].ends_with(&format!("{native}.jsonl")),
+        "only its transcript: {calls}"
+    );
+    let (digest, _, code) = output_of(fixture.person().arg("digest"));
+    assert_eq!(code, Some(0), "{digest}");
+    assert!(digest.contains("claude \"costed\" · exit 0"), "{digest}");
+    assert!(digest.contains("3.0M tokens"), "{digest}");
+    assert!(!fixture.human_dir().join("seen.json").exists(), "piped");
+    let (said, _) = on_a_terminal(fixture.person().args(["digest", "--since", "7d"]));
+    assert!(said.contains("Sessions ended"), "{said}");
+    assert!(!fixture.human_dir().join("seen.json").exists(), "--since");
+    let (said, _) = on_a_terminal(fixture.person().arg("digest"));
+    assert!(said.contains("Sessions ended"), "{said}");
+    assert!(
+        fixture.human_dir().join("seen.json").is_file(),
+        "a person read it"
+    );
+    // Seen: today's digest is done, and nothing is new.
+    let (said, _) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(said, "");
+    fixture.cleanup();
+}
+
+#[test]
+fn shell_init_adds_the_line_after_the_launcher() {
+    let fixture = Fixture::new("shell-init-line");
+    let (stdout, _, code) = output_of(fixture.ohjaa().args(["shell-init", "zsh"]));
+    assert_eq!(code, Some(0));
+    assert!(stdout.contains("_ohjaa_launch()"), "{stdout}");
+    assert!(
+        stdout
+            .trim_end()
+            .ends_with("[[ ${OHJAA_LINE:-1} == 0 ]] || ohjaa line"),
         "{stdout}"
     );
     fixture.cleanup();
