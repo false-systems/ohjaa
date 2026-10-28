@@ -50,8 +50,13 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   candidate the drafter answered for or failed on, its time and a digest of
   its words, never the words, and for a failure how often and why in ohjaa's
   words, kept until the drafter answers for it; an end line with the count),
-  the lock that lets one intake run at a time (`intake.lock`), the
-  report's two times (`report-at`, `report-shown-at`), and the human view's
+  the lock that lets one intake run at a time (`intake.lock`), what intake
+  saw of each current node (`knowledge-evidence.json`: per node, each
+  message a person re-taught it with, by its time, a digest of its words and
+  its session's id, never the words, and when a draft last cited it; history
+  like the session log, read by `ohjaa list`, `check` and `review`, never by
+  a briefing, a gate or a report), the report's two times (`report-at`,
+  `report-shown-at`), and the human view's
   folder (`human/`: `seen.json`, what the person last saw and when, the keys
   of what was said in the last two hours, where the next digest begins and
   where the earliest of what a day's digest left out begins, each with the
@@ -64,7 +69,8 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   the terminal saying the line and by `ohjaa digest` shown to a person, and
   `collect.lock`, held by the one collect that runs). Deleting them loses
   no knowledge: intake then reads its default window again, and sends once
-  more what is still in it, and the human view starts from the last day.
+  more what is still in it, the counts of re-teaching start again, and the
+  human view starts from the last day.
   Everything else — fleet, perimeter, coverage, marks — is derived now and
   stored never, but in the human view's snapshot: a copy that is said with
   its age wherever it is shown, read only by `ohjaa line`, `ohjaa digest`

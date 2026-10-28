@@ -1465,17 +1465,19 @@ pub fn summary(report: &Report) -> String {
 /// from the session itself; a missing read-back is not.
 pub fn candidates(report: &Report) -> Vec<Candidate> {
     let mut out = Vec::new();
-    let mut push = |at_ms: i64, place: &str, context: String, text: String| {
-        out.push(Candidate {
-            source: "observed",
-            at_ms,
-            at: intake::rfc3339(at_ms.div_euclid(1000)),
-            place: place.to_owned(),
-            who: "ohjaa".to_owned(),
-            context,
-            text,
-        });
-    };
+    let mut push =
+        |at_ms: i64, place: &str, session: Option<&str>, context: String, text: String| {
+            out.push(Candidate {
+                source: "observed",
+                at_ms,
+                at: intake::rfc3339(at_ms.div_euclid(1000)),
+                place: place.to_owned(),
+                who: "ohjaa".to_owned(),
+                context,
+                text,
+                session: session.map(str::to_owned),
+            });
+        };
     for u in report
         .untold
         .iter()
@@ -1484,6 +1486,7 @@ pub fn candidates(report: &Report) -> Vec<Candidate> {
         push(
             u.started_ms,
             &u.repo,
+            Some(&u.id),
             format!(
                 "session {} ({}, {}), observed by ohjaa, not said by anyone",
                 u.id, u.agent, u.intent
@@ -1498,6 +1501,7 @@ pub fn candidates(report: &Report) -> Vec<Candidate> {
         push(
             u.on.committed * 1000,
             &u.repo,
+            None,
             format!(
                 "{} on {} in {}, observed by ohjaa, not said by anyone",
                 short(&u.on.commit),
@@ -1519,6 +1523,7 @@ pub fn candidates(report: &Report) -> Vec<Candidate> {
             push(
                 b.started_ms,
                 &b.cwd,
+                Some(&b.id),
                 format!(
                     "{} session {}, observed by ohjaa through vessa, not said by anyone",
                     b.agent, b.id

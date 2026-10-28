@@ -11,6 +11,7 @@ mod apply;
 mod collect;
 mod derived;
 mod doctor;
+mod evidence;
 mod flat_toml;
 mod gate;
 mod gitconfig;
@@ -146,7 +147,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// List the knowledge that applies here.
+    /// List the knowledge that applies here, each current node with how often
+    /// a person had to teach it again since it was accepted.
     List {
         /// Include superseded and retired knowledge.
         #[arg(long)]
@@ -207,7 +209,8 @@ enum Cmd {
         #[command(subcommand)]
         action: LessonsCmd,
     },
-    /// Validate every node and flag what may no longer hold.
+    /// Validate every node, flag what may no longer hold, and suggest what
+    /// to reword or re-confirm (suggestions only: they never fail `--strict`).
     Check {
         /// Briefing size, in characters, past which it is too long to be read.
         #[arg(long, default_value_t = knowledge::DEFAULT_BUDGET)]
@@ -231,7 +234,8 @@ enum Cmd {
         #[arg(long = "source", value_name = "SOURCE")]
         sources: Vec<String>,
         /// The command that drafts: it reads the prompt on stdin and prints a
-        /// JSON array. Default: ~/.config/ohjaa/drafter, else `claude -p`.
+        /// JSON object: its drafts, and what each candidate re-teaches. Default:
+        /// ~/.config/ohjaa/drafter, else `claude -p`.
         #[arg(long)]
         drafter: Option<String>,
         /// Candidates per drafter call.
@@ -1789,6 +1793,13 @@ fn cmd_list(all: bool) -> Result<i32> {
     // Where each of this repository's own current nodes stands: in its
     // AGENTS.md, in a pull request, or not delivered, and why.
     let standing = lessons::Standing::read(&dirs, &loaded);
+    // How often each current node was re-taught, and when last touched. A
+    // record that cannot be read is said, never shown as no counts.
+    let evidence = evidence::Evidence::read(&dirs);
+    if let Err(error) = &evidence {
+        eprintln!("ohjaa: {error:#}; how often each node was re-taught is not shown");
+    }
+    let today = knowledge::today();
     for located in &nodes {
         let node = &located.node;
         println!(
@@ -1806,6 +1817,10 @@ fn cmd_list(all: bool) -> Result<i32> {
         if let Some(status) = status {
             println!("{:<8} {status}", "");
         }
+        if let (Ok(evidence), Status::Current) = (&evidence, node.status) {
+            let tally = evidence.tally(located.scope, dirs.repo_root.as_deref(), node, today);
+            println!("{:<8} {}", "", tally.line());
+        }
     }
     if nodes.is_empty() {
         println!("no knowledge here yet");
@@ -1817,7 +1832,11 @@ fn cmd_list(all: bool) -> Result<i32> {
             broken.reason
         );
     }
-    Ok(if loaded.broken.is_empty() { 0 } else { 1 })
+    Ok(if loaded.broken.is_empty() && evidence.is_ok() {
+        0
+    } else {
+        1
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2020,11 +2039,14 @@ fn after_decision(
     }
 }
 
+/// `tally` says, of a current node, how often it was re-taught (see
+/// [`evidence::Tally::line`]); `None` for any other.
 fn show_pending(
     pending: &knowledge::Pending,
     duplicate_of: Option<&str>,
     loaded: &knowledge::Loaded,
     waiting: &[knowledge::Pending],
+    tally: &dyn Fn(&str) -> Option<String>,
 ) {
     let node = &pending.node;
     let place = match &pending.repo {
@@ -2060,6 +2082,9 @@ fn show_pending(
                 ""
             }
         );
+        if let Some(line) = tally(base) {
+            println!("    {base}: {line}");
+        }
     }
     if !node.supersedes.is_empty() {
         println!("    supersedes: {}", node.supersedes.join(", "));
@@ -2069,6 +2094,9 @@ fn show_pending(
             "    possible duplicate of: {} (their titles are near; you decide)",
             standing(of)
         );
+        if let Some(line) = tally(of) {
+            println!("    {of}: {line}");
+        }
     }
 }
 
@@ -2090,9 +2118,33 @@ fn cmd_review(list: bool) -> Result<i32> {
         println!("nothing is waiting for a decision");
         return Ok(0);
     }
+    // How often a current node a proposal names was re-taught: the person
+    // decides with it in view.
+    let evidence = evidence::Evidence::read(&dirs);
+    if let Err(error) = &evidence {
+        eprintln!("ohjaa: {error:#}; how often a node was re-taught is not shown");
+    }
+    let today = knowledge::today();
+    let tally = |id: &str| -> Option<String> {
+        let evidence = evidence.as_ref().ok()?;
+        let located = loaded
+            .nodes
+            .iter()
+            .find(|l| l.node.id == id && l.node.status == Status::Current)?;
+        Some(
+            evidence
+                .tally(
+                    located.scope,
+                    dirs.repo_root.as_deref(),
+                    &located.node,
+                    today,
+                )
+                .line(),
+        )
+    };
     if list {
         for (pending, of) in &reviewed {
-            show_pending(pending, of.as_deref(), &loaded, &waiting);
+            show_pending(pending, of.as_deref(), &loaded, &waiting, &tally);
         }
         println!(
             "\n{} waiting; decide with `ohjaa review` at a terminal",
@@ -2106,7 +2158,7 @@ fn cmd_review(list: bool) -> Result<i32> {
     let today = knowledge::today();
     let mut asker = lessons::Asker::new(roots::load(&[], dirs.repo_root.as_deref()));
     for (pending, of) in &reviewed {
-        show_pending(pending, of.as_deref(), &loaded, &waiting);
+        show_pending(pending, of.as_deref(), &loaded, &waiting, &tally);
         print!("  [a]ccept  [r]eject  [s]kip  [q]uit > ");
         std::io::stdout().flush()?;
         let answer = lines.next().transpose()?.unwrap_or_default();
@@ -2228,6 +2280,46 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
         .iter()
         .filter(|l| l.node.status == Status::Current)
         .count();
+    // Does it work? Per current node, how often a person had to teach it
+    // again, and what that suggests. Suggestions only: never a flag, and
+    // ohjaa never changes a node itself.
+    let mut suggestions = 0;
+    match evidence::Evidence::read(&dirs) {
+        Err(error) => {
+            println!("error    {error:#}");
+            errors += 1;
+        }
+        Ok(evidence) => {
+            let today = knowledge::today();
+            let mut nodes: Vec<&fk::Located> = loaded
+                .nodes
+                .iter()
+                .filter(|l| l.node.status == Status::Current)
+                .collect();
+            nodes.sort_by(|a, b| {
+                (a.scope, a.node.kind, &a.node.id).cmp(&(b.scope, b.node.kind, &b.node.id))
+            });
+            let mut suggested = Vec::new();
+            for located in nodes {
+                let node = &located.node;
+                let tally = evidence.tally(located.scope, dirs.repo_root.as_deref(), node, today);
+                println!("evidence {}: {}", node.id, tally.line());
+                // A fact flagged as not re-confirmed already asks.
+                let flagged_stale = flags.iter().any(
+                    |flag| matches!(flag, knowledge::Flag::Stale { id, .. } if *id == node.id),
+                );
+                match tally.suggestion() {
+                    Some(evidence::Suggestion::StillTrue) if flagged_stale => {}
+                    Some(suggestion) => suggested.push((&node.id, suggestion)),
+                    None => {}
+                }
+            }
+            for (id, suggestion) in &suggested {
+                println!("suggest  {id}: {}", suggestion.describe());
+            }
+            suggestions = suggested.len();
+        }
+    }
     for scope in Scope::ALL {
         match (scope, dirs.scope_dir(scope), dirs.repo_root.as_deref()) {
             (Scope::Repo, Some(legacy), Some(root)) => {
@@ -2252,7 +2344,8 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
         }
     }
     println!(
-        "summary  {current} current, {} waiting for a decision, {errors} error(s), {} flag(s), briefing {size}/{budget}",
+        "summary  {current} current, {} waiting for a decision, {errors} error(s), {} flag(s), \
+         {suggestions} suggestion(s), briefing {size}/{budget}",
         waiting.len(),
         flags.len() + usize::from(over)
     );
@@ -2427,6 +2520,13 @@ fn cmd_intake(
     // What earlier runs handled, read first: a retry reads back to the oldest
     // candidate set aside.
     let mut handled = intake::read_handled(&dirs)?;
+    // What was seen of each node, before anything is sent: a damaged record
+    // stops the run, and is never replaced. A dry run records nothing.
+    let mut evidence = if dry_run {
+        evidence::Evidence::default()
+    } else {
+        evidence::Evidence::read(&dirs)?
+    };
     let retry: std::collections::HashSet<intake::Key> = if retry_failed {
         handled.set_aside().map(|(key, _)| *key).collect()
     } else {
@@ -2627,6 +2727,9 @@ fn cmd_intake(
     // Proposals that may repeat what was present, by the id of what each may
     // repeat.
     let mut possible: std::collections::BTreeMap<String, usize> = Default::default();
+    // Re-teachings recorded in this run, by node id; and those dropped.
+    let mut recorded: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut dropped = intake::Dropped::default();
     let mut drafted = intake::Drafted::default();
     if left > 0 {
         let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
@@ -2644,15 +2747,30 @@ fn cmd_intake(
                 // Scrubbed of secrets, whatever the source or the filter.
                 let (prompt, scrubbed) = intake::prompt(&known, chunk);
                 redacted += scrubbed;
-                for draft in intake::draft(&drafter, &prompt)? {
+                let answer = intake::draft(&drafter, &prompt)?;
+                // Checked against what the drafter was shown, before the
+                // drafts of this answer join it.
+                let (retaught, dropped_here) = known.retaught(&answer.reteaches, chunk);
+                dropped.add(dropped_here);
+                // The nodes the drafts written refine or supersede.
+                let mut named: Vec<String> = Vec::new();
+                for draft in answer.drafts {
                     let id = draft.id.clone();
                     let result = draft.into_proposal().and_then(|proposal| {
                         let near = known.repeated_by(&proposal).map(str::to_owned);
                         let present = known.present(&proposal);
-                        knowledge::propose(&dirs, &loaded, proposal, today).map(|_| (present, near))
+                        let names: Vec<String> = proposal
+                            .refines
+                            .iter()
+                            .chain(&proposal.supersedes)
+                            .cloned()
+                            .collect();
+                        knowledge::propose(&dirs, &loaded, proposal, today)
+                            .map(|_| (present, near, names))
                     });
                     match result {
-                        Ok((present, near)) => {
+                        Ok((present, near, names)) => {
+                            named.extend(names);
                             // Present for the drafts after it in this answer.
                             known.add(present);
                             proposed += 1;
@@ -2671,6 +2789,31 @@ fn cmd_intake(
                             eprintln!("ohjaa: draft `{id}` refused: {error:#}");
                         }
                     }
+                }
+                // Kept before the batch is handled: a run killed between
+                // the two sends it again, and a message counts once.
+                let mut new = Vec::new();
+                for r in &retaught {
+                    if evidence.retaught(&r.node, r.key, r.session.as_deref()) {
+                        new.push(r);
+                    }
+                }
+                let mut changed = !new.is_empty();
+                // A citation is as of the newest message of its batch.
+                if let Some(newest) = chunk.iter().map(|c| c.at_ms).max() {
+                    for node in known.cited(&named, chunk) {
+                        changed |= evidence.cited(&node, newest);
+                    }
+                }
+                if changed {
+                    evidence.write(&dirs).map_err(|error| {
+                        intake::Failure::Silent(error.context("cannot keep the knowledge evidence"))
+                    })?;
+                }
+                // Said by node, time and source, never by the words.
+                for r in new {
+                    println!("re-taught {} ({} {})", r.node.id, r.at, r.source);
+                    *recorded.entry(r.node.id.clone()).or_default() += 1;
                 }
                 Ok(())
             },
@@ -2704,6 +2847,13 @@ fn cmd_intake(
              secret-looking token(s) were redacted from what it was sent",
             drafted.sent
         );
+        if dropped.total() > 0 {
+            eprintln!(
+                "ohjaa: intake: {} re-teaching(s) the drafter named were dropped: {}",
+                dropped.total(),
+                dropped.describe()
+            );
+        }
     }
     handled.done_retrying();
     // A session is drafted from once every candidate of it is handled, in
@@ -2818,6 +2968,18 @@ fn cmd_intake(
             println!(
                 "possible duplicates: {} (`ohjaa review` shows each after what it may repeat)",
                 of.join(", ")
+            );
+        }
+        let retaught: usize = recorded.values().sum();
+        if retaught > 0 {
+            let by: Vec<String> = recorded
+                .iter()
+                .map(|(id, n)| format!("{id} ×{n}"))
+                .collect();
+            println!(
+                "{retaught} re-teaching(s) of current knowledge recorded: {} (`ohjaa check` shows \
+                 each node's count)",
+                by.join(", ")
             );
         }
     }
