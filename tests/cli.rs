@@ -159,7 +159,7 @@ fi
 if [ "$1" = usage ]; then
   printf '%s\n' "$*" >> "$HOME/vessa-calls"
   if [ -f "$HOME/vessa-usage.json" ]; then cat "$HOME/vessa-usage.json"
-  else echo '{"schema":"vessa-usage.v1","sessions":[],"warnings":[]}'; fi
+  else echo '{"schema":"vessa-usage.v2","sessions":[],"warnings":[]}'; fi
   exit 0
 fi
 [ "$*" = "sessions --json --headers" ] || { echo "vessa stub: not the header listing: $*" >&2; exit 64; }
@@ -9420,11 +9420,10 @@ fn the_digest_says_what_a_session_cost_and_moves_the_cursor_only_for_a_person() 
     assert_eq!(code, Some(0), "{stderr}");
     fs::write(
         fixture.dir.join("home/vessa-usage.json"),
-        serde_json::json!({"schema": "vessa-usage.v1", "warnings": [], "sessions": [
+        serde_json::json!({"schema": "vessa-usage.v2", "warnings": [], "sessions": [
             {"agent": "claude", "id": native, "limitations": [],
              "totals": [{"input_tokens": 62, "output_tokens": 20305,
-                         "cache_read_tokens": 2923935, "cache_write_tokens": 94881,
-                         "estimated_usd_micros": null}]}]})
+                         "cache_read_tokens": 2923935, "cache_write_tokens": 94881}]}]})
         .to_string(),
     )
     .unwrap();
