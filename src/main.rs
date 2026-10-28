@@ -373,7 +373,7 @@ enum Cmd {
         on the home's first commit; never pushed)\n\
         Changes outside it, and nothing else:\n  \
         git's global config    [include] path = <home>/git/config (once)\n  \
-        git's global excludes  a block marked \"ohjaa apply\" holding .sykli/ .teko/\n  \
+        git's global excludes  a block marked \"ohjaa apply\" holding .sykli/ .teko/ .ohjaa/\n  \
         ~/.zshrc               [[ -x <ohjaa> ]] && eval \"$(<ohjaa> shell-init zsh)\", in place\n                         \
         of a line that sources ~/projects/ohjaa-launch.zsh\n  \
         each agent's own       a block marked \"ohjaa:knowledge\" holding mine and machine\n  \

@@ -56,7 +56,9 @@ pub const IGNORE_BEGIN: &str =
     "# >>> ohjaa apply: workflow files no repository tracks (edits inside are replaced)";
 const IGNORE_END: &str = "# <<< ohjaa apply";
 /// What every repository ignores without being told: the workflow's own files.
-pub const IGNORED: &[&str] = &[".sykli/", ".teko/"];
+/// `.ohjaa/` is a repository's accepted lessons left in its checkout; untracked,
+/// it would count in sykli's tree digest, and no receipt would match a commit.
+pub const IGNORED: &[&str] = &[".sykli/", ".teko/", ".ohjaa/"];
 
 const RECORD_SCHEMA: &str = "ohjaa-applied.v1";
 
@@ -1415,7 +1417,7 @@ mod tests {
 
     #[test]
     fn the_ignore_block_is_added_once_replaced_in_place_and_taken_out() {
-        let block = format!("{IGNORE_BEGIN}\n.sykli/\n.teko/\n{IGNORE_END}\n");
+        let block = format!("{IGNORE_BEGIN}\n.sykli/\n.teko/\n.ohjaa/\n{IGNORE_END}\n");
         assert_eq!(ignore_with_block("").unwrap(), (block.clone(), false));
         let mine = "*.swp\n.DS_Store\n";
         let (added, blank) = ignore_with_block(mine).unwrap();

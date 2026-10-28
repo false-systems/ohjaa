@@ -1259,7 +1259,7 @@ starts it.
                                     or machine, per apply and per adopt; never pushed
 ~/.gitconfig                        [include] path = ~/.config/ohjaa/git/config (once)
 ~/.config/git/ignore                git's global excludes (or core.excludesFile):
-                                    a block marked "ohjaa apply" holds .sykli/ and .teko/
+                                    a block marked "ohjaa apply" holds .sykli/, .teko/ and .ohjaa/
 ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.pi/agent/AGENTS.md,
 ~/.config/opencode/AGENTS.md        each that exists: a block marked "ohjaa:knowledge"
                                     holds mine and machine (see "Keeping it true")
