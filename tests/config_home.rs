@@ -8046,7 +8046,10 @@ fn an_older_ignore_block_is_upgraded_in_place_and_undo_is_exact() {
     assert!(ignore.contains("\n.sykli/\n.teko/\n.ohjaa/\n"), "{ignore}");
     sandbox.git(&repo, &["check-ignore", "-q", ".teko/state.json"]);
     sandbox.git(&repo, &["check-ignore", "-q", ".sykli/receipt.json"]);
-    sandbox.git(&repo, &["check-ignore", "-q", ".ohjaa/knowledge/a-lesson.md"]);
+    sandbox.git(
+        &repo,
+        &["check-ignore", "-q", ".ohjaa/knowledge/a-lesson.md"],
+    );
 
     // As each earlier apply left it: `.sykli/` only, then `.sykli/` and
     // `.teko/`, the block on machines applied before `.ohjaa/` was added.
@@ -8058,14 +8061,15 @@ fn an_older_ignore_block_is_upgraded_in_place_and_undo_is_exact() {
         let output = sandbox.ohjaa(&["doctor"]);
         let (stdout, _) = text(&output);
         assert!(
-            stdout.contains(
-                "holds an older ohjaa block; it should ignore .sykli/ .teko/ .ohjaa/"
-            ),
+            stdout.contains("holds an older ohjaa block; it should ignore .sykli/ .teko/ .ohjaa/"),
             "{stdout}"
         );
         let output = sandbox.ohjaa(&["apply"]);
         let (stdout, _) = text(&output);
-        assert!(stdout.contains("added .sykli/ .teko/ .ohjaa/ to"), "{stdout}");
+        assert!(
+            stdout.contains("added .sykli/ .teko/ .ohjaa/ to"),
+            "{stdout}"
+        );
         assert_eq!(
             sandbox.read("config/git/ignore"),
             ignore,
