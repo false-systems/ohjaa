@@ -505,9 +505,9 @@ fn ended(session: &Session, left: &Left, usage: Option<&TokenUsage>) -> Item {
     }
     let (readback, handover) = (session.readback.is_some(), session.handover.is_some());
     match (readback, handover) {
-        (false, false) => parts.push("no read-back or handover".to_owned()),
-        (false, true) => parts.push("no read-back".to_owned()),
-        (true, false) => parts.push("no handover".to_owned()),
+        (false, false) => parts.push("missing startup notes and handover".to_owned()),
+        (false, true) => parts.push("missing startup notes".to_owned()),
+        (true, false) => parts.push("missing handover".to_owned()),
         (true, true) => {}
     }
     if !left.landed.is_empty() {
@@ -645,10 +645,20 @@ fn build(
             n => format!(" ({n} failed)"),
         };
         let said = format!(
-            "{}: {}{} unproven{failed}",
+            "{}: {}{} {} need{} passing checks{failed}",
             clean(&branch.branch),
             branch.unproven,
             if branch.more { "+" } else { "" },
+            if branch.unproven == 1 && !branch.more {
+                "commit"
+            } else {
+                "commits"
+            },
+            if branch.unproven == 1 && !branch.more {
+                "s"
+            } else {
+                ""
+            },
         );
         let age = match (&branch.error, old(branch.as_of_ms, now_ms)) {
             (Some(_), _) => format!(", {} (unread since)", as_of(branch.as_of_ms, now_ms)),
@@ -665,7 +675,7 @@ fn build(
             ),
             &branch.slug,
             format!(
-                "{said} since {}{age}. Prove it: ohjaa gate",
+                "{said} since {}{age}. Run: ohjaa gate",
                 short(branch.oldest.as_deref().unwrap_or("?"))
             ),
         );
@@ -926,17 +936,17 @@ fn count(items: &[&Item], of: impl Fn(Kind) -> bool) -> usize {
     items.iter().filter(|item| of(item.kind)).count()
 }
 
-/// `3 sessions ended (1 without read-back/handover)`: with `gaps`, how many
-/// of them left no read-back or no handover.
+/// `3 agent sessions ended (1 missing startup notes or handover)`: with `gaps`, how many
+/// of them omitted startup notes or a handover.
 fn sessions_ended(events: &[&Item], gaps: bool) -> Option<String> {
     let ended = count(events, |k| matches!(k, Kind::Ended { .. }));
     if ended == 0 {
         return None;
     }
     let untold = count(events, |k| k == Kind::Ended { told: false });
-    let mut text = plural(ended, "session ended", "sessions ended");
+    let mut text = plural(ended, "agent session ended", "agent sessions ended");
     if gaps && untold > 0 {
-        text.push_str(&format!(" ({untold} without read-back/handover)"));
+        text.push_str(&format!(" ({untold} missing startup notes or handover)"));
     }
     Some(text)
 }
@@ -960,7 +970,7 @@ fn pull_requests(events: &[&Item]) -> Option<String> {
 /// at most [`WIDTH`] characters; `None` when nothing is.
 fn one_line(news: &News) -> Option<String> {
     let mut parts = Vec::new();
-    // `sykli main: 2 unproven (1 failed)`, as the digest says it.
+    // Name the repository and branch, and explain what is missing.
     let mains: Vec<&&Item> = news
         .standing
         .iter()
@@ -969,7 +979,7 @@ fn one_line(news: &News) -> Option<String> {
     match mains.as_slice() {
         [] => {}
         [one] => parts.extend(one.brief.clone()),
-        many => parts.push(format!("{} branches not proven", many.len())),
+        many => parts.push(format!("{} branches need passing checks", many.len())),
     }
     parts.extend(
         news.standing
@@ -1006,8 +1016,8 @@ fn one_line(news: &News) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
-    // Whole parts only: what does not fit is left to the digest, said with `…`.
-    let (more, tail) = (" · …", " · ohjaa digest");
+    // Keep the details command even when a repository name is very long.
+    let (more, tail) = (" · more", " · Details: ohjaa digest");
     let mut line = String::from("ohjaa");
     for (i, part) in parts.iter().enumerate() {
         let after = if i + 1 < parts.len() { more } else { "" };
@@ -1015,24 +1025,80 @@ fn one_line(news: &News) -> Option<String> {
             .iter()
             .map(|s| s.chars().count())
             .sum::<usize>();
-        if width > WIDTH && i > 0 {
-            line.push_str(more);
+        if width > WIDTH {
+            if i == 0 {
+                let room = WIDTH.saturating_sub(
+                    line.chars().count() + 3 + after.chars().count() + tail.chars().count(),
+                );
+                line.push_str(" · ");
+                line.push_str(&cut(part, room));
+                line.push_str(after);
+            } else {
+                line.push_str(more);
+            }
             break;
         }
         line.push_str(" · ");
         line.push_str(part);
     }
     line.push_str(tail);
-    Some(format!("{}\n", cut(&line, WIDTH)))
+    Some(format!("{line}\n"))
 }
 
-/// `  ! sykli    main: 2 unproven since 5fcdeef. Prove it: ohjaa gate`.
+/// `  ! sykli    main: 2 commits need passing checks since 5fcdeef. Run: ohjaa gate`.
 fn row(item: &Item, width: usize) -> String {
     let bullet = if item.class.is_some() { "!" } else { "·" };
     cut(
         &format!("  {bullet} {:<width$}  {}", item.repo, item.text),
         WIDTH,
     )
+}
+
+/// The full digest must not discard the details its summary points to.
+fn full_row(item: &Item, width: usize) -> String {
+    let bullet = if item.class.is_some() { "!" } else { "·" };
+    let mut out = String::new();
+    let mut line = String::new();
+    for c in format!("  {bullet} {:<width$}  ", item.repo).chars() {
+        if line.chars().count() == WIDTH {
+            out.push_str(&line);
+            out.push('\n');
+            line = "    ".into();
+        }
+        line.push(c);
+    }
+    for (i, part) in item.text.split(" · ").enumerate() {
+        let separator = if i == 0 { "" } else { " · " };
+        if line.chars().count() + separator.chars().count() + part.chars().count() <= WIDTH {
+            line.push_str(separator);
+            line.push_str(part);
+            continue;
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+        line = "    ".into();
+        for word in part.split_whitespace() {
+            if line.chars().count() > 4 {
+                if line.chars().count() + 1 + word.chars().count() > WIDTH {
+                    out.push_str(&line);
+                    out.push('\n');
+                    line = "    ".into();
+                } else {
+                    line.push(' ');
+                }
+            }
+            for c in word.chars() {
+                if line.chars().count() == WIDTH {
+                    out.push_str(&line);
+                    out.push('\n');
+                    line = "    ".into();
+                }
+                line.push(c);
+            }
+        }
+    }
+    out.push_str(&line);
+    out
 }
 
 fn repo_width<'a>(items: impl Iterator<Item = &'a Item>) -> usize {
@@ -1177,7 +1243,7 @@ fn full(
         if !items.is_empty() {
             out.push_str(&format!("\n{title}\n"));
             for item in items {
-                out.push_str(&row(item, width));
+                out.push_str(&full_row(item, width));
                 out.push('\n');
             }
         }
@@ -1692,11 +1758,12 @@ mod tests {
             session("b", 3 * HOUR_MS, Some(HOUR_MS), false),
             session("old", 9 * DAY_MS, Some(8 * DAY_MS), false),
         ];
-        let view = view(&logged, None);
+        let collected = snapshot(NOW);
+        let view = view(&logged, Some(&collected));
         let first = Seen::first(NOW);
         let line = one_line(&news(&view, &first)).expect("something is new");
         assert!(
-            line.contains("2 sessions ended (1 without read-back/handover)"),
+            line.contains("2 agent sessions ended (1 missing startup notes or handover)"),
             "{line}"
         );
         let seen = advance(&view, &first, None, NOW, Shown::Line, "d");
@@ -1705,9 +1772,9 @@ mod tests {
         // after: new once.
         let mut later = logged.to_vec();
         later.push(session("late", 2 * HOUR_MS, Some(MINUTE_MS), false));
-        let view = build(&later, Ok(Vec::new()), None, NOW + MINUTE_MS, 0);
+        let view = build(&later, Ok(Vec::new()), Some(&collected), NOW + MINUTE_MS, 0);
         let line = one_line(&news(&view, &seen)).expect("the late record is new");
-        assert!(line.contains("1 session ended (1 without"), "{line}");
+        assert!(line.contains("1 agent session ended (1 missing"), "{line}");
         let seen = advance(&view, &seen, None, NOW + MINUTE_MS, Shown::Line, "d");
         assert_eq!(one_line(&news(&view, &seen)), None);
     }
@@ -1772,8 +1839,14 @@ mod tests {
         );
         let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
         assert!(line.chars().count() <= WIDTH + 1, "{line}");
-        assert!(line.starts_with("ohjaa · 3 branches not proven"), "{line}");
-        assert!(line.trim_end().ends_with("· ohjaa digest"), "{line}");
+        assert!(
+            line.starts_with("ohjaa · 3 branches need passing checks"),
+            "{line}"
+        );
+        assert!(
+            line.trim_end().ends_with("· Details: ohjaa digest"),
+            "{line}"
+        );
         // No ids in the line, and nothing raw from outside.
         assert!(!line.contains("oh-") && !line.contains("s1"), "{line}");
         let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
@@ -1787,6 +1860,52 @@ mod tests {
         for row in full(&view, &Window::at(NOW - DAY_MS), None, None, NOW).lines() {
             assert!(row.chars().count() <= WIDTH, "{row}");
         }
+    }
+
+    #[test]
+    fn the_status_names_the_repository_and_explains_missing_checks() {
+        let mut collected = snapshot(NOW);
+        collected.local.value.branches.push(Branch {
+            slug: "false-systems/valvo".into(),
+            branch: "main".into(),
+            unproven: 2,
+            as_of_ms: Some(NOW),
+            ..Branch::default()
+        });
+        let view = view(&[], Some(&collected));
+        assert_eq!(
+            one_line(&news(&view, &Seen::first(NOW))).unwrap(),
+            "ohjaa · valvo main: 2 commits need passing checks · Details: ohjaa digest\n"
+        );
+        // A long name must not swallow the command that explains the warning.
+        collected.local.value.branches[0].slug =
+            format!("false-systems/{}", "long-name".repeat(30));
+        let view = build(&[], Ok(Vec::new()), Some(&collected), NOW, 0);
+        let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
+        assert!(line.chars().count() <= WIDTH + 1, "{line}");
+        assert!(line.ends_with(" · Details: ohjaa digest\n"), "{line}");
+    }
+
+    #[test]
+    fn full_digest_rows_wrap_without_discarding_details() {
+        let mut item = standing(Kind::Main, Class::Evidence, "key".into(), "work",
+            "claude \"costed\" · exit 0 · 0s · missing startup notes and handover · 115k tokens + 2.9M cache reads".into());
+        let row = full_row(&item, 5);
+        assert!(row.contains("missing startup notes and handover"), "{row}");
+        assert!(row.contains("115k tokens + 2.9M cache reads"), "{row}");
+        assert!(
+            row.lines().all(|line| line.chars().count() <= WIDTH),
+            "{row}"
+        );
+        item.repo = "repository".repeat(30);
+        item.text = "x".repeat(300);
+        let row = full_row(&item, 12);
+        assert!(
+            row.lines().all(|line| line.chars().count() <= WIDTH),
+            "{row}"
+        );
+        assert_eq!(row.chars().filter(|c| *c == 'x').count(), 300);
+        assert!(!row.contains('…'));
     }
 
     #[test]
@@ -1842,7 +1961,9 @@ mod tests {
         );
         let full = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(
-            full.contains("main: 1 unproven (1 failed) since 093dfc5. Prove it: ohjaa gate"),
+            full.contains(
+                "main: 1 commit needs passing checks (1 failed) since 093dfc5. Run: ohjaa gate"
+            ),
             "{full}"
         );
         assert!(full.contains("still running, its ohjaa gone"), "{full}");
@@ -1859,7 +1980,7 @@ mod tests {
         let view = build(&logged, Ok(Vec::new()), Some(&collected), NOW, 0);
         let line = one_line(&news(&view, &seen)).unwrap();
         assert!(
-            line.contains("ohjaa · failed main: 1 unproven (1 failed) · ohjaa digest"),
+            line.contains("ohjaa · failed main: 1 commit needs passing checks (1 failed) · Details: ohjaa digest"),
             "{line}"
         );
     }
@@ -1938,15 +2059,15 @@ mod tests {
         };
         assert_eq!(
             said("killed"),
-            "claude \"fix the parser\" · killed (signal 9) · 60m · no read-back or handover"
+            "claude \"fix the parser\" · killed (signal 9) · 60m · missing startup notes and handover"
         );
         assert_eq!(
             said("orphan"),
-            "claude \"fix the parser\" · orphaned · no read-back or handover"
+            "claude \"fix the parser\" · orphaned · missing startup notes and handover"
         );
         assert_eq!(
             said("costed"),
-            "claude \"fix the parser\" · exit 0 · 60m · no read-back · 115k tokens + 2.9M cache \
+            "claude \"fix the parser\" · exit 0 · 60m · missing startup notes · 115k tokens + 2.9M cache \
              reads"
         );
     }
@@ -2045,8 +2166,7 @@ mod tests {
         assert_eq!(failed.standing[0].class, Some(Class::Failed));
         assert_eq!(
             failed.standing[0].text,
-            "main: 3 unproven (1 failed) since 1a2b3c4, as of 05:00 UTC (unread since). Prove \
-             it: ohjaa gate"
+            "main: 3 commits need passing checks (1 failed) since 1a2b3c4, as of 05:00 UTC (unread since). Run: ohjaa gate"
         );
         assert!(failed.incomplete());
         // An old read, not a failed one, is said with its age too.

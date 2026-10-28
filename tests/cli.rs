@@ -9207,7 +9207,7 @@ fn line_says_nothing_and_moves_nothing_without_a_person_at_a_terminal() {
     assert_eq!(fixture.graphql_calls(), 0);
     // A person at a terminal: a collect starts, and what is new is said.
     let (said, _) = on_a_terminal(fixture.person().arg("line"));
-    assert!(said.contains("1 session ended"), "{said}");
+    assert!(said.contains("1 agent session ended"), "{said}");
     assert!(fixture.collected());
     assert!(fixture.human_dir().join("seen.json").is_file());
     fixture.cleanup();
@@ -9235,9 +9235,9 @@ fn the_days_first_line_is_its_digest_then_a_line_only_for_what_is_new() {
     let digest = day("2026-10-27");
     assert!(digest.starts_with("ohjaa · since "), "{digest}");
     for said in [
-        "1 session ended · PRs: 1 merged, 1 opened",
+        "1 agent session ended · PRs: 1 merged, 1 opened",
         "sh \"retry uploads\" · exit 0",
-        "no read-back or handover",
+        "missing startup notes and handover",
         "#76 merged by yairfalse: Ask git once",
         "#16 opened by yairfalse: docs: nothing refuses \u{fffd}[2J",
     ] {
@@ -9250,7 +9250,7 @@ fn the_days_first_line_is_its_digest_then_a_line_only_for_what_is_new() {
     let line = day("2026-10-27");
     assert_eq!(
         line,
-        "ohjaa · 1 session ended (1 without read-back/handover) · ohjaa digest\n"
+        "ohjaa · 1 agent session ended (1 missing startup notes or handover) · Details: ohjaa digest\n"
     );
     assert_eq!(day("2026-10-27"), "", "seen");
     // The next day: its digest, since the last one.
@@ -9542,7 +9542,7 @@ fn what_could_not_be_read_is_said_never_an_all_clear() {
         "1 could not be read",
         "false-systems/valvo",
         "! sykli",
-        "main: 1 unproven since",
+        "main: 1 commit needs passing checks since",
         "could not be scanned",
     ] {
         assert!(digest.contains(said), "missing `{said}`: {digest}");
@@ -9662,7 +9662,7 @@ fn terminals_opened_together_say_a_line_once() {
     };
     assert_eq!(line(), "", "another terminal is saying it");
     drop(held);
-    assert!(line().contains("1 session ended"));
+    assert!(line().contains("1 agent session ended"));
     assert_eq!(line(), "");
     fixture.cleanup();
 }
@@ -9717,12 +9717,17 @@ fn a_branch_stays_as_last_read_when_the_entries_cannot_be_listed() {
     assert!(!snapshot.contains("(entries)"), "{snapshot}");
     let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
     assert_eq!(code, Some(4), "{digest}");
-    let still_open = digest
-        .lines()
-        .find(|line| line.contains("! sykli"))
+    let mut rows = digest.lines().skip_while(|line| !line.contains("! sykli"));
+    let first = rows
+        .next()
         .unwrap_or_else(|| panic!("sykli dropped from what stays: {digest}"));
+    let still_open = std::iter::once(first)
+        .chain(rows.take_while(|line| line.starts_with("    ")))
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        still_open.contains("main: 1 unproven since") && still_open.contains("(unread since)"),
+        still_open.contains("main: 1 commit needs passing checks since")
+            && still_open.contains("(unread since)"),
         "{digest}"
     );
     fixture.cleanup();
@@ -9768,7 +9773,8 @@ fn a_git_that_fails_is_said_as_that_never_as_a_missing_clone() {
     let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
     assert_eq!(code, Some(4), "{digest}");
     assert!(
-        digest.contains("main: 1 unproven since") && digest.contains("(unread since)"),
+        digest.contains("main: 1 commit needs passing checks since")
+            && digest.contains("(unread since)"),
         "{digest}"
     );
     fixture.cleanup();
