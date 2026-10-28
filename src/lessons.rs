@@ -2362,6 +2362,42 @@ mod tests {
     }
 
     #[test]
+    fn marks_tags_and_links_that_hide_a_name_are_seen_through_or_held() {
+        let private = Private {
+            repos: ["secret-thing", "habitat", "ote"]
+                .map(str::to_owned)
+                .to_vec(),
+            ..Private::default()
+        };
+        let deny = DenyList::build(&private, None, "acme/widget");
+        for hidden in [
+            "Widget calls sec<b></b>ret-thing",
+            "hab<span></span>itat",
+            "hab<wbr>itat",
+            "[hab](x)itat",
+        ] {
+            assert!(
+                deny.matches(hidden)
+                    .iter()
+                    .any(|named| named.contains("private repository")),
+                "not named: {hidden}: {:?}",
+                deny.matches(hidden)
+            );
+        }
+        // A mark no reading drops (a Hebrew accent, a Cyrillic or musical
+        // combining mark) is held, as a letter outside ASCII is.
+        for marked in ["o\u{0591}te", "x\u{0489}y", "z\u{1D167}"] {
+            assert!(!deny.matches(marked).is_empty(), "{marked}");
+        }
+        // The few characters prose uses are not.
+        assert!(
+            deny.matches("a — b – c “d” ‘e’ ’f … → g").is_empty(),
+            "{:?}",
+            deny.matches("a — b – c “d” ‘e’ ’f … → g")
+        );
+    }
+
+    #[test]
     fn a_marked_line_inside_a_fence_or_a_comment_is_not_held_by_the_file() {
         let found = lines_in(
             "```\n- <!-- lesson: fenced --> x\n```\n<!--\n- <!-- lesson: commented --> y\n-->\n\

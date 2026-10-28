@@ -536,6 +536,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_code_with_its_claude_mds_turned_off_reads_none() {
+        let file = Path::new("/c/.claude/CLAUDE.md");
+        let off = not_read("claude", &[], file, |name| {
+            (name == "CLAUDE_CODE_DISABLE_CLAUDE_MDS").then(|| "1".into())
+        });
+        assert!(
+            off.as_deref()
+                .is_some_and(|why| why.contains("CLAUDE_CODE_DISABLE_CLAUDE_MDS")),
+            "{off:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_file_is_inside_the_repository_a_git_folder_above_it_names() {

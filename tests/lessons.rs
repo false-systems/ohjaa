@@ -471,6 +471,21 @@ impl World {
         briefing
     }
 
+    /// [`World::brief`], launched in `dir` (a folder of the checkout).
+    fn brief_in(&self, dir: &Path, agent: Option<&str>, env: &[(&str, &str)]) -> String {
+        let mut brief = self.ohjaa(dir);
+        brief.args(["brief", "--knowledge-only"]);
+        if let Some(agent) = agent {
+            brief.args(["--agent", agent]);
+        }
+        for (key, value) in env {
+            brief.env(key, value);
+        }
+        let (briefing, stderr, code) = self.run(&mut brief);
+        assert_eq!(code, Some(0), "{stderr}");
+        briefing
+    }
+
     /// `ohjaa run <agent> --dry-run -- <args>`: the briefing it would give,
     /// which it says on stderr.
     fn run_dry(&self, agent: &str, args: &[&str]) -> String {
@@ -1540,4 +1555,94 @@ fn an_accept_delivers_without_holding_the_homes_lock() {
         said.contains("opened https://github.com/acme/widget/pull/41"),
         "{said}"
     );
+}
+
+#[test]
+fn claude_launched_in_a_subfolder_skips_the_roots_import_unless_its_project_approved_them() {
+    let world = merged_world("subfolder");
+    world.put("CLAUDE.md", "@AGENTS.md\n");
+    fs::create_dir_all(world.checkout.join("src")).unwrap();
+    assert!(
+        left(&world.brief(Some("claude"), &[])),
+        "at the root it reads it"
+    );
+    // Claude Code 2.1.311 skips an import whose file is outside the folder it
+    // starts in, unless the project approved external imports.
+    let briefing = world.brief_in(&world.checkout.join("src"), Some("claude"), &[]);
+    assert!(
+        carried(&briefing, "hasClaudeMdExternalIncludesApproved"),
+        "{briefing}"
+    );
+    let config = |approved: bool| {
+        fs::write(
+            world.home.join(".claude.json"),
+            format!(
+                "{{\"projects\":{{\"{}\":{{\"hasClaudeMdExternalIncludesApproved\":{approved}}}}}}}",
+                world.checkout.display()
+            ),
+        )
+        .unwrap();
+    };
+    config(false);
+    let briefing = world.brief_in(&world.checkout.join("src"), Some("claude"), &[]);
+    assert!(
+        carried(&briefing, "hasClaudeMdExternalIncludesApproved"),
+        "{briefing}"
+    );
+    config(true);
+    let briefing = world.brief_in(&world.checkout.join("src"), Some("claude"), &[]);
+    assert!(left(&briefing), "{briefing}");
+}
+
+#[test]
+fn an_import_claude_code_ignores_does_not_count() {
+    let world = merged_world("ignored");
+    for (name, text) in [
+        ("a comment", "<!-- @AGENTS.md -->\n"),
+        ("a comment over lines", "<!--\n@AGENTS.md\n-->\n"),
+        ("an HTML block", "<details>\n@AGENTS.md\n</details>\n"),
+        ("frontmatter", "---\nnote: x\n@AGENTS.md\n---\n# Notes\n"),
+        ("indented code", "# Notes\n\n    @AGENTS.md\n"),
+    ] {
+        world.put("CLAUDE.md", text);
+        let briefing = world.brief(Some("claude"), &[]);
+        assert!(carried(&briefing, "does not import"), "{name}: {briefing}");
+    }
+    world.put("CLAUDE.md", "@AGENTS.md\n");
+    assert!(left(&world.brief(Some("claude"), &[])));
+    // Claude Code reads no CLAUDE.md at all with it set (as --safe-mode sets it).
+    let briefing = world.brief(Some("claude"), &[("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1")]);
+    assert!(
+        carried(&briefing, "CLAUDE_CODE_DISABLE_CLAUDE_MDS"),
+        "{briefing}"
+    );
+}
+
+#[test]
+fn a_hook_that_changes_the_commit_after_the_check_stops_the_push() {
+    let world = World::new("commitmsg");
+    world.set_visibility("PUBLIC");
+    // A commit-msg hook that adds a trailer naming a private path.
+    write_executable(
+        &world.checkout.join(".git/hooks/commit-msg"),
+        "#!/bin/sh\nprintf '\\nSeen-in: %s/projects/secret-thing\\n' \"$HOME\" >> \"$1\"\n",
+    );
+    let file = world.legacy("widget-uses-rust", "decision", RUST);
+    let (stdout, stderr, code) = world.publish(&[]);
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    assert!(stdout.contains("changed the commit message"), "{stdout}");
+    assert_eq!(world.remote_heads(), vec!["main"], "nothing is pushed");
+    assert!(!world.gh_calls().contains("pr create"));
+    assert!(file.exists());
+
+    // A post-commit hook that makes a second commit.
+    fs::remove_file(world.checkout.join(".git/hooks/commit-msg")).unwrap();
+    write_executable(
+        &world.checkout.join(".git/hooks/post-commit"),
+        "#!/bin/sh\n[ -n \"$IN_HOOK\" ] || IN_HOOK=1 git commit -q --allow-empty -m extra\n",
+    );
+    let (stdout, stderr, code) = world.publish(&[]);
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    assert!(stdout.contains("more than one commit"), "{stdout}");
+    assert_eq!(world.remote_heads(), vec!["main"]);
 }
