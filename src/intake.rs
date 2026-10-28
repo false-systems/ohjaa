@@ -76,6 +76,16 @@ pub fn now_ms() -> i64 {
 /// time with `Z` or a `±HH:MM` offset and optional fraction of a second.
 pub fn parse_time(text: &str) -> Option<i64> {
     let text = text.trim();
+    let date_text = text.get(..10)?;
+    if !date_text.bytes().enumerate().all(|(at, byte)| {
+        if at == 4 || at == 7 {
+            byte == b'-'
+        } else {
+            byte.is_ascii_digit()
+        }
+    }) {
+        return None;
+    }
     let date = parse_date(text)?;
     let days = day_number(date);
     if text.len() == 10 {
@@ -83,7 +93,12 @@ pub fn parse_time(text: &str) -> Option<i64> {
     }
     let rest = text.get(10..)?;
     let rest = rest.strip_prefix('T').or_else(|| rest.strip_prefix('t'))?;
-    let number = |s: &str| s.parse::<i64>().ok();
+    let number = |s: &str| {
+        s.bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| s.parse::<i64>().ok())
+            .flatten()
+    };
     let (hours, minutes, seconds) = (
         number(rest.get(0..2)?)?,
         number(rest.get(3..5)?)?,
@@ -119,7 +134,12 @@ pub fn parse_time(text: &str) -> Option<i64> {
             if rest.len() != 6 || rest.get(3..4)? != ":" {
                 return None;
             }
-            sign * (number(rest.get(1..3)?)? * 60 + number(rest.get(4..6)?)?)
+            let hours = number(rest.get(1..3)?)?;
+            let minutes = number(rest.get(4..6)?)?;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            sign * (hours * 60 + minutes)
         }
     };
     let local = ((days * 24 + hours) * 60 + minutes) * 60 + seconds;
@@ -3877,6 +3897,23 @@ mod tests {
             parse_time("2026-09-10T00:00:00Z").unwrap()
         );
         assert!(normalize_since("yesterday").is_err());
+    }
+
+    #[test]
+    fn times_reject_signed_fields_and_out_of_range_offsets() {
+        for bad in [
+            "2026-09-25T-1:00:00Z",
+            "2026-09-25T+1:00:00Z",
+            "2026-09-25T10:-1:00Z",
+            "2026-09-25T10:00:-1Z",
+            "2026-09-25T10:00:00+24:00",
+            "2026-09-25T10:00:00+00:60",
+            "2026-09-25T10:00:00+-1:00",
+            "2026-09-25T10:00:00+00:-1",
+            "+026-09-25",
+        ] {
+            assert_eq!(parse_time(bad), None, "{bad}");
+        }
     }
 
     #[test]

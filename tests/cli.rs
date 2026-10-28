@@ -2445,6 +2445,20 @@ fn a_repository_with_no_commits_yet_is_empty_and_does_not_hold_the_cursor() {
         format!("gitdir: {}\n", fixture.dir.join("nowhere").display()),
     )
     .unwrap();
+    // Git versions word a broken gitfile differently. Pin the diagnostic
+    // this Git gives, rather than accepting several possible messages.
+    let refused = Command::new("git")
+        .arg("-C")
+        .arg(&gone)
+        .arg("log")
+        .env("LC_ALL", "C")
+        .env_remove("LANGUAGE")
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let reason = String::from_utf8(refused.stderr).unwrap();
+    let reason = reason.trim();
+    assert!(!reason.is_empty());
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -2453,7 +2467,7 @@ fn a_repository_with_no_commits_yet_is_empty_and_does_not_hold_the_cursor() {
     );
     assert_eq!(code, Some(4), "{stderr}");
     assert!(
-        stderr.contains("gone") && stderr.contains("not a git repository"),
+        stderr.contains("gone") && stderr.contains(reason),
         "{stderr}"
     );
     assert!(stderr.contains("the cursor stays"), "{stderr}");
