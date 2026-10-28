@@ -860,7 +860,7 @@ fn apply_dry_run_says_every_change_and_makes_none() {
             sandbox.dir.join("gitconfig").display()
         ),
         format!(
-            "would add .sykli/ .teko/ to {}",
+            "would add .sykli/ .teko/ .ohjaa/ to {}",
             sandbox.dir.join("config/git/ignore").display()
         ),
         format!("would change {}", sandbox.home().join(".zshrc").display()),
@@ -3986,7 +3986,7 @@ fn doctor_checks_every_gated_clone_and_ohjaa_run_warns_in_one() {
         "DRIFT  git's global config does not include",
         "ok     git's global core.hooksPath is unset",
         "/git/config is missing: nothing is observed (ohjaa apply)",
-        "lacks the ohjaa block (.sykli/ .teko/)",
+        "lacks the ohjaa block (.sykli/ .teko/ .ohjaa/)",
         "does not load the launcher",
         &format!("roots: {root} (given with --root)"),
         "note   older: an older in-repo sykli.json and no entry",
@@ -8032,9 +8032,9 @@ fn a_push_from_a_client_without_the_path_is_still_observed() {
     assert!(!text(&output).1.contains("ohjaa:"), "{}", text(&output).1);
 }
 
-/// The ignore block holds `.sykli/` and `.teko/`. A block an earlier apply
-/// wrote with `.sykli/` only is brought up to date in place, and undo still
-/// puts back exactly what was there before the first apply.
+/// The ignore block holds `.sykli/`, `.teko/` and `.ohjaa/`. A block an
+/// earlier apply wrote with fewer is brought up to date in place, and undo
+/// still puts back exactly what was there before the first apply.
 #[test]
 fn an_older_ignore_block_is_upgraded_in_place_and_undo_is_exact() {
     let sandbox = Sandbox::new("teko");
@@ -8043,27 +8043,39 @@ fn an_older_ignore_block_is_upgraded_in_place_and_undo_is_exact() {
     fs::write(sandbox.dir.join("config/git/ignore"), "*.swp\n").unwrap();
     sandbox.apply();
     let ignore = sandbox.read("config/git/ignore");
-    assert!(ignore.contains("\n.sykli/\n.teko/\n"), "{ignore}");
+    assert!(ignore.contains("\n.sykli/\n.teko/\n.ohjaa/\n"), "{ignore}");
     sandbox.git(&repo, &["check-ignore", "-q", ".teko/state.json"]);
     sandbox.git(&repo, &["check-ignore", "-q", ".sykli/receipt.json"]);
+    sandbox.git(&repo, &["check-ignore", "-q", ".ohjaa/knowledge/a-lesson.md"]);
 
-    // As an earlier apply left it: .sykli/ only.
-    let older = ignore.replace(".sykli/\n.teko/\n", ".sykli/\n");
-    fs::write(sandbox.dir.join("config/git/ignore"), &older).unwrap();
-    let output = sandbox.ohjaa(&["doctor"]);
-    let (stdout, _) = text(&output);
-    assert!(
-        stdout.contains("holds an older ohjaa block; it should ignore .sykli/ .teko/"),
-        "{stdout}"
-    );
+    // As each earlier apply left it: `.sykli/` only, then `.sykli/` and
+    // `.teko/`, the block on machines applied before `.ohjaa/` was added.
+    for older in [
+        ignore.replace(".sykli/\n.teko/\n.ohjaa/\n", ".sykli/\n"),
+        ignore.replace(".sykli/\n.teko/\n.ohjaa/\n", ".sykli/\n.teko/\n"),
+    ] {
+        fs::write(sandbox.dir.join("config/git/ignore"), &older).unwrap();
+        let output = sandbox.ohjaa(&["doctor"]);
+        let (stdout, _) = text(&output);
+        assert!(
+            stdout.contains(
+                "holds an older ohjaa block; it should ignore .sykli/ .teko/ .ohjaa/"
+            ),
+            "{stdout}"
+        );
+        let output = sandbox.ohjaa(&["apply"]);
+        let (stdout, _) = text(&output);
+        assert!(stdout.contains("added .sykli/ .teko/ .ohjaa/ to"), "{stdout}");
+        assert_eq!(
+            sandbox.read("config/git/ignore"),
+            ignore,
+            "upgraded in place"
+        );
+    }
     let output = sandbox.ohjaa(&["apply"]);
     let (stdout, _) = text(&output);
-    assert!(stdout.contains("added .sykli/ .teko/ to"), "{stdout}");
-    assert_eq!(
-        sandbox.read("config/git/ignore"),
-        ignore,
-        "upgraded in place"
-    );
+    assert!(!stdout.contains("added .sykli/"), "applied twice: {stdout}");
+    assert_eq!(sandbox.read("config/git/ignore"), ignore, "applied twice");
 
     let output = sandbox.ohjaa(&["apply", "--undo"]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);

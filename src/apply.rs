@@ -1415,7 +1415,7 @@ mod tests {
 
     #[test]
     fn the_ignore_block_is_added_once_replaced_in_place_and_taken_out() {
-        let block = format!("{IGNORE_BEGIN}\n.sykli/\n.teko/\n{IGNORE_END}\n");
+        let block = format!("{IGNORE_BEGIN}\n.sykli/\n.teko/\n.ohjaa/\n{IGNORE_END}\n");
         assert_eq!(ignore_with_block("").unwrap(), (block.clone(), false));
         let mine = "*.swp\n.DS_Store\n";
         let (added, blank) = ignore_with_block(mine).unwrap();
