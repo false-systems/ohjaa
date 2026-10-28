@@ -226,3 +226,11 @@ or Node (JavaScript/TypeScript): not for tools, scripts, CI helpers, tests,
 dashboards or glue. A thin shell step in a CI workflow is fine; anything with
 logic is Rust. Existing Python or Node files are debt to be rewritten, not
 precedent to follow.
+
+## Lessons
+
+<!-- This repository's accepted knowledge: one line per node, each marked with its id, written here through a pull request when a person accepts one. A line changed here by hand is replaced the next time it is written: change a lesson where it is decided. -->
+
+- <!-- lesson: ohjaa-env-claimed-ids-are-testimony --> **decision**: Treat a session id claimed by the agent's environment as testimony, not observation, and label it that way. Rank the evidence: launch prompt, then receipt, then env claim, then window. When the launch prompt and the env claim disagree, keep the observation and name the disagreement. (as of 2026-10-27)
+- <!-- lesson: ohjaa-marks-v1-only-gains-keys --> **decision**: The `ohjaa-marks.v1` schema only gains keys, and the keys viemari was built on never go. Dropping the unread `judgements` key was the one exception, so the schema keeps its name. (as of 2026-10-27)
+- <!-- lesson: ohjaa-never-writes-its-config-home --> **decision**: ohjaa writes nothing into its config home. A gate that a later run needs is kept under $XDG_STATE_HOME/ohjaa/derived/<digest>/, and a gate that is only read goes into a private $TMPDIR folder that is removed when done. `ohjaa gate --print` writes nothing. (as of 2026-10-27)
