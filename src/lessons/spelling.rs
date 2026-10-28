@@ -45,9 +45,10 @@ pub fn normalised(text: &str) -> String {
     out
 }
 
-/// `text` without HTML comments (an unclosed one to the end) and without
-/// Markdown's emphasis and code marks, so that `hab<!-- -->itat` and
-/// `**hab**itat` read `habitat`.
+/// `text` without HTML comments (an unclosed one to the end), HTML tags
+/// (`<b>`, `</span>`, `<wbr>`), Markdown link targets (`](…)`) and
+/// Markdown's emphasis and code marks, so that `hab<!-- -->itat`,
+/// `hab<b></b>itat`, `[hab](x)itat` and `**hab**itat` read `habitat`.
 fn joined(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -59,9 +60,38 @@ fn joined(text: &str) -> String {
         };
     }
     out.push_str(rest);
+    let out = without_between(
+        &out,
+        |rest| {
+            rest.starts_with('<')
+                && rest[1..].starts_with(|c: char| c.is_ascii_alphabetic() || c == '/')
+        },
+        '>',
+    );
+    let out = without_between(&out, |rest| rest.starts_with("]("), ')');
     out.chars()
-        .filter(|c| !matches!(c, '*' | '_' | '`' | '~'))
+        .filter(|c| !matches!(c, '*' | '_' | '`' | '~' | '[' | ']'))
         .collect()
+}
+
+/// `text` without each stretch that begins where `opens` says and ends at
+/// the next `close` (an unclosed one is left).
+fn without_between(text: &str, opens: impl Fn(&str) -> bool, close: char) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        if opens(rest) {
+            if let Some(end) = rest.find(close) {
+                at += end + close.len_utf8();
+                continue;
+            }
+        }
+        let c = rest.chars().next().unwrap_or(' ');
+        out.push(c);
+        at += c.len_utf8();
+    }
+    out
 }
 
 /// Numeric character references (`&#97;`, `&#x61;`) and the few named ones
@@ -129,10 +159,16 @@ pub fn unread_entity(text: &str) -> Option<String> {
     None
 }
 
-/// The first letter outside ASCII in `text` (already normalised): one no
-/// fold here reads, which may stand for another (a Cyrillic а for an a).
-pub fn odd_letter(text: &str) -> Option<char> {
-    text.chars().find(|c| c.is_alphabetic() && !c.is_ascii())
+/// What prose writes outside ASCII that hides no letter: curly quotes,
+/// dashes, the ellipsis and arrows.
+const PROSE: &[char] = &['’', '‘', '“', '”', '—', '–', '…', '→', '←'];
+
+/// The first character outside ASCII in `text` (already normalised) that
+/// is not [`PROSE`]: a letter no fold here reads, which may stand for
+/// another (a Cyrillic а for an a), or a mark no reading drops (U+0591),
+/// which may sit on a letter of a name.
+pub fn odd_char(text: &str) -> Option<char> {
+    text.chars().find(|c| !c.is_ascii() && !PROSE.contains(c))
 }
 
 /// One character as matching compares it: lower case.

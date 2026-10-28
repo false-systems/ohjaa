@@ -405,6 +405,13 @@ pub struct DenyList {
     allowed: Vec<String>,
 }
 
+/// What a deny entry of the person's own name says it is.
+const ACCOUNT: &str = "your account's name";
+const GITHUB_NAME: &str = "you, as GitHub names you";
+/// The entries that are the person's own name: left out of a commit's
+/// author and committer, which carry it by nature.
+const PERSON: [&str; 2] = [ACCOUNT, GITHUB_NAME];
+
 #[derive(Debug, Clone)]
 struct Deny {
     text: String,
@@ -457,13 +464,8 @@ impl DenyList {
         }
         let people = account
             .iter()
-            .map(|account| (account, "your account's name"))
-            .chain(
-                private
-                    .people
-                    .iter()
-                    .map(|person| (person, "you, as GitHub names you")),
-            );
+            .map(|account| (account, ACCOUNT))
+            .chain(private.people.iter().map(|person| (person, GITHUB_NAME)));
         for (person, what) in people {
             if !person.eq_ignore_ascii_case(owner) {
                 list.add(person, what, true);
@@ -486,6 +488,27 @@ impl DenyList {
                 word,
             });
         }
+    }
+
+    /// What of the list, but the person's own name and account, `text`
+    /// names: for the author and committer of a commit, which are the
+    /// person's own identity by nature.
+    pub fn matches_beside_the_person(&self, text: &str) -> Vec<String> {
+        let readings = spelling::readings(text);
+        self.entries
+            .iter()
+            .filter(|entry| !PERSON.contains(&entry.what))
+            .filter(|entry| {
+                readings.iter().any(|reading| {
+                    if entry.word {
+                        spelling::names_word(reading, &entry.text, &self.allowed)
+                    } else {
+                        spelling::names_anywhere(reading, &entry.text)
+                    }
+                })
+            })
+            .map(|entry| format!("`{}` ({})", entry.text, entry.what))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -514,9 +537,11 @@ impl DenyList {
             })
             .map(|entry| format!("`{}` ({})", entry.text, entry.what))
             .collect();
-        if let Some(odd) = spelling::odd_letter(&readings[0]) {
+        if let Some(odd) = spelling::odd_char(&readings[0]) {
             found.push(format!(
-                "`{odd}` (a letter outside ASCII, which could stand for one inside it)"
+                "`{odd}` (U+{:04X}, a character outside ASCII, which could stand for a letter \
+                 inside it or mark one)",
+                odd as u32
             ));
         }
         if let Some(entity) = spelling::unread_entity(&readings[0]) {
@@ -1796,7 +1821,7 @@ fn attempt(
             })
             .max();
         if let Some(end) = end {
-            for command in ["claude", "codex"] {
+            for (command, name) in [("claude", "Claude Code"), ("codex", "Codex")] {
                 said.push(
                     match crate::repo_docs::reads(Some((command, &[][..])), checkout, checkout, end)
                     {
@@ -1804,7 +1829,7 @@ fn attempt(
                             format!("once merged, {agent}: left to AGENTS.md ({how})")
                         }
                         crate::repo_docs::Reads::No { why } => {
-                            format!("once merged, {command}: carried in the briefing ({why})")
+                            format!("once merged, {name}: carried in the briefing ({why})")
                         }
                     },
                 );
@@ -1846,6 +1871,16 @@ fn attempt(
     let work = Work::add(checkout, state, &tracking(&base_branch))?;
     write_atomic(&work.path.join("AGENTS.md"), plan.text.as_bytes())?;
     git_in(&work.path, &["add", "AGENTS.md"], process::LOCAL)?;
+    // Who the commit is by, as git would make it now: a hook that changes it
+    // is caught below.
+    let ident = |which: &str| -> Result<String, String> {
+        let said = git_in(&work.path, &["var", which], process::LOCAL)?;
+        // `Name <email> <seconds> <zone>`: the name and the email.
+        let said = said.trim();
+        Ok(said.rsplitn(3, ' ').nth(2).unwrap_or(said).to_owned())
+    };
+    let author = ident("GIT_AUTHOR_IDENT")?;
+    let committer = ident("GIT_COMMITTER_IDENT")?;
     eprintln!(
         "ohjaa: committing for {} in a worktree, where its own hooks run",
         ready.slug
@@ -1855,8 +1890,16 @@ fn attempt(
         &["commit", "--quiet", "-m", &out.message],
         HOOKS,
     )?;
-    // What is pushed is what was checked: AGENTS.md alone, in ohjaa's words.
-    // A hook that changed or added a file stops the delivery.
+    // What is pushed is what was checked, as the commit was made: one
+    // commit, its message, its author and committer, and AGENTS.md alone in
+    // ohjaa's words. A hook that changed any of them stops the delivery.
+    check_commit(
+        &work.path,
+        &tracking(&base_branch),
+        &out.message,
+        (&author, &committer),
+        ready.deny.as_ref(),
+    )?;
     let changed = git_in(
         &work.path,
         &["diff", "--name-only", &tracking(&base_branch), "HEAD"],
@@ -1916,6 +1959,59 @@ fn attempt(
         url: Some(url),
         branch: Some(out.branch),
     }))
+}
+
+/// The commit as it was made, before it is pushed: exactly one commit on
+/// `base`, whose message is `message` and whose author and committer are
+/// `who` (name and email, as git said before committing), so that no hook
+/// added to or rewrote any of them. For a repository that is not private,
+/// the message, and the author and committer but for the person's own
+/// name, are checked against the deny list once more, as they are now.
+fn check_commit(
+    work: &Path,
+    base: &str,
+    message: &str,
+    who: (&str, &str),
+    deny: Option<&DenyList>,
+) -> Result<(), String> {
+    let stop = |what: &str| {
+        Err(format!(
+            "a hook of the repository's {what}, so nothing was pushed"
+        ))
+    };
+    let count = git_in(
+        work,
+        &["rev-list", "--count", &format!("{base}..HEAD")],
+        process::LOCAL,
+    )?;
+    if count.trim() != "1" {
+        return stop(&format!("made more than one commit ({})", count.trim()));
+    }
+    let made = git_in(work, &["log", "-1", "--format=%B"], process::LOCAL)?;
+    if made.trim_end() != message.trim_end() {
+        return stop("changed the commit message");
+    }
+    let by = git_in(
+        work,
+        &["log", "-1", "--format=%an <%ae>%n%cn <%ce>"],
+        process::LOCAL,
+    )?;
+    let mut by = by.lines();
+    if by.next() != Some(who.0) || by.next() != Some(who.1) {
+        return stop("changed the commit's author or committer");
+    }
+    if let Some(deny) = deny {
+        let mut found = deny.matches(&made);
+        found.extend(deny.matches_beside_the_person(who.0));
+        found.extend(deny.matches_beside_the_person(who.1));
+        if !found.is_empty() {
+            return Err(format!(
+                "the commit as it was made names {}, so nothing was pushed",
+                found.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// What the plan adds, changes, takes out and holds back.
