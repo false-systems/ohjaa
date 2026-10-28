@@ -529,18 +529,19 @@ A branch is said as it was last read: when that was not just now, with its
 age (`, as of 05:00 UTC (unread since)`), and it stays until a read resolves
 it. A branch is said again when its tip moves. What happened is said once:
 - each session that ended, with how it ended, how long it ran, whether it
-  read back and handed over, what landed, its pull request and its cost;
+  read back and handed over, what landed, its pull request and its token usage;
 - the pull requests merged into a default branch;
 - those opened or closed.
 
 A pull request opened and merged in the same stretch is said once, as merged.
 
-**Cost** is vessa's estimate, never a bill. It is joined by the agent's own
+**Token usage** comes from Vessa. It is joined by the agent's own
 session ids ohjaa found in the transcripts at leaving. It is unknown, never
-zero, unless every one of the session's own sessions was read. An estimate in
-dollars is given only when vessa priced all of it, which it does only with a
-rate card; otherwise the cost is given in tokens, with the reads of the
-cache apart (`115k tokens + 2.9M cache reads`): they are most of it.
+zero, unless every one of the session's own sessions was read. Usage is given
+in tokens, with cache reads apart (`115k tokens + 2.9M cache reads`). The
+collector reads Vessa's token-only `vessa-usage.v2` exports and also accepts
+the token fields of older v1 exports. It ignores legacy spending fields and
+never shows currency estimates, including from a previously saved snapshot.
 
 **Today's proposal:** one of the proposals waiting for a person, in turn,
 oldest first, a different one each day. It is shown with its id, and decided

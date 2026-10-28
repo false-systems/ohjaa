@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::collect::{self, Collected, Cost, Part, Pr};
+use crate::collect::{self, Collected, Part, Pr, TokenUsage};
 use crate::knowledge::{self, Dirs};
 use crate::report::{self, Waiting};
 use crate::sessions::{self, clock, Exit, Finished, Left, Session};
@@ -445,14 +445,11 @@ fn amount(n: u64) -> String {
     }
 }
 
-/// `est. $1.20`, or `115k tokens + 2.9M cache reads`: most of a session's
+/// `115k tokens + 2.9M cache reads`: most of a session's
 /// tokens are reads of its cache, said apart.
-fn cost(cost: &Cost) -> Option<String> {
-    if let Some(usd) = cost.usd_micros {
-        return Some(format!("est. ${:.2}", usd as f64 / 1e6));
-    }
-    let tokens = cost.tokens?;
-    Some(match cost.cache_reads {
+fn usage_text(usage: &TokenUsage) -> Option<String> {
+    let tokens = usage.tokens?;
+    Some(match usage.cache_reads {
         Some(cached) if cached > 0 => {
             format!("{} tokens + {} cache reads", amount(tokens), amount(cached))
         }
@@ -491,7 +488,7 @@ fn event(kind: Kind, key: String, at_ms: i64, github: bool, repo: &str, text: St
 }
 
 /// How a session ended, and what it left out, in a few words.
-fn ended(session: &Session, left: &Left, costed: Option<&Cost>) -> Item {
+fn ended(session: &Session, left: &Left, usage: Option<&TokenUsage>) -> Item {
     let mut parts = vec![format!(
         "{} \"{}\"",
         clean(&session.agent),
@@ -519,7 +516,7 @@ fn ended(session: &Session, left: &Left, costed: Option<&Cost>) -> Item {
     if let Finished::PullRequest { state, .. } = &left.finished {
         parts.push(format!("PR {}", clean(state).to_lowercase()));
     }
-    parts.extend(costed.and_then(cost));
+    parts.extend(usage.and_then(usage_text));
     event(
         Kind::Ended {
             told: readback && handover,
@@ -1573,7 +1570,7 @@ pub fn collect_now(repos: Result<Vec<PathBuf>>, background: bool) -> Result<i32>
             "vessa",
             &collected.usage,
             format!(
-                "{} costed",
+                "{} with token usage",
                 plural(collected.usage.value.len(), "session", "sessions")
             ),
         );
@@ -1925,10 +1922,9 @@ mod tests {
         let mut collected = snapshot(NOW);
         collected.usage.value.insert(
             "costed".into(),
-            Cost {
+            TokenUsage {
                 tokens: Some(115_248),
                 cache_reads: Some(2_923_935),
-                usd_micros: None,
             },
         );
         let view = view(&[gone, orphan, costed], Some(&collected));
@@ -1953,6 +1949,28 @@ mod tests {
             "claude \"fix the parser\" · exit 0 · 60m · no read-back · 115k tokens + 2.9M cache \
              reads"
         );
+    }
+
+    #[test]
+    fn a_legacy_snapshot_never_displays_its_currency_estimate() {
+        let usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "tokens": 115_248, "cache_reads": 2_923_935, "usd_micros": 9_000_000
+        }))
+        .unwrap();
+        assert_eq!(
+            usage_text(&usage).as_deref(),
+            Some("115k tokens + 2.9M cache reads")
+        );
+        let saved = serde_json::to_value(&usage).unwrap();
+        assert_eq!(
+            saved,
+            serde_json::json!({"tokens":115_248,"cache_reads":2_923_935})
+        );
+        let unknown: TokenUsage = serde_json::from_value(serde_json::json!({
+            "tokens": null, "cache_reads": null, "usd_micros": 9_000_000
+        }))
+        .unwrap();
+        assert_eq!(usage_text(&unknown), None);
     }
 
     /// Review of #63, finding 1: what could not be read is said where the
