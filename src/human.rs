@@ -1599,7 +1599,7 @@ fn say_part<T>(name: &str, part: &Part<T>, answer: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collect::{Branch, Local, Part};
+    use crate::collect::{Branch, Finding, Local, Part, Secrets, Typed};
     use serde_json::json;
 
     const NOW: i64 = 1_800_000_000_000;
@@ -1647,6 +1647,14 @@ mod tests {
                 ..Part::default()
             },
             usage: Part {
+                as_of_ms: Some(at_ms),
+                ..Part::default()
+            },
+            typed: Part {
+                as_of_ms: Some(at_ms),
+                ..Part::default()
+            },
+            secrets: Part {
                 as_of_ms: Some(at_ms),
                 ..Part::default()
             },
@@ -1953,6 +1961,237 @@ mod tests {
             "claude \"fix the parser\" · exit 0 · 60m · no read-back · 115k tokens + 2.9M cache \
              reads"
         );
+    }
+
+    /// Yair, 2026-10-28: `claude "interactive" · exit 0 · 13h` tells a
+    /// person nothing. A session ended is said by the first words they
+    /// typed in it, and by its intent only when there are none.
+    #[test]
+    fn a_session_ended_is_said_by_the_first_words_typed_in_it_else_its_intent() {
+        let typed = session("typed", 2 * HOUR_MS, Some(HOUR_MS), true);
+        let headless = session("headless", 2 * HOUR_MS, Some(HOUR_MS), true);
+        let long = session("long", 2 * HOUR_MS, Some(HOUR_MS), true);
+        let mut collected = snapshot(NOW);
+        for (id, text) in [
+            ("typed", "make the digest say what I asked for"),
+            (
+                "long",
+                "make the digest show the first thing I typed in each session, not its…",
+            ),
+        ] {
+            collected.typed.value.insert(
+                id.into(),
+                Typed {
+                    text: text.into(),
+                    ended_ms: NOW - HOUR_MS,
+                },
+            );
+        }
+        let view = view(&[typed, headless, long], Some(&collected));
+        let said = |id: &str| {
+            view.events
+                .iter()
+                .find(|item| item.key == format!("session:{id}"))
+                .unwrap()
+                .text
+                .clone()
+        };
+        assert_eq!(
+            said("typed"),
+            "claude \"make the digest say what I asked for\" · exit 0 · 60m"
+        );
+        assert_eq!(said("headless"), "claude \"fix the parser\" · exit 0 · 60m");
+        // Beside what the row must say, the words give way at a word.
+        let long = said("long");
+        assert!(
+            long.starts_with("claude \"make the digest show the first thing I typed")
+                && long.ends_with("…\" · exit 0 · 60m"),
+            "{long}"
+        );
+        assert!(long.chars().count() <= WIDTH - 18, "{long}");
+        let full = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        for row in full.lines() {
+            assert!(row.chars().count() <= WIDTH, "{row}");
+        }
+        assert!(
+            full.contains("Sources\n  marks as of 08:00 UTC · GitHub as of 08:00 UTC"),
+            "{full}"
+        );
+        assert!(
+            full.contains("messages as of 08:00 UTC") && full.contains("secrets as of 08:00 UTC"),
+            "{full}"
+        );
+    }
+
+    fn finding(
+        place: &str,
+        rule: &str,
+        count: u64,
+        fingerprint: Option<&str>,
+        ago: i64,
+    ) -> Finding {
+        Finding {
+            agent: "claude".into(),
+            session: "5e1976e4-71c3-407c-9533-0be05b7e1b70".into(),
+            cwd: Some("/p/habitat".into()),
+            at_ms: Some(NOW - ago),
+            place: place.into(),
+            rule: rule.into(),
+            count,
+            fingerprint: fingerprint.map(str::to_owned),
+            found_ms: NOW,
+        }
+    }
+
+    /// Yair, 2026-10-28: the secret-shaped tokens vessa found in agent
+    /// sessions are said in the line once, and each in the digest, with
+    /// what to do about them.
+    #[test]
+    fn secrets_found_are_said_once_in_the_line_and_each_in_the_digest() {
+        let mut collected = snapshot(NOW);
+        collected.secrets.value = Secrets {
+            read_ms: Some(NOW),
+            findings: vec![
+                finding("person", "github", 1, Some("1a2b3c4d"), HOUR_MS),
+                finding("tool_output", "aws", 2, None, 2 * HOUR_MS),
+                finding("agent", "jwt", 1, None, 3 * HOUR_MS),
+                finding("tool_input", "openai", 1, None, 4 * HOUR_MS),
+            ],
+        };
+        let view = view(&[], Some(&collected));
+        assert!(!view.incomplete(), "a scan that read everything");
+        let first = Seen::first(NOW);
+        assert_eq!(
+            one_line(&news(&view, &first)).as_deref(),
+            Some("! 5 secret-shaped tokens in agent sessions: ohjaa digest\n")
+        );
+        let seen = advance(&view, &first, Some(&collected), NOW, Shown::Line, "d");
+        assert_eq!(one_line(&news(&view, &seen)), None, "said once");
+        // One found later is new, and said beside what else is.
+        let mut later = collected.clone();
+        later.at_ms = NOW + MINUTE_MS;
+        later.secrets.as_of_ms = Some(NOW + MINUTE_MS);
+        later.secrets.value.findings.push(Finding {
+            found_ms: NOW + MINUTE_MS,
+            ..finding("person", "anthropic", 1, None, 0)
+        });
+        let logged = [session("a", HOUR_MS, Some(MINUTE_MS / 2), true)];
+        let view = build(&logged, Ok(Vec::new()), Some(&later), NOW + MINUTE_MS, 0);
+        assert_eq!(
+            one_line(&news(&view, &seen)).as_deref(),
+            Some(
+                "ohjaa · 1 session ended · ohjaa digest\n\
+                 ! 1 secret-shaped token in agent sessions: ohjaa digest\n"
+            )
+        );
+        // The digest: one line per finding, and what to do.
+        let digest = full(
+            &view,
+            &Window::at(NOW - DAY_MS),
+            None,
+            None,
+            NOW + MINUTE_MS,
+        );
+        let section = digest
+            .split("\nSecrets seen\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no section: {digest}"));
+        for said in [
+            "  ! habitat  07:00 UTC · claude 5e1976e4 · you typed it · github ×1 · fingerprint \
+             1a2b3c4d\n",
+            "06:00 UTC · claude 5e1976e4 · command output · aws ×2\n",
+            "05:00 UTC · claude 5e1976e4 · agent reply · jwt ×1\n",
+            "04:00 UTC · claude 5e1976e4 · tool call · openai ×1\n",
+            "08:00 UTC · claude 5e1976e4 · you typed it · anthropic ×1\n",
+            "  Rotate any that are real keys; `printf %s KEY | shasum -a 256 | cut -c1-8` \
+             matches a fingerprint\n",
+        ] {
+            assert!(section.contains(said), "missing `{said}`: {digest}");
+        }
+        for row in digest.lines() {
+            assert!(row.chars().count() <= WIDTH, "{row}");
+        }
+        // The day's digest points to them; a digest read is not said again.
+        let (daily, _) = daily(&view, &Window::at(NOW - DAY_MS), None, NOW + MINUTE_MS).unwrap();
+        assert!(
+            daily.contains("\n  ! 6 secret-shaped tokens in agent sessions: ohjaa digest\n"),
+            "{daily}"
+        );
+        assert!(!daily.contains("github ×1"), "{daily}");
+        let read = advance(
+            &view,
+            &seen,
+            Some(&later),
+            NOW + MINUTE_MS,
+            Shown::Full,
+            "d",
+        );
+        let next = full(
+            &view,
+            &read.full_from(NOW + MINUTE_MS),
+            None,
+            None,
+            NOW + MINUTE_MS,
+        );
+        assert!(!next.contains("Secrets seen"), "{next}");
+    }
+
+    /// Yair, 2026-10-28: a secrets scan that could not run, or not read
+    /// everything, is said, with why, and never as nothing found.
+    #[test]
+    fn a_secrets_scan_that_could_not_run_is_said_and_never_an_all_clear() {
+        let mut collected = snapshot(NOW);
+        collected.secrets.as_of_ms = None;
+        collected.secrets.error = Some(
+            "this vessa has no `secrets`: update vessa (exit 2: error: unrecognized \
+             subcommand 'secrets')"
+                .into(),
+        );
+        let shown = view(&[], Some(&collected));
+        assert!(shown.incomplete());
+        let line = one_line(&news(&shown, &Seen::first(NOW))).unwrap();
+        assert!(line.contains("secrets: the scan could not run"), "{line}");
+        let said = full(&shown, &Window::at(NOW - DAY_MS), None, None, NOW);
+        let section = said
+            .split("\nSecrets seen\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no section: {said}"));
+        assert!(
+            section.starts_with(
+                "  ! secrets  the scan could not run, never read: this vessa has no `secrets`: \
+                 update vessa"
+            ),
+            "{said}"
+        );
+        assert!(
+            !said.contains("Still open\n  ! secrets"),
+            "said once: {said}"
+        );
+        assert!(!said.contains("Nothing new happened"), "{said}");
+        assert!(!said.contains("Rotate"), "{said}");
+        // What it found before stands, as of then; a scan that could not
+        // read everything says what.
+        collected.secrets.error = None;
+        collected.secrets.as_of_ms = Some(NOW - 3 * HOUR_MS);
+        collected.secrets.gaps = vec!["could not read /h/x.jsonl: Permission denied".into()];
+        collected.secrets.value.findings = vec![finding("person", "github", 1, None, 4 * HOUR_MS)];
+        let shown = view(&[], Some(&collected));
+        assert!(shown.incomplete());
+        let said = full(&shown, &Window::at(NOW - DAY_MS), None, None, NOW);
+        assert!(
+            said.contains(
+                "! secrets  the scan could not read 1, as of 05:00 UTC: could not read \
+                 /h/x.jsonl: Permission denied"
+            ),
+            "{said}"
+        );
+        assert!(said.contains("you typed it · github ×1"), "{said}");
+        let line = one_line(&news(&shown, &Seen::first(NOW))).unwrap();
+        assert!(
+            line.contains("secrets: the scan could not read 1"),
+            "{line}"
+        );
+        assert!(line.contains("! 1 secret-shaped token"), "{line}");
     }
 
     /// Review of #63, finding 1: what could not be read is said where the

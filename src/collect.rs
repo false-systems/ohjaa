@@ -84,6 +84,155 @@ pub struct Collected {
     /// By ohjaa session id.
     #[serde(default)]
     pub usage: Part<BTreeMap<String, Cost>>,
+    /// The first words the person typed in each session ended lately, by
+    /// ohjaa session id: their own words, shown back to them, kept only for
+    /// the window the digest shows ([`Collected::keep_window`]).
+    #[serde(default)]
+    pub typed: Part<BTreeMap<String, Typed>>,
+    /// Where vessa found secret-shaped tokens in agent sessions, and how
+    /// many: never a value.
+    #[serde(default)]
+    pub secrets: Part<Secrets>,
+}
+
+impl Collected {
+    /// What the snapshot keeps of the person's words and of the secrets
+    /// found, only for the window the digest shows, from `from_ms`: never
+    /// longer, and that holds what a read that failed keeps too.
+    pub fn keep_window(&mut self, from_ms: i64) {
+        let _ = from_ms;
+    }
+}
+
+/// The first words a person typed in a session, cut at a word to about
+/// [`EXCERPT_CHARS`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Typed {
+    pub text: String,
+    /// When its session ended: it is kept while that is in the window.
+    pub ended_ms: i64,
+}
+
+/// What vessa's secrets scan found, and up to when it read everything.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Secrets {
+    /// When a scan last read everything it looked at: the next one begins
+    /// there. `None`: none has yet.
+    pub read_ms: Option<i64>,
+    pub findings: Vec<Finding>,
+}
+
+/// One place vessa found secret-shaped tokens: where and how many, never
+/// the value (`vessa-secrets.v1`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    pub agent: String,
+    /// The agent's own session id.
+    pub session: String,
+    pub cwd: Option<String>,
+    pub at_ms: Option<i64>,
+    /// `person`, `agent`, `tool_input`, `tool_output` or `other`.
+    #[serde(rename = "where")]
+    pub place: String,
+    pub rule: String,
+    pub count: u64,
+    /// The first 8 hex characters of the token's SHA-256, when vessa gave
+    /// one.
+    pub fingerprint: Option<String>,
+    /// When a collect first found it, by the snapshot's clock.
+    pub found_ms: i64,
+}
+
+impl Finding {
+    /// The same finding, read again, has the same key.
+    pub fn key(&self) -> String {
+        format!(
+            "secret:{}:{}:{}:{}:{}:{}",
+            self.agent,
+            self.session,
+            self.at_ms.map_or("-".to_owned(), |at| at.to_string()),
+            self.place,
+            self.rule,
+            self.fingerprint.as_deref().unwrap_or("-")
+        )
+    }
+}
+
+/// One message a person wrote, as `vessa messages --json` lists it: what
+/// the first words of a session are taken from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heard {
+    pub agent: String,
+    pub session: String,
+    pub at_ms: i64,
+    pub text: String,
+}
+
+/// The first words typed in a session are cut at a word to about this many
+/// characters, `…` included.
+pub const EXCERPT_CHARS: usize = 70;
+
+/// At most this many vessa calls one collect makes: `usage`, `messages` and
+/// `secrets`, each once.
+pub const MAX_VESSA_CALLS: usize = 3;
+
+/// A secrets scan begins this long before the last one that read
+/// everything: a record written as that one read is read again, and is the
+/// same finding.
+pub const SECRETS_OVERLAP_MS: i64 = 5 * 60_000;
+
+/// `text` with its runs of white space made one space, cut at a word to at
+/// most [`EXCERPT_CHARS`], with `…` when cut. `None`: nothing in it.
+pub fn excerpt(text: &str) -> Option<String> {
+    let _ = text;
+    None
+}
+
+/// vessa's list of what people wrote (`vessa-messages.v1`; its exit `code`,
+/// and `detail`, what it said on stderr), with what it could not list.
+pub fn read_messages(
+    code: Option<i32>,
+    stdout: &[u8],
+    detail: &str,
+) -> Result<(Vec<Heard>, Vec<String>), String> {
+    let _ = (code, stdout, detail);
+    Ok((Vec::new(), Vec::new()))
+}
+
+/// The first words typed in each of `sessions`, by its own agent's
+/// sessions, from what vessa listed after `since_ms`.
+pub fn first_typed(
+    sessions: &[&Session],
+    heard: &[Heard],
+    since_ms: i64,
+) -> BTreeMap<String, Typed> {
+    let _ = (sessions, heard, since_ms);
+    BTreeMap::new()
+}
+
+/// Where the next secrets scan begins: where the last one that read
+/// everything ended, a little before, and never before `from_ms`.
+pub fn secrets_since(before: &Secrets, from_ms: i64) -> i64 {
+    let _ = before;
+    from_ms
+}
+
+/// vessa's secrets scan (`vessa-secrets.v1`; its exit `code`, and `detail`,
+/// what it said on stderr), joined to what was found `before`.
+pub fn read_secrets(
+    code: Option<i32>,
+    stdout: &[u8],
+    detail: &str,
+    before: &Secrets,
+    now_ms: i64,
+) -> Answer<Secrets> {
+    let _ = (code, stdout, detail, now_ms);
+    Ok((before.clone(), Vec::new()))
+}
+
+/// Why vessa could not be run for `what`.
+pub fn vessa_failed(what: &str, error: &anyhow::Error) -> String {
+    format!("vessa {what}: {error:#}")
 }
 
 /// One source's answer, when it was read, what it could not read, and why
@@ -253,11 +402,13 @@ pub fn collect(
             local: Part::read(joined(local), &before.local, now_ms, None),
             github: Part::read(joined(github), &before.github, now_ms, Some(from_ms)),
             usage: Part::read(joined(usage), &before.usage, now_ms, Some(from_ms)),
+            typed: Part::default(),
+            secrets: Part::default(),
         }
     })
 }
 
-type Answer<T> = Result<(T, Vec<String>), String>;
+pub type Answer<T> = Result<(T, Vec<String>), String>;
 
 fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, Answer<T>>) -> Answer<T> {
     handle
@@ -856,6 +1007,361 @@ mod tests {
         assert!(pr(&into_main).unwrap().landed());
         // Not a pull request: an empty hit.
         assert_eq!(pr(&json!({})), None);
+    }
+
+    // ---- the first words typed, and the secrets seen (Yair, 2026-10-28) ----
+
+    const NOW: i64 = 1_800_000_000_000;
+    const HOUR: i64 = 3_600_000;
+
+    /// A session that ran from `start` to `end`, with its agent's own
+    /// sessions `natives`.
+    fn ran(id: &str, start: i64, end: i64, natives: Value) -> Session {
+        let mut session = session(id, natives);
+        session.started_ms = start;
+        session.left.as_mut().unwrap().ended_ms = end;
+        session
+    }
+
+    fn heard(agent: &str, session: &str, at_ms: Option<i64>, text: &str) -> Value {
+        json!({"agent": agent, "session": session, "parent": null, "kind": "message",
+               "id": null, "at": at_ms.map(intake::rfc3339_ms), "cwd": "/r/ohjaa",
+               "text": text, "question": null, "reply": null,
+               "source": "/t/x.jsonl", "line": 1})
+    }
+
+    fn listed(messages: Value, warnings: Value) -> Vec<u8> {
+        json!({"schema": "vessa-messages.v1", "messages": messages, "sessions": [],
+               "coverage": {"gaps": [], "limitations": []}, "warnings": warnings,
+               "redacted": 0, "redacted_by_rule": {}})
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn the_first_words_typed_are_cut_at_a_word_to_about_seventy_characters() {
+        assert_eq!(
+            excerpt("  fix   the\n\tparser  ").as_deref(),
+            Some("fix the parser")
+        );
+        assert_eq!(excerpt(" \n\t "), None);
+        let long = "make the digest show the first thing I typed in each session, not \
+                    its intent, which nobody reads";
+        let cut = excerpt(long).unwrap();
+        assert!(cut.chars().count() <= EXCERPT_CHARS, "{cut}");
+        let kept = cut.strip_suffix('…').expect("said cut");
+        assert!(
+            long.starts_with(kept) && long[kept.len()..].starts_with(' '),
+            "cut at a word: {cut}"
+        );
+        assert!(kept.chars().count() > EXCERPT_CHARS - 15, "about 70: {cut}");
+        // A word longer than all the room is cut inside it.
+        let word = excerpt(&"x".repeat(200)).unwrap();
+        assert_eq!(word.chars().count(), EXCERPT_CHARS);
+        assert!(word.ends_with('…'));
+    }
+
+    #[test]
+    fn each_session_shows_the_first_words_typed_in_it_by_its_own_agent() {
+        let start = NOW - 3 * HOUR;
+        let end = NOW - HOUR;
+        let own = ran(
+            "oh-1",
+            start,
+            end,
+            json!([native("claude", "c1", "/t/c1.jsonl")]),
+        );
+        let mut claim = native("claude", "c9", usage::ENV_SOURCE);
+        claim["testimony"] = json!(true);
+        let claimed = ran("oh-2", start, end, json!([claim]));
+        let quiet = ran(
+            "oh-3",
+            start,
+            end,
+            json!([native("claude", "c3", "/t/c3.jsonl")]),
+        );
+        let document = listed(
+            json!([
+                heard(
+                    "claude",
+                    "c1",
+                    Some(start - 60_000),
+                    "an earlier run, resumed"
+                ),
+                heard(
+                    "codex",
+                    "c1",
+                    Some(start + 1_000),
+                    "another agent's session"
+                ),
+                heard(
+                    "claude",
+                    "c1/agent-a1",
+                    Some(start + 1_000),
+                    "to a subagent"
+                ),
+                heard("claude", "c1", Some(start + 9_000), "the second thing"),
+                heard("claude", "c1", None, "no time"),
+                heard("claude", "c1", Some(start + 2_000), "   "),
+                heard(
+                    "claude",
+                    "c1",
+                    Some(start + 5_000),
+                    "  the first\n thing  typed "
+                ),
+                heard("claude", "c1", Some(end + 60_000), "after it ended"),
+                heard("claude", "c9", Some(start + 1_000), "only claimed"),
+            ]),
+            json!([]),
+        );
+        let (heard, gaps) = read_messages(Some(0), &document, "").unwrap();
+        assert!(gaps.is_empty(), "{gaps:?}");
+        let typed = first_typed(&[&own, &claimed, &quiet], &heard, start - 1_000);
+        assert_eq!(
+            typed,
+            BTreeMap::from([(
+                "oh-1".to_owned(),
+                Typed {
+                    text: "the first thing typed".into(),
+                    ended_ms: end,
+                }
+            )]),
+            "its own agent's, in its own time, found in its transcript"
+        );
+        // Read from after it began: its first words may lie before, so none.
+        assert!(first_typed(&[&own], &heard, start + 1_000).is_empty());
+    }
+
+    #[test]
+    fn a_message_list_vessa_cannot_give_is_said() {
+        let old = read_messages(Some(2), b"", "error: unrecognized subcommand 'messages'");
+        assert!(old.unwrap_err().contains("update vessa"));
+        let broken = read_messages(Some(0), b"{\"schema\": \"vessa-mess", "");
+        assert!(broken.unwrap_err().contains("vessa-messages.v1"));
+        let other = json!({"schema": "vessa-messages.v2", "messages": []}).to_string();
+        assert!(read_messages(Some(0), other.as_bytes(), "").is_err());
+        let failed = read_messages(Some(1), b"", "vessa: disk on fire").unwrap_err();
+        assert!(failed.contains("disk on fire"), "{failed}");
+        // Partial: what it listed stands, and what it could not read is said.
+        let partial = listed(
+            json!([heard("claude", "c1", Some(NOW), "hi")]),
+            json!(["/h/.codex/sessions/r.jsonl: Permission denied (os error 13)"]),
+        );
+        let (heard, gaps) = read_messages(Some(4), &partial, "vessa: partial").unwrap();
+        assert_eq!(heard.len(), 1);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("Permission denied"), "{gaps:?}");
+    }
+
+    fn scan(complete: bool, unreadable: Value, findings: Value) -> Vec<u8> {
+        json!({"schema": "vessa-secrets.v1", "since": null, "complete": complete,
+               "unreadable": unreadable, "findings": findings})
+        .to_string()
+        .into_bytes()
+    }
+
+    fn found(session: &str, at_ms: i64, place: &str, rule: &str, fingerprint: Value) -> Value {
+        json!({"agent": "claude", "session": session, "cwd": "/p/habitat",
+               "at": intake::rfc3339(at_ms / 1000), "where": place, "rule": rule,
+               "count": 1, "fingerprint": fingerprint})
+    }
+
+    #[test]
+    fn secrets_are_kept_as_where_and_how_many_and_read_on_from_the_last_whole_scan() {
+        let typed = found("s1", NOW - HOUR, "person", "github", json!("1A2B3C4D"));
+        let printed = found("s1", NOW - 2 * HOUR, "tool_output", "aws", Value::Null);
+        let (first, gaps) = read_secrets(
+            Some(0),
+            &scan(true, json!([]), json!([typed, printed])),
+            "",
+            &Secrets::default(),
+            NOW,
+        )
+        .unwrap();
+        assert!(gaps.is_empty(), "{gaps:?}");
+        assert_eq!(first.read_ms, Some(NOW));
+        assert_eq!(first.findings.len(), 2);
+        let said = &first.findings[0];
+        assert_eq!(
+            (said.place.as_str(), said.rule.as_str(), said.count),
+            ("person", "github", 1)
+        );
+        assert_eq!(said.at_ms, Some(NOW - HOUR));
+        assert_eq!(said.fingerprint.as_deref(), Some("1a2b3c4d"));
+        assert_eq!(said.found_ms, NOW);
+        // The next scan begins where this one ended, a little before, and
+        // never before the window.
+        assert_eq!(
+            secrets_since(&first, NOW - 24 * HOUR),
+            NOW - SECRETS_OVERLAP_MS
+        );
+        assert_eq!(secrets_since(&first, NOW), NOW);
+        assert_eq!(
+            secrets_since(&Secrets::default(), NOW - 24 * HOUR),
+            NOW - 24 * HOUR
+        );
+        // Read again: the same one is one, found when it was first; one
+        // more is new.
+        let later = found("s2", NOW + 60_000, "agent", "jwt", Value::Null);
+        let (again, _) = read_secrets(
+            Some(0),
+            &scan(true, json!([]), json!([typed, later])),
+            "",
+            &first,
+            NOW + 15 * 60_000,
+        )
+        .unwrap();
+        assert_eq!(again.findings.len(), 3);
+        let found_at: Vec<i64> = again.findings.iter().map(|f| f.found_ms).collect();
+        assert_eq!(found_at, vec![NOW, NOW, NOW + 15 * 60_000]);
+        // Nothing that could be a value is kept as given: a fingerprint
+        // that is not 8 hex digits, a rule or a place that is not a name.
+        let odd = json!([{"agent": "claude", "session": "s3", "cwd": null, "at": null,
+                          "where": "sk-ant-api03-abc", "rule": "sk-ant-api03-abc def",
+                          "count": 2, "fingerprint": "sk-ant-api03"}]);
+        let (kept, _) = read_secrets(
+            Some(0),
+            &scan(true, json!([]), odd),
+            "",
+            &Secrets::default(),
+            NOW,
+        )
+        .unwrap();
+        let odd = &kept.findings[0];
+        assert_eq!(
+            (odd.place.as_str(), odd.rule.as_str(), &odd.fingerprint),
+            ("other", "unknown", &None)
+        );
+        assert_eq!((odd.at_ms, odd.count), (None, 2));
+    }
+
+    #[test]
+    fn a_secrets_scan_that_could_not_read_everything_holds_its_place_and_says_why() {
+        let before = Secrets {
+            read_ms: Some(NOW - HOUR),
+            findings: Vec::new(),
+        };
+        let unreadable = json!([{"path": "/h/.claude/projects/-p/x.jsonl",
+                                 "why": "Permission denied (os error 13)"}]);
+        let finding = found("s1", NOW - 60_000, "person", "github", Value::Null);
+        let (partial, gaps) = read_secrets(
+            Some(4),
+            &scan(false, unreadable, json!([finding])),
+            "vessa: 1 transcript could not be read",
+            &before,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(
+            partial.read_ms,
+            Some(NOW - HOUR),
+            "the next scan begins where the last whole one ended"
+        );
+        assert_eq!(partial.findings.len(), 1, "what it found stands");
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(
+            gaps[0].contains("/h/.claude/projects/-p/x.jsonl")
+                && gaps[0].contains("Permission denied"),
+            "{gaps:?}"
+        );
+        // Incomplete with nothing named, or exit 4 alone: no all-clear either.
+        for (code, complete) in [(Some(0), false), (Some(4), true)] {
+            let (kept, gaps) = read_secrets(
+                code,
+                &scan(complete, json!([]), json!([])),
+                "",
+                &before,
+                NOW,
+            )
+            .unwrap();
+            assert!(!gaps.is_empty(), "{code:?} {complete}");
+            assert_eq!(kept.read_ms, Some(NOW - HOUR));
+        }
+        // An older vessa, a report that is not one, another schema, another
+        // exit: no answer, and why.
+        let old = read_secrets(
+            Some(2),
+            b"",
+            "error: unrecognized subcommand 'secrets'",
+            &before,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(
+            old.contains("no `secrets`") && old.contains("update vessa"),
+            "{old}"
+        );
+        let broken = read_secrets(
+            Some(0),
+            b"{\"schema\": \"vessa-secrets.v1\", \"findings\": [",
+            "",
+            &before,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(broken.contains("no report"), "{broken}");
+        let other = json!({"schema": "vessa-secrets.v2", "complete": true, "findings": []});
+        assert!(read_secrets(Some(0), other.to_string().as_bytes(), "", &before, NOW).is_err());
+        let unsaid = json!({"schema": "vessa-secrets.v1", "findings": []});
+        assert!(
+            read_secrets(Some(0), unsaid.to_string().as_bytes(), "", &before, NOW).is_err(),
+            "a report that does not say whether it is complete is none"
+        );
+        let nameless = scan(
+            true,
+            json!([]),
+            json!([{"agent": "claude", "session": "s"}]),
+        );
+        assert!(read_secrets(Some(0), &nameless, "", &before, NOW).is_err());
+        let failed = read_secrets(Some(1), b"", "vessa: disk on fire", &before, NOW).unwrap_err();
+        assert!(failed.contains("disk on fire"), "{failed}");
+        // vessa is not installed.
+        let missing = vessa_failed(
+            "secrets",
+            &anyhow::anyhow!("cannot run vessa: No such file or directory (os error 2)"),
+        );
+        assert!(missing.contains("vessa is not installed"), "{missing}");
+    }
+
+    #[test]
+    fn first_words_and_secrets_are_kept_only_for_the_window_the_digest_shows() {
+        let from = NOW - 24 * HOUR;
+        let mut collected = Collected::default();
+        for (id, ended_ms) in [("before", from - 1), ("in", from + 1)] {
+            collected.typed.value.insert(
+                id.into(),
+                Typed {
+                    text: "words".into(),
+                    ended_ms,
+                },
+            );
+        }
+        let finding = |at_ms: Option<i64>, found_ms: i64| Finding {
+            agent: "claude".into(),
+            session: "s".into(),
+            place: "person".into(),
+            rule: "github".into(),
+            count: 1,
+            at_ms,
+            found_ms,
+            ..Finding::default()
+        };
+        collected.secrets.value.findings = vec![
+            finding(Some(from - 1), NOW),
+            finding(None, from - 1),
+            finding(Some(from + 1), NOW),
+            finding(None, from + 1),
+        ];
+        collected.keep_window(from);
+        assert_eq!(collected.typed.value.keys().collect::<Vec<_>>(), vec!["in"]);
+        let kept: Vec<(Option<i64>, i64)> = collected
+            .secrets
+            .value
+            .findings
+            .iter()
+            .map(|f| (f.at_ms, f.found_ms))
+            .collect();
+        assert_eq!(kept, vec![(Some(from + 1), NOW), (None, from + 1)]);
     }
 
     #[test]

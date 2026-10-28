@@ -139,7 +139,31 @@ exit 0
 /// read) or source warning (one it could not read), and it exits 4. With
 /// `$HOME/vessa-old` it is a vessa older than `messages`. `usage` prints
 /// `$HOME/vessa-usage.json`, else no sessions, its arguments logged too.
+/// `secrets` answers `vessa-secrets.v1`: `$HOME/vessa-secrets.json` as it
+/// is, else a whole scan that found nothing, and exits with what
+/// `$HOME/vessa-secrets-exit` holds (else 0); with `$HOME/vessa-old-secrets`
+/// it is a vessa older than `secrets`, as clap refuses one. Its arguments
+/// are logged too.
 const VESSA_STUB: &str = r#"#!/bin/sh
+if [ "$1" = secrets ]; then
+  printf '%s\n' "$*" >> "$HOME/vessa-calls"
+  if [ -e "$HOME/vessa-old-secrets" ]; then
+    echo "error: unrecognized subcommand 'secrets'" >&2
+    echo "" >&2
+    echo "  tip: a similar subcommand exists: 'receipt'" >&2
+    echo "" >&2
+    echo "Usage: vessa [OPTIONS] <COMMAND>" >&2
+    echo "" >&2
+    echo "For more information, try '--help'." >&2
+    exit 2
+  fi
+  if [ -f "$HOME/vessa-secrets.json" ]; then cat "$HOME/vessa-secrets.json"
+  else echo '{"schema":"vessa-secrets.v1","since":null,"complete":true,"unreadable":[],"findings":[]}'; fi
+  code=0
+  if [ -f "$HOME/vessa-secrets-exit" ]; then code=$(cat "$HOME/vessa-secrets-exit"); fi
+  [ "$code" = 4 ] && echo "vessa: the secrets scan is incomplete: 1 transcript could not be read" >&2
+  exit "$code"
+fi
 if [ "$1" = messages ]; then
   printf '%s\n' "$*" >> "$HOME/vessa-calls"
   if [ -e "$HOME/vessa-old" ]; then
@@ -8982,32 +9006,32 @@ fn unix_seconds() -> i64 {
         .as_secs() as i64
 }
 
+/// `unix_s` (unix seconds) as RFC 3339 UTC.
+fn utc(unix_s: i64) -> String {
+    let (days, s) = (unix_s.div_euclid(86_400), unix_s.rem_euclid(86_400));
+    // Civil from days (Howard Hinnant), as the binary does.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        s / 3600,
+        s % 3600 / 60,
+        s % 60
+    )
+}
+
 /// [`graphql_page`], its times counted back from `now` (unix seconds): two
 /// answers from one base differ in what they hold, never in when a pull
 /// request happened, however long apart they are written.
 fn graphql_page_at(now: i64, more: bool, extra: u64) -> String {
-    let at = |ago_s: i64| {
-        let (days, s) = (
-            (now - ago_s).div_euclid(86_400),
-            (now - ago_s).rem_euclid(86_400),
-        );
-        // Civil from days (Howard Hinnant), as the binary does.
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z - era * 146_097;
-        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let day = doy - (153 * mp + 2) / 5 + 1;
-        let month = if mp < 10 { mp + 3 } else { mp - 9 };
-        let year = yoe + era * 400 + i64::from(month <= 2);
-        format!(
-            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-            s / 3600,
-            s % 3600 / 60,
-            s % 60
-        )
-    };
+    let at = |ago_s: i64| utc(now - ago_s);
     let repo = |name: &str| {
         serde_json::json!({"nameWithOwner": format!("false-systems/{name}"),
                            "defaultBranchRef": {"name": "main"}})
@@ -9366,7 +9390,7 @@ fn collect_asks_github_at_most_twice_and_says_what_failed() {
     );
     assert_eq!(code, Some(4), "{stdout}");
     assert!(
-        stdout.contains("github  unavailable: gh api graphql: gh: To get started"),
+        stdout.contains("github   unavailable: gh api graphql: gh: To get started"),
         "{stdout}"
     );
     let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
@@ -9491,9 +9515,10 @@ impl Fixture {
             }
         };
         back(&mut snapshot["at_ms"]);
-        for part in ["local", "github", "usage"] {
+        for part in ["local", "github", "usage", "typed", "secrets"] {
             back(&mut snapshot[part]["as_of_ms"]);
         }
+        back(&mut snapshot["secrets"]["value"]["read_ms"]);
         for branch in snapshot["local"]["value"]["branches"]
             .as_array_mut()
             .unwrap()
@@ -9875,5 +9900,286 @@ fn a_digest_moves_the_cursor_only_under_the_claim() {
         "shown again: {said}"
     );
     assert!(fixture.human_dir().join("seen.json").is_file());
+    fixture.cleanup();
+}
+
+// ---- the first words typed, and the secrets seen (Yair, 2026-10-28) ---------
+
+impl Fixture {
+    /// What the stand-in's `vessa secrets --json` answers next, and its exit.
+    fn secrets_scan(&self, report: &str, exit: i32) {
+        fs::write(self.dir.join("home/vessa-secrets.json"), report).unwrap();
+        fs::write(self.dir.join("home/vessa-secrets-exit"), exit.to_string()).unwrap();
+    }
+}
+
+/// One finding, as `vessa secrets --json` lists it.
+fn secret_found(
+    session: &str,
+    at_s: i64,
+    place: &str,
+    rule: &str,
+    fingerprint: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({"agent": "claude", "session": session, "cwd": "/p/habitat",
+                       "at": utc(at_s), "where": place, "rule": rule, "count": 1,
+                       "fingerprint": fingerprint})
+}
+
+/// `vessa-secrets.v1`.
+fn secrets_report(
+    complete: bool,
+    unreadable: serde_json::Value,
+    findings: Vec<serde_json::Value>,
+) -> String {
+    serde_json::json!({"schema": "vessa-secrets.v1", "since": null, "complete": complete,
+                       "unreadable": unreadable, "findings": findings})
+    .to_string()
+}
+
+/// Yair, 2026-10-28: a session ended is said by the first words the person
+/// typed in it, and what vessa's secrets scan found is said in the line once
+/// and in the digest. `collect` asks vessa at most three times, once each for
+/// usage, messages and secrets, and GitHub at most twice; the next scan
+/// begins where the last whole one ended.
+#[test]
+fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("human-typed");
+    fixture.human_view(false);
+    let repo = fixture.make_git_repo("work");
+    fixture.set_context(r#"{"repo":{"name":"work","role":"a test repo","not_roles":[]}}"#);
+    fake_claude(&fixture);
+    let native = "5e1976e4-71c3-407c-9533-0be05b7e1b70";
+    let (_, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "claude", "--intent", "interactive"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_FAKE_NATIVE", native)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let started = export_of(&fixture, &repo)["sessions"][0]["started_ms"]
+        .as_i64()
+        .unwrap()
+        / 1000;
+    let typed = |at_s: i64, text: &str| {
+        serde_json::json!({"agent": "claude", "session": native, "parent": null,
+                           "kind": "message", "id": null, "at": utc(at_s),
+                           "cwd": repo.display().to_string(), "text": text,
+                           "question": null, "reply": null,
+                           "source": format!("/t/{native}.jsonl"), "line": 2})
+        .to_string()
+    };
+    fixture.said(&[
+        typed(started, "make the digest say what I asked for"),
+        typed(started, "and then this"),
+    ]);
+    fixture.secrets_scan(
+        &secrets_report(
+            true,
+            serde_json::json!([]),
+            vec![secret_found(
+                native,
+                unix_seconds() - 60,
+                "person",
+                "github",
+                Some("1a2b3c4d"),
+            )],
+        ),
+        0,
+    );
+    let (stdout, stderr, code) = output_of(fixture.person().arg("collect"));
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let calls = fixture.vessa_calls();
+    let asked = |calls: &[String], what: &str| {
+        calls
+            .iter()
+            .filter(|call| call.split(' ').next() == Some(what))
+            .count()
+    };
+    assert_eq!(
+        (
+            asked(&calls, "usage"),
+            asked(&calls, "messages"),
+            asked(&calls, "secrets")
+        ),
+        (1, 1, 1),
+        "{calls:?}"
+    );
+    assert_eq!(calls.len(), 3, "at most three vessa calls: {calls:?}");
+    assert!(fixture.graphql_calls() <= 2);
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("messages --json --since ")),
+        "{calls:?}"
+    );
+    let first_scan = calls
+        .iter()
+        .find(|call| call.starts_with("secrets --json --since "))
+        .unwrap_or_else(|| panic!("{calls:?}"))
+        .clone();
+    // The snapshot keeps the first words, cut short, and where a finding
+    // is: never a value.
+    let snapshot = fs::read_to_string(fixture.human_dir().join("collected.json")).unwrap();
+    assert!(
+        snapshot.contains("make the digest say what I asked for"),
+        "{snapshot}"
+    );
+    assert!(!snapshot.contains("and then this"), "only the first words");
+    let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(0), "{digest}");
+    assert!(
+        digest.contains("claude \"make the digest say what I asked for\" · exit 0"),
+        "{digest}"
+    );
+    assert!(!digest.contains("\"interactive\""), "{digest}");
+    for said in [
+        "\nSecrets seen\n",
+        "claude 5e1976e4 · you typed it · github ×1 · fingerprint 1a2b3c4d\n",
+        "  Rotate any that are real keys; `printf %s KEY | shasum -a 256 | cut -c1-8` matches \
+         a fingerprint\n",
+    ] {
+        assert!(digest.contains(said), "missing `{said}`: {digest}");
+    }
+    // The day's first terminal: its digest points to the finding; then
+    // nothing, until one more is found.
+    let day = || {
+        on_a_terminal(
+            fixture
+                .person()
+                .arg("line")
+                .env("OHJAA_TODAY", "2026-10-27"),
+        )
+        .0
+    };
+    let daily = day();
+    assert!(
+        daily.contains("\n  ! 1 secret-shaped token in agent sessions: ohjaa digest\n"),
+        "{daily}"
+    );
+    assert_eq!(day(), "", "said once");
+    fixture.secrets_scan(
+        &secrets_report(
+            true,
+            serde_json::json!([]),
+            vec![secret_found(
+                native,
+                unix_seconds() - 30,
+                "tool_output",
+                "aws",
+                None,
+            )],
+        ),
+        0,
+    );
+    let (stdout, stderr, code) = output_of(fixture.person().arg("collect"));
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert_eq!(
+        day(),
+        "! 1 secret-shaped token in agent sessions: ohjaa digest\n"
+    );
+    assert_eq!(day(), "");
+    // The second scan began where the first ended, not at the window's start.
+    let calls = fixture.vessa_calls();
+    let second_scan = calls
+        .iter()
+        .filter(|call| call.starts_with("secrets --json --since "))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{calls:?}"));
+    assert!(second_scan.as_str() > first_scan.as_str(), "{calls:?}");
+    fixture.cleanup();
+}
+
+/// Yair, 2026-10-28: what the secrets scan cannot read is never an
+/// all-clear. An older vessa (no `secrets`), a scan that could not read
+/// everything (exit 4) and an answer that is no report are each said in the
+/// digest, with why, and `collect` and `digest` exit 4.
+#[test]
+fn a_secrets_scan_that_cannot_run_is_said_never_an_all_clear() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("human-secrets");
+    fixture.human_view(false);
+    let home = fixture.dir.join("home");
+    let collect = || output_of(fixture.person().arg("collect"));
+    let digest = || output_of(fixture.person().args(["digest", "--no-collect"]));
+    let section = |said: &str| {
+        said.split("\nSecrets seen\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no Secrets seen: {said}"))
+            .to_owned()
+    };
+    // An older vessa, without `secrets`.
+    fs::write(home.join("vessa-old-secrets"), "").unwrap();
+    let (stdout, _, code) = collect();
+    assert_eq!(code, Some(4), "{stdout}");
+    assert!(
+        stdout.contains("  secrets  unavailable: this vessa has no `secrets`: update vessa"),
+        "{stdout}"
+    );
+    let (said, _, code) = digest();
+    assert_eq!(code, Some(4), "{said}");
+    let seen = section(&said);
+    assert!(
+        seen.starts_with("  ! secrets")
+            && seen.contains(
+                "the scan could not run, never read: this vessa has no `secrets`: update vessa"
+            ),
+        "{said}"
+    );
+    // It could not read everything (exit 4): what it found stands, and what
+    // it could not read is said.
+    fs::remove_file(home.join("vessa-old-secrets")).unwrap();
+    fixture.secrets_scan(
+        &secrets_report(
+            false,
+            serde_json::json!([{"path": "/h/x.jsonl", "why": "Permission denied (os error 13)"}]),
+            vec![secret_found(
+                "s1",
+                unix_seconds() - 60,
+                "person",
+                "github",
+                None,
+            )],
+        ),
+        4,
+    );
+    let (stdout, _, code) = collect();
+    assert_eq!(code, Some(4), "{stdout}");
+    let (said, _, code) = digest();
+    assert_eq!(code, Some(4), "{said}");
+    let seen = section(&said);
+    assert!(
+        seen.contains("the scan could not read 1, as of ")
+            && seen.contains("could not read /h/x.jsonl: Permission denied"),
+        "{said}"
+    );
+    assert!(seen.contains("you typed it · github ×1"), "{said}");
+    // An answer that is no report: what was found before stays, as of then.
+    fixture.secrets_scan("{\"schema\":\"vessa-secrets.v1\",\"findings\":[", 0);
+    let (stdout, _, code) = collect();
+    assert_eq!(code, Some(4), "{stdout}");
+    assert!(
+        stdout.contains("  secrets  unavailable: vessa secrets --json printed no report"),
+        "{stdout}"
+    );
+    let (said, _, code) = digest();
+    assert_eq!(code, Some(4), "{said}");
+    let seen = section(&said);
+    assert!(seen.contains("the scan could not run, as of "), "{said}");
+    assert!(seen.contains("you typed it · github ×1"), "kept: {said}");
+    // A whole scan again: only now is nothing missing.
+    fixture.secrets_scan(&secrets_report(true, serde_json::json!([]), Vec::new()), 0);
+    let (stdout, _, code) = collect();
+    assert_eq!(code, Some(0), "{stdout}");
+    let (said, _, code) = digest();
+    assert_eq!(code, Some(0), "{said}");
+    assert!(!said.contains("! secrets"), "{said}");
     fixture.cleanup();
 }
