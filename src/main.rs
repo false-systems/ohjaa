@@ -2872,10 +2872,11 @@ impl Intent {
         // The handshake leaving looks for in the agent's transcript (D7).
         format!(
             "{}; its intent is {}, {origin}. Continue it in a later session with: ohjaa \
-             run <agent> --intent-id {}\n",
+             run <agent> --intent-id {}\n\nCurrent session intent:\n{}\n\n",
             usage::handshake(session),
             self.id,
-            self.id
+            self.id,
+            self.text
         )
     }
 }
@@ -4266,7 +4267,9 @@ fn lifecycle_briefing(intent: &str, root: &Path, in_repo: bool, scoped: &[PathBu
         .collect::<Vec<_>>()
         .join(", ");
     let phases = if !in_repo && scoped.is_empty() {
-        "2. This folder is not a Git repository, and no --scope named one. At leaving,
+        "2. This folder is not a Git repository, and no --scope named one. For the
+   assigned goal, identify the repositories needed and declare each before
+   working there. You do not need the person to choose repositories first. At leaving,
    ohjaa records the repositories directly in it whose branches or worktrees
    moved, but it cannot tell your work there from another agent's. Say in your
    handover what you changed, and in which repos. Declare any repo you work in
@@ -4298,8 +4301,11 @@ fn lifecycle_briefing(intent: &str, root: &Path, in_repo: bool, scoped: &[PathBu
     format!(
         "\
 How this session works (ohjaa):
-{intent}If no concrete task is assigned, acknowledge and wait; the wrapper has already
-recorded entry. Do not run orientation, discovery or handover tools just to start.
+{intent}A concrete intent is assigned work: start on that goal even without --task.
+An explicit task gives the specific work within that intent. If neither gives
+concrete work (for example, the intent is only \"interactive\"), acknowledge and
+wait; the wrapper has already recorded entry. Do not run orientation, discovery
+or handover tools just for an idle startup.
 Once a task is assigned, use this briefing and the Toimija packet as your starting
 knowledge. Read the named files to resolve gaps; do not repeat repository discovery.
 1. Before your first change, read back what you know:
