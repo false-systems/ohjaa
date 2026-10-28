@@ -1081,9 +1081,10 @@ instructions: /Users/you/.codex/AGENTS.md does not exist.`), when:
 - the agent will not read the file, by its own options (before its own `--`)
   or variables:
   - Claude Code 2.1.311 given `--bare` or `--safe-mode`, or with
-    `CLAUDE_CODE_SIMPLE` or `CLAUDE_CODE_SAFE_MODE` set truthy, reads no
-    CLAUDE.md; given `--setting-sources` without `user`, or an empty
-    `CLAUDE_CONFIG_DIR`, it does not read that one;
+    `CLAUDE_CODE_SIMPLE` or `CLAUDE_CODE_SAFE_MODE` set truthy, or
+    `CLAUDE_CODE_DISABLE_CLAUDE_MDS` set at all, reads no CLAUDE.md; given
+    `--setting-sources` without `user`, or an empty `CLAUDE_CONFIG_DIR`, it
+    does not read that one;
   - pi 1.2.0 given `--no-context-files` or `-nc` reads no AGENTS.md or
     CLAUDE.md;
   - opencode 2.1.4 given `--server <url>` leaves its instructions to that
@@ -1223,7 +1224,7 @@ This repository's lessons are carried here, though its AGENTS.md holds 14 of the
 
 | agent | left to AGENTS.md when | carried when |
 |---|---|---|
-| Claude Code 2.1.311 | a `CLAUDE.md`, `.claude/CLAUDE.md` or `CLAUDE.local.md` of the root, or of a folder between it and the launch folder, imports the root's AGENTS.md (`.md`, outside fences and code); or `pluginConfigs` of your or your organisation's settings set the built-in `cc-plugin-agents-md` plugin's `instructionFiles` to `claude-md-and-agents-md` | otherwise: no CLAUDE.md (its fallback reads AGENTS.md only where no CLAUDE.md is found at the root or above, and one above every checkout defeats it), a prose mention, `--bare`, `--safe-mode`, `CLAUDE_CODE_SIMPLE` or `CLAUDE_CODE_SAFE_MODE`, `--setting-sources` without `project`, `--settings`, `managed-only` |
+| Claude Code 2.1.311 | a `CLAUDE.md`, `.claude/CLAUDE.md` or `CLAUDE.local.md` of the root, or of a folder between it and the launch folder, imports the root's AGENTS.md (`@AGENTS.md` in its text: not in frontmatter, fenced or indented code, code spans, HTML comments or HTML blocks), **and** it starts at the root, or the project's `hasClaudeMdExternalIncludesApproved` is true in `~/.claude.json` (it follows an import outside the folder it starts in only then); or `pluginConfigs` of your or your organisation's settings set the built-in `cc-plugin-agents-md` plugin's `instructionFiles` to `claude-md-and-agents-md` | otherwise: no CLAUDE.md (its fallback reads AGENTS.md only where no CLAUDE.md is found at the root or above, and one above every checkout defeats it), a prose mention, a launch in a subfolder without that approval, `--bare`, `--safe-mode`, `CLAUDE_CODE_SIMPLE` or `CLAUDE_CODE_SAFE_MODE`, `CLAUDE_CODE_DISABLE_CLAUDE_MDS`, `--setting-sources` without `project`, `--settings`, `claudeMdExcludes`, `managed-only` |
 | Codex 0.164.0 | always, within its cap | an `AGENTS.override.md` at the root; the last lesson's line ending past `project_doc_max_bytes` (a `-c`, else `/config.toml`, else 32768) |
 | pi 1.2.0 | always | `-nc`, `--no-context-files`; an `AGENTS.override.md` at the root |
 | opencode 2.1.4 | always | `OPENCODE_DISABLE_PROJECT_CONFIG` or `OPENCODE_CONFIG_PROJECT_DISABLE` set; `--server` |

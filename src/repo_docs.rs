@@ -14,12 +14,20 @@
 //!   CLAUDE.md above every checkout defeats it): left to AGENTS.md only when
 //!   a CLAUDE.md, `.claude/CLAUDE.md` or `CLAUDE.local.md` of the root, or
 //!   of a folder between it and the launch folder, imports the root's
-//!   AGENTS.md (`@AGENTS.md`, outside fences and code), or `instructionFiles`
-//!   is `claude-md-and-agents-md` (the legacy `projectInstructions = "both"`
-//!   too). Carried with `--bare`, `--safe-mode`, `CLAUDE_CODE_SIMPLE` or
-//!   `CLAUDE_CODE_SAFE_MODE` truthy, `--setting-sources` without `project`,
-//!   `--settings` (not read here), the plugin turned off in `enabledPlugins`,
-//!   or `instructionFiles` `managed-only`.
+//!   AGENTS.md (`@AGENTS.md` in its text: not in frontmatter, fenced or
+//!   indented code, code spans, HTML comments or HTML blocks, which its
+//!   extractor skips), and Claude Code starts at the root or the project
+//!   approved external imports (its loader follows an import outside the
+//!   folder it starts in only then: `hasClaudeMdExternalIncludesApproved` of
+//!   the project, keyed by its git root, in `~/.claude.json`); or
+//!   `instructionFiles` is `claude-md-and-agents-md` (the legacy
+//!   `projectInstructions = "both"` too). Carried with `--bare`,
+//!   `--safe-mode`, `CLAUDE_CODE_SIMPLE` or `CLAUDE_CODE_SAFE_MODE` truthy,
+//!   `CLAUDE_CODE_DISABLE_CLAUDE_MDS` with any value, `--setting-sources`
+//!   without `project`, `--settings` (not read here), `claudeMdExcludes` set
+//!   in any settings (its patterns not matched here), the plugin turned off
+//!   in `enabledPlugins`, or `instructionFiles` `managed-only`
+//!   (`CLAUDE_CODE_MANAGED_SETTINGS_PATH` moves the organisation's settings).
 //! - **Codex 0.164.0** reads AGENTS.md from the git root down to the launch
 //!   folder, an `AGENTS.override.md` in its place where there is one, at
 //!   most `project_doc_max_bytes` (32768 by default) in all, the root's
@@ -159,6 +167,22 @@ fn claude(
             ));
         }
     }
+    // Any value turns every CLAUDE.md off (Claude Code sets it itself under
+    // `--safe-mode`).
+    if let Some(value) = var("CLAUDE_CODE_DISABLE_CLAUDE_MDS").filter(|value| !value.is_empty()) {
+        return Err(format!(
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS={} is in the environment, so Claude Code loads no \
+             CLAUDE.md",
+            value.to_string_lossy()
+        ));
+    }
+    if let Some(file) = md_excludes(root, user_settings, var)? {
+        return Err(format!(
+            "{} sets claudeMdExcludes, and ohjaa does not match its patterns against the \
+             CLAUDE.md files",
+            file.display()
+        ));
+    }
     match plugin_mode(user_settings, var)? {
         Mode::ManagedOnly(file) => Err(format!(
             "Claude Code's agents-md plugin is set to managed-only in {}, so no project \
@@ -183,28 +207,115 @@ enum Mode {
 
 const PLUGIN: &str = "cc-plugin-agents-md";
 
-/// The plugin's `instructionFiles` from the user's settings (unless
-/// `--setting-sources` leaves `user` out) and the organisation's (which
-/// come after, and win), and whether the plugin is turned off. A settings
-/// file that cannot be read is an error: what it says cannot be told.
-fn plugin_mode(user: bool, var: &dyn Fn(&str) -> Option<OsString>) -> Result<Mode, String> {
-    let config = var("CLAUDE_CONFIG_DIR")
+/// Where the organisation's settings are when nothing moves them.
+const MANAGED_SETTINGS: &str = if cfg!(target_os = "macos") {
+    "/Library/Application Support/ClaudeCode/managed-settings.json"
+} else {
+    "/etc/claude-code/managed-settings.json"
+};
+
+/// The organisation's settings: `CLAUDE_CODE_MANAGED_SETTINGS_PATH` moves them.
+fn managed_settings(var: &dyn Fn(&str) -> Option<OsString>) -> PathBuf {
+    var("CLAUDE_CODE_MANAGED_SETTINGS_PATH")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(MANAGED_SETTINGS))
+}
+
+/// Claude Code's own folder: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+fn claude_config(var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    var("CLAUDE_CONFIG_DIR")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             var("HOME")
                 .filter(|home| !home.is_empty())
                 .map(|home| PathBuf::from(home).join(".claude"))
+        })
+}
+
+/// The settings file that sets `claudeMdExcludes` (patterns of CLAUDE.md
+/// files Claude Code leaves out), among the user's (unless left out), the
+/// project's, its local ones and the organisation's. ohjaa does not match
+/// those patterns, so any such setting carries the lessons.
+fn md_excludes(
+    root: &Path,
+    user: bool,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Option<PathBuf>, String> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    if user {
+        files.extend(claude_config(var).map(|dir| dir.join("settings.json")));
+    }
+    files.push(root.join(".claude").join("settings.json"));
+    files.push(root.join(".claude").join("settings.local.json"));
+    files.push(managed_settings(var));
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let settings: Value = serde_json::from_str(&text).map_err(|error| {
+            format!(
+                "{} cannot be read as JSON ({error}), so what it says of CLAUDE.md cannot be told",
+                file.display()
+            )
+        })?;
+        let set = match &settings["claudeMdExcludes"] {
+            Value::Null => false,
+            Value::Array(patterns) => !patterns.is_empty(),
+            _ => true,
+        };
+        if set {
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether Claude Code may follow an import outside the folder it starts in,
+/// for the project at `root`: `projects[<root>].hasClaudeMdExternalIncludesApproved`
+/// in its global config (`$CLAUDE_CONFIG_DIR/.claude.json`, else
+/// `~/.claude.json`), the project keyed by its git root (Claude Code
+/// 2.1.311's `lPe`). The file, and whether it says so, or why not.
+fn external_imports_approved(
+    root: &Path,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> (PathBuf, bool) {
+    let file = var("CLAUDE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| PathBuf::from(dir).join(".claude.json"))
+        .or_else(|| {
+            var("HOME")
+                .filter(|home| !home.is_empty())
+                .map(|home| PathBuf::from(home).join(".claude.json"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".claude.json"));
+    let approved = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .is_some_and(|config| {
+            let real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            [root.to_path_buf(), real].iter().any(|key| {
+                config["projects"][key.to_string_lossy().as_ref()]
+                    ["hasClaudeMdExternalIncludesApproved"]
+                    .as_bool()
+                    == Some(true)
+            })
         });
+    (file, approved)
+}
+
+/// The plugin's `instructionFiles` from the user's settings (unless
+/// `--setting-sources` leaves `user` out) and the organisation's (which
+/// come after, and win), and whether the plugin is turned off. A settings
+/// file that cannot be read is an error: what it says cannot be told.
+fn plugin_mode(user: bool, var: &dyn Fn(&str) -> Option<OsString>) -> Result<Mode, String> {
+    let config = claude_config(var);
     let mut files: Vec<PathBuf> = Vec::new();
     if user {
         files.extend(config.map(|dir| dir.join("settings.json")));
     }
-    files.push(PathBuf::from(if cfg!(target_os = "macos") {
-        "/Library/Application Support/ClaudeCode/managed-settings.json"
-    } else {
-        "/etc/claude-code/managed-settings.json"
-    }));
+    files.push(managed_settings(var));
     let mut mode = Mode::Otherwise;
     let mut off = false;
     for file in files {
@@ -315,6 +426,25 @@ fn imports_agents_md(
                 is_agents_md(&resolved)
             });
             if names_it {
+                // Claude Code 2.1.311 follows an import whose file is outside
+                // the folder it starts in only when the project approved
+                // external imports (its loader: `if(!j0(We)&&!V)continue`).
+                // The root's AGENTS.md is inside that folder only when it
+                // starts at the root.
+                if launch != root_real {
+                    let (config, approved) = external_imports_approved(root, var);
+                    if !approved {
+                        return Err(format!(
+                            "Claude Code starts in {}, and follows {}'s import of {}, outside \
+                             that folder, only when the project's \
+                             hasClaudeMdExternalIncludesApproved is true in {}, which it is not",
+                            launch.display(),
+                            file.display(),
+                            root.join("AGENTS.md").display(),
+                            config.display()
+                        ));
+                    }
+                }
                 return Ok(file);
             }
         }
@@ -335,18 +465,45 @@ fn imports_agents_md(
     })
 }
 
-/// The paths a CLAUDE.md imports: each word that begins with `@`, outside
-/// fenced blocks and code spans.
+/// The paths a CLAUDE.md imports, as Claude Code 2.1.311's extractor finds
+/// them (it walks Markdown's tokens: code and code spans skipped, HTML
+/// comments stripped, other HTML blocks skipped, frontmatter dropped): each
+/// word that begins with `@` in its text, and nowhere else. Indented code
+/// is skipped, though a paragraph's indented line is text to Markdown: what
+/// is not counted only carries the lessons.
 fn imports(text: &str) -> Vec<String> {
+    let text = without_comments(text);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // Frontmatter: a first line `---`, to the next `---` (an unclosed one
+    // to the end).
+    if lines.first().is_some_and(|line| line.trim() == "---") {
+        match lines.iter().skip(1).position(|line| line.trim() == "---") {
+            Some(end) => {
+                lines.drain(..end + 2);
+            }
+            None => lines.clear(),
+        }
+    }
+    let (mut fence, mut html) = (false, false);
     let mut found = Vec::new();
-    let mut fence = false;
-    for line in text.lines() {
+    for line in lines {
         let bare = line.trim_start();
+        if html {
+            // An HTML block runs to a blank line.
+            html = !bare.is_empty();
+            continue;
+        }
         if bare.starts_with("```") || bare.starts_with("~~~") {
             fence = !fence;
             continue;
         }
-        if fence {
+        if fence || line.starts_with('\t') || line.starts_with("    ") {
+            continue;
+        }
+        if bare.starts_with('<')
+            && bare[1..].starts_with(|c: char| c.is_ascii_alphabetic() || c == '/')
+        {
+            html = true;
             continue;
         }
         // What is between backticks is code, not an import.
@@ -364,6 +521,21 @@ fn imports(text: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// `text` without its HTML comments, an unclosed one to the end.
+fn without_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("<!--") {
+        out.push_str(&rest[..at]);
+        rest = match rest[at + 4..].find("-->") {
+            Some(end) => &rest[at + 4 + end + 3..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
 }
 
 fn codex(
