@@ -521,9 +521,16 @@ What stays until it is resolved comes first, in this order:
 1. a branch with a failed commit;
 2. what is unknown: a source that could not be read, a session still running
    with its ohjaa gone, an orphan, a commit sykli could say nothing about;
-3. a branch whose commits lack evidence (`main: 2 unproven since 5fcdeef.
-   Prove it: ohjaa gate`);
+3. a branch whose commits lack evidence (`main: 2 commits need passing checks
+   since 5fcdeef. Run: ohjaa gate`);
 4. what waits for a person: a session open more than a day.
+
+"Needs passing checks" means no verified passing result is recorded; it
+does not by itself mean a check failed. Failures are counted explicitly.
+"Startup notes" are the agent's confirmation that it understood the task
+and rules; a handover records what changed and what remains. Missing notes
+mean missing documentation, not failed code. The terminal summary ends with
+`Details: ohjaa digest` and says `more` when it leaves other updates out.
 
 A branch is said as it was last read: when that was not just now, with its
 age (`, as of 05:00 UTC (unread since)`), and it stays until a read resolves
@@ -589,8 +596,8 @@ pull request reviews, and direct pushes that are proven. `ohjaa session`,
 In particular, viemari's day listed each failed validation a session asked
 sykli for (`FAILED: test`). This view does not ask sykli about validation
 runs, so their absence here is **not a pass**: a failed run shows here only
-as the mark of a commit on an entry's branch (`main: 1 unproven (1
-failed)`). `ohjaa session <id>` shows the validations a session asked for.
+as the mark of a commit on an entry's branch (`main: 1 commit needs passing
+checks (1 failed)`). `ohjaa session <id>` shows the validations a session asked for.
 
 ## Sessions: entering to leaving
 
