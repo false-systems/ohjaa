@@ -6,15 +6,19 @@
 //! node carries its time, its why and whose it is; the scope is the directory
 //! it lives in.
 //!
-//! | scope   | lives in                          | changes by        |
-//! |---------|-----------------------------------|-------------------|
-//! | ours    | `<ours checkout>/knowledge/`      | review (PR)       |
-//! | repo    | `<repo>/.ohjaa/knowledge/`        | review (PR)       |
-//! | mine    | `$XDG_CONFIG_HOME/ohjaa/mine/`    | its owner         |
-//! | machine | `$XDG_CONFIG_HOME/ohjaa/machine/` | its owner         |
+//! | scope   | lives in                                         | changes by        |
+//! |---------|--------------------------------------------------|-------------------|
+//! | ours    | `<ours checkout>/knowledge/`                     | review (PR)       |
+//! | repo    | `<repo>/AGENTS.md`, `## Lessons` ([`crate::lessons`]) | a PR ohjaa opens |
+//! | mine    | `$XDG_CONFIG_HOME/ohjaa/mine/`                   | its owner         |
+//! | machine | `$XDG_CONFIG_HOME/ohjaa/machine/`                | its owner         |
 //!
 //! Proposals wait in `$XDG_STATE_HOME/ohjaa/proposals/` until a person accepts
-//! them, so an agent's draft never lands in a shared repository by itself.
+//! them, so an agent's draft never lands in a shared repository by itself. An
+//! accepted repo node is kept in `$XDG_STATE_HOME/ohjaa/lessons/<clone>/`
+//! ([`accepted_dir`]), with its why, while its line goes to the repository's
+//! AGENTS.md; one accepted before that sits in `<repo>/.ohjaa/knowledge/`
+//! until `ohjaa lessons publish` moves it.
 
 use std::fmt::Write as _;
 use std::io::IsTerminal;
@@ -128,8 +132,40 @@ impl Dirs {
     }
 }
 
+/// Where repo knowledge accepted before ohjaa wrote it into AGENTS.md sits:
+/// untracked in the checkout, until `ohjaa lessons publish` moves it.
 pub fn repo_knowledge(root: &Path) -> PathBuf {
     root.join(".ohjaa").join("knowledge")
+}
+
+/// `.ohjaa/knowledge/`, then `.ohjaa/`, taken out of a checkout once
+/// nothing is left in them: what ohjaa left untracked there, gone whole.
+pub fn tidy_untracked(root: &Path) {
+    let untracked = repo_knowledge(root);
+    if std::fs::remove_dir(&untracked).is_ok() {
+        if let Some(dot) = untracked.parent() {
+            let _ = std::fs::remove_dir(dot);
+        }
+    }
+}
+
+/// The clone `repo` is a checkout of, as its common git directory read from
+/// git's layout (no git process), else `repo` itself: every worktree of a
+/// clone shares the repo knowledge accepted for it.
+fn clone_key(repo: &Path) -> PathBuf {
+    let common = repo
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .and_then(|dir| crate::hook::common_dir_in(dir, None, None));
+    let key = common.unwrap_or_else(|| repo.to_path_buf());
+    std::fs::canonicalize(&key).unwrap_or(key)
+}
+
+/// Where ohjaa keeps the repo knowledge accepted for `repo`'s clone, each
+/// node with where its line went (`delivery.json`): in ohjaa's state
+/// (`state` is `$XDG_STATE_HOME/ohjaa`), never in the repository.
+pub fn accepted_dir(state: &Path, repo: &Path) -> PathBuf {
+    state.join("lessons").join(encode_repo(&clone_key(repo)))
 }
 
 /// A repository path as one directory name: `/a/b` → `a%2Fb` (and `%` → `%25`).
@@ -176,6 +212,9 @@ pub struct Loaded {
     /// The file each node was read from, index for index with `nodes`.
     pub files: Vec<PathBuf>,
     pub broken: Vec<Broken>,
+    /// Files untracked in a checkout's `.ohjaa/knowledge/` of a node ohjaa's
+    /// state holds too (a move cut short): left, the state's copy read.
+    pub shadowed: Vec<PathBuf>,
 }
 
 impl Loaded {
@@ -225,19 +264,38 @@ fn read_node(path: &Path) -> std::result::Result<Node, String> {
     fk::parse_node(stem, &text).map_err(|error| error.to_string())
 }
 
+/// Every node of the scopes that have a home here. Repo knowledge is read
+/// from ohjaa's state for the repository's clone and from its
+/// `.ohjaa/knowledge/`, what was accepted before ohjaa wrote it into AGENTS.md.
 pub fn load(dirs: &Dirs) -> Result<Loaded> {
     let mut loaded = Loaded::default();
     for scope in Scope::ALL {
-        let Some(dir) = dirs.scope_dir(scope) else {
-            continue;
-        };
-        for path in markdown_files(&dir)? {
-            match read_node(&path) {
-                Ok(node) => {
-                    loaded.nodes.push(Located { scope, node });
-                    loaded.files.push(path);
+        let mut homes: Vec<PathBuf> = Vec::new();
+        // ohjaa's state for a repository first: a node it holds is the one,
+        // and a copy of it left untracked in the checkout is shadowed.
+        if let (Scope::Repo, Some(root)) = (scope, &dirs.repo_root) {
+            homes.push(accepted_dir(&dirs.state, root));
+        }
+        homes.extend(dirs.scope_dir(scope));
+        let accepted = homes.len() > 1;
+        for (at, dir) in homes.into_iter().enumerate() {
+            let held: Vec<String> = loaded
+                .nodes
+                .iter()
+                .filter(|located| located.scope == scope)
+                .map(|located| located.node.id.clone())
+                .collect();
+            for path in markdown_files(&dir)? {
+                match read_node(&path) {
+                    Ok(node) if accepted && at > 0 && held.contains(&node.id) => {
+                        loaded.shadowed.push(path);
+                    }
+                    Ok(node) => {
+                        loaded.nodes.push(Located { scope, node });
+                        loaded.files.push(path);
+                    }
+                    Err(reason) => loaded.broken.push(Broken { path, reason }),
                 }
-                Err(reason) => loaded.broken.push(Broken { path, reason }),
             }
         }
     }
@@ -324,7 +382,7 @@ impl Flag {
     }
 }
 
-fn on_path(name: &str) -> bool {
+pub fn on_path(name: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
@@ -414,7 +472,7 @@ pub const PREAMBLE: &str =
 /// The briefing limited to some scopes, in full: a file other people read
 /// gets only shared Knowledge, never one person's `mine` or `machine`.
 pub fn render_scopes(loaded: &Loaded, flags: &[Flag], scopes: &[Scope]) -> String {
-    render_nodes(&in_scopes(loaded, scopes), flags, 0)
+    render_nodes(&in_scopes(loaded, scopes), flags, &[], 0)
 }
 
 /// The current nodes of `scopes`, in briefing order.
@@ -476,9 +534,20 @@ impl Within<'_> {
     }
 }
 
-/// The briefing of `nodes` (in briefing order) within `budget` characters.
-pub fn render_within<'a>(nodes: Vec<&'a Located>, flags: &[Flag], budget: usize) -> Within<'a> {
-    within(nodes, budget, |kept, more| render_nodes(kept, flags, more))
+/// What the briefing says beside a node, after its id and date: (id, note).
+pub type Notes = [(String, String)];
+
+/// The briefing of `nodes` (in briefing order) within `budget` characters,
+/// each with its `notes`.
+pub fn render_within<'a>(
+    nodes: Vec<&'a Located>,
+    flags: &[Flag],
+    notes: &Notes,
+    budget: usize,
+) -> Within<'a> {
+    within(nodes, budget, |kept, more| {
+        render_nodes(kept, flags, notes, more)
+    })
 }
 
 /// Past the decisions, which node is kept first when not all fit: taste
@@ -554,7 +623,7 @@ fn within<'a>(
 
 /// These nodes as the briefing shows them, then the count of those it does
 /// not. Empty when there are none of either.
-fn render_nodes(nodes: &[&Located], flags: &[Flag], more: usize) -> String {
+fn render_nodes(nodes: &[&Located], flags: &[Flag], notes: &Notes, more: usize) -> String {
     if nodes.is_empty() && more == 0 {
         return String::new();
     }
@@ -580,7 +649,12 @@ fn render_nodes(nodes: &[&Located], flags: &[Flag], more: usize) -> String {
                 let _ = writeln!(out, "  {line}");
             }
         }
-        let _ = writeln!(out, "  ({} · as of {})", node.id, node.as_of);
+        let note: String = notes
+            .iter()
+            .filter(|(id, _)| *id == node.id)
+            .map(|(_, note)| format!(" · {note}"))
+            .collect();
+        let _ = writeln!(out, "  ({} · as of {}{note})", node.id, node.as_of);
         for flag in flags.iter().filter(|flag| flag.id() == node.id) {
             let _ = writeln!(out, "  ! {}", flag.describe());
         }
@@ -1039,10 +1113,13 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
 pub struct Outcome {
     pub written: Vec<PathBuf>,
     pub removed: Vec<PathBuf>,
-    /// Shared checkouts that now hold uncommitted Knowledge to review.
+    /// Shared checkouts that now hold uncommitted Knowledge to review: the
+    /// ours checkout. Repo knowledge goes through a pull request ohjaa opens.
     pub review_in: Vec<PathBuf>,
     /// The node decided on, as it now is (a rejected proposal as it was).
     pub decided: Option<Located>,
+    /// For a decision on repo knowledge: the repository it is of.
+    pub repo: Option<PathBuf>,
 }
 
 impl Outcome {
@@ -1095,19 +1172,20 @@ pub fn decision_message(action: &str, id: &str, outcome: &Outcome, why: Option<&
     message.trim_end().to_owned()
 }
 
-fn shared_checkout(dirs: &Dirs, scope: Scope, repo: Option<&Path>) -> Option<PathBuf> {
+/// The checkout a decision leaves for the person to commit and review: the
+/// ours checkout. Repo knowledge reaches its repository through the pull
+/// request ohjaa opens ([`crate::lessons`]), and nothing is left in it.
+fn shared_checkout(dirs: &Dirs, scope: Scope) -> Option<PathBuf> {
     match scope {
         Scope::Ours => dirs.ours_checkout.clone(),
-        Scope::Repo => repo
-            .map(Path::to_path_buf)
-            .or_else(|| dirs.repo_root.clone()),
         _ => None,
     }
 }
 
 fn target_dir(dirs: &Dirs, scope: Scope, repo: Option<&Path>) -> Result<PathBuf> {
     match scope {
-        Scope::Repo => Ok(repo_knowledge(
+        Scope::Repo => Ok(accepted_dir(
+            &dirs.state,
             repo.or(dirs.repo_root.as_deref())
                 .context("which repository? run inside it")?,
         )),
@@ -1175,15 +1253,32 @@ pub fn accept(dirs: &Dirs, id: &str, today: Date) -> Result<Outcome> {
     write_atomic(&path, &fk::to_text(&node))?;
     outcome.written.push(path.clone());
     for (old, old_path) in replaced.iter().zip(replaced_files) {
-        write_atomic(&old_path, &fk::to_text(&old.node))?;
-        outcome.written.push(old_path);
+        // A repo node still untracked in the checkout goes into ohjaa's
+        // state with its successor: nothing is written into the checkout.
+        let moved = (pending.scope == Scope::Repo && old_path.parent() != Some(dir.as_path()))
+            .then(|| dir.join(format!("{}.md", old.node.id)));
+        let to = moved.clone().unwrap_or_else(|| old_path.clone());
+        write_atomic(&to, &fk::to_text(&old.node))?;
+        outcome.written.push(to);
+        if moved.is_some() {
+            std::fs::remove_file(&old_path)?;
+            outcome.removed.push(old_path);
+        }
     }
-    if pending.staged && pending.path != path {
+    // A proposal waiting among the proposals, or a proposed node in a scope
+    // directory that is not where the current one now is.
+    if pending.path != path {
         std::fs::remove_file(&pending.path)?;
         outcome.removed.push(pending.path.clone());
     }
-    if let Some(checkout) = shared_checkout(dirs, pending.scope, pending.repo.as_deref()) {
+    if let Some(checkout) = shared_checkout(dirs, pending.scope) {
         outcome.review_in.push(checkout);
+    }
+    outcome.repo = (pending.scope == Scope::Repo)
+        .then(|| pending.repo.clone().or_else(|| dirs.repo_root.clone()))
+        .flatten();
+    if let Some(root) = outcome.repo.as_deref() {
+        tidy_untracked(root);
     }
     outcome.decided = Some(Located {
         scope: pending.scope,
@@ -1206,7 +1301,7 @@ pub fn reject(dirs: &Dirs, id: &str) -> Result<Outcome> {
         ..Outcome::default()
     };
     if !pending.staged {
-        if let Some(checkout) = shared_checkout(dirs, pending.scope, pending.repo.as_deref()) {
+        if let Some(checkout) = shared_checkout(dirs, pending.scope) {
             outcome.review_in.push(checkout);
         }
     }
@@ -1225,16 +1320,43 @@ fn amend(dirs: &Dirs, id: &str, change: impl FnOnce(&mut Node) -> Result<()>) ->
     }
     let mut node = located.node.clone();
     change(&mut node)?;
-    write_atomic(&path, &fk::to_text(&node))?;
+    let repo = (located.scope == Scope::Repo)
+        .then(|| dirs.repo_root.clone())
+        .flatten();
+    // A repo node still untracked in the checkout goes into ohjaa's state:
+    // nothing is written into the checkout.
+    let into_state = repo
+        .as_deref()
+        .map(|root| accepted_dir(&dirs.state, root))
+        .filter(|dir| path.parent() != Some(dir.as_path()));
+    let (written, removed) = match into_state {
+        Some(dir) => {
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("cannot create {}", dir.display()))?;
+            let to = dir.join(format!("{id}.md"));
+            write_atomic(&to, &fk::to_text(&node))?;
+            std::fs::remove_file(&path)?;
+            if let Some(root) = repo.as_deref() {
+                tidy_untracked(root);
+            }
+            (vec![to], vec![path])
+        }
+        None => {
+            write_atomic(&path, &fk::to_text(&node))?;
+            (vec![path], Vec::new())
+        }
+    };
     let mut outcome = Outcome {
-        written: vec![path],
+        written,
+        removed,
+        repo,
         decided: Some(Located {
             scope: located.scope,
             node,
         }),
         ..Outcome::default()
     };
-    if let Some(checkout) = shared_checkout(dirs, located.scope, None) {
+    if let Some(checkout) = shared_checkout(dirs, located.scope) {
         outcome.review_in.push(checkout);
     }
     Ok(outcome)
@@ -1475,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn repo_proposals_wait_per_repository_and_land_in_it() {
+    fn repo_proposals_wait_per_repository_and_land_in_ohjaas_state_not_in_it() {
         let sandbox = Sandbox::new("repo");
         let elsewhere = sandbox.root.join("other repo%x");
         let mut proposal = sandbox.proposal(Scope::Repo, "uploader-owner");
@@ -1485,11 +1607,111 @@ mod tests {
         assert_eq!(waiting[0].repo.as_deref(), Some(elsewhere.as_path()));
 
         let outcome = accept(&sandbox.dirs, "uploader-owner", date("2026-09-24")).unwrap();
-        assert_eq!(
-            outcome.written,
-            vec![repo_knowledge(&elsewhere).join("uploader-owner.md")]
+        assert_eq!(outcome.written.len(), 1, "{:?}", outcome.written);
+        let written = &outcome.written[0];
+        assert!(
+            written.starts_with(sandbox.dirs.state.join("lessons")),
+            "kept in ohjaa's state until it reaches the repository's AGENTS.md: {}",
+            written.display()
         );
-        assert_eq!(outcome.review_in, vec![elsewhere]);
+        assert!(written.ends_with("uploader-owner.md"));
+        assert!(
+            !repo_knowledge(&elsewhere).exists() && !elsewhere.exists(),
+            "nothing is written into the repository"
+        );
+        assert!(
+            outcome.review_in.is_empty(),
+            "ohjaa opens the pull request itself"
+        );
+        // That repository's knowledge has it, current.
+        let mut there = sandbox.dirs.clone();
+        there.repo_root = Some(elsewhere.clone());
+        let loaded = load(&there).unwrap();
+        assert_eq!(
+            loaded.get("uploader-owner").unwrap().node.status,
+            Status::Current
+        );
+    }
+
+    #[test]
+    fn retiring_or_confirming_an_untracked_node_takes_it_out_of_the_checkout() {
+        let sandbox = Sandbox::new("amend-untracked");
+        let root = sandbox.dirs.repo_root.clone().unwrap();
+        let untracked = repo_knowledge(&root);
+        std::fs::create_dir_all(&untracked).unwrap();
+        for id in ["to-retire", "to-confirm"] {
+            let node = Node {
+                id: id.to_owned(),
+                kind: Kind::Fact,
+                status: Status::Current,
+                as_of: date("2026-09-01"),
+                origin: vec!["accepted before".to_owned()],
+                supersedes: Vec::new(),
+                refines: None,
+                holds_while: Vec::new(),
+                body: format!("{id}."),
+            };
+            std::fs::write(untracked.join(format!("{id}.md")), fk::to_text(&node)).unwrap();
+        }
+        let accepted = accepted_dir(&sandbox.dirs.state, &root);
+        let outcome = retire(&sandbox.dirs, "to-retire", "gone", date("2026-09-24")).unwrap();
+        assert_eq!(outcome.written, vec![accepted.join("to-retire.md")]);
+        assert_eq!(outcome.removed, vec![untracked.join("to-retire.md")]);
+        assert!(untracked.is_dir(), "the other is still there");
+        let outcome = confirm(&sandbox.dirs, "to-confirm", date("2026-09-24")).unwrap();
+        assert_eq!(outcome.written, vec![accepted.join("to-confirm.md")]);
+        assert!(
+            !root.join(".ohjaa").exists(),
+            "nothing of ohjaa's is left in the checkout"
+        );
+        let loaded = load(&sandbox.dirs).unwrap();
+        assert_eq!(
+            loaded.get("to-retire").unwrap().node.status,
+            Status::Retired
+        );
+        assert_eq!(
+            loaded.get("to-confirm").unwrap().node.as_of,
+            date("2026-09-24")
+        );
+    }
+
+    #[test]
+    fn a_successor_takes_the_untracked_node_it_supersedes_out_of_the_checkout() {
+        let sandbox = Sandbox::new("supersede-untracked");
+        let root = sandbox.dirs.repo_root.clone().unwrap();
+        let untracked = repo_knowledge(&root);
+        std::fs::create_dir_all(&untracked).unwrap();
+        let old = Node {
+            id: "old-way".to_owned(),
+            kind: Kind::Decision,
+            status: Status::Current,
+            as_of: date("2026-09-01"),
+            origin: vec!["accepted before".to_owned()],
+            supersedes: Vec::new(),
+            refines: None,
+            holds_while: Vec::new(),
+            body: "The old way.".to_owned(),
+        };
+        std::fs::write(untracked.join("old-way.md"), fk::to_text(&old)).unwrap();
+        let mut successor = sandbox.proposal(Scope::Repo, "new-way");
+        successor.supersedes = vec!["old-way".to_owned()];
+        sandbox.propose(successor).unwrap();
+
+        let outcome = accept(&sandbox.dirs, "new-way", date("2026-09-24")).unwrap();
+        let accepted = accepted_dir(&sandbox.dirs.state, &root);
+        assert!(
+            !untracked.join("old-way.md").exists(),
+            "out of the checkout"
+        );
+        assert!(outcome.removed.contains(&untracked.join("old-way.md")));
+        assert!(outcome.written.contains(&accepted.join("old-way.md")));
+        let loaded = load(&sandbox.dirs).unwrap();
+        assert_eq!(
+            loaded.get("old-way").unwrap().node.status,
+            Status::Superseded
+        );
+        assert_eq!(loaded.get("new-way").unwrap().node.status, Status::Current);
+        assert_eq!(outcome.repo.as_deref(), Some(root.as_path()));
     }
 
     #[test]
@@ -1741,7 +1963,7 @@ mod tests {
         let big = located(Scope::Mine, "big", Kind::Taste, &"Keep it. ".repeat(30));
         let fact = located(Scope::Machine, "lima", Kind::Fact, "Lima is here.");
         let said = |nodes: Vec<&Located>, budget: usize| {
-            let within = render_within(nodes, &[], budget);
+            let within = render_within(nodes, &[], &[], budget);
             let over = within.over(budget);
             (over, within.full, within.text.len())
         };

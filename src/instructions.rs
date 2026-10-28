@@ -247,8 +247,9 @@ pub fn source(command: &str, args: &[String], compact: &Compact) -> Option<Sourc
 ///
 /// - Claude Code 2.1.311: `--bare` and `--safe-mode`, and their variables
 ///   `CLAUDE_CODE_SIMPLE` and `CLAUDE_CODE_SAFE_MODE` when truthy as it
-///   reads them (`1`, `true`, `yes`, `on`, in any case), skip every
-///   CLAUDE.md; `--setting-sources` without `user` skips the user's own; and
+///   reads them (`1`, `true`, `yes`, `on`, in any case), and
+///   `CLAUDE_CODE_DISABLE_CLAUDE_MDS` with any value, skip every CLAUDE.md;
+///   `--setting-sources` without `user` skips the user's own; and
 ///   `CLAUDE_CONFIG_DIR` set but empty is taken as is, so the file is not
 ///   the one under `~/.claude` that an empty variable means to ohjaa.
 /// - pi 1.2.0: `--no-context-files` and `-nc` skip every AGENTS.md and
@@ -364,6 +365,15 @@ fn claude_not_read(
                 "{name}={value} is in the environment, so Claude Code reads no CLAUDE.md"
             ));
         }
+    }
+    // Any value turns every CLAUDE.md off; Claude Code sets it itself under
+    // `--safe-mode`.
+    if let Some(value) = var("CLAUDE_CODE_DISABLE_CLAUDE_MDS").filter(|value| !value.is_empty()) {
+        return Some(format!(
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS={} is in the environment, so Claude Code reads no \
+             CLAUDE.md",
+            value.to_string_lossy()
+        ));
     }
     if var("CLAUDE_CONFIG_DIR").is_some_and(|value| value.is_empty()) {
         return Some(format!(
@@ -533,6 +543,19 @@ mod tests {
             ask(&["--", "--standalone"], &[("XDG_CONFIG_HOME", "/c")]),
             service("XDG_CONFIG_HOME"),
             "after opencode's own `--` it is no option"
+        );
+    }
+
+    #[test]
+    fn claude_code_with_its_claude_mds_turned_off_reads_none() {
+        let file = Path::new("/c/.claude/CLAUDE.md");
+        let off = not_read("claude", &[], file, |name| {
+            (name == "CLAUDE_CODE_DISABLE_CLAUDE_MDS").then(|| "1".into())
+        });
+        assert!(
+            off.as_deref()
+                .is_some_and(|why| why.contains("CLAUDE_CODE_DISABLE_CLAUDE_MDS")),
+            "{off:?}"
         );
     }
 
