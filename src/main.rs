@@ -308,12 +308,16 @@ enum Cmd {
     },
     /// Gather what `ohjaa line` cannot work out at a terminal's opening into
     /// its snapshot: the marks and open sessions, GitHub's pull requests,
-    /// and vessa's usage of recent sessions.
+    /// vessa's usage of recent sessions and the first words typed in each,
+    /// and the secret-shaped tokens vessa found in agent sessions.
     #[command(after_help = "Each part asked once, at the same time:\n  \
-        marks   as `ohjaa report --marks` finds them (git, sykli, ps)\n  \
-        github  gh api graphql: the pull requests updated in the entries' owners, at most 2 calls\n  \
-        vessa   vessa usage --json --input <transcript>…: only the sessions ended lately\n\
-        A part that fails keeps what it held before, said as of then, and so does a branch\n\
+        marks     as `ohjaa report --marks` finds them (git, sykli, ps)\n  \
+        github    gh api graphql: the pull requests updated in the entries' owners, at most 2 calls\n  \
+        vessa     vessa usage --json --input <transcript>…: only the sessions ended lately\n  \
+        messages  vessa messages --json --since …: the first words typed in each of them\n  \
+        secrets   vessa secrets --json --since …: where and how many, never a value\n\
+        vessa is asked at most 3 times. The first words are kept only for the window the digest\n\
+        shows. A part that fails keeps what it held before, said as of then, and so does a branch\n\
         whose marks cannot be read. Writes $XDG_STATE_HOME/ohjaa/human/collected.json,\n\
         holding human/collect.lock while it runs.\n\n\
         Exit codes:\n  \

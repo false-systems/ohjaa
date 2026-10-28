@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::collect::{self, Collected, Cost, Part, Pr};
+use crate::collect::{self, Collected, Cost, Finding, Part, Pr, Typed};
 use crate::knowledge::{self, Dirs};
 use crate::report::{self, Waiting};
 use crate::sessions::{self, clock, Exit, Finished, Left, Session};
@@ -334,6 +334,8 @@ enum Kind {
     Merged,
     Opened,
     Closed,
+    /// Where vessa found secret-shaped tokens in an agent session.
+    Secret,
 }
 
 #[derive(Debug, Clone)]
@@ -342,13 +344,20 @@ struct Item {
     /// For what stands: its place in the order.
     class: Option<Class>,
     key: String,
-    /// For what happened: when, and whether by GitHub's clock.
+    /// For what happened: when, and whether by the snapshot's clock (when
+    /// GitHub was read, or when a collect found a secret) rather than the
+    /// session log's.
     at_ms: i64,
     github: bool,
     repo: String,
     text: String,
     /// What a line says of it, when that is not just counted.
     brief: Option<String>,
+    /// For a secret found: how many tokens.
+    tokens: u64,
+    /// In the full digest, when its row cannot hold it all: what is said on
+    /// its row, and what on the line below.
+    long: Option<(String, String)>,
 }
 
 struct View {
@@ -474,6 +483,8 @@ fn standing(kind: Kind, class: Class, key: String, repo: &str, text: String) -> 
         repo: clean(&name(repo)),
         text,
         brief: None,
+        tokens: 0,
+        long: None,
     }
 }
 
@@ -487,16 +498,26 @@ fn event(kind: Kind, key: String, at_ms: i64, github: bool, repo: &str, text: St
         repo: clean(&name(repo)),
         text,
         brief: None,
+        tokens: 0,
+        long: None,
     }
 }
 
-/// How a session ended, and what it left out, in a few words.
-fn ended(session: &Session, left: &Left, costed: Option<&Cost>) -> Item {
-    let mut parts = vec![format!(
-        "{} \"{}\"",
-        clean(&session.agent),
-        cut(&clean(&session.intent), 40)
-    )];
+/// The widest a row's text is, past its bullet and the widest repository
+/// name a row is given room for.
+const ROW_TEXT: usize = WIDTH - 18;
+
+/// An intent is said in at most this many characters.
+const INTENT_CHARS: usize = 40;
+
+/// How a session ended, and what it left out, in a few words. It is said by
+/// the first words the person `typed` in it, else by its intent. Where its
+/// words and the rest do not fit on one row, the full digest gives the words
+/// the row and the rest the line below ([`Item::long`]); one row (the day's
+/// digest) cuts the words at a word, to no fewer characters than an intent
+/// has.
+fn ended(session: &Session, left: &Left, costed: Option<&Cost>, typed: Option<&Typed>) -> Item {
+    let mut parts = Vec::new();
     parts.push(match (left.orphaned, left.exit) {
         (true, _) => "orphaned".to_owned(),
         (_, Exit::Code { code }) => format!("exit {code}"),
@@ -520,7 +541,32 @@ fn ended(session: &Session, left: &Left, costed: Option<&Cost>) -> Item {
         parts.push(format!("PR {}", clean(state).to_lowercase()));
     }
     parts.extend(costed.and_then(cost));
-    event(
+    let agent = clean(&session.agent);
+    let rest = parts.join(" · ");
+    let (text, long) = match typed.map(|typed| clean(&typed.text)) {
+        Some(words) => {
+            let whole = format!("{agent} \"{words}\" · {rest}");
+            if whole.chars().count() <= ROW_TEXT {
+                (whole, None)
+            } else {
+                let room = ROW_TEXT
+                    .saturating_sub(agent.chars().count() + 6 + rest.chars().count())
+                    .max(INTENT_CHARS);
+                (
+                    format!("{agent} \"{}\" · {rest}", collect::fit(&words, room)),
+                    Some((format!("{agent} \"{words}\""), rest)),
+                )
+            }
+        }
+        None => (
+            format!(
+                "{agent} \"{}\" · {rest}",
+                cut(&clean(&session.intent), INTENT_CHARS)
+            ),
+            None,
+        ),
+    };
+    let mut item = event(
         Kind::Ended {
             told: readback && handover,
         },
@@ -528,8 +574,10 @@ fn ended(session: &Session, left: &Left, costed: Option<&Cost>) -> Item {
         left.ended_ms,
         false,
         &session.repo,
-        parts.join(" · "),
-    )
+        text,
+    );
+    item.long = long;
+    item
 }
 
 /// A pull request's opening, and its merge or close. A merge into another
@@ -571,14 +619,99 @@ fn pr_events(pr: &Pr, out: &mut Vec<Item>) {
     }
 }
 
+/// Where vessa found secret-shaped tokens, by the repository the session
+/// worked in: when, the agent and its session, whose words they were, the
+/// rule and how many, and the fingerprint when vessa gave one. Never a
+/// value: the snapshot holds none. It happened when a collect found it, by
+/// the snapshot's clock, as GitHub's are.
+fn secret(finding: &Finding, now_ms: i64) -> Item {
+    let when = match finding.at_ms {
+        Some(at) => short_clock(at, now_ms),
+        None => format!("found {}", short_clock(finding.found_ms, now_ms)),
+    };
+    let session: String = finding
+        .session
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(8)
+        .collect();
+    let whose = match finding.place.as_str() {
+        "person" => "you typed it",
+        "agent" => "agent reply",
+        "tool_output" => "command output",
+        "tool_input" => "tool call",
+        _ => "elsewhere",
+    };
+    let said = format!(
+        "{when} · {} {} · {whose} · {} ×{}",
+        clean(&finding.agent),
+        clean(&session),
+        clean(&finding.rule),
+        finding.count
+    );
+    let text = match &finding.fingerprint {
+        None => said,
+        Some(fingerprint) => {
+            let long = format!("{said} · fingerprint {}", clean(fingerprint));
+            if long.chars().count() <= ROW_TEXT {
+                long
+            } else {
+                format!("{said} · fp {}", clean(fingerprint))
+            }
+        }
+    };
+    let mut item = event(
+        Kind::Secret,
+        finding.key(),
+        finding.found_ms,
+        true,
+        finding.cwd.as_deref().unwrap_or("?"),
+        text,
+    );
+    item.tokens = finding.count;
+    item
+}
+
+/// The key of the secrets scan's failure, said with what it found.
+const SECRETS_SOURCE: &str = "source:secrets:";
+
+/// What a source is: one that is read, or a scan, which runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Read,
+    Scan,
+}
+
 /// A part of the snapshot that could not be read, or not all of it: said
 /// as that, with how old what it holds is, and never as an all-clear.
-fn source<T>(name: &str, part: &Part<T>, now_ms: i64, unread: &mut Vec<String>) -> Option<Item> {
+fn source<T>(
+    name: &str,
+    part: &Part<T>,
+    kind: Source,
+    now_ms: i64,
+    unread: &mut Vec<String>,
+) -> Option<Item> {
     let age = as_of(part.as_of_ms, now_ms);
+    let (failed, partly) = match kind {
+        Source::Read => (
+            "unavailable".to_owned(),
+            format!("{} could not be read", part.gaps.len()),
+        ),
+        Source::Scan => (
+            "the scan could not run".to_owned(),
+            format!("the scan could not read {}", part.gaps.len()),
+        ),
+    };
+    let said = match kind {
+        Source::Read => format!("{name} {failed}"),
+        Source::Scan => format!("{name}: {failed}"),
+    };
     unread.extend(
         part.error
             .iter()
-            .map(|why| format!("{name} unavailable, {age}: {}", clean(why))),
+            .map(|why| format!("{said}, {age}: {}", clean(why))),
     );
     unread.extend(
         part.gaps
@@ -586,8 +719,8 @@ fn source<T>(name: &str, part: &Part<T>, now_ms: i64, unread: &mut Vec<String>) 
             .map(|gap| format!("{name}: {}", clean(gap))),
     );
     let (what, why) = match (&part.error, part.gaps.as_slice()) {
-        (Some(why), _) => ("unavailable".to_owned(), why),
-        (None, [first, ..]) => (format!("{} could not be read", part.gaps.len()), first),
+        (Some(why), _) => (failed, why),
+        (None, [first, ..]) => (partly, first),
         (None, []) => return None,
     };
     let failures: Vec<&String> = part.error.iter().chain(&part.gaps).collect();
@@ -692,9 +825,31 @@ fn build(
             );
         }
         Some(snapshot) => {
-            standing_items.extend(source("marks", &snapshot.local, now_ms, &mut unread));
-            standing_items.extend(source("GitHub", &snapshot.github, now_ms, &mut unread));
-            standing_items.extend(source("vessa", &snapshot.usage, now_ms, &mut unread));
+            let read = Source::Read;
+            standing_items.extend(source("marks", &snapshot.local, read, now_ms, &mut unread));
+            standing_items.extend(source(
+                "GitHub",
+                &snapshot.github,
+                read,
+                now_ms,
+                &mut unread,
+            ));
+            standing_items.extend(source("vessa", &snapshot.usage, read, now_ms, &mut unread));
+            standing_items.extend(source(
+                "messages",
+                &snapshot.typed,
+                read,
+                now_ms,
+                &mut unread,
+            ));
+            let scan = Source::Scan;
+            standing_items.extend(source(
+                "secrets",
+                &snapshot.secrets,
+                scan,
+                now_ms,
+                &mut unread,
+            ));
         }
     }
     // Open in the log now: what the snapshot found of them, as of when.
@@ -707,7 +862,7 @@ fn build(
         let who = format!(
             "{} \"{}\"",
             clean(&session.agent),
-            cut(&clean(&session.intent), 40)
+            cut(&clean(&session.intent), INTENT_CHARS)
         );
         let id = &session.id;
         if local.gone.contains(id) {
@@ -740,12 +895,21 @@ fn build(
     let mut events = Vec::new();
     for session in logged {
         if let Some(left) = &session.left {
-            events.push(ended(session, left, snapshot.usage.value.get(&session.id)));
+            events.push(ended(
+                session,
+                left,
+                snapshot.usage.value.get(&session.id),
+                snapshot.typed.value.get(&session.id),
+            ));
         }
     }
     for pr in &snapshot.github.value {
         pr_events(pr, &mut events);
     }
+    // Found in one collect, the latest first.
+    let mut findings: Vec<&Finding> = snapshot.secrets.value.findings.iter().collect();
+    findings.sort_by_key(|finding| std::cmp::Reverse(finding.at_ms.unwrap_or(finding.found_ms)));
+    events.extend(findings.into_iter().map(|finding| secret(finding, now_ms)));
     events.sort_by_key(|item| std::cmp::Reverse(item.at_ms));
 
     let (waiting, today) = match waiting {
@@ -777,6 +941,8 @@ fn build(
                 ("marks", c.local.as_of_ms, c.local.from_ms),
                 ("GitHub", c.github.as_of_ms, c.github.from_ms),
                 ("vessa", c.usage.as_of_ms, c.usage.from_ms),
+                ("messages", c.typed.as_of_ms, c.typed.from_ms),
+                ("secrets", c.secrets.as_of_ms, c.secrets.from_ms),
             ]
         })
         .unwrap_or_default();
@@ -1006,8 +1172,10 @@ fn one_line(news: &News) -> Option<String> {
             "sessions open over a day",
         )),
     }
+    // Secrets found are said on a line of their own, after it.
+    let secrets = secrets_found(&news.events).map(|said| format!("! {said}\n"));
     if parts.is_empty() {
-        return None;
+        return secrets;
     }
     // Whole parts only: what does not fit is left to the digest, said with `…`.
     let (more, tail) = (" · …", " · ohjaa digest");
@@ -1026,16 +1194,57 @@ fn one_line(news: &News) -> Option<String> {
         line.push_str(part);
     }
     line.push_str(tail);
-    Some(format!("{}\n", cut(&line, WIDTH)))
+    Some(format!(
+        "{}\n{}",
+        cut(&line, WIDTH),
+        secrets.unwrap_or_default()
+    ))
 }
 
-/// `  ! sykli    main: 2 unproven since 5fcdeef. Prove it: ohjaa gate`.
+/// `3 secret-shaped tokens in agent sessions: ohjaa digest`, counting the
+/// tokens of the findings among `events`.
+fn secrets_found(events: &[&Item]) -> Option<String> {
+    let tokens: u64 = events
+        .iter()
+        .filter(|item| item.kind == Kind::Secret)
+        .map(|item| item.tokens)
+        .sum();
+    let what = if tokens == 1 {
+        "secret-shaped token"
+    } else {
+        "secret-shaped tokens"
+    };
+    (tokens > 0).then(|| format!("{tokens} {what} in agent sessions: ohjaa digest"))
+}
+
+/// `  ! sykli    main: 2 unproven since 5fcdeef. Prove it: ohjaa gate`. A
+/// secret found is flagged as what stands is.
 fn row(item: &Item, width: usize) -> String {
-    let bullet = if item.class.is_some() { "!" } else { "·" };
+    let bullet = if item.class.is_some() || item.kind == Kind::Secret {
+        "!"
+    } else {
+        "·"
+    };
     cut(
         &format!("  {bullet} {:<width$}  {}", item.repo, item.text),
         WIDTH,
     )
+}
+
+/// [`row`], in the full digest: what its row cannot hold goes on the line
+/// below, under its text.
+fn full_row(item: &Item, width: usize) -> String {
+    match &item.long {
+        None => row(item, width),
+        Some((head, rest)) => {
+            let first = Item {
+                text: head.clone(),
+                ..item.clone()
+            };
+            let below = format!("{:indent$}{rest}", "", indent = 4 + width + 2);
+            format!("{}\n{}", row(&first, width), cut(&below, WIDTH))
+        }
+    }
 }
 
 fn repo_width<'a>(items: impl Iterator<Item = &'a Item>) -> usize {
@@ -1091,6 +1300,12 @@ fn daily(
             short_clock(at, now_ms)
         ));
     }
+    // Secrets found are pointed to, each one left to `ohjaa digest`.
+    lines.extend(secrets_found(&events).map(|said| format!("  ! {said}")));
+    let events: Vec<&Item> = events
+        .into_iter()
+        .filter(|item| item.kind != Kind::Secret)
+        .collect();
     let width = repo_width(view.standing.iter().chain(events.iter().copied()));
     let mut rows: Vec<String> = view.standing.iter().map(|item| row(item, width)).collect();
     let after_standing = rows.len();
@@ -1176,16 +1391,24 @@ fn full(
         out.push_str(&format!("{pending}\n"));
     }
     let width = repo_width(view.standing.iter().chain(events.iter().copied()));
-    let mut section = |title: &str, items: Vec<&Item>| {
+    // A section's rows, and what is said after them.
+    let mut section = |title: &str, items: Vec<&Item>, end: Option<&str>| {
         if !items.is_empty() {
             out.push_str(&format!("\n{title}\n"));
             for item in items {
-                out.push_str(&row(item, width));
+                out.push_str(&full_row(item, width));
                 out.push('\n');
             }
+            out.extend(end.map(|end| format!("{end}\n")));
         }
     };
-    section("Still open", view.standing.iter().collect());
+    // The secrets scan's own failure is said with what it found, and only
+    // there.
+    let (scan, open): (Vec<&Item>, Vec<&Item>) = view
+        .standing
+        .iter()
+        .partition(|item| item.key.starts_with(SECRETS_SOURCE));
+    section("Still open", open, None);
     let of = |kinds: &[fn(Kind) -> bool]| -> Vec<&Item> {
         events
             .iter()
@@ -1193,13 +1416,34 @@ fn full(
             .filter(|item| kinds.iter().any(|is| is(item.kind)))
             .collect()
     };
-    section("Sessions ended", of(&[|k| matches!(k, Kind::Ended { .. })]));
-    section("Landed", of(&[|k| k == Kind::Merged]));
+    let found = of(&[|k| k == Kind::Secret]);
+    let rotate = (!found.is_empty()).then_some(
+        "  Rotate any that are real keys; `printf %s KEY | shasum -a 256 | cut -c1-8` matches \
+         a fingerprint",
+    );
+    section(
+        "Secrets seen",
+        scan.into_iter().chain(found).collect(),
+        rotate,
+    );
+    section(
+        "Sessions ended",
+        of(&[|k| matches!(k, Kind::Ended { .. })]),
+        None,
+    );
+    section("Landed", of(&[|k| k == Kind::Merged]), None);
     section(
         "Pull requests",
         of(&[|k| k == Kind::Opened, |k| k == Kind::Closed]),
+        None,
     );
-    if events.is_empty() {
+    // Nothing found where something could not be read is no all-clear.
+    if events.is_empty() && view.incomplete() {
+        out.push_str(&format!(
+            "\nNothing new was found since {}, but not all could be read: see Sources.\n",
+            clock(from.sessions_ms)
+        ));
+    } else if events.is_empty() {
         out.push_str(&format!(
             "\nNothing new happened since {}.\n",
             clock(from.sessions_ms)
@@ -1247,8 +1491,18 @@ fn full(
             .iter()
             .map(|(name, at, _)| format!("{name} {}", as_of(*at, now_ms)))
             .collect();
-        if !ages.is_empty() {
-            out.push_str(&cut(&format!("  {}", ages.join(" · ")), WIDTH));
+        // As many to a line as fit.
+        let mut line = String::new();
+        for age in ages {
+            if !line.is_empty() && line.chars().count() + 3 + age.chars().count() > WIDTH {
+                out.push_str(&format!("{line}\n"));
+                line.clear();
+            }
+            line.push_str(if line.is_empty() { "  " } else { " · " });
+            line.push_str(&age);
+        }
+        if !line.is_empty() {
+            out.push_str(&cut(&line, WIDTH));
             out.push('\n');
         }
         for said in &view.unread {
@@ -1577,12 +1831,41 @@ pub fn collect_now(repos: Result<Vec<PathBuf>>, background: bool) -> Result<i32>
                 plural(collected.usage.value.len(), "session", "sessions")
             ),
         );
+        say_part(
+            "messages",
+            &collected.typed,
+            format!(
+                "the first words of {}",
+                plural(collected.typed.value.len(), "session", "sessions")
+            ),
+        );
+        let findings = &collected.secrets.value.findings;
+        let tokens: u64 = findings.iter().map(|finding| finding.count).sum();
+        say_part(
+            "secrets",
+            &collected.secrets,
+            match (findings.len(), &collected.secrets.from_ms) {
+                (0, Some(from)) => format!("none found since {}", clock(*from)),
+                (n, _) => format!(
+                    "{tokens} secret-shaped token{} in {}: ohjaa digest",
+                    if tokens == 1 { "" } else { "s" },
+                    plural(n, "place", "places")
+                ),
+            },
+        );
     }
-    let failed = collected.local.failed() || collected.github.failed() || collected.usage.failed();
+    let failed = [
+        collected.local.failed(),
+        collected.github.failed(),
+        collected.usage.failed(),
+        collected.typed.failed(),
+        collected.secrets.failed(),
+    ]
+    .contains(&true);
     Ok(if failed { crate::INCOMPLETE } else { 0 })
 }
 
-/// `  marks   10 entries, 1 not proven at the tip; 1 could not be read: …`.
+/// `  marks    10 entries, 1 not proven at the tip; 1 could not be read: …`.
 fn say_part<T>(name: &str, part: &Part<T>, answer: String) {
     let said = match (&part.error, part.gaps.first()) {
         (Some(why), _) => format!("unavailable: {}", clean(why)),
@@ -1593,7 +1876,7 @@ fn say_part<T>(name: &str, part: &Part<T>, answer: String) {
         ),
         (None, None) => answer,
     };
-    println!("{}", cut(&format!("  {name:<7} {said}"), WIDTH));
+    println!("{}", cut(&format!("  {name:<8} {said}"), WIDTH));
 }
 
 #[cfg(test)]
@@ -2013,6 +2296,21 @@ mod tests {
         for row in full.lines() {
             assert!(row.chars().count() <= WIDTH, "{row}");
         }
+        // The full digest gives the words their row, and the rest the line
+        // below; what fits on one row stays on it.
+        assert!(
+            full.contains(
+                "  · ohjaa  claude \"make the digest show the first thing I typed in each \
+                 session, not its…\"\n           exit 0 · 60m\n"
+            ),
+            "{full}"
+        );
+        assert!(
+            full.contains(
+                "  · ohjaa  claude \"make the digest say what I asked for\" · exit 0 · 60m\n"
+            ),
+            "{full}"
+        );
         assert!(
             full.contains("Sources\n  marks as of 08:00 UTC · GitHub as of 08:00 UTC"),
             "{full}"
@@ -2181,7 +2479,7 @@ mod tests {
         assert!(
             said.contains(
                 "! secrets  the scan could not read 1, as of 05:00 UTC: could not read \
-                 /h/x.jsonl: Permission denied"
+                 /h/x.jsonl"
             ),
             "{said}"
         );

@@ -9992,7 +9992,13 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
         ),
         0,
     );
-    let (stdout, stderr, code) = output_of(fixture.person().arg("collect"));
+    let gh_calls = fixture.dir.join("gh-calls");
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .person()
+            .arg("collect")
+            .env("OHJAA_STUB_GH_CALLS", &gh_calls),
+    );
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     let calls = fixture.vessa_calls();
     let asked = |calls: &[String], what: &str| {
@@ -10011,7 +10017,15 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
         "{calls:?}"
     );
     assert_eq!(calls.len(), 3, "at most three vessa calls: {calls:?}");
-    assert!(fixture.graphql_calls() <= 2);
+    // GitHub's one page of pull requests, and no gh call more.
+    // Each call is logged as `<cwd>|<arguments>`, the query over lines.
+    let gh = fs::read_to_string(&gh_calls).unwrap_or_default();
+    let started: Vec<&str> = gh
+        .lines()
+        .filter(|line| line.starts_with('/') && line.contains('|'))
+        .collect();
+    assert_eq!(started.len(), 1, "{gh}");
+    assert!(started[0].contains("|api graphql "), "{gh}");
     assert!(
         calls
             .iter()
@@ -10034,8 +10048,9 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
     assert_eq!(code, Some(0), "{digest}");
     assert!(
-        digest.contains("claude \"make the digest say what I asked for\" · exit 0"),
-        "{digest}"
+        digest.contains("claude \"make the digest say what I asked for\"\n")
+            && digest.contains("  exit 0 · "),
+        "its words on its row, the rest below: {digest}"
     );
     assert!(!digest.contains("\"interactive\""), "{digest}");
     for said in [
