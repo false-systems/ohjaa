@@ -2136,24 +2136,11 @@ fn show_pending_relationships(
     }
 }
 
-/// Plain terminal output: wrap paragraphs, never truncate a rule or a source.
+/// Preserve the text being decided on, including literal spacing and code
+/// indentation. Let the terminal soft-wrap: reflowing words changes literals.
 fn review_text(prefix: &str, text: &str) {
-    for paragraph in text.lines() {
-        let mut line = prefix.to_owned();
-        let mut words = 0;
-        for word in paragraph.split_whitespace() {
-            if words > 0 && line.chars().count() + 1 + word.chars().count() > 78 {
-                println!("{line}");
-                line = " ".repeat(prefix.chars().count());
-                words = 0;
-            }
-            if words > 0 {
-                line.push(' ');
-            }
-            line.push_str(word);
-            words += 1;
-        }
-        println!("{line}");
+    for line in text.lines() {
+        println!("{prefix}{line}");
     }
 }
 

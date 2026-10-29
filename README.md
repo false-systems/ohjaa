@@ -101,7 +101,9 @@ nodes; older records without that identity still read.
   without an interactive terminal, and agents run without one.
 - Interactive `ohjaa review` shows one numbered proposal at a time: a readable
   title, its scope, the complete rule and its sources, and what accepting it
-  does. Replacements, refinements and possible duplicates stay visible before
+  does. Original spacing and code indentation are preserved; the terminal
+  handles visual wrapping without reformatting quoted commands or literals.
+  Replacements, refinements and possible duplicates stay visible before
   the choice. Type `a` to accept, `r` to dismiss, `s` or Enter to leave it for
   later, `d` for the original identifier and proposal file, or `q` to stop.
   Full action names and uppercase work too. Invalid input (including `aq`)
