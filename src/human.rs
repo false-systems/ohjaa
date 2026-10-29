@@ -783,11 +783,7 @@ fn build(
         String::new()
     };
     for session in logged.iter().filter(|s| s.left.is_none()) {
-        let who = format!(
-            "{} \"{}\"",
-            clean(&session.agent),
-            cut(&clean(&session.intent), 40)
-        );
+        let who = format!("{} \"{}\"", clean(&session.agent), clean(&session.intent));
         let id = &session.id;
         if local.gone.contains(id) {
             standing_items.push(standing(
@@ -1247,7 +1243,7 @@ fn daily(
     let mut lines = vec!["ohjaa — needs your attention".to_owned()];
     if let Some(at) = view.collected_ms.filter(|at| old(Some(*at), now_ms)) {
         lines.push(format!(
-            "  Cached status collected {}; source dates are shown below.",
+            "  Cached status collected {}; source dates: ohjaa digest.",
             clock(at)
         ));
     }
@@ -2689,6 +2685,22 @@ mod tests {
         let unread = after(&next, &seen.full_from(NOW + 800));
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].key, "session:late");
+    }
+
+    #[test]
+    fn open_session_notices_retain_the_complete_recorded_task() {
+        let mut open = session("long", 2 * DAY_MS, None, true);
+        open.intent =
+            "Investigate the parser without changing how incomplete source records are reported"
+                .into();
+        let view = view(std::slice::from_ref(&open), None);
+        let notice = view
+            .standing
+            .iter()
+            .find(|item| item.kind == Kind::OpenLong)
+            .unwrap();
+        assert!(notice.text.contains(&open.intent));
+        assert!(notice.text.contains("ohjaa session long"));
     }
 
     /// Second review of #63, a nit: a source is said in the line for each
