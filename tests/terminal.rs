@@ -751,6 +751,11 @@ fn review_invalid_input_keeps_the_same_proposal_and_quit_keeps_the_rest() {
     let Some(mut tty) = Terminal::new("review-input") else {
         return;
     };
+    fs::write(
+        tty.dir.join("home/gitconfig"),
+        "[user]\nname = Test Person\nemail = person@example.invalid\n",
+    )
+    .unwrap();
     for id in ["first-rule", "second-rule"] {
         let (code, said) = tty.run(&format!(
             "ohjaa propose --scope mine --id {id} --kind lesson \
@@ -789,6 +794,16 @@ fn review_invalid_input_keeps_the_same_proposal_and_quit_keeps_the_rest() {
         "{said}"
     );
     assert!(tty.history().is_empty());
+    tty.type_line("ohjaa review");
+    assert!(tty.expect("[a]ccept", 10), "{}", tty.report());
+    tty.send("R\r");
+    assert!(tty.expect("Review 2 of 2", 10), "{}", tty.report());
+    tty.send("q\r");
+    assert!(tty.shell_answers(10), "{}", tty.report());
+    assert!(tty
+        .all()
+        .contains("0 accepted, 1 rejected, 0 skipped; 1 still waiting"));
+    assert_eq!(tty.history().len(), 1);
 }
 
 #[test]
@@ -836,6 +851,16 @@ fn review_shows_a_readable_card_and_concise_success_without_hiding_history_failu
     assert_eq!(tty.history().len(), 1);
     eprintln!("Synthetic terminal preview:\n{said}");
 
+    // A full saved history can exceed the instruction block's text budget:
+    // the shorter confirmation must still say that coverage is partial.
+    for n in 0..40 {
+        let id = format!("synthetic-rule-{n:02}");
+        fs::write(tty.config().join("mine").join(format!("{id}.md")), format!(
+            "+++\nid = \"{id}\"\nkind = \"lesson\"\nstatus = \"current\"\nas_of = 2026-10-30\norigin = [\"Synthetic coverage fixture\"]\n+++\n{}\n",
+            "A synthetic rule kept only for the review coverage test. ".repeat(8)
+        )).unwrap();
+    }
+
     let (code, said) = tty.run(
         "ohjaa propose --scope mine --id another-rule --kind lesson \
          --origin 'Synthetic review fixture' 'Make the next choice explicit too.'",
@@ -852,6 +877,9 @@ fn review_shows_a_readable_card_and_concise_success_without_hiding_history_failu
     // Check all output: shell_answers moves the mark past the decision.
     let said = tty.all();
     assert!(said.contains("is not in the home's history"), "{said}");
+    let words = said.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(words.contains("Agent instructions include 16 of 42 saved rules in full; 26 are only named by count because the text exceeds 8000 characters."), "{said}");
+    assert!(words.contains("No saved knowledge was removed."), "{said}");
     assert!(
         fs::read_to_string(tty.config().join("mine/another-rule.md"))
             .unwrap()

@@ -99,6 +99,19 @@ nodes; older records without that identity still read.
   by itself.
 - `ohjaa review`, `accept`, `reject`, `retire` and `confirm` refuse to run
   without an interactive terminal, and agents run without one.
+- Interactive `ohjaa review` shows one numbered proposal at a time: a readable
+  title, its scope, the complete rule and its sources, and what accepting it
+  does. Replacements, refinements and possible duplicates stay visible before
+  the choice. Type `a` to accept, `r` to dismiss, `s` or Enter to leave it for
+  later, `d` for the original identifier and proposal file, or `q` to stop.
+  Full action names and uppercase work too. Invalid input (including `aq`)
+  changes nothing and asks again; end-of-input stops without skipping the rest.
+  Each decision is saved immediately, with brief confirmation rather than a
+  file-operation log. History failures, instruction-update failures and partial
+  instruction coverage remain visible. The final summary counts decisions and
+  proposals still waiting; `ohjaa list` shows saved knowledge. `review --list`
+  remains read-only. Unreadable proposals or evidence make review incomplete
+  (exit 4), not an empty or complete queue.
 - Accepting a node that supersedes another marks the old node `superseded` in
   the same step, and refuses outright if the result would not hold together.
   Nothing is deleted: retired and superseded Knowledge keeps its time and its

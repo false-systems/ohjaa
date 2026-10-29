@@ -414,7 +414,9 @@ pub fn home_knowledge() -> Result<(Compact, Vec<Broken>)> {
 /// After a decision: the block rewritten in each agent's file that holds it,
 /// and each file rewritten, said. Never an error: what cannot be read or
 /// written is said on stderr, and the decision stands.
-pub fn sync() -> Vec<String> {
+/// Interactive review groups successful updates when `concise`; warnings and
+/// partial instruction coverage are still shown, never treated as success.
+pub fn sync(concise: bool) -> Vec<String> {
     let compact = match home_knowledge() {
         Ok((compact, _)) => compact,
         Err(error) => {
@@ -423,11 +425,13 @@ pub fn sync() -> Vec<String> {
         }
     };
     let mut said = Vec::new();
+    let mut updated = Vec::new();
     for target in targets() {
         let Some(file) = target.file else {
             continue;
         };
         match rewrite(&file, &compact) {
+            Ok(Rewrite::Rewritten) if concise => updated.push(target.agent),
             Ok(Rewrite::Rewritten) => said.push(format!(
                 "rewrote the knowledge block in {} ({}'s own instructions; {})",
                 file.display(),
@@ -440,6 +444,23 @@ pub fn sync() -> Vec<String> {
                 "ohjaa: warning: the knowledge block in {} is not rewritten: {error:#}",
                 file.display()
             ),
+        }
+    }
+    if !updated.is_empty() {
+        said.push(format!(
+            "Updated agent instructions: {}.",
+            updated.join(", ")
+        ));
+        if compact.more > 0 {
+            said.push(format!(
+                "Agent instructions include {} of {} saved rules in full; {} are only named by \
+                 count because the text exceeds {} characters. No saved knowledge was removed. \
+                 See `ohjaa list` to review it.",
+                compact.shown,
+                compact.shown + compact.more,
+                compact.more,
+                knowledge::DEFAULT_BUDGET,
+            ));
         }
     }
     said
