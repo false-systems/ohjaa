@@ -2193,8 +2193,17 @@ fn root_launch_delivers_the_goal_without_requiring_scope_or_a_task() {
         briefing.contains("identify the repositories needed"),
         "{briefing}"
     );
-    assert!(!argv.iter().any(|arg| arg == "--task" || arg == "--scope"));
+    assert!(argv
+        .windows(2)
+        .any(|pair| pair == ["--task", "reduce Toimija's Git pressure"]));
+    assert!(!argv.iter().any(|arg| arg == "--scope"));
     assert!(!briefing.contains("unselected"));
+    let (export, _, _) = output_of(fixture.ohjaa_in(&fixture.dir).args(["usage", "export"]));
+    let export: serde_json::Value = serde_json::from_str(&export).unwrap();
+    assert!(
+        export["sessions"][0].get("task").is_none(),
+        "intent is not an explicit task"
+    );
     fixture.cleanup();
 }
 
@@ -8609,6 +8618,9 @@ fn an_intent_has_an_id_that_a_later_session_continues() {
     assert_eq!(second["intent"], "fix the parser");
     assert!(second.get("task").is_none(), "no task given: {second:#}");
     let argv = fixture.argv();
+    assert!(argv
+        .windows(2)
+        .any(|pair| pair == ["--task", "fix the parser"]));
     assert!(
         argv.windows(2)
             .any(|pair| pair[0] == "--intent" && pair[1] == "fix the parser"),

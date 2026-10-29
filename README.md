@@ -691,6 +691,10 @@ The briefing includes the current intent's full text, including on continuation,
 so a concrete goal is assigned work even without `--task`. An explicit `--task`
 specifies work within that goal and stays separate; a placeholder intent such
 as `interactive` without a task leaves the agent waiting for an assignment.
+To start the turn, a concrete intent uses Toimija's task transport when no
+explicit task is supplied. The Ohjaa session still records only the explicit
+`--task` as its task; the goal remains its intent. Empty, `unknown` and
+`interactive` intents do not start a turn on their own.
 
 **Validations.** `ohjaa gate` inside a session writes a validation reference
 into the session's record before it asks sykli (see `ohjaa gate` below): a

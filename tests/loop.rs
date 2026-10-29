@@ -548,6 +548,75 @@ fn session_named(briefing: &str) -> String {
     rest.split(';').next().unwrap().to_owned()
 }
 
+/// Real Toimija must start a Codex turn, not only attach idle instructions.
+#[test]
+#[ignore = "needs real tools: OHJAA_TEST_SYKLI, OHJAA_TEST_TOIMIJA and OHJAA_TEST_VESSA"]
+fn concrete_intent_starts_a_turn_through_real_toimija() {
+    let world = World::new();
+    let source = world.dir.join("argv.rs");
+    fs::write(
+        &source,
+        r#"
+        fn main() {
+            let args = std::env::args().skip(1).collect::<Vec<_>>().join("\0");
+            std::fs::write(std::env::var_os("CAPTURE").unwrap(), args).unwrap();
+        }
+    "#,
+    )
+    .unwrap();
+    world.ok(
+        &world.dir,
+        "rustc",
+        &[path(&source), "-o", path(&world.dir.join("bin/codex"))],
+    );
+    let capture = world.dir.join("argv");
+    let launch = |args: &[&str]| {
+        let result = ran(world
+            .command("ohjaa", &world.dir)
+            .args(args)
+            .env("CAPTURE", &capture));
+        assert_eq!(result.code, Some(0), "{}", result.said());
+        let args = fs::read_to_string(&capture).unwrap();
+        let mut args = args.split('\0');
+        let mut prompts = Vec::new();
+        while let Some(arg) = args.next() {
+            if arg == "-c" {
+                args.next().expect("configuration value");
+            } else {
+                prompts.push(arg.to_owned());
+            }
+        }
+        prompts
+    };
+    let goal = "reduce Git pressure";
+    let prompts = launch(&["run", "codex", "--intent", goal]);
+    assert_eq!(prompts.len(), 1, "a concrete intent starts a turn");
+    assert!(
+        prompts[0].contains("Task: reduce Git pressure"),
+        "{}",
+        prompts[0]
+    );
+    let exported = world.ok(&world.dir, "ohjaa", &["usage", "export"]);
+    let exported: Value = serde_json::from_str(&exported.stdout).unwrap();
+    assert!(exported["sessions"][0].get("task").is_none());
+    let explicit = launch(&[
+        "run",
+        "codex",
+        "--intent",
+        goal,
+        "--task",
+        "start with the lexer",
+    ]);
+    assert_eq!(explicit.len(), 1);
+    assert!(explicit[0].contains("Task: start with the lexer"));
+    for placeholder in ["", "unknown", "interactive"] {
+        assert!(
+            launch(&["run", "codex", "--intent", placeholder]).is_empty(),
+            "{placeholder:?} stays idle"
+        );
+    }
+}
+
 /// The mark of `sha`, from an entry's marks.
 fn mark<'a>(entry: &'a Value, sha: &str) -> &'a Value {
     entry["commits"]

@@ -2852,6 +2852,18 @@ enum IntentOrigin {
 }
 
 impl Intent {
+    /// A concrete goal starts a turn when no explicit task was supplied.
+    /// Placeholder intents and an unchecked continuation without its goal stay idle.
+    fn assignment(&self) -> Option<&str> {
+        let text = self.text.trim();
+        (!text.is_empty()
+            && !text.eq_ignore_ascii_case("interactive")
+            && !text.eq_ignore_ascii_case("unknown")
+            && !(matches!(&self.origin, IntentOrigin::Unchecked(_))
+                && text == format!("continuing intent {}", self.id)))
+        .then_some(self.text.as_str())
+    }
+
     /// The line the briefing opens "How this session works" with.
     fn briefing_line(&self, session: &str) -> String {
         let origin = match &self.origin {
@@ -3361,7 +3373,12 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
 
     let mut command = Command::new("toimija");
     command.arg("run").arg("--intent").arg(&intent.text);
-    if let Some(task) = task {
+    // Toimija's --task is also the turn-starting transport. Keep the session's
+    // explicit task unchanged: a goal transported here is still its Intent.
+    if let Some(task) = task
+        .filter(|task| !task.trim().is_empty())
+        .or_else(|| intent.assignment())
+    {
         command.arg("--task").arg(task);
     }
     if let Some(briefing) = &briefing {
@@ -4504,6 +4521,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_concrete_intents_supply_an_initial_assignment() {
+        let mut intent = Intent {
+            id: "in-1000-1".into(),
+            text: String::new(),
+            origin: IntentOrigin::New,
+        };
+        for text in ["", "  ", "unknown", "interactive", "INTERACTIVE"] {
+            intent.text = text.into();
+            assert_eq!(intent.assignment(), None, "{text:?}");
+        }
+        intent.text = "fix the parser".into();
+        assert_eq!(intent.assignment(), Some("fix the parser"));
+        intent.origin = IntentOrigin::Unchecked("log locked".into());
+        assert_eq!(intent.assignment(), Some("fix the parser"));
+        intent.text = "continuing intent in-1000-1".into();
+        assert_eq!(intent.assignment(), None);
+    }
 
     #[test]
     fn shell_words_read_back_unchanged() {
