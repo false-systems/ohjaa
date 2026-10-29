@@ -159,7 +159,7 @@ fi
 if [ "$1" = usage ]; then
   printf '%s\n' "$*" >> "$HOME/vessa-calls"
   if [ -f "$HOME/vessa-usage.json" ]; then cat "$HOME/vessa-usage.json"
-  else echo '{"schema":"vessa-usage.v1","sessions":[],"warnings":[]}'; fi
+  else echo '{"schema":"vessa-usage.v2","sessions":[],"warnings":[]}'; fi
   exit 0
 fi
 [ "$*" = "sessions --json --headers" ] || { echo "vessa stub: not the header listing: $*" >&2; exit 64; }
@@ -2445,6 +2445,20 @@ fn a_repository_with_no_commits_yet_is_empty_and_does_not_hold_the_cursor() {
         format!("gitdir: {}\n", fixture.dir.join("nowhere").display()),
     )
     .unwrap();
+    // Git versions word a broken gitfile differently. Pin the diagnostic
+    // this Git gives, rather than accepting several possible messages.
+    let refused = Command::new("git")
+        .arg("-C")
+        .arg(&gone)
+        .arg("log")
+        .env("LC_ALL", "C")
+        .env_remove("LANGUAGE")
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let reason = String::from_utf8(refused.stderr).unwrap();
+    let reason = reason.trim();
+    assert!(!reason.is_empty());
     let (_, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -2453,7 +2467,7 @@ fn a_repository_with_no_commits_yet_is_empty_and_does_not_hold_the_cursor() {
     );
     assert_eq!(code, Some(4), "{stderr}");
     assert!(
-        stderr.contains("gone") && stderr.contains("not a git repository"),
+        stderr.contains("gone") && stderr.contains(reason),
         "{stderr}"
     );
     assert!(stderr.contains("the cursor stays"), "{stderr}");
@@ -9207,7 +9221,8 @@ fn line_says_nothing_and_moves_nothing_without_a_person_at_a_terminal() {
     assert_eq!(fixture.graphql_calls(), 0);
     // A person at a terminal: a collect starts, and what is new is said.
     let (said, _) = on_a_terminal(fixture.person().arg("line"));
-    assert!(said.contains("1 session ended"), "{said}");
+    assert!(said.contains("needs your attention"), "{said}");
+    assert!(!said.contains("agent session ended"), "{said}");
     assert!(fixture.collected());
     assert!(fixture.human_dir().join("seen.json").is_file());
     fixture.cleanup();
@@ -9217,7 +9232,7 @@ fn line_says_nothing_and_moves_nothing_without_a_person_at_a_terminal() {
 /// then one line only when something is new. Audit findings: seeing a line
 /// moves the cursor, and sessions without read-back or handover are said.
 #[test]
-fn the_days_first_line_is_its_digest_then_a_line_only_for_what_is_new() {
+fn startup_is_attention_only_and_activity_stays_unread_until_the_digest() {
     if !git_available() {
         return;
     }
@@ -9233,37 +9248,96 @@ fn the_days_first_line_is_its_digest_then_a_line_only_for_what_is_new() {
         said
     };
     let digest = day("2026-10-27");
-    assert!(digest.starts_with("ohjaa · since "), "{digest}");
+    assert!(
+        digest.starts_with("ohjaa — needs your attention"),
+        "{digest}"
+    );
+    assert!(
+        !digest.contains("agent session ended") && !digest.contains("#76"),
+        "{digest}"
+    );
+    assert_eq!(day("2026-10-27"), "", "attention already shown");
+    run_session(&fixture, &repo, "exit 2");
+    assert_eq!(day("2026-10-27"), "", "activity does not interrupt startup");
+    let next = day("2026-10-28");
+    assert!(next.starts_with("ohjaa — needs your attention"), "{next}");
+    assert!(
+        !next.contains("retry uploads") && !next.contains("#76"),
+        "{next}"
+    );
+    assert_eq!(day("2026-10-28"), "");
+    let (digest, _) = on_a_terminal(
+        fixture
+            .person()
+            .args(["digest", "--no-collect"])
+            .env("OHJAA_TODAY", "2026-10-28"),
+    );
     for said in [
-        "1 session ended · PRs: 1 merged, 1 opened",
-        "sh \"retry uploads\" · exit 0",
-        "no read-back or handover",
+        "2 agent sessions ended",
+        "Pull requests: 1 merged, 1 opened",
+        "sh \"retry uploads\" · process exited successfully (code 0)",
+        "process exited with code 2",
+        "no task confirmation or completion note recorded",
         "#76 merged by yairfalse: Ask git once",
         "#16 opened by yairfalse: docs: nothing refuses \u{fffd}[2J",
     ] {
         assert!(digest.contains(said), "missing `{said}`: {digest}");
     }
     assert!(!digest.contains("#76 opened"), "said once: {digest}");
-    assert_eq!(day("2026-10-27"), "", "nothing new since");
-    // Something new: one line, once.
-    run_session(&fixture, &repo, "exit 2");
-    let line = day("2026-10-27");
-    assert_eq!(
-        line,
-        "ohjaa · 1 session ended (1 without read-back/handover) · ohjaa digest\n"
-    );
-    assert_eq!(day("2026-10-27"), "", "seen");
-    // The next day: its digest, since the last one.
-    let next = day("2026-10-28");
-    assert!(next.starts_with("ohjaa · since "), "{next}");
-    assert!(next.contains("sh \"retry uploads\" · exit 2"), "{next}");
-    assert!(!next.contains("#76"), "shown the day before: {next}");
     assert_eq!(day("2026-10-28"), "");
     fixture.cleanup();
 }
 
 /// The ruling: `line` makes no network call and starts no git process; with
 /// a fresh snapshot it starts nothing at all.
+#[test]
+fn quiet_startup_retains_unread_sessions_and_pull_requests_across_days() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("quiet-history");
+    fixture.human_view(false);
+    let repo = fixture.make_git_repo("work");
+    run_session(&fixture, &repo, "exit 0");
+    output_of(fixture.person().arg("collect"));
+    // The rendering fixture has activity but no outstanding branch notices.
+    let path = fixture.human_dir().join("collected.json");
+    let mut collected: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    collected["local"]["value"]["branches"] = serde_json::json!([]);
+    fs::write(path, serde_json::to_string(&collected).unwrap()).unwrap();
+    let day = |date: &str| on_a_terminal(fixture.person().arg("line").env("OHJAA_TODAY", date)).0;
+    assert_eq!(day("2026-10-27"), "");
+    assert_eq!(day("2026-10-28"), "");
+    let seen: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fixture.human_dir().join("seen.json")).unwrap())
+            .unwrap();
+    assert!(
+        seen["digest"].is_object(),
+        "quiet startup anchors the unread window"
+    );
+    let (digest, code) = on_a_terminal(
+        fixture
+            .person()
+            .args(["digest", "--no-collect"])
+            .env("OHJAA_TODAY", "2026-10-28"),
+    );
+    assert_eq!(code, Some(0));
+    assert!(
+        digest.contains("sh \"retry uploads\" · process exited successfully (code 0)"),
+        "{digest}"
+    );
+    assert_eq!(
+        digest.matches("#76 merged by yairfalse").count(),
+        1,
+        "{digest}"
+    );
+    assert!(digest.contains("#16 opened by yairfalse"), "{digest}");
+    let (again, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
+    assert!(again.contains("No unread activity recorded"), "{again}");
+    fixture.cleanup();
+}
+
 #[test]
 fn line_starts_no_git_and_touches_no_network() {
     if !git_available() {
@@ -9298,11 +9372,83 @@ fn line_starts_no_git_and_touches_no_network() {
     let (said, code) = on_a_terminal(&mut command);
     assert_eq!(code, Some(0));
     assert!(
-        said.starts_with("ohjaa · since"),
-        "the day's digest: {said}"
+        said.starts_with("ohjaa — needs your attention"),
+        "attention without processes: {said}"
     );
     assert!(!fixture.dir.join("started").exists(), "started a process");
     assert!(!trace.exists(), "started git");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_collection_start_failure_after_first_startup_is_reported_once() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("line-refresh-failure");
+    fixture.human_view(false);
+    output_of(fixture.person().arg("collect"));
+    let (first, _) = on_a_terminal(fixture.person().arg("line"));
+    assert!(first.contains("needs your attention"), "{first}");
+    let path = fixture.human_dir().join("collected.json");
+    let mut collected: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    collected["at_ms"] = serde_json::json!(1);
+    fs::write(path, collected.to_string()).unwrap();
+    // A directory at the lock path makes collection fail before spawning.
+    let lock = fixture.human_dir().join("collect.lock");
+    fs::remove_file(&lock).unwrap();
+    fs::create_dir(&lock).unwrap();
+    let (notice, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0));
+    assert!(
+        notice.starts_with("ohjaa · Could not refresh cached status:"),
+        "{notice:?}"
+    );
+    assert!(notice.ends_with("Details: ohjaa digest\n"), "{notice}");
+    assert_eq!(on_a_terminal(fixture.person().arg("line")).0, "");
+    fixture.cleanup();
+}
+
+#[test]
+fn unreadable_session_rows_after_first_startup_are_reported_once() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("line-unreadable-session");
+    fixture.human_view(false);
+    let repo = fixture.make_git_repo("work");
+    run_session(&fixture, &repo, "exit 0");
+    output_of(fixture.person().arg("collect"));
+    let (first, _) = on_a_terminal(fixture.person().arg("line"));
+    assert!(first.contains("needs your attention"), "{first}");
+    {
+        let db = redb::Database::open(fixture.dir.join("state/ohjaa/sessions.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        tx.open_table(redb::TableDefinition::<&str, &[u8]>::new("sessions"))
+            .unwrap()
+            .insert("oh-broken", b"not a session".as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let (notice, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0));
+    assert!(
+        notice.starts_with("ohjaa · 1 agent session record(s) could not be read"),
+        "{notice:?}"
+    );
+    assert!(notice.ends_with("Details: ohjaa digest\n"), "{notice}");
+    assert_eq!(on_a_terminal(fixture.person().arg("line")).0, "");
+    let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(4));
+    assert!(
+        digest.contains("retry uploads"),
+        "readable session retained: {digest}"
+    );
+    assert!(
+        digest.contains("1 session record(s) in the log could not be read"),
+        "{digest}"
+    );
     fixture.cleanup();
 }
 
@@ -9371,7 +9517,10 @@ fn collect_asks_github_at_most_twice_and_says_what_failed() {
     );
     let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
     assert_eq!(code, Some(4), "{digest}");
-    assert!(digest.contains("GitHub as of "), "{digest}");
+    assert!(
+        digest.contains("GitHub (pull request activity) as of "),
+        "{digest}"
+    );
     assert!(digest.contains("#76 merged by yairfalse"), "kept: {digest}");
     fixture.cleanup();
 }
@@ -9420,11 +9569,10 @@ fn the_digest_says_what_a_session_cost_and_moves_the_cursor_only_for_a_person() 
     assert_eq!(code, Some(0), "{stderr}");
     fs::write(
         fixture.dir.join("home/vessa-usage.json"),
-        serde_json::json!({"schema": "vessa-usage.v1", "warnings": [], "sessions": [
+        serde_json::json!({"schema": "vessa-usage.v2", "warnings": [], "sessions": [
             {"agent": "claude", "id": native, "limitations": [],
              "totals": [{"input_tokens": 62, "output_tokens": 20305,
-                         "cache_read_tokens": 2923935, "cache_write_tokens": 94881,
-                         "estimated_usd_micros": null}]}]})
+                         "cache_read_tokens": 2923935, "cache_write_tokens": 94881}]}]})
         .to_string(),
     )
     .unwrap();
@@ -9440,7 +9588,10 @@ fn the_digest_says_what_a_session_cost_and_moves_the_cursor_only_for_a_person() 
     );
     let (digest, _, code) = output_of(fixture.person().arg("digest"));
     assert_eq!(code, Some(0), "{digest}");
-    assert!(digest.contains("claude \"costed\" · exit 0"), "{digest}");
+    assert!(
+        digest.contains("claude \"costed\" · process exited successfully (code 0)"),
+        "{digest}"
+    );
     // Cache reads apart: they are most of it.
     assert!(
         digest.contains("115k tokens + 2.9M cache reads"),
@@ -9543,7 +9694,7 @@ fn what_could_not_be_read_is_said_never_an_all_clear() {
         "1 could not be read",
         "false-systems/valvo",
         "! sykli",
-        "main: 1 unproven since",
+        "main: no verified passing result for 1 recent commit",
         "could not be scanned",
     ] {
         assert!(digest.contains(said), "missing `{said}`: {digest}");
@@ -9576,7 +9727,10 @@ fn what_the_days_digest_left_out_is_what_ohjaa_digest_shows() {
             .arg("line")
             .env("OHJAA_TODAY", "2026-10-27"),
     );
-    assert!(daily.contains("more: ohjaa digest"), "{daily}");
+    assert!(
+        daily.contains("Full details and activity: ohjaa digest"),
+        "{daily}"
+    );
     assert!(!daily.contains("#119 merged"), "{daily}");
     let (digest, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
     for number in [76, 100, 110, 119] {
@@ -9587,7 +9741,7 @@ fn what_the_days_digest_left_out_is_what_ohjaa_digest_shows() {
     }
     let (again, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
     assert!(
-        again.contains("Nothing new happened"),
+        again.contains("No unread activity recorded"),
         "seen in full: {again}"
     );
     fixture.cleanup();
@@ -9613,9 +9767,9 @@ fn the_days_first_terminal_gets_its_digest_from_an_old_snapshot() {
             .arg("line")
             .env("OHJAA_TODAY", "2026-10-27"),
     );
-    assert!(daily.starts_with("ohjaa · since "), "{daily}");
-    assert!(daily.contains("snapshot as of "), "{daily}");
-    assert!(daily.contains("sh \"retry uploads\" · exit 0"), "{daily}");
+    assert!(daily.starts_with("ohjaa — needs your attention"), "{daily}");
+    assert!(daily.contains("Cached status collected "), "{daily}");
+    assert!(!daily.contains("retry uploads"), "{daily}");
     assert!(fixture.asked_github(2), "a collect started beside it");
     let (again, _) = on_a_terminal(
         fixture
@@ -9645,6 +9799,23 @@ fn terminals_opened_together_say_a_line_once() {
             .env("OHJAA_TODAY", "2026-10-27"),
     );
     run_session(&fixture, &repo, "exit 0");
+    let clone = fixture.dir.join("sykli");
+    run_git(
+        &clone,
+        &[
+            "-c",
+            "user.email=o@example.invalid",
+            "-c",
+            "user.name=O",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "two",
+        ],
+    );
+    run_git(&clone, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    output_of(fixture.person().arg("collect"));
     let claim = fixture.human_dir().join("seen.lock");
     let held = fs::File::create(&claim).unwrap();
     {
@@ -9663,7 +9834,7 @@ fn terminals_opened_together_say_a_line_once() {
     };
     assert_eq!(line(), "", "another terminal is saying it");
     drop(held);
-    assert!(line().contains("1 session ended"));
+    assert!(line().contains("sykli main: no passing verification recorded"));
     assert_eq!(line(), "");
     fixture.cleanup();
 }
@@ -9718,12 +9889,17 @@ fn a_branch_stays_as_last_read_when_the_entries_cannot_be_listed() {
     assert!(!snapshot.contains("(entries)"), "{snapshot}");
     let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
     assert_eq!(code, Some(4), "{digest}");
-    let still_open = digest
-        .lines()
-        .find(|line| line.contains("! sykli"))
+    let mut rows = digest.lines().skip_while(|line| !line.contains("! sykli"));
+    let first = rows
+        .next()
         .unwrap_or_else(|| panic!("sykli dropped from what stays: {digest}"));
+    let still_open = std::iter::once(first)
+        .chain(rows.take_while(|line| line.starts_with("    ")))
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        still_open.contains("main: 1 unproven since") && still_open.contains("(unread since)"),
+        still_open.contains("main: no verified passing result for 1 recent commit")
+            && still_open.contains("Could not refresh:"),
         "{digest}"
     );
     fixture.cleanup();
@@ -9769,7 +9945,8 @@ fn a_git_that_fails_is_said_as_that_never_as_a_missing_clone() {
     let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
     assert_eq!(code, Some(4), "{digest}");
     assert!(
-        digest.contains("main: 1 unproven since") && digest.contains("(unread since)"),
+        digest.contains("main: no verified passing result for 1 recent commit")
+            && digest.contains("Could not refresh:"),
         "{digest}"
     );
     fixture.cleanup();
@@ -9787,11 +9964,14 @@ fn what_a_days_digest_left_out_is_kept_past_the_next_day() {
     output_of(fixture.person().arg("collect"));
     let day = |date: &str| on_a_terminal(fixture.person().arg("line").env("OHJAA_TODAY", date)).0;
     let first = day("2026-10-27");
-    assert!(first.contains("more: ohjaa digest"), "{first}");
-    let next = day("2026-10-28");
-    assert!(next.starts_with("ohjaa · since "), "{next}");
     assert!(
-        next.contains("what an earlier digest left out") && next.contains("ohjaa digest"),
+        first.contains("Full details and activity: ohjaa digest"),
+        "{first}"
+    );
+    let next = day("2026-10-28");
+    assert!(next.starts_with("ohjaa — needs your attention"), "{next}");
+    assert!(
+        !next.contains("#76") && next.contains("ohjaa digest"),
         "{next}"
     );
     let (digest, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
@@ -9802,7 +9982,7 @@ fn what_a_days_digest_left_out_is_kept_past_the_next_day() {
         );
     }
     let (again, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
-    assert!(again.contains("Nothing new happened"), "{again}");
+    assert!(again.contains("No unread activity recorded"), "{again}");
     let after = day("2026-10-29");
     assert!(!after.contains("left out"), "read in full: {after}");
     fixture.cleanup();
