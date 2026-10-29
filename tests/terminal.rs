@@ -746,6 +746,99 @@ fn under_a_wrapper_without_job_control_a_killed_ohjaa_leaves_the_terminal_usable
 
 // ---- a person's decisions, at a terminal ------------------------------------
 
+#[test]
+fn review_invalid_input_keeps_the_same_proposal_and_quit_keeps_the_rest() {
+    let Some(mut tty) = Terminal::new("review-input") else {
+        return;
+    };
+    for id in ["first-rule", "second-rule"] {
+        let (code, said) = tty.run(&format!(
+            "ohjaa propose --scope mine --id {id} --kind lesson \
+             --origin 'Synthetic review fixture' 'Keep review choices explicit.'"
+        ));
+        assert_eq!(code, Some(0), "{said}");
+    }
+    tty.type_line("ohjaa review");
+    assert!(tty.expect("[a]ccept", 10), "{}", tty.report());
+    tty.mark();
+    tty.send("aq\r");
+    assert!(tty.expect("Choose one action", 5), "{}", tty.report());
+    assert!(!tty.all()[tty.mark..].contains("Second rule"));
+    assert!(!tty.config().join("mine/first-rule.md").exists());
+    tty.mark();
+    tty.send("d\r");
+    assert!(tty.expect("Proposal file:", 5), "{}", tty.report());
+    assert!(tty.all()[tty.mark..].contains("first-rule.md"));
+    tty.send("\r");
+    assert!(tty.expect("Review 2 of 2", 5), "{}", tty.report());
+    tty.send("q\r");
+    assert!(tty.shell_answers(10), "{}", tty.report());
+    let said = tty.all();
+    assert!(
+        said.contains("0 accepted, 0 rejected, 1 skipped; 2 still waiting"),
+        "{said}"
+    );
+    assert!(tty.history().is_empty());
+}
+
+#[test]
+fn review_shows_a_readable_card_and_concise_success_without_hiding_history_failure() {
+    let Some(mut tty) = Terminal::new("review-card") else {
+        return;
+    };
+    fs::write(
+        tty.dir.join("home/gitconfig"),
+        "[user]\nname = Test Person\nemail = person@example.invalid\n",
+    )
+    .unwrap();
+    let (code, said) = tty.run(
+        "ohjaa propose --scope mine --id readable-review --kind lesson \
+         --origin 'Synthetic review fixture' 'Keep each choice easy to understand.'",
+    );
+    assert_eq!(code, Some(0), "{said}");
+    tty.type_line("ohjaa review");
+    assert!(tty.expect("[a]ccept", 10), "{}", tty.report());
+    let card = tty.all()[tty.mark..].to_owned();
+    assert!(card.contains("Review 1 of 1"), "{card}");
+    assert!(card.contains("Readable review"), "{card}");
+    assert!(card.contains("Personal lesson"), "{card}");
+    assert!(card.contains("Why this was proposed"), "{card}");
+    assert!(card.contains("Synthetic review fixture"), "{card}");
+    tty.send("a\r");
+    assert!(tty.shell_answers(15), "{}", tty.report());
+    let said = tty.all();
+    assert!(said.contains("Accepted: Readable review"), "{said}");
+    assert!(said.contains("Saved in your local history."), "{said}");
+    assert!(!said.contains("  wrote   "), "{said}");
+    assert!(!said.contains("  removed "), "{said}");
+    assert!(!said.contains("  committed in "), "{said}");
+    assert_eq!(tty.history().len(), 1);
+
+    let (code, said) = tty.run(
+        "ohjaa propose --scope mine --id another-rule --kind lesson \
+         --origin 'Synthetic review fixture' 'Make the next choice explicit too.'",
+    );
+    assert_eq!(code, Some(0), "{said}");
+    let lock = tty.config().join(".git/index.lock");
+    fs::write(&lock, "a synthetic competing git operation\n").unwrap();
+    tty.type_line("ohjaa review");
+    assert!(tty.expect("[a]ccept", 10), "{}", tty.report());
+    tty.send("a\r");
+    assert!(tty.shell_answers(15), "{}", tty.report());
+    let said = tty.all()[tty.mark..].to_owned();
+    assert!(said.contains("SHELL-42-OK"), "{said}");
+    // Check all output: shell_answers moves the mark past the decision.
+    let said = tty.all();
+    assert!(said.contains("is not in the home's history"), "{said}");
+    assert!(
+        fs::read_to_string(tty.config().join("mine/another-rule.md"))
+            .unwrap()
+            .contains("status = \"current\"")
+    );
+    assert_eq!(tty.history().len(), 1);
+    fs::remove_file(lock).unwrap();
+}
+
 impl Terminal {
     /// `line` run at the shell and waited for; its exit status and what it
     /// said. The status is echoed with a sum the shell works out, so the
