@@ -222,7 +222,9 @@ is made, the filter's default (on) also keeps most messages from leaving the
 machine at all.
 
 It sends them in batches to a **drafter**, an agent CLI that reads a prompt on
-stdin and prints a JSON array. The default is `claude -p`; override it with
+stdin and prints its answer as one JSON object: its drafts, and what each
+candidate re-teaches (see *Does knowledge work?* below). The default is
+`claude -p`; override it with
 `--drafter` or `~/.config/ohjaa/drafter`. The drafter sees what is already
 present where the batch comes from: the existing Knowledge, then the
 proposals waiting for a person, of ours, mine and machine, and of each
@@ -236,9 +238,10 @@ its body, in at most 24,000 characters; what does not fit is counted. On the
 (about 21,000 characters); now a batch from no repository carries 75 (12,011),
 most repositories add 1 to 3 (to about 12,600), habitat 14 (14,821) and
 valvo 24 (16,799). The drafter is told to return nothing for a lesson already
-present. When a correction shows that a present node is not reaching agents,
-or adds to it, it names that node in `refines` and says what was missed, and
-that is how such a node gets noticed.
+present. When a candidate adds to a present node, it names that node in
+`refines` and says what it adds. When a person corrects an agent on what a
+current node already says, it names that node in `reteaches` and drafts
+nothing, and that is how a node that does not reach agents gets noticed.
 
 **A draft that may repeat what is present is written, and said to a
 person.** Every draft costs a person a review, and only a person decides
@@ -345,6 +348,86 @@ candidates that were handled, never back.
   days back) as the cursor before it drafts.
 - A `--since` before the cursor reads that stretch again, and sends once more
   what is no longer kept as handled.
+
+## Does knowledge work? What a person had to teach again
+
+The briefing gives agents knowledge; this is how ohjaa sees whether it changes
+what they do. A node the person keeps re-teaching ("no Python", "use Lima",
+"I asked you twice") is not working: it needs rewording, or making a
+decision. A node nothing touches may no longer hold.
+
+**The drafter says what each candidate re-teaches.** Its answer is one JSON
+object:
+
+```json
+{"drafts": [{"scope": "mine", "repo": null, "id": "…", "kind": "lesson",
+             "body": "…", "origin": ["…"], "refines": null, "supersedes": []}],
+ "reteaches": [{"candidate": 2, "ids": ["rust-elixir-only"]}]}
+```
+
+`candidate` is the number the prompt gives a candidate (`[2]`), and `ids` the
+current nodes it corrects an agent against. A message that only re-teaches
+makes no draft. The drafter is already shown the current nodes' ids and first
+lines, scrubbed of secrets like the rest of the prompt, within its 24,000
+characters, current knowledge first so that it is the last to be cut. An
+answer in the shape before, a bare array of drafts, is still read, as
+re-teaching nothing.
+
+**Its answer is checked.** A re-teaching is kept only when:
+- it names a candidate of the batch, and that candidate is a person's words: a
+  message in an agent session or a review comment, never an observed failure,
+  a handover or a revert;
+- its id is one current node the drafter was shown with that candidate: a
+  repo node only with a candidate from its repository, and an id defined in
+  two scopes is not one node.
+
+Everything else is dropped and counted by why on every run (`5
+re-teaching(s) the drafter named were dropped: 3 naming no current node shown
+with its candidate, 1 of no candidate in its batch, 1 unreadable`). One entry
+written wrong costs only itself; an answer that is neither drafts nor
+re-teachings is refused, and its batch split, as before. A run says each
+re-teaching it records by node, time and source, never the words
+(`re-taught rust-elixir-only (2026-09-21T10:00:00Z claude)`), and counts them
+by node at its end.
+
+**Kept as history**, like the session log, in
+`$XDG_STATE_HOME/ohjaa/knowledge-evidence.json` (`ohjaa-knowledge-evidence.v1`).
+Per node (its scope and id, and for a repo node its clone, so every worktree
+of a clone shares its count and another repository's node of the same id has
+its own) it holds:
+- each message that re-taught it: its time, the digest intake keys it by, and
+  its session's id (the agent's own, as vessa names it), never its words;
+- the newest time a draft cited it, refining or superseding it, as of the
+  newest message in that draft's batch.
+
+It is written whole, after each batch the drafter answers for and before that
+batch is kept as handled. A message counts once per node however often the
+drafter answers for it: a run killed before its progress was kept, a deleted
+`intake-handled`, a `--since` back over it, or `--retry-failed` sends it again
+under the same key. Deleting the file loses no knowledge, only the counts. A
+damaged one stops intake before anything is sent, and is never replaced;
+`ohjaa list`, `check` and `review` say so, and show no counts rather than
+zeros.
+
+**Shown, and only suggested.** A count is since the node's `as_of`, when a
+person last accepted or confirmed it: a message said before that (its own
+origin, say) did not re-teach it.
+- `ohjaa list`, under each current node: `re-taught 3 times since 2026-09-20,
+  last 2026-09-23`, where last is the newest re-teaching or citation since.
+- `ohjaa check`: the same for each current node (`evidence <id>: …`), then a
+  suggestion where one applies (`suggest  <id>: …`), counted in its summary:
+  - re-taught 3 or more times in the last 30 days: `reword it, or make it a
+    decision`;
+  - nothing re-taught or cited it, and no person accepted or confirmed it, in
+    60 days: `still true?` (a fact already flagged as not re-confirmed is
+    asked by its flag).
+
+  A suggestion is never a flag: `check --strict` does not fail on one.
+- `ohjaa review`, when a proposal may repeat a current node, or refines one:
+  that node's count, under it.
+
+ohjaa never changes a node itself. Rewording, deciding, confirming and
+retiring stay a person's.
 
 ## The bypass report: what went around the workflow
 
@@ -1023,6 +1106,10 @@ what may no longer hold:
   fix is to merge or retire nodes.
 
 A flag never hides a node. The briefing shows it with the flag beside it.
+
+It also says, per current node, how often a person had to teach it again, and
+suggests rewording what keeps being re-taught and re-confirming what nothing
+touches: suggestions, never flags (see *Does knowledge work?* above).
 
 Until the knowledge is merged or retired back under the budget, the briefing
 degrades rather than falls off a cliff, and says so on stderr. It keeps every
