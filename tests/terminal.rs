@@ -747,6 +747,40 @@ fn under_a_wrapper_without_job_control_a_killed_ohjaa_leaves_the_terminal_usable
 // ---- a person's decisions, at a terminal ------------------------------------
 
 #[test]
+fn review_preserves_literal_spacing_indentation_and_long_code_lines() {
+    let Some(mut tty) = Terminal::new("review-literal-layout") else {
+        return;
+    };
+    let long_line = format!("`{}  end`", "long-literal-".repeat(12));
+    let body = format!(
+        "Require exactly `left  right`, not `left right`.\n\n\
+         ```text\n    indented  literal  \n\ttabbed\tliteral\n```\n\n{long_line}"
+    );
+    let proposals = tty.dir.join("state/ohjaa/proposals/mine");
+    fs::create_dir_all(&proposals).unwrap();
+    fs::write(
+        proposals.join("literal-layout.md"),
+        format!(
+            "+++\nid = \"literal-layout\"\nkind = \"lesson\"\nstatus = \"proposed\"\n\
+             as_of = 2026-10-30\norigin = [\"Synthetic layout fixture\"]\n+++\n{body}\n"
+        ),
+    )
+    .unwrap();
+    tty.type_line("ohjaa review");
+    assert!(tty.expect("[a]ccept", 10), "{}", tty.report());
+    let card = tty.all()[tty.mark..].replace("\r\n", "\n");
+    tty.send("q\r");
+    assert!(tty.shell_answers(10), "{}", tty.report());
+    for line in body.lines() {
+        assert!(
+            card.contains(&format!("  {line}\n")),
+            "the decision card changed proposal text {line:?}:\n{card}"
+        );
+    }
+    assert!(tty.history().is_empty());
+}
+
+#[test]
 fn review_invalid_input_keeps_the_same_proposal_and_quit_keeps_the_rest() {
     let Some(mut tty) = Terminal::new("review-input") else {
         return;
