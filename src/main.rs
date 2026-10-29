@@ -2744,12 +2744,12 @@ fn cmd_intake(
                 let mut known =
                     intake::Known::read(&dirs, &loaded).map_err(intake::Failure::Silent)?;
                 // Scrubbed of secrets, whatever the source or the filter.
-                let (prompt, scrubbed) = intake::prompt(&known, chunk);
+                let (prompt, scrubbed, shown) = intake::prompt_with_evidence(&known, chunk);
                 redacted += scrubbed;
                 let answer = intake::draft(&drafter, &prompt)?;
                 // Checked against what the drafter was shown, before the
                 // drafts of this answer join it.
-                let (retaught, dropped_here) = known.retaught(&answer.reteaches, chunk);
+                let (retaught, dropped_here) = shown.retaught(&answer.reteaches, chunk);
                 dropped.add(dropped_here);
                 // The nodes the drafts written refine or supersede.
                 let mut named: Vec<String> = Vec::new();
@@ -2800,7 +2800,7 @@ fn cmd_intake(
                 let mut changed = !new.is_empty();
                 // A citation is as of the newest message of its batch.
                 if let Some(newest) = chunk.iter().map(|c| c.at_ms).max() {
-                    for node in known.cited(&named, chunk) {
+                    for node in shown.cited(&named, chunk) {
                         changed |= evidence.cited(&node, newest);
                     }
                 }

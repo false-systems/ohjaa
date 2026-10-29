@@ -1456,9 +1456,15 @@ carries anything, answer {\"drafts\": [], \"reteaches\": []}. Each node:
 /// each candidate's time, source, place and author, its words and the
 /// agent's words before them.
 pub fn prompt(known: &Known, batch: &[Candidate]) -> (String, usize) {
+    let (text, redacted, _) = prompt_with_evidence(known, batch);
+    (text, redacted)
+}
+
+/// The prompt and the exact knowledge sent, for validating its answer.
+pub fn prompt_with_evidence(known: &Known, batch: &[Candidate]) -> (String, usize, Shown) {
     let mut out = String::from(INSTRUCTIONS);
     let mut redacted = 0;
-    known.render(&mut out, &mut redacted, batch);
+    let shown = known.render(&mut out, &mut redacted, batch);
     out.push_str("\nCandidates:\n");
     for (index, candidate) in batch.iter().enumerate() {
         let (header, n) = scrub(&format!(
@@ -1480,7 +1486,7 @@ pub fn prompt(known: &Known, batch: &[Candidate]) -> (String, usize) {
         redacted += n;
         let _ = writeln!(out, "    said: {}", text.replace('\n', " "));
     }
-    (out, redacted)
+    (out, redacted, shown)
 }
 
 /// One node as the drafter proposes it.
@@ -1506,7 +1512,7 @@ pub struct Draft {
 pub struct Answer {
     pub drafts: Vec<Draft>,
     /// Each `{"candidate": <n>, "ids": [...]}` as the drafter wrote it: read
-    /// and checked one by one ([`Known::retaught`]), so one it got wrong
+    /// and checked one by one ([`Shown::retaught`]), so one it got wrong
     /// costs only itself.
     pub reteaches: Vec<Value>,
 }
@@ -1520,45 +1526,46 @@ struct AnswerObject {
 /// The drafter's answer: a JSON object holding `drafts` or `reteaches` (or
 /// both), or, as it answered before it was asked what each candidate
 /// re-teaches, an array of drafts. Prose or a code fence around it is
-/// tolerated: of the object and the array, the one that starts first is
-/// read, else the other.
+/// tolerated. The first enclosing JSON value is read: an invalid object
+/// must never be recovered as one of its nested legacy arrays.
 pub fn parse_answer(answer: &str) -> Result<Answer> {
-    let span = |open: char, close: char| {
-        let start = answer.find(open)?;
-        let end = answer.rfind(close)?;
-        (end > start).then(|| (start, &answer[start..=end]))
-    };
-    let object = span('{', '}').map(|(start, text)| {
-        (
-            start,
-            serde_json::from_str::<AnswerObject>(text)
-                .ok()
-                .filter(|object| object.drafts.is_some() || object.reteaches.is_some())
-                .map(|object| Answer {
-                    drafts: object.drafts.unwrap_or_default(),
-                    reteaches: object.reteaches.unwrap_or_default(),
-                }),
-        )
-    });
-    let array = span('[', ']').map(|(start, text)| {
-        (
-            start,
-            serde_json::from_str::<Vec<Draft>>(text)
-                .ok()
-                .map(|drafts| Answer {
-                    drafts,
-                    reteaches: Vec::new(),
-                }),
-        )
-    });
-    if object.is_none() && array.is_none() {
-        bail!("the drafter did not answer with a JSON object");
+    let mut remaining = answer;
+    loop {
+        let start = remaining
+            .find(['{', '['])
+            .context("the drafter did not answer with a JSON object")?;
+        let source = &remaining[start..];
+        let mut values = serde_json::Deserializer::from_str(source).into_iter::<Value>();
+        let value = values
+            .next()
+            .context("the drafter gave no JSON value")?
+            .context("the drafter's answer is not valid JSON")?;
+        if value.is_array() {
+            match serde_json::from_value(value) {
+                Ok(drafts) => {
+                    return Ok(Answer {
+                        drafts,
+                        reteaches: Vec::new(),
+                    })
+                }
+                Err(_) => {
+                    // Prose can contain references such as Notes [1]. Skip the
+                    // whole parsed value, never scan inside an invalid object.
+                    remaining = &source[values.byte_offset()..];
+                    continue;
+                }
+            }
+        }
+        let object: AnswerObject = serde_json::from_value(value)
+            .context("the drafter's answer is not drafts and what they re-teach")?;
+        if object.drafts.is_none() && object.reteaches.is_none() {
+            bail!("the drafter's answer contains neither drafts nor re-teachings");
+        }
+        return Ok(Answer {
+            drafts: object.drafts.unwrap_or_default(),
+            reteaches: object.reteaches.unwrap_or_default(),
+        });
     }
-    let mut read: Vec<(usize, Option<Answer>)> = object.into_iter().chain(array).collect();
-    read.sort_by_key(|(start, _)| *start);
-    read.into_iter()
-        .find_map(|(_, answer)| answer)
-        .context("the drafter's answer is not drafts and what they re-teach")
 }
 
 impl Draft {
@@ -1789,6 +1796,12 @@ pub struct Known {
     repo_root: Option<PathBuf>,
 }
 
+/// Only nodes actually rendered into a prompt, after its shared size limit.
+/// Evidence checks cannot be called on an unbounded on-disk knowledge set.
+pub struct Shown {
+    nodes: Vec<Present>,
+}
+
 impl Known {
     /// Everything loaded, and every proposal waiting for a person.
     pub fn read(dirs: &Dirs, loaded: &Loaded) -> Result<Known> {
@@ -1848,7 +1861,9 @@ impl Known {
             &proposal.supersedes,
         )
     }
+}
 
+impl Shown {
     /// The one current node `id` names that the drafter was shown with
     /// `with`: none when no current node has it there, or two do.
     fn current(&self, id: &str, with: &[Candidate]) -> Option<crate::evidence::NodeKey> {
@@ -1925,14 +1940,16 @@ impl Known {
         cited.dedup();
         cited
     }
+}
 
+impl Known {
     /// The list the drafter is shown with `batch`, within [`KNOWN_BUDGET`]
     /// characters: what is present where it comes from ([`Present::shown_with`]),
     /// current knowledge first (then what was superseded or retired, then
     /// what waits for a person), each in the order stored; what does not fit
     /// is counted. Each line is scrubbed whole, then cut, then measured; only
     /// what is sent adds to `redacted`.
-    fn render(&self, out: &mut String, redacted: &mut usize, batch: &[Candidate]) {
+    fn render(&self, out: &mut String, redacted: &mut usize, batch: &[Candidate]) -> Shown {
         let (waiting, mut other): (Vec<&Present>, Vec<&Present>) = self
             .nodes
             .iter()
@@ -1941,6 +1958,7 @@ impl Known {
         // Stable: the order stored, within each.
         other.sort_by_key(|present| present.status != Status::Current);
         let mut budget = KNOWN_BUDGET;
+        let mut sent = Vec::new();
         let mut list = |heading: &str, nodes: &[&Present], out: &mut String| {
             out.push_str(heading);
             if nodes.is_empty() {
@@ -1972,6 +1990,7 @@ impl Known {
                 budget -= line.len();
                 *redacted += in_head + in_first;
                 out.push_str(&line);
+                sent.push((**present).clone());
                 shown += 1;
             }
             if shown < nodes.len() {
@@ -1989,6 +2008,7 @@ impl Known {
             &waiting,
             out,
         );
+        Shown { nodes: sent }
     }
 }
 
@@ -4169,6 +4189,7 @@ mod tests {
             ]"#,
         )
         .unwrap();
+        let (_, _, present) = prompt_with_evidence(&present, &batch);
         let (kept, dropped) = present.retaught(&reteaches, &batch);
         let mine = crate::evidence::NodeKey::new(Scope::Mine, None, "rust-elixir-only");
         let here =
@@ -4228,6 +4249,46 @@ mod tests {
             both.sort();
             both
         });
+    }
+
+    #[test]
+    fn evidence_cannot_name_a_node_omitted_by_the_prompt_budget() {
+        let ids: Vec<String> = (0..600).map(|n| format!("current-lesson-{n:04}")).collect();
+        let nodes: Vec<_> = ids
+            .iter()
+            .map(|id| (Scope::Mine, None, id.as_str(), Status::Current))
+            .collect();
+        let known = known(&nodes);
+        let batch = vec![Candidate {
+            source: "claude",
+            at_ms: 1_000,
+            at: "1970-01-01T00:00:01Z".into(),
+            place: "/r/here".into(),
+            who: "person".into(),
+            context: String::new(),
+            text: "Follow the rule I already gave you".into(),
+            session: Some("s1".into()),
+        }];
+        let (sent, _, shown) = prompt_with_evidence(&known, &batch);
+        assert!(!sent.contains("current-lesson-0599"));
+        let reteaches = vec![serde_json::json!({"candidate": 1, "ids": ["current-lesson-0599"]})];
+        let (kept, dropped) = shown.retaught(&reteaches, &batch);
+        assert!(kept.is_empty());
+        assert_eq!(dropped.not_current, 1);
+        assert!(shown
+            .cited(&["current-lesson-0599".into()], &batch)
+            .is_empty());
+    }
+
+    #[test]
+    fn malformed_answer_objects_cannot_become_nested_legacy_arrays() {
+        for answer in [
+            r#"{"drafts":[],"reteaches":"not an array"}"#,
+            r#"{"drafts":{},"reteaches":[]}"#,
+            r#"{"drafts":[]"#,
+        ] {
+            assert!(parse_answer(answer).is_err(), "{answer}");
+        }
     }
 
     #[test]

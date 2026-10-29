@@ -3247,6 +3247,63 @@ fn damaged_evidence_stops_intake_and_is_said_never_shown_as_nothing() {
 }
 
 #[test]
+fn malformed_reteaching_answers_leave_the_correction_available_for_retry() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("reteach-invalid-answer");
+    let repo = fixture.make_git_repo("work");
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        "rust-only",
+        "decision",
+        "Code is Rust.",
+    );
+    fixture.said(&[vessa_line(
+        "2026-09-21T10:00:00Z",
+        &repo.display().to_string(),
+        "I already told you no Python",
+        None,
+    )]);
+    let answer = fixture.dir.join("answer.json");
+    fs::write(&answer, r#"{"drafts":[],"reteaches":"not an array"}"#).unwrap();
+    let drafter = answering_drafter(&fixture, &fixture.dir);
+    let run = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "intake",
+                    "--source",
+                    "transcripts",
+                    "--no-prefilter",
+                    "--since",
+                    "2026-09-01",
+                    "--drafter",
+                ])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    let (stdout, stderr, code) = run();
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    let evidence = fixture.dir.join("state/ohjaa/knowledge-evidence.json");
+    assert!(!evidence.exists());
+    fs::write(
+        &answer,
+        r#"{"drafts":[],"reteaches":[{"candidate":1,"ids":["rust-only"]}]}"#,
+    )
+    .unwrap();
+    let (stdout, stderr, code) = run();
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("re-taught rust-only"), "{stdout}");
+    let kept: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(evidence).unwrap()).unwrap();
+    assert_eq!(kept["nodes"][0]["retaught"].as_array().unwrap().len(), 1);
+    fixture.cleanup();
+}
+
+#[test]
 fn a_file_inside_a_repository_gets_only_shared_knowledge() {
     if !git_available() {
         return;
