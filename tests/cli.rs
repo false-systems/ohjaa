@@ -10228,16 +10228,19 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
     assert_eq!(code, Some(0), "{digest}");
     assert!(
-        digest.contains("claude \"make the digest say what I asked for\"\n")
-            && digest.contains("  exit 0 · "),
-        "its words on its row, the rest below: {digest}"
+        digest.contains("claude \"make the digest say what I asked for\"")
+            && digest.contains("process exited successfully (code 0)"),
+        "its first words and observed process result: {digest}"
     );
-    assert!(!digest.contains("\"interactive\""), "{digest}");
+    assert!(
+        digest.contains("recorded launch intent: \"interactive\""),
+        "{digest}"
+    );
     for said in [
         "\nSecrets seen\n",
-        "claude 5e1976e4 · you typed it · github ×1 · fingerprint 1a2b3c4d\n",
-        "  Rotate any that are real keys; `printf %s KEY | shasum -a 256 | cut -c1-8` matches \
-         a fingerprint\n",
+        "claude 5e1976e4-71c3-407c-9533-0be05b7e1b70 · you typed it",
+        "github ×1 · fingerprint 1a2b3c4d",
+        "Rotate any findings that are real keys.",
     ] {
         assert!(digest.contains(said), "missing `{said}`: {digest}");
     }
@@ -10254,7 +10257,7 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     };
     let daily = day();
     assert!(
-        daily.contains("\n  ! 1 secret-shaped token in agent sessions: ohjaa digest\n"),
+        daily.contains("\n  1 secret-shaped token in agent sessions\n"),
         "{daily}"
     );
     assert_eq!(day(), "", "said once");
@@ -10276,7 +10279,7 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     assert_eq!(
         day(),
-        "! 1 secret-shaped token in agent sessions: ohjaa digest\n"
+        "ohjaa · 1 secret-shaped token in agent sessions · Details: ohjaa digest\n"
     );
     assert_eq!(day(), "");
     // The second scan began where the first ended, not at the window's start.
@@ -10324,7 +10327,7 @@ fn a_secrets_scan_that_cannot_run_is_said_never_an_all_clear() {
     assert!(
         seen.starts_with("  ! secrets")
             && seen.contains(
-                "the scan could not run, never read: this vessa has no `secrets`: update vessa"
+                "Secrets scan: unavailable, never read: this vessa has no `secrets`: update vessa"
             ),
         "{said}"
     );
@@ -10351,7 +10354,7 @@ fn a_secrets_scan_that_cannot_run_is_said_never_an_all_clear() {
     assert_eq!(code, Some(4), "{said}");
     let seen = section(&said);
     assert!(
-        seen.contains("the scan could not read 1, as of ")
+        seen.contains("Secrets scan: 1 could not be read, as of ")
             && seen.contains("could not read /h/x.jsonl: Permission denied"),
         "{said}"
     );
@@ -10367,7 +10370,7 @@ fn a_secrets_scan_that_cannot_run_is_said_never_an_all_clear() {
     let (said, _, code) = digest();
     assert_eq!(code, Some(4), "{said}");
     let seen = section(&said);
-    assert!(seen.contains("the scan could not run, as of "), "{said}");
+    assert!(seen.contains("Secrets scan: unavailable, as of "), "{said}");
     assert!(seen.contains("you typed it · github ×1"), "kept: {said}");
     // A whole scan again: only now is nothing missing.
     fixture.secrets_scan(&secrets_report(true, serde_json::json!([]), Vec::new()), 0);
@@ -10376,5 +10379,38 @@ fn a_secrets_scan_that_cannot_run_is_said_never_an_all_clear() {
     let (said, _, code) = digest();
     assert_eq!(code, Some(0), "{said}");
     assert!(!said.contains("! secrets"), "{said}");
+    fixture.cleanup();
+}
+
+#[test]
+fn malformed_secrets_coverage_is_incomplete_and_keeps_the_retry_boundary() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("human-secrets-invalid-coverage");
+    fixture.human_view(false);
+    fixture.secrets_scan(&secrets_report(true, serde_json::json!([]), Vec::new()), 0);
+    output_of(fixture.person().arg("collect"));
+    let path = fixture.human_dir().join("collected.json");
+    let before: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    fixture.secrets_scan(
+        &serde_json::json!({"schema":"vessa-secrets.v1", "complete":true,
+        "findings":[], "unreadable":{"path":"/bad.jsonl","why":"permission denied"}})
+        .to_string(),
+        0,
+    );
+    let (stdout, stderr, code) = output_of(fixture.person().arg("collect"));
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(
+        after["secrets"]["value"]["read_ms"],
+        before["secrets"]["value"]["read_ms"]
+    );
+    assert!(after["secrets"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("unreadable-path list"));
     fixture.cleanup();
 }
