@@ -575,7 +575,8 @@ first-line summary before its id. It explains the scope (personal, shared,
 repository or machine) and labels the instruction's date without claiming
 it was created today or has waited since that date.
 
-Lines are at most 100 characters. Details wrap rather than disappear; the
+Lines wrap at 100 characters, except URLs kept intact for opening or copying.
+Details wrap rather than disappear; the
 short startup notice always retains `ohjaa digest` as its inspection action.
 Digest source dates are separate for repository verification, GitHub pull
 requests and Vessa token usage. These are human-readable changes only: no

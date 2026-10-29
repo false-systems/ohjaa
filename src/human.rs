@@ -698,9 +698,14 @@ fn build(
             Kind::Main,
             class,
             format!(
-                "main:{}:{}",
+                "main:{}:{}:{}:{}:{}:{}:{}",
                 branch.slug,
-                branch.tip.as_deref().unwrap_or("")
+                branch.tip.as_deref().unwrap_or(""),
+                branch.unproven,
+                branch.failed,
+                branch.unknown,
+                branch.more,
+                source_key("refresh", &branch.error.iter().collect::<Vec<_>>())
             ),
             &branch.slug,
             format!(
@@ -929,23 +934,43 @@ fn advance(
     // pull request event in the overlap before that end is in this digest's
     // stretch or was said by the one before it: the next leaves them out of
     // its overlap, and says only what GitHub indexed late.
+    let previous = old.digest.as_ref();
     let github_end = collected
         .and_then(|c| c.github.as_of_ms)
-        .unwrap_or(old.daily_from(now_ms).github_ms);
+        .unwrap_or(old.daily_from(now_ms).github_ms)
+        .max(previous.map_or(i64::MIN, |window| window.github_ms));
+    let sessions_end = now_ms.max(previous.map_or(i64::MIN, |window| window.sessions_ms));
     let overlap = github_end - OVERLAP_MS;
-    let here = Window {
-        sessions_ms: now_ms,
+    let mut here = Window {
+        sessions_ms: sessions_end,
         github_ms: github_end,
         said: view
             .events
             .iter()
             .filter(|item| {
-                let boundary = if item.github { overlap } else { now_ms };
+                let boundary = if item.github { overlap } else { sessions_end };
                 item.at_ms >= boundary - boundary.rem_euclid(1000)
             })
             .map(|item| item.key.clone())
             .collect(),
     };
+    // A digest reads sources before claiming the cursor. An older concurrent
+    // read must not undo keys acknowledged by the terminal that claimed first.
+    if let Some(previous) = previous {
+        here.said.extend(
+            previous
+                .said
+                .iter()
+                .filter(|key| {
+                    if key.starts_with("session:") {
+                        previous.sessions_ms.div_euclid(1000) == sessions_end.div_euclid(1000)
+                    } else {
+                        previous.github_ms == github_end
+                    }
+                })
+                .cloned(),
+        );
+    }
     let (digest, unseen, day) = match shown {
         Shown::Line => (
             Some(old.daily_from(now_ms)),
@@ -1188,6 +1213,12 @@ fn wrapped(prefix: &str, text: &str) -> String {
                 } else {
                     line.push(' ');
                 }
+            }
+            // A URL is an action, not prose: keep it intact for terminal
+            // link detection and copying, even beyond the preferred width.
+            if word.starts_with("https://") || word.starts_with("http://") {
+                line.push_str(word);
+                continue;
             }
             for c in word.chars() {
                 if line.chars().count() == WIDTH {
@@ -2701,6 +2732,56 @@ mod tests {
             .unwrap();
         assert!(notice.text.contains(&open.intent));
         assert!(notice.text.contains("ohjaa session long"));
+    }
+
+    #[test]
+    fn a_changed_verification_result_at_the_same_commit_needs_attention() {
+        let mut collected = snapshot(NOW);
+        collected.local.value.branches.push(Branch {
+            slug: "example/project".into(),
+            branch: "main".into(),
+            tip: Some("a".repeat(40)),
+            unproven: 1,
+            as_of_ms: Some(NOW),
+            ..Branch::default()
+        });
+        let initial = view(&[], Some(&collected));
+        let seen = advance(
+            &initial,
+            &Seen::first(NOW),
+            Some(&collected),
+            NOW,
+            Shown::Line,
+            "d",
+        );
+        collected.local.value.branches[0].failed = 1;
+        let failed = view(&[], Some(&collected));
+        assert_eq!(
+            one_line(&news(&failed, &seen)),
+            Some("ohjaa · project main: 1 verification failed · Details: ohjaa digest\n".into())
+        );
+    }
+
+    #[test]
+    fn a_stale_concurrent_digest_cannot_undo_a_boundary_acknowledgement() {
+        let empty = view(&[], None);
+        let fresh = view(&[session("just-ended", 10_000, Some(0), true)], None);
+        let first = advance(&fresh, &Seen::first(NOW), None, NOW + 200, Shown::Full, "d");
+        let stale = advance(&empty, &first, None, NOW + 100, Shown::Full, "d");
+        assert_eq!(stale.digest.as_ref().unwrap().sessions_ms, NOW + 200);
+        assert!(after(&fresh, &stale.full_from(NOW + 400)).is_empty());
+    }
+
+    #[test]
+    fn long_pull_request_urls_remain_usable_inspection_actions() {
+        let mut collected = snapshot(NOW);
+        let mut pull_request = pr(12345, HOUR_MS, Some(MINUTE_MS));
+        pull_request.repo = format!("{}/{}", "o".repeat(39), "r".repeat(80));
+        pull_request.url = format!("https://github.com/{}/pull/12345", pull_request.repo);
+        let url = pull_request.url.clone();
+        collected.github.value.push(pull_request);
+        let view = view(&[], Some(&collected));
+        assert!(full(&view, &Window::at(NOW - DAY_MS), None, None, NOW).contains(&url));
     }
 
     /// Second review of #63, a nit: a source is said in the line for each
