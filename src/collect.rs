@@ -52,7 +52,7 @@ const GH_TIMEOUT: Duration = Duration::from_secs(30);
 const VESSA_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The most sessions whose usage one collect asks vessa about, newest first.
-const MAX_COSTED: usize = 50;
+const MAX_USAGE_SESSIONS: usize = 50;
 
 const SEARCH: &str = "query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 100, after: $after) {
@@ -93,7 +93,7 @@ pub struct Collected {
     pub github: Part<Vec<Pr>>,
     /// By ohjaa session id.
     #[serde(default)]
-    pub usage: Part<BTreeMap<String, Cost>>,
+    pub usage: Part<BTreeMap<String, TokenUsage>>,
     /// The first words the person typed in each session ended lately, by
     /// ohjaa session id: their own words, shown back to them, kept only for
     /// the window the digest shows ([`Collected::keep_window`]).
@@ -302,17 +302,15 @@ impl Pr {
     }
 }
 
-/// What vessa estimates one ohjaa session used: unknown (`None`) unless
-/// every one of the agent's own sessions it ran was found, and an estimate
-/// only when vessa priced all of it. An estimate, never a bill.
+/// Token usage for one ohjaa session, unknown (`None`) unless every one
+/// of the agent's own sessions it ran was found.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Cost {
+pub struct TokenUsage {
     /// Input, output and cache writes.
     pub tokens: Option<u64>,
     /// Said apart: most of a session's tokens are reads of its cache.
     #[serde(default)]
     pub cache_reads: Option<u64>,
-    pub usd_micros: Option<u64>,
 }
 
 /// The last snapshot, unless there is none or it cannot be read as one.
@@ -581,7 +579,7 @@ fn pr(node: &Value) -> Option<Pr> {
 }
 
 /// The sessions that ended since `from_ms` and named their agent's own
-/// sessions, the newest [`MAX_COSTED`]: what vessa is asked about.
+/// sessions, the newest [`MAX_USAGE_SESSIONS`]: what vessa is asked about.
 fn ended_since(dirs: &Dirs, from_ms: i64) -> Result<Vec<Session>, String> {
     let log = sessions::Reader::open(&sessions::store_path(&dirs.state))
         .map_err(|error| format!("the session log could not be opened: {error}"))?;
@@ -595,14 +593,14 @@ fn ended_since(dirs: &Dirs, from_ms: i64) -> Result<Vec<Session>, String> {
         })
     });
     logged.sort_by_key(|s| std::cmp::Reverse(s.left.as_ref().map(|left| left.ended_ms)));
-    logged.truncate(MAX_COSTED);
+    logged.truncate(MAX_USAGE_SESSIONS);
     Ok(logged)
 }
 
 /// The usage of the sessions that ended lately (`logged`), from those
 /// sessions' transcripts alone: vessa is given each transcript, never asked
 /// to read them all.
-fn usage(logged: &[Session]) -> Result<(BTreeMap<String, Cost>, Vec<String>), String> {
+fn usage(logged: &[Session]) -> Result<(BTreeMap<String, TokenUsage>, Vec<String>), String> {
     let transcripts: BTreeSet<&str> = logged
         .iter()
         .flat_map(natives)
@@ -633,7 +631,7 @@ fn usage(logged: &[Session]) -> Result<(BTreeMap<String, Cost>, Vec<String>), St
     let read = read_usage(&answer, &mut gaps)?;
     let costs = logged
         .iter()
-        .map(|s| (s.id.clone(), cost_of(s, &read)))
+        .map(|s| (s.id.clone(), usage_of(s, &read)))
         .collect();
     Ok((costs, gaps))
 }
@@ -651,22 +649,23 @@ fn has_transcript(native: &usage::NativeSession) -> bool {
     !native.testimony && native.source != usage::ENV_SOURCE && !native.source.is_empty()
 }
 
-/// What vessa read of one native session, as a [`Cost`]. `None`: its id is
+/// What vessa read of one native session, as a [`TokenUsage`]. `None`: its id is
 /// in vessa's answer twice, so it is no one's.
-type Read = BTreeMap<(String, String), Option<Cost>>;
+type Read = BTreeMap<(String, String), Option<TokenUsage>>;
 
 /// All of them, or unknown when one is.
 fn sum(mut values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
     values.try_fold(0u64, |total, value| total.checked_add(value?))
 }
 
-/// `vessa-usage.v1`, by agent and native session id.
+/// Token totals from `vessa-usage.v2`, by agent and native session id.
+/// The former v1 export has the same token fields; its money is ignored.
 pub fn read_usage(answer: &Value, gaps: &mut Vec<String>) -> Result<Read, String> {
     match answer["schema"].as_str() {
-        Some("vessa-usage.v1") => {}
+        Some("vessa-usage.v1" | "vessa-usage.v2") => {}
         other => {
             return Err(format!(
-                "vessa answered {}, not vessa-usage.v1",
+                "vessa answered {}, not vessa-usage.v1 or vessa-usage.v2",
                 other.unwrap_or("without a schema")
             ))
         }
@@ -696,10 +695,9 @@ pub fn read_usage(answer: &Value, gaps: &mut Vec<String>) -> Result<Read, String
                 })
                 .flatten()
         };
-        let cost = Cost {
+        let cost = TokenUsage {
             tokens: all(&["input_tokens", "output_tokens", "cache_write_tokens"]),
             cache_reads: all(&["cache_read_tokens"]),
-            usd_micros: all(&["estimated_usd_micros"]),
         };
         let key = (agent.to_owned(), id.to_owned());
         if read.insert(key, Some(cost)).is_some() {
@@ -712,10 +710,10 @@ pub fn read_usage(answer: &Value, gaps: &mut Vec<String>) -> Result<Read, String
     Ok(read)
 }
 
-/// The cost of one ohjaa session: known only when each of its agent's own
+/// The usage of one ohjaa session: known only when each of its agent's own
 /// sessions has a transcript and vessa read it once.
-pub fn cost_of(session: &Session, read: &Read) -> Cost {
-    let found: Vec<Option<&Cost>> = natives(session)
+pub fn usage_of(session: &Session, read: &Read) -> TokenUsage {
+    let found: Vec<Option<&TokenUsage>> = natives(session)
         .map(|native| {
             has_transcript(native)
                 .then(|| read.get(&(native.agent.clone(), native.session_id.clone())))
@@ -723,15 +721,14 @@ pub fn cost_of(session: &Session, read: &Read) -> Cost {
                 .and_then(Option::as_ref)
         })
         .collect();
-    let total = |of: fn(&Cost) -> Option<u64>| {
+    let total = |of: fn(&TokenUsage) -> Option<u64>| {
         found
             .iter()
             .try_fold(0u64, |total, cost| total.checked_add(of((*cost)?)?))
     };
     let tokens = total(|c| c.tokens);
     let cache_reads = total(|c| c.cache_reads).filter(|_| tokens.is_some());
-    Cost {
-        usd_micros: total(|c| c.usd_micros).filter(|_| tokens.is_some()),
+    TokenUsage {
         cache_reads,
         tokens,
     }
@@ -1035,10 +1032,11 @@ pub fn read_secrets(
     let Some(listed) = report["findings"].as_array() else {
         return Err("vessa's secrets report lists no findings".to_owned());
     };
-    let mut gaps: Vec<String> = report["unreadable"]
+    let unreadable = report["unreadable"]
         .as_array()
-        .into_iter()
-        .flatten()
+        .ok_or_else(|| "vessa's secrets report has no valid unreadable-path list".to_owned())?;
+    let mut gaps: Vec<String> = unreadable
+        .iter()
         .map(|unread| {
             format!(
                 "could not read {}: {}",
@@ -1148,7 +1146,7 @@ mod tests {
     }
 
     fn vessa(sessions: Value) -> Value {
-        json!({"schema": "vessa-usage.v1", "sessions": sessions, "warnings": []})
+        json!({"schema": "vessa-usage.v2", "sessions": sessions, "warnings": []})
     }
 
     /// `tokens` of input and `cached` cache reads.
@@ -1157,11 +1155,10 @@ mod tests {
                "cache_write_tokens": 0, "estimated_usd_micros": usd})
     }
 
-    fn cost(tokens: Option<u64>, cache_reads: Option<u64>, usd_micros: Option<u64>) -> Cost {
-        Cost {
+    fn cost(tokens: Option<u64>, cache_reads: Option<u64>) -> TokenUsage {
+        TokenUsage {
             tokens,
             cache_reads,
-            usd_micros,
         }
     }
 
@@ -1191,8 +1188,8 @@ mod tests {
         ]));
         let read = read_usage(&answer, &mut Vec::new()).unwrap();
         // A session's usage is its subagents' too; cache reads apart;
-        // nothing priced, no estimate.
-        assert_eq!(cost_of(&s, &read), cost(Some(2_000), Some(100_000), None));
+        // No spending is read or calculated.
+        assert_eq!(usage_of(&s, &read), cost(Some(2_000), Some(100_000)));
     }
 
     #[test]
@@ -1207,20 +1204,20 @@ mod tests {
         assert!(gaps
             .iter()
             .any(|n| n.contains("dup") && n.contains("twice")));
-        let unknown = Cost::default();
+        let unknown = TokenUsage::default();
         // Another agent's session of the same id is not this one.
         let other = session("oh-1", json!([native("claude", "c1", "/t/c1.jsonl")]));
-        assert_eq!(cost_of(&other, &read), unknown);
+        assert_eq!(usage_of(&other, &read), unknown);
         let twice = session("oh-2", json!([native("claude", "dup", "/t/d.jsonl")]));
-        assert_eq!(cost_of(&twice, &read), unknown);
+        assert_eq!(usage_of(&twice, &read), unknown);
         // Only the agent's environment named it: no transcript was read.
         let mut claimed = native("codex", "c1", usage::ENV_SOURCE);
         claimed["testimony"] = json!(true);
-        assert_eq!(cost_of(&session("oh-3", json!([claimed])), &read), unknown);
+        assert_eq!(usage_of(&session("oh-3", json!([claimed])), &read), unknown);
     }
 
     #[test]
-    fn missing_or_partly_priced_usage_stays_unknown_never_zero() {
+    fn missing_usage_stays_unknown_and_legacy_spending_is_ignored() {
         let answer = vessa(json!([
             {"agent": "claude", "id": "a", "totals": [entry(10, 1, Some(7)), entry(5, 1, None)]},
             {"agent": "claude", "id": "b", "totals": []},
@@ -1232,18 +1229,55 @@ mod tests {
                 .iter()
                 .map(|id| native("claude", id, &format!("/t/{id}.jsonl")))
                 .collect();
-            cost_of(&session("oh", json!(natives)), &read)
+            usage_of(&session("oh", json!(natives)), &read)
         };
         assert_eq!(
             of(&["a"]),
-            cost(Some(15), Some(2), None),
-            "a part unpriced is no estimate"
+            cost(Some(15), Some(2)),
+            "legacy spending does not affect token totals"
         );
-        assert_eq!(of(&["b"]), Cost::default(), "no totals is unknown");
-        assert_eq!(of(&["c", "missing"]), Cost::default(), "one not found");
-        assert_eq!(of(&["c"]), cost(Some(3), Some(4), Some(2)));
+        assert_eq!(of(&["b"]), TokenUsage::default(), "no totals is unknown");
+        assert_eq!(
+            of(&["c", "missing"]),
+            TokenUsage::default(),
+            "one not found"
+        );
+        assert_eq!(of(&["c"]), cost(Some(3), Some(4)));
         let wrong = json!({"schema": "vessa-other.v1", "sessions": []});
         assert!(read_usage(&wrong, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn token_only_v2_and_legacy_v1_have_the_same_token_evidence() {
+        let expected = TokenUsage {
+            tokens: Some(35),
+            cache_reads: Some(400),
+        };
+        let entries = json!([{"input_tokens":20,"output_tokens":10,
+            "cache_write_tokens":5,"cache_read_tokens":400}]);
+        let mut answer = vessa(json!([{"agent":"pi","id":"pi-1",
+            "totals":entries,"limitations":[]}]));
+        let mut gaps = Vec::new();
+        let read = read_usage(&answer, &mut gaps).unwrap();
+        assert_eq!(read[&("pi".into(), "pi-1".into())], Some(expected.clone()));
+        assert!(gaps.is_empty());
+        answer["schema"] = json!("vessa-usage.v1");
+        answer["sessions"][0]["totals"][0]["estimated_usd_micros"] = json!(9_000_000);
+        let legacy = read_usage(&answer, &mut gaps).unwrap();
+        assert_eq!(legacy[&("pi".into(), "pi-1".into())], Some(expected));
+        assert!(gaps.is_empty());
+        answer["sessions"][0]["totals"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("input_tokens");
+        let missing = read_usage(&answer, &mut gaps).unwrap();
+        assert_eq!(
+            missing[&("pi".into(), "pi-1".into())]
+                .as_ref()
+                .unwrap()
+                .tokens,
+            None
+        );
     }
 
     #[test]
@@ -1404,6 +1438,25 @@ mod tests {
         let word = excerpt(&"x".repeat(200)).unwrap();
         assert_eq!(word.chars().count(), EXCERPT_CHARS);
         assert!(word.ends_with('…'));
+    }
+
+    #[test]
+    fn malformed_scan_coverage_does_not_advance_the_complete_scan() {
+        let before = Secrets {
+            read_ms: Some(NOW - HOUR),
+            findings: Vec::new(),
+        };
+        for unreadable in [
+            Value::Null,
+            json!({"path":"/bad", "why":"denied"}),
+            json!("unreadable"),
+        ] {
+            let report = json!({"schema":"vessa-secrets.v1", "complete":true, "findings":[], "unreadable":unreadable});
+            assert!(
+                read_secrets(Some(0), report.to_string().as_bytes(), "", &before, NOW).is_err()
+            );
+        }
+        assert_eq!(before.read_ms, Some(NOW - HOUR));
     }
 
     #[test]

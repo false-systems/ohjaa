@@ -172,6 +172,10 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
 
 ## If you are an agent working here
 
+- User-facing output must be plain and contextual: name the repository or
+  session involved, explain what happened or is missing, and show how to
+  see details or act. Do not leave internal terms such as "unproven" or
+  "read-back" unexplained, or truncate the command that helps the person.
 - Never run `ohjaa accept`, `reject`, `retire`, `confirm` or `review` on a
   person's behalf, and never fake a terminal to get past that refusal. Propose
   with `ohjaa propose` and say so. The one exception is a test that plays the

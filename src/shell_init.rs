@@ -11,9 +11,8 @@ const LAUNCH_ZSH: &str = include_str!("launch.zsh");
 /// Run once, as the eval runs: a terminal opening. `ohjaa line` says nothing
 /// in an agent's shell or without a terminal, so it needs no guard here.
 const LINE_ZSH: &str = "
-# What happened since you last looked: one line when something is new, and
-# the day's digest at the first terminal of the day (`ohjaa digest`, all of
-# it). Silent in an agent's shell. Off for a shell: OHJAA_LINE=0.
+# Only what needs attention or a decision. Activity stays in `ohjaa digest`.
+# Silent in an agent's shell. Off for a shell: OHJAA_LINE=0.
 [[ ${OHJAA_LINE:-1} == 0 ]] || ohjaa line
 ";
 
