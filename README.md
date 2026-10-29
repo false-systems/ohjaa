@@ -770,6 +770,15 @@ intent is in-…, new"), the record and the next briefing show it (`intent
 fix the parser (intent in-…)`), and `--task` is recorded as given. Older
 records have no intent id.
 
+The briefing includes the current intent's full text, including on continuation,
+so a concrete goal is assigned work even without `--task`. An explicit `--task`
+specifies work within that goal and stays separate; a placeholder intent such
+as `interactive` without a task leaves the agent waiting for an assignment.
+To start the turn, a concrete intent uses Toimija's task transport when no
+explicit task is supplied. The Ohjaa session still records only the explicit
+`--task` as its task; the goal remains its intent. Empty, `unknown` and
+`interactive` intents do not start a turn on their own.
+
 **Validations.** `ohjaa gate` inside a session writes a validation reference
 into the session's record before it asks sykli (see `ohjaa gate` below): a
 reference, never an outcome. The record and the next briefing list each one
@@ -1454,8 +1463,18 @@ ohjaa run codex --intent "change the parser" -- --model o3
 
 ## Agents launched from the root
 
-Launch agents from the folder that holds your repositories, and name the ones
-each agent will work in with `--scope`:
+Launch agents from the folder that holds your repositories. You can give a goal
+without choosing the repositories first:
+
+```bash
+cd ~/projects
+ohjaa run codex --intent "reduce Toimija's Git pressure"
+```
+
+The agent receives that goal, identifies the repositories it needs, and declares
+each with `toimija intent "<why>" --scope <repo>` before working there. This makes
+its scope visible to other sessions; Ohjaa's launch-time attribution remains as
+described below. When repositories are known at launch, name them with `--scope`:
 
 ```bash
 cd ~/projects

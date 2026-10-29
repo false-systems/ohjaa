@@ -2167,6 +2167,47 @@ fn startup_is_scoped_reuses_scans_and_delivers_repo_knowledge_from_the_root() {
 }
 
 #[test]
+fn root_launch_delivers_the_goal_without_requiring_scope_or_a_task() {
+    let fixture = Fixture::new("root-intent");
+    fixture.make_repo("unselected");
+    let (_, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "run",
+        "codex",
+        "--intent",
+        "reduce Toimija's Git pressure",
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    let argv = fixture.argv();
+    let start = argv.iter().position(|arg| arg == "--briefing").unwrap();
+    let end = argv.iter().position(|arg| arg == "--").unwrap();
+    let briefing = argv[start + 1..end].join("\n");
+    assert!(
+        briefing.contains("Current session intent:\nreduce Toimija's Git pressure\n"),
+        "{briefing}"
+    );
+    assert!(
+        briefing.contains("A concrete intent is assigned work"),
+        "{briefing}"
+    );
+    assert!(
+        briefing.contains("identify the repositories needed"),
+        "{briefing}"
+    );
+    assert!(argv
+        .windows(2)
+        .any(|pair| pair == ["--task", "reduce Toimija's Git pressure"]));
+    assert!(!argv.iter().any(|arg| arg == "--scope"));
+    assert!(!briefing.contains("unselected"));
+    let (export, _, _) = output_of(fixture.ohjaa_in(&fixture.dir).args(["usage", "export"]));
+    let export: serde_json::Value = serde_json::from_str(&export).unwrap();
+    assert!(
+        export["sessions"][0].get("task").is_none(),
+        "intent is not an explicit task"
+    );
+    fixture.cleanup();
+}
+
+#[test]
 fn unassigned_startup_does_not_derive_the_fleet_and_scope_failures_remain_visible() {
     let fixture = Fixture::new("unassigned");
     fixture.make_repo("broken-unrelated");
@@ -2178,7 +2219,14 @@ fn unassigned_startup_does_not_derive_the_fleet_and_scope_failures_remain_visibl
         "--dry-run",
     ]));
     assert_eq!(code, Some(0), "{stderr}");
-    assert!(stderr.contains("If no concrete task is assigned, acknowledge and wait"));
+    assert!(
+        stderr.contains("the intent is only \"interactive\""),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("wait; the wrapper has already recorded entry"),
+        "{stderr}"
+    );
     assert!(stderr.contains("--briefing"), "{stderr}");
     assert!(
         !stderr.contains("--task "),
@@ -9025,6 +9073,10 @@ fn an_intent_has_an_id_that_a_later_session_continues() {
     );
     assert_eq!(code, Some(0), "{stderr}");
     let briefing = fixture.argv().join("\n");
+    assert!(
+        briefing.contains("Current session intent:\nfix the parser\n"),
+        "{briefing}"
+    );
     let first = export_of(&fixture, &repo)["sessions"][0].clone();
     let id = first["id"].as_str().unwrap().to_owned();
     let intent = first["intent_id"]
@@ -9062,12 +9114,19 @@ fn an_intent_has_an_id_that_a_later_session_continues() {
     assert_eq!(second["intent"], "fix the parser");
     assert!(second.get("task").is_none(), "no task given: {second:#}");
     let argv = fixture.argv();
+    assert!(argv
+        .windows(2)
+        .any(|pair| pair == ["--task", "fix the parser"]));
     assert!(
         argv.windows(2)
             .any(|pair| pair[0] == "--intent" && pair[1] == "fix the parser"),
         "toimija gets the intent's text: {argv:?}"
     );
     let briefing = argv.join("\n");
+    assert!(
+        briefing.contains("Current session intent:\nfix the parser\n"),
+        "{briefing}"
+    );
     assert!(
         briefing.contains(&format!(
             "its intent is {intent}, continued from session {id}"
