@@ -1585,13 +1585,15 @@ fn say_line(roots: &[PathBuf]) -> Result<()> {
         failures.push(format!("Could not refresh cached status: {}", clean(&why)));
     }
     for why in failures {
-        view.standing.push(standing(
+        let mut item = standing(
             Kind::Source,
             Class::Unknown,
             source_key("status", &[&why]),
             "status",
             format!("{why} · Inspect: ohjaa digest"),
-        ));
+        );
+        item.brief = Some(why.clone());
+        view.standing.push(item);
         view.unread.push(why);
     }
     view.standing

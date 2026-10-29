@@ -9380,6 +9380,78 @@ fn line_starts_no_git_and_touches_no_network() {
     fixture.cleanup();
 }
 
+#[test]
+fn a_collection_start_failure_after_first_startup_is_reported_once() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("line-refresh-failure");
+    fixture.human_view(false);
+    output_of(fixture.person().arg("collect"));
+    let (first, _) = on_a_terminal(fixture.person().arg("line"));
+    assert!(first.contains("needs your attention"), "{first}");
+    let path = fixture.human_dir().join("collected.json");
+    let mut collected: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    collected["at_ms"] = serde_json::json!(1);
+    fs::write(path, collected.to_string()).unwrap();
+    // A directory at the lock path makes collection fail before spawning.
+    let lock = fixture.human_dir().join("collect.lock");
+    fs::remove_file(&lock).unwrap();
+    fs::create_dir(&lock).unwrap();
+    let (notice, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0));
+    assert!(
+        notice.starts_with("ohjaa · Could not refresh cached status:"),
+        "{notice:?}"
+    );
+    assert!(notice.ends_with("Details: ohjaa digest\n"), "{notice}");
+    assert_eq!(on_a_terminal(fixture.person().arg("line")).0, "");
+    fixture.cleanup();
+}
+
+#[test]
+fn unreadable_session_rows_after_first_startup_are_reported_once() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("line-unreadable-session");
+    fixture.human_view(false);
+    let repo = fixture.make_git_repo("work");
+    run_session(&fixture, &repo, "exit 0");
+    output_of(fixture.person().arg("collect"));
+    let (first, _) = on_a_terminal(fixture.person().arg("line"));
+    assert!(first.contains("needs your attention"), "{first}");
+    {
+        let db = redb::Database::open(fixture.dir.join("state/ohjaa/sessions.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        tx.open_table(redb::TableDefinition::<&str, &[u8]>::new("sessions"))
+            .unwrap()
+            .insert("oh-broken", b"not a session".as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let (notice, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0));
+    assert!(
+        notice.starts_with("ohjaa · 1 agent session record(s) could not be read"),
+        "{notice:?}"
+    );
+    assert!(notice.ends_with("Details: ohjaa digest\n"), "{notice}");
+    assert_eq!(on_a_terminal(fixture.person().arg("line")).0, "");
+    let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(4));
+    assert!(
+        digest.contains("retry uploads"),
+        "readable session retained: {digest}"
+    );
+    assert!(
+        digest.contains("1 session record(s) in the log could not be read"),
+        "{digest}"
+    );
+    fixture.cleanup();
+}
+
 /// A stale snapshot starts one collect in the background, never one per
 /// terminal; a running one is never joined by a second.
 #[test]
