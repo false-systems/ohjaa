@@ -151,8 +151,9 @@ pub fn tidy_untracked(root: &Path) {
 
 /// The clone `repo` is a checkout of, as its common git directory read from
 /// git's layout (no git process), else `repo` itself: every worktree of a
-/// clone shares the repo knowledge accepted for it.
-fn clone_key(repo: &Path) -> PathBuf {
+/// clone shares the repo knowledge accepted for it, and what intake saw of it
+/// ([`crate::evidence`]).
+pub fn clone_key(repo: &Path) -> PathBuf {
     let common = repo
         .ancestors()
         .find(|dir| dir.join(".git").exists())

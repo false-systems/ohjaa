@@ -42,6 +42,10 @@ pub struct Candidate {
     /// What the agent said just before, when known.
     pub context: String,
     pub text: String,
+    /// The session it was said or observed in, when one is known: the
+    /// agent's own (as vessa names it) for what a person wrote, ohjaa's for a
+    /// handover or an observed failure. Kept with what it re-teaches.
+    pub session: Option<String>,
 }
 
 // ---- time -------------------------------------------------------------------
@@ -449,6 +453,7 @@ fn heard(message: VessaMessage, at_ms: i64, text: String) -> Said {
             ),
             context,
             text,
+            session: Some(message.session),
         },
         kind: message.kind,
         reply,
@@ -981,6 +986,7 @@ pub fn reviews(repos: &[PathBuf], since_ms: i64, warnings: &mut Vec<String>) -> 
                         who: login.to_owned(),
                         context: repo.display().to_string(),
                         text,
+                        session: None,
                     });
                 }
             }
@@ -1035,6 +1041,7 @@ pub fn reverts(repos: &[PathBuf], since_ms: i64, warnings: &mut Vec<String>) -> 
                     who: fields[1].to_owned(),
                     context: String::new(),
                     text,
+                    session: None,
                 });
             }
         }
@@ -1066,6 +1073,7 @@ pub fn handover_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candida
                     who: session.agent.clone(),
                     context: format!("session {} ({}), its handover", session.id, session.intent),
                     text: format!("{label}: {value}"),
+                    session: Some(session.id.clone()),
                 });
             }
         }
@@ -1124,6 +1132,7 @@ pub fn observed_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candida
                     session.id, session.agent, session.intent
                 ),
                 text: format!("in session {}: {what}", session.id),
+                session: Some(session.id.clone()),
             });
         }
     }
@@ -1399,16 +1408,24 @@ is done, or a lesson from something that went wrong. Draft each as a node.
 
 Ignore ordinary task instructions (\"fix the test\", \"next\", \"merge it\"),
 questions, and anything that only mattered in that moment. Most candidates carry
-nothing, and an empty array is a good answer. Never invent: every node must be
+nothing, and an empty answer is a good answer. Never invent: every node must be
 supported by the quoted words.
 
 After the instructions comes the knowledge already present: the current nodes,
 and the proposals waiting for a person to review them. Return nothing for a
 lesson already present, current or waiting, however it would be worded and under
 whatever id: every draft costs that person a review, and a second draft of one
-lesson is only noise. If a candidate shows that a present node did not reach
-the agent, or adds to it, name that node's id in \"refines\" and say what was
-missed, instead of drafting a new node beside it.
+lesson is only noise. If a candidate adds to a present node, name that node's id
+in \"refines\" and say what it adds, instead of drafting a new node beside it.
+
+A person who corrects an agent on what a current node already says is teaching
+it again: the node is there, and it did not change what the agent did (\"no
+Python\", \"use Lima\", \"I asked you twice\"). For such a candidate, name each
+current node it re-teaches in \"reteaches\", by the candidate's number, and draft
+nothing for it, unless it also adds to the node: then draft a refinement too.
+Only a person's words re-teach (a message in an agent session, a review
+comment), never an observed failure, a handover or a revert. Name only nodes
+listed with status current, by their exact ids.
 
 Scopes:
 - ours: team-wide decisions and taste that hold in every project
@@ -1419,7 +1436,11 @@ Scopes:
 Kinds: decision (chosen, binding), fact (true about the world), taste
 (preference about how), lesson (learned from a correction or failure).
 
-Output ONLY a JSON array, no prose, no code fence. Each element:
+Output ONLY one JSON object, no prose, no code fence:
+{\"drafts\": [<node>, ...],
+ \"reteaches\": [{\"candidate\": <its number, as in [1]>, \"ids\": [\"current-id\", ...]}]}
+Leave a candidate that re-teaches nothing out of \"reteaches\"; when nothing
+carries anything, answer {\"drafts\": [], \"reteaches\": []}. Each node:
 {\"scope\": \"ours|repo|mine|machine\", \"repo\": \"/absolute/path or null\",
  \"id\": \"kebab-case, at most 64 characters, not an id already present\",
  \"kind\": \"decision|fact|taste|lesson\",
@@ -1435,9 +1456,15 @@ Output ONLY a JSON array, no prose, no code fence. Each element:
 /// each candidate's time, source, place and author, its words and the
 /// agent's words before them.
 pub fn prompt(known: &Known, batch: &[Candidate]) -> (String, usize) {
+    let (text, redacted, _) = prompt_with_evidence(known, batch);
+    (text, redacted)
+}
+
+/// The prompt and the exact knowledge sent, for validating its answer.
+pub fn prompt_with_evidence(known: &Known, batch: &[Candidate]) -> (String, usize, Shown) {
     let mut out = String::from(INSTRUCTIONS);
     let mut redacted = 0;
-    known.render(&mut out, &mut redacted, batch);
+    let shown = known.render(&mut out, &mut redacted, batch);
     out.push_str("\nCandidates:\n");
     for (index, candidate) in batch.iter().enumerate() {
         let (header, n) = scrub(&format!(
@@ -1459,7 +1486,7 @@ pub fn prompt(known: &Known, batch: &[Candidate]) -> (String, usize) {
         redacted += n;
         let _ = writeln!(out, "    said: {}", text.replace('\n', " "));
     }
-    (out, redacted)
+    (out, redacted, shown)
 }
 
 /// One node as the drafter proposes it.
@@ -1479,16 +1506,66 @@ pub struct Draft {
     pub supersedes: Vec<String>,
 }
 
-/// The JSON array in a drafter's answer, tolerating prose or a code fence
-/// around it.
-pub fn parse_drafts(answer: &str) -> Result<Vec<Draft>> {
-    let (Some(start), Some(end)) = (answer.find('['), answer.rfind(']')) else {
-        bail!("the drafter did not answer with a JSON array");
-    };
-    if end < start {
-        bail!("the drafter did not answer with a JSON array");
+/// What the drafter answers for one batch: its drafts, and what each
+/// candidate re-teaches of the current knowledge.
+#[derive(Debug, Default)]
+pub struct Answer {
+    pub drafts: Vec<Draft>,
+    /// Each `{"candidate": <n>, "ids": [...]}` as the drafter wrote it: read
+    /// and checked one by one ([`Shown::retaught`]), so one it got wrong
+    /// costs only itself.
+    pub reteaches: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+struct AnswerObject {
+    drafts: Option<Vec<Draft>>,
+    reteaches: Option<Vec<Value>>,
+}
+
+/// The drafter's answer: a JSON object holding `drafts` or `reteaches` (or
+/// both), or, as it answered before it was asked what each candidate
+/// re-teaches, an array of drafts. Prose or a code fence around it is
+/// tolerated. The first enclosing JSON value is read: an invalid object
+/// must never be recovered as one of its nested legacy arrays.
+pub fn parse_answer(answer: &str) -> Result<Answer> {
+    let mut remaining = answer;
+    loop {
+        let start = remaining
+            .find(['{', '['])
+            .context("the drafter did not answer with a JSON object")?;
+        let source = &remaining[start..];
+        let mut values = serde_json::Deserializer::from_str(source).into_iter::<Value>();
+        let value = values
+            .next()
+            .context("the drafter gave no JSON value")?
+            .context("the drafter's answer is not valid JSON")?;
+        if value.is_array() {
+            match serde_json::from_value(value) {
+                Ok(drafts) => {
+                    return Ok(Answer {
+                        drafts,
+                        reteaches: Vec::new(),
+                    })
+                }
+                Err(_) => {
+                    // Prose can contain references such as Notes [1]. Skip the
+                    // whole parsed value, never scan inside an invalid object.
+                    remaining = &source[values.byte_offset()..];
+                    continue;
+                }
+            }
+        }
+        let object: AnswerObject = serde_json::from_value(value)
+            .context("the drafter's answer is not drafts and what they re-teach")?;
+        if object.drafts.is_none() && object.reteaches.is_none() {
+            bail!("the drafter's answer contains neither drafts nor re-teachings");
+        }
+        return Ok(Answer {
+            drafts: object.drafts.unwrap_or_default(),
+            reteaches: object.reteaches.unwrap_or_default(),
+        });
     }
-    serde_json::from_str(&answer[start..=end]).context("the drafter's array is not valid drafts")
 }
 
 impl Draft {
@@ -1522,7 +1599,7 @@ impl Draft {
 }
 
 /// Ask the drafter about one batch: the prompt goes in on stdin.
-pub fn draft(drafter: &str, prompt: &str) -> Result<Vec<Draft>, Failure> {
+pub fn draft(drafter: &str, prompt: &str) -> Result<Answer, Failure> {
     let output = process::run(
         Command::new("sh").args(["-c", drafter]),
         Some(prompt.as_bytes()),
@@ -1535,7 +1612,78 @@ pub fn draft(drafter: &str, prompt: &str) -> Result<Vec<Draft>, Failure> {
             detail.context(format!("the drafter failed ({})", output.status)),
         ));
     }
-    parse_drafts(&output.stdout_text()).map_err(Failure::Refused)
+    parse_answer(&output.stdout_text()).map_err(Failure::Refused)
+}
+
+// ---- what a person had to teach again -----------------------------------------
+//
+// A candidate the drafter says re-teaches a current node is the evidence that
+// the node did not change what an agent did ([`crate::evidence`]). Its
+// answer is checked as every draft is: a re-teaching is kept only when it
+// names a candidate of the batch, that candidate is a person's words, and the
+// id is one current node shown with that candidate (a repo node only with a
+// candidate from its repository). Everything else is dropped, and counted.
+
+/// What a person wrote, as against what ohjaa observed or an agent said: only
+/// that re-teaches.
+fn a_persons_words(candidate: &Candidate) -> bool {
+    SAID.contains(&candidate.source) || candidate.source == "review"
+}
+
+/// A re-teaching the drafter named, as kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retaught {
+    pub node: crate::evidence::NodeKey,
+    /// The message: its key, when it was said, where from, and in which
+    /// session.
+    pub key: Key,
+    pub at: String,
+    pub source: &'static str,
+    pub session: Option<String>,
+}
+
+/// The re-teachings the drafter named that were not kept, by why.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Dropped {
+    /// An id no current node shown with its candidate has (proposed,
+    /// superseded, retired, unknown, of another repository, or in two scopes).
+    pub not_current: usize,
+    /// Of a candidate that is not a person's words.
+    pub not_said: usize,
+    /// Of a number no candidate of the batch has.
+    pub no_candidate: usize,
+    /// An entry, or an id in one, that is not what was asked for.
+    pub unreadable: usize,
+}
+
+impl Dropped {
+    pub fn total(&self) -> usize {
+        self.not_current + self.not_said + self.no_candidate + self.unreadable
+    }
+
+    pub fn add(&mut self, other: Dropped) {
+        self.not_current += other.not_current;
+        self.not_said += other.not_said;
+        self.no_candidate += other.no_candidate;
+        self.unreadable += other.unreadable;
+    }
+
+    pub fn describe(&self) -> String {
+        [
+            (
+                self.not_current,
+                "naming no current node shown with its candidate",
+            ),
+            (self.not_said, "of a candidate that is not a person's words"),
+            (self.no_candidate, "of no candidate in its batch"),
+            (self.unreadable, "unreadable"),
+        ]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, why)| format!("{n} {why}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
 }
 
 // ---- what is already present ------------------------------------------------
@@ -1648,6 +1796,12 @@ pub struct Known {
     repo_root: Option<PathBuf>,
 }
 
+/// Only nodes actually rendered into a prompt, after its shared size limit.
+/// Evidence checks cannot be called on an unbounded on-disk knowledge set.
+pub struct Shown {
+    nodes: Vec<Present>,
+}
+
 impl Known {
     /// Everything loaded, and every proposal waiting for a person.
     pub fn read(dirs: &Dirs, loaded: &Loaded) -> Result<Known> {
@@ -1707,19 +1861,104 @@ impl Known {
             &proposal.supersedes,
         )
     }
+}
 
+impl Shown {
+    /// The one current node `id` names that the drafter was shown with
+    /// `with`: none when no current node has it there, or two do.
+    fn current(&self, id: &str, with: &[Candidate]) -> Option<crate::evidence::NodeKey> {
+        let mut found = self.nodes.iter().filter(|present| {
+            present.status == Status::Current && present.id == id && present.shown_with(with)
+        });
+        let one = found.next()?;
+        found
+            .next()
+            .is_none()
+            .then(|| crate::evidence::NodeKey::new(one.scope, one.repo.as_deref(), &one.id))
+    }
+
+    /// The re-teachings the drafter named for `batch` that are kept (see
+    /// [`a_persons_words`] and [`Known::current`]), each pair of a candidate
+    /// and a node once, in the order named; and what was dropped, by why.
+    pub fn retaught(&self, reteaches: &[Value], batch: &[Candidate]) -> (Vec<Retaught>, Dropped) {
+        let mut kept: Vec<Retaught> = Vec::new();
+        let mut dropped = Dropped::default();
+        let mut named: BTreeSet<(usize, String)> = BTreeSet::new();
+        for entry in reteaches {
+            let number = entry.get("candidate").and_then(|n| {
+                n.as_u64()
+                    .or_else(|| n.as_str().and_then(|s| s.trim().parse().ok()))
+            });
+            let ids = entry.get("ids").and_then(Value::as_array);
+            let (Some(number), Some(ids)) = (number, ids) else {
+                dropped.unreadable += ids.map_or(1, |ids| ids.len().max(1));
+                continue;
+            };
+            let candidate = usize::try_from(number)
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| batch.get(i).map(|c| (i, c)));
+            for id in ids {
+                let Some(id) = id.as_str() else {
+                    dropped.unreadable += 1;
+                    continue;
+                };
+                let Some((index, candidate)) = candidate else {
+                    dropped.no_candidate += 1;
+                    continue;
+                };
+                if !named.insert((index, id.to_owned())) {
+                    continue;
+                }
+                if !a_persons_words(candidate) {
+                    dropped.not_said += 1;
+                    continue;
+                }
+                match self.current(id, std::slice::from_ref(candidate)) {
+                    Some(node) => kept.push(Retaught {
+                        node,
+                        key: candidate.key(),
+                        at: candidate.at.clone(),
+                        source: candidate.source,
+                        session: candidate.session.clone(),
+                    }),
+                    None => dropped.not_current += 1,
+                }
+            }
+        }
+        (kept, dropped)
+    }
+
+    /// The current nodes among `ids` (what drafts from `batch` refine or
+    /// supersede) the drafter was shown with it: those they cite.
+    pub fn cited(&self, ids: &[String], batch: &[Candidate]) -> Vec<crate::evidence::NodeKey> {
+        let mut cited: Vec<crate::evidence::NodeKey> = ids
+            .iter()
+            .filter_map(|id| self.current(id, batch))
+            .collect();
+        cited.sort();
+        cited.dedup();
+        cited
+    }
+}
+
+impl Known {
     /// The list the drafter is shown with `batch`, within [`KNOWN_BUDGET`]
     /// characters: what is present where it comes from ([`Present::shown_with`]),
-    /// current knowledge first, then what waits for a person, in the order
-    /// they are stored; what does not fit is counted. Each line is scrubbed
-    /// whole, then cut, then measured; only what is sent adds to `redacted`.
-    fn render(&self, out: &mut String, redacted: &mut usize, batch: &[Candidate]) {
-        let (waiting, other): (Vec<&Present>, Vec<&Present>) = self
+    /// current knowledge first (then what was superseded or retired, then
+    /// what waits for a person), each in the order stored; what does not fit
+    /// is counted. Each line is scrubbed whole, then cut, then measured; only
+    /// what is sent adds to `redacted`.
+    fn render(&self, out: &mut String, redacted: &mut usize, batch: &[Candidate]) -> Shown {
+        let (waiting, mut other): (Vec<&Present>, Vec<&Present>) = self
             .nodes
             .iter()
             .filter(|present| present.shown_with(batch))
             .partition(|present| present.status == Status::Proposed);
+        // Stable: the order stored, within each.
+        other.sort_by_key(|present| present.status != Status::Current);
         let mut budget = KNOWN_BUDGET;
+        let mut sent = Vec::new();
         let mut list = |heading: &str, nodes: &[&Present], out: &mut String| {
             out.push_str(heading);
             if nodes.is_empty() {
@@ -1751,6 +1990,11 @@ impl Known {
                 budget -= line.len();
                 *redacted += in_head + in_first;
                 out.push_str(&line);
+                // Evidence can name only an identifier that survived scrubbing
+                // and normalization in the header actually sent to the drafter.
+                if line.starts_with(&format!("- {} [", present.id)) {
+                    sent.push((**present).clone());
+                }
                 shown += 1;
             }
             if shown < nodes.len() {
@@ -1768,6 +2012,7 @@ impl Known {
             &waiting,
             out,
         );
+        Shown { nodes: sent }
     }
 }
 
@@ -2457,7 +2702,7 @@ pub fn write_handled(dirs: &Dirs, handled: &Handled) -> Result<()> {
 /// Replace `path` whole: written aside and flushed to disk, renamed into
 /// place, and its folder flushed after, so neither a kill nor a power loss
 /// leaves part of it.
-fn replace_durably(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn replace_durably(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write as _;
     let partial = path.with_extension("partial");
     let replace = || -> std::io::Result<()> {
@@ -3195,6 +3440,7 @@ mod tests {
             who: "person".to_owned(),
             context,
             text,
+            session: None,
         };
         let batch = [
             candidate(
@@ -3728,6 +3974,7 @@ mod tests {
             who: "person".to_owned(),
             context: context.to_owned(),
             text: "no".to_owned(),
+            session: None,
         };
         let shown = |batch: &[Candidate]| -> Vec<&'static str> {
             let (text, _) = prompt(&present, batch);
@@ -3857,13 +4104,271 @@ mod tests {
 
     #[test]
     fn drafts_are_found_inside_prose_and_fences() {
+        // The answer as it was before the drafter was asked what each
+        // candidate re-teaches: an array of drafts.
         let answer = "Here you go:\n```json\n[{\"scope\":\"ours\",\"id\":\"a\",\"kind\":\"taste\",\"body\":\"B\",\"origin\":[\"o\"]}]\n```";
-        let drafts = parse_drafts(answer).unwrap();
-        assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].refines, None);
-        assert!(parse_drafts("[]").unwrap().is_empty());
-        assert!(parse_drafts("no array").is_err());
-        assert!(parse_drafts("] [").is_err());
+        let answered = parse_answer(answer).unwrap();
+        assert_eq!(answered.drafts.len(), 1);
+        assert_eq!(answered.drafts[0].refines, None);
+        assert!(answered.reteaches.is_empty());
+        assert!(parse_answer("[]").unwrap().drafts.is_empty());
+        assert!(parse_answer("no array").is_err());
+        assert!(parse_answer("] [").is_err());
+    }
+
+    #[test]
+    fn the_drafter_answers_what_each_candidate_reteaches_beside_its_drafts() {
+        let draft = r#"{"scope":"ours","id":"a","kind":"taste","body":"B","origin":["o"]}"#;
+        let answer = format!(
+            "Sure.\n```json\n{{\"drafts\": [{draft}], \"reteaches\": [{{\"candidate\": 1, \
+             \"ids\": [\"rust-elixir-only\"]}}, {{\"candidate\": 3, \"ids\": [\"x\", \"y\"]}}]}}\n```"
+        );
+        let answered = parse_answer(&answer).unwrap();
+        assert_eq!(answered.drafts.len(), 1);
+        assert_eq!(answered.reteaches.len(), 2);
+        assert_eq!(answered.reteaches[1]["ids"][1], "y");
+        // A message that only re-teaches: no draft.
+        let only = parse_answer(r#"{"reteaches":[{"candidate":1,"ids":["a"]}]}"#).unwrap();
+        assert!(only.drafts.is_empty() && only.reteaches.len() == 1);
+        let none = parse_answer(r#"{"drafts": [], "reteaches": []}"#).unwrap();
+        assert!(none.drafts.is_empty() && none.reteaches.is_empty());
+        // Brackets in the prose before it are no answer.
+        let noted =
+            parse_answer(r#"Notes [1]: {"drafts":[],"reteaches":[{"candidate":1,"ids":["a"]}]}"#)
+                .unwrap();
+        assert_eq!(noted.reteaches.len(), 1);
+        // One draft alone, not inside an answer, is no answer; nor are
+        // drafts that are not drafts: either is refused, and the batch split.
+        assert!(parse_answer(draft).is_err());
+        assert!(parse_answer(r#"{"drafts": [{"id": "no-kind"}], "reteaches": []}"#).is_err());
+        // Each re-teaching is read on its own, later: one written wrong
+        // costs only itself.
+        let odd =
+            parse_answer(r#"{"drafts":[],"reteaches":["nonsense",{"candidate":"two"}]}"#).unwrap();
+        assert_eq!(odd.reteaches.len(), 2);
+    }
+
+    #[test]
+    fn a_reteaching_is_kept_only_of_a_current_node_shown_with_a_persons_words() {
+        let present = known(&[
+            (Scope::Mine, None, "rust-elixir-only", Status::Current),
+            (Scope::Mine, None, "waiting-lesson", Status::Proposed),
+            (Scope::Mine, None, "old-way", Status::Retired),
+            (Scope::Repo, None, "here-lesson", Status::Current),
+            // Defined in two scopes: which one is meant cannot be told.
+            (Scope::Ours, None, "twice", Status::Current),
+            (Scope::Mine, None, "twice", Status::Current),
+        ]);
+        let candidate =
+            |source: &'static str, at_ms: i64, place: &str, session: Option<&str>| Candidate {
+                source,
+                at_ms,
+                at: rfc3339(at_ms.div_euclid(1000)),
+                place: place.to_owned(),
+                who: "person".to_owned(),
+                context: String::new(),
+                text: format!("said at {at_ms}"),
+                session: session.map(str::to_owned),
+            };
+        let batch = [
+            candidate("claude", 1_000, "/r/here/src", Some("s1")),
+            candidate("review", 2_000, "https://github.com/o/here/pull/1", None),
+            candidate("observed", 3_000, "/r/here", Some("ohjaa-1")),
+            candidate("handover", 4_000, "/r/here", Some("ohjaa-1")),
+            candidate("codex", 5_000, "/r/elsewhere", Some("s5")),
+        ];
+        let reteaches: Vec<Value> = serde_json::from_str(
+            r#"[
+              {"candidate": 1, "ids": ["rust-elixir-only", "rust-elixir-only", "waiting-lesson",
+                                       "old-way", "here-lesson", "twice", 7]},
+              {"candidate": "2", "ids": ["rust-elixir-only", "here-lesson"]},
+              {"candidate": 3, "ids": ["rust-elixir-only"]},
+              {"candidate": 4, "ids": ["rust-elixir-only"]},
+              {"candidate": 5, "ids": ["here-lesson", "rust-elixir-only"]},
+              {"candidate": 0, "ids": ["rust-elixir-only"]},
+              {"candidate": 6, "ids": ["a", "b"]},
+              {"ids": ["rust-elixir-only"]},
+              {"candidate": 1},
+              "nonsense"
+            ]"#,
+        )
+        .unwrap();
+        let (_, _, present) = prompt_with_evidence(&present, &batch);
+        let (kept, dropped) = present.retaught(&reteaches, &batch);
+        let mine = crate::evidence::NodeKey::new(Scope::Mine, None, "rust-elixir-only");
+        let here =
+            crate::evidence::NodeKey::new(Scope::Repo, Some(Path::new("/r/here")), "here-lesson");
+        assert_eq!(here.clone.as_deref(), Some(Path::new("/r/here")));
+        let got: Vec<(&crate::evidence::NodeKey, i64, Option<&str>)> = kept
+            .iter()
+            .map(|r| (&r.node, r.key.at_ms, r.session.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (&mine, 1_000, Some("s1")),
+                (&here, 1_000, Some("s1")),
+                (&mine, 2_000, None),
+                (&here, 2_000, None),
+                // A repo node is re-taught only from its own repository.
+                (&mine, 5_000, Some("s5")),
+            ]
+        );
+        assert_eq!(kept[0].key, batch[0].key(), "keyed as intake keys it");
+        assert_eq!(
+            (kept[0].source, kept[0].at.as_str()),
+            ("claude", "1970-01-01T00:00:01Z")
+        );
+        assert_eq!(
+            dropped,
+            Dropped {
+                not_current: 4,
+                not_said: 2,
+                no_candidate: 3,
+                unreadable: 4,
+            }
+        );
+        assert_eq!(
+            dropped.describe(),
+            "4 naming no current node shown with its candidate, 2 of a candidate that is not a \
+             person's words, 3 of no candidate in its batch, 4 unreadable"
+        );
+
+        // A draft cites the current nodes it refines or supersedes that the
+        // drafter was shown with its batch, each once.
+        let named: Vec<String> = [
+            "rust-elixir-only",
+            "waiting-lesson",
+            "rust-elixir-only",
+            "here-lesson",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(
+            present.cited(&named, &batch[4..]),
+            std::slice::from_ref(&mine)
+        );
+        assert_eq!(present.cited(&named, &batch[..1]), {
+            let mut both = vec![mine, here];
+            both.sort();
+            both
+        });
+    }
+
+    #[test]
+    fn evidence_cannot_name_a_node_omitted_by_the_prompt_budget() {
+        let ids: Vec<String> = (0..600).map(|n| format!("current-lesson-{n:04}")).collect();
+        let nodes: Vec<_> = ids
+            .iter()
+            .map(|id| (Scope::Mine, None, id.as_str(), Status::Current))
+            .collect();
+        let known = known(&nodes);
+        let batch = vec![Candidate {
+            source: "claude",
+            at_ms: 1_000,
+            at: "1970-01-01T00:00:01Z".into(),
+            place: "/r/here".into(),
+            who: "person".into(),
+            context: String::new(),
+            text: "Follow the rule I already gave you".into(),
+            session: Some("s1".into()),
+        }];
+        let (sent, _, shown) = prompt_with_evidence(&known, &batch);
+        assert!(!sent.contains("current-lesson-0599"));
+        let reteaches = vec![serde_json::json!({"candidate": 1, "ids": ["current-lesson-0599"]})];
+        let (kept, dropped) = shown.retaught(&reteaches, &batch);
+        assert!(kept.is_empty());
+        assert_eq!(dropped.not_current, 1);
+        assert!(shown
+            .cited(&["current-lesson-0599".into()], &batch)
+            .is_empty());
+    }
+
+    #[test]
+    fn evidence_cannot_name_a_redacted_identifier_but_can_name_a_visible_one() {
+        let hidden = fake(&["s", "k-", &"a1".repeat(12)]);
+        let repo_token = fake(&["s", "k-", &"b2".repeat(12)]);
+        let secret_repo = format!("/r/project {repo_token}");
+        let loaded = Loaded {
+            nodes: vec![
+                faija_knowledge::Located {
+                    scope: Scope::Mine,
+                    node: lesson(&hidden, Status::Current, "A lesson in a scope."),
+                },
+                faija_knowledge::Located {
+                    scope: Scope::Repo,
+                    node: lesson("visible-lesson", Status::Current, "A lesson in a scope."),
+                },
+            ],
+            ..Loaded::default()
+        };
+        let known = Known::of(&loaded, &[], Some(Path::new(&secret_repo)));
+        let batch = vec![Candidate {
+            source: "claude",
+            at_ms: 1_000,
+            at: "1970-01-01T00:00:01Z".into(),
+            place: secret_repo.clone(),
+            who: "person".into(),
+            context: String::new(),
+            text: "Follow the rule I already gave you".into(),
+            session: Some("s1".into()),
+        }];
+        let (sent, _, shown) = prompt_with_evidence(&known, &batch);
+        assert!(!sent.contains(&hidden));
+        assert!(sent.contains("- [redacted] [mine/lesson/current]"));
+        assert!(
+            sent.contains("- visible-lesson [repo/lesson/current] in /r/project [redacted]"),
+            "{sent}"
+        );
+        let reteaches = vec![serde_json::json!({
+            "candidate": 1, "ids": [&hidden, "visible-lesson"]
+        })];
+        let (kept, dropped) = shown.retaught(&reteaches, &batch);
+        let visible = crate::evidence::NodeKey::new(
+            Scope::Repo,
+            Some(Path::new(&secret_repo)),
+            "visible-lesson",
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].node, visible);
+        assert_eq!(dropped.not_current, 1);
+        assert_eq!(
+            shown.cited(&[hidden, "visible-lesson".into()], &batch),
+            vec![visible]
+        );
+    }
+
+    #[test]
+    fn malformed_answer_objects_cannot_become_nested_legacy_arrays() {
+        for answer in [
+            r#"{"drafts":[],"reteaches":"not an array"}"#,
+            r#"{"drafts":{},"reteaches":[]}"#,
+            r#"{"drafts":[]"#,
+        ] {
+            assert!(parse_answer(answer).is_err(), "{answer}");
+        }
+    }
+
+    #[test]
+    fn the_drafter_is_asked_what_each_candidate_reteaches_and_shown_current_knowledge_first() {
+        assert!(
+            INSTRUCTIONS.contains("\"reteaches\": [{\"candidate\""),
+            "{INSTRUCTIONS}"
+        );
+        assert!(INSTRUCTIONS.contains("Name only nodes\nlisted with status current"));
+        // Stored after what was put aside, current knowledge is still shown
+        // first: the last to be cut by the budget.
+        let (text, _) = prompt(
+            &known(&[
+                (Scope::Mine, None, "old-way", Status::Retired),
+                (Scope::Mine, None, "superseded-way", Status::Superseded),
+                (Scope::Mine, None, "rust-elixir-only", Status::Current),
+            ]),
+            &[],
+        );
+        let at = |id: &str| text.find(&format!("- {id} [")).expect(id);
+        assert!(at("rust-elixir-only") < at("old-way"), "{text}");
+        assert!(at("old-way") < at("superseded-way"), "stored order: {text}");
     }
 
     #[test]
@@ -4090,6 +4595,7 @@ mod tests {
             who: "person".to_owned(),
             context: String::new(),
             text: text.to_owned(),
+            session: None,
         };
         let mut handled = Handled::default();
         handled.answered.insert(said(-5, "never python").key());
@@ -4127,6 +4633,7 @@ mod tests {
             who: "person".to_owned(),
             context: String::new(),
             text: text.to_owned(),
+            session: None,
         };
         let (old, a, b, z) = (c(3, "old"), c(10, "a"), c(20, "b"), c(30, "c"));
         let settle_with = |found: &[Candidate],
@@ -4204,6 +4711,7 @@ mod tests {
             who: "person".to_owned(),
             context: String::new(),
             text: text.to_owned(),
+            session: None,
         };
         let mut handled = Handled::default();
         for (at, text) in [(5, "a"), (-7, "b"), (1_793_000_000_123, "c")] {
@@ -4357,6 +4865,7 @@ mod tests {
             who: "person".to_owned(),
             context: String::new(),
             text,
+            session: None,
         }
     }
 

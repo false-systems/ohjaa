@@ -2191,6 +2191,47 @@ fn startup_is_scoped_reuses_scans_and_delivers_repo_knowledge_from_the_root() {
 }
 
 #[test]
+fn root_launch_delivers_the_goal_without_requiring_scope_or_a_task() {
+    let fixture = Fixture::new("root-intent");
+    fixture.make_repo("unselected");
+    let (_, stderr, code) = output_of(fixture.ohjaa_in(&fixture.dir).args([
+        "run",
+        "codex",
+        "--intent",
+        "reduce Toimija's Git pressure",
+    ]));
+    assert_eq!(code, Some(0), "{stderr}");
+    let argv = fixture.argv();
+    let start = argv.iter().position(|arg| arg == "--briefing").unwrap();
+    let end = argv.iter().position(|arg| arg == "--").unwrap();
+    let briefing = argv[start + 1..end].join("\n");
+    assert!(
+        briefing.contains("Current session intent:\nreduce Toimija's Git pressure\n"),
+        "{briefing}"
+    );
+    assert!(
+        briefing.contains("A concrete intent is assigned work"),
+        "{briefing}"
+    );
+    assert!(
+        briefing.contains("identify the repositories needed"),
+        "{briefing}"
+    );
+    assert!(argv
+        .windows(2)
+        .any(|pair| pair == ["--task", "reduce Toimija's Git pressure"]));
+    assert!(!argv.iter().any(|arg| arg == "--scope"));
+    assert!(!briefing.contains("unselected"));
+    let (export, _, _) = output_of(fixture.ohjaa_in(&fixture.dir).args(["usage", "export"]));
+    let export: serde_json::Value = serde_json::from_str(&export).unwrap();
+    assert!(
+        export["sessions"][0].get("task").is_none(),
+        "intent is not an explicit task"
+    );
+    fixture.cleanup();
+}
+
+#[test]
 fn unassigned_startup_does_not_derive_the_fleet_and_scope_failures_remain_visible() {
     let fixture = Fixture::new("unassigned");
     fixture.make_repo("broken-unrelated");
@@ -2202,7 +2243,14 @@ fn unassigned_startup_does_not_derive_the_fleet_and_scope_failures_remain_visibl
         "--dry-run",
     ]));
     assert_eq!(code, Some(0), "{stderr}");
-    assert!(stderr.contains("If no concrete task is assigned, acknowledge and wait"));
+    assert!(
+        stderr.contains("the intent is only \"interactive\""),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("wait; the wrapper has already recorded entry"),
+        "{stderr}"
+    );
     assert!(stderr.contains("--briefing"), "{stderr}");
     assert!(
         !stderr.contains("--task "),
@@ -2827,6 +2875,553 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
              that one is"
         ),
         "{listed}"
+    );
+    fixture.cleanup();
+}
+
+/// The line under `id` in `ohjaa list`'s output that says how often it was
+/// re-taught: the first after its own line.
+fn retaught_line<'a>(listing: &'a str, id: &str) -> &'a str {
+    let mut lines = listing.lines();
+    lines
+        .by_ref()
+        .find(|line| line.split_whitespace().nth(3) == Some(id))
+        .unwrap_or_else(|| panic!("{id} is not listed:\n{listing}"));
+    lines
+        .find(|line| line.trim_start().starts_with("re-taught "))
+        .unwrap_or_else(|| panic!("no re-taught line under {id}:\n{listing}"))
+        .trim()
+}
+
+/// A drafter that keeps each prompt it is sent (`prompt-<n>.txt`) and answers
+/// each with `answer.json`, all in `dir`.
+fn answering_drafter(fixture: &Fixture, dir: &Path) -> PathBuf {
+    let drafter = fixture.stub_dir.join("drafter");
+    write_executable(
+        &drafter,
+        format!(
+            "#!/bin/sh\nd='{}'\nn=$(($(cat \"$d/drafter-calls\" 2>/dev/null || echo 0) + 1))\n\
+             echo $n > \"$d/drafter-calls\"\ncat > \"$d/prompt-$n.txt\"\ncat \"$d/answer.json\"\n",
+            dir.display()
+        ),
+    );
+    drafter
+}
+
+#[test]
+fn intake_counts_what_a_person_had_to_teach_again_once_and_list_check_review_show_it() {
+    // Yair, 2026-10-28: the briefing gives agents knowledge, and nothing
+    // measured whether it changes what they do. A node the person keeps
+    // re-teaching is not working; one nothing ever touches may be stale.
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("reteach");
+    let repo = fixture.make_git_repo("work");
+    let other = fixture.make_git_repo("other");
+    let mine = fixture.dir.join("config/ohjaa/mine");
+    let machine = fixture.dir.join("config/ohjaa/machine");
+    fixture.node(
+        &mine,
+        "rust-elixir-only",
+        "decision",
+        "Code is Rust or Elixir.",
+    );
+    fixture.node(
+        &mine,
+        "answer-first",
+        "taste",
+        "Answer first, then explain.",
+    );
+    fixture.node(
+        &machine,
+        "linux-work-in-lima",
+        "fact",
+        "Linux work runs in Lima.",
+    );
+    fixture.node_as_of(
+        &fixture.dir.join("ours/knowledge"),
+        "small-pull-requests",
+        "taste",
+        "2026-06-01",
+        "Keep pull requests small.",
+    );
+    // A repo node, and another repository's node of the same id.
+    fixture.node(
+        &repo.join(".ohjaa/knowledge"),
+        "tests-run-in-lima",
+        "lesson",
+        "The tests of this repository run in Lima.",
+    );
+    fixture.node(
+        &other.join(".ohjaa/knowledge"),
+        "tests-run-in-lima",
+        "lesson",
+        "The tests of the other repository run in Lima.",
+    );
+    // Not current: never re-taught.
+    fs::write(
+        mine.join("old-way.md"),
+        "+++\nid = \"old-way\"\nkind = \"taste\"\nstatus = \"retired\"\nas_of = 2026-09-01\n\
+         origin = [\"a test\", \"2026-09-02: retired: gone\"]\n+++\nThe old way.\n",
+    )
+    .unwrap();
+    let nodes_before: Vec<(PathBuf, String)> = [
+        mine.join("rust-elixir-only.md"),
+        mine.join("answer-first.md"),
+        mine.join("old-way.md"),
+        machine.join("linux-work-in-lima.md"),
+        fixture.dir.join("ours/knowledge/small-pull-requests.md"),
+        repo.join(".ohjaa/knowledge/tests-run-in-lima.md"),
+        other.join(".ohjaa/knowledge/tests-run-in-lima.md"),
+    ]
+    .into_iter()
+    .map(|path| {
+        let text = fs::read_to_string(&path).unwrap();
+        (path, text)
+    })
+    .collect();
+
+    let work = repo.display().to_string();
+    fixture.said(&[
+        vessa_line("2026-09-21T10:00:00Z", &work, "no python. rust", None),
+        vessa_line(
+            "2026-09-22T10:00:00Z",
+            &work,
+            "i said rust, not python",
+            None,
+        ),
+        vessa_line("2026-09-23T09:00:00Z", &work, "again: no python", None),
+        vessa_line("2026-09-23T10:00:00Z", &work, "use lima for that", None),
+        vessa_line("2026-09-23T11:00:00Z", &work, "the tests go in lima", None),
+        vessa_line(
+            "2026-09-23T12:00:00Z",
+            "/p/elsewhere",
+            "lima, as always",
+            None,
+        ),
+    ]);
+    // Six candidates, one batch. The drafter says what each re-teaches,
+    // besides one refinement; some of what it says names nothing it may.
+    fs::write(
+        fixture.dir.join("answer.json"),
+        serde_json::json!({
+            "drafts": [drafted("mine", None, "answer-first-even-in-reviews", Some("answer-first"))],
+            "reteaches": [
+                {"candidate": 1, "ids": ["rust-elixir-only"]},
+                // Said twice, counted once; a retired node is not current.
+                {"candidate": 2, "ids": ["rust-elixir-only", "rust-elixir-only", "old-way"]},
+                {"candidate": 3, "ids": ["rust-elixir-only", "no-such-node"]},
+                {"candidate": 4, "ids": ["linux-work-in-lima"]},
+                {"candidate": 5, "ids": ["tests-run-in-lima"]},
+                // A repo node, from a message not of its repository.
+                {"candidate": 6, "ids": ["tests-run-in-lima"]},
+                // No such candidate, and one that cannot be read.
+                {"candidate": 7, "ids": ["linux-work-in-lima"]},
+                {"candidate": "first", "ids": ["answer-first"]},
+            ],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let drafter = answering_drafter(&fixture, &fixture.dir);
+    let intake = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "intake",
+                    "--source",
+                    "transcripts",
+                    "--no-prefilter",
+                    "--since",
+                    "2026-09-01",
+                    "--batch",
+                    "10",
+                    "--drafter",
+                ])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    let (stdout, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+
+    // The drafter is shown the current nodes and asked what each candidate
+    // re-teaches, in the answer's new shape.
+    let prompt = fs::read_to_string(fixture.dir.join("prompt-1.txt")).unwrap();
+    assert!(
+        prompt.contains("- rust-elixir-only [mine/decision/current]: Code is Rust or Elixir."),
+        "{prompt}"
+    );
+    assert!(prompt.contains("\"reteaches\""), "{prompt}");
+    assert!(prompt.contains("\"drafts\""), "{prompt}");
+
+    // What was recorded is said by node, time and source, never the words.
+    for line in [
+        "re-taught rust-elixir-only (2026-09-21T10:00:00Z claude)\n",
+        "re-taught rust-elixir-only (2026-09-22T10:00:00Z claude)\n",
+        "re-taught rust-elixir-only (2026-09-23T09:00:00Z claude)\n",
+        "re-taught linux-work-in-lima (2026-09-23T10:00:00Z claude)\n",
+        "re-taught tests-run-in-lima (2026-09-23T11:00:00Z claude)\n",
+        "proposed answer-first-even-in-reviews\n",
+        "5 re-teaching(s) of current knowledge recorded: linux-work-in-lima ×1, rust-elixir-only \
+         ×3, tests-run-in-lima ×1 (`ohjaa check` shows each node's count)",
+    ] {
+        assert!(stdout.contains(line), "{line}\n{stdout}");
+    }
+    assert!(!stdout.contains("python") && !stderr.contains("python"));
+    // What names nothing it may is dropped, and counted.
+    assert!(
+        stderr.contains(
+            "ohjaa: intake: 5 re-teaching(s) the drafter named were dropped: 3 naming no current \
+             node shown with its candidate, 1 of no candidate in its batch, 1 unreadable"
+        ),
+        "{stderr}"
+    );
+    // A message that only re-teaches makes no proposal.
+    let proposed: Vec<String> = fs::read_dir(fixture.dir.join("state/ohjaa/proposals/mine"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(proposed, ["answer-first-even-in-reviews.md"]);
+
+    // Kept as history in ohjaa's state: per node, the time, digest and
+    // session of each message, never its words.
+    let evidence_path = fixture.dir.join("state/ohjaa/knowledge-evidence.json");
+    let evidence = fs::read_to_string(&evidence_path).unwrap();
+    for words in [
+        "python",
+        "rust,",
+        "lima for that",
+        "the tests go",
+        "as always",
+    ] {
+        assert!(!evidence.contains(words), "{words}: {evidence}");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+    assert_eq!(
+        parsed["schema"], "ohjaa-knowledge-evidence.v1",
+        "{evidence}"
+    );
+    let node = |id: &str| {
+        parsed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == id)
+            .unwrap_or_else(|| panic!("{id}: {evidence}"))
+            .clone()
+    };
+    let rust = node("rust-elixir-only");
+    assert_eq!(rust["scope"], "mine");
+    let retaught = rust["retaught"].as_array().unwrap();
+    assert_eq!(retaught.len(), 3, "{evidence}");
+    assert!(
+        retaught
+            .iter()
+            .all(|event| event["session"] == "s1" && event["digest"].as_str().unwrap().len() == 16),
+        "{evidence}"
+    );
+    assert_eq!(node("tests-run-in-lima")["scope"], "repo");
+    assert!(node("tests-run-in-lima")["clone"].is_string(), "{evidence}");
+    // The node the refinement names was cited, re-taught never.
+    assert_eq!(node("answer-first")["retaught"], serde_json::json!([]));
+    assert!(node("answer-first")["cited_ms"].is_i64(), "{evidence}");
+
+    // The same messages answered for again (their progress lost) are not
+    // counted twice.
+    fs::remove_file(fixture.dir.join("state/ohjaa/intake-handled")).unwrap();
+    let (stdout, stderr, code) = intake();
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(fixture.dir.join("prompt-2.txt").is_file(), "sent again");
+    assert!(!stdout.contains("re-taught rust-elixir-only ("), "{stdout}");
+    assert_eq!(fs::read_to_string(&evidence_path).unwrap(), evidence);
+
+    // `ohjaa list`: per current node, how often since it was accepted, and
+    // when last touched.
+    let (listed, stderr, code) = output_of(fixture.ohjaa().arg("list").current_dir(&repo));
+    assert_eq!(code, Some(0), "{stderr}");
+    for (id, line) in [
+        (
+            "rust-elixir-only",
+            "re-taught 3 times since 2026-09-20, last 2026-09-23",
+        ),
+        (
+            "linux-work-in-lima",
+            "re-taught 1 time since 2026-09-20, last 2026-09-23",
+        ),
+        (
+            "tests-run-in-lima",
+            "re-taught 1 time since 2026-09-20, last 2026-09-23",
+        ),
+        // Cited by the refinement, from the newest message in its batch.
+        (
+            "answer-first",
+            "re-taught 0 times since 2026-09-20, last 2026-09-23",
+        ),
+        ("small-pull-requests", "re-taught 0 times since 2026-06-01"),
+    ] {
+        assert_eq!(retaught_line(&listed, id), line, "{id}\n{listed}");
+    }
+    // Another repository's node of the same id has its own count.
+    let (listed, _, _) = output_of(fixture.ohjaa().arg("list").current_dir(&other));
+    assert_eq!(
+        retaught_line(&listed, "tests-run-in-lima"),
+        "re-taught 0 times since 2026-09-20"
+    );
+
+    // `ohjaa check` adds suggestions, and only suggests: `--strict` passes.
+    let (checked, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["check", "--strict"])
+            .current_dir(&repo),
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "suggestions are not flags: {checked}{stderr}"
+    );
+    for line in [
+        "evidence rust-elixir-only: re-taught 3 times since 2026-09-20, last 2026-09-23\n",
+        "evidence small-pull-requests: re-taught 0 times since 2026-06-01\n",
+        "suggest  rust-elixir-only: re-taught 3 times in 30 days: reword it, or make it a \
+         decision\n",
+        "suggest  small-pull-requests: nothing has re-taught or cited it in 60 days: still \
+         true?\n",
+        "2 suggestion(s)",
+    ] {
+        assert!(checked.contains(line), "{line}\n{checked}");
+    }
+    for quiet in ["answer-first", "linux-work-in-lima", "tests-run-in-lima"] {
+        assert!(
+            !checked.contains(&format!("suggest  {quiet}:")),
+            "{quiet}\n{checked}"
+        );
+    }
+
+    // `ohjaa review`: a proposal that may repeat a node, or refines one,
+    // shows that node's count.
+    waiting_proposal(
+        &fixture.dir.join("state/ohjaa/proposals/mine"),
+        "code-is-rust-or-elixir",
+        "Code is Rust or Elixir, nothing else.",
+    );
+    let (reviewed, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["review", "--list"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    for line in [
+        "    possible duplicate of: rust-elixir-only (current: Code is Rust or Elixir.) (their \
+         titles are near; you decide)\n    rust-elixir-only: re-taught 3 times since 2026-09-20, \
+         last 2026-09-23\n",
+        "    refines: answer-first (current: Answer first, then explain.)\n    answer-first: \
+         re-taught 0 times since 2026-09-20, last 2026-09-23\n",
+    ] {
+        assert!(reviewed.contains(line), "{line}\n{reviewed}");
+    }
+
+    // ohjaa never changes a node itself.
+    for (path, text) in &nodes_before {
+        assert_eq!(
+            &fs::read_to_string(path).unwrap(),
+            text,
+            "{}",
+            path.display()
+        );
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn damaged_evidence_stops_intake_and_is_said_never_shown_as_nothing() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("reteachdamaged");
+    let repo = fixture.make_git_repo("work");
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        "rust-elixir-only",
+        "decision",
+        "Code is Rust or Elixir.",
+    );
+    let evidence = fixture.dir.join("state/ohjaa/knowledge-evidence.json");
+    fs::create_dir_all(evidence.parent().unwrap()).unwrap();
+    fs::write(
+        &evidence,
+        "{\"schema\":\"ohjaa-knowledge-evidence.v1\",\"nodes\":[",
+    )
+    .unwrap();
+    fixture.said(&[vessa_line(
+        "2026-09-21T10:00:00Z",
+        &repo.display().to_string(),
+        "no python. rust",
+        None,
+    )]);
+    fs::write(
+        fixture.dir.join("answer.json"),
+        r#"{"drafts":[],"reteaches":[{"candidate":1,"ids":["rust-elixir-only"]}]}"#,
+    )
+    .unwrap();
+    let drafter = answering_drafter(&fixture, &fixture.dir);
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "intake",
+                "--source",
+                "transcripts",
+                "--no-prefilter",
+                "--since",
+                "2026-09-01",
+                "--drafter",
+            ])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("knowledge-evidence.json is damaged; remove it to start over"),
+        "{stderr}"
+    );
+    assert!(
+        !fixture.dir.join("prompt-1.txt").exists(),
+        "nothing was sent"
+    );
+    assert_eq!(
+        fs::read_to_string(&evidence).unwrap(),
+        "{\"schema\":\"ohjaa-knowledge-evidence.v1\",\"nodes\":[",
+        "a damaged record is said, never replaced"
+    );
+
+    // The knowledge is still listed; no count is made up for it.
+    let (listed, stderr, code) = output_of(fixture.ohjaa().arg("list").current_dir(&repo));
+    assert_eq!(code, Some(1), "{listed}{stderr}");
+    assert!(listed.contains("rust-elixir-only"), "{listed}");
+    assert!(!listed.contains("re-taught"), "{listed}");
+    assert!(
+        stderr.contains("knowledge-evidence.json is damaged"),
+        "{stderr}"
+    );
+    let (checked, _, code) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert_eq!(code, Some(1), "{checked}");
+    assert!(
+        checked.contains("error    ") && checked.contains("knowledge-evidence.json is damaged"),
+        "{checked}"
+    );
+    assert!(!checked.contains("evidence rust-elixir-only"), "{checked}");
+    fixture.cleanup();
+}
+
+#[test]
+fn malformed_reteaching_answers_leave_the_correction_available_for_retry() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("reteach-invalid-answer");
+    let repo = fixture.make_git_repo("work");
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        "rust-only",
+        "decision",
+        "Code is Rust.",
+    );
+    fixture.said(&[vessa_line(
+        "2026-09-21T10:00:00Z",
+        &repo.display().to_string(),
+        "I already told you no Python",
+        None,
+    )]);
+    let answer = fixture.dir.join("answer.json");
+    fs::write(&answer, r#"{"drafts":[],"reteaches":"not an array"}"#).unwrap();
+    let drafter = answering_drafter(&fixture, &fixture.dir);
+    let run = || {
+        output_of(
+            fixture
+                .ohjaa()
+                .args([
+                    "intake",
+                    "--source",
+                    "transcripts",
+                    "--no-prefilter",
+                    "--since",
+                    "2026-09-01",
+                    "--drafter",
+                ])
+                .arg(&drafter)
+                .current_dir(&repo),
+        )
+    };
+    let (stdout, stderr, code) = run();
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    let evidence = fixture.dir.join("state/ohjaa/knowledge-evidence.json");
+    assert!(!evidence.exists());
+    fs::write(
+        &answer,
+        r#"{"drafts":[],"reteaches":[{"candidate":1,"ids":["rust-only"]}]}"#,
+    )
+    .unwrap();
+    let (stdout, stderr, code) = run();
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("re-taught rust-only"), "{stdout}");
+    let kept: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(evidence).unwrap()).unwrap();
+    assert_eq!(kept["nodes"][0]["retaught"].as_array().unwrap().len(), 1);
+    fixture.cleanup();
+}
+
+#[test]
+fn a_redacted_node_id_cannot_be_recorded_as_sent_evidence() {
+    let fixture = Fixture::new("redacted-evidence-id");
+    let repo = fixture.make_git_repo("work");
+    // Synthetic, valid kebab-case metadata, not an actual credential.
+    let id = ["s", "k-", &"a1".repeat(12)].concat();
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        &id,
+        "decision",
+        "Use Rust for code.",
+    );
+    fixture.said(&[vessa_line(
+        "2026-09-21T10:00:00Z",
+        &repo.display().to_string(),
+        "I told you to use Rust",
+        None,
+    )]);
+    fs::write(
+        fixture.dir.join("answer.json"),
+        serde_json::json!({"drafts":[],"reteaches":[{"candidate":1,"ids":[id]}]}).to_string(),
+    )
+    .unwrap();
+    let drafter = answering_drafter(&fixture, &fixture.dir);
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "intake",
+                "--source",
+                "transcripts",
+                "--no-prefilter",
+                "--since",
+                "2026-09-01",
+                "--drafter",
+            ])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let sent = fs::read_to_string(fixture.dir.join("prompt-1.txt")).unwrap();
+    assert!(!sent.contains(&id));
+    assert!(sent.contains("[redacted]"));
+    let evidence = fixture.dir.join("state/ohjaa/knowledge-evidence.json");
+    assert!(
+        !evidence.exists(),
+        "an invisible identifier is not evidence"
     );
     fixture.cleanup();
 }
@@ -8553,6 +9148,10 @@ fn an_intent_has_an_id_that_a_later_session_continues() {
     );
     assert_eq!(code, Some(0), "{stderr}");
     let briefing = fixture.argv().join("\n");
+    assert!(
+        briefing.contains("Current session intent:\nfix the parser\n"),
+        "{briefing}"
+    );
     let first = export_of(&fixture, &repo)["sessions"][0].clone();
     let id = first["id"].as_str().unwrap().to_owned();
     let intent = first["intent_id"]
@@ -8590,12 +9189,19 @@ fn an_intent_has_an_id_that_a_later_session_continues() {
     assert_eq!(second["intent"], "fix the parser");
     assert!(second.get("task").is_none(), "no task given: {second:#}");
     let argv = fixture.argv();
+    assert!(argv
+        .windows(2)
+        .any(|pair| pair == ["--task", "fix the parser"]));
     assert!(
         argv.windows(2)
             .any(|pair| pair[0] == "--intent" && pair[1] == "fix the parser"),
         "toimija gets the intent's text: {argv:?}"
     );
     let briefing = argv.join("\n");
+    assert!(
+        briefing.contains("Current session intent:\nfix the parser\n"),
+        "{briefing}"
+    );
     assert!(
         briefing.contains(&format!(
             "its intent is {intent}, continued from session {id}"

@@ -50,8 +50,13 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   candidate the drafter answered for or failed on, its time and a digest of
   its words, never the words, and for a failure how often and why in ohjaa's
   words, kept until the drafter answers for it; an end line with the count),
-  the lock that lets one intake run at a time (`intake.lock`), the
-  report's two times (`report-at`, `report-shown-at`), and the human view's
+  the lock that lets one intake run at a time (`intake.lock`), what intake
+  saw of each current node (`knowledge-evidence.json`: per node, each
+  message a person re-taught it with, by its time, a digest of its words and
+  its session's id, never the words, and when a draft last cited it; history
+  like the session log, read by `ohjaa list`, `check` and `review`, never by
+  a briefing, a gate or a report), the report's two times (`report-at`,
+  `report-shown-at`), and the human view's
   folder (`human/`: `seen.json`, what the person last saw and when, the keys
   of what was said in the last two hours, where the next digest begins and
   where the earliest of what a day's digest left out begins, each with the
@@ -70,7 +75,8 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   shown to a person, and `collect.lock`, held by the one collect that
   runs). Deleting them loses
   no knowledge: intake then reads its default window again, and sends once
-  more what is still in it, and the human view starts from the last day.
+  more what is still in it, the counts of re-teaching start again, and the
+  human view starts from the last day.
   Everything else — fleet, perimeter, coverage, marks — is derived now and
   stored never, but in the human view's snapshot: a copy that is said with
   its age wherever it is shown, read only by `ohjaa line`, `ohjaa digest`
@@ -237,3 +243,11 @@ or Node (JavaScript/TypeScript): not for tools, scripts, CI helpers, tests,
 dashboards or glue. A thin shell step in a CI workflow is fine; anything with
 logic is Rust. Existing Python or Node files are debt to be rewritten, not
 precedent to follow.
+
+## Lessons
+
+<!-- This repository's accepted knowledge: one line per node, each marked with its id, written here through a pull request when a person accepts one. A line changed here by hand is replaced the next time it is written: change a lesson where it is decided. -->
+
+- <!-- lesson: ohjaa-env-claimed-ids-are-testimony --> **decision**: Treat a session id claimed by the agent's environment as testimony, not observation, and label it that way. Rank the evidence: launch prompt, then receipt, then env claim, then window. When the launch prompt and the env claim disagree, keep the observation and name the disagreement. (as of 2026-10-27)
+- <!-- lesson: ohjaa-marks-v1-only-gains-keys --> **decision**: The `ohjaa-marks.v1` schema only gains keys, and the keys viemari was built on never go. Dropping the unread `judgements` key was the one exception, so the schema keeps its name. (as of 2026-10-27)
+- <!-- lesson: ohjaa-derived-gates-stay-out-of-config --> **decision**: Derived gate artifacts are never written into Ohjaa's config home; normal configuration and knowledge writes remain allowed. A gate that a later run needs is kept under $XDG_STATE_HOME/ohjaa/derived/<digest>/, and a gate that is only read goes into a private $TMPDIR folder that is removed when done. `ohjaa gate --print` writes nothing. (as of 2026-10-29)
