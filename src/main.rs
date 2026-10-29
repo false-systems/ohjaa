@@ -274,9 +274,8 @@ enum Cmd {
         #[arg(long)]
         marks: bool,
     },
-    /// For a terminal's opening: one line when something happened since you
-    /// last saw it, otherwise nothing. The first `line` of each local day
-    /// prints the day's digest instead. Seeing it moves your cursor.
+    /// For a terminal's opening: only matters needing attention or your decision.
+    /// Silent when there are none. Activity stays unread for `ohjaa digest`.
     #[command(
         after_help = "Prints, reads and moves nothing unless stdout is a terminal and no agent \
         session's marker is set (OHJAA_SESSION, TOIMIJA_SESSION, TOIMIJA_RUN, CLAUDECODE, \
@@ -287,12 +286,12 @@ enum Cmd {
         Starts no git and touches no network: it reads the session log and the proposals, and \
         the rest from the snapshot `ohjaa collect` writes, said with its age when it is older \
         than 15 minutes. Then it starts one `ohjaa collect` in the background, unless one \
-        runs; the day's digest never waits for it. Always exits 0."
+        runs; startup never waits for it. Notices are shown once per day or when they change. \
+        Opening a terminal does not consume session or pull-request history. Always exits 0."
     )]
     Line,
-    /// What the person has not seen in full (what the day's digest left
-    /// out, or since the last digest), what stays until it is resolved,
-    /// today's proposal and who is live. Shown to you, it moves your cursor.
+    /// Attention details and unread activity: sessions, pull requests, proposed
+    /// instructions and who is live. Reading it at a terminal marks activity seen.
     #[command(
         after_help = "When the snapshot is more than 5 minutes old it starts a collect \
         and waits for it at most 10 s; past that it shows the snapshot it has, and the collect \

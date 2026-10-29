@@ -1,10 +1,10 @@
 //! The human view: what happened, for the person at the terminal.
 //!
 //! An agent learns the state of the work from its briefing; a person learns
-//! it here. `ohjaa line` runs as a terminal opens: one line when something
-//! happened since the person last saw the view, else nothing, and the first
-//! `line` of each local day prints the day's digest instead. `ohjaa digest`
-//! is all of it. Records only: nothing is sent to anyone, decided or refused.
+//! it here. `ohjaa line` runs as a terminal opens: attention notices only,
+//! once per day or when they change. Activity is retained for `ohjaa digest`;
+//! opening a terminal never consumes it. Records only: nothing is sent to
+//! anyone, decided or refused.
 //!
 //! What a person saw is the cursor: a line or a digest printed for them
 //! moves it. Nothing is printed, read or moved unless stdout is a terminal
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::collect::{self, Collected, Cost, Part, Pr};
+use crate::collect::{self, Collected, Part, Pr, TokenUsage};
 use crate::knowledge::{self, Dirs};
 use crate::report::{self, Waiting};
 use crate::sessions::{self, clock, Exit, Finished, Left, Session};
@@ -67,7 +67,7 @@ const OPEN_TOO_LONG_MS: i64 = DAY_MS;
 /// The widest line the view prints, in characters.
 pub const WIDTH: usize = 100;
 
-/// The day's digest is at most this many lines.
+/// The startup attention view is at most this many lines.
 const DAILY_LINES: usize = 15;
 
 /// What the shells an agent runs its tools in carry, each set by the agent
@@ -149,21 +149,10 @@ fn local_offset_s(_now_ms: i64) -> i64 {
     0
 }
 
-/// `08:12 UTC` within the day, else `10-26 08:12 UTC`: ohjaa's times are
-/// UTC, and say so.
-fn short_clock(at_ms: i64, now_ms: i64) -> String {
-    let full = clock(at_ms);
-    if (now_ms - at_ms).abs() < 20 * HOUR_MS {
-        full[11..].to_owned()
-    } else {
-        full[5..].to_owned()
-    }
-}
-
-/// `as of 08:12 UTC`, or `never read`.
-fn as_of(at_ms: Option<i64>, now_ms: i64) -> String {
+/// Full UTC date and time, or `never read`.
+fn as_of(at_ms: Option<i64>, _now_ms: i64) -> String {
     match at_ms {
-        Some(at) => format!("as of {}", short_clock(at, now_ms)),
+        Some(at) => format!("as of {}", clock(at)),
         None => "never read".to_owned(),
     }
 }
@@ -186,8 +175,7 @@ const SEEN_SCHEMA: &str = "ohjaa-seen.v1";
 struct Window {
     sessions_ms: i64,
     github_ms: i64,
-    /// The keys of what GitHub said from the overlap before `github_ms` on,
-    /// its very end included, as the digest that ended here had it.
+    /// Keys already shown in GitHub's overlap or the session boundary second.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     said: BTreeSet<String>,
 }
@@ -209,7 +197,7 @@ impl Window {
     fn holds(&self, item: &Item) -> bool {
         let second = |ms: i64| ms - ms.rem_euclid(1000);
         if !item.github {
-            return item.at_ms >= second(self.sessions_ms);
+            return item.at_ms >= second(self.sessions_ms) && !self.said.contains(&item.key);
         }
         item.at_ms >= second(self.github_ms - OVERLAP_MS) && !self.said.contains(&item.key)
     }
@@ -223,11 +211,12 @@ struct Seen {
     at_ms: i64,
     /// How far GitHub had been read by then (the snapshot's own time).
     github_ms: i64,
-    /// What happened that they saw, still within the overlap.
+    /// Activity they read in the full digest, still within the overlap.
     events: BTreeSet<String>,
     /// What stood, and the proposals that waited, when they saw it.
     items: BTreeSet<String>,
-    /// Where the next day's digest begins: where the last digest ended.
+    /// Where unread activity begins: anchored at first startup, advanced
+    /// only by a full digest. The serialized name is retained.
     digest: Option<Window>,
     /// Where what a day's digest left out begins, the earliest one's when
     /// several were cut: `ohjaa digest` shows it, and it stays until a
@@ -252,7 +241,8 @@ fn claim_path(dirs: &Dirs) -> PathBuf {
 #[derive(Debug, Clone)]
 enum Shown {
     Line,
-    /// The day's digest, from `from`; `cut`: it left some out.
+    /// Today's attention view. `from` retains the unread activity anchor;
+    /// `cut` records omitted attention, never consumed activity.
     Daily {
         from: Window,
         cut: bool,
@@ -271,7 +261,7 @@ impl Seen {
         }
     }
 
-    /// Where the day's digest begins.
+    /// Where unread activity begins, including before the first digest.
     fn daily_from(&self, now_ms: i64) -> Window {
         self.digest
             .clone()
@@ -356,7 +346,7 @@ struct View {
     standing: Vec<Item>,
     /// Newest first.
     events: Vec<Item>,
-    /// The proposals waiting for a person, oldest first, and today's.
+    /// Proposals waiting for a person, oldest first, and the selected example.
     waiting: Vec<Waiting>,
     today: Option<usize>,
     /// Each part of the snapshot: its name, when it was read, and from when
@@ -410,10 +400,6 @@ fn cut(text: &str, max: usize) -> String {
     out
 }
 
-fn short(sha: &str) -> &str {
-    sha.get(..7).unwrap_or(sha)
-}
-
 /// The last part of a path or an `owner/name`.
 fn name(place: &str) -> String {
     place
@@ -445,14 +431,11 @@ fn amount(n: u64) -> String {
     }
 }
 
-/// `est. $1.20`, or `115k tokens + 2.9M cache reads`: most of a session's
+/// `115k tokens + 2.9M cache reads`: most of a session's
 /// tokens are reads of its cache, said apart.
-fn cost(cost: &Cost) -> Option<String> {
-    if let Some(usd) = cost.usd_micros {
-        return Some(format!("est. ${:.2}", usd as f64 / 1e6));
-    }
-    let tokens = cost.tokens?;
-    Some(match cost.cache_reads {
+fn usage_text(usage: &TokenUsage) -> Option<String> {
+    let tokens = usage.tokens?;
+    Some(match usage.cache_reads {
         Some(cached) if cached > 0 => {
             format!("{} tokens + {} cache reads", amount(tokens), amount(cached))
         }
@@ -491,26 +474,36 @@ fn event(kind: Kind, key: String, at_ms: i64, github: bool, repo: &str, text: St
 }
 
 /// How a session ended, and what it left out, in a few words.
-fn ended(session: &Session, left: &Left, costed: Option<&Cost>) -> Item {
+fn ended(session: &Session, left: &Left, usage: Option<&TokenUsage>) -> Item {
     let mut parts = vec![format!(
         "{} \"{}\"",
         clean(&session.agent),
-        cut(&clean(&session.intent), 40)
+        clean(&session.intent)
     )];
+    if session.intent.trim().is_empty() || session.intent.trim() == "interactive" {
+        parts.push("task not recorded".to_owned());
+    }
     parts.push(match (left.orphaned, left.exit) {
         (true, _) => "orphaned".to_owned(),
-        (_, Exit::Code { code }) => format!("exit {code}"),
+        (_, Exit::Code { code: 0 }) => "process exited successfully (code 0)".to_owned(),
+        (_, Exit::Code { code }) => {
+            format!("process exited with code {code}; cause not recorded here")
+        }
         (_, Exit::Signal { signal }) => format!("killed (signal {signal})"),
         (_, Exit::Unknown) => "exit unknown".to_owned(),
     });
     if !left.orphaned {
-        parts.push(span(left.ended_ms - session.started_ms));
+        parts.push(format!(
+            "elapsed {}",
+            span(left.ended_ms - session.started_ms)
+        ));
     }
+    parts.push(format!("ended {}", clock(left.ended_ms)));
     let (readback, handover) = (session.readback.is_some(), session.handover.is_some());
     match (readback, handover) {
-        (false, false) => parts.push("no read-back or handover".to_owned()),
-        (false, true) => parts.push("no read-back".to_owned()),
-        (true, false) => parts.push("no handover".to_owned()),
+        (false, false) => parts.push("no task confirmation or completion note recorded".to_owned()),
+        (false, true) => parts.push("no task confirmation recorded".to_owned()),
+        (true, false) => parts.push("no completion note recorded".to_owned()),
         (true, true) => {}
     }
     if !left.landed.is_empty() {
@@ -519,7 +512,25 @@ fn ended(session: &Session, left: &Left, costed: Option<&Cost>) -> Item {
     if let Finished::PullRequest { state, .. } = &left.finished {
         parts.push(format!("PR {}", clean(state).to_lowercase()));
     }
-    parts.extend(costed.and_then(cost));
+    parts.extend(usage.and_then(usage_text));
+    if session.outside_repo {
+        parts.push(format!(
+            "outside a repository; launch folder: {}",
+            clean(&session.repo)
+        ));
+    }
+    if !session.scoped.is_empty() {
+        parts.push(format!(
+            "declared repositories: {}",
+            session
+                .scoped
+                .iter()
+                .map(|scope| clean(&scope.repo))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    parts.push(format!("Inspect: ohjaa session {}", clean(&session.id)));
     event(
         Kind::Ended {
             told: readback && handover,
@@ -540,7 +551,14 @@ fn pr_events(pr: &Pr, out: &mut Vec<Item>) {
     let who = |login: &Option<String>| clean(login.as_deref().unwrap_or("?"));
     let mut say = |kind, what: &str, at_ms, text: String| {
         let key = format!("pr:{}#{number}:{what}", pr.repo);
-        out.push(event(kind, key, at_ms, true, &pr.repo, text));
+        out.push(event(
+            kind,
+            key,
+            at_ms,
+            true,
+            &pr.repo,
+            format!("{text} · Inspect: {}", clean(&pr.url)),
+        ));
     };
     say(
         Kind::Opened,
@@ -574,6 +592,12 @@ fn pr_events(pr: &Pr, out: &mut Vec<Item>) {
 /// A part of the snapshot that could not be read, or not all of it: said
 /// as that, with how old what it holds is, and never as an all-clear.
 fn source<T>(name: &str, part: &Part<T>, now_ms: i64, unread: &mut Vec<String>) -> Option<Item> {
+    let meaning = match name {
+        "marks" => "Repository verification records",
+        "GitHub" => "Pull request activity",
+        "vessa" => "Token usage",
+        other => other,
+    };
     let age = as_of(part.as_of_ms, now_ms);
     unread.extend(
         part.error
@@ -596,9 +620,12 @@ fn source<T>(name: &str, part: &Part<T>, now_ms: i64, unread: &mut Vec<String>) 
         Class::Unknown,
         source_key(name, &failures),
         name,
-        format!("{what}, {age}: {}", clean(why)),
+        format!(
+            "{meaning}: {what}, {age}: {} · Retry collecting status: ohjaa collect",
+            clean(why)
+        ),
     );
-    item.brief = Some(format!("{name}: {what}"));
+    item.brief = Some(format!("{meaning}: {what}, {age}"));
     Some(item)
 }
 
@@ -647,11 +674,20 @@ fn build(
             0 => String::new(),
             n => format!(" ({n} failed)"),
         };
+        let unknown = match branch.unknown {
+            0 => String::new(),
+            n => format!(" ({n} verification result(s) unavailable)"),
+        };
         let said = format!(
-            "{}: {}{} unproven{failed}",
+            "{}: no verified passing result for {}{} recent {}{failed}{unknown}",
             clean(&branch.branch),
             branch.unproven,
             if branch.more { "+" } else { "" },
+            if branch.unproven == 1 && !branch.more {
+                "commit"
+            } else {
+                "commits"
+            },
         );
         let age = match (&branch.error, old(branch.as_of_ms, now_ms)) {
             (Some(_), _) => format!(", {} (unread since)", as_of(branch.as_of_ms, now_ms)),
@@ -662,17 +698,65 @@ fn build(
             Kind::Main,
             class,
             format!(
-                "main:{}:{}",
+                "main:{}:{}:{}:{}:{}:{}:{}",
                 branch.slug,
-                branch.tip.as_deref().unwrap_or("")
+                branch.tip.as_deref().unwrap_or(""),
+                branch.unproven,
+                branch.failed,
+                branch.unknown,
+                branch.more,
+                source_key("refresh", &branch.error.iter().collect::<Vec<_>>())
             ),
             &branch.slug,
             format!(
-                "{said} since {}{age}. Prove it: ohjaa gate",
-                short(branch.oldest.as_deref().unwrap_or("?"))
+                "Repository: {} · {said} · Last checked: {} · Latest observed commit: {} · \
+                Oldest without a passing result: {} · Inspect results: ohjaa report --marks · \
+                To run checks, use a checkout of this repository at the latest observed commit; \
+                ohjaa gate proves that checkout's HEAD, not a branch named in this notice",
+                clean(&branch.slug),
+                branch.as_of_ms.map_or_else(|| "never".into(), clock),
+                branch
+                    .tip
+                    .as_deref()
+                    .map(clean)
+                    .unwrap_or_else(|| "not recorded".into()),
+                branch
+                    .oldest
+                    .as_deref()
+                    .map(clean)
+                    .unwrap_or_else(|| "not recorded".into())
             ),
         );
-        item.brief = Some(format!("{} {said}", item.repo));
+        let brief = if branch.failed > 0 {
+            format!(
+                "{}: {}",
+                clean(&branch.branch),
+                plural(branch.failed, "verification failed", "verifications failed")
+            )
+        } else if branch.unknown > 0 {
+            format!(
+                "{}: verification could not be completed for {} commit(s)",
+                clean(&branch.branch),
+                branch.unknown
+            )
+        } else {
+            format!(
+                "{}: no passing verification recorded for {}{} {}",
+                clean(&branch.branch),
+                branch.unproven,
+                if branch.more { "+" } else { "" },
+                if branch.unproven == 1 && !branch.more {
+                    "commit"
+                } else {
+                    "commits"
+                }
+            )
+        };
+        item.brief = Some(format!("{brief}{age}"));
+        if let Some(why) = &branch.error {
+            item.text
+                .push_str(&format!(" · Could not refresh: {}", clean(why)));
+        }
         standing_items.push(item);
     }
     match collected {
@@ -682,7 +766,7 @@ fn build(
                 Class::Unknown,
                 "source:snapshot".to_owned(),
                 "snapshot",
-                "nothing collected yet: `ohjaa collect` reads it".to_owned(),
+                "Repository checks, pull requests and usage have not been collected yet. Read status: ohjaa collect".to_owned(),
             );
             item.brief = Some("nothing collected yet".to_owned());
             standing_items.push(item);
@@ -704,11 +788,7 @@ fn build(
         String::new()
     };
     for session in logged.iter().filter(|s| s.left.is_none()) {
-        let who = format!(
-            "{} \"{}\"",
-            clean(&session.agent),
-            cut(&clean(&session.intent), 40)
-        );
+        let who = format!("{} \"{}\"", clean(&session.agent), clean(&session.intent));
         let id = &session.id;
         if local.gone.contains(id) {
             standing_items.push(standing(
@@ -716,7 +796,8 @@ fn build(
                 Class::Unknown,
                 format!("gone:{id}"),
                 &session.repo,
-                format!("still running, its ohjaa gone{found}: {who} ({id})"),
+                format!("Agent still running without its Ohjaa supervisor{found}; later work is not observed: \
+                    {who} · Inspect: ohjaa session {id}"),
             ));
         } else if local.orphaned.contains(id) {
             standing_items.push(standing(
@@ -724,7 +805,8 @@ fn build(
                 Class::Unknown,
                 format!("orphaned:{id}"),
                 &session.repo,
-                format!("orphaned{found}, nothing after its ohjaa went is observed: {who} ({id})"),
+                format!("Neither the agent nor its supervisor was found running{found}; final result unknown: \
+                    {who} · Inspect: ohjaa session {id}"),
             ));
         } else if now_ms - session.started_ms > OPEN_TOO_LONG_MS {
             standing_items.push(standing(
@@ -732,7 +814,10 @@ fn build(
                 Class::Person,
                 format!("open:{id}"),
                 &session.repo,
-                format!("open {}: {who} ({id})", span(now_ms - session.started_ms)),
+                format!(
+                    "Session has remained open for {}: {who} · Inspect: ohjaa session {id}",
+                    span(now_ms - session.started_ms)
+                ),
             ));
         }
     }
@@ -794,7 +879,6 @@ fn build(
 /// What is new since `seen`.
 struct News<'a> {
     standing: Vec<&'a Item>,
-    events: Vec<&'a Item>,
     proposals: usize,
 }
 
@@ -805,19 +889,6 @@ fn news<'a>(view: &'a View, seen: &Seen) -> News<'a> {
             .iter()
             .filter(|item| !seen.items.contains(&item.key))
             .collect(),
-        events: folded(
-            view.events
-                .iter()
-                .filter(|item| {
-                    let from = if item.github {
-                        seen.github_ms
-                    } else {
-                        seen.at_ms
-                    };
-                    item.at_ms > from - OVERLAP_MS && !seen.events.contains(&item.key)
-                })
-                .collect(),
-        ),
         proposals: view
             .waiting
             .iter()
@@ -840,15 +911,18 @@ fn advance(
         .and_then(|c| c.github.as_of_ms)
         .unwrap_or(old.github_ms)
         .max(old.github_ms);
-    let events = view
-        .events
-        .iter()
-        .filter(|item| {
-            let from = if item.github { github_ms } else { now_ms };
-            item.at_ms > from - OVERLAP_MS
-        })
-        .map(|item| item.key.clone())
-        .collect();
+    let events = if matches!(&shown, Shown::Full) {
+        view.events
+            .iter()
+            .filter(|item| {
+                let from = if item.github { github_ms } else { now_ms };
+                item.at_ms > from - OVERLAP_MS
+            })
+            .map(|item| item.key.clone())
+            .collect()
+    } else {
+        old.events.clone()
+    };
     let items = view
         .standing
         .iter()
@@ -860,26 +934,53 @@ fn advance(
     // pull request event in the overlap before that end is in this digest's
     // stretch or was said by the one before it: the next leaves them out of
     // its overlap, and says only what GitHub indexed late.
+    let previous = old.digest.as_ref();
     let github_end = collected
         .and_then(|c| c.github.as_of_ms)
-        .unwrap_or(old.daily_from(now_ms).github_ms);
+        .unwrap_or(old.daily_from(now_ms).github_ms)
+        .max(previous.map_or(i64::MIN, |window| window.github_ms));
+    let sessions_end = now_ms.max(previous.map_or(i64::MIN, |window| window.sessions_ms));
     let overlap = github_end - OVERLAP_MS;
-    let here = Window {
-        sessions_ms: now_ms,
+    let mut here = Window {
+        sessions_ms: sessions_end,
         github_ms: github_end,
         said: view
             .events
             .iter()
-            .filter(|item| item.github && item.at_ms >= overlap - overlap.rem_euclid(1000))
+            .filter(|item| {
+                let boundary = if item.github { overlap } else { sessions_end };
+                item.at_ms >= boundary - boundary.rem_euclid(1000)
+            })
             .map(|item| item.key.clone())
             .collect(),
     };
+    // A digest reads sources before claiming the cursor. An older concurrent
+    // read must not undo keys acknowledged by the terminal that claimed first.
+    if let Some(previous) = previous {
+        here.said.extend(
+            previous
+                .said
+                .iter()
+                .filter(|key| {
+                    if key.starts_with("session:") {
+                        previous.sessions_ms.div_euclid(1000) == sessions_end.div_euclid(1000)
+                    } else {
+                        previous.github_ms == github_end
+                    }
+                })
+                .cloned(),
+        );
+    }
     let (digest, unseen, day) = match shown {
-        Shown::Line => (old.digest.clone(), old.unseen.clone(), old.day.clone()),
+        Shown::Line => (
+            Some(old.daily_from(now_ms)),
+            old.unseen.clone(),
+            Some(today.to_owned()),
+        ),
         // What an earlier digest left out begins earlier still: kept, so
         // nothing the person has not seen is dropped.
         Shown::Daily { from, cut } => (
-            Some(here),
+            Some(old.digest.clone().unwrap_or(from.clone())),
             old.unseen.clone().or(cut.then_some(from)),
             Some(today.to_owned()),
         ),
@@ -929,17 +1030,17 @@ fn count(items: &[&Item], of: impl Fn(Kind) -> bool) -> usize {
     items.iter().filter(|item| of(item.kind)).count()
 }
 
-/// `3 sessions ended (1 without read-back/handover)`: with `gaps`, how many
-/// of them left no read-back or no handover.
+/// `3 agent sessions ended (1 missing startup notes or handover)`: with `gaps`, how many
+/// of them omitted startup notes or a handover.
 fn sessions_ended(events: &[&Item], gaps: bool) -> Option<String> {
     let ended = count(events, |k| matches!(k, Kind::Ended { .. }));
     if ended == 0 {
         return None;
     }
     let untold = count(events, |k| k == Kind::Ended { told: false });
-    let mut text = plural(ended, "session ended", "sessions ended");
+    let mut text = plural(ended, "agent session ended", "agent sessions ended");
     if gaps && untold > 0 {
-        text.push_str(&format!(" ({untold} without read-back/handover)"));
+        text.push_str(&format!(" ({untold} missing startup notes or handover)"));
     }
     Some(text)
 }
@@ -956,14 +1057,14 @@ fn pull_requests(events: &[&Item]) -> Option<String> {
     .filter(|(n, _)| *n > 0)
     .map(|(n, what)| format!("{n} {what}"))
     .collect();
-    (!said.is_empty()).then(|| format!("PRs: {}", said.join(", ")))
+    (!said.is_empty()).then(|| format!("Pull requests: {}", said.join(", ")))
 }
 
 /// The one line for a terminal's opening: what is new, most urgent first,
 /// at most [`WIDTH`] characters; `None` when nothing is.
 fn one_line(news: &News) -> Option<String> {
     let mut parts = Vec::new();
-    // `sykli main: 2 unproven (1 failed)`, as the digest says it.
+    // Name the repository and branch, and explain what is missing.
     let mains: Vec<&&Item> = news
         .standing
         .iter()
@@ -971,8 +1072,20 @@ fn one_line(news: &News) -> Option<String> {
         .collect();
     match mains.as_slice() {
         [] => {}
-        [one] => parts.extend(one.brief.clone()),
-        many => parts.push(format!("{} branches not proven", many.len())),
+        [one] => parts.extend(
+            one.brief
+                .as_ref()
+                .map(|text| format!("{} {text}", one.repo)),
+        ),
+        many => parts.push(format!(
+            "{} branches need verification{}",
+            many.len(),
+            if many.iter().any(|item| item.class == Some(Class::Failed)) {
+                " (checks failed)"
+            } else {
+                ""
+            }
+        )),
     }
     parts.extend(
         news.standing
@@ -983,20 +1096,34 @@ fn one_line(news: &News) -> Option<String> {
     for (kind, one, many) in [
         (
             Kind::Gone,
-            "session runs, its ohjaa gone",
-            "sessions run, their ohjaa gone",
+            "agent still running without its supervisor",
+            "agents still running without their supervisor",
         ),
-        (Kind::Orphaned, "session orphaned", "sessions orphaned"),
+        (
+            Kind::Orphaned,
+            "session has no observed final result",
+            "sessions have no observed final result",
+        ),
     ] {
         match count(&news.standing, |k| k == kind) {
             0 => {}
             n => parts.push(plural(n, one, many)),
         }
     }
-    parts.extend(sessions_ended(&news.events, true));
-    parts.extend(pull_requests(&news.events));
     if news.proposals > 0 {
-        parts.push(plural(news.proposals, "new proposal", "new proposals"));
+        parts.push(format!(
+            "{} {} your decision",
+            plural(
+                news.proposals,
+                "proposed agent instruction",
+                "proposed agent instructions"
+            ),
+            if news.proposals == 1 {
+                "awaits"
+            } else {
+                "await"
+            }
+        ));
     }
     match count(&news.standing, |k| k == Kind::OpenLong) {
         0 => {}
@@ -1009,8 +1136,8 @@ fn one_line(news: &News) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
-    // Whole parts only: what does not fit is left to the digest, said with `…`.
-    let (more, tail) = (" · …", " · ohjaa digest");
+    // Keep the details command even when a repository name is very long.
+    let (more, tail) = (" · more", " · Details: ohjaa digest");
     let mut line = String::from("ohjaa");
     for (i, part) in parts.iter().enumerate() {
         let after = if i + 1 < parts.len() { more } else { "" };
@@ -1018,24 +1145,93 @@ fn one_line(news: &News) -> Option<String> {
             .iter()
             .map(|s| s.chars().count())
             .sum::<usize>();
-        if width > WIDTH && i > 0 {
-            line.push_str(more);
+        if width > WIDTH {
+            if i == 0 {
+                let room = WIDTH.saturating_sub(
+                    line.chars().count() + 3 + after.chars().count() + tail.chars().count(),
+                );
+                line.push_str(" · ");
+                line.push_str(&cut(part, room));
+                line.push_str(after);
+            } else {
+                line.push_str(more);
+            }
             break;
         }
         line.push_str(" · ");
         line.push_str(part);
     }
     line.push_str(tail);
-    Some(format!("{}\n", cut(&line, WIDTH)))
+    Some(format!("{line}\n"))
 }
 
-/// `  ! sykli    main: 2 unproven since 5fcdeef. Prove it: ohjaa gate`.
+/// A compact attention row, retaining its complete meaning through wrapping.
 fn row(item: &Item, width: usize) -> String {
+    let brief = Item {
+        text: item.brief.clone().unwrap_or_else(|| item.text.clone()),
+        ..item.clone()
+    };
+    full_row(&brief, width)
+}
+
+/// The full digest must not discard the details its summary points to.
+fn full_row(item: &Item, width: usize) -> String {
     let bullet = if item.class.is_some() { "!" } else { "·" };
-    cut(
-        &format!("  {bullet} {:<width$}  {}", item.repo, item.text),
-        WIDTH,
-    )
+    wrapped(&format!("  {bullet} {:<width$}  ", item.repo), &item.text)
+}
+
+/// Wrap human text without discarding details.
+fn wrapped(prefix: &str, text: &str) -> String {
+    let mut out = String::new();
+    let mut line = String::new();
+    for c in prefix.chars() {
+        if line.chars().count() == WIDTH {
+            out.push_str(&line);
+            out.push('\n');
+            line = "    ".into();
+        }
+        line.push(c);
+    }
+    for (i, part) in text.split(" · ").enumerate() {
+        let separator = if i == 0 { "" } else { " · " };
+        if line.chars().count() + separator.chars().count() + part.chars().count() <= WIDTH {
+            line.push_str(separator);
+            line.push_str(part);
+            continue;
+        }
+        if !line.trim().is_empty() {
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        line = "    ".into();
+        for word in part.split_whitespace() {
+            if line.chars().count() > 4 {
+                if line.chars().count() + 1 + word.chars().count() > WIDTH {
+                    out.push_str(&line);
+                    out.push('\n');
+                    line = "    ".into();
+                } else {
+                    line.push(' ');
+                }
+            }
+            // A URL is an action, not prose: keep it intact for terminal
+            // link detection and copying, even beyond the preferred width.
+            if word.starts_with("https://") || word.starts_with("http://") {
+                line.push_str(word);
+                continue;
+            }
+            for c in word.chars() {
+                if line.chars().count() == WIDTH {
+                    out.push_str(&line);
+                    out.push('\n');
+                    line = "    ".into();
+                }
+                line.push(c);
+            }
+        }
+    }
+    out.push_str(&line);
+    out
 }
 
 fn repo_width<'a>(items: impl Iterator<Item = &'a Item>) -> usize {
@@ -1046,81 +1242,73 @@ fn repo_width<'a>(items: impl Iterator<Item = &'a Item>) -> usize {
         .min(12)
 }
 
-/// Today's proposal in one line, with its id and the command that decides it.
+/// The pending decision count and the command that opens complete proposals.
 fn proposal_line(view: &View) -> Option<String> {
-    let waiting = &view.waiting[view.today?];
-    let head = format!(
-        "  ? today's proposal {} ({})",
-        clean(&waiting.name),
-        clean(&waiting.scope)
-    );
-    let tail = format!(" · {} wait · ohjaa review", view.waiting.len());
-    let room = WIDTH.saturating_sub(head.chars().count() + tail.chars().count() + 2);
-    let title = clean(&waiting.title);
-    let said = if room >= 12 && !title.is_empty() {
-        format!(": {}", cut(&title, room))
-    } else {
-        String::new()
-    };
-    Some(cut(&format!("{head}{said}{tail}"), WIDTH))
+    (!view.waiting.is_empty()).then(|| {
+        wrapped(
+            "  ",
+            &format!(
+                "Your decision: {}. Read and decide: ohjaa review",
+                plural(
+                    view.waiting.len(),
+                    "proposed agent instruction",
+                    "proposed agent instructions"
+                )
+            ),
+        )
+    })
 }
 
-/// The day's digest: what stands, today's proposal and what happened from
-/// `from`, at most [`DAILY_LINES`] lines, and whether it left any out.
-/// `left_out`: where what an earlier one left out begins, still unread in
-/// full; the last line points to it. `None` when there is nothing.
+/// Today's attention view, at most [`DAILY_LINES`] lines. Activity and legacy
+/// unread-history positions never make startup noisy or advance its history.
 fn daily(
     view: &View,
-    from: &Window,
-    left_out: Option<&Window>,
+    _from: &Window,
+    _left_out: Option<&Window>,
     now_ms: i64,
 ) -> Option<(String, bool)> {
-    let events = after(view, from);
     let proposal = proposal_line(view);
-    if view.standing.is_empty() && events.is_empty() && proposal.is_none() && left_out.is_none() {
+    if view.standing.is_empty() && proposal.is_none() {
         return None;
     }
-    let mut summary = vec![format!("since {}", clock(from.sessions_ms))];
-    summary.extend(sessions_ended(&events, false));
-    summary.extend(pull_requests(&events));
-    let mut lines = vec![cut(&format!("ohjaa · {}", summary.join(" · ")), WIDTH)];
-    // An old snapshot is said, never waited for: a collect runs beside it.
+    let mut lines = vec!["ohjaa — needs your attention".to_owned()];
     if let Some(at) = view.collected_ms.filter(|at| old(Some(*at), now_ms)) {
         lines.push(format!(
-            "  snapshot as of {}; a fresh collect runs in the background",
-            short_clock(at, now_ms)
+            "  Cached status collected {}; source dates: ohjaa digest.",
+            clock(at)
         ));
     }
-    let width = repo_width(view.standing.iter().chain(events.iter().copied()));
-    let mut rows: Vec<String> = view.standing.iter().map(|item| row(item, width)).collect();
-    let after_standing = rows.len();
-    rows.extend(events.iter().map(|item| row(item, width)));
-    // The last line points to `ohjaa digest`, for what this one leaves out
-    // and for what an earlier one did.
-    let mut room = DAILY_LINES - lines.len() - usize::from(proposal.is_some());
-    if rows.len() > room || left_out.is_some() {
-        room -= 1;
+    if view
+        .standing
+        .iter()
+        .any(|item| item.kind == Kind::Main && item.class != Some(Class::Failed))
+    {
+        lines.push("  Missing verification is not a report of failed tests.".to_owned());
     }
-    let more = rows.len().saturating_sub(room);
-    rows.truncate(room);
-    if let Some(proposal) = proposal {
-        rows.insert(after_standing.min(rows.len()), proposal);
-    }
-    lines.extend(rows);
-    let earlier = left_out.map(|at| {
-        format!(
-            "what an earlier digest left out, since {}",
-            short_clock(at.sessions_ms, now_ms)
-        )
-    });
-    match (more, earlier) {
-        (0, None) => {}
-        (0, Some(earlier)) => lines.push(format!("  … and {earlier}: ohjaa digest")),
-        (more, None) => lines.push(format!("  … {more} more: ohjaa digest")),
-        (more, Some(earlier)) => {
-            lines.push(format!("  … {more} more, and {earlier}: ohjaa digest"))
+    let width = repo_width(view.standing.iter());
+    let reserved = lines.len() + proposal.as_ref().map_or(0, |text| text.lines().count()) + 2;
+    let room = DAILY_LINES.saturating_sub(reserved);
+    let (mut shown, mut used) = (0, 0);
+    for item in &view.standing {
+        let row = row(item, width);
+        let size = row.lines().count();
+        if used + size > room {
+            break;
         }
+        lines.push(row);
+        used += size;
+        shown += 1;
     }
+    if let Some(proposal) = proposal {
+        lines.push(proposal);
+    }
+    let more = view.standing.len() - shown;
+    if more > 0 {
+        lines.push(format!(
+            "  {more} more attention item(s) are in the full digest."
+        ));
+    }
+    lines.push("  Full details and activity: ohjaa digest".to_owned());
     Some((lines.join("\n") + "\n", more > 0))
 }
 
@@ -1157,35 +1345,46 @@ fn full(
     now_ms: i64,
 ) -> String {
     let events = after(view, from);
-    let mut out = format!("ohjaa digest · since {}", clock(from.sessions_ms));
+    let mut out = format!("ohjaa digest · activity since {}", clock(from.sessions_ms));
     if let Some(at) = view.collected_ms {
-        out.push_str(&format!(" · collected {}", short_clock(at, now_ms)));
+        out.push_str(&format!(" · status collected {}", clock(at)));
     }
     out.push('\n');
+    let paragraph = |out: &mut String, text: &str| {
+        out.push_str(&wrapped("  ", text));
+        out.push('\n');
+    };
+    paragraph(&mut out, "Session records and proposed instructions are read now. Repository checks, \
+        pull requests and token usage were collected separately; each source has its own date below.");
     // GitHub was read from where the snapshot asked, not from `since`.
     let pull_requests_from = view
         .github_from()
         .map_or(from.github_ms, |read| read.max(from.github_ms));
     if pull_requests_from > from.sessions_ms + MINUTE_MS {
         out.push_str(&format!(
-            "pull requests only since {}: GitHub was read from there\n",
+            "Pull request activity is available only since {}; earlier activity was not collected.\n",
             clock(pull_requests_from)
         ));
     }
     if let Some(pending) = pending {
-        out.push_str(&format!("{pending}\n"));
+        paragraph(&mut out, &clean(pending));
+    }
+    if view.standing.iter().any(|item| item.kind == Kind::Main) {
+        paragraph(&mut out, "A missing passing result is not a report of failed tests. \
+            Explicit failures are counted separately; remote CI success and local verified receipts \
+            are different observations. Branch tips are those last fetched in the local clone.");
     }
     let width = repo_width(view.standing.iter().chain(events.iter().copied()));
     let mut section = |title: &str, items: Vec<&Item>| {
         if !items.is_empty() {
             out.push_str(&format!("\n{title}\n"));
             for item in items {
-                out.push_str(&row(item, width));
+                out.push_str(&full_row(item, width));
                 out.push('\n');
             }
         }
     };
-    section("Still open", view.standing.iter().collect());
+    section("Needs your attention", view.standing.iter().collect());
     let of = |kinds: &[fn(Kind) -> bool]| -> Vec<&Item> {
         events
             .iter()
@@ -1194,35 +1393,59 @@ fn full(
             .collect()
     };
     section("Sessions ended", of(&[|k| matches!(k, Kind::Ended { .. })]));
-    section("Landed", of(&[|k| k == Kind::Merged]));
+    section("Pull requests merged", of(&[|k| k == Kind::Merged]));
     section(
         "Pull requests",
         of(&[|k| k == Kind::Opened, |k| k == Kind::Closed]),
     );
+    if let Some(sessions) = sessions_ended(&events, false) {
+        paragraph(&mut out, &format!("{sessions}. A process exit describes the agent process, \
+            not task completion or test results. Missing notes are missing documentation, not failed code. \
+            Elapsed time includes idle time."));
+        paragraph(&mut out, "Token counts include input, output and cache writes. Cached input is counted separately \
+            as cache-read tokens, not filesystem reads or provider charges. Unavailable usage is unknown, not zero.");
+    }
+    if let Some(prs) = pull_requests(&events) {
+        paragraph(&mut out, &prs);
+    }
     if events.is_empty() {
         out.push_str(&format!(
-            "\nNothing new happened since {}.\n",
+            "\nNo unread activity recorded since {}.\n",
             clock(from.sessions_ms)
         ));
     }
     if let Some(today) = view.today {
         let waiting = &view.waiting[today];
-        out.push_str("\nProposal of the day\n");
-        out.push_str(&cut(
+        out.push_str("\nProposed agent instructions — your decision\n");
+        paragraph(
+            &mut out,
             &format!(
-                "  {} ({}, since {})",
-                clean(&waiting.name),
-                clean(&waiting.scope),
-                clean(&waiting.since)
+                "{} waiting. Nothing becomes an instruction until you decide. \
+            One waiting proposal is shown below; it was not necessarily created today.",
+                plural(view.waiting.len(), "proposal", "proposals")
             ),
-            WIDTH,
-        ));
-        out.push('\n');
-        out.push_str(&cut(&format!("  {}", clean(&waiting.title)), WIDTH));
-        out.push_str(&format!(
-            "\n  {} wait. Decide: ohjaa review\n",
-            view.waiting.len()
-        ));
+        );
+        paragraph(&mut out, &format!("Summary: {}", clean(&waiting.title)));
+        let scope = match waiting.scope.as_str() {
+            "mine" => "personal agent instructions",
+            "ours" => "shared agent instructions",
+            "repo" => "instructions for one repository",
+            "machine" => "instructions about this machine",
+            other => other,
+        };
+        paragraph(
+            &mut out,
+            &format!(
+                "Applies to: {} · Instruction dated: {} · Proposal: {}",
+                clean(scope),
+                clean(&waiting.since),
+                clean(&waiting.name)
+            ),
+        );
+        if let Some(repo) = &waiting.repo {
+            paragraph(&mut out, &format!("Repository: {}", clean(repo)));
+        }
+        paragraph(&mut out, "Read complete proposals and decide: ohjaa review");
     }
     if let Some(fleet) = fleet {
         out.push_str("\nNow\n");
@@ -1237,23 +1460,24 @@ fn full(
             Ok(fleet) if fleet.live.is_empty() => "  nobody is live".to_owned(),
             Ok(fleet) => format!("  {} live: {}", fleet.live.len(), fleet.live.join(", ")),
         };
-        out.push_str(&cut(&said, WIDTH));
-        out.push('\n');
+        paragraph(&mut out, &clean(&said));
     }
     if !view.parts.is_empty() || !view.unread.is_empty() {
         out.push_str("\nSources\n");
-        let ages: Vec<String> = view
-            .parts
-            .iter()
-            .map(|(name, at, _)| format!("{name} {}", as_of(*at, now_ms)))
-            .collect();
-        if !ages.is_empty() {
-            out.push_str(&cut(&format!("  {}", ages.join(" · ")), WIDTH));
-            out.push('\n');
+        for (name, at, _) in &view.parts {
+            let meaning = match *name {
+                "marks" => "repository verification records",
+                "GitHub" => "pull request activity",
+                "vessa" => "recorded token usage",
+                other => other,
+            };
+            paragraph(
+                &mut out,
+                &format!("{name} ({meaning}) {}", as_of(*at, now_ms)),
+            );
         }
         for said in &view.unread {
-            out.push_str(&cut(&format!("  {said}"), WIDTH));
-            out.push('\n');
+            paragraph(&mut out, &clean(said));
         }
     }
     out
@@ -1335,28 +1559,50 @@ fn say_line(roots: &[PathBuf]) -> Result<()> {
     };
     let now = now_ms();
     let collected = collect::read(&dirs);
-    if old(collected.as_ref().map(|c| c.at_ms), now) {
-        start_collect(&dirs, roots);
-    }
+    let collecting =
+        old(collected.as_ref().map(|c| c.at_ms), now).then(|| start_collect(&dirs, roots));
     // A log a writer holds now is read at the next terminal: a terminal
     // never waits for one.
     let log = sessions::Reader::open_now(&sessions::store_path(&dirs.state))?;
-    let (logged, _) = log.all()?;
+    let (logged, unread_records) = log.all()?;
     drop(log);
     let (today, day) = local_day(now);
-    let view = build(
+    let mut view = build(
         &logged,
         report::waiting(&dirs),
         collected.as_ref(),
         now,
         day,
     );
+    let mut failures = Vec::new();
+    if !unread_records.is_empty() {
+        failures.push(format!(
+            "{} agent session record(s) could not be read; other readable records are retained",
+            unread_records.len()
+        ));
+    }
+    if let Some(Collecting::Failed(why)) = collecting {
+        failures.push(format!("Could not refresh cached status: {}", clean(&why)));
+    }
+    for why in failures {
+        let mut item = standing(
+            Kind::Source,
+            Class::Unknown,
+            source_key("status", &[&why]),
+            "status",
+            format!("{why} · Inspect: ohjaa digest"),
+        );
+        item.brief = Some(why.clone());
+        view.standing.push(item);
+        view.unread.push(why);
+    }
+    view.standing
+        .sort_by(|a, b| (&a.class, &a.repo, &a.key).cmp(&(&b.class, &b.repo, &b.key)));
     let old_seen = Seen::read(&dirs).unwrap_or_else(|| Seen::first(now));
     let mut out = std::io::stdout().lock();
-    // The day's digest, from the snapshot there is (said as of when it was
-    // collected; a fresh one is on its way). It is marked shown before it is
-    // shown: where it cannot be marked, it is never shown, rather than at
-    // every terminal.
+    // Show attention once per day or on change, never activity. Mark notices
+    // before printing: where they cannot be marked, do not repeat them at
+    // every terminal. The activity window advances only in the full digest.
     if old_seen.day.as_deref() != Some(today.as_str()) {
         let from = old_seen.daily_from(now);
         let said = daily(&view, &from, old_seen.unseen.as_ref(), now);
@@ -1369,8 +1615,6 @@ fn say_line(roots: &[PathBuf]) -> Result<()> {
         return Ok(());
     }
     if let Some(text) = one_line(&news(&view, &old_seen)) {
-        out.write_all(text.as_bytes())?;
-        out.flush()?;
         advance(
             &view,
             &old_seen,
@@ -1380,6 +1624,8 @@ fn say_line(roots: &[PathBuf]) -> Result<()> {
             &today,
         )
         .write(&dirs)?;
+        out.write_all(text.as_bytes())?;
+        out.flush()?;
     }
     Ok(())
 }
@@ -1573,7 +1819,7 @@ pub fn collect_now(repos: Result<Vec<PathBuf>>, background: bool) -> Result<i32>
             "vessa",
             &collected.usage,
             format!(
-                "{} costed",
+                "{} with token usage",
                 plural(collected.usage.value.len(), "session", "sessions")
             ),
         );
@@ -1674,6 +1920,100 @@ mod tests {
     }
 
     #[test]
+    fn startup_is_attention_only_and_does_not_consume_activity() {
+        let logged = [session("finished", 3 * HOUR_MS, Some(HOUR_MS), false)];
+        let mut collected = snapshot(NOW);
+        collected.github.value = vec![pr(7, 3 * HOUR_MS, Some(HOUR_MS))];
+        let view = view(&logged, Some(&collected));
+        let from = Window::at(NOW - DAY_MS);
+        assert_eq!(daily(&view, &from, None, NOW), None);
+        assert_eq!(one_line(&news(&view, &Seen::first(NOW))), None);
+        let first = advance(
+            &view,
+            &Seen::first(NOW),
+            Some(&collected),
+            NOW,
+            Shown::Daily {
+                from: from.clone(),
+                cut: false,
+            },
+            "d",
+        );
+        let tomorrow = advance(
+            &view,
+            &first,
+            Some(&collected),
+            NOW + DAY_MS,
+            Shown::Line,
+            "d2",
+        );
+        assert_eq!(tomorrow.full_from(NOW + DAY_MS), from);
+        let digest = full(&view, &tomorrow.full_from(NOW + DAY_MS), None, None, NOW);
+        assert!(digest.contains("ohjaa session finished"), "{digest}");
+        assert!(digest.contains("#7 merged"), "{digest}");
+    }
+
+    #[test]
+    fn verification_notices_name_the_commit_and_do_not_suggest_a_wrong_checkout() {
+        let mut collected = snapshot(NOW - 3 * HOUR_MS);
+        collected.local.value.branches.push(Branch {
+            slug: "false-systems/work".into(),
+            branch: "main".into(),
+            tip: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            oldest: Some("abcdef0123456789abcdef0123456789abcdef01".into()),
+            unproven: 2,
+            as_of_ms: Some(NOW - 3 * HOUR_MS),
+            ..Branch::default()
+        });
+        let view = view(&[], Some(&collected));
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        for expected in [
+            "no verified passing result",
+            "0123456789abcdef0123456789abcdef01234567",
+            "Last checked:",
+            "ohjaa report --marks",
+            "not a report of failed tests",
+        ] {
+            assert!(digest.contains(expected), "missing {expected}: {digest}");
+        }
+        assert!(!digest.contains("Run: ohjaa gate"));
+    }
+
+    #[test]
+    fn digest_preserves_proposal_meaning_and_explains_session_records() {
+        let mut proposal = waiting(&"long-id-".repeat(20), "2026-10-20");
+        proposal.scope = "mine".into();
+        proposal.title =
+            "Keep a complete, understandable instruction instead of cutting away its meaning. "
+                .repeat(3);
+        let mut ended = session("inspect-me", HOUR_MS, Some(MINUTE_MS), false);
+        ended.intent = "interactive".into();
+        ended.outside_repo = true;
+        ended.repo = "/r/projects".into();
+        let view = build(
+            &[ended],
+            Ok(vec![proposal.clone()]),
+            Some(&snapshot(NOW)),
+            NOW,
+            0,
+        );
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        let flattened = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flattened.contains(proposal.title.trim()), "{digest}");
+        for expected in [
+            "task not recorded",
+            "process exited successfully (code 0)",
+            "ohjaa session inspect-me",
+            "personal agent instructions",
+            "not failed code",
+            "Cached input is counted separately",
+            "outside a repository",
+        ] {
+            assert!(digest.contains(expected), "missing {expected}: {digest}");
+        }
+    }
+
+    #[test]
     fn every_agent_marker_silences_the_line_and_a_persons_own_variables_do_not() {
         for marker in AGENT_MARKERS {
             let env = |name: &str| (name == marker).then(|| OsString::from("1"));
@@ -1689,28 +2029,30 @@ mod tests {
     }
 
     #[test]
-    fn a_line_says_what_is_new_once_and_seeing_it_moves_the_cursor() {
+    fn session_activity_stays_in_the_digest_including_late_records() {
         let logged = [
             session("a", 3 * HOUR_MS, Some(HOUR_MS), true),
             session("b", 3 * HOUR_MS, Some(HOUR_MS), false),
             session("old", 9 * DAY_MS, Some(8 * DAY_MS), false),
         ];
-        let view = view(&logged, None);
+        let collected = snapshot(NOW);
+        let view = view(&logged, Some(&collected));
         let first = Seen::first(NOW);
-        let line = one_line(&news(&view, &first)).expect("something is new");
-        assert!(
-            line.contains("2 sessions ended (1 without read-back/handover)"),
-            "{line}"
-        );
+        assert_eq!(one_line(&news(&view, &first)), None);
+        assert_eq!(after(&view, &first.full_from(NOW)).len(), 2);
         let seen = advance(&view, &first, None, NOW, Shown::Line, "d");
         assert_eq!(one_line(&news(&view, &seen)), None, "seen is not new");
         // The record of a session that ended before the person looked, read
         // after: new once.
         let mut later = logged.to_vec();
         later.push(session("late", 2 * HOUR_MS, Some(MINUTE_MS), false));
-        let view = build(&later, Ok(Vec::new()), None, NOW + MINUTE_MS, 0);
-        let line = one_line(&news(&view, &seen)).expect("the late record is new");
-        assert!(line.contains("1 session ended (1 without"), "{line}");
+        let view = build(&later, Ok(Vec::new()), Some(&collected), NOW + MINUTE_MS, 0);
+        assert_eq!(one_line(&news(&view, &seen)), None);
+        let keys = after(&view, &seen.full_from(NOW))
+            .iter()
+            .map(|item| item.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["session:late", "session:a", "session:b"]);
         let seen = advance(&view, &seen, None, NOW + MINUTE_MS, Shown::Line, "d");
         assert_eq!(one_line(&news(&view, &seen)), None);
     }
@@ -1732,10 +2074,11 @@ mod tests {
         let mut fresh = snapshot(NOW + MINUTE_MS);
         fresh.github.value = vec![pr(7, 4 * HOUR_MS, Some(4 * HOUR_MS))];
         let view = build(&[], Ok(Vec::new()), Some(&fresh), NOW + MINUTE_MS, 0);
-        let line = one_line(&news(&view, &seen)).expect("merged after the snapshot");
-        assert!(line.contains("PRs: 1 merged"), "{line}");
+        assert_eq!(one_line(&news(&view, &seen)), None);
         // Opened and merged in the same stretch: said once, as merged.
-        assert!(!line.contains("opened"), "{line}");
+        let events = after(&view, &seen.full_from(NOW));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].key, "pr:false-systems/sykli#7:merged");
     }
 
     #[test]
@@ -1775,8 +2118,14 @@ mod tests {
         );
         let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
         assert!(line.chars().count() <= WIDTH + 1, "{line}");
-        assert!(line.starts_with("ohjaa · 3 branches not proven"), "{line}");
-        assert!(line.trim_end().ends_with("· ohjaa digest"), "{line}");
+        assert!(
+            line.starts_with("ohjaa · 3 branches need verification (checks failed)"),
+            "{line}"
+        );
+        assert!(
+            line.trim_end().ends_with("· Details: ohjaa digest"),
+            "{line}"
+        );
         // No ids in the line, and nothing raw from outside.
         assert!(!line.contains("oh-") && !line.contains("s1"), "{line}");
         let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
@@ -1786,10 +2135,63 @@ mod tests {
         for row in daily.lines() {
             assert!(row.chars().count() <= WIDTH, "{row}");
         }
-        assert!(daily.contains("more: ohjaa digest"), "{daily}");
+        assert!(
+            daily.contains("Full details and activity: ohjaa digest"),
+            "{daily}"
+        );
+        assert!(
+            !daily.contains("sessions ended") && !daily.contains("#1"),
+            "{daily}"
+        );
         for row in full(&view, &Window::at(NOW - DAY_MS), None, None, NOW).lines() {
             assert!(row.chars().count() <= WIDTH, "{row}");
         }
+    }
+
+    #[test]
+    fn the_status_names_the_repository_and_explains_missing_checks() {
+        let mut collected = snapshot(NOW);
+        collected.local.value.branches.push(Branch {
+            slug: "false-systems/valvo".into(),
+            branch: "main".into(),
+            unproven: 2,
+            as_of_ms: Some(NOW),
+            ..Branch::default()
+        });
+        let view = view(&[], Some(&collected));
+        assert_eq!(
+            one_line(&news(&view, &Seen::first(NOW))).unwrap(),
+            "ohjaa · valvo main: no passing verification recorded for 2 commits · Details: ohjaa digest\n"
+        );
+        // A long name must not swallow the command that explains the warning.
+        collected.local.value.branches[0].slug =
+            format!("false-systems/{}", "long-name".repeat(30));
+        let view = build(&[], Ok(Vec::new()), Some(&collected), NOW, 0);
+        let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
+        assert!(line.chars().count() <= WIDTH + 1, "{line}");
+        assert!(line.ends_with(" · Details: ohjaa digest\n"), "{line}");
+    }
+
+    #[test]
+    fn full_digest_rows_wrap_without_discarding_details() {
+        let mut item = standing(Kind::Main, Class::Evidence, "key".into(), "work",
+            "claude \"costed\" · exit 0 · 0s · missing startup notes and handover · 115k tokens + 2.9M cache reads".into());
+        let row = full_row(&item, 5);
+        assert!(row.contains("missing startup notes and handover"), "{row}");
+        assert!(row.contains("115k tokens + 2.9M cache reads"), "{row}");
+        assert!(
+            row.lines().all(|line| line.chars().count() <= WIDTH),
+            "{row}"
+        );
+        item.repo = "repository".repeat(30);
+        item.text = "x".repeat(300);
+        let row = full_row(&item, 12);
+        assert!(
+            row.lines().all(|line| line.chars().count() <= WIDTH),
+            "{row}"
+        );
+        assert_eq!(row.chars().filter(|c| *c == 'x').count(), 300);
+        assert!(!row.contains('…'));
     }
 
     #[test]
@@ -1845,10 +2247,13 @@ mod tests {
         );
         let full = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(
-            full.contains("main: 1 unproven (1 failed) since 093dfc5. Prove it: ohjaa gate"),
+            full.contains("main: no verified passing result for 1 recent commit (1 failed)"),
             "{full}"
         );
-        assert!(full.contains("still running, its ohjaa gone"), "{full}");
+        assert!(
+            full.contains("Agent still running without its Ohjaa supervisor"),
+            "{full}"
+        );
         // A new tip is a new item: said again.
         let seen = advance(
             &view,
@@ -1862,13 +2267,13 @@ mod tests {
         let view = build(&logged, Ok(Vec::new()), Some(&collected), NOW, 0);
         let line = one_line(&news(&view, &seen)).unwrap();
         assert!(
-            line.contains("ohjaa · failed main: 1 unproven (1 failed) · ohjaa digest"),
+            line.contains("failed main: 1 verification failed"),
             "{line}"
         );
     }
 
     #[test]
-    fn one_proposal_a_day_with_its_id_and_the_command_that_decides_it() {
+    fn startup_counts_proposed_instructions_and_digest_explains_one_without_truncation() {
         let proposals: Vec<Waiting> = ["b", "a", "c"]
             .iter()
             .map(|name| waiting(name, "2026-10-20"))
@@ -1878,40 +2283,49 @@ mod tests {
             let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
                 .unwrap()
                 .0;
-            let line = daily
-                .lines()
-                .find(|line| line.contains("today's proposal"))
-                .unwrap()
-                .to_owned();
-            assert!(line.ends_with("· 3 wait · ohjaa review"), "{line}");
-            assert!(line.chars().count() <= WIDTH, "{line}");
-            line
+            assert!(
+                daily.contains("Your decision: 3 proposed agent instructions"),
+                "{daily}"
+            );
+            assert!(daily.contains("Read and decide: ohjaa review"), "{daily}");
+            assert!(!daily.contains("today's proposal"), "{daily}");
+            let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+            digest.split_whitespace().collect::<Vec<_>>().join(" ")
         };
         // Oldest first, then by name; one a day, in turn.
-        assert!(today(0).contains("today's proposal a (ours): What a says"));
-        assert!(today(1).contains("today's proposal b (ours)"));
-        assert!(today(2).contains("today's proposal c (ours)"));
-        assert!(today(3).contains("today's proposal a (ours)"));
+        assert!(today(0)
+            .contains("Summary: What a says, at some length so that it has to be cut short"));
+        assert!(today(1).contains("Summary: What b says"));
+        assert!(today(2).contains("Summary: What c says"));
+        assert!(today(3).contains("Summary: What a says"));
         let view = build(&[], Ok(proposals), Some(&snapshot(NOW)), NOW, 4);
         let full = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
-        assert!(full.contains("Proposal of the day\n  b (ours, since 2026-10-20)"));
-        assert!(full.contains("3 wait. Decide: ohjaa review"), "{full}");
+        assert!(full.contains("Proposed agent instructions — your decision"));
+        assert!(full.contains("3 proposals waiting"), "{full}");
+        assert!(
+            full.contains("Read complete proposals and decide: ohjaa review"),
+            "{full}"
+        );
     }
 
     #[test]
     fn new_proposals_are_news_once() {
         let mut proposals = vec![waiting("a", "2026-10-20")];
-        let view = build(&[], Ok(proposals.clone()), None, NOW, 0);
+        let collected = snapshot(NOW);
+        let view = build(&[], Ok(proposals.clone()), Some(&collected), NOW, 0);
         let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
-        assert!(line.contains("1 new proposal"), "{line}");
+        assert!(
+            line.contains("1 proposed agent instruction awaits your decision"),
+            "{line}"
+        );
         let seen = advance(&view, &Seen::first(NOW), None, NOW, Shown::Line, "d");
         assert_eq!(one_line(&news(&view, &seen)), None);
         proposals.push(waiting("b", "2026-10-21"));
         proposals.push(waiting("c", "2026-10-21"));
-        let view = build(&[], Ok(proposals), None, NOW, 0);
+        let view = build(&[], Ok(proposals), Some(&collected), NOW, 0);
         assert!(one_line(&news(&view, &seen))
             .unwrap()
-            .contains("2 new proposals"));
+            .contains("2 proposed agent instructions await your decision"));
     }
 
     #[test]
@@ -1925,10 +2339,9 @@ mod tests {
         let mut collected = snapshot(NOW);
         collected.usage.value.insert(
             "costed".into(),
-            Cost {
+            TokenUsage {
                 tokens: Some(115_248),
                 cache_reads: Some(2_923_935),
-                usd_micros: None,
             },
         );
         let view = view(&[gone, orphan, costed], Some(&collected));
@@ -1942,17 +2355,47 @@ mod tests {
         };
         assert_eq!(
             said("killed"),
-            "claude \"fix the parser\" · killed (signal 9) · 60m · no read-back or handover"
+            format!(
+                "claude \"fix the parser\" · killed (signal 9) · elapsed 60m · ended {} · \
+                no task confirmation or completion note recorded · Inspect: ohjaa session killed",
+                clock(NOW - HOUR_MS)
+            )
         );
         assert_eq!(
             said("orphan"),
-            "claude \"fix the parser\" · orphaned · no read-back or handover"
+            format!(
+                "claude \"fix the parser\" · orphaned · ended {} · \
+                no task confirmation or completion note recorded · Inspect: ohjaa session orphan",
+                clock(NOW - HOUR_MS)
+            )
         );
         assert_eq!(
             said("costed"),
-            "claude \"fix the parser\" · exit 0 · 60m · no read-back · 115k tokens + 2.9M cache \
-             reads"
+            format!("claude \"fix the parser\" · process exited successfully (code 0) · elapsed 60m · \
+                ended {} · no task confirmation recorded · 115k tokens + 2.9M cache reads · Inspect: ohjaa session costed", clock(NOW-HOUR_MS))
         );
+    }
+
+    #[test]
+    fn a_legacy_snapshot_never_displays_its_currency_estimate() {
+        let usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "tokens": 115_248, "cache_reads": 2_923_935, "usd_micros": 9_000_000
+        }))
+        .unwrap();
+        assert_eq!(
+            usage_text(&usage).as_deref(),
+            Some("115k tokens + 2.9M cache reads")
+        );
+        let saved = serde_json::to_value(&usage).unwrap();
+        assert_eq!(
+            saved,
+            serde_json::json!({"tokens":115_248,"cache_reads":2_923_935})
+        );
+        let unknown: TokenUsage = serde_json::from_value(serde_json::json!({
+            "tokens": null, "cache_reads": null, "usd_micros": 9_000_000
+        }))
+        .unwrap();
+        assert_eq!(usage_text(&unknown), None);
     }
 
     /// Review of #63, finding 1: what could not be read is said where the
@@ -1972,19 +2415,22 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                "1 could not be read, as of 08:00 UTC: false-systems/valvo: not marked: no clone",
-                "unavailable, as of 08:00 UTC: gh api graphql: not logged in",
+                "Repository verification records: 1 could not be read, as of 2027-01-15 08:00 UTC: false-systems/valvo: not marked: no clone · Retry collecting status: ohjaa collect",
+                "Pull request activity: unavailable, as of 2027-01-15 08:00 UTC: gh api graphql: not logged in · Retry collecting status: ohjaa collect",
             ]
         );
         let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
         assert!(
-            line.contains("marks: 1 could not be read · GitHub: unavailable"),
+            line.contains("Repository verification records: 1 could not be read")
+                && line.contains("more"),
             "{line}"
         );
         let full = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(full.contains("! marks"), "{full}");
         assert!(
-            full.contains("Sources\n  marks as of 08:00 UTC · GitHub as of 08:00 UTC"),
+            full.contains(
+                "Sources\n  marks (repository verification records) as of 2027-01-15 08:00 UTC"
+            ) && full.contains("GitHub (pull request activity) as of 2027-01-15 08:00 UTC"),
             "{full}"
         );
         // Nothing collected yet is unknown too, not nothing.
@@ -2027,8 +2473,11 @@ mod tests {
         assert_eq!(failed.standing[0].class, Some(Class::Failed));
         assert_eq!(
             failed.standing[0].text,
-            "main: 3 unproven (1 failed) since 1a2b3c4, as of 05:00 UTC (unread since). Prove \
-             it: ohjaa gate"
+            format!("Repository: false-systems/habitat · main: no verified passing result for 3 recent commits (1 failed) · \
+                Last checked: {} · Latest observed commit: 86bd44c0 · Oldest without a passing result: 1a2b3c4d · \
+                Inspect results: ohjaa report --marks · To run checks, use a checkout of this repository at the latest \
+                observed commit; ohjaa gate proves that checkout's HEAD, not a branch named in this notice · \
+                Could not refresh: git: cannot run", clock(NOW-3*HOUR_MS))
         );
         assert!(failed.incomplete());
         // An old read, not a failed one, is said with its age too.
@@ -2036,7 +2485,9 @@ mod tests {
         collected.local.gaps.clear();
         let view = view(&[], Some(&collected));
         assert!(
-            view.standing[0].text.contains(", as of 05:00 UTC."),
+            view.standing[0]
+                .text
+                .contains(&format!("Last checked: {}", clock(NOW - 3 * HOUR_MS))),
             "{}",
             view.standing[0].text
         );
@@ -2069,12 +2520,8 @@ mod tests {
         );
         assert_eq!(
             cut.daily_from(NOW),
-            Window {
-                sessions_ms: NOW,
-                github_ms: NOW - 3 * HOUR_MS,
-                said: BTreeSet::new(),
-            },
-            "the next day's starts where GitHub was read to"
+            from,
+            "opening a terminal never advances the activity window"
         );
         let whole = advance(
             &view,
@@ -2155,31 +2602,25 @@ mod tests {
     /// Second review of #63, finding 2: the day's digest points to what an
     /// earlier one left out while it is unread, within its lines.
     #[test]
-    fn the_days_digest_points_to_what_an_earlier_one_left_out() {
+    fn unread_history_does_not_turn_into_startup_attention() {
         let earlier = Window::at(NOW - 2 * DAY_MS);
         let quiet = build(&[], Ok(Vec::new()), Some(&snapshot(NOW)), NOW, 0);
-        let (said, cut) = daily(&quiet, &Window::at(NOW - DAY_MS), Some(&earlier), NOW)
-            .expect("said, though nothing else is");
-        assert!(!cut);
-        assert!(
-            said.trim_end().ends_with(&format!(
-                "  … and what an earlier digest left out, since {}: ohjaa digest",
-                short_clock(NOW - 2 * DAY_MS, NOW)
-            )),
-            "{said}"
+        assert_eq!(
+            daily(&quiet, &Window::at(NOW - DAY_MS), Some(&earlier), NOW),
+            None
         );
         let mut busy = snapshot(NOW);
         busy.github.value = (1..40).map(|n| pr(n, HOUR_MS, Some(HOUR_MS / 2))).collect();
         let view = build(&[], Ok(Vec::new()), Some(&busy), NOW, 0);
-        let (said, cut) = daily(&view, &Window::at(NOW - DAY_MS), Some(&earlier), NOW).unwrap();
-        assert!(cut);
-        assert_eq!(said.lines().count(), DAILY_LINES, "{said}");
-        let last = said.lines().last().unwrap();
-        assert!(
-            last.starts_with("  … 26 more, and what an earlier digest left out, since "),
-            "{said}"
+        assert_eq!(
+            daily(&view, &Window::at(NOW - DAY_MS), Some(&earlier), NOW),
+            None
         );
-        assert!(last.chars().count() <= WIDTH, "{last}");
+        assert_eq!(
+            after(&view, &earlier).len(),
+            39,
+            "every merged PR remains available"
+        );
     }
 
     /// Second review of #63, finding 3: a pull request GitHub indexes late,
@@ -2265,6 +2706,86 @@ mod tests {
         assert!(keys(&view, &seen.daily_from(NOW + HOUR_MS)).is_empty());
     }
 
+    #[test]
+    fn sessions_at_the_digest_boundary_are_read_once_without_hiding_late_records() {
+        let first = session("first", 10_000, Some(0), true);
+        let shown = view(std::slice::from_ref(&first), None);
+        let seen = advance(&shown, &Seen::first(NOW), None, NOW + 700, Shown::Full, "d");
+        assert!(after(&shown, &seen.full_from(NOW + 800)).is_empty());
+
+        let late = session("late", 9_000, Some(0), true);
+        let next = view(&[first, late], None);
+        let unread = after(&next, &seen.full_from(NOW + 800));
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].key, "session:late");
+    }
+
+    #[test]
+    fn open_session_notices_retain_the_complete_recorded_task() {
+        let mut open = session("long", 2 * DAY_MS, None, true);
+        open.intent =
+            "Investigate the parser without changing how incomplete source records are reported"
+                .into();
+        let view = view(std::slice::from_ref(&open), None);
+        let notice = view
+            .standing
+            .iter()
+            .find(|item| item.kind == Kind::OpenLong)
+            .unwrap();
+        assert!(notice.text.contains(&open.intent));
+        assert!(notice.text.contains("ohjaa session long"));
+    }
+
+    #[test]
+    fn a_changed_verification_result_at_the_same_commit_needs_attention() {
+        let mut collected = snapshot(NOW);
+        collected.local.value.branches.push(Branch {
+            slug: "example/project".into(),
+            branch: "main".into(),
+            tip: Some("a".repeat(40)),
+            unproven: 1,
+            as_of_ms: Some(NOW),
+            ..Branch::default()
+        });
+        let initial = view(&[], Some(&collected));
+        let seen = advance(
+            &initial,
+            &Seen::first(NOW),
+            Some(&collected),
+            NOW,
+            Shown::Line,
+            "d",
+        );
+        collected.local.value.branches[0].failed = 1;
+        let failed = view(&[], Some(&collected));
+        assert_eq!(
+            one_line(&news(&failed, &seen)),
+            Some("ohjaa · project main: 1 verification failed · Details: ohjaa digest\n".into())
+        );
+    }
+
+    #[test]
+    fn a_stale_concurrent_digest_cannot_undo_a_boundary_acknowledgement() {
+        let empty = view(&[], None);
+        let fresh = view(&[session("just-ended", 10_000, Some(0), true)], None);
+        let first = advance(&fresh, &Seen::first(NOW), None, NOW + 200, Shown::Full, "d");
+        let stale = advance(&empty, &first, None, NOW + 100, Shown::Full, "d");
+        assert_eq!(stale.digest.as_ref().unwrap().sessions_ms, NOW + 200);
+        assert!(after(&fresh, &stale.full_from(NOW + 400)).is_empty());
+    }
+
+    #[test]
+    fn long_pull_request_urls_remain_usable_inspection_actions() {
+        let mut collected = snapshot(NOW);
+        let mut pull_request = pr(12345, HOUR_MS, Some(MINUTE_MS));
+        pull_request.repo = format!("{}/{}", "o".repeat(39), "r".repeat(80));
+        pull_request.url = format!("https://github.com/{}/pull/12345", pull_request.repo);
+        let url = pull_request.url.clone();
+        collected.github.value.push(pull_request);
+        let view = view(&[], Some(&collected));
+        assert!(full(&view, &Window::at(NOW - DAY_MS), None, None, NOW).contains(&url));
+    }
+
     /// Second review of #63, a nit: a source is said in the line for each
     /// failure, not once while the first stands; the same failure with its
     /// numbers moved (a count, a time) is the same.
@@ -2286,7 +2807,10 @@ mod tests {
         collected.github.error = Some("gh api graphql: connection refused".into());
         let other = view(&[], Some(&collected));
         let line = one_line(&news(&other, &seen)).expect("another failure");
-        assert!(line.contains("GitHub: unavailable"), "{line}");
+        assert!(
+            line.contains("Pull request activity: unavailable"),
+            "{line}"
+        );
         assert!(!line.contains("marks"), "the marks failed the same: {line}");
         let seen = advance(&other, &seen, Some(&collected), NOW, Shown::Line, "d");
         collected
@@ -2295,7 +2819,10 @@ mod tests {
             .push("false-systems/habitat: not marked: no clone".into());
         let more = view(&[], Some(&collected));
         let line = one_line(&news(&more, &seen)).expect("one more could not be read");
-        assert!(line.contains("marks: 2 could not be read"), "{line}");
+        assert!(
+            line.contains("Repository verification records: 2 could not be read"),
+            "{line}"
+        );
         let seen = advance(&more, &seen, Some(&collected), NOW, Shown::Line, "d");
         // The same cap, read later: its count and time moved, nothing new.
         collected.github.error = None;
@@ -2318,7 +2845,7 @@ mod tests {
         let week = full(&view, &Window::at(NOW - 7 * DAY_MS), None, None, NOW);
         assert!(
             week.contains(&format!(
-                "pull requests only since {}: GitHub was read from there",
+                "Pull request activity is available only since {}; earlier activity was not collected.",
                 clock(NOW - DAY_MS)
             )),
             "{week}"
