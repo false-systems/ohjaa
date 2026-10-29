@@ -3352,6 +3352,23 @@ fn malformed_reteaching_answers_leave_the_correction_available_for_retry() {
 }
 
 #[test]
+fn review_does_not_claim_an_empty_queue_when_a_proposal_is_unreadable() {
+    let fixture = Fixture::new("review-unreadable");
+    let proposals = fixture.dir.join("state/ohjaa/proposals/mine");
+    fs::create_dir_all(&proposals).unwrap();
+    fs::write(proposals.join("broken.md"), "not a knowledge node\n").unwrap();
+    let (stdout, stderr, code) = output_of(fixture.ohjaa().args(["review", "--list"]));
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    assert!(stderr.contains("unreadable proposal"), "{stderr}");
+    assert!(
+        stdout.contains("No readable proposals; 1 could not be read"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("nothing is waiting"), "{stdout}");
+    fixture.cleanup();
+}
+
+#[test]
 fn a_redacted_node_id_cannot_be_recorded_as_sent_evidence() {
     let fixture = Fixture::new("redacted-evidence-id");
     let repo = fixture.make_git_repo("work");

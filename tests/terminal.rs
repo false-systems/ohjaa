@@ -779,6 +779,16 @@ fn review_invalid_input_keeps_the_same_proposal_and_quit_keeps_the_rest() {
         "{said}"
     );
     assert!(tty.history().is_empty());
+    tty.type_line("ohjaa review");
+    assert!(tty.expect("[a]ccept", 10), "{}", tty.report());
+    tty.send("\u{4}");
+    assert!(tty.shell_answers(10), "{}", tty.report());
+    let said = tty.all();
+    assert!(
+        said.contains("0 accepted, 0 rejected, 0 skipped; 2 still waiting"),
+        "{said}"
+    );
+    assert!(tty.history().is_empty());
 }
 
 #[test]
@@ -791,6 +801,9 @@ fn review_shows_a_readable_card_and_concise_success_without_hiding_history_failu
         "[user]\nname = Test Person\nemail = person@example.invalid\n",
     )
     .unwrap();
+    let claude = tty.dir.join("home/.claude/CLAUDE.md");
+    fs::create_dir_all(claude.parent().unwrap()).unwrap();
+    fs::write(&claude, "# Test instructions\n<!-- ohjaa:knowledge begin: mine and machine -->\nold\n<!-- ohjaa:knowledge end -->\n").unwrap();
     let (code, said) = tty.run(
         "ohjaa propose --scope mine --id readable-review --kind lesson \
          --origin 'Synthetic review fixture' 'Keep each choice easy to understand.'",
@@ -812,7 +825,16 @@ fn review_shows_a_readable_card_and_concise_success_without_hiding_history_failu
     assert!(!said.contains("  wrote   "), "{said}");
     assert!(!said.contains("  removed "), "{said}");
     assert!(!said.contains("  committed in "), "{said}");
+    assert!(
+        said.contains("Updated agent instructions: Claude Code."),
+        "{said}"
+    );
+    assert!(!said.contains("rewrote the knowledge block"), "{said}");
+    assert!(fs::read_to_string(&claude)
+        .unwrap()
+        .contains("Keep each choice easy to understand."));
     assert_eq!(tty.history().len(), 1);
+    eprintln!("Synthetic terminal preview:\n{said}");
 
     let (code, said) = tty.run(
         "ohjaa propose --scope mine --id another-rule --kind lesson \
