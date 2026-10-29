@@ -3352,6 +3352,57 @@ fn malformed_reteaching_answers_leave_the_correction_available_for_retry() {
 }
 
 #[test]
+fn a_redacted_node_id_cannot_be_recorded_as_sent_evidence() {
+    let fixture = Fixture::new("redacted-evidence-id");
+    let repo = fixture.make_git_repo("work");
+    // Synthetic, valid kebab-case metadata, not an actual credential.
+    let id = ["s", "k-", &"a1".repeat(12)].concat();
+    fixture.node(
+        &fixture.dir.join("config/ohjaa/mine"),
+        &id,
+        "decision",
+        "Use Rust for code.",
+    );
+    fixture.said(&[vessa_line(
+        "2026-09-21T10:00:00Z",
+        &repo.display().to_string(),
+        "I told you to use Rust",
+        None,
+    )]);
+    fs::write(
+        fixture.dir.join("answer.json"),
+        serde_json::json!({"drafts":[],"reteaches":[{"candidate":1,"ids":[id]}]}).to_string(),
+    )
+    .unwrap();
+    let drafter = answering_drafter(&fixture, &fixture.dir);
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args([
+                "intake",
+                "--source",
+                "transcripts",
+                "--no-prefilter",
+                "--since",
+                "2026-09-01",
+                "--drafter",
+            ])
+            .arg(&drafter)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let sent = fs::read_to_string(fixture.dir.join("prompt-1.txt")).unwrap();
+    assert!(!sent.contains(&id));
+    assert!(sent.contains("[redacted]"));
+    let evidence = fixture.dir.join("state/ohjaa/knowledge-evidence.json");
+    assert!(
+        !evidence.exists(),
+        "an invisible identifier is not evidence"
+    );
+    fixture.cleanup();
+}
+
+#[test]
 fn a_file_inside_a_repository_gets_only_shared_knowledge() {
     if !git_available() {
         return;

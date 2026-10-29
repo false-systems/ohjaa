@@ -1990,7 +1990,11 @@ impl Known {
                 budget -= line.len();
                 *redacted += in_head + in_first;
                 out.push_str(&line);
-                sent.push((**present).clone());
+                // Evidence can name only an identifier that survived scrubbing
+                // and normalization in the header actually sent to the drafter.
+                if line.starts_with(&format!("- {} [", present.id)) {
+                    sent.push((**present).clone());
+                }
                 shown += 1;
             }
             if shown < nodes.len() {
@@ -4278,6 +4282,60 @@ mod tests {
         assert!(shown
             .cited(&["current-lesson-0599".into()], &batch)
             .is_empty());
+    }
+
+    #[test]
+    fn evidence_cannot_name_a_redacted_identifier_but_can_name_a_visible_one() {
+        let hidden = fake(&["s", "k-", &"a1".repeat(12)]);
+        let repo_token = fake(&["s", "k-", &"b2".repeat(12)]);
+        let secret_repo = format!("/r/project {repo_token}");
+        let loaded = Loaded {
+            nodes: vec![
+                faija_knowledge::Located {
+                    scope: Scope::Mine,
+                    node: lesson(&hidden, Status::Current, "A lesson in a scope."),
+                },
+                faija_knowledge::Located {
+                    scope: Scope::Repo,
+                    node: lesson("visible-lesson", Status::Current, "A lesson in a scope."),
+                },
+            ],
+            ..Loaded::default()
+        };
+        let known = Known::of(&loaded, &[], Some(Path::new(&secret_repo)));
+        let batch = vec![Candidate {
+            source: "claude",
+            at_ms: 1_000,
+            at: "1970-01-01T00:00:01Z".into(),
+            place: secret_repo.clone(),
+            who: "person".into(),
+            context: String::new(),
+            text: "Follow the rule I already gave you".into(),
+            session: Some("s1".into()),
+        }];
+        let (sent, _, shown) = prompt_with_evidence(&known, &batch);
+        assert!(!sent.contains(&hidden));
+        assert!(sent.contains("- [redacted] [mine/lesson/current]"));
+        assert!(
+            sent.contains("- visible-lesson [repo/lesson/current] in /r/project [redacted]"),
+            "{sent}"
+        );
+        let reteaches = vec![serde_json::json!({
+            "candidate": 1, "ids": [&hidden, "visible-lesson"]
+        })];
+        let (kept, dropped) = shown.retaught(&reteaches, &batch);
+        let visible = crate::evidence::NodeKey::new(
+            Scope::Repo,
+            Some(Path::new(&secret_repo)),
+            "visible-lesson",
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].node, visible);
+        assert_eq!(dropped.not_current, 1);
+        assert_eq!(
+            shown.cited(&[hidden, "visible-lesson".into()], &batch),
+            vec![visible]
+        );
     }
 
     #[test]
