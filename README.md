@@ -448,8 +448,8 @@ What could not be checked or judged never does.
 ## The human view: what happened, for the person
 
 ```bash
-ohjaa line            # at a terminal's opening: one line when something is new, else nothing
-ohjaa digest          # all you have not seen in full; moves the cursor
+ohjaa line            # at terminal startup: attention only, otherwise silent
+ohjaa digest          # attention details and unread activity; marks activity seen at a terminal
 ohjaa digest --since 7d   # a window instead; the cursor stays
 ohjaa collect         # gather the snapshot `line` reads (it starts this itself when it is old)
 ```
@@ -457,21 +457,26 @@ ohjaa collect         # gather the snapshot `line` reads (it starts this itself 
 An agent learns the state of the work from its briefing. A person learns it
 here. It records only: nothing is sent to anyone, decided or refused.
 
-- **`ohjaa line`** prints one line when something happened since the person
-  last saw the view, and nothing otherwise. The first `line` of each local
-  day prints the day's digest instead: at most 15 lines, what stands first,
-  then today's proposal, then what happened since the last digest. Seeing a
-  line or a digest moves the cursor. A line that has been seen is not said
-  again, and terminals opened together say it once: the one that claims
-  `seen.lock` says it.
-- **`ohjaa digest`** shows what the person has not seen in full: what the
-  day's digest left out (`… 44 more: ohjaa digest`), else what happened
-  since the last digest. What a day's digest left out stays there until it
-  is read in full, the earliest kept when several were cut, and each day's
-  digest points to it (`… and what an earlier digest left out, since …:
-  ohjaa digest`). Who is live it asks now, as `ohjaa fleet` does. It moves
-  the cursor under `seen.lock`; one that cannot claim it within 2 s shows
-  all the same and leaves the cursor, so nothing is said twice or lost.
+- **`ohjaa line`** shows only matters needing attention or a decision:
+  failed or missing verification, observations that could not be read,
+  sessions without an observed final state, long-open sessions, and proposed
+  agent instructions waiting for you. The first terminal of a local day
+  shows up to 15 lines of attention; later terminals show a short notice
+  only when attention changes. With no attention it is silent, even when
+  sessions ended or pull requests were merged. Silence is not a claim that
+  every system is healthy. Terminals opened together say a notice once:
+  the one that claims `seen.lock` says it.
+- **Opening a terminal never marks activity read.** The first startup
+  anchors the unread window, even when quiet; subsequent days do not move
+  that window. Existing unread positions from older versions are retained.
+- **`ohjaa digest`** shows attention details, unread agent sessions and
+  pull requests, proposed instructions and who is live. Each ended session
+  has its full recorded intent, end time, elapsed time and an inspection
+  command, `ohjaa session <id>`. A pull request has its URL. Reading a digest
+  at a person's terminal marks activity seen under `seen.lock`; piping it,
+  using `--since`, or running it inside an agent session does not. A digest
+  that cannot claim the lock within 2 s shows the same information but
+  leaves the cursor unchanged.
 - **Only a person sees it.** `line` prints, reads, writes and starts nothing
   unless stdout is a terminal and no agent session's marker is set:
   `OHJAA_SESSION`, `TOIMIJA_SESSION`, `TOIMIJA_RUN`, `CLAUDECODE`,
@@ -487,9 +492,10 @@ here. It records only: nothing is sent to anyone, decided or refused.
   and the proposals itself. Everything else comes from the snapshot `ohjaa
   collect` writes. When the snapshot is older than 15 minutes, `line` starts
   one collect in the background, detached, unless one is running, and says
-  what the snapshot holds with its age: the day's digest never waits for a
-  collect (`snapshot as of 23:10 UTC; a fresh collect runs in the
-  background`). `ohjaa digest` collects first when the snapshot is more than
+  what cached observations it has with their dates. Routine background
+  refresh alone is not an attention item. Cached observations are not the
+  age of live session records. A refresh that cannot start is reported.
+  `ohjaa digest` collects first when the snapshot is more than
   5 minutes old, and waits for it at most 10 s.
 - **`ohjaa collect`** asks three sources once, at the same time. A source
   that fails keeps what it held before, and is said to be as of then.
@@ -521,16 +527,27 @@ What stays until it is resolved comes first, in this order:
 1. a branch with a failed commit;
 2. what is unknown: a source that could not be read, a session still running
    with its ohjaa gone, an orphan, a commit sykli could say nothing about;
-3. a branch whose commits lack evidence (`main: 2 commits need passing checks
-   since 5fcdeef. Run: ohjaa gate`);
+3. a branch whose recent commits have no recorded verified passing result;
 4. what waits for a person: a session open more than a day.
 
-"Needs passing checks" means no verified passing result is recorded; it
-does not by itself mean a check failed. Failures are counted explicitly.
-"Startup notes" are the agent's confirmation that it understood the task
-and rules; a handover records what changed and what remains. Missing notes
-mean missing documentation, not failed code. The terminal summary ends with
-`Details: ohjaa digest` and says `more` when it leaves other updates out.
+Missing verification does not by itself mean tests failed. Failures are
+counted explicitly, and an unavailable source remains unknown. Local
+verified receipts and remote CI results are different observations. Branch
+details identify the repository, latest observed commit, oldest commit
+without a passing result, and when those facts were checked. Inspect them
+with `ohjaa report --marks`. Before running `ohjaa gate`, use a checkout of
+that repository at the recorded commit: the command proves the current
+checkout's `HEAD`, not whichever branch a notice names. Ohjaa does not switch
+checkouts on your behalf.
+
+An agent's process exit describes the process, not task completion or test
+results. Code 0 is successful process exit; another code has no inferred
+cause. Elapsed time includes idle time. A task confirmation records that the
+agent understood the task and rules; a completion note records what changed
+and what remains. Missing notes are missing documentation, not failed code.
+An `interactive` or empty launch intent is labelled **task not recorded**,
+not assumed idle. A launch outside a repository says so and names its folder
+and declared repository scopes, when recorded.
 
 A branch is said as it was last read: when that was not just now, with its
 age (`, as of 05:00 UTC (unread since)`), and it stays until a read resolves
@@ -550,11 +567,21 @@ collector reads Vessa's token-only `vessa-usage.v2` exports and also accepts
 the token fields of older v1 exports. It ignores legacy spending fields and
 never shows currency estimates, including from a previously saved snapshot.
 
-**Today's proposal:** one of the proposals waiting for a person, in turn,
-oldest first, a different one each day. It is shown with its id, and decided
-with `ohjaa review`. A new proposal is news in the line once.
+**Proposed agent instructions:** startup shows the waiting count and the
+`ohjaa review` command, which lets a person read complete proposals and
+decide what becomes an instruction. This is instruction review, not code
+review. The digest shows one waiting proposal in rotation, with its complete
+first-line summary before its id. It explains the scope (personal, shared,
+repository or machine) and labels the instruction's date without claiming
+it was created today or has waited since that date.
 
-Lines are at most 100 characters. They are plain words with no colour, and
+Lines wrap at 100 characters, except URLs kept intact for opening or copying.
+Details wrap rather than disappear; the
+short startup notice always retains `ohjaa digest` as its inspection action.
+Digest source dates are separate for repository verification, GitHub pull
+requests and Vessa token usage. These are human-readable changes only: no
+machine schema, observation, receipt or authority is changed.
+Lines use plain words with no colour, and
 ids appear only where a person needs one: a session to look at with `ohjaa
 session <id>`, a commit, a pull request, a proposal. Text from a source (a
 title, an intent, a tool's error) has every control character and bidi
@@ -562,9 +589,10 @@ control replaced with U+FFFD before it reaches the terminal.
 
 **State**, in `$XDG_STATE_HOME/ohjaa/human/`:
 - `seen.json`, the cursor: when the person last saw the view, the keys of
-  what they saw then (within the overlap), where the next digest begins and
-  where the earliest of what a day's digest left out begins (each with the
-  keys of what GitHub said in the 2 hours before it), and the day it was
+  attention they saw and activity read in full (within the overlap), where
+  unread activity begins and any older unread position retained from a
+  previous version (each with the keys of what GitHub said in the 2 hours
+  before it and sessions shown at the boundary second), and the day it was
   shown;
 - `seen.lock`, which the terminal saying the line, and `ohjaa digest`
   moving the cursor, hold with `flock(2)`;
@@ -584,8 +612,8 @@ switch over, once this ohjaa is installed:
    and `command -v viemari >/dev/null && viemari line`. `ohjaa shell-init zsh`
    now ends with `[[ ${OHJAA_LINE:-1} == 0 ]] || ohjaa line`, and the line
    `ohjaa apply` wrote already evals it.
-2. Run `ohjaa collect` once. The first terminal after that gets the day's
-   digest.
+2. Run `ohjaa collect` once. Startup then shows attention only; use
+   `ohjaa digest` to read activity and details.
 3. Archive viemari. Its state, `~/.local/state/viemari/`, can then be removed.
 
 Not carried over: viemari's lifecycle view (Intent, session, change,
