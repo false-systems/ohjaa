@@ -2852,6 +2852,18 @@ enum IntentOrigin {
 }
 
 impl Intent {
+    /// A concrete goal starts a turn when no explicit task was supplied.
+    /// Placeholder intents and an unchecked continuation without its goal stay idle.
+    fn assignment(&self) -> Option<&str> {
+        let text = self.text.trim();
+        (!text.is_empty()
+            && !text.eq_ignore_ascii_case("interactive")
+            && !text.eq_ignore_ascii_case("unknown")
+            && !(matches!(&self.origin, IntentOrigin::Unchecked(_))
+                && text == format!("continuing intent {}", self.id)))
+        .then_some(self.text.as_str())
+    }
+
     /// The line the briefing opens "How this session works" with.
     fn briefing_line(&self, session: &str) -> String {
         let origin = match &self.origin {
@@ -2871,10 +2883,11 @@ impl Intent {
         // The handshake leaving looks for in the agent's transcript (D7).
         format!(
             "{}; its intent is {}, {origin}. Continue it in a later session with: ohjaa \
-             run <agent> --intent-id {}\n",
+             run <agent> --intent-id {}\n\nCurrent session intent:\n{}\n\n",
             usage::handshake(session),
             self.id,
-            self.id
+            self.id,
+            self.text
         )
     }
 }
@@ -3360,7 +3373,12 @@ fn cmd_run(options: RunOptions<'_>) -> Result<i32> {
 
     let mut command = Command::new("toimija");
     command.arg("run").arg("--intent").arg(&intent.text);
-    if let Some(task) = task {
+    // Toimija's --task is also the turn-starting transport. Keep the session's
+    // explicit task unchanged: a goal transported here is still its Intent.
+    if let Some(task) = task
+        .filter(|task| !task.trim().is_empty())
+        .or_else(|| intent.assignment())
+    {
         command.arg("--task").arg(task);
     }
     if let Some(briefing) = &briefing {
@@ -4265,7 +4283,9 @@ fn lifecycle_briefing(intent: &str, root: &Path, in_repo: bool, scoped: &[PathBu
         .collect::<Vec<_>>()
         .join(", ");
     let phases = if !in_repo && scoped.is_empty() {
-        "2. This folder is not a Git repository, and no --scope named one. At leaving,
+        "2. This folder is not a Git repository, and no --scope named one. For the
+   assigned goal, identify the repositories needed and declare each before
+   working there. You do not need the person to choose repositories first. At leaving,
    ohjaa records the repositories directly in it whose branches or worktrees
    moved, but it cannot tell your work there from another agent's. Say in your
    handover what you changed, and in which repos. Declare any repo you work in
@@ -4297,8 +4317,11 @@ fn lifecycle_briefing(intent: &str, root: &Path, in_repo: bool, scoped: &[PathBu
     format!(
         "\
 How this session works (ohjaa):
-{intent}If no concrete task is assigned, acknowledge and wait; the wrapper has already
-recorded entry. Do not run orientation, discovery or handover tools just to start.
+{intent}A concrete intent is assigned work: start on that goal even without --task.
+An explicit task gives the specific work within that intent. If neither gives
+concrete work (for example, the intent is only \"interactive\"), acknowledge and
+wait; the wrapper has already recorded entry. Do not run orientation, discovery
+or handover tools just for an idle startup.
 Once a task is assigned, use this briefing and the Toimija packet as your starting
 knowledge. Read the named files to resolve gaps; do not repeat repository discovery.
 1. Before your first change, read back what you know:
@@ -4498,6 +4521,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_concrete_intents_supply_an_initial_assignment() {
+        let mut intent = Intent {
+            id: "in-1000-1".into(),
+            text: String::new(),
+            origin: IntentOrigin::New,
+        };
+        for text in ["", "  ", "unknown", "interactive", "INTERACTIVE"] {
+            intent.text = text.into();
+            assert_eq!(intent.assignment(), None, "{text:?}");
+        }
+        intent.text = "fix the parser".into();
+        assert_eq!(intent.assignment(), Some("fix the parser"));
+        intent.origin = IntentOrigin::Unchecked("log locked".into());
+        assert_eq!(intent.assignment(), Some("fix the parser"));
+        intent.text = "continuing intent in-1000-1".into();
+        assert_eq!(intent.assignment(), None);
+    }
 
     #[test]
     fn shell_words_read_back_unchanged() {
