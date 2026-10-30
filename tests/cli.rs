@@ -10916,6 +10916,104 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     fixture.cleanup();
 }
 
+/// Explicit opt-in: no build or runtime dependency on Vessa's repository.
+/// The real producer reads only the synthetic HOME made by this fixture.
+#[test]
+#[ignore = "set OHJAA_TEST_VESSA to an independently built Vessa binary"]
+fn real_vessa_producer_preserves_findings_excerpts_and_partial_retry_boundaries() {
+    let binary =
+        fs::canonicalize(std::env::var_os("OHJAA_TEST_VESSA").expect("set OHJAA_TEST_VESSA"))
+            .unwrap();
+    let fixture = Fixture::new("real-vessa");
+    fixture.human_view(false);
+    let repo = fixture.make_git_repo("work");
+    fixture
+        .set_context(r#"{"repo":{"name":"work","role":"synthetic integration","not_roles":[]}}"#);
+    fake_claude(&fixture);
+    let native = "7b45bb32-2a03-4ca5-8db4-425edc153b16";
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["run", "claude", "--intent", "interactive"])
+            .env("OHJAA_STUB_RUN_AGENT", "1")
+            .env("OHJAA_FAKE_NATIVE", native)
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let started = export_of(&fixture, &repo)["sessions"][0]["started_ms"]
+        .as_i64()
+        .unwrap()
+        / 1000;
+    let secret = ["s", "k-", &"a1".repeat(12)].concat();
+    let transcript = fixture
+        .dir
+        .join(format!("home/.claude/projects/-work/{native}.jsonl"));
+    let records = [
+        serde_json::json!({"type":"user","sessionId":native,"cwd":repo,"timestamp":utc(started),"isSidechain":false,"message":{"role":"user","content":"Keep this synthetic input readable."}}),
+        serde_json::json!({"type":"user","sessionId":native,"timestamp":utc(started),"message":{"role":"user","content":[{"type":"tool_result","content":secret}]}}),
+    ].iter().map(|v| format!("{v}\n")).collect::<String>();
+    fs::write(&transcript, &records).unwrap();
+    fs::remove_file(fixture.stub_dir.join("vessa")).unwrap();
+    std::os::unix::fs::symlink(binary, fixture.stub_dir.join("vessa")).unwrap();
+    let person = || {
+        let mut command = fixture.person();
+        command.env("XDG_DATA_HOME", fixture.dir.join("data"));
+        command
+    };
+    let snapshot = || -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(fixture.human_dir().join("collected.json")).unwrap(),
+        )
+        .unwrap()
+    };
+    let (stdout, stderr, code) = output_of(person().arg("collect"));
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let first = snapshot();
+    let found = &first["secrets"]["value"]["findings"];
+    assert_eq!(found.as_array().unwrap().len(), 1, "{first}");
+    assert_eq!(found[0]["session"], native);
+    assert_eq!(found[0]["where"], "tool_output");
+    assert_eq!(found[0]["rule"], "openai");
+    assert_eq!(found[0]["count"], 1);
+    let complete_at = first["secrets"]["value"]["read_ms"].as_i64().unwrap();
+    assert!(
+        first
+            .to_string()
+            .contains("Keep this synthetic input readable."),
+        "{first}"
+    );
+    assert!(!first.to_string().contains(&secret));
+    let (digest, stderr, code) = output_of(person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(0), "{digest}{stderr}");
+    assert!(
+        digest.contains("Keep this synthetic input readable."),
+        "{digest}"
+    );
+    assert!(digest.contains("openai ×1"), "{digest}");
+    assert!(!digest.contains(&secret));
+    fs::write(&transcript, format!("{records}{{broken\n")).unwrap();
+    let (stdout, stderr, code) = output_of(person().arg("collect"));
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    let partial = snapshot();
+    assert_eq!(partial["secrets"]["value"]["read_ms"], complete_at);
+    assert_eq!(
+        partial["secrets"]["value"]["findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (digest, stderr, code) = output_of(person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(4), "{digest}{stderr}");
+    assert!(digest.contains("could not read"), "{digest}");
+    assert!(!digest.contains(&secret));
+    fs::write(&transcript, records).unwrap();
+    let (stdout, stderr, code) = output_of(person().arg("collect"));
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(snapshot()["secrets"]["value"]["read_ms"].as_i64().unwrap() > complete_at);
+    fixture.cleanup();
+}
+
 /// Yair, 2026-10-28: what the secrets scan cannot read is never an
 /// all-clear. An older vessa (no `secrets`), a scan that could not read
 /// everything (exit 4) and an answer that is no report are each said in the
