@@ -2001,7 +2001,7 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     };
     println!("{done} {id}");
     report(&outcome);
-    after_decision(action, id, &outcome, why, lock.as_ref());
+    after_decision(action, id, &outcome, why, lock.as_ref(), false);
     // The decision is made and recorded: the home's lock goes before a
     // delivery, which may run a repository's hooks for minutes.
     drop(lock);
@@ -2022,6 +2022,7 @@ fn after_decision(
     outcome: &Outcome,
     why: Option<&str>,
     lock: Option<&process::FileLock>,
+    concise: bool,
 ) {
     if outcome.in_the_home() {
         let message = knowledge::decision_message(action, id, outcome, why);
@@ -2030,6 +2031,7 @@ fn after_decision(
             home::commit(&home, &message, lock)?;
             Ok(home)
         }) {
+            Ok(_) if concise => println!("  Saved in your local history."),
             Ok(home) => println!("  committed in {}: {subject}", home.display()),
             Err(error) => eprintln!(
                 "ohjaa: warning: the decision stands, but \"{subject}\" is not in the home's \
@@ -2037,8 +2039,12 @@ fn after_decision(
             ),
         }
     }
-    for said in instructions::sync() {
-        println!("  {said}");
+    for said in instructions::sync(concise) {
+        if concise {
+            review_text("  ", &said);
+        } else {
+            println!("  {said}");
+        }
     }
 }
 
@@ -2063,6 +2069,18 @@ fn show_pending(
     for why in &node.origin {
         println!("    why: {why}");
     }
+    show_pending_relationships(pending, duplicate_of, loaded, waiting, tally, false);
+}
+
+fn show_pending_relationships(
+    pending: &knowledge::Pending,
+    duplicate_of: Option<&str>,
+    loaded: &knowledge::Loaded,
+    waiting: &[knowledge::Pending],
+    tally: &dyn Fn(&str) -> Option<String>,
+    plain: bool,
+) {
+    let node = &pending.node;
     // What a node it names is now: current, still waiting, or gone.
     let standing = |id: &str| {
         if let Some(located) = loaded.get(id).filter(|l| l.node.status != Status::Proposed) {
@@ -2076,8 +2094,8 @@ fn show_pending(
     };
     if let Some(base) = &node.refines {
         let waits = loaded.get(base).is_none() && waiting.iter().any(|p| p.node.id == *base);
-        println!(
-            "    refines: {}{}",
+        let relation = format!(
+            "{}{}",
             standing(base),
             if waits {
                 "; it can be accepted once that one is"
@@ -2085,21 +2103,88 @@ fn show_pending(
                 ""
             }
         );
+        if plain {
+            review_text("  Extends: ", &relation);
+        } else {
+            println!("    refines: {relation}");
+        }
         if let Some(line) = tally(base) {
             println!("    {base}: {line}");
         }
     }
     if !node.supersedes.is_empty() {
-        println!("    supersedes: {}", node.supersedes.join(", "));
+        if plain {
+            review_text(
+                "  Replaces on acceptance: ",
+                &node
+                    .supersedes
+                    .iter()
+                    .map(|id| standing(id))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+        } else {
+            println!("    supersedes: {}", node.supersedes.join(", "));
+        }
     }
     if let Some(of) = duplicate_of {
-        println!(
-            "    possible duplicate of: {} (their titles are near; you decide)",
-            standing(of)
-        );
+        let relation = format!("{} (their titles are near; you decide)", standing(of));
+        if plain {
+            review_text("  May repeat existing knowledge: ", &relation);
+        } else {
+            println!("    possible duplicate of: {relation}");
+        }
         if let Some(line) = tally(of) {
             println!("    {of}: {line}");
         }
+    }
+}
+
+/// Preserve the text being decided on, including literal spacing and code
+/// indentation. Let the terminal soft-wrap: reflowing words changes literals.
+fn review_text(prefix: &str, text: &str) {
+    for line in text.lines() {
+        println!("{prefix}{line}");
+    }
+}
+
+fn review_title(id: &str) -> String {
+    let words = id.replace('-', " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => words,
+    }
+}
+
+fn show_review_card(pending: &knowledge::Pending, index: usize, total: usize) {
+    let node = &pending.node;
+    println!("\n── Review {index} of {total} ──\n");
+    println!("  {}", review_title(&node.id));
+    let scope = match pending.scope {
+        Scope::Mine => "Personal",
+        Scope::Machine => "This machine's",
+        Scope::Ours => "Shared team",
+        Scope::Repo => "Repository",
+    };
+    println!("  {scope} {}\n", node.kind.name());
+    review_text("  ", &node.body);
+    println!("\n  Why this was proposed");
+    for why in &node.origin {
+        review_text("    ", why);
+    }
+    println!();
+    let effect = match pending.scope {
+        Scope::Mine => "Accept to use this in your future agent sessions, across repositories.",
+        Scope::Machine => "Accept to use this in future agent sessions on this machine.",
+        Scope::Ours => {
+            "Accept to stage shared knowledge; the team must review it in a pull request."
+        }
+        Scope::Repo => "Accept to prepare a pull request; it is not a repository merge.",
+    };
+    review_text("  ", effect);
+    if let Some(repo) = &pending.repo {
+        review_text("  Repository: ", &repo.display().to_string());
     }
 }
 
@@ -2118,8 +2203,12 @@ fn cmd_review(list: bool) -> Result<i32> {
         );
     }
     if waiting.is_empty() {
-        println!("nothing is waiting for a decision");
-        return Ok(0);
+        if broken.is_empty() {
+            println!("nothing is waiting for a decision");
+            return Ok(0);
+        }
+        println!("No readable proposals; {} could not be read. Fix the files reported above, then run `ohjaa review` again.", broken.len());
+        return Ok(INCOMPLETE);
     }
     // How often a current node a proposal names was re-taught: the person
     // decides with it in view.
@@ -2127,6 +2216,7 @@ fn cmd_review(list: bool) -> Result<i32> {
     if let Err(error) = &evidence {
         eprintln!("ohjaa: {error:#}; how often a node was re-taught is not shown");
     }
+    let mut incomplete = !broken.is_empty() || evidence.is_err();
     let today = knowledge::today();
     let tally = |id: &str| -> Option<String> {
         let evidence = evidence.as_ref().ok()?;
@@ -2153,47 +2243,118 @@ fn cmd_review(list: bool) -> Result<i32> {
             "\n{} waiting; decide with `ohjaa review` at a terminal",
             waiting.len()
         );
-        return Ok(0);
+        return Ok(if incomplete { INCOMPLETE } else { 0 });
     }
     knowledge::require_person("review")?;
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     let today = knowledge::today();
     let mut asker = lessons::Asker::new(roots::load(&[], dirs.repo_root.as_deref()));
-    for (pending, of) in &reviewed {
-        show_pending(pending, of.as_deref(), &loaded, &waiting, &tally);
-        print!("  [a]ccept  [r]eject  [s]kip  [q]uit > ");
-        std::io::stdout().flush()?;
-        let answer = lines.next().transpose()?.unwrap_or_default();
+    println!("Review knowledge proposals — nothing changes until you accept or reject.");
+    println!(
+        "Reject dismisses a proposal. Skip or Enter leaves it for later. Quit keeps the rest."
+    );
+    let (mut accepted, mut rejected, mut skipped) = (0, 0, 0);
+    'proposals: for (index, (pending, of)) in reviewed.iter().enumerate() {
+        // Earlier choices may have made a referenced proposal current.
+        let current = knowledge::load(&dirs)?;
+        let (still_waiting, _) = knowledge::pending(&dirs, &current)?;
+        show_review_card(pending, index + 1, reviewed.len());
+        show_pending_relationships(
+            pending,
+            of.as_deref(),
+            &current,
+            &still_waiting,
+            &tally,
+            true,
+        );
+        let accepting = loop {
+            print!("\n  [a]ccept  [r]eject  [s]kip  [d]etails  [q]uit > ");
+            std::io::stdout().flush()?;
+            let Some(answer) = lines.next().transpose()? else {
+                break 'proposals;
+            };
+            match answer.trim().to_ascii_lowercase().as_str() {
+                "a" | "accept" => break true,
+                "r" | "reject" => break false,
+                "s" | "skip" | "" => {
+                    skipped += 1;
+                    println!("  Skipped; still waiting for your decision.");
+                    continue 'proposals;
+                }
+                "q" | "quit" => break 'proposals,
+                "d" | "details" => {
+                    show_pending(pending, of.as_deref(), &current, &still_waiting, &tally);
+                    println!("  Proposal file: {}", pending.path.display());
+                }
+                _ => println!("  Choose one action: a, r, s, d or q, then Enter. Nothing changed."),
+            }
+        };
         let id = &pending.node.id;
         // Held for the decision, never while the person thinks.
-        let lock = matches!(answer.trim(), "a" | "accept" | "r" | "reject")
-            .then(decision_lock)
-            .flatten();
+        let lock = decision_lock();
         let mut ready = None;
-        let result = match answer.trim() {
-            "a" | "accept" => screen_accept(&dirs, id, &mut asker).and_then(|screened| {
+        let action = if accepting { "accept" } else { "reject" };
+        let result = if accepting {
+            screen_accept(&dirs, id, &mut asker).and_then(|screened| {
                 ready = screened;
-                knowledge::accept(&dirs, id, today).map(|o| Some(("accept", o)))
-            }),
-            "r" | "reject" => knowledge::reject(&dirs, id).map(|o| Some(("reject", o))),
-            "q" | "quit" => break,
-            _ => Ok(None),
+                knowledge::accept(&dirs, id, today)
+            })
+        } else {
+            knowledge::reject(&dirs, id)
         };
         match result {
-            Ok(Some((action, outcome))) => {
-                report(&outcome);
-                after_decision(action, id, &outcome, None, lock.as_ref());
+            Ok(outcome) => {
+                if action == "accept" {
+                    accepted += 1;
+                } else {
+                    rejected += 1;
+                }
+                println!(
+                    "  {}: {}",
+                    if action == "accept" {
+                        "Accepted"
+                    } else {
+                        "Rejected"
+                    },
+                    review_title(id)
+                );
+                if !outcome.in_the_home() {
+                    report(&outcome);
+                }
+                after_decision(action, id, &outcome, None, lock.as_ref(), true);
                 drop(lock);
                 if action == "accept" {
                     deliver_decided(&dirs, &outcome, ready.take(), &mut asker, today);
                 }
             }
-            Ok(None) => println!("  skipped"),
-            Err(error) => println!("  refused: {error:#}"),
+            Err(error) => {
+                incomplete = true;
+                println!("  Could not {action} this proposal: {error:#}");
+            }
         }
     }
-    Ok(0)
+    let (remaining, unreadable) = knowledge::pending(&dirs, &knowledge::load(&dirs)?)?;
+    println!("\nReview finished: {accepted} accepted, {rejected} rejected, {skipped} skipped; {} still waiting.", remaining.len());
+    if !unreadable.is_empty() {
+        println!(
+            "{} more proposal file(s) could not be read; the waiting count is incomplete.",
+            unreadable.len()
+        );
+    }
+    for broken in unreadable {
+        incomplete = true;
+        eprintln!(
+            "ohjaa: unreadable proposal {}: {}",
+            broken.path.display(),
+            broken.reason
+        );
+    }
+    if !remaining.is_empty() {
+        println!("Continue with `ohjaa review`.");
+    }
+    println!("Inspect saved knowledge with `ohjaa list`.");
+    Ok(if incomplete { INCOMPLETE } else { 0 })
 }
 
 /// `ohjaa lessons publish`: per repository, its accepted lessons not in its
