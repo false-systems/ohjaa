@@ -887,10 +887,12 @@ fn review_shows_a_readable_card_and_concise_success_without_hiding_history_failu
 
     // A full saved history can exceed the instruction block's text budget:
     // the shorter confirmation must still say that coverage is partial.
+    // Keep these long rules older than the short rules accepted by this test.
+    // A fixed future date made their priority change when UTC crossed it.
     for n in 0..40 {
         let id = format!("synthetic-rule-{n:02}");
         fs::write(tty.config().join("mine").join(format!("{id}.md")), format!(
-            "+++\nid = \"{id}\"\nkind = \"lesson\"\nstatus = \"current\"\nas_of = 2026-10-30\norigin = [\"Synthetic coverage fixture\"]\n+++\n{}\n",
+            "+++\nid = \"{id}\"\nkind = \"lesson\"\nstatus = \"current\"\nas_of = 1970-01-01\norigin = [\"Synthetic coverage fixture\"]\n+++\n{}\n",
             "A synthetic rule kept only for the review coverage test. ".repeat(8)
         )).unwrap();
     }
@@ -912,7 +914,7 @@ fn review_shows_a_readable_card_and_concise_success_without_hiding_history_failu
     let said = tty.all();
     assert!(said.contains("is not in the home's history"), "{said}");
     let words = said.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(words.contains("Agent instructions include 16 of 42 saved rules in full; 26 are only named by count because the text exceeds 8000 characters."), "{said}");
+    assert!(words.contains("Agent instructions include 18 of 42 saved rules in full; 24 are only named by count because the text exceeds 8000 characters."), "{said}");
     assert!(words.contains("No saved knowledge was removed."), "{said}");
     assert!(
         fs::read_to_string(tty.config().join("mine/another-rule.md"))
