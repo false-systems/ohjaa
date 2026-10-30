@@ -595,7 +595,7 @@ here. It records only: nothing is sent to anyone, decided or refused.
   age of live session records. A refresh that cannot start is reported.
   `ohjaa digest` collects first when the snapshot is more than
   5 minutes old, and waits for it at most 10 s.
-- **`ohjaa collect`** asks three sources once, at the same time. A source
+- **`ohjaa collect`** asks five sources once, at the same time. A source
   that fails keeps what it held before, and is said to be as of then.
   - The marks and the open sessions, as `ohjaa report --marks` finds them. A
     branch whose marks cannot be read keeps what it was last read as, and so
@@ -612,6 +612,30 @@ here. It records only: nothing is sent to anyone, decided or refused.
   - vessa: `vessa usage --json --input <transcript>…` over the transcripts of
     the sessions that ended since then, found at leaving (`left.native`). It
     never reads every transcript.
+  - Message excerpts: one `vessa messages --json` call for sessions ended
+    lately, matched by observed native agent/session IDs and launch/end times.
+    The first non-empty message leads the session row; the full recorded
+    launch intent and inspection action remain available. Sessions without
+    an excerpt keep their intent. Excerpts are scrubbed by Vessa (never
+    requested with `--raw`), cut at a word to about 70 characters and retained
+    only within the digest's window.
+  - Secrets: one `vessa secrets --json` scan from the last complete scan,
+    with a five-minute overlap. Only locations, rules, counts and optional
+    SHA-256 fingerprint prefixes are kept, never secret values. New findings
+    are attention notices; opening a terminal does not consume their digest
+    details. The digest's **Secrets seen** section names the native session,
+    whose words contained the finding, its time, rule and fingerprint.
+    Rotate findings that are real keys. Malformed, unavailable or partial
+    scan coverage stays unknown/incomplete and does not advance the last
+    complete-scan boundary. An older snapshot with no scan says so too.
+
+The secrets scan requires a Vessa that implements `vessa-secrets.v1`. Without
+it, collection and the digest report incomplete coverage (exit 4), not an
+empty successful scan. Default consumer tests use a stand-in for controlled
+failure cases. The opt-in real-producer test below runs an independently built
+Vessa against synthetic native records, checking excerpts, private findings,
+partial coverage, preserved retry boundaries and recovery. No repository is
+built or fetched implicitly.
 - **What could not be read is said, never an all-clear.** A source that did
   not answer, or could not read all it asked (an entry that cannot be
   marked, a page of pull requests not asked for, vessa's partial usage, the
@@ -692,6 +716,8 @@ control replaced with U+FFFD before it reaches the terminal.
   previous version (each with the keys of what GitHub said in the 2 hours
   before it and sessions shown at the boundary second), and the day it was
   shown;
+  new cursors also keep the secrets scan's own boundary, so a background
+  result cannot be skipped because a digest read an older snapshot;
 - `seen.lock`, which the terminal saying the line, and `ohjaa digest`
   moving the cursor, hold with `flock(2)`;
 - `collected.json`, the snapshot: the marks and open sessions, GitHub's pull
@@ -2260,6 +2286,14 @@ can still be open for writing in such a child at the moment it runs.
 
 Tests that need the real tools are ignored by default, since CI's runners
 have none of them:
+
+- `tests/cli.rs`, `real_vessa_producer_*`: the actual Vessa command reads only
+  a synthetic HOME, while Ohjaa collects and renders its output. Requires a
+  Vessa implementing `vessa-secrets.v1`; older versions fail visibly:
+
+  ```bash
+  OHJAA_TEST_VESSA=/absolute/path/to/vessa cargo test --test cli real_vessa_producer -- --ignored
+  ```
 
 - `tests/config_home.rs`, `real_sykli_*`: what a flag says and what a mark
   is, in the real sykli's judgement

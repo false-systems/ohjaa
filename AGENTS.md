@@ -63,11 +63,17 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   keys of what GitHub said in the two hours before it; `collected.json`,
   the snapshot `ohjaa collect` writes of what `ohjaa line` cannot derive
   without git or the network, namely the marks and open sessions, GitHub's
-  pull requests and vessa's usage of the sessions ended lately, each with
-  when it was read and what it could not read; and two empty lock files,
-  neither a cache: `seen.lock`, held while the cursor is read and moved, by
-  the terminal saying the line and by `ohjaa digest` shown to a person, and
-  `collect.lock`, held by the one collect that runs). Deleting them loses
+  pull requests, vessa's usage of the sessions ended lately, the first
+  words the person typed in each of them (the person's own words shown
+  back to them, as vessa prints them with secrets scrubbed, cut to about
+  70 characters and kept only for the window the digest shows, never
+  longer), and where and how often vessa's secrets scan found
+  secret-shaped tokens in agent sessions (places and counts, never a
+  value), each with when it was read and what it could not read; and two
+  empty lock files, neither a cache: `seen.lock`, held while the cursor is
+  read and moved, by the terminal saying the line and by `ohjaa digest`
+  shown to a person, and `collect.lock`, held by the one collect that
+  runs). Deleting them loses
   no knowledge: intake then reads its default window again, and sends once
   more what is still in it, the counts of re-teaching start again, and the
   human view starts from the last day.
@@ -158,12 +164,13 @@ These mirror `.toimija/repo.yaml` verbatim; keep both in sync.
   git to GitHub with gh's credentials** — in `ohjaa intake` (review
   comments, drafting), when a session leaves (its branch's pull request,
   bounded, recorded as unknown when gh cannot say), in `ohjaa collect` (one
-  search for the pull requests of the entries' owners, at most two calls),
-  and after a person's decision on repo knowledge and in `ohjaa lessons
-  publish` (gh: the repository's visibility, the person's private
-  repositories and name once a run, its open lessons pull request, `pr
-  create`; git: one fetch and one push to the repository on GitHub, by HTTPS
-  with gh's credentials; a dry run fetches and pushes nothing). Every other
+  search for the pull requests of the entries' owners, at most two calls;
+  its vessa calls, at most three, one each for usage, messages and
+  secrets, are local), and after a person's decision on repo knowledge and
+  in `ohjaa lessons publish` (gh: the repository's visibility, the person's
+  private repositories and name once a run, its open lessons pull request,
+  `pr create`; git: one fetch and one push to the repository on GitHub, by
+  HTTPS with gh's credentials; a dry run fetches and pushes nothing). Every other
   command works from the filesystem and local CLIs, and `ohjaa line` starts
   no git process either.
 - Failed coverage is never rendered as an empty result. If a scan could not
