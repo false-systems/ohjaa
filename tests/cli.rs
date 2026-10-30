@@ -10950,6 +10950,7 @@ fn real_vessa_producer_preserves_findings_excerpts_and_partial_retry_boundaries(
         .join(format!("home/.claude/projects/-work/{native}.jsonl"));
     let records = [
         serde_json::json!({"type":"user","sessionId":native,"cwd":repo,"timestamp":utc(started),"isSidechain":false,"message":{"role":"user","content":"Keep this synthetic input readable."}}),
+        serde_json::json!({"type":"assistant","sessionId":native,"timestamp":utc(started),"uuid":"synthetic-answer","requestId":"synthetic-request","message":{"id":"synthetic-answer","role":"assistant","model":"synthetic-model","content":[{"type":"text","text":"Synthetic response."}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}),
         serde_json::json!({"type":"user","sessionId":native,"timestamp":utc(started),"message":{"role":"user","content":[{"type":"tool_result","content":secret}]}}),
     ].iter().map(|v| format!("{v}\n")).collect::<String>();
     fs::write(&transcript, &records).unwrap();

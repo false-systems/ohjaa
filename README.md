@@ -631,8 +631,11 @@ here. It records only: nothing is sent to anyone, decided or refused.
 
 The secrets scan requires a Vessa that implements `vessa-secrets.v1`. Without
 it, collection and the digest report incomplete coverage (exit 4), not an
-empty successful scan. The consumer tests use a stand-in; producer-side
-compatibility must be verified when that Vessa command ships.
+empty successful scan. Default consumer tests use a stand-in for controlled
+failure cases. The opt-in real-producer test below runs an independently built
+Vessa against synthetic native records, checking excerpts, private findings,
+partial coverage, preserved retry boundaries and recovery. No repository is
+built or fetched implicitly.
 - **What could not be read is said, never an all-clear.** A source that did
   not answer, or could not read all it asked (an entry that cannot be
   marked, a page of pull requests not asked for, vessa's partial usage, the
@@ -2283,6 +2286,14 @@ can still be open for writing in such a child at the moment it runs.
 
 Tests that need the real tools are ignored by default, since CI's runners
 have none of them:
+
+- `tests/cli.rs`, `real_vessa_producer_*`: the actual Vessa command reads only
+  a synthetic HOME, while Ohjaa collects and renders its output. Requires a
+  Vessa implementing `vessa-secrets.v1`; older versions fail visibly:
+
+  ```bash
+  OHJAA_TEST_VESSA=/absolute/path/to/vessa cargo test --test cli real_vessa_producer -- --ignored
+  ```
 
 - `tests/config_home.rs`, `real_sykli_*`: what a flag says and what a mark
   is, in the real sykli's judgement
