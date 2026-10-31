@@ -2352,6 +2352,63 @@ mod tests {
         assert!(digest.contains("[redacted]"), "{digest}");
     }
 
+    fn long_goal_keeps_liveness_warning_visible(orphaned: bool) {
+        for stale in [false, true] {
+            let mut open = session("long-liveness-goal", 2 * DAY_MS, None, true);
+            open.intent = "interactive".into();
+            let goal = "Keep this complete recorded goal available. ".repeat(40);
+            open.readback.as_mut().unwrap().text = goal.clone();
+            let following = session("following-open-record", 2 * DAY_MS, None, false);
+            let at = if stale { NOW - DAY_MS } else { NOW };
+            let mut collected = snapshot(at);
+            let warning = if orphaned {
+                collected.local.value.orphaned.push(open.id.clone());
+                "Neither the agent nor its supervisor was found running"
+            } else {
+                collected.local.value.gone.push(open.id.clone());
+                "Agent still running without its Ohjaa supervisor"
+            };
+            let view = view(&[open, following], Some(&collected));
+            let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+                .unwrap()
+                .0;
+            let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
+            for text in [
+                warning,
+                "last recorded goal:",
+                "ohjaa session long-liveness-goal",
+                "ohjaa session following-open-record",
+            ] {
+                assert!(
+                    words.contains(text),
+                    "missing {text}; stale={stale}:\n{daily}"
+                );
+            }
+            assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
+            assert!(
+                daily.lines().all(|line| line.chars().count() <= WIDTH),
+                "{daily}"
+            );
+            if stale {
+                assert!(daily.contains(&clock(at)), "{daily}");
+            }
+            let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+            let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains(goal.trim()), "{digest}");
+            assert!(words.contains(warning), "{digest}");
+        }
+    }
+
+    #[test]
+    fn long_goals_do_not_hide_supervisor_missing_startup_warnings() {
+        long_goal_keeps_liveness_warning_visible(false);
+    }
+
+    #[test]
+    fn long_goals_do_not_hide_orphaned_startup_warnings() {
+        long_goal_keeps_liveness_warning_visible(true);
+    }
+
     #[test]
     fn first_typed_words_lead_the_session_without_losing_its_recorded_intent() {
         let mut collected = snapshot(NOW);
