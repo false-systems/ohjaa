@@ -2259,6 +2259,75 @@ mod tests {
     }
 
     #[test]
+    fn crowded_startup_groups_unknown_sources_and_open_records_without_a_wall_of_caveats() {
+        let mut collected = snapshot(NOW - 2 * DAY_MS);
+        let why = "could not read /synthetic/conversations/unreadable-session.jsonl";
+        collected.typed.gaps.push(why.into());
+        collected.secrets.gaps.push(why.into());
+        collected.secrets.value.findings.push(Finding {
+            agent: "codex".into(),
+            session: "synthetic-only".into(),
+            count: 18_330,
+            found_ms: NOW - HOUR_MS,
+            ..Finding::default()
+        });
+        let logged: Vec<_> = (0..4)
+            .map(|i| session(&format!("open-{i}"), 2 * DAY_MS, None, false))
+            .collect();
+        let view = build(
+            &logged,
+            Ok(vec![waiting("synthetic-proposal", "2026-10-20")]),
+            Some(&collected),
+            NOW,
+            0,
+        );
+        let daily = daily(&view, &Window::at(NOW - 3 * DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        eprintln!("Synthetic crowded startup:\n{daily}");
+        let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
+        for text in [
+            "Possible secrets (unconfirmed): 18,330 pattern matches",
+            "Could not fully read",
+            "session excerpts",
+            "secrets scan",
+            "4 older session records",
+            "may still be active",
+            "not active yet",
+            "ohjaa collect",
+            "ohjaa review",
+            "ohjaa digest",
+        ] {
+            assert!(words.contains(text), "missing {text}:\n{daily}");
+        }
+        assert!(daily.lines().count() <= 10, "{daily}");
+        assert!(
+            daily.lines().all(|line| line.chars().count() <= WIDTH),
+            "{daily}"
+        );
+        assert!(!daily.contains("/synthetic/"), "{daily}");
+        assert!(!daily.contains("more attention item"), "{daily}");
+        assert_eq!(daily.matches("ohjaa collect").count(), 1, "{daily}");
+        assert!(view.incomplete());
+        let digest = full(&view, &Window::at(NOW - 3 * DAY_MS), None, None, NOW);
+        assert!(digest.contains("unreadable-session.jsonl"), "{digest}");
+        for i in 0..4 {
+            assert!(
+                digest.contains(&format!("ohjaa session open-{i}")),
+                "{digest}"
+            );
+        }
+        assert_eq!(
+            view.events
+                .iter()
+                .find(|item| item.kind == Kind::Secret)
+                .unwrap()
+                .tokens,
+            18_330
+        );
+    }
+
+    #[test]
     fn startup_keeps_source_dates_reasons_and_real_findings_separate() {
         let mut collected = snapshot(NOW);
         collected.secrets.as_of_ms = Some(NOW - 2 * DAY_MS);
