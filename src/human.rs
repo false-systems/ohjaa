@@ -917,23 +917,33 @@ fn build(
         let who = open_context(session, false);
         let id = &session.id;
         if local.gone.contains(id) {
-            standing_items.push(standing(
+            let text = |brief| {
+                format!("Agent still running without its Ohjaa supervisor{found}; later work is not observed: \
+                {} · Inspect: ohjaa session {id}", open_context(session, brief))
+            };
+            let mut item = standing(
                 Kind::Gone,
                 Class::Unknown,
                 format!("gone:{id}"),
                 &session.repo,
-                format!("Agent still running without its Ohjaa supervisor{found}; later work is not observed: \
-                    {who} · Inspect: ohjaa session {id}"),
-            ));
+                text(false),
+            );
+            item.brief = Some(text(true));
+            standing_items.push(item);
         } else if local.orphaned.contains(id) {
-            standing_items.push(standing(
+            let text = |brief| {
+                format!("Neither the agent nor its supervisor was found running{found}; final result unknown: \
+                {} · Inspect: ohjaa session {id}", open_context(session, brief))
+            };
+            let mut item = standing(
                 Kind::Orphaned,
                 Class::Unknown,
                 format!("orphaned:{id}"),
                 &session.repo,
-                format!("Neither the agent nor its supervisor was found running{found}; final result unknown: \
-                    {who} · Inspect: ohjaa session {id}"),
-            ));
+                text(false),
+            );
+            item.brief = Some(text(true));
+            standing_items.push(item);
         } else if now_ms - session.started_ms > OPEN_TOO_LONG_MS {
             let mut item = standing(
                 Kind::OpenLong,

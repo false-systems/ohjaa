@@ -10395,6 +10395,73 @@ fn what_the_days_digest_left_out_is_what_ohjaa_digest_shows() {
     fixture.cleanup();
 }
 
+#[test]
+fn startup_keeps_liveness_warnings_with_long_recorded_goals() {
+    for orphaned in [false, true] {
+        let fixture = Fixture::new("line-long-liveness-goal");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let goal = "Keep this complete recorded goal available. ".repeat(40);
+        fs::create_dir_all(fixture.dir.join("state/ohjaa")).unwrap();
+        {
+            let db = redb::Database::create(fixture.dir.join("state/ohjaa/sessions.redb")).unwrap();
+            let tx = db.begin_write().unwrap();
+            let session = serde_json::json!({
+                "id": "long-liveness-goal", "agent": "codex", "repo": "/synthetic/ohjaa",
+                "intent": "interactive", "started_ms": now - 172_800_000, "delivered": [],
+                "readback": {"at_ms": now - 172_800_000, "text": goal}
+            })
+            .to_string();
+            tx.open_table(redb::TableDefinition::<&str, &[u8]>::new("sessions"))
+                .unwrap()
+                .insert("long-liveness-goal", session.as_bytes())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let mut snapshot = serde_json::json!({"schema": "ohjaa-collected.v1", "at_ms": now});
+        for part in ["local", "github", "usage", "typed", "secrets"] {
+            snapshot[part] = serde_json::json!({"as_of_ms": now});
+        }
+        snapshot["local"]["value"] = if orphaned {
+            serde_json::json!({"branches": [], "orphaned": ["long-liveness-goal"]})
+        } else {
+            serde_json::json!({"branches": [], "gone": ["long-liveness-goal"]})
+        };
+        fs::create_dir_all(fixture.human_dir()).unwrap();
+        fs::write(
+            fixture.human_dir().join("collected.json"),
+            snapshot.to_string(),
+        )
+        .unwrap();
+        let (daily, code) = on_a_terminal(fixture.person().arg("line"));
+        eprintln!("Synthetic liveness startup (orphaned={orphaned}):\n{daily}");
+        assert_eq!(code, Some(0));
+        let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
+        let warning = if orphaned {
+            "Neither the agent nor its supervisor was found running"
+        } else {
+            "Agent still running without its Ohjaa supervisor"
+        };
+        assert!(words.contains(warning), "{daily}");
+        assert!(
+            daily.contains("ohjaa session long-liveness-goal"),
+            "{daily}"
+        );
+        assert!(daily.lines().count() <= 15, "{daily}");
+        assert!(
+            daily.lines().all(|line| line.chars().count() <= 100),
+            "{daily}"
+        );
+        let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+        assert_eq!(code, Some(0), "{digest}");
+        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains(goal.trim()), "{digest}");
+        fixture.cleanup();
+    }
+}
+
 /// Finding 4: the first terminal of a day gets the day's digest from the
 /// snapshot there is, said as of when it was collected, and a collect starts
 /// beside it; nothing waits.
