@@ -576,6 +576,13 @@ here. It records only: nothing is sent to anyone, decided or refused.
   recorded goal when the launch label was only `interactive`. Goals are context,
   not proof of current progress; absent descriptions are stated explicitly.
   Proposed instructions are labelled as not active until you decide.
+- **Startup is a summary, not a diagnostic dump.** Unreadable saved sources are
+  grouped by what is missing, with one refresh command; paths and detailed
+  reasons stay in `ohjaa digest`. Multiple old open records are grouped by
+  repository, without claiming that their agents are stuck. Possible secrets
+  are labelled as unconfirmed pattern matches, not confirmed credential leaks
+  or a count of unique credentials. Full findings, individual inspection
+  commands, source dates, and incomplete coverage remain in the digest.
 - **`ohjaa digest`** shows attention details, unread agent sessions and
   pull requests, proposed instructions and who is live. Each ended session
   has its full recorded intent, end time, elapsed time and an inspection

@@ -10354,8 +10354,11 @@ fn what_could_not_be_read_is_said_never_an_all_clear() {
             .arg("line")
             .env("OHJAA_TODAY", "2026-10-27"),
     );
-    assert!(daily.contains("! marks"), "{daily}");
-    assert!(daily.contains("1 could not be read"), "{daily}");
+    assert!(
+        daily.contains("Could not fully read: repository checks"),
+        "{daily}"
+    );
+    assert!(daily.contains("Refresh: ohjaa collect"), "{daily}");
     fixture.cleanup();
 }
 
@@ -10484,12 +10487,8 @@ fn the_days_first_terminal_gets_its_digest_from_an_old_snapshot() {
     );
     assert!(daily.starts_with("ohjaa — needs your attention"), "{daily}");
     eprintln!("Synthetic startup preview:\n{daily}");
-    assert!(daily.contains("The last background update was "), "{daily}");
-    assert!(daily.contains("Session records are read now"), "{daily}");
-    assert!(
-        daily.contains("Refresh saved checks: ohjaa collect"),
-        "{daily}"
-    );
+    assert!(daily.contains("Last background update: "), "{daily}");
+    assert!(daily.contains("Refresh: ohjaa collect"), "{daily}");
     assert!(!daily.contains("retry uploads"), "{daily}");
     assert!(fixture.asked_github(2), "a collect started beside it");
     let (again, _) = on_a_terminal(
@@ -10953,7 +10952,7 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     };
     let daily = day();
     assert!(
-        daily.contains("\n  1 secret-shaped token in agent sessions\n"),
+        daily.contains("\n  Possible secrets (unconfirmed): 1 pattern match\n"),
         "{daily}"
     );
     assert_eq!(day(), "", "said once");
@@ -10975,7 +10974,7 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     assert_eq!(
         day(),
-        "ohjaa · 1 secret-shaped token in agent sessions · Details: ohjaa digest\n"
+        "ohjaa · Possible secrets (unconfirmed): 1 pattern match · Details: ohjaa digest\n"
     );
     assert_eq!(day(), "");
     // The second scan began where the first ended, not at the window's start.

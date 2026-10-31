@@ -689,10 +689,77 @@ fn secrets_found(items: &[&Item]) -> Option<String> {
         .fold(0u64, |sum, item| sum.saturating_add(item.tokens));
     (count > 0).then(|| {
         format!(
-            "{count} secret-shaped {} in agent sessions",
-            if count == 1 { "token" } else { "tokens" }
+            "Possible secrets (unconfirmed): {} pattern {}",
+            grouped_count(count),
+            if count == 1 { "match" } else { "matches" }
         )
     })
+}
+
+fn grouped_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut out = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// Only collected sources: live-log and proposal failures retain their own warnings.
+fn saved_source(item: &Item) -> bool {
+    item.kind == Kind::Source
+        && matches!(
+            item.repo.as_str(),
+            "snapshot" | "marks" | "GitHub" | "vessa" | "messages" | "secrets"
+        )
+}
+
+fn saved_sources_summary(items: &[&Item]) -> Option<String> {
+    let names: BTreeSet<_> = items
+        .iter()
+        .filter(|item| saved_source(item))
+        .map(|item| match item.repo.as_str() {
+            "snapshot" => "saved checks (including secrets scan)",
+            "marks" => "repository checks",
+            "GitHub" => "pull requests",
+            "vessa" => "token usage",
+            "messages" => "session excerpts",
+            "secrets" => "secrets scan",
+            _ => unreachable!("saved_source admits only the collected sources above"),
+        })
+        .collect();
+    (!names.is_empty()).then(|| {
+        format!(
+            "Could not fully read: {}",
+            names.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
+fn open_records_summary(items: &[&Item]) -> Option<String> {
+    let records: Vec<_> = items
+        .iter()
+        .filter(|item| item.kind == Kind::OpenLong)
+        .collect();
+    if records.len() < 2 {
+        return None;
+    }
+    let repos: BTreeSet<_> = records.iter().map(|item| clean(&item.repo)).collect();
+    let mut names: Vec<_> = repos.iter().take(3).map(|repo| cut(repo, 20)).collect();
+    if repos.len() > names.len() {
+        names.push(format!(
+            "and {} more repositories",
+            repos.len() - names.len()
+        ));
+    }
+    Some(format!(
+        "{} older session records ({}) have no closing result; they may still be active.",
+        records.len(),
+        names.join(", ")
+    ))
 }
 
 /// A part of the snapshot that could not be read, or not all of it: said
@@ -733,19 +800,7 @@ fn source<T>(name: &str, part: &Part<T>, now_ms: i64, unread: &mut Vec<String>) 
             clean(why)
         ),
     );
-    item.brief = Some(if name == "secrets" {
-        let status = if part.as_of_ms.is_none() {
-            "Secret-scan status is unknown; no usable result is recorded".to_owned()
-        } else {
-            format!("Secret-scan coverage is incomplete; saved result {age}")
-        };
-        format!(
-            "{status} · Reason: {} · Retry: ohjaa collect",
-            cut(&clean(why), 70)
-        )
-    } else {
-        format!("{meaning}: {what}, {age}")
-    });
+    item.brief = Some(format!("{meaning}: {what}, {age}"));
     Some(item)
 }
 
@@ -957,7 +1012,7 @@ fn build(
                 ),
             );
             item.brief = Some(format!(
-                "Record still open after {}: {} · Inspect: ohjaa session {id}",
+                "Record still open after {} (may still be active): {} · Inspect: ohjaa session {id}",
                 open_age(now_ms - session.started_ms),
                 open_context(session, true)
             ));
@@ -1272,10 +1327,11 @@ fn one_line(news: &News) -> Option<String> {
             }
         )),
     }
+    parts.extend(saved_sources_summary(&news.standing));
     parts.extend(
         news.standing
             .iter()
-            .filter(|item| item.kind == Kind::Source)
+            .filter(|item| item.kind == Kind::Source && !saved_source(item))
             .filter_map(|item| item.brief.clone()),
     );
     for (kind, one, many) in [
@@ -1476,49 +1532,67 @@ fn daily(
     }
     .to_owned()];
     if let Some(secrets) = secrets {
-        lines.push(format!("  {secrets}"));
+        lines.push(wrapped("  ", &secrets));
     }
+    let items: Vec<_> = view.standing.iter().collect();
+    let sources = saved_sources_summary(&items);
+    let open_records = open_records_summary(&items);
     if let Some(at) = view.collected_ms.filter(|at| old(Some(*at), now_ms)) {
         lines.push(wrapped(
             "  ",
             &format!(
-                "The last background update was {}. Some saved checks may be older.",
-                clock(at)
+                "Last background update: {}; individual checks may be older.{}",
+                clock(at),
+                if sources.is_none() {
+                    " · Refresh: ohjaa collect"
+                } else {
+                    ""
+                }
             ),
         ));
     }
-    if view.incomplete() || old(view.collected_ms, now_ms) {
-        lines.push(
-            "  Session records are read now. Refresh saved checks: ohjaa collect.".to_owned(),
-        );
+    if let Some(sources) = sources {
+        lines.push(wrapped(
+            "  ",
+            &format!("{sources} · Refresh: ohjaa collect"),
+        ));
+        let oldest = view
+            .parts
+            .iter()
+            .filter(|(name, _, _)| {
+                view.standing
+                    .iter()
+                    .any(|item| saved_source(item) && item.repo == *name)
+            })
+            .filter_map(|(_, at, _)| *at)
+            .min();
+        if let Some(at) =
+            oldest.filter(|at| old(Some(*at), now_ms) && Some(*at) != view.collected_ms)
+        {
+            lines.push(wrapped(
+                "  ",
+                &format!(
+                    "Saved information for these checks includes results from {}.",
+                    clock(at)
+                ),
+            ));
+        }
     }
-    if view
-        .standing
-        .iter()
-        .any(|item| item.key.starts_with("source:secrets:") || item.key == "source:snapshot")
-    {
-        lines.push("  Missing scan coverage is not a finding.".to_owned());
-    }
-    if view.standing.iter().any(|item| item.kind == Kind::OpenLong) {
-        lines.push(
-            "  Open records may still be active; age alone does not mean they are stuck."
-                .to_owned(),
-        );
-    }
-    if view
-        .standing
-        .iter()
-        .any(|item| item.kind == Kind::Main && item.class != Some(Class::Failed))
-    {
-        lines.push("  Missing verification is not a report of failed tests.".to_owned());
-    }
-    let width = repo_width(view.standing.iter());
+    let individual: Vec<_> = items
+        .into_iter()
+        .filter(|item| {
+            !saved_source(item) && !(open_records.is_some() && item.kind == Kind::OpenLong)
+        })
+        .collect();
+    let open_records = open_records.map(|text| wrapped("  ", &text));
+    let width = repo_width(individual.iter().copied());
     let reserved = lines.iter().map(|line| line.lines().count()).sum::<usize>()
         + proposal.as_ref().map_or(0, |text| text.lines().count())
+        + open_records.as_ref().map_or(0, |text| text.lines().count())
         + 2;
     let room = DAILY_LINES.saturating_sub(reserved);
     let (mut shown, mut used) = (0, 0);
-    for item in &view.standing {
+    for item in &individual {
         let row = row(item, width);
         let size = row.lines().count();
         if used + size > room {
@@ -1528,10 +1602,13 @@ fn daily(
         used += size;
         shown += 1;
     }
+    if let Some(open_records) = open_records {
+        lines.push(open_records);
+    }
     if let Some(proposal) = proposal {
         lines.push(proposal);
     }
-    let more = view.standing.len() - shown;
+    let more = individual.len() - shown;
     if more > 0 {
         lines.push(format!(
             "  {more} more attention item(s) are in the full digest."
@@ -2228,13 +2305,10 @@ mod tests {
             .0;
         let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
         for context in [
-            "The last background update was",
-            "Session records are read now",
-            "Refresh saved checks: ohjaa collect",
-            "Secret-scan status is unknown",
-            "Missing scan coverage is not a finding",
+            "Last background update:",
+            "Refresh: ohjaa collect",
+            "Could not fully read: secrets scan",
             "may still be active",
-            "age alone does not mean they are stuck",
             "no task description recorded",
             "not active yet",
             "ohjaa session still-open",
@@ -2328,6 +2402,57 @@ mod tests {
     }
 
     #[test]
+    fn grouped_startup_leaves_room_for_failed_checks_even_when_every_source_is_partial() {
+        let mut collected = snapshot(NOW - 2 * DAY_MS);
+        collected.local.error = Some("synthetic unavailable source".into());
+        collected.github.error = collected.local.error.clone();
+        collected.typed.error = collected.local.error.clone();
+        collected.usage.error = collected.local.error.clone();
+        collected.secrets.error = collected.local.error.clone();
+        collected.secrets.as_of_ms = Some(NOW - 3 * DAY_MS);
+        collected.secrets.value.findings.push(Finding {
+            count: u64::MAX,
+            found_ms: NOW,
+            ..Finding::default()
+        });
+        collected.local.value.branches.push(Branch {
+            slug: "false-systems/check-me".into(),
+            branch: "main".into(),
+            unproven: 1,
+            failed: 1,
+            as_of_ms: Some(NOW),
+            ..Branch::default()
+        });
+        let logged: Vec<_> = (0..15)
+            .map(|i| {
+                let mut open = session(&format!("open-{i}"), 2 * DAY_MS, None, false);
+                open.repo = format!("/r/repository-with-a-long-name-{i}");
+                open
+            })
+            .collect();
+        let view = build(
+            &logged,
+            Ok(vec![waiting("proposal", "2026-10-20")]),
+            Some(&collected),
+            NOW,
+            0,
+        );
+        let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
+        assert!(
+            daily.lines().all(|line| line.chars().count() <= WIDTH),
+            "{daily}"
+        );
+        assert!(daily.contains("check-me"), "{daily}");
+        assert!(daily.contains("verification failed"), "{daily}");
+        assert!(daily.contains("18,446,744,073,709,551,615"), "{daily}");
+        assert!(daily.contains("Refresh: ohjaa collect"), "{daily}");
+        assert!(view.incomplete());
+    }
+
+    #[test]
     fn startup_keeps_source_dates_reasons_and_real_findings_separate() {
         let mut collected = snapshot(NOW);
         collected.secrets.as_of_ms = Some(NOW - 2 * DAY_MS);
@@ -2347,12 +2472,20 @@ mod tests {
             .0;
         let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(daily.contains(&clock(NOW - 2 * DAY_MS)), "{daily}");
-        assert!(words.contains("Vessa is unavailable"), "{daily}");
         assert!(
-            words.contains("Missing scan coverage is not a finding"),
+            words.contains("Could not fully read: secrets scan"),
             "{daily}"
         );
-        assert!(daily.contains("1 secret-shaped token"), "{daily}");
+        assert!(
+            daily.contains("Possible secrets (unconfirmed): 1 pattern match"),
+            "{daily}"
+        );
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        assert!(digest.contains("Vessa is unavailable"), "{digest}");
+        assert!(
+            digest.contains("Missing scan coverage is not a finding"),
+            "{digest}"
+        );
         assert!(view.incomplete());
         assert_eq!(
             view.events
@@ -2537,7 +2670,7 @@ mod tests {
         let notice = one_line(&news(&view, &initial)).unwrap();
         assert_eq!(
             notice,
-            "ohjaa · 2 secret-shaped tokens in agent sessions · Details: ohjaa digest\n"
+            "ohjaa · Possible secrets (unconfirmed): 2 pattern matches · Details: ohjaa digest\n"
         );
         let seen = advance(
             &view,
@@ -3093,8 +3226,8 @@ mod tests {
         );
         let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
         assert!(
-            line.contains("Repository verification records: 1 could not be read")
-                && line.contains("more"),
+            line.contains("Could not fully read: pull requests, repository checks")
+                && line.ends_with("Details: ohjaa digest\n"),
             "{line}"
         );
         let full = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
@@ -3480,7 +3613,7 @@ mod tests {
         let other = view(&[], Some(&collected));
         let line = one_line(&news(&other, &seen)).expect("another failure");
         assert!(
-            line.contains("Pull request activity: unavailable"),
+            line.contains("Could not fully read: pull requests"),
             "{line}"
         );
         assert!(!line.contains("marks"), "the marks failed the same: {line}");
@@ -3492,9 +3625,11 @@ mod tests {
         let more = view(&[], Some(&collected));
         let line = one_line(&news(&more, &seen)).expect("one more could not be read");
         assert!(
-            line.contains("Repository verification records: 2 could not be read"),
+            line.contains("Could not fully read: repository checks"),
             "{line}"
         );
+        assert!(full(&more, &Window::at(NOW - DAY_MS), None, None, NOW)
+            .contains("Repository verification records: 2 could not be read"));
         let seen = advance(&more, &seen, Some(&collected), NOW, Shown::Line, "d");
         // The same cap, read later: its count and time moved, nothing new.
         collected.github.error = None;
