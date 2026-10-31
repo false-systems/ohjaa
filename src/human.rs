@@ -2093,6 +2093,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn startup_explains_saved_checks_open_records_and_undecided_instructions() {
+        let mut collected = snapshot(NOW - 2 * DAY_MS);
+        collected.secrets = Part::default();
+        let mut open = session("still-open", 2 * DAY_MS, None, false);
+        open.intent = "interactive".into();
+        let view = build(
+            &[open],
+            Ok(vec![waiting("synthetic-proposal", "2026-10-20")]),
+            Some(&collected),
+            NOW,
+            0,
+        );
+        let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
+        for context in [
+            "The last background update was",
+            "Session records are read now",
+            "Refresh saved checks: ohjaa collect",
+            "Secret-scan status is unknown",
+            "Missing scan coverage is not a finding",
+            "may still be active",
+            "age alone does not mean they are stuck",
+            "no task description recorded",
+            "not active yet",
+            "ohjaa session still-open",
+        ] {
+            assert!(words.contains(context), "missing {context}:\n{daily}");
+        }
+        assert!(!daily.contains("\"interactive\""), "{daily}");
+        assert!(!daily.contains("never read"), "{daily}");
+        assert!(view.incomplete());
+        assert_eq!(
+            view.standing
+                .iter()
+                .filter(|item| item.kind == Kind::OpenLong)
+                .count(),
+            1
+        );
+        assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
+        assert!(
+            daily.lines().all(|line| line.chars().count() <= WIDTH),
+            "{daily}"
+        );
+    }
+
+    #[test]
+    fn startup_keeps_source_dates_reasons_and_real_findings_separate() {
+        let mut collected = snapshot(NOW);
+        collected.secrets.as_of_ms = Some(NOW - 2 * DAY_MS);
+        collected.secrets.error = Some("Vessa is unavailable".into());
+        collected.secrets.value.findings.push(Finding {
+            agent: "claude".into(),
+            session: "native-demo".into(),
+            place: "tool_output".into(),
+            rule: "openai".into(),
+            count: 1,
+            found_ms: NOW,
+            ..Finding::default()
+        });
+        let view = view(&[], Some(&collected));
+        let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(daily.contains(&clock(NOW - 2 * DAY_MS)), "{daily}");
+        assert!(words.contains("Vessa is unavailable"), "{daily}");
+        assert!(
+            words.contains("Missing scan coverage is not a finding"),
+            "{daily}"
+        );
+        assert!(daily.contains("1 secret-shaped token"), "{daily}");
+        assert!(view.incomplete());
+        assert_eq!(
+            view.events
+                .iter()
+                .filter(|item| item.kind == Kind::Secret)
+                .count(),
+            1
+        );
+    }
+
     fn pr(number: u64, created_ago: i64, merged_ago: Option<i64>) -> Pr {
         Pr {
             repo: "false-systems/sykli".into(),
