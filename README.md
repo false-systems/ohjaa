@@ -567,6 +567,15 @@ here. It records only: nothing is sent to anyone, decided or refused.
 - **Opening a terminal never marks activity read.** The first startup
   anchors the unread window, even when quiet; subsequent days do not move
   that window. Existing unread positions from older versions are retained.
+- **Saved checks and open records mean different things.** Startup identifies
+  an old background update and gives `ohjaa collect` to refresh saved checks;
+  session records are read now. An unknown or incomplete secrets scan is not
+  a finding and cannot establish an all-clear. An old, unclosed session record
+  may still be active: age alone does not mean it is stuck. The digest separates
+  these records from failures and shows their recorded task, or the last
+  recorded goal when the launch label was only `interactive`. Goals are context,
+  not proof of current progress; absent descriptions are stated explicitly.
+  Proposed instructions are labelled as not active until you decide.
 - **`ohjaa digest`** shows attention details, unread agent sessions and
   pull requests, proposed instructions and who is live. Each ended session
   has its full recorded intent, end time, elapsed time and an inspection

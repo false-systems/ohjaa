@@ -10416,7 +10416,13 @@ fn the_days_first_terminal_gets_its_digest_from_an_old_snapshot() {
             .env("OHJAA_TODAY", "2026-10-27"),
     );
     assert!(daily.starts_with("ohjaa — needs your attention"), "{daily}");
-    assert!(daily.contains("Cached status collected "), "{daily}");
+    eprintln!("Synthetic startup preview:\n{daily}");
+    assert!(daily.contains("The last background update was "), "{daily}");
+    assert!(daily.contains("Session records are read now"), "{daily}");
+    assert!(
+        daily.contains("Refresh saved checks: ohjaa collect"),
+        "{daily}"
+    );
     assert!(!daily.contains("retry uploads"), "{daily}");
     assert!(fixture.asked_github(2), "a collect started beside it");
     let (again, _) = on_a_terminal(
