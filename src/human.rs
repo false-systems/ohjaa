@@ -2194,6 +2194,22 @@ mod tests {
     }
 
     #[test]
+    fn open_records_use_the_last_recorded_goal_without_claiming_it_is_current_work() {
+        let mut open = session("ongoing-chat", 2 * DAY_MS, None, true);
+        open.intent = "interactive".into();
+        open.readback.as_mut().unwrap().text = "Make the startup message understandable".into();
+        let view = view(&[open], Some(&snapshot(NOW)));
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("last recorded goal: \"Make the startup message understandable\""),
+            "{digest}"
+        );
+        assert!(!digest.contains("no task description recorded"), "{digest}");
+        assert!(digest.contains("ohjaa session ongoing-chat"), "{digest}");
+    }
+
+    #[test]
     fn first_typed_words_lead_the_session_without_losing_its_recorded_intent() {
         let mut collected = snapshot(NOW);
         let session = session("typed", HOUR_MS, Some(1_000), true);
