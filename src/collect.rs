@@ -1565,6 +1565,62 @@ mod tests {
     }
 
     #[test]
+    fn secret_context_counts_are_preserved_validated_and_unknown_for_older_reports() {
+        let mut first = found("context", NOW, "agent", "mixed_token", Value::Null);
+        first["count"] = json!(2);
+        first["opaque_count"] = json!(1);
+        let report = json!({"schema":"vessa-secrets.v1", "complete":false,
+            "undated_records":1, "unreadable":[{"path":"/synthetic/session.jsonl","why":"finding has no valid time"}],
+            "findings":[first.clone(), first.clone()]});
+        let (read, gaps) = read_secrets(
+            Some(4),
+            report.to_string().as_bytes(),
+            "",
+            &Secrets::default(),
+            NOW,
+        )
+        .unwrap();
+        let value = serde_json::to_value(read).unwrap();
+        assert_eq!(value["findings"][0]["count"], 4);
+        assert_eq!(value["findings"][0]["opaque_count"], 2);
+        assert_eq!(value["undated_records"], 1);
+        assert_eq!(value["other_issues"], 0);
+        assert!(value["read_ms"].is_null());
+        assert_eq!(gaps.len(), 1);
+        for bad in [json!(3), json!("1"), json!(-1)] {
+            let mut invalid = report.clone();
+            invalid["findings"][0]["opaque_count"] = bad;
+            assert!(read_secrets(
+                Some(4),
+                invalid.to_string().as_bytes(),
+                "",
+                &Secrets::default(),
+                NOW
+            )
+            .is_err());
+        }
+        let mut invalid = report.clone();
+        invalid["undated_records"] = json!(2);
+        assert!(read_secrets(
+            Some(4),
+            invalid.to_string().as_bytes(),
+            "",
+            &Secrets::default(),
+            NOW
+        )
+        .is_err());
+        let old = scan(
+            true,
+            json!([]),
+            json!([found("old", NOW, "agent", "mixed_token", Value::Null)]),
+        );
+        let (read, _) = read_secrets(Some(0), &old, "", &Secrets::default(), NOW).unwrap();
+        let value = serde_json::to_value(read).unwrap();
+        assert!(value["findings"][0]["opaque_count"].is_null());
+        assert!(value["undated_records"].is_null());
+    }
+
+    #[test]
     fn secrets_are_kept_as_where_and_how_many_and_read_on_from_the_last_whole_scan() {
         let typed = found("s1", NOW - HOUR, "person", "github", json!("1A2B3C4D"));
         let printed = found("s1", NOW - 2 * HOUR, "tool_output", "aws", Value::Null);

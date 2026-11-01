@@ -2402,6 +2402,40 @@ mod tests {
     }
 
     #[test]
+    fn startup_distinguishes_key_formats_broad_patterns_and_transport_metadata() {
+        let mut raw = serde_json::to_value(snapshot(NOW)).unwrap();
+        raw["secrets"]["gaps"] = json!([
+            "synthetic missing time",
+            "synthetic missing time",
+            "synthetic unsupported source"
+        ]);
+        raw["secrets"]["value"] = json!({"read_ms":null,"undated_records":2,"other_issues":1,"findings":[
+            {"agent":"codex","session":"synthetic","cwd":null,"at_ms":null,"where":"other","rule":"mixed_token","count":100,"opaque_count":90,"fingerprint":null,"found_ms":NOW},
+            {"agent":"codex","session":"synthetic","cwd":null,"at_ms":null,"where":"person","rule":"openai","count":2,"opaque_count":0,"fingerprint":null,"found_ms":NOW}
+        ]});
+        let collected: Collected = serde_json::from_value(raw).unwrap();
+        let view = view(&[], Some(&collected));
+        let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
+        for text in [
+            "2 key-format",
+            "100 broad",
+            "90 in signature/encrypted fields",
+            "2 records have no timestamp",
+            "1 other coverage issue",
+            "unconfirmed",
+        ] {
+            assert!(words.contains(text), "missing {text}:\n{daily}");
+        }
+        assert!(daily.lines().count() <= 10, "{daily}");
+        assert!(view.incomplete());
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        assert!(digest.contains("not distinct credentials"), "{digest}");
+    }
+
+    #[test]
     fn grouped_startup_leaves_room_for_failed_checks_even_when_every_source_is_partial() {
         let mut collected = snapshot(NOW - 2 * DAY_MS);
         collected.local.error = Some("synthetic unavailable source".into());
