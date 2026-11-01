@@ -598,6 +598,9 @@ here. It records only: nothing is sent to anyone, decided or refused.
   key formats, secret-labelled values, unknown rules/context, and incomplete
   coverage still need attention. No detector or redaction rule is disabled,
   and opening a quiet terminal does not consume the underlying evidence.
+  A changed reviewable subset has its own attention identity and observed
+  scan time: reading metadata earlier does not acknowledge later candidates,
+  and an unchanged re-scan does not replay the same alert.
 - **`ohjaa digest`** shows attention details, unread agent sessions and
   pull requests, proposed instructions and who is live. Each ended session
   has its full recorded intent, end time, elapsed time and an inspection

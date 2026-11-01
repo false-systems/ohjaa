@@ -659,7 +659,7 @@ fn pr_events(pr: &Pr, out: &mut Vec<Item>) {
 
 /// A finding is a newly collected observation on the local source clock,
 /// independent of whether GitHub could be refreshed.
-fn secret(finding: &Finding) -> Item {
+fn secret(finding: &Finding, observed_ms: Option<i64>) -> Item {
     let whose = match finding.place.as_str() {
         "person" => "you typed it",
         "agent" => "agent reply",
@@ -692,6 +692,18 @@ fn secret(finding: &Finding) -> Item {
     item.secret_rule = Some(finding.rule.clone());
     item.opaque_tokens = finding.opaque_count;
     item.opaque_native = finding.opaque_native == Some(true);
+    let review = review_count(&item);
+    if review > 0 {
+        // A changed reviewable subset is new attention even if the native
+        // record/first sighting is old. Keep the native time in the text;
+        // this event's clock is the saved scan that observed the candidate.
+        item.key.push_str(&format!(":review:{review}"));
+        item.at_ms = observed_ms
+            .unwrap_or(finding.found_ms)
+            .max(finding.found_ms);
+    } else {
+        item.key.push_str(":evidence");
+    }
     item
 }
 
@@ -1126,7 +1138,14 @@ fn build(
     for pr in &snapshot.github.value {
         pr_events(pr, &mut events);
     }
-    events.extend(snapshot.secrets.value.findings.iter().map(secret));
+    events.extend(
+        snapshot
+            .secrets
+            .value
+            .findings
+            .iter()
+            .map(|finding| secret(finding, snapshot.secrets.as_of_ms)),
+    );
     events.sort_by_key(|item| std::cmp::Reverse(item.at_ms));
 
     let (waiting, today) = match waiting {
