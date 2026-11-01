@@ -10465,6 +10465,46 @@ fn startup_keeps_liveness_warnings_with_long_recorded_goals() {
     }
 }
 
+#[test]
+fn opaque_entropy_stays_in_the_digest_without_a_startup_credential_alert() {
+    let fixture = Fixture::new("line-native-opaque");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let path = fixture.human_dir().join("collected.json");
+    let mut snapshot = serde_json::json!({"schema":"ohjaa-collected.v1","at_ms":now});
+    for part in ["local", "github", "usage", "typed", "secrets"] {
+        snapshot[part] = serde_json::json!({"as_of_ms":now});
+    }
+    snapshot["secrets"]["value"] = serde_json::json!({"read_ms":now,"findings":[
+        {"agent":"claude","session":"synthetic","cwd":null,"at_ms":now,"where":"agent","rule":"mixed_token","count":100,"opaque_count":100,"opaque_native":true,"fingerprint":null,"found_ms":now}
+    ]});
+    fs::create_dir_all(fixture.human_dir()).unwrap();
+    fs::write(&path, snapshot.to_string()).unwrap();
+    let (quiet, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0));
+    assert_eq!(quiet, "", "native opaque entropy is not a credential alert");
+    let (digest, stderr, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(digest.contains("mixed_token ×100"), "{digest}");
+    assert!(digest.contains("All scan evidence"), "{digest}");
+    // A provider-shaped key still needs review even inside the same native field.
+    snapshot["secrets"]["value"]["findings"][0]["rule"] = serde_json::json!("openai");
+    snapshot["secrets"]["value"]["findings"][0]["count"] = serde_json::json!(1);
+    snapshot["secrets"]["value"]["findings"][0]["opaque_count"] = serde_json::json!(1);
+    fs::write(path, snapshot.to_string()).unwrap();
+    let (notice, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0));
+    assert!(notice.contains("1 key-format match"), "{notice}");
+    assert!(notice.contains("Details: ohjaa digest"), "{notice}");
+    eprintln!(
+        "Synthetic opaque-only startup bytes: {}\nKey-shaped metadata notice: {notice}",
+        quiet.len()
+    );
+    fixture.cleanup();
+}
+
 /// Finding 4: the first terminal of a day gets the day's digest from the
 /// snapshot there is, said as of when it was collected, and a collect starts
 /// beside it; nothing waits.

@@ -590,6 +590,14 @@ here. It records only: nothing is sent to anyone, decided or refused.
   unknown; partial context is a lower bound, never a complete total. Timestamp
   gaps are counted separately from other coverage issues when available.
   Counts are occurrences, not distinct credentials; no validity is inferred.
+- **Raw matches are not all credential alerts.** Generic random-string
+  (`mixed_token`) occurrences verified in native signature/encrypted fields
+  remain scan evidence in the digest but do not trigger a startup credential
+  alert. This requires Vessa's explicit native-position marker and a valid
+  subset count; old/unverified context is never silently discounted. Known
+  key formats, secret-labelled values, unknown rules/context, and incomplete
+  coverage still need attention. No detector or redaction rule is disabled,
+  and opening a quiet terminal does not consume the underlying evidence.
 - **`ohjaa digest`** shows attention details, unread agent sessions and
   pull requests, proposed instructions and who is live. Each ended session
   has its full recorded intent, end time, elapsed time and an inspection

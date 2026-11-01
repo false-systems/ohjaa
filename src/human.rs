@@ -341,6 +341,7 @@ struct Item {
     tokens: u64,
     secret_rule: Option<String>,
     opaque_tokens: Option<u64>,
+    opaque_native: bool,
     kind: Kind,
     /// For what stands: its place in the order.
     class: Option<Class>,
@@ -500,6 +501,7 @@ fn standing(kind: Kind, class: Class, key: String, repo: &str, text: String) -> 
         tokens: 0,
         secret_rule: None,
         opaque_tokens: None,
+        opaque_native: false,
         kind,
         class: Some(class),
         key,
@@ -516,6 +518,7 @@ fn event(kind: Kind, key: String, at_ms: i64, github: bool, repo: &str, text: St
         tokens: 0,
         secret_rule: None,
         opaque_tokens: None,
+        opaque_native: false,
         kind,
         class: None,
         key,
@@ -688,10 +691,36 @@ fn secret(finding: &Finding) -> Item {
     item.tokens = finding.count;
     item.secret_rule = Some(finding.rule.clone());
     item.opaque_tokens = finding.opaque_count;
+    item.opaque_native = finding.opaque_native == Some(true);
     item
 }
 
 fn secrets_found(items: &[&Item]) -> Option<String> {
+    secret_summary(items, false)
+}
+
+fn secrets_attention(items: &[&Item]) -> Option<String> {
+    secret_summary(items, true)
+}
+
+fn verified_opaque(item: &Item) -> Option<u64> {
+    item.opaque_native
+        .then_some(item.opaque_tokens)
+        .flatten()
+        .filter(|n| *n <= item.tokens)
+}
+
+fn review_count(item: &Item) -> u64 {
+    // Only the entropy heuristic in verified native transport fields is
+    // non-alert evidence. Key formats, labelled secrets and unknowns stay.
+    if item.secret_rule.as_deref() == Some("mixed_token") {
+        item.tokens - verified_opaque(item).unwrap_or(0)
+    } else {
+        item.tokens
+    }
+}
+
+fn secret_summary(items: &[&Item], attention: bool) -> Option<String> {
     let mut counts = [0u64; 3];
     for item in items.iter().filter(|item| item.kind == Kind::Secret) {
         let group = match item.secret_rule.as_deref() {
@@ -702,7 +731,11 @@ fn secrets_found(items: &[&Item]) -> Option<String> {
             Some("mixed_token" | "named_secret") => 1,
             _ => 2,
         };
-        counts[group] = counts[group].saturating_add(item.tokens);
+        counts[group] = counts[group].saturating_add(if attention {
+            review_count(item)
+        } else {
+            item.tokens
+        });
     }
     let labels = ["key-format", "broad", "unclassified"];
     let parts: Vec<_> = counts
@@ -713,7 +746,12 @@ fn secrets_found(items: &[&Item]) -> Option<String> {
         .collect();
     (!parts.is_empty()).then(|| {
         format!(
-            "Secrets (unconfirmed): {} {}",
+            "{} (unconfirmed): {} {}",
+            if attention {
+                "Secrets"
+            } else {
+                "All scan evidence"
+            },
             parts.join(" + "),
             if counts.iter().copied().fold(0u64, u64::saturating_add) == 1 {
                 "match"
@@ -727,7 +765,7 @@ fn secrets_found(items: &[&Item]) -> Option<String> {
 fn secret_context(items: &[&Item]) -> Option<String> {
     let (mut opaque, mut unknown) = (0u64, 0u64);
     for item in items.iter().filter(|item| item.kind == Kind::Secret) {
-        match item.opaque_tokens {
+        match verified_opaque(item) {
             Some(n) => opaque = opaque.saturating_add(n),
             None => unknown = unknown.saturating_add(item.tokens),
         }
@@ -1362,7 +1400,7 @@ fn pull_requests(events: &[&Item]) -> Option<String> {
 /// at most [`WIDTH`] characters; `None` when nothing is.
 fn one_line(news: &News) -> Option<String> {
     let mut parts = Vec::new();
-    parts.extend(secrets_found(&news.secrets));
+    parts.extend(secrets_attention(&news.secrets));
     // Name the repository and branch, and explain what is missing.
     let mains: Vec<&&Item> = news
         .standing
@@ -1576,8 +1614,7 @@ fn daily(
         .iter()
         .filter(|item| item.kind == Kind::Secret && from.holds(item))
         .collect::<Vec<_>>();
-    let secrets = secrets_found(&secret_items);
-    let context = secret_context(&secret_items);
+    let secrets = secrets_attention(&secret_items);
     if view.standing.is_empty() && proposal.is_none() && secrets.is_none() {
         return None;
     }
@@ -1592,9 +1629,6 @@ fn daily(
     .to_owned()];
     if let Some(secrets) = secrets {
         lines.push(wrapped("  ", &secrets));
-    }
-    if let Some(context) = context {
-        lines.push(wrapped("  ", &context));
     }
     let items: Vec<_> = view.standing.iter().collect();
     let sources = saved_sources_summary(&items);
@@ -1818,6 +1852,12 @@ fn full(
         .collect();
     if !secret_items.is_empty() {
         out.push_str("\nSecrets seen\n");
+        if let Some(attention) = secrets_attention(&findings) {
+            paragraph(&mut out, &attention);
+        }
+        if has_findings {
+            paragraph(&mut out, "Raw scan evidence is retained below. Generic random-string matches in verified native signatures/encrypted payloads are evidence, not credential alerts. Known key formats, secret-labelled values and unverified context still need review.");
+        }
         if let Some(summary) = secrets_found(&findings) {
             paragraph(&mut out, &summary);
         }
@@ -2513,8 +2553,8 @@ mod tests {
             "synthetic unsupported source"
         ]);
         raw["secrets"]["value"] = json!({"read_ms":null,"undated_records":2,"other_issues":1,"findings":[
-            {"agent":"codex","session":"synthetic","cwd":null,"at_ms":null,"where":"other","rule":"mixed_token","count":100,"opaque_count":90,"fingerprint":null,"found_ms":NOW},
-            {"agent":"codex","session":"synthetic","cwd":null,"at_ms":null,"where":"person","rule":"openai","count":2,"opaque_count":0,"fingerprint":null,"found_ms":NOW}
+            {"agent":"codex","session":"synthetic","cwd":null,"at_ms":null,"where":"other","rule":"mixed_token","count":100,"opaque_count":90,"opaque_native":true,"fingerprint":null,"found_ms":NOW},
+            {"agent":"codex","session":"synthetic","cwd":null,"at_ms":null,"where":"person","rule":"openai","count":2,"opaque_count":0,"opaque_native":true,"fingerprint":null,"found_ms":NOW}
         ]});
         let collected: Collected = serde_json::from_value(raw).unwrap();
         let view = view(&[], Some(&collected));
@@ -2524,8 +2564,7 @@ mod tests {
         let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
         for text in [
             "2 key-format",
-            "100 broad",
-            "90 in signature/encrypted fields",
+            "10 broad",
             "2 records have no timestamp",
             "1 other coverage issue",
             "unconfirmed",
@@ -2536,23 +2575,27 @@ mod tests {
         assert!(view.incomplete());
         let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(digest.contains("not distinct credentials"), "{digest}");
+        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("90 in signature/encrypted fields"),
+            "{digest}"
+        );
+        assert!(digest.contains("mixed_token ×100"), "{digest}");
         let mut partial = collected;
         partial.secrets.value.findings[1].opaque_count = None;
         let partial_view = self::view(&[], Some(&partial));
-        let partial_daily = self::daily(&partial_view, &Window::at(NOW - DAY_MS), None, NOW)
-            .unwrap()
-            .0;
-        let words = partial_daily
+        let partial_digest = full(&partial_view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        let words = partial_digest
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
         assert!(
             words.contains("At least 90 in signature/encrypted fields"),
-            "{partial_daily}"
+            "{partial_digest}"
         );
         assert!(
             words.contains("context unknown for 2 occurrences"),
-            "{partial_daily}"
+            "{partial_digest}"
         );
     }
 
@@ -2566,6 +2609,18 @@ mod tests {
         let view = view(&[], Some(&collected));
         assert_eq!(daily(&view, &Window::at(NOW - DAY_MS), None, NOW), None);
         assert_eq!(one_line(&news(&view, &Seen::first(NOW))), None);
+        let seen = advance(
+            &view,
+            &Seen::first(NOW),
+            Some(&collected),
+            NOW,
+            Shown::Daily {
+                from: Window::at(NOW - DAY_MS),
+                cut: false,
+            },
+            "synthetic-day",
+        );
+        assert!(full(&view, &seen.full_from(NOW), None, None, NOW).contains("mixed_token ×100"));
         let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(digest.contains("mixed_token ×100"), "{digest}");
         assert!(digest.contains("signature/encrypted"), "{digest}");
@@ -2870,6 +2925,7 @@ mod tests {
             rule: "github".into(),
             count: 2,
             opaque_count: None,
+            opaque_native: None,
             fingerprint: Some("1a2b3c4d".into()),
             found_ms: NOW,
         });
