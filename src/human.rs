@@ -2557,6 +2557,61 @@ mod tests {
     }
 
     #[test]
+    fn verified_opaque_entropy_is_evidence_not_a_credential_alert() {
+        let mut raw = serde_json::to_value(snapshot(NOW)).unwrap();
+        raw["secrets"]["value"]["findings"] = json!([
+            {"agent":"claude","session":"synthetic","cwd":null,"at_ms":NOW,"where":"agent","rule":"mixed_token","count":100,"opaque_count":100,"opaque_native":true,"fingerprint":null,"found_ms":NOW}
+        ]);
+        let collected: Collected = serde_json::from_value(raw.clone()).unwrap();
+        let view = view(&[], Some(&collected));
+        assert_eq!(daily(&view, &Window::at(NOW - DAY_MS), None, NOW), None);
+        assert_eq!(one_line(&news(&view, &Seen::first(NOW))), None);
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        assert!(digest.contains("mixed_token ×100"), "{digest}");
+        assert!(digest.contains("signature/encrypted"), "{digest}");
+        for (rule, context, native, expected) in [
+            ("openai", json!(100), json!(true), "100 key-format"),
+            ("named_secret", json!(100), json!(true), "100 broad"),
+            ("future_rule", json!(100), json!(true), "100 unclassified"),
+            (
+                "mixed_token",
+                serde_json::Value::Null,
+                json!(true),
+                "100 broad",
+            ),
+            (
+                "mixed_token",
+                json!(100),
+                serde_json::Value::Null,
+                "100 broad",
+            ),
+            ("mixed_token", json!(101), json!(true), "100 broad"),
+            ("mixed_token", json!(90), json!(true), "10 broad"),
+        ] {
+            raw["secrets"]["value"]["findings"][0]["rule"] = json!(rule);
+            raw["secrets"]["value"]["findings"][0]["opaque_count"] = context;
+            raw["secrets"]["value"]["findings"][0]["opaque_native"] = native;
+            let collected: Collected = serde_json::from_value(raw.clone()).unwrap();
+            let view = self::view(&[], Some(&collected));
+            let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
+            assert!(line.contains(expected), "{rule}: {line}");
+        }
+        raw["secrets"]["value"]["findings"][0]["opaque_count"] = json!(100);
+        raw["secrets"]["gaps"] = json!(["synthetic incomplete scan"]);
+        let collected: Collected = serde_json::from_value(raw).unwrap();
+        let view = self::view(&[], Some(&collected));
+        let daily = self::daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        assert!(
+            daily.contains("Missing or incomplete information"),
+            "{daily}"
+        );
+        assert!(!daily.contains("Secrets (unconfirmed)"), "{daily}");
+        assert!(view.incomplete());
+    }
+
+    #[test]
     fn grouped_startup_leaves_room_for_failed_checks_even_when_every_source_is_partial() {
         let mut collected = snapshot(NOW - 2 * DAY_MS);
         collected.local.error = Some("synthetic unavailable source".into());
