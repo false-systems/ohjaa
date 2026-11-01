@@ -10355,7 +10355,7 @@ fn what_could_not_be_read_is_said_never_an_all_clear() {
             .env("OHJAA_TODAY", "2026-10-27"),
     );
     assert!(
-        daily.contains("Could not fully read: repository checks"),
+        daily.contains("Missing or incomplete information: repository checks"),
         "{daily}"
     );
     assert!(daily.contains("Refresh: ohjaa collect"), "{daily}");
@@ -10952,7 +10952,7 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     };
     let daily = day();
     assert!(
-        daily.contains("\n  Possible secrets (unconfirmed): 1 pattern match\n"),
+        daily.contains("\n  Secrets (unconfirmed): 1 key-format match\n"),
         "{daily}"
     );
     assert_eq!(day(), "", "said once");
@@ -10974,7 +10974,7 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     assert_eq!(
         day(),
-        "ohjaa · Possible secrets (unconfirmed): 1 pattern match · Details: ohjaa digest\n"
+        "ohjaa · Secrets (unconfirmed): 1 key-format match · Details: ohjaa digest\n"
     );
     assert_eq!(day(), "");
     // The second scan began where the first ended, not at the window's start.

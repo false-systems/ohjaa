@@ -583,6 +583,13 @@ here. It records only: nothing is sent to anyone, decided or refused.
   are labelled as unconfirmed pattern matches, not confirmed credential leaks
   or a count of unique credentials. Full findings, individual inspection
   commands, source dates, and incomplete coverage remain in the digest.
+- **A match count is not a leaked-key count.** Startup separates recognizable
+  key-format matches from broad heuristics and unclassified rules. When Vessa
+  reports context, it says how many occurrences are in signature/encrypted
+  fields, without suppressing those matches. Older reports leave context
+  unknown; partial context is a lower bound, never a complete total. Timestamp
+  gaps are counted separately from other coverage issues when available.
+  Counts are occurrences, not distinct credentials; no validity is inferred.
 - **`ohjaa digest`** shows attention details, unread agent sessions and
   pull requests, proposed instructions and who is live. Each ended session
   has its full recorded intent, end time, elapsed time and an inspection

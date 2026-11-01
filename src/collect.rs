@@ -134,6 +134,10 @@ pub struct Secrets {
     /// there. `None`: none has yet.
     pub read_ms: Option<i64>,
     pub findings: Vec<Finding>,
+    #[serde(default)]
+    pub undated_records: Option<u64>,
+    #[serde(default)]
+    pub other_issues: Option<u64>,
 }
 
 /// One place vessa found secret-shaped tokens: where and how many, never
@@ -150,6 +154,9 @@ pub struct Finding {
     pub place: String,
     pub rule: String,
     pub count: u64,
+    /// Measured subset in signature/encrypted fields; absent in older reports.
+    #[serde(default)]
+    pub opaque_count: Option<u64>,
     /// The first 8 hex characters of the token's SHA-256, when vessa gave
     /// one.
     pub fingerprint: Option<String>,
@@ -1046,6 +1053,16 @@ pub fn read_secrets(
         })
         .collect();
     let whole = code == Some(0) && complete && gaps.is_empty();
+    let undated_records = report
+        .get("undated_records")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|count| *count <= unreadable.len() as u64)
+                .ok_or_else(|| "vessa's undated-record count is invalid".to_owned())
+        })
+        .transpose()?;
     if !whole && gaps.is_empty() {
         gaps.push(match code {
             Some(4) if !detail.is_empty() => {
@@ -1063,7 +1080,18 @@ pub fn read_secrets(
                 .to_owned()
         })?;
         match read.iter_mut().find(|same| same.key() == finding.key()) {
-            Some(same) => same.count = same.count.saturating_add(finding.count),
+            Some(same) => {
+                same.count = same
+                    .count
+                    .checked_add(finding.count)
+                    .ok_or("vessa's finding counts overflow")?;
+                same.opaque_count = match (same.opaque_count, finding.opaque_count) {
+                    (Some(a), Some(b)) => {
+                        Some(a.checked_add(b).ok_or("vessa's context counts overflow")?)
+                    }
+                    _ => None,
+                };
+            }
             None => read.push(finding),
         }
     }
@@ -1081,7 +1109,16 @@ pub fn read_secrets(
         }
     }
     let read_ms = if whole { Some(now_ms) } else { before.read_ms };
-    Ok((Secrets { read_ms, findings }, gaps))
+    let other_issues = undated_records.map(|undated| gaps.len() as u64 - undated);
+    Ok((
+        Secrets {
+            read_ms,
+            findings,
+            undated_records,
+            other_issues,
+        },
+        gaps,
+    ))
 }
 
 /// One finding of the report. What should be a name and is not is not kept
@@ -1094,6 +1131,11 @@ fn finding(listed: &Value, now_ms: i64) -> Option<Finding> {
     let named = !rule.is_empty()
         && rule.len() <= 32
         && rule.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+    let count = listed["count"].as_u64()?;
+    let opaque_count = match listed.get("opaque_count") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().filter(|n| *n <= count)?),
+    };
     Some(Finding {
         agent: text("agent")?,
         session: text("session")?,
@@ -1104,7 +1146,8 @@ fn finding(listed: &Value, now_ms: i64) -> Option<Finding> {
             _ => "other".to_owned(),
         },
         rule: if named { rule } else { "unknown".to_owned() },
-        count: listed["count"].as_u64()?,
+        count,
+        opaque_count,
         fingerprint: text("fingerprint")
             .filter(|fp| fp.len() == 8 && fp.chars().all(|c| c.is_ascii_hexdigit()))
             .map(|fp| fp.to_ascii_lowercase()),
@@ -1445,6 +1488,7 @@ mod tests {
         let before = Secrets {
             read_ms: Some(NOW - HOUR),
             findings: Vec::new(),
+            ..Secrets::default()
         };
         for unreadable in [
             Value::Null,
@@ -1618,6 +1662,20 @@ mod tests {
         let value = serde_json::to_value(read).unwrap();
         assert!(value["findings"][0]["opaque_count"].is_null());
         assert!(value["undated_records"].is_null());
+        let mut unknown = report;
+        unknown["undated_records"] = Value::Null;
+        unknown["findings"][1]["opaque_count"] = Value::Null;
+        let (read, _) = read_secrets(
+            Some(4),
+            unknown.to_string().as_bytes(),
+            "",
+            &Secrets::default(),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(read.findings[0].count, 4);
+        assert_eq!(read.findings[0].opaque_count, None);
+        assert_eq!(read.undated_records, None);
     }
 
     #[test]
@@ -1694,6 +1752,7 @@ mod tests {
         let before = Secrets {
             read_ms: Some(NOW - HOUR),
             findings: Vec::new(),
+            ..Secrets::default()
         };
         let unreadable = json!([{"path": "/h/.claude/projects/-p/x.jsonl",
                                  "why": "Permission denied (os error 13)"}]);

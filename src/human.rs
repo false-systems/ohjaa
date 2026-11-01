@@ -339,6 +339,8 @@ enum Kind {
 #[derive(Debug, Clone)]
 struct Item {
     tokens: u64,
+    secret_rule: Option<String>,
+    opaque_tokens: Option<u64>,
     kind: Kind,
     /// For what stands: its place in the order.
     class: Option<Class>,
@@ -366,6 +368,7 @@ struct View {
     /// Everything that could not be read, each in full.
     unread: Vec<String>,
     collected_ms: Option<i64>,
+    secret_coverage: Option<(u64, u64)>,
 }
 
 impl View {
@@ -495,6 +498,8 @@ fn proposal_key(waiting: &Waiting) -> String {
 fn standing(kind: Kind, class: Class, key: String, repo: &str, text: String) -> Item {
     Item {
         tokens: 0,
+        secret_rule: None,
+        opaque_tokens: None,
         kind,
         class: Some(class),
         key,
@@ -509,6 +514,8 @@ fn standing(kind: Kind, class: Class, key: String, repo: &str, text: String) -> 
 fn event(kind: Kind, key: String, at_ms: i64, github: bool, repo: &str, text: String) -> Item {
     Item {
         tokens: 0,
+        secret_rule: None,
+        opaque_tokens: None,
         kind,
         class: None,
         key,
@@ -679,21 +686,68 @@ fn secret(finding: &Finding) -> Item {
         text,
     );
     item.tokens = finding.count;
+    item.secret_rule = Some(finding.rule.clone());
+    item.opaque_tokens = finding.opaque_count;
     item
 }
 
 fn secrets_found(items: &[&Item]) -> Option<String> {
-    let count = items
+    let mut counts = [0u64; 3];
+    for item in items.iter().filter(|item| item.kind == Kind::Secret) {
+        let group = match item.secret_rule.as_deref() {
+            Some(
+                "openai" | "anthropic" | "github" | "slack" | "aws" | "gitlab" | "google" | "jwt"
+                | "id_and_secret" | "private_key",
+            ) => 0,
+            Some("mixed_token" | "named_secret") => 1,
+            _ => 2,
+        };
+        counts[group] = counts[group].saturating_add(item.tokens);
+    }
+    let labels = ["key-format", "broad", "unclassified"];
+    let parts: Vec<_> = counts
         .iter()
-        .filter(|item| item.kind == Kind::Secret)
-        .fold(0u64, |sum, item| sum.saturating_add(item.tokens));
-    (count > 0).then(|| {
+        .zip(labels)
+        .filter(|(count, _)| **count > 0)
+        .map(|(count, label)| format!("{} {label}", grouped_count(*count)))
+        .collect();
+    (!parts.is_empty()).then(|| {
         format!(
-            "Possible secrets (unconfirmed): {} pattern {}",
-            grouped_count(count),
-            if count == 1 { "match" } else { "matches" }
+            "Secrets (unconfirmed): {} {}",
+            parts.join(" + "),
+            if counts.iter().copied().fold(0u64, u64::saturating_add) == 1 {
+                "match"
+            } else {
+                "matches"
+            }
         )
     })
+}
+
+fn secret_context(items: &[&Item]) -> Option<String> {
+    let (mut opaque, mut unknown) = (0u64, 0u64);
+    for item in items.iter().filter(|item| item.kind == Kind::Secret) {
+        match item.opaque_tokens {
+            Some(n) => opaque = opaque.saturating_add(n),
+            None => unknown = unknown.saturating_add(item.tokens),
+        }
+    }
+    if opaque > 0 && unknown > 0 {
+        Some(format!(
+            "At least {} in signature/encrypted fields; context unknown for {} occurrences.",
+            grouped_count(opaque),
+            grouped_count(unknown)
+        ))
+    } else if opaque > 0 {
+        Some(format!(
+            "{} in signature/encrypted fields; counts are occurrences, not distinct credentials.",
+            grouped_count(opaque)
+        ))
+    } else if unknown > 0 {
+        Some("Match context unavailable; counts are occurrences, not distinct credentials.".into())
+    } else {
+        None
+    }
 }
 
 fn grouped_count(count: u64) -> String {
@@ -733,7 +787,7 @@ fn saved_sources_summary(items: &[&Item]) -> Option<String> {
         .collect();
     (!names.is_empty()).then(|| {
         format!(
-            "Could not fully read: {}",
+            "Missing or incomplete information: {}",
             names.into_iter().collect::<Vec<_>>().join(", ")
         )
     })
@@ -1079,6 +1133,11 @@ fn build(
         parts,
         unread,
         collected_ms: collected.map(|c| c.at_ms),
+        secret_coverage: snapshot
+            .secrets
+            .value
+            .undated_records
+            .zip(snapshot.secrets.value.other_issues),
     }
 }
 
@@ -1512,13 +1571,13 @@ fn daily(
     now_ms: i64,
 ) -> Option<(String, bool)> {
     let proposal = proposal_line(view);
-    let secrets = secrets_found(
-        &view
-            .events
-            .iter()
-            .filter(|item| item.kind == Kind::Secret && from.holds(item))
-            .collect::<Vec<_>>(),
-    );
+    let secret_items = view
+        .events
+        .iter()
+        .filter(|item| item.kind == Kind::Secret && from.holds(item))
+        .collect::<Vec<_>>();
+    let secrets = secrets_found(&secret_items);
+    let context = secret_context(&secret_items);
     if view.standing.is_empty() && proposal.is_none() && secrets.is_none() {
         return None;
     }
@@ -1533,6 +1592,9 @@ fn daily(
     .to_owned()];
     if let Some(secrets) = secrets {
         lines.push(wrapped("  ", &secrets));
+    }
+    if let Some(context) = context {
+        lines.push(wrapped("  ", &context));
     }
     let items: Vec<_> = view.standing.iter().collect();
     let sources = saved_sources_summary(&items);
@@ -1556,6 +1618,34 @@ fn daily(
             "  ",
             &format!("{sources} · Refresh: ohjaa collect"),
         ));
+        if view
+            .standing
+            .iter()
+            .any(|item| item.key.starts_with("source:secrets:"))
+        {
+            if let Some((undated, other)) = view.secret_coverage {
+                let mut issues = Vec::new();
+                if undated > 0 {
+                    issues.push(format!(
+                        "{} no timestamp",
+                        plural(undated as usize, "record has", "records have")
+                    ));
+                }
+                if other > 0 {
+                    issues.push(plural(
+                        other as usize,
+                        "other coverage issue",
+                        "other coverage issues",
+                    ));
+                }
+                if !issues.is_empty() {
+                    lines.push(wrapped(
+                        "  ",
+                        &format!("Saved scan coverage: {}.", issues.join("; ")),
+                    ));
+                }
+            }
+        }
         let oldest = view
             .parts
             .iter()
@@ -1720,15 +1810,28 @@ fn full(
     };
     let findings = of(&[|kind| kind == Kind::Secret]);
     let has_findings = !findings.is_empty();
-    section(
-        &mut out,
-        "Secrets seen",
-        view.standing
-            .iter()
-            .filter(|item| item.key.starts_with("source:secrets:"))
-            .chain(findings)
-            .collect(),
-    );
+    let secret_items: Vec<_> = view
+        .standing
+        .iter()
+        .filter(|item| item.key.starts_with("source:secrets:"))
+        .chain(findings.iter().copied())
+        .collect();
+    if !secret_items.is_empty() {
+        out.push_str("\nSecrets seen\n");
+        if let Some(summary) = secrets_found(&findings) {
+            paragraph(&mut out, &summary);
+        }
+        if let Some(context) = secret_context(&findings) {
+            paragraph(&mut out, &context);
+        }
+        if has_findings {
+            paragraph(&mut out, "Counts are occurrences, not distinct credentials. Key-format matches follow recognizable key shapes; broad matches use general heuristics. Neither confirms a leak. Signature/encrypted fields are counted, not suppressed.");
+        }
+        for item in secret_items {
+            out.push_str(&full_row(item, width));
+            out.push('\n');
+        }
+    }
     if has_findings {
         paragraph(&mut out, "Rotate any findings that are real keys. The fingerprint is the first eight hex characters of the token's SHA-256; no secret value is kept here.");
     }
@@ -2307,7 +2410,7 @@ mod tests {
         for context in [
             "Last background update:",
             "Refresh: ohjaa collect",
-            "Could not fully read: secrets scan",
+            "Missing or incomplete information: secrets scan",
             "may still be active",
             "no task description recorded",
             "not active yet",
@@ -2361,8 +2464,8 @@ mod tests {
         eprintln!("Synthetic crowded startup:\n{daily}");
         let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
         for text in [
-            "Possible secrets (unconfirmed): 18,330 pattern matches",
-            "Could not fully read",
+            "Secrets (unconfirmed): 18,330 unclassified matches",
+            "Missing or incomplete information",
             "session excerpts",
             "secrets scan",
             "4 older session records",
@@ -2433,6 +2536,24 @@ mod tests {
         assert!(view.incomplete());
         let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(digest.contains("not distinct credentials"), "{digest}");
+        let mut partial = collected;
+        partial.secrets.value.findings[1].opaque_count = None;
+        let partial_view = self::view(&[], Some(&partial));
+        let partial_daily = self::daily(&partial_view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        let words = partial_daily
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            words.contains("At least 90 in signature/encrypted fields"),
+            "{partial_daily}"
+        );
+        assert!(
+            words.contains("context unknown for 2 occurrences"),
+            "{partial_daily}"
+        );
     }
 
     #[test]
@@ -2507,11 +2628,11 @@ mod tests {
         let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(daily.contains(&clock(NOW - 2 * DAY_MS)), "{daily}");
         assert!(
-            words.contains("Could not fully read: secrets scan"),
+            words.contains("Missing or incomplete information: secrets scan"),
             "{daily}"
         );
         assert!(
-            daily.contains("Possible secrets (unconfirmed): 1 pattern match"),
+            daily.contains("Secrets (unconfirmed): 1 key-format match"),
             "{daily}"
         );
         let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
@@ -2693,6 +2814,7 @@ mod tests {
             place: "person".into(),
             rule: "github".into(),
             count: 2,
+            opaque_count: None,
             fingerprint: Some("1a2b3c4d".into()),
             found_ms: NOW,
         });
@@ -2704,7 +2826,7 @@ mod tests {
         let notice = one_line(&news(&view, &initial)).unwrap();
         assert_eq!(
             notice,
-            "ohjaa · Possible secrets (unconfirmed): 2 pattern matches · Details: ohjaa digest\n"
+            "ohjaa · Secrets (unconfirmed): 2 key-format matches · Details: ohjaa digest\n"
         );
         let seen = advance(
             &view,
@@ -3260,7 +3382,7 @@ mod tests {
         );
         let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
         assert!(
-            line.contains("Could not fully read: pull requests, repository checks")
+            line.contains("Missing or incomplete information: pull requests, repository checks")
                 && line.ends_with("Details: ohjaa digest\n"),
             "{line}"
         );
@@ -3647,7 +3769,7 @@ mod tests {
         let other = view(&[], Some(&collected));
         let line = one_line(&news(&other, &seen)).expect("another failure");
         assert!(
-            line.contains("Could not fully read: pull requests"),
+            line.contains("Missing or incomplete information: pull requests"),
             "{line}"
         );
         assert!(!line.contains("marks"), "the marks failed the same: {line}");
@@ -3659,7 +3781,7 @@ mod tests {
         let more = view(&[], Some(&collected));
         let line = one_line(&news(&more, &seen)).expect("one more could not be read");
         assert!(
-            line.contains("Could not fully read: repository checks"),
+            line.contains("Missing or incomplete information: repository checks"),
             "{line}"
         );
         assert!(full(&more, &Window::at(NOW - DAY_MS), None, None, NOW)
