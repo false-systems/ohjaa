@@ -2667,6 +2667,63 @@ mod tests {
     }
 
     #[test]
+    fn later_reviewable_content_is_not_acknowledged_by_earlier_opaque_evidence() {
+        let mut collected = snapshot(NOW);
+        collected.secrets.value.findings.push(Finding {
+            agent: "claude".into(),
+            session: "changing-record".into(),
+            place: "agent".into(),
+            rule: "mixed_token".into(),
+            count: 100,
+            opaque_count: Some(100),
+            opaque_native: Some(true),
+            at_ms: Some(NOW - 6 * HOUR_MS),
+            found_ms: NOW - 6 * HOUR_MS,
+            ..Finding::default()
+        });
+        let old = view(&[], Some(&collected));
+        let seen = advance(
+            &old,
+            &Seen::first(NOW),
+            Some(&collected),
+            NOW,
+            Shown::Full,
+            "d",
+        );
+        collected.secrets.as_of_ms = Some(NOW + MINUTE_MS);
+        collected.secrets.value.findings[0].count = 101;
+        let next = build(&[], Ok(Vec::new()), Some(&collected), NOW + MINUTE_MS, 0);
+        let notice = one_line(&news(&next, &seen)).expect("new review candidate");
+        assert!(notice.contains("1 broad match"), "{notice}");
+        let digest = full(
+            &next,
+            &seen.full_from(NOW + MINUTE_MS),
+            None,
+            None,
+            NOW + MINUTE_MS,
+        );
+        assert!(digest.contains("mixed_token ×101"), "{digest}");
+        let read = advance(
+            &next,
+            &seen,
+            Some(&collected),
+            NOW + MINUTE_MS,
+            Shown::Full,
+            "d",
+        );
+        collected.secrets.as_of_ms = Some(NOW + 2 * MINUTE_MS);
+        let same = build(
+            &[],
+            Ok(Vec::new()),
+            Some(&collected),
+            NOW + 2 * MINUTE_MS,
+            0,
+        );
+        assert_eq!(one_line(&news(&same, &read)), None);
+        assert!(after(&same, &read.full_from(NOW + 2 * MINUTE_MS)).is_empty());
+    }
+
+    #[test]
     fn grouped_startup_leaves_room_for_failed_checks_even_when_every_source_is_partial() {
         let mut collected = snapshot(NOW - 2 * DAY_MS);
         collected.local.error = Some("synthetic unavailable source".into());
