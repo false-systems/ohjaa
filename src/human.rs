@@ -2564,6 +2564,40 @@ mod tests {
     }
 
     #[test]
+    fn generic_redaction_matches_are_evidence_not_startup_attention() {
+        for (opaque_count, opaque_native) in [
+            (None, None),
+            (Some(0), Some(true)),
+            (Some(8000), Some(true)),
+            (Some(8513), Some(true)),
+            (Some(9000), Some(true)),
+        ] {
+            let mut collected = snapshot(NOW);
+            collected.secrets.value.findings.push(Finding {
+                agent: "codex".into(),
+                session: "synthetic-generic".into(),
+                rule: "mixed_token".into(),
+                count: 8513,
+                opaque_count,
+                opaque_native,
+                at_ms: Some(NOW),
+                found_ms: NOW,
+                ..Finding::default()
+            });
+            let view = view(&[], Some(&collected));
+            assert_eq!(daily(&view, &Window::at(NOW - DAY_MS), None, NOW), None);
+            assert_eq!(one_line(&news(&view, &Seen::first(NOW))), None);
+            let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+            assert!(digest.contains("mixed_token ×8513"), "{digest}");
+            assert!(digest.contains("All scan evidence"), "{digest}");
+            // Unknown metadata is still unknown, not invented as known-safe.
+            if opaque_count.is_none() {
+                assert!(digest.contains("Match context unavailable"), "{digest}");
+            }
+        }
+    }
+
+    #[test]
     fn startup_distinguishes_key_formats_broad_patterns_and_transport_metadata() {
         let mut raw = serde_json::to_value(snapshot(NOW)).unwrap();
         raw["secrets"]["gaps"] = json!([
