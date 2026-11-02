@@ -584,18 +584,20 @@ here. It records only: nothing is sent to anyone, decided or refused.
   or a count of unique credentials. Full findings, individual inspection
   commands, source dates, and incomplete coverage remain in the digest.
 - **A match count is not a leaked-key count.** Startup separates recognizable
-  key-format matches from broad heuristics and unclassified rules. When Vessa
+  key-format matches from secret-labelled values and unclassified rules. Generic
+  random-string matches alone stay in the digest, not in startup attention. When Vessa
   reports context, it says how many occurrences are in signature/encrypted
   fields, without suppressing those matches. Older reports leave context
   unknown; partial context is a lower bound, never a complete total. Timestamp
   gaps are counted separately from other coverage issues when available.
   Counts are occurrences, not distinct credentials; no validity is inferred.
-- **Raw matches are not all credential alerts.** Generic random-string
-  (`mixed_token`) occurrences verified in native signature/encrypted fields
-  remain scan evidence in the digest but do not trigger a startup credential
-  alert. This requires Vessa's explicit native-position marker and a valid
-  subset count; old/unverified context is never silently discounted. Known
-  key formats, secret-labelled values, unknown rules/context, and incomplete
+- **Redaction is not credential detection.** Generic random-string
+  (`mixed_token`) occurrences remain scan evidence in the digest but do not
+  trigger startup credential alerts, regardless of context. The heuristic
+  checks string length and character mixtures; that alone cannot distinguish
+  keys from identifiers, encoded data or examples. Unknown context stays unknown,
+  never known-safe, and all counts remain inspectable. Known
+  key formats, secret-labelled values, unknown rules, and incomplete
   coverage still need attention. No detector or redaction rule is disabled,
   and opening a quiet terminal does not consume the underlying evidence.
   A changed reviewable subset has its own attention identity and observed

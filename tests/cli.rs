@@ -10466,6 +10466,61 @@ fn startup_keeps_liveness_warnings_with_long_recorded_goals() {
 }
 
 #[test]
+fn generic_matches_remain_inspectable_without_becoming_credential_alerts() {
+    let fixture = Fixture::new("line-generic-evidence");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let path = fixture.human_dir().join("collected.json");
+    let mut snapshot = serde_json::json!({"schema":"ohjaa-collected.v1","at_ms":now});
+    for part in ["local", "github", "usage", "typed", "secrets"] {
+        snapshot[part] = serde_json::json!({"as_of_ms":now});
+    }
+    snapshot["secrets"]["value"] = serde_json::json!({"read_ms":now,"findings":[
+        {"agent":"codex","session":"synthetic","at_ms":now,"where":"tool_output","rule":"mixed_token","count":8513,"found_ms":now}
+    ]});
+    fs::create_dir_all(fixture.human_dir()).unwrap();
+    fs::write(&path, snapshot.to_string()).unwrap();
+    let (quiet, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0));
+    assert_eq!(quiet, "");
+    let (digest, stderr, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(digest.contains("mixed_token ×8513"), "{digest}");
+    assert!(digest.contains("8,513 generic-pattern matches"), "{digest}");
+    assert!(digest.contains("Match context unavailable"), "{digest}");
+    // A quiet startup did not consume evidence, and missing scan coverage
+    // still warns even when the only matches are generic.
+    snapshot["secrets"]["gaps"] = serde_json::json!(["synthetic unreadable source"]);
+    fs::write(&path, snapshot.to_string()).unwrap();
+    let (partial, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0)); // Shell startup itself does not return scan status.
+    assert!(partial.contains("secrets scan"), "{partial}");
+    assert!(!partial.contains("Possible credentials"), "{partial}");
+    let (partial_digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(4), "{partial_digest}");
+    assert!(
+        partial_digest.contains("mixed_token ×8513"),
+        "{partial_digest}"
+    );
+    snapshot["secrets"]["value"]["findings"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "agent":"codex","session":"synthetic-key","at_ms":now,"where":"person",
+            "rule":"openai","count":27,"found_ms":now
+        }));
+    fs::write(&path, snapshot.to_string()).unwrap();
+    let (notice, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0));
+    assert!(notice.contains("27 key-format matches"), "{notice}");
+    assert!(!notice.contains("8,513"), "{notice}");
+    eprintln!("Synthetic credential notice with incomplete coverage:\n{notice}");
+    fixture.cleanup();
+}
+
+#[test]
 fn opaque_entropy_stays_in_the_digest_without_a_startup_credential_alert() {
     let fixture = Fixture::new("line-native-opaque");
     let now = std::time::SystemTime::now()
@@ -10992,7 +11047,7 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     };
     let daily = day();
     assert!(
-        daily.contains("\n  Secrets (unconfirmed): 1 key-format match\n"),
+        daily.contains("\n  Possible credentials: 1 key-format match\n"),
         "{daily}"
     );
     assert_eq!(day(), "", "said once");
@@ -11014,7 +11069,7 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     assert_eq!(
         day(),
-        "ohjaa · Secrets (unconfirmed): 1 key-format match · Details: ohjaa digest\n"
+        "ohjaa · Possible credentials: 1 key-format match · Details: ohjaa digest\n"
     );
     assert_eq!(day(), "");
     // The second scan began where the first ended, not at the window's start.

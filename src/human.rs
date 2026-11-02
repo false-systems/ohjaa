@@ -723,25 +723,28 @@ fn verified_opaque(item: &Item) -> Option<u64> {
 }
 
 fn review_count(item: &Item) -> u64 {
-    // Only the entropy heuristic in verified native transport fields is
-    // non-alert evidence. Key formats, labelled secrets and unknowns stay.
+    // The generic redaction heuristic is deliberately cautious, not evidence
+    // of a credential. Keep every occurrence in the digest, with its original
+    // context/coverage limitations. Specific formats, labels and unknown rules
+    // still need review; no scanner or redaction rule is changed here.
     if item.secret_rule.as_deref() == Some("mixed_token") {
-        item.tokens - verified_opaque(item).unwrap_or(0)
+        0
     } else {
         item.tokens
     }
 }
 
 fn secret_summary(items: &[&Item], attention: bool) -> Option<String> {
-    let mut counts = [0u64; 3];
+    let mut counts = [0u64; 4];
     for item in items.iter().filter(|item| item.kind == Kind::Secret) {
         let group = match item.secret_rule.as_deref() {
             Some(
                 "openai" | "anthropic" | "github" | "slack" | "aws" | "gitlab" | "google" | "jwt"
                 | "id_and_secret" | "private_key",
             ) => 0,
-            Some("mixed_token" | "named_secret") => 1,
-            _ => 2,
+            Some("named_secret") => 1,
+            Some("mixed_token") => 2,
+            _ => 3,
         };
         counts[group] = counts[group].saturating_add(if attention {
             review_count(item)
@@ -749,7 +752,12 @@ fn secret_summary(items: &[&Item], attention: bool) -> Option<String> {
             item.tokens
         });
     }
-    let labels = ["key-format", "broad", "unclassified"];
+    let labels = [
+        "key-format",
+        "secret-labelled",
+        "generic-pattern",
+        "unclassified",
+    ];
     let parts: Vec<_> = counts
         .iter()
         .zip(labels)
@@ -758,11 +766,11 @@ fn secret_summary(items: &[&Item], attention: bool) -> Option<String> {
         .collect();
     (!parts.is_empty()).then(|| {
         format!(
-            "{} (unconfirmed): {} {}",
+            "{}: {} {}",
             if attention {
-                "Secrets"
+                "Possible credentials"
             } else {
-                "All scan evidence"
+                "All scan evidence (unconfirmed)"
             },
             parts.join(" + "),
             if counts.iter().copied().fold(0u64, u64::saturating_add) == 1 {
@@ -1648,6 +1656,10 @@ fn daily(
     .to_owned()];
     if let Some(secrets) = secrets {
         lines.push(wrapped("  ", &secrets));
+        lines.push(wrapped(
+            "  ",
+            "Unconfirmed occurrences, not distinct keys. Review: ohjaa digest",
+        ));
     }
     let items: Vec<_> = view.standing.iter().collect();
     let sources = saved_sources_summary(&items);
@@ -1875,7 +1887,7 @@ fn full(
             paragraph(&mut out, &attention);
         }
         if has_findings {
-            paragraph(&mut out, "Raw scan evidence is retained below. Generic random-string matches in verified native signatures/encrypted payloads are evidence, not credential alerts. Known key formats, secret-labelled values and unverified context still need review.");
+            paragraph(&mut out, "Review candidates match a known key format or a value labelled as a secret; unrecognised scan rules also remain candidates. Generic random-string matches alone do not establish a credential and do not trigger startup alerts. All occurrences remain below, including those with unknown context; none is classified as safe.");
         }
         if let Some(summary) = secrets_found(&findings) {
             paragraph(&mut out, &summary);
@@ -1884,7 +1896,7 @@ fn full(
             paragraph(&mut out, &context);
         }
         if has_findings {
-            paragraph(&mut out, "Counts are occurrences, not distinct credentials. Key-format matches follow recognizable key shapes; broad matches use general heuristics. Neither confirms a leak. Signature/encrypted fields are counted, not suppressed.");
+            paragraph(&mut out, "Counts are occurrences, not distinct credentials. Generic-pattern matches are long strings mixing uppercase, lowercase and digits; secret-labelled matches follow words such as token or password. These rules do not confirm a leak. Signature/encrypted fields are counted, not suppressed.");
         }
         for item in secret_items {
             out.push_str(&full_row(item, width));
@@ -2523,7 +2535,7 @@ mod tests {
         eprintln!("Synthetic crowded startup:\n{daily}");
         let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
         for text in [
-            "Secrets (unconfirmed): 18,330 unclassified matches",
+            "Possible credentials: 18,330 unclassified matches",
             "Missing or incomplete information",
             "session excerpts",
             "secrets scan",
@@ -2617,14 +2629,14 @@ mod tests {
         let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
         for text in [
             "2 key-format",
-            "10 broad",
             "2 records have no timestamp",
             "1 other coverage issue",
-            "unconfirmed",
+            "Unconfirmed",
         ] {
             assert!(words.contains(text), "missing {text}:\n{daily}");
         }
         assert!(daily.lines().count() <= 10, "{daily}");
+        assert!(!words.contains("broad"), "{daily}");
         assert!(view.incomplete());
         let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(digest.contains("not distinct credentials"), "{digest}");
@@ -2679,22 +2691,13 @@ mod tests {
         assert!(digest.contains("signature/encrypted"), "{digest}");
         for (rule, context, native, expected) in [
             ("openai", json!(100), json!(true), "100 key-format"),
-            ("named_secret", json!(100), json!(true), "100 broad"),
-            ("future_rule", json!(100), json!(true), "100 unclassified"),
             (
-                "mixed_token",
-                serde_json::Value::Null,
-                json!(true),
-                "100 broad",
-            ),
-            (
-                "mixed_token",
+                "named_secret",
                 json!(100),
-                serde_json::Value::Null,
-                "100 broad",
+                json!(true),
+                "100 secret-labelled",
             ),
-            ("mixed_token", json!(101), json!(true), "100 broad"),
-            ("mixed_token", json!(90), json!(true), "10 broad"),
+            ("future_rule", json!(100), json!(true), "100 unclassified"),
         ] {
             raw["secrets"]["value"]["findings"][0]["rule"] = json!(rule);
             raw["secrets"]["value"]["findings"][0]["opaque_count"] = context;
@@ -2704,6 +2707,7 @@ mod tests {
             let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
             assert!(line.contains(expected), "{rule}: {line}");
         }
+        raw["secrets"]["value"]["findings"][0]["rule"] = json!("mixed_token");
         raw["secrets"]["value"]["findings"][0]["opaque_count"] = json!(100);
         raw["secrets"]["gaps"] = json!(["synthetic incomplete scan"]);
         let collected: Collected = serde_json::from_value(raw).unwrap();
@@ -2715,7 +2719,7 @@ mod tests {
             daily.contains("Missing or incomplete information"),
             "{daily}"
         );
-        assert!(!daily.contains("Secrets (unconfirmed)"), "{daily}");
+        assert!(!daily.contains("Possible credentials"), "{daily}");
         assert!(view.incomplete());
     }
 
@@ -2744,10 +2748,14 @@ mod tests {
             "d",
         );
         collected.secrets.as_of_ms = Some(NOW + MINUTE_MS);
-        collected.secrets.value.findings[0].count = 101;
+        // A specific secret-labelled value is reviewable even after reading
+        // generic evidence from the same native record.
+        collected.secrets.value.findings[0].rule = "named_secret".into();
+        collected.secrets.value.findings[0].count = 1;
+        collected.secrets.value.findings[0].opaque_count = Some(0);
         let next = build(&[], Ok(Vec::new()), Some(&collected), NOW + MINUTE_MS, 0);
         let notice = one_line(&news(&next, &seen)).expect("new review candidate");
-        assert!(notice.contains("1 broad match"), "{notice}");
+        assert!(notice.contains("1 secret-labelled match"), "{notice}");
         let digest = full(
             &next,
             &seen.full_from(NOW + MINUTE_MS),
@@ -2755,7 +2763,7 @@ mod tests {
             None,
             NOW + MINUTE_MS,
         );
-        assert!(digest.contains("mixed_token ×101"), "{digest}");
+        assert!(digest.contains("named_secret ×1"), "{digest}");
         let read = advance(
             &next,
             &seen,
@@ -2852,7 +2860,7 @@ mod tests {
             "{daily}"
         );
         assert!(
-            daily.contains("Secrets (unconfirmed): 1 key-format match"),
+            daily.contains("Possible credentials: 1 key-format match"),
             "{daily}"
         );
         let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
@@ -3047,7 +3055,7 @@ mod tests {
         let notice = one_line(&news(&view, &initial)).unwrap();
         assert_eq!(
             notice,
-            "ohjaa · Secrets (unconfirmed): 2 key-format matches · Details: ohjaa digest\n"
+            "ohjaa · Possible credentials: 2 key-format matches · Details: ohjaa digest\n"
         );
         let seen = advance(
             &view,
