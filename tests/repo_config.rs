@@ -37,24 +37,36 @@ fn repo_yaml_parses_the_way_toimija_reads_it() {
 /// `snapshots/` through, so `toimija doctor --strict` failed here.
 #[test]
 fn git_ignores_toimijas_working_files_but_not_its_config() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // Exit 0: ignored; 1: not ignored. The person's own global ignore rules
-    // are kept out, so only this repository's decide.
-    let ignored = |path: &str| {
+    let gitignore =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(".gitignore"))
+            .expect("read .gitignore");
+    // This `.gitignore` alone, in a repository of the test's own, decides:
+    // none of the person's rules does. Git reads a global excludes file
+    // ($XDG_CONFIG_HOME/git/ignore, else ~/.config/git/ignore) even with no
+    // global config, and a clone's own info/exclude, so neither is used.
+    let base = std::env::temp_dir().join(format!("ohjaa-gitignore-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let repo = base.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
         std::process::Command::new("git")
-            .current_dir(root)
+            .current_dir(&repo)
+            .env("HOME", &base)
+            .env("XDG_CONFIG_HOME", &base)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .args(["check-ignore", "--quiet", "--no-index", path])
+            .args(["-c", "core.excludesFile=/dev/null"])
+            .args(args)
             .status()
-            .ok()
-            .and_then(|status| status.code())
+            .expect("git runs")
     };
-    if ignored("README.md") != Some(1) {
-        eprintln!("skipped: not a git checkout, or git did not run");
-        return;
-    }
-    for path in [
+    assert!(git(&["init", "--quiet"]).success(), "git init");
+    std::fs::write(repo.join(".gitignore"), gitignore).unwrap();
+    // Exit 0: ignored; 1: not ignored.
+    let ignored = |path: &str| git(&["check-ignore", "--quiet", "--no-index", path]).code();
+    let answers: Vec<(&str, Option<i32>)> = [
+        "README.md",
+        ".toimija/repo.yaml",
         ".toimija/current.md",
         ".toimija/current.json",
         ".toimija/sessions/1793700398-28263/current.md",
@@ -63,12 +75,22 @@ fn git_ignores_toimijas_working_files_but_not_its_config() {
         ".toimija/runs/r1/log",
         ".toimija/snapshots/s1",
         ".toimija/written-by-a-later-toimija",
-    ] {
-        assert_eq!(ignored(path), Some(0), "git does not ignore {path}");
+    ]
+    .into_iter()
+    .map(|path| (path, ignored(path)))
+    .collect();
+    std::fs::remove_dir_all(&base).unwrap();
+    for (path, answer) in answers {
+        let tracked = path == "README.md" || path == ".toimija/repo.yaml";
+        assert_eq!(
+            answer,
+            Some(if tracked { 1 } else { 0 }),
+            "{path}: git {} it",
+            if tracked {
+                "ignores, though it is tracked,"
+            } else {
+                "does not ignore"
+            }
+        );
     }
-    assert_eq!(
-        ignored(".toimija/repo.yaml"),
-        Some(1),
-        "git ignores .toimija/repo.yaml, which is tracked"
-    );
 }
