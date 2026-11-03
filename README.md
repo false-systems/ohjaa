@@ -30,7 +30,7 @@ ohjaa graph rust-only                  # a node, its neighbours, who was briefed
 ohjaa fleet                            # who is live, across every repo
 ohjaa system                           # what every tool in the fleet is, derived now
 ohjaa apply                            # apply the workflow from ~/.config/ohjaa, outside every repo
-ohjaa adopt ~/projects/sykli           # give a repo an entry: the branch ohjaa observes, and its gate
+ohjaa adopt ~/projects/sykli           # give a repo an entry: the branch ohjaa observes, and [cargo_env]
 ohjaa doctor                           # what differs from what apply would make it
 ohjaa gate                             # prove HEAD: run this repo's gate, as a push is judged
 ```

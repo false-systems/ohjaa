@@ -431,11 +431,13 @@ enum Cmd {
         repository's own core.hooksPath, means its pushes are not observed), and\n\
         each hook of its own must have a dispatcher (else git skips it).")]
     Doctor,
-    /// Write a repository's entry into the home: the branch ohjaa observes
-    /// (origin's default branch) and the gate it is judged by, copied from the
-    /// repository's sykli.json on that branch, else written by
-    /// `sykli init --contract`; then regenerate the home's git config. Neither
-    /// git's global config nor the repository is written.
+    /// Write a repository's entry into the home: `repo.toml`, with the branch
+    /// ohjaa observes (origin's default branch) and the `[cargo_env]` its gate
+    /// gives cargo tasks; then regenerate the home's git config. The entry
+    /// keeps no copy of a gate: every commit's gate is derived from that
+    /// commit's own sykli.json, else from what `sykli init` writes for its
+    /// tree, and --force removes a copy an earlier adopt kept. Neither git's
+    /// global config nor the repository is written.
     Adopt {
         /// The repository (any directory inside it).
         path: PathBuf,
