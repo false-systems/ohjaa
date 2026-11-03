@@ -166,6 +166,10 @@ pub struct Natives {
     /// Headless runs (`claude -p`, `codex exec`, intake's drafter among
     /// them): no person started them, so they bypass nothing.
     pub headless: usize,
+    /// Copies of earlier history an agent's app wrote in one go, written in
+    /// the window, by agent: vessa's `written_in_one_go`. No one started
+    /// them as sessions then, so they bypass nothing either.
+    pub copies: std::collections::BTreeMap<String, usize>,
     pub undated: Vec<Undated>,
 }
 
@@ -692,6 +696,14 @@ pub fn parse_native(
         .filter(|s| s["parent"].is_null())
     {
         let text = |key: &str| s[key].as_str().unwrap_or_default().to_owned();
+        // A copy of earlier history, written in one go: its records say only
+        // when it was copied, and no one started it as a session then.
+        if let Some(copied_ms) = s["written_in_one_go"].as_str().and_then(intake::parse_time) {
+            if in_window(copied_ms) {
+                *natives.copies.entry(text("agent")).or_default() += 1;
+            }
+            continue;
+        }
         let started_ms = s["started_at"].as_str().and_then(intake::parse_time);
         let cwd = text("cwd");
         match started_ms {
@@ -1094,6 +1106,25 @@ pub fn render(report: &Report) -> String {
                     natives.headless
                 );
             }
+            let copies: usize = natives.copies.values().sum();
+            if copies > 0 {
+                let by = natives
+                    .copies
+                    .iter()
+                    .map(|(agent, n)| format!("{agent} {n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let (what, sessions) = if copies == 1 {
+                    ("1 copy".to_owned(), "a session")
+                } else {
+                    (format!("{copies} copies"), "sessions")
+                };
+                let _ = writeln!(
+                    out,
+                    "  Not counted: {what} of earlier history that an agent's app wrote in one \
+                     go ({by}), not {sessions} anyone started then"
+                );
+            }
             if !natives.undated.is_empty() {
                 let _ = writeln!(
                     out,
@@ -1369,6 +1400,9 @@ fn report_json(report: &Report) -> Value {
                     "testimony": m.by.testimony(),
                 })).collect::<Vec<_>>(),
                 "headless": natives.headless,
+                // Additive: copies of earlier history written in one go, by
+                // agent.
+                "copies": natives.copies,
                 "undated": natives.undated.iter().map(|u| json!({
                     "agent": u.agent,
                     "id": u.id,
@@ -2076,6 +2110,11 @@ mod tests {
             natives.headless, 2,
             "claude -p and codex exec bypass nothing"
         );
+        assert_eq!(
+            natives.copies,
+            [("codex".to_owned(), 1)].into(),
+            "the copy written in the window is counted; the older one is not"
+        );
         let undated: Vec<&str> = natives.undated.iter().map(|u| u.id.as_str()).collect();
         assert_eq!(
             undated,
@@ -2439,6 +2478,7 @@ mod tests {
             }],
             matched: Vec::new(),
             headless: 3,
+            copies: Default::default(),
             undated: Vec::new(),
         };
         let report = sample(Ok(natives));

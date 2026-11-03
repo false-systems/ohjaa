@@ -508,6 +508,11 @@ mark, flag" below) and three lists for the window:
     (`entrypoint` `sdk-…`), `codex exec` (`originator` naming exec), and
     intake's own drafter with them. A pi transcript does not say how pi was
     started, so a `pi -p` run counts as a person's session.
+  - A copy of earlier history that an agent's app wrote in one go (vessa's
+    `written_in_one_go`, such as the 34 Codex Desktop wrote at once on
+    2026-10-28) bypasses nothing either: no one started it as a session
+    then. Copies written in the window are counted by agent (`bypasses.copies`
+    in `--json`) and leave no gap.
   - A session vessa could not date or place is listed apart, not judged.
   - A vessa too old for `--headers` (before vessa#5: exit 2, nothing
     listed) leaves the list not judged, and the report says to update it.
