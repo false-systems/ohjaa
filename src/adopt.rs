@@ -1,7 +1,8 @@
 //! `ohjaa adopt`: write a repository's entry into the home (`repo.toml`: the
 //! branch and `[cargo_env]`; no copy of a gate, every commit's gate being
 //! derived from the commit: from its own `sykli.json`, else from what `sykli
-//! init` writes for its tree) and regenerate the home's git config, then commit
+//! init` writes for its tree, and none for a commit whose only contract is a
+//! `sykli.rs`) and regenerate the home's git config, then commit
 //! that in the home's history. It never touches git's global config, and never
 //! writes into a repository (it takes no lock there either: no `git status`).
 
