@@ -2055,6 +2055,12 @@ mod tests {
             s("exec", "codex", json!({"originator": "codex_exec"})),
             s("undated", "claude", json!({"started_at": null, "cwd": ""})),
             s("nowhere", "codex", json!({"cwd": ""})),
+            // vessa's copies of earlier history, written in one go: no one
+            // started them then, and they are no gap.
+            s("copy", "codex", json!({"started_at": null,
+                "written_in_one_go": "2026-10-09T10:00:00.100Z"})),
+            s("old-copy", "codex", json!({"started_at": null,
+                "written_in_one_go": "2026-09-01T10:00:00.100Z"})),
         ]});
         let (judgeable, natives) = parse_native(&listed, since, now).unwrap();
         let at = since + 6 * 86_400_000 + 36_000_500;

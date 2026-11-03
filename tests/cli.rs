@@ -8512,6 +8512,54 @@ fn what_vessa_could_not_read_or_date_leaves_the_report_incomplete() {
     fixture.cleanup();
 }
 
+/// vessa marks a transcript written in one go (`written_in_one_go`): a copy
+/// of earlier history, such as the 34 Codex Desktop wrote at once on
+/// 2026-10-28. No one started it as a session then, and ohjaa knows what it
+/// is, so it is counted apart, plainly, and leaves no gap.
+#[test]
+fn a_copy_vessa_marks_is_said_plainly_and_leaves_the_report_complete() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("report-vessa-copies");
+    let repo = fixture.make_git_repo("work");
+    let copy = fixture.dir.join("copy.jsonl");
+    fs::write(&copy, "{}\n").unwrap();
+    fs::write(
+        fixture.dir.join("vessa.json"),
+        format!(
+            r#"{{"schema":"vessa-session-headers.v1","warnings":[],"sessions":[
+            {{"agent":"codex","id":"copied","parent":null,"started_at":null,"cwd":"/r/app",
+              "source":"{}","entrypoint":null,"originator":"Codex Desktop",
+              "written_in_one_go":"{}"}}]}}"#,
+            copy.display(),
+            utc_now()
+        ),
+    )
+    .unwrap();
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .arg("--root")
+            .arg(&fixture.dir)
+            .arg("report")
+            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
+            .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
+            .current_dir(&repo),
+    );
+    assert!(
+        stdout.contains("Agent sessions a person started without ohjaa (0):")
+            && stdout.contains(
+                "  Not counted: 1 copy of earlier history that an agent's app wrote in one go \
+                 (codex 1), not a session anyone started then"
+            )
+            && !stdout.contains("could not date"),
+        "{stdout}"
+    );
+    assert_eq!(code, Some(0), "complete: {stdout}{stderr}");
+    fixture.cleanup();
+}
+
 /// A vessa from before vessa#5 refuses `--headers` as clap does (exit 2,
 /// nothing on stdout). The report says to update it, and never asks for the
 /// slow full listing instead.
