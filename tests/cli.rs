@@ -11136,3 +11136,24 @@ fn malformed_secrets_coverage_is_incomplete_and_keeps_the_retry_boundary() {
         .contains("unreadable-path list"));
     fixture.cleanup();
 }
+
+/// `ohjaa adopt --help` says what an entry holds. It said the entry kept the
+/// gate "copied from the repository's sykli.json", while every commit's gate
+/// is derived from that commit, and `ohjaa doctor` calls such a copy never
+/// read.
+#[test]
+fn adopt_help_says_the_entry_keeps_no_copy_of_a_gate() {
+    let fixture = Fixture::new("adopt-help");
+    let (stdout, stderr, code) = output_of(fixture.ohjaa().args(["adopt", "--help"]));
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let said = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        said.contains(
+            "The entry keeps no copy of a gate: every commit's gate is derived from that \
+             commit's own sykli.json, else from what `sykli init` writes for its tree"
+        ),
+        "{stdout}"
+    );
+    assert!(!said.contains("copied from"), "{stdout}");
+    fixture.cleanup();
+}
