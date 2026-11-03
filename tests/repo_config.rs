@@ -30,3 +30,45 @@ fn repo_yaml_parses_the_way_toimija_reads_it() {
         );
     }
 }
+
+/// toimija writes its working files under `.toimija/`: the packet, sessions,
+/// history, runs, snapshots, and whatever it adds next. Git must ignore all
+/// of them but `repo.yaml`, which is tracked. Naming each file let
+/// `snapshots/` through, so `toimija doctor --strict` failed here.
+#[test]
+fn git_ignores_toimijas_working_files_but_not_its_config() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Exit 0: ignored; 1: not ignored. The person's own global ignore rules
+    // are kept out, so only this repository's decide.
+    let ignored = |path: &str| {
+        std::process::Command::new("git")
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["check-ignore", "--quiet", "--no-index", path])
+            .status()
+            .ok()
+            .and_then(|status| status.code())
+    };
+    if ignored("README.md") != Some(1) {
+        eprintln!("skipped: not a git checkout, or git did not run");
+        return;
+    }
+    for path in [
+        ".toimija/current.md",
+        ".toimija/current.json",
+        ".toimija/sessions/1793700398-28263/current.md",
+        ".toimija/history.jsonl",
+        ".toimija/history.lock",
+        ".toimija/runs/r1/log",
+        ".toimija/snapshots/s1",
+        ".toimija/written-by-a-later-toimija",
+    ] {
+        assert_eq!(ignored(path), Some(0), "git does not ignore {path}");
+    }
+    assert_eq!(
+        ignored(".toimija/repo.yaml"),
+        Some(1),
+        "git ignores .toimija/repo.yaml, which is tracked"
+    );
+}
