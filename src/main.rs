@@ -431,11 +431,14 @@ enum Cmd {
         repository's own core.hooksPath, means its pushes are not observed), and\n\
         each hook of its own must have a dispatcher (else git skips it).")]
     Doctor,
-    /// Write a repository's entry into the home: the branch ohjaa observes
-    /// (origin's default branch) and the gate it is judged by, copied from the
-    /// repository's sykli.json on that branch, else written by
-    /// `sykli init --contract`; then regenerate the home's git config. Neither
-    /// git's global config nor the repository is written.
+    /// Write a repository's entry into the home: `repo.toml`, with the branch
+    /// ohjaa observes (origin's default branch) and the `[cargo_env]` its gate
+    /// gives cargo tasks; then regenerate the home's git config. The entry
+    /// keeps no copy of a gate: every commit's gate is derived from that
+    /// commit's own sykli.json, else from what `sykli init` writes for its
+    /// tree, and a commit whose only contract is a sykli.rs has none; --force
+    /// removes a copy an earlier adopt kept. Neither git's
+    /// global config nor the repository is written.
     Adopt {
         /// The repository (any directory inside it).
         path: PathBuf,
@@ -457,11 +460,14 @@ enum Cmd {
         The repository is found by the URL git pushes to; its entry is\n\
         <home>/repos/<owner>/<repo>/. A push that moves the entry's branch is\n\
         handed, quietly, to\n  \
-        sykli hook pre-push --contract <entry>/sykli.json --branch <branch> <remote> <url>\n\
-        for at most 15 s. When sykli does not accept it, the commit is asked about\n\
-        as the marks ask (a receipt in any worktree of the clone). When that does\n\
-        not prove it either, or sykli cannot judge it (no sykli, one without\n\
-        --contract and --branch, an entry without a gate), the push goes on and\n\
+        sykli hook pre-push --contract <gate> --branch <branch> <remote> <url>\n\
+        for at most 15 s, where <gate> is the gate derived from the pushed commit\n\
+        (its own sykli.json, else what sykli init writes for its tree), written\n\
+        outside the repository. When sykli does not accept it, the commit is asked\n\
+        about as the marks ask (a receipt in any worktree of the clone). When that\n\
+        does not prove it either, or sykli cannot judge it (no sykli, one without\n\
+        --contract and --branch, a commit with no gate: only a sykli.rs, or a tree\n\
+        sykli init writes none for), the push goes on and\n\
         one line flags it: ohjaa: UNPROVEN push to <branch> (<why>). A push ohjaa\n\
         cannot observe at all (no workflow home, an unreadable entry) goes on\n\
         with: ohjaa: UNOBSERVED push to <owner/repo>: <why>. The repository's\n\

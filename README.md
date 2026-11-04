@@ -30,7 +30,7 @@ ohjaa graph rust-only                  # a node, its neighbours, who was briefed
 ohjaa fleet                            # who is live, across every repo
 ohjaa system                           # what every tool in the fleet is, derived now
 ohjaa apply                            # apply the workflow from ~/.config/ohjaa, outside every repo
-ohjaa adopt ~/projects/sykli           # give a repo an entry: the branch ohjaa observes, and its gate
+ohjaa adopt ~/projects/sykli           # give a repo an entry: the branch ohjaa observes, and the build settings its gate gives cargo
 ohjaa doctor                           # what differs from what apply would make it
 ohjaa gate                             # prove HEAD: run this repo's gate, as a push is judged
 ```
@@ -1890,7 +1890,8 @@ dispatcher names):
 a commit proven in another worktree is a quiet push too. Otherwise (no
 receipt of the commit's tree, a failed one, one under another contract), or
 when sykli cannot judge it (no sykli, one without `--contract` and
-`--branch`, an entry without a gate, sykli out of time), the push goes on,
+`--branch`, a commit with no gate: only a `sykli.rs`, or a tree sykli init
+writes none for; sykli out of time), the push goes on,
 and one line says so, after the repository's own hook:
 
 ```

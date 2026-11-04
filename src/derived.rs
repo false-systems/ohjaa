@@ -5,9 +5,11 @@
 //! `sykli.lock` beside it), with the entry's `[cargo_env]` lines given to
 //! each cargo task that does not say where it builds (KATANA D10, the lines
 //! `ohjaa adopt` used to write into a copy). It is written outside the
-//! repository, under the entry, keyed by its digest
-//! (`<entry>/derived/<digest>/sykli.json` and `sykli.lock`), and is a
-//! function of C and the entry alone: the same C always gives the same gate,
+//! repository and the config home, keyed by its digest: kept under
+//! `$XDG_STATE_HOME/ohjaa/derived/<digest>/` (`sykli.json` and `sykli.lock`)
+//! for a run that outlives ohjaa ([`Gates::keep`]), else in this process's
+//! own folder for sykli to read now ([`Gates::read`]). It is a function of C
+//! and the entry alone: the same C always gives the same gate,
 //! and a contract changed at C gives another. A commit with no contract of
 //! its own (no `sykli.json`, and no `sykli.rs`) is judged by what `sykli
 //! init` writes for its tree ([`derive_inferred`]), given the same lines:
