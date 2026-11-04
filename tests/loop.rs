@@ -145,10 +145,9 @@ const CARGO_TOML: &str = "[package]\nname = \"widget\"\nversion = \"0.1.0\"\nedi
 const REPO_YAML: &str =
     "repo:\n  name: widget\n  role: the loop test's fixture crate\n  not:\n    - a product\n";
 
-/// What toimija writes beside `repo.yaml`, as ohjaa's own `.gitignore` has it.
-const GITIGNORE: &str = "target/\n.toimija/current.md\n.toimija/current.json\n\
-                         .toimija/sessions/\n.toimija/history.jsonl\n.toimija/history.lock\n\
-                         .toimija/runs/\n.toimija/tmp/\n";
+/// What toimija writes beside `repo.yaml`, as ohjaa's own `.gitignore` has it:
+/// everything under `.toimija/` but the config.
+const GITIGNORE: &str = "target/\n/.toimija/*\n!/.toimija/repo.yaml\n";
 
 const LIB: &str = "pub fn add(a: u32, b: u32) -> u32 {
     a + b
