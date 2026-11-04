@@ -10354,8 +10354,11 @@ fn what_could_not_be_read_is_said_never_an_all_clear() {
             .arg("line")
             .env("OHJAA_TODAY", "2026-10-27"),
     );
-    assert!(daily.contains("! marks"), "{daily}");
-    assert!(daily.contains("1 could not be read"), "{daily}");
+    assert!(
+        daily.contains("Missing or incomplete information: repository checks"),
+        "{daily}"
+    );
+    assert!(daily.contains("Refresh: ohjaa collect"), "{daily}");
     fixture.cleanup();
 }
 
@@ -10395,6 +10398,168 @@ fn what_the_days_digest_left_out_is_what_ohjaa_digest_shows() {
     fixture.cleanup();
 }
 
+#[test]
+fn startup_keeps_liveness_warnings_with_long_recorded_goals() {
+    for orphaned in [false, true] {
+        let fixture = Fixture::new("line-long-liveness-goal");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let goal = "Keep this complete recorded goal available. ".repeat(40);
+        fs::create_dir_all(fixture.dir.join("state/ohjaa")).unwrap();
+        {
+            let db = redb::Database::create(fixture.dir.join("state/ohjaa/sessions.redb")).unwrap();
+            let tx = db.begin_write().unwrap();
+            let session = serde_json::json!({
+                "id": "long-liveness-goal", "agent": "codex", "repo": "/synthetic/ohjaa",
+                "intent": "interactive", "started_ms": now - 172_800_000, "delivered": [],
+                "readback": {"at_ms": now - 172_800_000, "text": goal}
+            })
+            .to_string();
+            tx.open_table(redb::TableDefinition::<&str, &[u8]>::new("sessions"))
+                .unwrap()
+                .insert("long-liveness-goal", session.as_bytes())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let mut snapshot = serde_json::json!({"schema": "ohjaa-collected.v1", "at_ms": now});
+        for part in ["local", "github", "usage", "typed", "secrets"] {
+            snapshot[part] = serde_json::json!({"as_of_ms": now});
+        }
+        snapshot["local"]["value"] = if orphaned {
+            serde_json::json!({"branches": [], "orphaned": ["long-liveness-goal"]})
+        } else {
+            serde_json::json!({"branches": [], "gone": ["long-liveness-goal"]})
+        };
+        fs::create_dir_all(fixture.human_dir()).unwrap();
+        fs::write(
+            fixture.human_dir().join("collected.json"),
+            snapshot.to_string(),
+        )
+        .unwrap();
+        let (daily, code) = on_a_terminal(fixture.person().arg("line"));
+        eprintln!("Synthetic liveness startup (orphaned={orphaned}):\n{daily}");
+        assert_eq!(code, Some(0));
+        let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
+        let warning = if orphaned {
+            "Neither the agent nor its supervisor was found running"
+        } else {
+            "Agent still running without its Ohjaa supervisor"
+        };
+        assert!(words.contains(warning), "{daily}");
+        assert!(
+            daily.contains("ohjaa session long-liveness-goal"),
+            "{daily}"
+        );
+        assert!(daily.lines().count() <= 15, "{daily}");
+        assert!(
+            daily.lines().all(|line| line.chars().count() <= 100),
+            "{daily}"
+        );
+        let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+        assert_eq!(code, Some(0), "{digest}");
+        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains(goal.trim()), "{digest}");
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn generic_matches_remain_inspectable_without_becoming_credential_alerts() {
+    let fixture = Fixture::new("line-generic-evidence");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let path = fixture.human_dir().join("collected.json");
+    let mut snapshot = serde_json::json!({"schema":"ohjaa-collected.v1","at_ms":now});
+    for part in ["local", "github", "usage", "typed", "secrets"] {
+        snapshot[part] = serde_json::json!({"as_of_ms":now});
+    }
+    snapshot["secrets"]["value"] = serde_json::json!({"read_ms":now,"findings":[
+        {"agent":"codex","session":"synthetic","at_ms":now,"where":"tool_output","rule":"mixed_token","count":8513,"found_ms":now}
+    ]});
+    fs::create_dir_all(fixture.human_dir()).unwrap();
+    fs::write(&path, snapshot.to_string()).unwrap();
+    let (quiet, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0));
+    assert_eq!(quiet, "");
+    let (digest, stderr, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(digest.contains("mixed_token ×8513"), "{digest}");
+    assert!(digest.contains("8,513 generic-pattern matches"), "{digest}");
+    assert!(digest.contains("Match context unavailable"), "{digest}");
+    // A quiet startup did not consume evidence, and missing scan coverage
+    // still warns even when the only matches are generic.
+    snapshot["secrets"]["gaps"] = serde_json::json!(["synthetic unreadable source"]);
+    fs::write(&path, snapshot.to_string()).unwrap();
+    let (partial, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0)); // Shell startup itself does not return scan status.
+    assert!(partial.contains("secrets scan"), "{partial}");
+    assert!(!partial.contains("Possible credentials"), "{partial}");
+    let (partial_digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(4), "{partial_digest}");
+    assert!(
+        partial_digest.contains("mixed_token ×8513"),
+        "{partial_digest}"
+    );
+    snapshot["secrets"]["value"]["findings"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "agent":"codex","session":"synthetic-key","at_ms":now,"where":"person",
+            "rule":"openai","count":27,"found_ms":now
+        }));
+    fs::write(&path, snapshot.to_string()).unwrap();
+    let (notice, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0));
+    assert!(notice.contains("27 key-format matches"), "{notice}");
+    assert!(!notice.contains("8,513"), "{notice}");
+    eprintln!("Synthetic credential notice with incomplete coverage:\n{notice}");
+    fixture.cleanup();
+}
+
+#[test]
+fn opaque_entropy_stays_in_the_digest_without_a_startup_credential_alert() {
+    let fixture = Fixture::new("line-native-opaque");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let path = fixture.human_dir().join("collected.json");
+    let mut snapshot = serde_json::json!({"schema":"ohjaa-collected.v1","at_ms":now});
+    for part in ["local", "github", "usage", "typed", "secrets"] {
+        snapshot[part] = serde_json::json!({"as_of_ms":now});
+    }
+    snapshot["secrets"]["value"] = serde_json::json!({"read_ms":now,"findings":[
+        {"agent":"claude","session":"synthetic","cwd":null,"at_ms":now,"where":"agent","rule":"mixed_token","count":100,"opaque_count":100,"opaque_native":true,"fingerprint":null,"found_ms":now}
+    ]});
+    fs::create_dir_all(fixture.human_dir()).unwrap();
+    fs::write(&path, snapshot.to_string()).unwrap();
+    let (quiet, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0));
+    assert_eq!(quiet, "", "native opaque entropy is not a credential alert");
+    let (digest, stderr, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(digest.contains("mixed_token ×100"), "{digest}");
+    assert!(digest.contains("All scan evidence"), "{digest}");
+    // A provider-shaped key still needs review even inside the same native field.
+    snapshot["secrets"]["value"]["findings"][0]["rule"] = serde_json::json!("openai");
+    snapshot["secrets"]["value"]["findings"][0]["count"] = serde_json::json!(1);
+    snapshot["secrets"]["value"]["findings"][0]["opaque_count"] = serde_json::json!(1);
+    fs::write(path, snapshot.to_string()).unwrap();
+    let (notice, code) = on_a_terminal(fixture.person().arg("line"));
+    assert_eq!(code, Some(0));
+    assert!(notice.contains("1 key-format match"), "{notice}");
+    assert!(notice.contains("Details: ohjaa digest"), "{notice}");
+    eprintln!(
+        "Synthetic opaque-only startup bytes: {}\nKey-shaped metadata notice: {notice}",
+        quiet.len()
+    );
+    fixture.cleanup();
+}
+
 /// Finding 4: the first terminal of a day gets the day's digest from the
 /// snapshot there is, said as of when it was collected, and a collect starts
 /// beside it; nothing waits.
@@ -10416,7 +10581,9 @@ fn the_days_first_terminal_gets_its_digest_from_an_old_snapshot() {
             .env("OHJAA_TODAY", "2026-10-27"),
     );
     assert!(daily.starts_with("ohjaa — needs your attention"), "{daily}");
-    assert!(daily.contains("Cached status collected "), "{daily}");
+    eprintln!("Synthetic startup preview:\n{daily}");
+    assert!(daily.contains("Last background update: "), "{daily}");
+    assert!(daily.contains("Refresh: ohjaa collect"), "{daily}");
     assert!(!daily.contains("retry uploads"), "{daily}");
     assert!(fixture.asked_github(2), "a collect started beside it");
     let (again, _) = on_a_terminal(
@@ -10880,7 +11047,7 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     };
     let daily = day();
     assert!(
-        daily.contains("\n  1 secret-shaped token in agent sessions\n"),
+        daily.contains("\n  Possible credentials: 1 key-format match\n"),
         "{daily}"
     );
     assert_eq!(day(), "", "said once");
@@ -10902,7 +11069,7 @@ fn collect_asks_vessa_once_each_for_usage_first_words_and_secrets() {
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     assert_eq!(
         day(),
-        "ohjaa · 1 secret-shaped token in agent sessions · Details: ohjaa digest\n"
+        "ohjaa · Possible credentials: 1 key-format match · Details: ohjaa digest\n"
     );
     assert_eq!(day(), "");
     // The second scan began where the first ended, not at the window's start.

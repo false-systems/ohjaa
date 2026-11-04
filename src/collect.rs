@@ -134,6 +134,10 @@ pub struct Secrets {
     /// there. `None`: none has yet.
     pub read_ms: Option<i64>,
     pub findings: Vec<Finding>,
+    #[serde(default)]
+    pub undated_records: Option<u64>,
+    #[serde(default)]
+    pub other_issues: Option<u64>,
 }
 
 /// One place vessa found secret-shaped tokens: where and how many, never
@@ -150,6 +154,12 @@ pub struct Finding {
     pub place: String,
     pub rule: String,
     pub count: u64,
+    /// Measured subset in signature/encrypted fields; absent in older reports.
+    #[serde(default)]
+    pub opaque_count: Option<u64>,
+    /// Explicit native-position verification; absent legacy context is unverified.
+    #[serde(default)]
+    pub opaque_native: Option<bool>,
     /// The first 8 hex characters of the token's SHA-256, when vessa gave
     /// one.
     pub fingerprint: Option<String>,
@@ -1046,6 +1056,16 @@ pub fn read_secrets(
         })
         .collect();
     let whole = code == Some(0) && complete && gaps.is_empty();
+    let undated_records = report
+        .get("undated_records")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|count| *count <= unreadable.len() as u64)
+                .ok_or_else(|| "vessa's undated-record count is invalid".to_owned())
+        })
+        .transpose()?;
     if !whole && gaps.is_empty() {
         gaps.push(match code {
             Some(4) if !detail.is_empty() => {
@@ -1063,7 +1083,22 @@ pub fn read_secrets(
                 .to_owned()
         })?;
         match read.iter_mut().find(|same| same.key() == finding.key()) {
-            Some(same) => same.count = same.count.saturating_add(finding.count),
+            Some(same) => {
+                same.count = same
+                    .count
+                    .checked_add(finding.count)
+                    .ok_or("vessa's finding counts overflow")?;
+                same.opaque_count = match (same.opaque_count, finding.opaque_count) {
+                    (Some(a), Some(b)) => {
+                        Some(a.checked_add(b).ok_or("vessa's context counts overflow")?)
+                    }
+                    _ => None,
+                };
+                same.opaque_native = same
+                    .opaque_native
+                    .zip(finding.opaque_native)
+                    .map(|(a, b)| a && b);
+            }
             None => read.push(finding),
         }
     }
@@ -1081,7 +1116,16 @@ pub fn read_secrets(
         }
     }
     let read_ms = if whole { Some(now_ms) } else { before.read_ms };
-    Ok((Secrets { read_ms, findings }, gaps))
+    let other_issues = undated_records.map(|undated| gaps.len() as u64 - undated);
+    Ok((
+        Secrets {
+            read_ms,
+            findings,
+            undated_records,
+            other_issues,
+        },
+        gaps,
+    ))
 }
 
 /// One finding of the report. What should be a name and is not is not kept
@@ -1094,6 +1138,15 @@ fn finding(listed: &Value, now_ms: i64) -> Option<Finding> {
     let named = !rule.is_empty()
         && rule.len() <= 32
         && rule.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+    let count = listed["count"].as_u64()?;
+    let opaque_count = match listed.get("opaque_count") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().filter(|n| *n <= count)?),
+    };
+    let opaque_native = match listed.get("opaque_native") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_bool()?),
+    };
     Some(Finding {
         agent: text("agent")?,
         session: text("session")?,
@@ -1104,7 +1157,9 @@ fn finding(listed: &Value, now_ms: i64) -> Option<Finding> {
             _ => "other".to_owned(),
         },
         rule: if named { rule } else { "unknown".to_owned() },
-        count: listed["count"].as_u64()?,
+        count,
+        opaque_count,
+        opaque_native,
         fingerprint: text("fingerprint")
             .filter(|fp| fp.len() == 8 && fp.chars().all(|c| c.is_ascii_hexdigit()))
             .map(|fp| fp.to_ascii_lowercase()),
@@ -1445,6 +1500,7 @@ mod tests {
         let before = Secrets {
             read_ms: Some(NOW - HOUR),
             findings: Vec::new(),
+            ..Secrets::default()
         };
         for unreadable in [
             Value::Null,
@@ -1565,6 +1621,97 @@ mod tests {
     }
 
     #[test]
+    fn secret_context_counts_are_preserved_validated_and_unknown_for_older_reports() {
+        let mut first = found("context", NOW, "agent", "mixed_token", Value::Null);
+        first["count"] = json!(2);
+        first["opaque_count"] = json!(1);
+        first["opaque_native"] = json!(true);
+        let report = json!({"schema":"vessa-secrets.v1", "complete":false,
+            "undated_records":1, "unreadable":[{"path":"/synthetic/session.jsonl","why":"finding has no valid time"}],
+            "findings":[first.clone(), first.clone()]});
+        let (read, gaps) = read_secrets(
+            Some(4),
+            report.to_string().as_bytes(),
+            "",
+            &Secrets::default(),
+            NOW,
+        )
+        .unwrap();
+        let value = serde_json::to_value(read).unwrap();
+        assert_eq!(value["findings"][0]["count"], 4);
+        assert_eq!(value["findings"][0]["opaque_count"], 2);
+        assert_eq!(value["findings"][0]["opaque_native"], true);
+        assert_eq!(value["undated_records"], 1);
+        assert_eq!(value["other_issues"], 0);
+        assert!(value["read_ms"].is_null());
+        assert_eq!(gaps.len(), 1);
+        for bad in [json!(3), json!("1"), json!(-1)] {
+            let mut invalid = report.clone();
+            invalid["findings"][0]["opaque_count"] = bad;
+            assert!(read_secrets(
+                Some(4),
+                invalid.to_string().as_bytes(),
+                "",
+                &Secrets::default(),
+                NOW
+            )
+            .is_err());
+        }
+        let mut invalid = report.clone();
+        invalid["undated_records"] = json!(2);
+        assert!(read_secrets(
+            Some(4),
+            invalid.to_string().as_bytes(),
+            "",
+            &Secrets::default(),
+            NOW
+        )
+        .is_err());
+        let mut invalid = report.clone();
+        invalid["findings"][0]["opaque_native"] = json!("true");
+        assert!(read_secrets(
+            Some(4),
+            invalid.to_string().as_bytes(),
+            "",
+            &Secrets::default(),
+            NOW
+        )
+        .is_err());
+        let old = scan(
+            true,
+            json!([]),
+            json!([found("old", NOW, "agent", "mixed_token", Value::Null)]),
+        );
+        let (read, _) = read_secrets(Some(0), &old, "", &Secrets::default(), NOW).unwrap();
+        let value = serde_json::to_value(read).unwrap();
+        assert!(value["findings"][0]["opaque_count"].is_null());
+        assert!(value["undated_records"].is_null());
+        let mut legacy_context = first;
+        legacy_context
+            .as_object_mut()
+            .unwrap()
+            .remove("opaque_native");
+        let old = scan(true, json!([]), json!([legacy_context]));
+        let (read, _) = read_secrets(Some(0), &old, "", &Secrets::default(), NOW).unwrap();
+        assert_eq!(read.findings[0].opaque_count, Some(1));
+        assert_eq!(read.findings[0].opaque_native, None);
+        let mut unknown = report;
+        unknown["undated_records"] = Value::Null;
+        unknown["findings"][1]["opaque_count"] = Value::Null;
+        let (read, _) = read_secrets(
+            Some(4),
+            unknown.to_string().as_bytes(),
+            "",
+            &Secrets::default(),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(read.findings[0].count, 4);
+        assert_eq!(read.findings[0].opaque_count, None);
+        assert_eq!(read.undated_records, None);
+    }
+
+    #[test]
     fn secrets_are_kept_as_where_and_how_many_and_read_on_from_the_last_whole_scan() {
         let typed = found("s1", NOW - HOUR, "person", "github", json!("1A2B3C4D"));
         let printed = found("s1", NOW - 2 * HOUR, "tool_output", "aws", Value::Null);
@@ -1638,6 +1785,7 @@ mod tests {
         let before = Secrets {
             read_ms: Some(NOW - HOUR),
             findings: Vec::new(),
+            ..Secrets::default()
         };
         let unreadable = json!([{"path": "/h/.claude/projects/-p/x.jsonl",
                                  "why": "Permission denied (os error 13)"}]);

@@ -567,6 +567,42 @@ here. It records only: nothing is sent to anyone, decided or refused.
 - **Opening a terminal never marks activity read.** The first startup
   anchors the unread window, even when quiet; subsequent days do not move
   that window. Existing unread positions from older versions are retained.
+- **Saved checks and open records mean different things.** Startup identifies
+  an old background update and gives `ohjaa collect` to refresh saved checks;
+  session records are read now. An unknown or incomplete secrets scan is not
+  a finding and cannot establish an all-clear. An old, unclosed session record
+  may still be active: age alone does not mean it is stuck. The digest separates
+  these records from failures and shows their recorded task, or the last
+  recorded goal when the launch label was only `interactive`. Goals are context,
+  not proof of current progress; absent descriptions are stated explicitly.
+  Proposed instructions are labelled as not active until you decide.
+- **Startup is a summary, not a diagnostic dump.** Unreadable saved sources are
+  grouped by what is missing, with one refresh command; paths and detailed
+  reasons stay in `ohjaa digest`. Multiple old open records are grouped by
+  repository, without claiming that their agents are stuck. Possible secrets
+  are labelled as unconfirmed pattern matches, not confirmed credential leaks
+  or a count of unique credentials. Full findings, individual inspection
+  commands, source dates, and incomplete coverage remain in the digest.
+- **A match count is not a leaked-key count.** Startup separates recognizable
+  key-format matches from secret-labelled values and unclassified rules. Generic
+  random-string matches alone stay in the digest, not in startup attention. When Vessa
+  reports context, it says how many occurrences are in signature/encrypted
+  fields, without suppressing those matches. Older reports leave context
+  unknown; partial context is a lower bound, never a complete total. Timestamp
+  gaps are counted separately from other coverage issues when available.
+  Counts are occurrences, not distinct credentials; no validity is inferred.
+- **Redaction is not credential detection.** Generic random-string
+  (`mixed_token`) occurrences remain scan evidence in the digest but do not
+  trigger startup credential alerts, regardless of context. The heuristic
+  checks string length and character mixtures; that alone cannot distinguish
+  keys from identifiers, encoded data or examples. Unknown context stays unknown,
+  never known-safe, and all counts remain inspectable. Known
+  key formats, secret-labelled values, unknown rules, and incomplete
+  coverage still need attention. No detector or redaction rule is disabled,
+  and opening a quiet terminal does not consume the underlying evidence.
+  A changed reviewable subset has its own attention identity and observed
+  scan time: reading metadata earlier does not acknowledge later candidates,
+  and an unchanged re-scan does not replay the same alert.
 - **`ohjaa digest`** shows attention details, unread agent sessions and
   pull requests, proposed instructions and who is live. Each ended session
   has its full recorded intent, end time, elapsed time and an inspection

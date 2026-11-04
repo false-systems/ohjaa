@@ -339,6 +339,9 @@ enum Kind {
 #[derive(Debug, Clone)]
 struct Item {
     tokens: u64,
+    secret_rule: Option<String>,
+    opaque_tokens: Option<u64>,
+    opaque_native: bool,
     kind: Kind,
     /// For what stands: its place in the order.
     class: Option<Class>,
@@ -366,6 +369,7 @@ struct View {
     /// Everything that could not be read, each in full.
     unread: Vec<String>,
     collected_ms: Option<i64>,
+    secret_coverage: Option<(u64, u64)>,
 }
 
 impl View {
@@ -434,6 +438,40 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+fn open_age(ms: i64) -> String {
+    let (n, unit) = if ms >= 2 * DAY_MS {
+        (ms / DAY_MS, "day")
+    } else {
+        (ms.max(0) / HOUR_MS, "hour")
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// A recorded goal is context, not proof of current activity or progress.
+fn open_context(session: &Session, brief: bool) -> String {
+    let intent = session.intent.trim();
+    let goal = if !intent.is_empty() && intent != "interactive" {
+        Some(("recorded task", intent))
+    } else {
+        session
+            .readback
+            .as_ref()
+            .map(|readback| ("last recorded goal", readback.text.trim()))
+            .filter(|(_, text)| !text.is_empty())
+    };
+    match goal {
+        Some((label, text)) => {
+            let (text, _) = crate::intake::scrub(&clean(text));
+            format!(
+                "{}; {label}: \"{}\"",
+                clean(&session.agent),
+                if brief { cut(&text, 70) } else { text }
+            )
+        }
+        None => format!("{}; no task description recorded", clean(&session.agent)),
+    }
+}
+
 fn amount(n: u64) -> String {
     match n {
         n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
@@ -461,6 +499,9 @@ fn proposal_key(waiting: &Waiting) -> String {
 fn standing(kind: Kind, class: Class, key: String, repo: &str, text: String) -> Item {
     Item {
         tokens: 0,
+        secret_rule: None,
+        opaque_tokens: None,
+        opaque_native: false,
         kind,
         class: Some(class),
         key,
@@ -475,6 +516,9 @@ fn standing(kind: Kind, class: Class, key: String, repo: &str, text: String) -> 
 fn event(kind: Kind, key: String, at_ms: i64, github: bool, repo: &str, text: String) -> Item {
     Item {
         tokens: 0,
+        secret_rule: None,
+        opaque_tokens: None,
+        opaque_native: false,
         kind,
         class: None,
         key,
@@ -615,7 +659,7 @@ fn pr_events(pr: &Pr, out: &mut Vec<Item>) {
 
 /// A finding is a newly collected observation on the local source clock,
 /// independent of whether GitHub could be refreshed.
-fn secret(finding: &Finding) -> Item {
+fn secret(finding: &Finding, observed_ms: Option<i64>) -> Item {
     let whose = match finding.place.as_str() {
         "person" => "you typed it",
         "agent" => "agent reply",
@@ -645,20 +689,189 @@ fn secret(finding: &Finding) -> Item {
         text,
     );
     item.tokens = finding.count;
+    item.secret_rule = Some(finding.rule.clone());
+    item.opaque_tokens = finding.opaque_count;
+    item.opaque_native = finding.opaque_native == Some(true);
+    let review = review_count(&item);
+    if review > 0 {
+        // A changed reviewable subset is new attention even if the native
+        // record/first sighting is old. Keep the native time in the text;
+        // this event's clock is the saved scan that observed the candidate.
+        item.key.push_str(&format!(":review:{review}"));
+        item.at_ms = observed_ms
+            .unwrap_or(finding.found_ms)
+            .max(finding.found_ms);
+    } else {
+        item.key.push_str(":evidence");
+    }
     item
 }
 
 fn secrets_found(items: &[&Item]) -> Option<String> {
-    let count = items
+    secret_summary(items, false)
+}
+
+fn secrets_attention(items: &[&Item]) -> Option<String> {
+    secret_summary(items, true)
+}
+
+fn verified_opaque(item: &Item) -> Option<u64> {
+    item.opaque_native
+        .then_some(item.opaque_tokens)
+        .flatten()
+        .filter(|n| *n <= item.tokens)
+}
+
+fn review_count(item: &Item) -> u64 {
+    // The generic redaction heuristic is deliberately cautious, not evidence
+    // of a credential. Keep every occurrence in the digest, with its original
+    // context/coverage limitations. Specific formats, labels and unknown rules
+    // still need review; no scanner or redaction rule is changed here.
+    if item.secret_rule.as_deref() == Some("mixed_token") {
+        0
+    } else {
+        item.tokens
+    }
+}
+
+fn secret_summary(items: &[&Item], attention: bool) -> Option<String> {
+    let mut counts = [0u64; 4];
+    for item in items.iter().filter(|item| item.kind == Kind::Secret) {
+        let group = match item.secret_rule.as_deref() {
+            Some(
+                "openai" | "anthropic" | "github" | "slack" | "aws" | "gitlab" | "google" | "jwt"
+                | "id_and_secret" | "private_key",
+            ) => 0,
+            Some("named_secret") => 1,
+            Some("mixed_token") => 2,
+            _ => 3,
+        };
+        counts[group] = counts[group].saturating_add(if attention {
+            review_count(item)
+        } else {
+            item.tokens
+        });
+    }
+    let labels = [
+        "key-format",
+        "secret-labelled",
+        "generic-pattern",
+        "unclassified",
+    ];
+    let parts: Vec<_> = counts
         .iter()
-        .filter(|item| item.kind == Kind::Secret)
-        .fold(0u64, |sum, item| sum.saturating_add(item.tokens));
-    (count > 0).then(|| {
+        .zip(labels)
+        .filter(|(count, _)| **count > 0)
+        .map(|(count, label)| format!("{} {label}", grouped_count(*count)))
+        .collect();
+    (!parts.is_empty()).then(|| {
         format!(
-            "{count} secret-shaped {} in agent sessions",
-            if count == 1 { "token" } else { "tokens" }
+            "{}: {} {}",
+            if attention {
+                "Possible credentials"
+            } else {
+                "All scan evidence (unconfirmed)"
+            },
+            parts.join(" + "),
+            if counts.iter().copied().fold(0u64, u64::saturating_add) == 1 {
+                "match"
+            } else {
+                "matches"
+            }
         )
     })
+}
+
+fn secret_context(items: &[&Item]) -> Option<String> {
+    let (mut opaque, mut unknown) = (0u64, 0u64);
+    for item in items.iter().filter(|item| item.kind == Kind::Secret) {
+        match verified_opaque(item) {
+            Some(n) => opaque = opaque.saturating_add(n),
+            None => unknown = unknown.saturating_add(item.tokens),
+        }
+    }
+    if opaque > 0 && unknown > 0 {
+        Some(format!(
+            "At least {} in signature/encrypted fields; context unknown for {} occurrences.",
+            grouped_count(opaque),
+            grouped_count(unknown)
+        ))
+    } else if opaque > 0 {
+        Some(format!(
+            "{} in signature/encrypted fields; counts are occurrences, not distinct credentials.",
+            grouped_count(opaque)
+        ))
+    } else if unknown > 0 {
+        Some("Match context unavailable; counts are occurrences, not distinct credentials.".into())
+    } else {
+        None
+    }
+}
+
+fn grouped_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut out = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// Only collected sources: live-log and proposal failures retain their own warnings.
+fn saved_source(item: &Item) -> bool {
+    item.kind == Kind::Source
+        && matches!(
+            item.repo.as_str(),
+            "snapshot" | "marks" | "GitHub" | "vessa" | "messages" | "secrets"
+        )
+}
+
+fn saved_sources_summary(items: &[&Item]) -> Option<String> {
+    let names: BTreeSet<_> = items
+        .iter()
+        .filter(|item| saved_source(item))
+        .map(|item| match item.repo.as_str() {
+            "snapshot" => "saved checks (including secrets scan)",
+            "marks" => "repository checks",
+            "GitHub" => "pull requests",
+            "vessa" => "token usage",
+            "messages" => "session excerpts",
+            "secrets" => "secrets scan",
+            _ => unreachable!("saved_source admits only the collected sources above"),
+        })
+        .collect();
+    (!names.is_empty()).then(|| {
+        format!(
+            "Missing or incomplete information: {}",
+            names.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
+fn open_records_summary(items: &[&Item]) -> Option<String> {
+    let records: Vec<_> = items
+        .iter()
+        .filter(|item| item.kind == Kind::OpenLong)
+        .collect();
+    if records.len() < 2 {
+        return None;
+    }
+    let repos: BTreeSet<_> = records.iter().map(|item| clean(&item.repo)).collect();
+    let mut names: Vec<_> = repos.iter().take(3).map(|repo| cut(repo, 20)).collect();
+    if repos.len() > names.len() {
+        names.push(format!(
+            "and {} more repositories",
+            repos.len() - names.len()
+        ));
+    }
+    Some(format!(
+        "{} older session records ({}) have no closing result; they may still be active.",
+        records.len(),
+        names.join(", ")
+    ))
 }
 
 /// A part of the snapshot that could not be read, or not all of it: said
@@ -842,7 +1055,7 @@ fn build(
                 "snapshot",
                 "Repository checks, pull requests and usage have not been collected yet. Read status: ohjaa collect".to_owned(),
             );
-            item.brief = Some("nothing collected yet".to_owned());
+            item.brief = Some("No saved check results yet. Refresh: ohjaa collect".to_owned());
             standing_items.push(item);
             unread.push(
                 "nothing collected yet: `ohjaa collect` reads the marks, GitHub and vessa"
@@ -868,37 +1081,54 @@ fn build(
         String::new()
     };
     for session in logged.iter().filter(|s| s.left.is_none()) {
-        let who = format!("{} \"{}\"", clean(&session.agent), clean(&session.intent));
+        let who = open_context(session, false);
         let id = &session.id;
         if local.gone.contains(id) {
-            standing_items.push(standing(
+            let text = |brief| {
+                format!("Agent still running without its Ohjaa supervisor{found}; later work is not observed: \
+                {} · Inspect: ohjaa session {id}", open_context(session, brief))
+            };
+            let mut item = standing(
                 Kind::Gone,
                 Class::Unknown,
                 format!("gone:{id}"),
                 &session.repo,
-                format!("Agent still running without its Ohjaa supervisor{found}; later work is not observed: \
-                    {who} · Inspect: ohjaa session {id}"),
-            ));
+                text(false),
+            );
+            item.brief = Some(text(true));
+            standing_items.push(item);
         } else if local.orphaned.contains(id) {
-            standing_items.push(standing(
+            let text = |brief| {
+                format!("Neither the agent nor its supervisor was found running{found}; final result unknown: \
+                {} · Inspect: ohjaa session {id}", open_context(session, brief))
+            };
+            let mut item = standing(
                 Kind::Orphaned,
                 Class::Unknown,
                 format!("orphaned:{id}"),
                 &session.repo,
-                format!("Neither the agent nor its supervisor was found running{found}; final result unknown: \
-                    {who} · Inspect: ohjaa session {id}"),
-            ));
+                text(false),
+            );
+            item.brief = Some(text(true));
+            standing_items.push(item);
         } else if now_ms - session.started_ms > OPEN_TOO_LONG_MS {
-            standing_items.push(standing(
+            let mut item = standing(
                 Kind::OpenLong,
                 Class::Person,
                 format!("open:{id}"),
                 &session.repo,
                 format!(
-                    "Session has remained open for {}: {who} · Inspect: ohjaa session {id}",
-                    span(now_ms - session.started_ms)
+                    "Session record still open after {}: {who} · This is an unclosed record, \
+                     not proof of failed or stuck work · Inspect: ohjaa session {id}",
+                    open_age(now_ms - session.started_ms)
                 ),
+            );
+            item.brief = Some(format!(
+                "Record still open after {} (may still be active): {} · Inspect: ohjaa session {id}",
+                open_age(now_ms - session.started_ms),
+                open_context(session, true)
             ));
+            standing_items.push(item);
         }
     }
 
@@ -916,7 +1146,14 @@ fn build(
     for pr in &snapshot.github.value {
         pr_events(pr, &mut events);
     }
-    events.extend(snapshot.secrets.value.findings.iter().map(secret));
+    events.extend(
+        snapshot
+            .secrets
+            .value
+            .findings
+            .iter()
+            .map(|finding| secret(finding, snapshot.secrets.as_of_ms)),
+    );
     events.sort_by_key(|item| std::cmp::Reverse(item.at_ms));
 
     let (waiting, today) = match waiting {
@@ -961,6 +1198,11 @@ fn build(
         parts,
         unread,
         collected_ms: collected.map(|c| c.at_ms),
+        secret_coverage: snapshot
+            .secrets
+            .value
+            .undated_records
+            .zip(snapshot.secrets.value.other_issues),
     }
 }
 
@@ -1185,7 +1427,7 @@ fn pull_requests(events: &[&Item]) -> Option<String> {
 /// at most [`WIDTH`] characters; `None` when nothing is.
 fn one_line(news: &News) -> Option<String> {
     let mut parts = Vec::new();
-    parts.extend(secrets_found(&news.secrets));
+    parts.extend(secrets_attention(&news.secrets));
     // Name the repository and branch, and explain what is missing.
     let mains: Vec<&&Item> = news
         .standing
@@ -1209,10 +1451,11 @@ fn one_line(news: &News) -> Option<String> {
             }
         )),
     }
+    parts.extend(saved_sources_summary(&news.standing));
     parts.extend(
         news.standing
             .iter()
-            .filter(|item| item.kind == Kind::Source)
+            .filter(|item| item.kind == Kind::Source && !saved_source(item))
             .filter_map(|item| item.brief.clone()),
     );
     for (kind, one, many) in [
@@ -1249,10 +1492,9 @@ fn one_line(news: &News) -> Option<String> {
     }
     match count(&news.standing, |k| k == Kind::OpenLong) {
         0 => {}
-        n => parts.push(plural(
-            n,
-            "session open over a day",
-            "sessions open over a day",
+        n => parts.push(format!(
+            "{}; check if unexpected",
+            plural(n, "session record still open", "session records still open")
         )),
     }
     if parts.is_empty() {
@@ -1298,7 +1540,11 @@ fn row(item: &Item, width: usize) -> String {
 
 /// The full digest must not discard the details its summary points to.
 fn full_row(item: &Item, width: usize) -> String {
-    let bullet = if item.class.is_some() { "!" } else { "·" };
+    let bullet = if item.class.is_some() && item.kind != Kind::OpenLong {
+        "!"
+    } else {
+        "·"
+    };
     wrapped(&format!("  {bullet} {:<width$}  ", item.repo), &item.text)
 }
 
@@ -1370,7 +1616,7 @@ fn proposal_line(view: &View) -> Option<String> {
         wrapped(
             "  ",
             &format!(
-                "Your decision: {}. Read and decide: ohjaa review",
+                "Your decision: {}, not active yet · Read and decide: ohjaa review",
                 plural(
                     view.waiting.len(),
                     "proposed agent instruction",
@@ -1390,38 +1636,118 @@ fn daily(
     now_ms: i64,
 ) -> Option<(String, bool)> {
     let proposal = proposal_line(view);
-    let secrets = secrets_found(
-        &view
-            .events
-            .iter()
-            .filter(|item| item.kind == Kind::Secret && from.holds(item))
-            .collect::<Vec<_>>(),
-    );
+    let secret_items = view
+        .events
+        .iter()
+        .filter(|item| item.kind == Kind::Secret && from.holds(item))
+        .collect::<Vec<_>>();
+    let secrets = secrets_attention(&secret_items);
     if view.standing.is_empty() && proposal.is_none() && secrets.is_none() {
         return None;
     }
-    let mut lines = vec!["ohjaa — needs your attention".to_owned()];
-    if let Some(secrets) = secrets {
-        lines.push(format!("  {secrets}"));
+    let only_open_records = secrets.is_none()
+        && proposal.is_none()
+        && view.standing.iter().all(|item| item.kind == Kind::OpenLong);
+    let mut lines = vec![if only_open_records {
+        "ohjaa — sessions still open"
+    } else {
+        "ohjaa — needs your attention"
     }
-    if let Some(at) = view.collected_ms.filter(|at| old(Some(*at), now_ms)) {
-        lines.push(format!(
-            "  Cached status collected {}; source dates: ohjaa digest.",
-            clock(at)
+    .to_owned()];
+    if let Some(secrets) = secrets {
+        lines.push(wrapped("  ", &secrets));
+        lines.push(wrapped(
+            "  ",
+            "Unconfirmed occurrences, not distinct keys. Review: ohjaa digest",
         ));
     }
-    if view
-        .standing
-        .iter()
-        .any(|item| item.kind == Kind::Main && item.class != Some(Class::Failed))
-    {
-        lines.push("  Missing verification is not a report of failed tests.".to_owned());
+    let items: Vec<_> = view.standing.iter().collect();
+    let sources = saved_sources_summary(&items);
+    let open_records = open_records_summary(&items);
+    if let Some(at) = view.collected_ms.filter(|at| old(Some(*at), now_ms)) {
+        lines.push(wrapped(
+            "  ",
+            &format!(
+                "Last background update: {}; individual checks may be older.{}",
+                clock(at),
+                if sources.is_none() {
+                    " · Refresh: ohjaa collect"
+                } else {
+                    ""
+                }
+            ),
+        ));
     }
-    let width = repo_width(view.standing.iter());
-    let reserved = lines.len() + proposal.as_ref().map_or(0, |text| text.lines().count()) + 2;
+    if let Some(sources) = sources {
+        lines.push(wrapped(
+            "  ",
+            &format!("{sources} · Refresh: ohjaa collect"),
+        ));
+        if view
+            .standing
+            .iter()
+            .any(|item| item.key.starts_with("source:secrets:"))
+        {
+            if let Some((undated, other)) = view.secret_coverage {
+                let mut issues = Vec::new();
+                if undated > 0 {
+                    issues.push(format!(
+                        "{} no timestamp",
+                        plural(undated as usize, "record has", "records have")
+                    ));
+                }
+                if other > 0 {
+                    issues.push(plural(
+                        other as usize,
+                        "other coverage issue",
+                        "other coverage issues",
+                    ));
+                }
+                if !issues.is_empty() {
+                    lines.push(wrapped(
+                        "  ",
+                        &format!("Saved scan coverage: {}.", issues.join("; ")),
+                    ));
+                }
+            }
+        }
+        let oldest = view
+            .parts
+            .iter()
+            .filter(|(name, _, _)| {
+                view.standing
+                    .iter()
+                    .any(|item| saved_source(item) && item.repo == *name)
+            })
+            .filter_map(|(_, at, _)| *at)
+            .min();
+        if let Some(at) =
+            oldest.filter(|at| old(Some(*at), now_ms) && Some(*at) != view.collected_ms)
+        {
+            lines.push(wrapped(
+                "  ",
+                &format!(
+                    "Saved information for these checks includes results from {}.",
+                    clock(at)
+                ),
+            ));
+        }
+    }
+    let individual: Vec<_> = items
+        .into_iter()
+        .filter(|item| {
+            !saved_source(item) && !(open_records.is_some() && item.kind == Kind::OpenLong)
+        })
+        .collect();
+    let open_records = open_records.map(|text| wrapped("  ", &text));
+    let width = repo_width(individual.iter().copied());
+    let reserved = lines.iter().map(|line| line.lines().count()).sum::<usize>()
+        + proposal.as_ref().map_or(0, |text| text.lines().count())
+        + open_records.as_ref().map_or(0, |text| text.lines().count())
+        + 2;
     let room = DAILY_LINES.saturating_sub(reserved);
     let (mut shown, mut used) = (0, 0);
-    for item in &view.standing {
+    for item in &individual {
         let row = row(item, width);
         let size = row.lines().count();
         if used + size > room {
@@ -1431,10 +1757,13 @@ fn daily(
         used += size;
         shown += 1;
     }
+    if let Some(open_records) = open_records {
+        lines.push(open_records);
+    }
     if let Some(proposal) = proposal {
         lines.push(proposal);
     }
-    let more = view.standing.len() - shown;
+    let more = individual.len() - shown;
     if more > 0 {
         lines.push(format!(
             "  {more} more attention item(s) are in the full digest."
@@ -1521,9 +1850,22 @@ fn full(
         "Needs your attention",
         view.standing
             .iter()
-            .filter(|item| !item.key.starts_with("source:secrets:"))
+            .filter(|item| !item.key.starts_with("source:secrets:") && item.kind != Kind::OpenLong)
             .collect(),
     );
+    section(
+        &mut out,
+        "Sessions still marked open",
+        view.standing
+            .iter()
+            .filter(|item| item.kind == Kind::OpenLong)
+            .collect(),
+    );
+    if view.standing.iter().any(|item| item.kind == Kind::OpenLong) {
+        paragraph(&mut out, "These records have no closing result. They may still be active or waiting; \
+            age alone does not show that work failed or an agent is stuck. A recorded goal is context, \
+            not proof of current progress. Inspect a session if its continued presence is unexpected.");
+    }
     let of = |kinds: &[fn(Kind) -> bool]| -> Vec<&Item> {
         events
             .iter()
@@ -1533,17 +1875,43 @@ fn full(
     };
     let findings = of(&[|kind| kind == Kind::Secret]);
     let has_findings = !findings.is_empty();
-    section(
-        &mut out,
-        "Secrets seen",
-        view.standing
-            .iter()
-            .filter(|item| item.key.starts_with("source:secrets:"))
-            .chain(findings)
-            .collect(),
-    );
+    let secret_items: Vec<_> = view
+        .standing
+        .iter()
+        .filter(|item| item.key.starts_with("source:secrets:"))
+        .chain(findings.iter().copied())
+        .collect();
+    if !secret_items.is_empty() {
+        out.push_str("\nSecrets seen\n");
+        if let Some(attention) = secrets_attention(&findings) {
+            paragraph(&mut out, &attention);
+        }
+        if has_findings {
+            paragraph(&mut out, "Review candidates match a known key format or a value labelled as a secret; unrecognised scan rules also remain candidates. Generic random-string matches alone do not establish a credential and do not trigger startup alerts. All occurrences remain below, including those with unknown context; none is classified as safe.");
+        }
+        if let Some(summary) = secrets_found(&findings) {
+            paragraph(&mut out, &summary);
+        }
+        if let Some(context) = secret_context(&findings) {
+            paragraph(&mut out, &context);
+        }
+        if has_findings {
+            paragraph(&mut out, "Counts are occurrences, not distinct credentials. Generic-pattern matches are long strings mixing uppercase, lowercase and digits; secret-labelled matches follow words such as token or password. These rules do not confirm a leak. Signature/encrypted fields are counted, not suppressed.");
+        }
+        for item in secret_items {
+            out.push_str(&full_row(item, width));
+            out.push('\n');
+        }
+    }
     if has_findings {
         paragraph(&mut out, "Rotate any findings that are real keys. The fingerprint is the first eight hex characters of the token's SHA-256; no secret value is kept here.");
+    }
+    if view
+        .standing
+        .iter()
+        .any(|item| item.key.starts_with("source:secrets:"))
+    {
+        paragraph(&mut out, "Missing scan coverage is not a finding. An unreadable or incomplete scan cannot establish an all-clear.");
     }
     section(
         &mut out,
@@ -2093,6 +2461,424 @@ mod tests {
         }
     }
 
+    #[test]
+    fn startup_explains_saved_checks_open_records_and_undecided_instructions() {
+        let mut collected = snapshot(NOW - 2 * DAY_MS);
+        collected.secrets = Part::default();
+        let mut open = session("still-open", 2 * DAY_MS, None, false);
+        open.intent = "interactive".into();
+        let view = build(
+            &[open],
+            Ok(vec![waiting("synthetic-proposal", "2026-10-20")]),
+            Some(&collected),
+            NOW,
+            0,
+        );
+        let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
+        for context in [
+            "Last background update:",
+            "Refresh: ohjaa collect",
+            "Missing or incomplete information: secrets scan",
+            "may still be active",
+            "no task description recorded",
+            "not active yet",
+            "ohjaa session still-open",
+        ] {
+            assert!(words.contains(context), "missing {context}:\n{daily}");
+        }
+        assert!(!daily.contains("\"interactive\""), "{daily}");
+        assert!(!daily.contains("never read"), "{daily}");
+        assert!(view.incomplete());
+        assert_eq!(
+            view.standing
+                .iter()
+                .filter(|item| item.kind == Kind::OpenLong)
+                .count(),
+            1
+        );
+        assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
+        assert!(
+            daily.lines().all(|line| line.chars().count() <= WIDTH),
+            "{daily}"
+        );
+    }
+
+    #[test]
+    fn crowded_startup_groups_unknown_sources_and_open_records_without_a_wall_of_caveats() {
+        let mut collected = snapshot(NOW - 2 * DAY_MS);
+        let why = "could not read /synthetic/conversations/unreadable-session.jsonl";
+        collected.typed.gaps.push(why.into());
+        collected.secrets.gaps.push(why.into());
+        collected.secrets.value.findings.push(Finding {
+            agent: "codex".into(),
+            session: "synthetic-only".into(),
+            count: 18_330,
+            found_ms: NOW - HOUR_MS,
+            ..Finding::default()
+        });
+        let logged: Vec<_> = (0..4)
+            .map(|i| session(&format!("open-{i}"), 2 * DAY_MS, None, false))
+            .collect();
+        let view = build(
+            &logged,
+            Ok(vec![waiting("synthetic-proposal", "2026-10-20")]),
+            Some(&collected),
+            NOW,
+            0,
+        );
+        let daily = daily(&view, &Window::at(NOW - 3 * DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        eprintln!("Synthetic crowded startup:\n{daily}");
+        let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
+        for text in [
+            "Possible credentials: 18,330 unclassified matches",
+            "Missing or incomplete information",
+            "session excerpts",
+            "secrets scan",
+            "4 older session records",
+            "may still be active",
+            "not active yet",
+            "ohjaa collect",
+            "ohjaa review",
+            "ohjaa digest",
+        ] {
+            assert!(words.contains(text), "missing {text}:\n{daily}");
+        }
+        assert!(daily.lines().count() <= 10, "{daily}");
+        assert!(
+            daily.lines().all(|line| line.chars().count() <= WIDTH),
+            "{daily}"
+        );
+        assert!(!daily.contains("/synthetic/"), "{daily}");
+        assert!(!daily.contains("more attention item"), "{daily}");
+        assert_eq!(daily.matches("ohjaa collect").count(), 1, "{daily}");
+        assert!(view.incomplete());
+        let digest = full(&view, &Window::at(NOW - 3 * DAY_MS), None, None, NOW);
+        assert!(digest.contains("unreadable-session.jsonl"), "{digest}");
+        for i in 0..4 {
+            assert!(
+                digest.contains(&format!("ohjaa session open-{i}")),
+                "{digest}"
+            );
+        }
+        assert_eq!(
+            view.events
+                .iter()
+                .find(|item| item.kind == Kind::Secret)
+                .unwrap()
+                .tokens,
+            18_330
+        );
+    }
+
+    #[test]
+    fn generic_redaction_matches_are_evidence_not_startup_attention() {
+        for (opaque_count, opaque_native) in [
+            (None, None),
+            (Some(0), Some(true)),
+            (Some(8000), Some(true)),
+            (Some(8513), Some(true)),
+            (Some(9000), Some(true)),
+        ] {
+            let mut collected = snapshot(NOW);
+            collected.secrets.value.findings.push(Finding {
+                agent: "codex".into(),
+                session: "synthetic-generic".into(),
+                rule: "mixed_token".into(),
+                count: 8513,
+                opaque_count,
+                opaque_native,
+                at_ms: Some(NOW),
+                found_ms: NOW,
+                ..Finding::default()
+            });
+            let view = view(&[], Some(&collected));
+            assert_eq!(daily(&view, &Window::at(NOW - DAY_MS), None, NOW), None);
+            assert_eq!(one_line(&news(&view, &Seen::first(NOW))), None);
+            let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+            assert!(digest.contains("mixed_token ×8513"), "{digest}");
+            assert!(digest.contains("All scan evidence"), "{digest}");
+            // Unknown metadata is still unknown, not invented as known-safe.
+            if opaque_count.is_none() {
+                assert!(digest.contains("Match context unavailable"), "{digest}");
+            }
+        }
+    }
+
+    #[test]
+    fn startup_distinguishes_key_formats_broad_patterns_and_transport_metadata() {
+        let mut raw = serde_json::to_value(snapshot(NOW)).unwrap();
+        raw["secrets"]["gaps"] = json!([
+            "synthetic missing time",
+            "synthetic missing time",
+            "synthetic unsupported source"
+        ]);
+        raw["secrets"]["value"] = json!({"read_ms":null,"undated_records":2,"other_issues":1,"findings":[
+            {"agent":"codex","session":"synthetic","cwd":null,"at_ms":null,"where":"other","rule":"mixed_token","count":100,"opaque_count":90,"opaque_native":true,"fingerprint":null,"found_ms":NOW},
+            {"agent":"codex","session":"synthetic","cwd":null,"at_ms":null,"where":"person","rule":"openai","count":2,"opaque_count":0,"opaque_native":true,"fingerprint":null,"found_ms":NOW}
+        ]});
+        let collected: Collected = serde_json::from_value(raw).unwrap();
+        let view = view(&[], Some(&collected));
+        let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
+        for text in [
+            "2 key-format",
+            "2 records have no timestamp",
+            "1 other coverage issue",
+            "Unconfirmed",
+        ] {
+            assert!(words.contains(text), "missing {text}:\n{daily}");
+        }
+        assert!(daily.lines().count() <= 10, "{daily}");
+        assert!(!words.contains("broad"), "{daily}");
+        assert!(view.incomplete());
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        assert!(digest.contains("not distinct credentials"), "{digest}");
+        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("90 in signature/encrypted fields"),
+            "{digest}"
+        );
+        assert!(digest.contains("mixed_token ×100"), "{digest}");
+        let mut partial = collected;
+        partial.secrets.value.findings[1].opaque_count = None;
+        let partial_view = self::view(&[], Some(&partial));
+        let partial_digest = full(&partial_view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        let words = partial_digest
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            words.contains("At least 90 in signature/encrypted fields"),
+            "{partial_digest}"
+        );
+        assert!(
+            words.contains("context unknown for 2 occurrences"),
+            "{partial_digest}"
+        );
+    }
+
+    #[test]
+    fn verified_opaque_entropy_is_evidence_not_a_credential_alert() {
+        let mut raw = serde_json::to_value(snapshot(NOW)).unwrap();
+        raw["secrets"]["value"]["findings"] = json!([
+            {"agent":"claude","session":"synthetic","cwd":null,"at_ms":NOW,"where":"agent","rule":"mixed_token","count":100,"opaque_count":100,"opaque_native":true,"fingerprint":null,"found_ms":NOW}
+        ]);
+        let collected: Collected = serde_json::from_value(raw.clone()).unwrap();
+        let view = view(&[], Some(&collected));
+        assert_eq!(daily(&view, &Window::at(NOW - DAY_MS), None, NOW), None);
+        assert_eq!(one_line(&news(&view, &Seen::first(NOW))), None);
+        let seen = advance(
+            &view,
+            &Seen::first(NOW),
+            Some(&collected),
+            NOW,
+            Shown::Daily {
+                from: Window::at(NOW - DAY_MS),
+                cut: false,
+            },
+            "synthetic-day",
+        );
+        assert!(full(&view, &seen.full_from(NOW), None, None, NOW).contains("mixed_token ×100"));
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        assert!(digest.contains("mixed_token ×100"), "{digest}");
+        assert!(digest.contains("signature/encrypted"), "{digest}");
+        for (rule, context, native, expected) in [
+            ("openai", json!(100), json!(true), "100 key-format"),
+            (
+                "named_secret",
+                json!(100),
+                json!(true),
+                "100 secret-labelled",
+            ),
+            ("future_rule", json!(100), json!(true), "100 unclassified"),
+        ] {
+            raw["secrets"]["value"]["findings"][0]["rule"] = json!(rule);
+            raw["secrets"]["value"]["findings"][0]["opaque_count"] = context;
+            raw["secrets"]["value"]["findings"][0]["opaque_native"] = native;
+            let collected: Collected = serde_json::from_value(raw.clone()).unwrap();
+            let view = self::view(&[], Some(&collected));
+            let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
+            assert!(line.contains(expected), "{rule}: {line}");
+        }
+        raw["secrets"]["value"]["findings"][0]["rule"] = json!("mixed_token");
+        raw["secrets"]["value"]["findings"][0]["opaque_count"] = json!(100);
+        raw["secrets"]["gaps"] = json!(["synthetic incomplete scan"]);
+        let collected: Collected = serde_json::from_value(raw).unwrap();
+        let view = self::view(&[], Some(&collected));
+        let daily = self::daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        assert!(
+            daily.contains("Missing or incomplete information"),
+            "{daily}"
+        );
+        assert!(!daily.contains("Possible credentials"), "{daily}");
+        assert!(view.incomplete());
+    }
+
+    #[test]
+    fn later_reviewable_content_is_not_acknowledged_by_earlier_opaque_evidence() {
+        let mut collected = snapshot(NOW);
+        collected.secrets.value.findings.push(Finding {
+            agent: "claude".into(),
+            session: "changing-record".into(),
+            place: "agent".into(),
+            rule: "mixed_token".into(),
+            count: 100,
+            opaque_count: Some(100),
+            opaque_native: Some(true),
+            at_ms: Some(NOW - 6 * HOUR_MS),
+            found_ms: NOW - 6 * HOUR_MS,
+            ..Finding::default()
+        });
+        let old = view(&[], Some(&collected));
+        let seen = advance(
+            &old,
+            &Seen::first(NOW),
+            Some(&collected),
+            NOW,
+            Shown::Full,
+            "d",
+        );
+        collected.secrets.as_of_ms = Some(NOW + MINUTE_MS);
+        // A specific secret-labelled value is reviewable even after reading
+        // generic evidence from the same native record.
+        collected.secrets.value.findings[0].rule = "named_secret".into();
+        collected.secrets.value.findings[0].count = 1;
+        collected.secrets.value.findings[0].opaque_count = Some(0);
+        let next = build(&[], Ok(Vec::new()), Some(&collected), NOW + MINUTE_MS, 0);
+        let notice = one_line(&news(&next, &seen)).expect("new review candidate");
+        assert!(notice.contains("1 secret-labelled match"), "{notice}");
+        let digest = full(
+            &next,
+            &seen.full_from(NOW + MINUTE_MS),
+            None,
+            None,
+            NOW + MINUTE_MS,
+        );
+        assert!(digest.contains("named_secret ×1"), "{digest}");
+        let read = advance(
+            &next,
+            &seen,
+            Some(&collected),
+            NOW + MINUTE_MS,
+            Shown::Full,
+            "d",
+        );
+        collected.secrets.as_of_ms = Some(NOW + 2 * MINUTE_MS);
+        let same = build(
+            &[],
+            Ok(Vec::new()),
+            Some(&collected),
+            NOW + 2 * MINUTE_MS,
+            0,
+        );
+        assert_eq!(one_line(&news(&same, &read)), None);
+        assert!(after(&same, &read.full_from(NOW + 2 * MINUTE_MS)).is_empty());
+    }
+
+    #[test]
+    fn grouped_startup_leaves_room_for_failed_checks_even_when_every_source_is_partial() {
+        let mut collected = snapshot(NOW - 2 * DAY_MS);
+        collected.local.error = Some("synthetic unavailable source".into());
+        collected.github.error = collected.local.error.clone();
+        collected.typed.error = collected.local.error.clone();
+        collected.usage.error = collected.local.error.clone();
+        collected.secrets.error = collected.local.error.clone();
+        collected.secrets.as_of_ms = Some(NOW - 3 * DAY_MS);
+        collected.secrets.value.findings.push(Finding {
+            count: u64::MAX,
+            found_ms: NOW,
+            ..Finding::default()
+        });
+        collected.local.value.branches.push(Branch {
+            slug: "false-systems/check-me".into(),
+            branch: "main".into(),
+            unproven: 1,
+            failed: 1,
+            as_of_ms: Some(NOW),
+            ..Branch::default()
+        });
+        let logged: Vec<_> = (0..15)
+            .map(|i| {
+                let mut open = session(&format!("open-{i}"), 2 * DAY_MS, None, false);
+                open.repo = format!("/r/repository-with-a-long-name-{i}");
+                open
+            })
+            .collect();
+        let view = build(
+            &logged,
+            Ok(vec![waiting("proposal", "2026-10-20")]),
+            Some(&collected),
+            NOW,
+            0,
+        );
+        let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
+        assert!(
+            daily.lines().all(|line| line.chars().count() <= WIDTH),
+            "{daily}"
+        );
+        assert!(daily.contains("check-me"), "{daily}");
+        assert!(daily.contains("verification failed"), "{daily}");
+        assert!(daily.contains("18,446,744,073,709,551,615"), "{daily}");
+        assert!(daily.contains("Refresh: ohjaa collect"), "{daily}");
+        assert!(view.incomplete());
+    }
+
+    #[test]
+    fn startup_keeps_source_dates_reasons_and_real_findings_separate() {
+        let mut collected = snapshot(NOW);
+        collected.secrets.as_of_ms = Some(NOW - 2 * DAY_MS);
+        collected.secrets.error = Some("Vessa is unavailable".into());
+        collected.secrets.value.findings.push(Finding {
+            agent: "claude".into(),
+            session: "native-demo".into(),
+            place: "tool_output".into(),
+            rule: "openai".into(),
+            count: 1,
+            found_ms: NOW,
+            ..Finding::default()
+        });
+        let view = view(&[], Some(&collected));
+        let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(daily.contains(&clock(NOW - 2 * DAY_MS)), "{daily}");
+        assert!(
+            words.contains("Missing or incomplete information: secrets scan"),
+            "{daily}"
+        );
+        assert!(
+            daily.contains("Possible credentials: 1 key-format match"),
+            "{daily}"
+        );
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        assert!(digest.contains("Vessa is unavailable"), "{digest}");
+        assert!(
+            digest.contains("Missing scan coverage is not a finding"),
+            "{digest}"
+        );
+        assert!(view.incomplete());
+        assert_eq!(
+            view.events
+                .iter()
+                .filter(|item| item.kind == Kind::Secret)
+                .count(),
+            1
+        );
+    }
+
     fn pr(number: u64, created_ago: i64, merged_ago: Option<i64>) -> Pr {
         Pr {
             repo: "false-systems/sykli".into(),
@@ -2107,6 +2893,115 @@ mod tests {
             base: Some("main".into()),
             default_branch: Some("main".into()),
         }
+    }
+
+    #[test]
+    fn open_records_use_the_last_recorded_goal_without_claiming_it_is_current_work() {
+        let mut open = session("ongoing-chat", 2 * DAY_MS, None, true);
+        open.intent = "interactive".into();
+        open.readback.as_mut().unwrap().text = "Make the startup message understandable".into();
+        let view = view(&[open], Some(&snapshot(NOW)));
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("last recorded goal: \"Make the startup message understandable\""),
+            "{digest}"
+        );
+        assert!(!digest.contains("no task description recorded"), "{digest}");
+        assert!(digest.contains("ohjaa session ongoing-chat"), "{digest}");
+    }
+
+    #[test]
+    fn old_open_records_are_not_presented_as_failures_and_long_context_is_retained() {
+        let mut open = session("long-context", 2 * DAY_MS, None, true);
+        open.intent = "interactive".into();
+        let goal = "Keep this complete recorded goal available. ".repeat(30);
+        open.readback.as_mut().unwrap().text = goal.clone();
+        let view = view(&[open], Some(&snapshot(NOW)));
+        let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+            .unwrap()
+            .0;
+        assert!(
+            daily.starts_with("ohjaa — sessions still open\n"),
+            "{daily}"
+        );
+        assert!(!daily.contains("  !"), "{daily}");
+        assert!(daily.contains("ohjaa session long-context"), "{daily}");
+        assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains(goal.trim()), "{digest}");
+        assert!(digest.contains("Sessions still marked open"), "{digest}");
+        assert!(!digest.contains("Needs your attention"), "{digest}");
+    }
+
+    #[test]
+    fn recorded_goal_context_does_not_display_secret_shaped_tokens() {
+        let mut open = session("scrubbed-goal", 2 * DAY_MS, None, true);
+        open.intent = "interactive".into();
+        let token = format!("sk-{}", "Ab9x".repeat(12));
+        open.readback.as_mut().unwrap().text = format!("Investigate API key {token}");
+        let view = view(&[open], Some(&snapshot(NOW)));
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        assert!(!digest.contains(&token), "{digest}");
+        assert!(digest.contains("[redacted]"), "{digest}");
+    }
+
+    fn long_goal_keeps_liveness_warning_visible(orphaned: bool) {
+        for stale in [false, true] {
+            let mut open = session("long-liveness-goal", 2 * DAY_MS, None, true);
+            open.intent = "interactive".into();
+            let goal = "Keep this complete recorded goal available. ".repeat(40);
+            open.readback.as_mut().unwrap().text = goal.clone();
+            let following = session("following-open-record", 2 * DAY_MS, None, false);
+            let at = if stale { NOW - DAY_MS } else { NOW };
+            let mut collected = snapshot(at);
+            let warning = if orphaned {
+                collected.local.value.orphaned.push(open.id.clone());
+                "Neither the agent nor its supervisor was found running"
+            } else {
+                collected.local.value.gone.push(open.id.clone());
+                "Agent still running without its Ohjaa supervisor"
+            };
+            let view = view(&[open, following], Some(&collected));
+            let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
+                .unwrap()
+                .0;
+            let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
+            for text in [
+                warning,
+                "last recorded goal:",
+                "ohjaa session long-liveness-goal",
+                "ohjaa session following-open-record",
+            ] {
+                assert!(
+                    words.contains(text),
+                    "missing {text}; stale={stale}:\n{daily}"
+                );
+            }
+            assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
+            assert!(
+                daily.lines().all(|line| line.chars().count() <= WIDTH),
+                "{daily}"
+            );
+            if stale {
+                assert!(daily.contains(&clock(at)), "{daily}");
+            }
+            let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+            let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains(goal.trim()), "{digest}");
+            assert!(words.contains(warning), "{digest}");
+        }
+    }
+
+    #[test]
+    fn long_goals_do_not_hide_supervisor_missing_startup_warnings() {
+        long_goal_keeps_liveness_warning_visible(false);
+    }
+
+    #[test]
+    fn long_goals_do_not_hide_orphaned_startup_warnings() {
+        long_goal_keeps_liveness_warning_visible(true);
     }
 
     #[test]
@@ -2147,6 +3042,8 @@ mod tests {
             place: "person".into(),
             rule: "github".into(),
             count: 2,
+            opaque_count: None,
+            opaque_native: None,
             fingerprint: Some("1a2b3c4d".into()),
             found_ms: NOW,
         });
@@ -2158,7 +3055,7 @@ mod tests {
         let notice = one_line(&news(&view, &initial)).unwrap();
         assert_eq!(
             notice,
-            "ohjaa · 2 secret-shaped tokens in agent sessions · Details: ohjaa digest\n"
+            "ohjaa · Possible credentials: 2 key-format matches · Details: ohjaa digest\n"
         );
         let seen = advance(
             &view,
@@ -2714,8 +3611,8 @@ mod tests {
         );
         let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
         assert!(
-            line.contains("Repository verification records: 1 could not be read")
-                && line.contains("more"),
+            line.contains("Missing or incomplete information: pull requests, repository checks")
+                && line.ends_with("Details: ohjaa digest\n"),
             "{line}"
         );
         let full = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
@@ -2731,7 +3628,7 @@ mod tests {
         assert!(none.incomplete());
         assert_eq!(
             none.standing[0].brief.as_deref(),
-            Some("nothing collected yet")
+            Some("No saved check results yet. Refresh: ohjaa collect")
         );
         // And all clear only when everything was read.
         assert!(!view_ok().incomplete());
@@ -3101,7 +3998,7 @@ mod tests {
         let other = view(&[], Some(&collected));
         let line = one_line(&news(&other, &seen)).expect("another failure");
         assert!(
-            line.contains("Pull request activity: unavailable"),
+            line.contains("Missing or incomplete information: pull requests"),
             "{line}"
         );
         assert!(!line.contains("marks"), "the marks failed the same: {line}");
@@ -3113,9 +4010,11 @@ mod tests {
         let more = view(&[], Some(&collected));
         let line = one_line(&news(&more, &seen)).expect("one more could not be read");
         assert!(
-            line.contains("Repository verification records: 2 could not be read"),
+            line.contains("Missing or incomplete information: repository checks"),
             "{line}"
         );
+        assert!(full(&more, &Window::at(NOW - DAY_MS), None, None, NOW)
+            .contains("Repository verification records: 2 could not be read"));
         let seen = advance(&more, &seen, Some(&collected), NOW, Shown::Line, "d");
         // The same cap, read later: its count and time moved, nothing new.
         collected.github.error = None;
