@@ -7090,6 +7090,8 @@ claude
         .output()
         .unwrap();
     let (stdout, stderr) = text(&output);
+    // The last `claude` runs in `/`, outside every repository: wrapped all
+    // the same, since only the briefing carries the team's knowledge.
     assert_eq!(
         stdout,
         "ohjaa run claude --intent interactive --\n\
@@ -7103,7 +7105,7 @@ claude
          direct \n\
          ohjaa run codex --intent interactive --task write it --\n\
          direct-codex exec hi\n\
-         direct \n",
+         ohjaa run claude --intent interactive --\n",
         "{stderr}"
     );
     assert!(

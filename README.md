@@ -1551,6 +1551,12 @@ ohjaa run codex --intent "change the parser" -- --model o3
 
 ## Agents launched from the root
 
+The launcher `ohjaa apply` puts in `~/.zshrc` routes `claude` and `codex`
+typed at a terminal through `ohjaa run` in any folder, the home folder as much
+as a repository: the team's knowledge (ours) reaches an agent only through
+the briefing, since an agent's own instruction file holds mine and machine
+alone. Outside every repository the session is the folder's.
+
 Launch agents from the folder that holds your repositories. You can give a goal
 without choosing the repositories first:
 
