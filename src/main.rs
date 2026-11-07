@@ -775,6 +775,12 @@ fn cmd_fleet(explicit: &[PathBuf], json: bool) -> Result<i32> {
     if !any_live {
         println!("no possibly running sessions reported by available scans");
     }
+    // The fleet is this machine's; what teammates work on elsewhere is in
+    // their pull requests, which the digest lists from GitHub.
+    println!(
+        "\nOnly this machine's sessions are listed. Teammates' work shows as their open \
+         pull requests, under \"Now\" in: ohjaa digest"
+    );
     Ok(report_coverage(&scans))
 }
 

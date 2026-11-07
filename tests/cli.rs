@@ -10839,8 +10839,12 @@ fn a_pull_request_github_indexes_late_is_in_the_next_digest_once() {
     assert_eq!(fixture.graphql_calls(), 2, "no call more for the overlap");
     let (next, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
     assert!(next.contains("#100 merged by yairfalse"), "{next}");
-    assert!(!next.contains("#76"), "said already: {next}");
-    assert!(!next.contains("#16"), "said already: {next}");
+    // Activity is said once; "Now" is what stands, said each time: #16 is
+    // still open, so it is listed there again, never as news.
+    let (activity, now) = next.split_once("\nNow\n").expect("a Now section");
+    assert!(!activity.contains("#76"), "said already: {next}");
+    assert!(!activity.contains("#16"), "said already: {next}");
+    assert!(now.contains("#16 by yairfalse"), "still open: {next}");
     fixture.cleanup();
 }
 

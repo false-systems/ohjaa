@@ -606,7 +606,15 @@ here. It records only: nothing is sent to anyone, decided or refused.
 - **`ohjaa digest`** shows attention details, unread agent sessions and
   pull requests, proposed instructions and who is live. Each ended session
   has its full recorded intent, end time, elapsed time and an inspection
-  command, `ohjaa session <id>`. A pull request has its URL. Reading a digest
+  command, `ohjaa session <id>`. A pull request has its URL. Its "Now" says
+  who is live on this machine, then the pull requests GitHub last said were
+  open in the entries' owners (updated in the window the snapshot read),
+  the last updated first: the repository, the number, the author, whether it
+  is a draft, its title, how long ago it last changed and its URL. That is
+  where teammates' work shows, from any machine: a session that pushes its
+  branch and opens a draft pull request as it starts is listed there. At
+  most 20 are listed, the rest counted; GitHub never read is said under
+  "Sources", never as none open. Reading a digest
   at a person's terminal marks activity seen under `seen.lock`; piping it,
   using `--since`, or running it inside an agent session does not. A digest
   that cannot claim the lock within 2 s shows the same information but
@@ -1476,7 +1484,10 @@ nothing. It exits 4 while anything is not delivered.
 sessions` in each repo and `toimija sessions --outside-repos` for the sessions
 running outside any repo (listed under "outside any repository", by folder).
 Both are **derived now, stored never**: a derived view cannot be staler than
-the moment it was computed. `ohjaa run` and `ohjaa brief` include only the launch
+the moment it was computed. The fleet is this machine's, and says so: what
+teammates work on elsewhere is their open pull requests, which `ohjaa digest`
+lists under "Now" (claiming work stays in GitHub; see "What it will never
+do"). `ohjaa run` and `ohjaa brief` include only the launch
 repository and repositories named by `--scope`, after the Knowledge. Sessions
 outside repositories are included when they are in the launch folder or their
 declared scope reaches a selected repository. Other repositories are explicitly
