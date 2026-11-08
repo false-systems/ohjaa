@@ -4,3 +4,4 @@ target/
 # only its config is tracked.
 /.toimija/*
 !/.toimija/repo.yaml
+.sykli/
