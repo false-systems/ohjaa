@@ -35,7 +35,6 @@ mod tests {
         for rule in [
             "[[ ${OHJAA_WRAP:-1} == 0 || -n $OHJAA_SESSION ]] && return 1",
             "_ohjaa_at_terminal || return 1",
-            "git rev-parse --git-dir >/dev/null 2>&1 || [[ $PWD == $HOME/projects* ]] || return 1",
             "claude:-p|claude:--print|claude:-c|claude:--continue|claude:-r|claude:--resume) return 1 ;;",
             "_ohjaa_task=(--task \"$1\")",
             "command claude \"$@\"",
@@ -44,6 +43,10 @@ mod tests {
         }
         assert!(LAUNCH_ZSH.contains("shell-init zsh"));
         assert!(!LAUNCH_ZSH.contains("source ~/projects/ohjaa-launch.zsh"));
+        // Every folder is wrapped: the team's knowledge reaches an agent only
+        // through the briefing, so no folder may skip it.
+        assert!(!LAUNCH_ZSH.contains("git rev-parse"));
+        assert!(!LAUNCH_ZSH.contains("$HOME/projects"));
     }
 
     #[test]
