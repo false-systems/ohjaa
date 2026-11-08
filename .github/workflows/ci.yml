@@ -68,3 +68,58 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  # The same checks as the repository's sykli.json, the contract `ohjaa gate`
+  # runs on a person's machine: one list, run in both places. Advisory while
+  # it proves itself on these runners; the `rust` job above stays the check
+  # that counts until it is removed on purpose.
+  sykli:
+    name: Sykli
+    runs-on: arc-arm64
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # The same as the rust job: scoped to false-systems, and needed here to
+      # fetch sykli itself, which is private.
+      - name: Authenticate git dependency fetches
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/false-systems/".insteadOf "https://github.com/false-systems/"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install build prerequisites
+        run: |
+          set -euo pipefail
+          if command -v cc >/dev/null 2>&1; then
+            exit 0
+          fi
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::error::runner is missing cc and apt-get; the hosted arm64 image should already carry cc"
+            exit 1
+          fi
+          sudo_cmd=""
+          if [ "$(id -u)" -ne 0 ]; then
+            if ! command -v sudo >/dev/null 2>&1; then
+              echo "::error::runner is missing cc and needs sudo or root to install build-essential"
+              exit 1
+            fi
+            sudo_cmd="sudo"
+          fi
+          $sudo_cmd apt-get update
+          $sudo_cmd apt-get install -y --no-install-recommends build-essential ca-certificates
+
+      # sykli has no release yet, so it is built from the commit that wrote
+      # and locked this contract (sykli 0.7.0), as toimija's CI does.
+      - name: Install sykli
+        run: cargo install --locked --git https://github.com/false-systems/sykli --rev 49018290537876467ed0bf7ed8caf8001d3187bf sykli
+
+      - name: Run the sykli contract
+        run: sykli run

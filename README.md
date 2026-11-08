@@ -2471,7 +2471,12 @@ each in full, with what ohjaa keeps where.
 
 `cargo test` runs against stand-ins for sykli, toimija, vessa, gh and the
 agents, in a sandboxed home, never the person's own. With `cargo fmt --check`
-and `cargo clippy --all-targets -- -D warnings`, it is what CI runs.
+and `cargo clippy --all-targets -- -D warnings`, it is what CI runs. The same
+three are the repository's `sykli.json` (with every input it reads, pinned in
+`sykli.lock`), the contract `ohjaa gate` runs on a person's machine; a second
+CI job installs sykli and runs that contract too, advisory until the plain
+cargo job is removed on purpose. A new source or test file goes into its
+inputs (`sykli init --force` rewrites them), or `sykli run` refuses.
 `tests/lessons.rs` delivers repo knowledge to a local bare repository as the
 remote: git's `insteadOf` turns the GitHub URL the checkout names into it,
 and `GIT_ALLOW_PROTOCOL=file` keeps git off the network should that fail; a
