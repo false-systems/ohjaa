@@ -165,6 +165,12 @@ pub struct Finding {
     pub fingerprint: Option<String>,
     /// When a collect first found it, by the snapshot's clock.
     pub found_ms: i64,
+    /// Which of this machine's credentials it is, by where it is kept
+    /// (`environment variable …`, `~/.aws/credentials`): a vessa that
+    /// compares with them says so. None from an earlier vessa, whose
+    /// findings were every secret-shaped string.
+    #[serde(default)]
+    pub held: Option<String>,
 }
 
 impl Finding {
@@ -1117,7 +1123,16 @@ pub fn read_secrets(
             None => read.push(finding),
         }
     }
-    let mut findings = before.findings.clone();
+    // A vessa that compares with this machine's credentials (it says what it
+    // compared with) lists only those as findings: what an earlier one
+    // listed of every other secret-shaped string is no finding, and goes.
+    let compares = report["compared_with"].is_array();
+    let mut findings: Vec<Finding> = before
+        .findings
+        .iter()
+        .filter(|kept| !compares || kept.held.is_some())
+        .cloned()
+        .collect();
     for finding in read {
         match findings.iter_mut().find(|same| same.key() == finding.key()) {
             // Read again: as it is now, found when it first was.
@@ -1179,6 +1194,10 @@ fn finding(listed: &Value, now_ms: i64) -> Option<Finding> {
             .filter(|fp| fp.len() == 8 && fp.chars().all(|c| c.is_ascii_hexdigit()))
             .map(|fp| fp.to_ascii_lowercase()),
         found_ms: now_ms,
+        // A name, as vessa scrubbed it: where the credential is kept.
+        held: text("held").filter(|held| {
+            (1..=120).contains(&held.chars().count()) && !held.chars().any(char::is_control)
+        }),
     })
 }
 
@@ -1663,6 +1682,52 @@ mod tests {
         json!({"agent": "claude", "session": session, "cwd": "/p/habitat",
                "at": intake::rfc3339(at_ms / 1000), "where": place, "rule": rule,
                "count": 1, "fingerprint": fingerprint})
+    }
+
+    /// A vessa that compares with this machine's credentials lists only
+    /// those: what an earlier one listed of every other secret-shaped string
+    /// goes from the snapshot, and each kept finding says where it is held.
+    #[test]
+    fn a_report_of_held_credentials_replaces_an_earlier_vessas_findings() {
+        let earlier = found("old", NOW - HOUR, "tool_output", "mixed_token", Value::Null);
+        let (before, _) = read_secrets(
+            Some(0),
+            &scan(true, json!([]), json!([earlier])),
+            "",
+            &Secrets::default(),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(before.findings[0].held, None);
+        let mut mine = found("new", NOW, "person", "id_and_secret", Value::Null);
+        mine["held"] = json!("environment variable ZAI_API_KEY");
+        let mut report: Value =
+            serde_json::from_slice(&scan(true, json!([]), json!([mine]))).unwrap();
+        report["compared_with"] = json!([{"source": "environment variable ZAI_API_KEY",
+                                         "status": "read", "credentials": 1}]);
+        let (after, _) = read_secrets(
+            Some(0),
+            report.to_string().as_bytes(),
+            "",
+            &before,
+            NOW + 60_000,
+        )
+        .unwrap();
+        assert_eq!(after.findings.len(), 1, "{:?}", after.findings);
+        assert_eq!(
+            after.findings[0].held.as_deref(),
+            Some("environment variable ZAI_API_KEY")
+        );
+        // An earlier vessa's report keeps what came before, as it did.
+        let (kept, _) = read_secrets(
+            Some(0),
+            &scan(true, json!([]), json!([])),
+            "",
+            &before,
+            NOW + 60_000,
+        )
+        .unwrap();
+        assert_eq!(kept.findings.len(), 1);
     }
 
     #[test]

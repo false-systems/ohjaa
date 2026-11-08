@@ -583,6 +583,17 @@ here. It records only: nothing is sent to anyone, decided or refused.
   are labelled as unconfirmed pattern matches, not confirmed credential leaks
   or a count of unique credentials. Full findings, individual inspection
   commands, source dates, and incomplete coverage remain in the digest.
+- **Your own credentials are an alarm.** A Vessa that compares with the
+  credentials this machine holds (its report says what it compared with,
+  `compared_with`) lists only those as findings, each naming where the
+  credential is kept (`held`: `environment variable …`, `~/.aws/credentials`,
+  gh's login). Each one is attention whatever rule the detector gave it:
+  startup says "Your credentials reached agent sessions: N occurrences;
+  rotate them", and the digest names each place it is kept and each session.
+  Such a report replaces what an earlier Vessa listed of every other
+  secret-shaped string, so that noise leaves the snapshot at the first collect;
+  Vessa counts those strings itself (`candidates`) and ohjaa shows none of
+  them. The paragraphs below describe an earlier Vessa's findings.
 - **A match count is not a leaked-key count.** Startup separates recognizable
   key-format matches from secret-labelled values and unclassified rules. Generic
   random-string matches alone stay in the digest, not in startup attention. When Vessa
@@ -664,8 +675,9 @@ here. It records only: nothing is sent to anyone, decided or refused.
     requested with `--raw`), cut at a word to about 70 characters and retained
     only within the digest's window.
   - Secrets: one `vessa secrets --json` scan from the last complete scan,
-    with a five-minute overlap. Only locations, rules, counts and optional
-    SHA-256 fingerprint prefixes are kept, never secret values. New findings
+    with a five-minute overlap. Only locations, rules, counts, where a held
+    credential is kept, and optional SHA-256 fingerprint prefixes are kept,
+    never secret values. New findings
     are attention notices; opening a terminal does not consume their digest
     details. The digest's **Secrets seen** section names the native session,
     whose words contained the finding, its time, rule and fingerprint.
@@ -2512,7 +2524,9 @@ have none of them:
 
 - `tests/cli.rs`, `real_vessa_producer_*`: the actual Vessa command reads only
   a synthetic HOME, while Ohjaa collects and renders its output. Requires a
-  Vessa implementing `vessa-secrets.v1`; older versions fail visibly:
+  Vessa implementing `vessa-secrets.v1` that compares with the machine's
+  credentials (`compared_with`); the test gives it its key as a secret-named
+  variable. Older versions fail visibly:
 
   ```bash
   OHJAA_TEST_VESSA=/absolute/path/to/vessa cargo test --test cli real_vessa_producer -- --ignored
