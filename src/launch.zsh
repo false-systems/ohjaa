@@ -26,9 +26,10 @@ _ohjaa_should_wrap() {
   # No person at a terminal: headless, piped or scripted. No briefing to read,
   # no handover to write.
   _ohjaa_at_terminal || return 1
-  # Nothing to observe outside a repository unless it's the projects folder,
-  # where ohjaa records the repos a session touched.
-  git rev-parse --git-dir >/dev/null 2>&1 || [[ $PWD == $HOME/projects* ]] || return 1
+  # Any folder, a repository or not: only the briefing carries the team's
+  # knowledge (ours), which no instruction file holds, so an agent started in
+  # the home folder needs it as much as one started in a repository. Outside
+  # every repository ohjaa keeps the session as the folder's.
   # One-shots, maintenance and resumed conversations stay direct.
   local arg
   for arg in "$@"; do

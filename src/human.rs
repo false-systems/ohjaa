@@ -70,6 +70,10 @@ pub const WIDTH: usize = 100;
 /// The startup attention view is at most this many lines.
 const DAILY_LINES: usize = 15;
 
+/// The full digest lists at most this many open pull requests, the last
+/// updated first, and says how many more there are.
+const OPEN_SHOWN: usize = 20;
+
 /// What the shells an agent runs its tools in carry, each set by the agent
 /// (or by `ohjaa run` and `toimija run` around it), never by a person's own
 /// startup files. A variable a person may set (`CODEX_HOME`) is not one.
@@ -370,6 +374,9 @@ struct View {
     unread: Vec<String>,
     collected_ms: Option<i64>,
     secret_coverage: Option<(u64, u64)>,
+    /// The pull requests GitHub last said were open, the last updated first:
+    /// where people are working, as of the snapshot's read of GitHub.
+    open: Vec<Item>,
 }
 
 impl View {
@@ -655,6 +662,34 @@ fn pr_events(pr: &Pr, out: &mut Vec<Item>) {
         ),
         (None, None) => {}
     }
+}
+
+/// An open pull request as the digest's "Now" says it: whose, whether a
+/// draft, its title, and how long ago GitHub last saw it change.
+fn open_pr(pr: &Pr, now_ms: i64) -> Item {
+    let author = clean(
+        pr.author
+            .as_deref()
+            .unwrap_or("someone GitHub did not name"),
+    );
+    let draft = if pr.draft { "draft " } else { "" };
+    let when = match pr.updated_ms {
+        Some(at) => format!("last updated {} ago", span(now_ms - at)),
+        None => format!("opened {}", clock(pr.created_ms)),
+    };
+    event(
+        Kind::Opened,
+        format!("open:{}#{}", pr.repo, pr.number),
+        pr.updated_ms.unwrap_or(pr.created_ms),
+        true,
+        &pr.repo,
+        format!(
+            "#{} {draft}by {author}: {} · {when} · Inspect: {}",
+            pr.number,
+            clean(&pr.title),
+            clean(&pr.url)
+        ),
+    )
 }
 
 /// A finding is a newly collected observation on the local source clock,
@@ -1146,6 +1181,14 @@ fn build(
     for pr in &snapshot.github.value {
         pr_events(pr, &mut events);
     }
+    let mut open: Vec<&Pr> = snapshot
+        .github
+        .value
+        .iter()
+        .filter(|pr| pr.open())
+        .collect();
+    open.sort_by_key(|pr| std::cmp::Reverse(pr.updated_ms.unwrap_or(pr.created_ms)));
+    let open = open.into_iter().map(|pr| open_pr(pr, now_ms)).collect();
     events.extend(
         snapshot
             .secrets
@@ -1203,6 +1246,7 @@ fn build(
             .value
             .undated_records
             .zip(snapshot.secrets.value.other_issues),
+        open,
     }
 }
 
@@ -1977,20 +2021,70 @@ fn full(
         }
         paragraph(&mut out, "Read complete proposals and decide: ohjaa review");
     }
-    if let Some(fleet) = fleet {
+    let github_read = view
+        .parts
+        .iter()
+        .find(|(name, _, _)| *name == "GitHub")
+        .and_then(|(_, at, _)| *at);
+    if fleet.is_some() || github_read.is_some() {
         out.push_str("\nNow\n");
+    }
+    if let Some(fleet) = fleet {
         let said = match fleet {
-            Err(why) => format!("  the fleet could not be read: {}", clean(why)),
+            Err(why) => format!(
+                "  On this machine: the fleet could not be read: {}",
+                clean(why)
+            ),
             Ok(fleet) if fleet.failed > 0 => format!(
-                "  {} live; {} of {} repositories could not be scanned",
+                "  On this machine: {} live; {} of {} repositories could not be scanned",
                 fleet.live.len(),
                 fleet.failed,
                 fleet.scanned
             ),
-            Ok(fleet) if fleet.live.is_empty() => "  nobody is live".to_owned(),
-            Ok(fleet) => format!("  {} live: {}", fleet.live.len(), fleet.live.join(", ")),
+            Ok(fleet) if fleet.live.is_empty() => "  On this machine: nobody is live".to_owned(),
+            Ok(fleet) => format!(
+                "  On this machine: {} live: {}",
+                fleet.live.len(),
+                fleet.live.join(", ")
+            ),
         };
         paragraph(&mut out, &clean(&said));
+    }
+    // GitHub never read is said under Sources; it is never "none open".
+    if let Some(at) = github_read {
+        let since = view
+            .github_from()
+            .map(|from| format!(" updated since {}", clock(from)))
+            .unwrap_or_default();
+        paragraph(
+            &mut out,
+            &format!(
+                "Open pull requests in the team's GitHub organizations{since}, as GitHub said \
+                 {}. An open pull request shows who is working on what, from any machine.",
+                clock(at)
+            ),
+        );
+        if view.open.is_empty() {
+            paragraph(
+                &mut out,
+                "None. When you start work, push your branch and open a draft \
+                pull request, so teammates see it here.",
+            );
+        }
+        let width = repo_width(view.open.iter());
+        for item in view.open.iter().take(OPEN_SHOWN) {
+            out.push_str(&full_row(item, width));
+            out.push('\n');
+        }
+        if view.open.len() > OPEN_SHOWN {
+            paragraph(
+                &mut out,
+                &format!(
+                    "{} more are open; the {OPEN_SHOWN} updated last are listed. See them all on GitHub.",
+                    view.open.len() - OPEN_SHOWN
+                ),
+            );
+        }
     }
     if !view.parts.is_empty() || !view.unread.is_empty() {
         out.push_str("\nSources\n");
@@ -2892,7 +2986,117 @@ mod tests {
             closed_ms: merged_ago.map(|ago| NOW - ago),
             base: Some("main".into()),
             default_branch: Some("main".into()),
+            draft: false,
+            updated_ms: None,
         }
+    }
+
+    /// An open pull request in `repo` by `author`, last updated `ago`.
+    fn open_in(repo: &str, number: u64, author: &str, draft: bool, ago: i64) -> Pr {
+        Pr {
+            repo: format!("false-systems/{repo}"),
+            title: format!("Work in {repo}"),
+            url: format!("https://github.com/false-systems/{repo}/pull/{number}"),
+            author: Some(author.into()),
+            draft,
+            updated_ms: Some(NOW - ago),
+            ..pr(number, DAY_MS, None)
+        }
+    }
+
+    /// The digest's "Now" section, its words joined by single spaces.
+    fn now_section(digest: &str) -> String {
+        let now = digest
+            .split("\nNow\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no Now section: {digest}"));
+        let now = now.split("\nSources\n").next().unwrap_or(now);
+        now.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn open_pull_requests_say_who_works_on_what_the_last_updated_first() {
+        let mut collected = snapshot(NOW);
+        collected.github.from_ms = Some(NOW - DAY_MS);
+        collected.github.value = vec![
+            open_in("sykli", 40, "yairfalse", false, 3 * HOUR_MS),
+            pr(7, 3 * HOUR_MS, Some(HOUR_MS)),
+            open_in("habitat", 12, "dima", true, 20 * MINUTE_MS),
+        ];
+        let view = view(&[], Some(&collected));
+        let now = now_section(&full(&view, &Window::at(NOW - DAY_MS), None, None, NOW));
+        for said in [
+            "Open pull requests in the team's GitHub organizations updated since",
+            "An open pull request shows who is working on what, from any machine.",
+            "habitat #12 draft by dima: Work in habitat · last updated 20m ago",
+            "Inspect: https://github.com/false-systems/habitat/pull/12",
+            "sykli #40 by yairfalse: Work in sykli · last updated 3h ago",
+        ] {
+            assert!(now.contains(said), "missing `{said}`: {now}");
+        }
+        assert!(
+            now.find("#12 draft by dima") < now.find("#40 by yairfalse"),
+            "the last updated comes first: {now}"
+        );
+        assert!(
+            !now.contains("#7 "),
+            "a merged pull request is not open: {now}"
+        );
+    }
+
+    #[test]
+    fn no_open_pull_request_says_how_to_show_up_and_unread_github_says_nothing() {
+        let collected = snapshot(NOW);
+        let read = full(
+            &view(&[], Some(&collected)),
+            &Window::at(NOW - DAY_MS),
+            None,
+            None,
+            NOW,
+        );
+        assert!(
+            now_section(&read).contains(
+                "None. When you start work, push your branch and open a draft pull request, \
+                 so teammates see it here."
+            ),
+            "{read}"
+        );
+        let mut unread = snapshot(NOW);
+        unread.github = Part::default();
+        let digest = full(
+            &view(&[], Some(&unread)),
+            &Window::at(NOW - DAY_MS),
+            None,
+            None,
+            NOW,
+        );
+        // GitHub never read is not "none open".
+        assert!(
+            !digest.contains("Open pull requests in the team"),
+            "{digest}"
+        );
+        assert!(!digest.contains("None. When you start work"), "{digest}");
+    }
+
+    #[test]
+    fn the_open_pull_requests_listed_are_bounded_and_the_rest_counted() {
+        let mut collected = snapshot(NOW);
+        collected.github.value = (1..=25)
+            .map(|n| open_in("sykli", n, "yairfalse", false, n as i64 * MINUTE_MS))
+            .collect();
+        let now = now_section(&full(
+            &view(&[], Some(&collected)),
+            &Window::at(NOW - DAY_MS),
+            None,
+            None,
+            NOW,
+        ));
+        assert!(now.contains("#20 by"), "{now}");
+        assert!(!now.contains("#21 by"), "{now}");
+        assert!(
+            now.contains("5 more are open; the 20 updated last are listed."),
+            "{now}"
+        );
     }
 
     #[test]

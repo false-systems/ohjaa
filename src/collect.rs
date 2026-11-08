@@ -60,7 +60,7 @@ const SEARCH: &str = "query($q: String!, $after: String) {
     pageInfo { hasNextPage endCursor }
     nodes {
       ... on PullRequest {
-        number title url createdAt closedAt mergedAt baseRefName
+        number title url createdAt updatedAt closedAt mergedAt baseRefName isDraft
         author { login }
         mergedBy { login }
         repository { nameWithOwner defaultBranchRef { name } }
@@ -298,9 +298,22 @@ pub struct Pr {
     pub closed_ms: Option<i64>,
     pub base: Option<String>,
     pub default_branch: Option<String>,
+    /// Opened as a draft: work in progress. A snapshot from before ohjaa
+    /// asked reads as not a draft.
+    #[serde(default)]
+    pub draft: bool,
+    /// When GitHub last saw it change (a push, a comment, an edit); unknown
+    /// in a snapshot from before ohjaa asked.
+    #[serde(default)]
+    pub updated_ms: Option<i64>,
 }
 
 impl Pr {
+    /// Neither merged nor closed when GitHub was read.
+    pub fn open(&self) -> bool {
+        self.merged_ms.is_none() && self.closed_ms.is_none()
+    }
+
     /// Merged into its repository's default branch (or one whose base is not
     /// known): a landing. A merge into another branch is not one.
     pub fn landed(&self) -> bool {
@@ -585,6 +598,8 @@ fn pr(node: &Value) -> Option<Pr> {
         closed_ms: time("closedAt"),
         base: text(&node["baseRefName"]),
         default_branch: text(&node["repository"]["defaultBranchRef"]["name"]),
+        draft: node["isDraft"].as_bool().unwrap_or(false),
+        updated_ms: time("updatedAt"),
     })
 }
 
@@ -1225,6 +1240,36 @@ mod tests {
             "org:false-systems org:yairfalse is:pr updated:>=2026-10-12T08:30:00Z \
              sort:updated-desc"
         );
+    }
+
+    #[test]
+    fn a_pull_request_says_whether_it_is_a_draft_and_when_it_last_changed() {
+        let node = json!({
+            "number": 12,
+            "title": "Rename the config module",
+            "url": "https://github.com/false-systems/habitat/pull/12",
+            "createdAt": "2026-11-08T08:00:00Z",
+            "updatedAt": "2026-11-08T09:40:00Z",
+            "isDraft": true,
+            "author": { "login": "dima" },
+            "repository": { "nameWithOwner": "false-systems/habitat" },
+        });
+        let read = pr(&node).unwrap();
+        assert!(read.draft && read.open());
+        assert_eq!(read.updated_ms, intake::parse_time("2026-11-08T09:40:00Z"));
+        // A snapshot written before ohjaa asked reads as not a draft, its
+        // last change unknown, and still open.
+        let mut old = serde_json::to_value(&read).unwrap();
+        old.as_object_mut().unwrap().remove("draft");
+        old.as_object_mut().unwrap().remove("updated_ms");
+        let old: Pr = serde_json::from_value(old).unwrap();
+        assert!(!old.draft && old.open());
+        assert_eq!(old.updated_ms, None);
+        let merged = Pr {
+            merged_ms: Some(1),
+            ..read
+        };
+        assert!(!merged.open());
     }
 
     #[test]
