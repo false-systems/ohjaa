@@ -11127,9 +11127,13 @@ fn real_vessa_producer_preserves_findings_excerpts_and_partial_retry_boundaries(
     fs::write(&transcript, &records).unwrap();
     fs::remove_file(fixture.stub_dir.join("vessa")).unwrap();
     std::os::unix::fs::symlink(binary, fixture.stub_dir.join("vessa")).unwrap();
+    // The planted key is one of this machine's credentials, as a
+    // secret-named variable: vessa finds only those.
     let person = || {
         let mut command = fixture.person();
-        command.env("XDG_DATA_HOME", fixture.dir.join("data"));
+        command
+            .env("XDG_DATA_HOME", fixture.dir.join("data"))
+            .env("FIXTURE_API_KEY", &secret);
         command
     };
     let snapshot = || -> serde_json::Value {
@@ -11146,6 +11150,7 @@ fn real_vessa_producer_preserves_findings_excerpts_and_partial_retry_boundaries(
     assert_eq!(found[0]["session"], native);
     assert_eq!(found[0]["where"], "tool_output");
     assert_eq!(found[0]["rule"], "openai");
+    assert_eq!(found[0]["held"], "environment variable FIXTURE_API_KEY");
     assert_eq!(found[0]["count"], 1);
     let complete_at = first["secrets"]["value"]["read_ms"].as_i64().unwrap();
     assert!(
@@ -11161,7 +11166,11 @@ fn real_vessa_producer_preserves_findings_excerpts_and_partial_retry_boundaries(
         digest.contains("Keep this synthetic input readable."),
         "{digest}"
     );
-    assert!(digest.contains("openai ×1"), "{digest}");
+    let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        words.contains("your credential from environment variable FIXTURE_API_KEY (openai) ×1"),
+        "{digest}"
+    );
     assert!(!digest.contains(&secret));
     fs::write(&transcript, format!("{records}{{broken\n")).unwrap();
     let (stdout, stderr, code) = output_of(person().arg("collect"));

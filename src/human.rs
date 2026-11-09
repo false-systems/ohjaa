@@ -344,6 +344,9 @@ enum Kind {
 struct Item {
     tokens: u64,
     secret_rule: Option<String>,
+    /// Which of this machine's credentials a secret finding is, by where
+    /// it is kept.
+    secret_held: Option<String>,
     opaque_tokens: Option<u64>,
     opaque_native: bool,
     kind: Kind,
@@ -507,6 +510,7 @@ fn standing(kind: Kind, class: Class, key: String, repo: &str, text: String) -> 
     Item {
         tokens: 0,
         secret_rule: None,
+        secret_held: None,
         opaque_tokens: None,
         opaque_native: false,
         kind,
@@ -524,6 +528,7 @@ fn event(kind: Kind, key: String, at_ms: i64, github: bool, repo: &str, text: St
     Item {
         tokens: 0,
         secret_rule: None,
+        secret_held: None,
         opaque_tokens: None,
         opaque_native: false,
         kind,
@@ -702,14 +707,21 @@ fn secret(finding: &Finding, observed_ms: Option<i64>) -> Item {
         "tool_output" => "command output",
         _ => "elsewhere",
     };
+    let what = match &finding.held {
+        Some(held) => format!(
+            "your credential from {} ({})",
+            clean(held),
+            clean(&finding.rule)
+        ),
+        None => clean(&finding.rule),
+    };
     let mut text = format!(
-        "{} · {} {} · {whose} · {} ×{}",
+        "{} · {} {} · {whose} · {what} ×{}",
         finding
             .at_ms
             .map_or_else(|| format!("found {}", clock(finding.found_ms)), clock),
         clean(&finding.agent),
         clean(&finding.session),
-        clean(&finding.rule),
         finding.count
     );
     if let Some(fingerprint) = &finding.fingerprint {
@@ -725,6 +737,7 @@ fn secret(finding: &Finding, observed_ms: Option<i64>) -> Item {
     );
     item.tokens = finding.count;
     item.secret_rule = Some(finding.rule.clone());
+    item.secret_held = finding.held.clone();
     item.opaque_tokens = finding.opaque_count;
     item.opaque_native = finding.opaque_native == Some(true);
     let review = review_count(&item);
@@ -758,6 +771,11 @@ fn verified_opaque(item: &Item) -> Option<u64> {
 }
 
 fn review_count(item: &Item) -> u64 {
+    // One of this machine's credentials is an alarm, whatever rule the
+    // detector gave it where it stood.
+    if item.secret_held.is_some() {
+        return item.tokens;
+    }
     // The generic redaction heuristic is deliberately cautious, not evidence
     // of a credential. Keep every occurrence in the digest, with its original
     // context/coverage limitations. Specific formats, labels and unknown rules
@@ -769,9 +787,48 @@ fn review_count(item: &Item) -> u64 {
     }
 }
 
+/// What the secret findings come to. This machine's own credentials are
+/// said first, as what they are: the attention line counts them, the
+/// digest names where each is kept. Findings of an earlier vessa, every
+/// secret-shaped string, keep their cautious wording after.
 fn secret_summary(items: &[&Item], attention: bool) -> Option<String> {
+    let secrets = items.iter().filter(|item| item.kind == Kind::Secret);
+    let held: u64 = secrets
+        .clone()
+        .filter(|item| item.secret_held.is_some())
+        .fold(0, |sum, item| sum.saturating_add(item.tokens));
+    let own = (held > 0).then(|| {
+        let mut sources: Vec<String> = secrets
+            .clone()
+            .filter_map(|item| item.secret_held.as_deref().map(clean))
+            .collect();
+        sources.sort();
+        sources.dedup();
+        if attention {
+            format!(
+                "Your credentials reached agent sessions: {}; rotate them",
+                plural(held as usize, "occurrence", "occurrences")
+            )
+        } else {
+            format!(
+                "Your credentials reached agent sessions: {}, of the credentials in {}",
+                plural(held as usize, "occurrence", "occurrences"),
+                sources.join(", ")
+            )
+        }
+    });
+    let earlier: Vec<&&Item> = secrets.filter(|item| item.secret_held.is_none()).collect();
+    let rest = unheld_summary(&earlier, attention);
+    match (own, rest) {
+        (Some(own), Some(rest)) => Some(format!("{own} · {rest}")),
+        (own, rest) => own.or(rest),
+    }
+}
+
+/// Findings of an earlier vessa, by kind of evidence.
+fn unheld_summary(items: &[&&Item], attention: bool) -> Option<String> {
     let mut counts = [0u64; 4];
-    for item in items.iter().filter(|item| item.kind == Kind::Secret) {
+    for item in items {
         let group = match item.secret_rule.as_deref() {
             Some(
                 "openai" | "anthropic" | "github" | "slack" | "aws" | "gitlab" | "google" | "jwt"
@@ -1918,7 +1975,10 @@ fn full(
             .collect()
     };
     let findings = of(&[|kind| kind == Kind::Secret]);
-    let has_findings = !findings.is_empty();
+    // This machine's own credentials, found by a vessa that compares with
+    // them; the rest come from an earlier one, every secret-shaped string.
+    let has_held = findings.iter().any(|item| item.secret_held.is_some());
+    let has_unheld = findings.iter().any(|item| item.secret_held.is_none());
     let secret_items: Vec<_> = view
         .standing
         .iter()
@@ -1930,7 +1990,10 @@ fn full(
         if let Some(attention) = secrets_attention(&findings) {
             paragraph(&mut out, &attention);
         }
-        if has_findings {
+        if has_held {
+            paragraph(&mut out, "Each is one of this machine's own credentials, named by where it is kept, that reached an agent session and so the provider that ran it. Rotate it with whoever issued it, then update where it is kept. No secret value is kept here.");
+        }
+        if has_unheld {
             paragraph(&mut out, "Review candidates match a known key format or a value labelled as a secret; unrecognised scan rules also remain candidates. Generic random-string matches alone do not establish a credential and do not trigger startup alerts. All occurrences remain below, including those with unknown context; none is classified as safe.");
         }
         if let Some(summary) = secrets_found(&findings) {
@@ -1939,7 +2002,7 @@ fn full(
         if let Some(context) = secret_context(&findings) {
             paragraph(&mut out, &context);
         }
-        if has_findings {
+        if has_unheld {
             paragraph(&mut out, "Counts are occurrences, not distinct credentials. Generic-pattern matches are long strings mixing uppercase, lowercase and digits; secret-labelled matches follow words such as token or password. These rules do not confirm a leak. Signature/encrypted fields are counted, not suppressed.");
         }
         for item in secret_items {
@@ -1947,7 +2010,7 @@ fn full(
             out.push('\n');
         }
     }
-    if has_findings {
+    if has_unheld {
         paragraph(&mut out, "Rotate any findings that are real keys. The fingerprint is the first eight hex characters of the token's SHA-256; no secret value is kept here.");
     }
     if view
@@ -3234,6 +3297,48 @@ mod tests {
             .starts_with("claude \"fix the parser\""));
     }
 
+    /// One of this machine's credentials is an alarm whatever rule the
+    /// detector gave it, said as the person's own and where it is kept.
+    #[test]
+    fn a_held_credential_is_an_alarm_whatever_its_rule_and_says_whose_it_is() {
+        let mut collected = snapshot(NOW);
+        collected.secrets.value.findings.push(Finding {
+            agent: "codex".into(),
+            session: "native-session".into(),
+            cwd: Some("/p/habitat".into()),
+            at_ms: Some(NOW - HOUR_MS),
+            place: "person".into(),
+            rule: "no_known_shape".into(),
+            count: 3,
+            opaque_count: Some(0),
+            opaque_native: Some(true),
+            fingerprint: None,
+            found_ms: NOW,
+            held: Some("environment variable ZAI_API_KEY".into()),
+        });
+        let view = view(&[], Some(&collected));
+        assert_eq!(
+            one_line(&news(&view, &Seen::first(NOW))).unwrap(),
+            "ohjaa · Your credentials reached agent sessions: 3 occurrences; rotate them · \
+             Details: ohjaa digest\n"
+        );
+        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
+        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+        for said in [
+            "of the credentials in environment variable ZAI_API_KEY",
+            "you typed it",
+            "your credential from environment variable ZAI_API_KEY (no_known_shape) ×3",
+            "Rotate it with whoever issued it",
+        ] {
+            assert!(words.contains(said), "missing `{said}`: {digest}");
+        }
+        assert!(!words.contains("Review candidates"), "{digest}");
+        assert!(
+            !words.contains("Rotate any findings that are real keys"),
+            "{digest}"
+        );
+    }
+
     #[test]
     fn secrets_are_attention_without_consuming_the_digest_or_using_githubs_clock() {
         let mut collected = snapshot(NOW);
@@ -3250,6 +3355,7 @@ mod tests {
             opaque_native: None,
             fingerprint: Some("1a2b3c4d".into()),
             found_ms: NOW,
+            held: None,
         });
         let view = view(
             &[session("a", HOUR_MS, Some(1_000), true)],
