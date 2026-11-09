@@ -19,8 +19,9 @@ use crate::home;
 use crate::knowledge::{config_home, expand_home};
 use crate::process;
 
-/// The environment a git run of ohjaa's own must not inherit from a hook
-/// that started it: it would point git at another repository.
+/// The environment a git run of ohjaa's own must not inherit from whatever
+/// started ohjaa (git sets these for its hooks and aliases): it would point
+/// git at another repository.
 pub const REPO_ENV: [&str; 4] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -348,6 +349,30 @@ pub fn layout_checkouts(common: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_common_dir_is_read_from_the_layout_git_wrote() {
+        let root = std::env::temp_dir().join(format!("ohjaa-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let main = root.join("main");
+        let linked = root.join("linked");
+        std::fs::create_dir_all(main.join(".git/worktrees/linked")).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        // A linked worktree, written with relative paths (`--relative-paths`).
+        std::fs::write(
+            linked.join(".git"),
+            "gitdir: ../main/.git/worktrees/linked\n",
+        )
+        .unwrap();
+        std::fs::write(main.join(".git/worktrees/linked/commondir"), "../..\n").unwrap();
+        let canonical = |path: PathBuf| std::fs::canonicalize(path).unwrap();
+        let common = canonical(main.join(".git"));
+        let found = |cwd: &Path| common_dir_in(cwd).map(canonical);
+        assert_eq!(found(&main), Some(common.clone()), "the main checkout");
+        assert_eq!(found(&linked), Some(common), "a linked worktree");
+        assert_eq!(found(&root), None, "no layout here: ask git");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn listings_are_read_with_and_without_origins() {

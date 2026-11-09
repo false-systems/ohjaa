@@ -31,8 +31,8 @@ ohjaa doctor                           # what differs from what apply would make
 ```
 
 The checks a commit must pass are the repository's own, in its `sykli.json`:
-`sykli run` proves HEAD, and `sykli hook install` makes the repository's
-pre-push hook refuse a push to its default branch without a passing receipt.
+`sykli run` proves HEAD, and `sykli hook install --pre-push` makes the
+repository's pre-push hook refuse a push to its default branch without a passing receipt.
 Ohjaa runs no check and installs no hook.
 
 ## Why
@@ -454,8 +454,7 @@ An agent learns the state of the work from its briefing. A person learns it
 here. It records only: nothing is sent to anyone, decided or refused.
 
 - **`ohjaa line`** shows only matters needing attention or a decision:
-  observations that could not be read, long-open session records, possible
-  secrets in agent sessions, and proposed agent instructions waiting for you. The first terminal of a local day
+  observations that could not be read, possible secrets in agent sessions, and proposed agent instructions waiting for you. The first terminal of a local day
   shows up to 15 lines of attention; later terminals show a short notice
   only when attention changes. With no attention it is silent, even when
   sessions ended or pull requests were merged. Silence is not a claim that
@@ -464,19 +463,15 @@ here. It records only: nothing is sent to anyone, decided or refused.
 - **Opening a terminal never marks activity read.** The first startup
   anchors the unread window, even when quiet; subsequent days do not move
   that window. Existing unread positions from older versions are retained.
-- **Saved status and open records mean different things.** Startup identifies
-  an old background update and gives `ohjaa collect` to refresh saved status;
-  session records are read now. An unknown or incomplete secrets scan is not
-  a finding and cannot establish an all-clear. An old, unclosed session record
-  may still be active: age alone does not mean it is stuck. The digest separates
-  these records from failures and shows their recorded task, or the last
-  recorded goal when the launch label was only `interactive`. Goals are context,
-  not proof of current progress; absent descriptions are stated explicitly.
+- **Saved status is said with its age.** Startup identifies an old background
+  update and gives `ohjaa collect` to refresh it; session records are read
+  now. An unknown or incomplete secrets scan is not a finding and cannot
+  establish an all-clear. A session record the removed `ohjaa run` left open
+  is history, not attention: nothing can close it, and no agent is behind it.
   Proposed instructions are labelled as not active until you decide.
 - **Startup is a summary, not a diagnostic dump.** Unreadable saved sources are
   grouped by what is missing, with one refresh command; paths and detailed
-  reasons stay in `ohjaa digest`. Multiple old open records are grouped by
-  repository, without claiming that their agents are stuck. Possible secrets
+  reasons stay in `ohjaa digest`. Possible secrets
   are labelled as unconfirmed pattern matches, not confirmed credential leaks
   or a count of unique credentials. Full findings, individual inspection
   commands, source dates, and incomplete coverage remain in the digest.
@@ -515,8 +510,8 @@ here. It records only: nothing is sent to anyone, decided or refused.
   pull requests, proposed instructions and who is live. Each ended session
   in the log has its recorded intent, end time and elapsed time. A pull request has its URL. Its "Now" says
   who is live on this machine, then the pull requests GitHub last said were
-  open in the owners of the clones under the roots (updated in the window
-  the snapshot read),
+  open in the owners of the fleet's clones under the roots (updated in the
+  window the snapshot read),
   the last updated first: the repository, the number, the author, whether it
   is a draft, its title, how long ago it last changed and its URL. That is
   where teammates' work shows, from any machine: a session that pushes its
@@ -550,8 +545,10 @@ here. It records only: nothing is sent to anyone, decided or refused.
 - **`ohjaa collect`** asks four sources once, at the same time. A source
   that fails keeps what it held before, and is said to be as of then.
   - GitHub: one `gh api graphql` search for the pull requests updated in the
-    owners on GitHub of the clones under the roots, at most 2 calls. Each
-    clone's origin is read with one `git config`; a clone git cannot read is
+    owners on GitHub of the fleet's clones under the roots, those that
+    declare themselves in `.toimija/repo.yaml` (as `ohjaa system` counts the
+    fleet), at most 2 calls: a clone of someone else's project never fills
+    the search. Each one's origin is read with one `git config`, all at once; a clone git cannot read is
     said, and when no owner was found and one could not be read, whose pull
     requests to ask for is unknown, never none. It reads from
     where the next digest begins, by GitHub's clock (2 hours earlier, for
@@ -595,10 +592,8 @@ built or fetched implicitly.
   collect` and `ohjaa digest` then exit 4. The line
   says each failure of a source once, and a different failure of it again.
 
-What stays until it is resolved comes first, in this order:
-
-1. what is unknown: a source that could not be read;
-2. what waits for a person: a session record open more than a day.
+What stays until it is resolved is what is unknown: a source that could not
+be read.
 
 An agent's process exit describes the process, not task completion or test
 results. Code 0 is successful process exit; another code has no inferred
@@ -1044,7 +1039,7 @@ nothing is installed on a repository or written into one.
 ```
 ~/.config/ohjaa/                    ($XDG_CONFIG_HOME/ohjaa)
   mine/ machine/ ours drafter       knowledge and settings
-  roots                             where ohjaa looks for repositories (written by hand)
+  roots                             where ohjaa looks for repositories (apply --root writes it)
   applied.toml                      what apply changed outside the home, for --undo
   .git/                             the home's history: one commit per decision on mine
                                     or machine, and per apply; never pushed
@@ -1069,11 +1064,15 @@ terminal's line; another binary running it is refused (exit 3), so a `cargo
 run` never points the line at itself. Every change is planned before any is
 made, and each is recorded in `applied.toml` before it is made, so `--undo`
 puts back exactly what was there, even after an apply that failed midway.
+What the record holds that `--undo` does not take back stays in it, and
+undo exits 4: it is never dropped unread. `apply --root <dir>` writes down
+where the repositories are (`roots`), which `collect` and `lessons` read
+wherever they run from; undo keeps it.
 
 **The checks a commit must pass are sykli's**, from the repository's own
 `sykli.json` and `sykli.lock`: `sykli run` proves HEAD, `sykli verify
---commit` says what proves a commit, and `sykli hook install` makes the
-repository's pre-push hook refuse a push to its default branch without a
+--commit` says what proves a commit, and `sykli hook install --pre-push`
+makes the repository's pre-push hook refuse a push to its default branch without a
 passing receipt. Ohjaa runs no check, keeps no gate and installs no hook.
 
 **Few git processes.** `apply` and `doctor` read git's global config in one
@@ -1082,9 +1081,9 @@ history costs two per commit (`add -A` and `commit`, with git's automatic
 maintenance off) and one more once, the home's `git init`: a decision on mine
 or machine starts those beside the one that finds the repository it runs in,
 and apply starts them when it changed something. The agents' instruction
-files are read and written without git. `ohjaa collect` reads each clone's
-config under the roots once, to find the owners whose pull requests GitHub is
-asked about. `tests/config_home.rs` holds these budgets, and
+files are read and written without git. `ohjaa collect` reads the config of
+each of the fleet's clones under the roots once, at the same time, to find
+the owners whose pull requests GitHub is asked about. `tests/config_home.rs` holds these budgets, and
 `tests/terminal.rs` a decision's.
 
 ### From ohjaa's gate
@@ -1099,10 +1098,17 @@ fails. Once, in this order:
    include, the dispatchers and the rest of what that apply wrote.
 2. Install this ohjaa, then `ohjaa apply`: the ignore block, the terminal's
    line and the agents' knowledge blocks, nothing else.
-3. In each repository whose pushes should be checked: `sykli hook install`.
+3. Remove the checkouts the old ohjaa made to validate what landed: each
+   `/ohjaa/integrated/<clone>/checkout` is a worktree of its
+   clone (`git -C <clone> worktree remove --force <checkout>`), which `ohjaa
+   brief` would otherwise scan as another session's.
+4. In each repository whose pushes should be checked: `sykli hook install
+   --pre-push` (without `--pre-push` it installs a pre-commit hook too, and
+   every commit runs the whole contract).
 
-The old entries (`~/.config/ohjaa/repos/`) and derived gates
-(`$XDG_STATE_HOME/ohjaa/derived/`) are read by nothing now, and can be
+The old entries (`~/.config/ohjaa/repos/`), derived gates
+(`/ohjaa/derived/`) and validation folders
+(`/ohjaa/integrated/`) are read by nothing now, and can be
 removed.
 
 ## Boundaries in full
@@ -1225,7 +1231,8 @@ each in full, with what ohjaa keeps where.
   git to GitHub with gh's credentials** — in `ohjaa intake` (review
   comments, drafting), when a session leaves (its branch's pull request,
   bounded, recorded as unknown when gh cannot say), in `ohjaa collect` (one
-  search for the pull requests of the owners of the clones under the roots,
+  search for the pull requests of the owners of the fleet's clones under the
+  roots,
   at most two calls;
   its vessa calls, at most three, one each for usage, messages and
   secrets, are local), and after a person's decision on repo knowledge and

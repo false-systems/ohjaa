@@ -60,9 +60,6 @@ const DIGEST_WAITS: Duration = Duration::from_secs(10);
 /// it a fraction of a second.
 const CLAIM_WAITS: Duration = Duration::from_secs(2);
 
-/// An open session older than this waits for a person to look at it.
-const OPEN_TOO_LONG_MS: i64 = DAY_MS;
-
 /// The widest line the view prints, in characters.
 pub const WIDTH: usize = 100;
 
@@ -313,7 +310,6 @@ impl Seen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Class {
     Unknown,
-    Person,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,7 +318,6 @@ enum Kind {
     // What stands until it is resolved.
     /// A source that could not be read, or not all of it.
     Source,
-    OpenLong,
     // What happened.
     /// `told`: it read back and handed over.
     Ended {
@@ -439,40 +434,6 @@ fn span(ms: i64) -> String {
 
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
-}
-
-fn open_age(ms: i64) -> String {
-    let (n, unit) = if ms >= 2 * DAY_MS {
-        (ms / DAY_MS, "day")
-    } else {
-        (ms.max(0) / HOUR_MS, "hour")
-    };
-    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
-}
-
-/// A recorded goal is context, not proof of current activity or progress.
-fn open_context(session: &Session, brief: bool) -> String {
-    let intent = session.intent.trim();
-    let goal = if !intent.is_empty() && intent != "interactive" {
-        Some(("recorded task", intent))
-    } else {
-        session
-            .readback
-            .as_ref()
-            .map(|readback| ("last recorded goal", readback.text.trim()))
-            .filter(|(_, text)| !text.is_empty())
-    };
-    match goal {
-        Some((label, text)) => {
-            let (text, _) = crate::intake::scrub(&clean(text));
-            format!(
-                "{}; {label}: \"{}\"",
-                clean(&session.agent),
-                if brief { cut(&text, 70) } else { text }
-            )
-        }
-        None => format!("{}; no task description recorded", clean(&session.agent)),
-    }
 }
 
 fn amount(n: u64) -> String {
@@ -934,29 +895,6 @@ fn saved_sources_summary(items: &[&Item]) -> Option<String> {
     })
 }
 
-fn open_records_summary(items: &[&Item]) -> Option<String> {
-    let records: Vec<_> = items
-        .iter()
-        .filter(|item| item.kind == Kind::OpenLong)
-        .collect();
-    if records.len() < 2 {
-        return None;
-    }
-    let repos: BTreeSet<_> = records.iter().map(|item| clean(&item.repo)).collect();
-    let mut names: Vec<_> = repos.iter().take(3).map(|repo| cut(repo, 20)).collect();
-    if repos.len() > names.len() {
-        names.push(format!(
-            "and {} more repositories",
-            repos.len() - names.len()
-        ));
-    }
-    Some(format!(
-        "{} older session records ({}) have no closing result; they may still be active.",
-        records.len(),
-        names.join(", ")
-    ))
-}
-
 /// A part of the snapshot that could not be read, or not all of it: said
 /// as that, with how old what it holds is, and never as an all-clear.
 fn source<T>(name: &str, part: &Part<T>, now_ms: i64, unread: &mut Vec<String>) -> Option<Item> {
@@ -1053,30 +991,6 @@ fn build(
             standing_items.extend(source("secrets", &secrets, now_ms, &mut unread));
         }
     }
-    for session in logged.iter().filter(|s| s.left.is_none()) {
-        let who = open_context(session, false);
-        let id = &session.id;
-        if now_ms - session.started_ms > OPEN_TOO_LONG_MS {
-            let mut item = standing(
-                Kind::OpenLong,
-                Class::Person,
-                format!("open:{id}"),
-                &session.repo,
-                format!(
-                    "Session record still open after {}: {who} · This is an unclosed record, \
-                     not proof of failed or stuck work",
-                    open_age(now_ms - session.started_ms)
-                ),
-            );
-            item.brief = Some(format!(
-                "Record still open after {} (may still be active): {}",
-                open_age(now_ms - session.started_ms),
-                open_context(session, true)
-            ));
-            standing_items.push(item);
-        }
-    }
-
     let mut events = Vec::new();
     for session in logged {
         if let Some(left) = &session.left {
@@ -1403,13 +1317,6 @@ fn one_line(news: &News) -> Option<String> {
             }
         ));
     }
-    match count(&news.standing, |k| k == Kind::OpenLong) {
-        0 => {}
-        n => parts.push(format!(
-            "{}; check if unexpected",
-            plural(n, "session record still open", "session records still open")
-        )),
-    }
     if parts.is_empty() {
         return None;
     }
@@ -1453,11 +1360,7 @@ fn row(item: &Item, width: usize) -> String {
 
 /// The full digest must not discard the details its summary points to.
 fn full_row(item: &Item, width: usize) -> String {
-    let bullet = if item.class.is_some() && item.kind != Kind::OpenLong {
-        "!"
-    } else {
-        "·"
-    };
+    let bullet = if item.class.is_some() { "!" } else { "·" };
     wrapped(&format!("  {bullet} {:<width$}  ", item.repo), &item.text)
 }
 
@@ -1558,15 +1461,7 @@ fn daily(
     if view.standing.is_empty() && proposal.is_none() && secrets.is_none() {
         return None;
     }
-    let only_open_records = secrets.is_none()
-        && proposal.is_none()
-        && view.standing.iter().all(|item| item.kind == Kind::OpenLong);
-    let mut lines = vec![if only_open_records {
-        "ohjaa — sessions still open"
-    } else {
-        "ohjaa — needs your attention"
-    }
-    .to_owned()];
+    let mut lines = vec!["ohjaa — needs your attention".to_owned()];
     if let Some(secrets) = secrets {
         lines.push(wrapped("  ", &secrets));
         lines.push(wrapped(
@@ -1576,7 +1471,6 @@ fn daily(
     }
     let items: Vec<_> = view.standing.iter().collect();
     let sources = saved_sources_summary(&items);
-    let open_records = open_records_summary(&items);
     if let Some(at) = view.collected_ms.filter(|at| old(Some(*at), now_ms)) {
         lines.push(wrapped(
             "  ",
@@ -1648,15 +1542,11 @@ fn daily(
     }
     let individual: Vec<_> = items
         .into_iter()
-        .filter(|item| {
-            !saved_source(item) && !(open_records.is_some() && item.kind == Kind::OpenLong)
-        })
+        .filter(|item| !saved_source(item))
         .collect();
-    let open_records = open_records.map(|text| wrapped("  ", &text));
     let width = repo_width(individual.iter().copied());
     let reserved = lines.iter().map(|line| line.lines().count()).sum::<usize>()
         + proposal.as_ref().map_or(0, |text| text.lines().count())
-        + open_records.as_ref().map_or(0, |text| text.lines().count())
         + 2;
     let room = DAILY_LINES.saturating_sub(reserved);
     let (mut shown, mut used) = (0, 0);
@@ -1669,9 +1559,6 @@ fn daily(
         lines.push(row);
         used += size;
         shown += 1;
-    }
-    if let Some(open_records) = open_records {
-        lines.push(open_records);
     }
     if let Some(proposal) = proposal {
         lines.push(proposal);
@@ -1728,8 +1615,12 @@ fn full(
         out.push_str(&wrapped("  ", text));
         out.push('\n');
     };
-    paragraph(&mut out, "Session records and proposed instructions are read now. Repository checks, \
-        pull requests and token usage were collected separately; each source has its own date below.");
+    paragraph(
+        &mut out,
+        "Session records and proposed instructions are read now. Pull requests, \
+        token usage, message excerpts and the secrets scan were collected separately; each source \
+        has its own date below.",
+    );
     // GitHub was read from where the snapshot asked, not from `since`.
     let pull_requests_from = view
         .github_from()
@@ -1758,22 +1649,9 @@ fn full(
         "Needs your attention",
         view.standing
             .iter()
-            .filter(|item| !item.key.starts_with("source:secrets:") && item.kind != Kind::OpenLong)
+            .filter(|item| !item.key.starts_with("source:secrets:"))
             .collect(),
     );
-    section(
-        &mut out,
-        "Sessions still marked open",
-        view.standing
-            .iter()
-            .filter(|item| item.kind == Kind::OpenLong)
-            .collect(),
-    );
-    if view.standing.iter().any(|item| item.kind == Kind::OpenLong) {
-        paragraph(&mut out, "These records have no closing result. They may still be active or waiting; \
-            age alone does not show that work failed or an agent is stuck. A recorded goal is context, \
-            not proof of current progress. Inspect a session if its continued presence is unexpected.");
-    }
     let of = |kinds: &[fn(Kind) -> bool]| -> Vec<&Item> {
         events
             .iter()
@@ -2395,6 +2273,16 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000_000;
 
+    #[test]
+    fn a_window_is_days_hours_or_a_time() {
+        let now = 10 * 86_400_000;
+        assert_eq!(parse_since("7d", now).unwrap(), 3 * 86_400_000);
+        assert_eq!(parse_since("24h", now).unwrap(), 9 * 86_400_000);
+        assert_eq!(parse_since("1970-01-02", now).unwrap(), 86_400_000);
+        assert!(parse_since("0d", now).is_err());
+        assert!(parse_since("soon", now).is_err());
+    }
+
     /// A session that started `ago_ms` before NOW and ended `ended_ago`
     /// before it (`None`: still open), with or without its testimony.
     fn session(id: &str, ago_ms: i64, ended_ago: Option<i64>, told: bool) -> Session {
@@ -2449,7 +2337,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_explains_saved_checks_open_records_and_undecided_instructions() {
+    fn startup_explains_saved_status_and_undecided_instructions_and_no_open_record() {
         let mut collected = snapshot(NOW - 2 * DAY_MS);
         collected.secrets = Part::default();
         let mut open = session("still-open", 2 * DAY_MS, None, false);
@@ -2469,21 +2357,20 @@ mod tests {
             "Last background update:",
             "Refresh: ohjaa collect",
             "Missing or incomplete information: secrets scan",
-            "may still be active",
-            "no task description recorded",
             "not active yet",
         ] {
             assert!(words.contains(context), "missing {context}:\n{daily}");
         }
+        // A record the removed `ohjaa run` left open: nothing can close it,
+        // so it is history, never attention.
+        assert!(!words.contains("still open"), "{daily}");
+        assert!(!words.contains("may still be active"), "{daily}");
         assert!(!daily.contains("\"interactive\""), "{daily}");
         assert!(!daily.contains("never read"), "{daily}");
         assert!(view.incomplete());
-        assert_eq!(
-            view.standing
-                .iter()
-                .filter(|item| item.kind == Kind::OpenLong)
-                .count(),
-            1
+        assert!(
+            view.standing.iter().all(|item| item.kind == Kind::Source),
+            "{daily}"
         );
         assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
         assert!(
@@ -2493,7 +2380,7 @@ mod tests {
     }
 
     #[test]
-    fn crowded_startup_groups_unknown_sources_and_open_records_without_a_wall_of_caveats() {
+    fn crowded_startup_groups_unknown_sources_without_a_wall_of_caveats() {
         let mut collected = snapshot(NOW - 2 * DAY_MS);
         let why = "could not read /synthetic/conversations/unreadable-session.jsonl";
         collected.typed.gaps.push(why.into());
@@ -2525,8 +2412,6 @@ mod tests {
             "Missing or incomplete information",
             "session excerpts",
             "secrets scan",
-            "4 older session records",
-            "may still be active",
             "not active yet",
             "ohjaa collect",
             "ohjaa review",
@@ -2545,11 +2430,7 @@ mod tests {
         assert!(view.incomplete());
         let digest = full(&view, &Window::at(NOW - 3 * DAY_MS), None, None, NOW);
         assert!(digest.contains("unreadable-session.jsonl"), "{digest}");
-        assert_eq!(
-            digest.matches("This is an unclosed record").count(),
-            4,
-            "{digest}"
-        );
+        assert!(!digest.contains("unclosed record"), "{digest}");
         assert_eq!(
             view.events
                 .iter()
@@ -2980,56 +2861,6 @@ mod tests {
     }
 
     #[test]
-    fn open_records_use_the_last_recorded_goal_without_claiming_it_is_current_work() {
-        let mut open = session("ongoing-chat", 2 * DAY_MS, None, true);
-        open.intent = "interactive".into();
-        open.readback.as_mut().unwrap().text = "Make the startup message understandable".into();
-        let view = view(&[open], Some(&snapshot(NOW)));
-        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
-        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            words.contains("last recorded goal: \"Make the startup message understandable\""),
-            "{digest}"
-        );
-        assert!(!digest.contains("no task description recorded"), "{digest}");
-    }
-
-    #[test]
-    fn old_open_records_are_not_presented_as_failures_and_long_context_is_retained() {
-        let mut open = session("long-context", 2 * DAY_MS, None, true);
-        open.intent = "interactive".into();
-        let goal = "Keep this complete recorded goal available. ".repeat(30);
-        open.readback.as_mut().unwrap().text = goal.clone();
-        let view = view(&[open], Some(&snapshot(NOW)));
-        let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
-            .unwrap()
-            .0;
-        assert!(
-            daily.starts_with("ohjaa — sessions still open\n"),
-            "{daily}"
-        );
-        assert!(!daily.contains("  !"), "{daily}");
-        assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
-        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
-        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(words.contains(goal.trim()), "{digest}");
-        assert!(digest.contains("Sessions still marked open"), "{digest}");
-        assert!(!digest.contains("Needs your attention"), "{digest}");
-    }
-
-    #[test]
-    fn recorded_goal_context_does_not_display_secret_shaped_tokens() {
-        let mut open = session("scrubbed-goal", 2 * DAY_MS, None, true);
-        open.intent = "interactive".into();
-        let token = format!("sk-{}", "Ab9x".repeat(12));
-        open.readback.as_mut().unwrap().text = format!("Investigate API key {token}");
-        let view = view(&[open], Some(&snapshot(NOW)));
-        let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
-        assert!(!digest.contains(&token), "{digest}");
-        assert!(digest.contains("[redacted]"), "{digest}");
-    }
-
-    #[test]
     fn first_typed_words_lead_the_session_without_losing_its_recorded_intent() {
         let mut collected = snapshot(NOW);
         let session = session("typed", HOUR_MS, Some(1_000), true);
@@ -3365,37 +3196,8 @@ mod tests {
     }
 
     #[test]
-    fn what_stands_comes_in_the_order_a_person_must_see_it() {
-        // Said last, but unknown: what could not be read comes before a
-        // record that only waits for a person.
-        let logged = [
-            session("long", 2 * DAY_MS, None, true),
-            session("closed", 3 * HOUR_MS, Some(HOUR_MS), true),
-        ];
-        let view = build(
-            &logged,
-            Err("cannot read the proposals".into()),
-            Some(&snapshot(NOW)),
-            NOW,
-            0,
-        );
-        let said: Vec<(Kind, Option<Class>)> = view
-            .standing
-            .iter()
-            .map(|item| (item.kind, item.class))
-            .collect();
-        assert_eq!(
-            said,
-            vec![
-                (Kind::Source, Some(Class::Unknown)),
-                (Kind::OpenLong, Some(Class::Person)),
-            ]
-        );
-    }
-
-    #[test]
     fn full_digest_rows_wrap_without_discarding_details() {
-        let mut item = standing(Kind::OpenLong, Class::Person, "key".into(), "work",
+        let mut item = standing(Kind::Source, Class::Unknown, "key".into(), "work",
             "claude \"costed\" · exit 0 · 0s · missing startup notes and handover · 115k tokens + 2.9M cache reads".into());
         let row = full_row(&item, 5);
         assert!(row.contains("missing startup notes and handover"), "{row}");
@@ -3822,21 +3624,6 @@ mod tests {
         let unread = after(&next, &seen.full_from(NOW + 800));
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].key, "session:late");
-    }
-
-    #[test]
-    fn open_session_notices_retain_the_complete_recorded_task() {
-        let mut open = session("long", 2 * DAY_MS, None, true);
-        open.intent =
-            "Investigate the parser without changing how incomplete source records are reported"
-                .into();
-        let view = view(std::slice::from_ref(&open), None);
-        let notice = view
-            .standing
-            .iter()
-            .find(|item| item.kind == Kind::OpenLong)
-            .unwrap();
-        assert!(notice.text.contains(&open.intent));
     }
 
     #[test]

@@ -257,7 +257,9 @@ impl Sandbox {
         self.git(&repo, &["init", "-q", "-b", "main"]);
         fs::write(repo.join("README"), "hello\n").unwrap();
         for (file, contents) in files {
-            fs::write(repo.join(file), contents).unwrap();
+            let path = repo.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
         }
         self.git(&repo, &["add", "-A"]);
         self.git(&repo, &["commit", "-q", "-m", "init"]);
@@ -437,6 +439,70 @@ fn undo_removes_the_files_apply_created() {
     );
 }
 
+/// What the record holds that this undo does not take back (an earlier
+/// apply's, say) stays in it, never dropped unread, and undo says it is not
+/// all done (exit 4).
+#[test]
+fn undo_keeps_what_it_does_not_take_back_and_says_so() {
+    let sandbox = Sandbox::new("undo-unknown");
+    sandbox.apply();
+    let record = sandbox.config().join("applied.toml");
+    let mut written = fs::read_to_string(&record).unwrap();
+    written.push_str("include = \"/somewhere/git/config\"\n");
+    fs::write(&record, written).unwrap();
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(4), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("not all undone") && stdout.contains("(include)"),
+        "{stdout}"
+    );
+    let kept = fs::read_to_string(&record).unwrap();
+    assert!(
+        kept.contains("include = \"/somewhere/git/config\""),
+        "{kept}"
+    );
+    assert!(
+        !kept.contains("zshrc"),
+        "what undo took back is gone: {kept}"
+    );
+    assert!(!sandbox.home().join(".zshrc").exists());
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    let (stdout, _) = text(&output);
+    assert_eq!(output.status.code(), Some(4), "{stdout}");
+    assert!(
+        stdout.contains("nothing to undo") && stdout.contains("not all undone"),
+        "{stdout}"
+    );
+}
+
+/// `apply --root` writes down where the repositories are, which collect and
+/// lessons read wherever they run from; without it and without the file,
+/// apply says how. Undo keeps the roots.
+#[test]
+fn apply_root_writes_the_roots_down() {
+    let sandbox = Sandbox::new("roots");
+    let output = sandbox.ohjaa(&["apply", "--dry-run"]);
+    let (_, stderr) = text(&output);
+    assert!(stderr.contains("ohjaa apply --root <dir>"), "{stderr}");
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let roots = sandbox.read("config/ohjaa/roots");
+    assert!(
+        roots.lines().any(|line| line == sandbox.projects()),
+        "{roots}"
+    );
+    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
+    assert!(
+        text(&output).0.contains("nothing to change"),
+        "{}",
+        text(&output).0
+    );
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
+    assert_eq!(sandbox.read("config/ohjaa/roots"), roots);
+}
 /// Each change is recorded before it is made: an apply that fails midway
 /// can still be undone.
 #[test]
@@ -1241,35 +1307,6 @@ fn a_failed_commit_in_the_home_is_said_and_apply_stands() {
     assert!(tracked.contains("applied.toml"), "{tracked}");
 }
 
-// ---- KATANA D10: a gate builds in its worktree's own directory -------------
-
-impl Sandbox {}
-
-impl Sandbox {}
-
-impl Sandbox {}
-
-// ---- KATANA D4: validation references ----------------------------------------
-
-impl Sandbox {}
-
-impl Sandbox {}
-
-// ---- against the real sykli --------------------------------------------------
-//
-// What a flag says and what a mark is depend on sykli's own judgement, so
-// these run the real one: built from sykli's main and named by
-// OHJAA_TEST_SYKLI. CI's runners have no sykli, so they are ignored there:
-//
-//     OHJAA_TEST_SYKLI=/path/to/sykli cargo test --test config_home -- --ignored
-//
-// One also needs a sykli from before `${worktree_cache}` (such as 68b99b6),
-// named by OHJAA_TEST_OLDER_SYKLI.
-
-impl Sandbox {}
-
-impl Sandbox {}
-
 /// Should-fix 3: settings in a file git's global config includes count.
 #[test]
 fn settings_in_an_included_global_file_count() {
@@ -1330,7 +1367,14 @@ codex "write it"
 #[test]
 fn every_command_stays_within_its_git_budget() {
     let sandbox = Sandbox::new("budget");
-    let (widget, _) = sandbox.repo("acme", "widget", &[("sykli.json", "{}\n")]);
+    let (widget, _) = sandbox.repo(
+        "acme",
+        "widget",
+        &[
+            ("sykli.json", "{}\n"),
+            (".toimija/repo.yaml", "repo:\n  name: widget\n"),
+        ],
+    );
     sandbox.repo("other", "free", &[]);
     let mut report = Vec::new();
     let mut budget = |what: &str, starts: usize, at_most: usize| {
@@ -1387,8 +1431,9 @@ fn every_command_stays_within_its_git_budget() {
     );
     budget("ohjaa brief", starts.len(), 2);
 
-    // collect: one `git config` per clone under the roots (2), to find the
-    // owners whose pull requests GitHub is asked about.
+    // collect: one `git config` per clone of the fleet under the roots (the
+    // one with `.toimija/repo.yaml`), to find the owners whose pull requests
+    // GitHub is asked about; the other clone is not read.
     let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&["collect", "--root", &root]));
     assert!(
         sandbox
@@ -1402,8 +1447,11 @@ fn every_command_stays_within_its_git_budget() {
         .iter()
         .filter(|line| line.contains("\"config\",\"-z\",\"--list\""))
         .count();
-    assert_eq!(listings, 2, "each clone's config, read once: {starts:#?}");
-    budget("ohjaa collect (2 clones)", starts.len(), 2);
+    assert_eq!(
+        listings, 1,
+        "the fleet clone's config, read once: {starts:#?}"
+    );
+    budget("ohjaa collect (2 clones, 1 of the fleet)", starts.len(), 1);
 
     let over: Vec<_> = report
         .iter()
@@ -1499,14 +1547,3 @@ fn an_older_ignore_block_is_upgraded_in_place_and_undo_is_exact() {
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
     assert_eq!(sandbox.read("config/git/ignore"), "*.swp\n");
 }
-
-// ---- KATANA Stage 5: integrated-state validation, stale base, and the -----
-// ---- sessions of every worktree of a clone --------------------------------
-
-impl Sandbox {}
-
-// ---- KATANA Stage 5, after review (#46): a request never dispatched, -------
-// ---- and one rolling validation checkout per clone ---------------------------
-
-// ---- KATANA Stage 5, after review part 2 (#46): a checkout never reset ------
-// ---- under a run, submodules, and leftovers ----------------------------------

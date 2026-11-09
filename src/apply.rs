@@ -180,6 +180,12 @@ pub struct ZshrcPlan {
     pub blank: bool,
 }
 
+/// A comment that names ohjaa: above apply's line, it is apply's own.
+fn ohjaa_comment(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with('#') && line.to_lowercase().contains("ohjaa")
+}
+
 /// A line that sources the old launcher file: `source …ohjaa-launch.zsh` or
 /// `. …ohjaa-launch.zsh`, alone or after `&&`. Any other line that names the
 /// file (an alias that edits it, a comment) is the person's, and stays.
@@ -197,28 +203,32 @@ pub fn sources_old_launcher(line: &str) -> bool {
 /// or is appended when there was none. `None` when nothing needs to change.
 pub fn zshrc_with_launcher(current: &str, desired: &str) -> Option<ZshrcPlan> {
     let lines: Vec<&str> = current.lines().collect();
-    let has_launch = lines.iter().any(|line| line.trim() == desired);
+    let launch = lines.iter().position(|line| line.trim() == desired);
+    let has_launch = launch.is_some();
     let mut drop = vec![false; lines.len()];
     for (at, line) in lines.iter().enumerate() {
         let stale_launch = launch_target(line).is_some() && line.trim() != desired;
         if sources_old_launcher(line) || stale_launch {
             drop[at] = true;
-            if at > 0 {
-                let above = lines[at - 1].trim_start();
-                if above.starts_with('#') && above.to_lowercase().contains("ohjaa") {
-                    drop[at - 1] = true;
-                }
+            if at > 0 && ohjaa_comment(lines[at - 1]) {
+                drop[at - 1] = true;
             }
         }
     }
-    if has_launch && !drop.contains(&true) {
+    // Apply's own comment above its line, in other words than these: said
+    // anew in place, as apply's, never kept as a line it replaced.
+    let reworded = launch
+        .filter(|&at| at > 0 && ohjaa_comment(lines[at - 1]) && lines[at - 1] != LAUNCH_COMMENT)
+        .map(|at| at - 1);
+    if has_launch && !drop.contains(&true) && reworded.is_none() {
         return None;
     }
-    let added: Vec<String> = if has_launch {
+    let insert: Vec<String> = if has_launch {
         Vec::new()
     } else {
         vec![LAUNCH_COMMENT.to_owned(), desired.to_owned()]
     };
+    let mut added = insert.clone();
     let mut out: Vec<String> = Vec::new();
     let mut removed = Vec::new();
     let mut placed = has_launch;
@@ -226,9 +236,13 @@ pub fn zshrc_with_launcher(current: &str, desired: &str) -> Option<ZshrcPlan> {
         if drop[at] {
             removed.push((*line).to_owned());
             if !placed {
-                out.extend(added.iter().cloned());
+                out.extend(insert.iter().cloned());
                 placed = true;
             }
+        } else if reworded == Some(at) {
+            removed.push((*line).to_owned());
+            added.push(LAUNCH_COMMENT.to_owned());
+            out.push(LAUNCH_COMMENT.to_owned());
         } else {
             out.push((*line).to_owned());
         }
@@ -239,7 +253,7 @@ pub fn zshrc_with_launcher(current: &str, desired: &str) -> Option<ZshrcPlan> {
             out.push(String::new());
             blank = true;
         }
-        out.extend(added.iter().cloned());
+        out.extend(insert.iter().cloned());
     }
     Some(ZshrcPlan {
         contents: joined(out),
@@ -258,7 +272,7 @@ fn zshrc_without_launcher(current: &str, replaced: &[String], blank: bool) -> Op
         .iter()
         .position(|line| launch_target(line).is_some())?;
     let mut begin = at;
-    if begin > 0 && lines[begin - 1] == LAUNCH_COMMENT {
+    if begin > 0 && ohjaa_comment(lines[begin - 1]) {
         begin -= 1;
     }
     let removed: Vec<String> = lines[begin..=at].iter().map(|l| (*l).to_owned()).collect();
@@ -342,6 +356,8 @@ fn zshrc_lines(plan: &ZshrcPlan) -> String {
 
 pub struct Options<'a> {
     pub dry_run: bool,
+    /// `--root`: where the repositories are, to write down in the roots file.
+    pub roots: &'a [PathBuf],
     /// The ohjaa the terminal's line runs, instead of the one on PATH.
     pub bin: Option<&'a Path>,
 }
@@ -394,6 +410,18 @@ fn keep_record(home: &Path, entries: &[(String, String)]) -> Result<()> {
     write_record(home, &record)
 }
 
+/// The roots file: one directory per line, under a comment.
+fn roots_text(roots: &[PathBuf]) -> String {
+    let mut text = String::from(
+        "# Where ohjaa looks for repositories: one directory per line. Written by\n\
+         # `ohjaa apply --root`; edit it to change them.\n",
+    );
+    for root in roots {
+        text.push_str(&format!("{}\n", root.display()));
+    }
+    text
+}
+
 /// Whether text that is not empty ends without a newline (undo keeps it so).
 fn lacks_final_newline(text: &str) -> bool {
     !text.is_empty() && !text.ends_with('\n')
@@ -414,6 +442,41 @@ pub fn apply(options: Options<'_>) -> Result<i32> {
     let lock = (!options.dry_run).then(|| home::lock(&home)).flatten();
     let global = gitconfig::GlobalFacts::read()?;
     let mut steps: Vec<Step> = Vec::new();
+
+    // Where the repositories are, written down when named: collect and
+    // lessons read it, wherever they run from. Kept by --undo.
+    let roots_file = crate::roots::config_path().context("no config home")?;
+    if !options.roots.is_empty() {
+        let roots: Vec<PathBuf> = options
+            .roots
+            .iter()
+            .map(|root| std::path::absolute(root).unwrap_or_else(|_| root.clone()))
+            .collect();
+        if crate::roots::parse_config(&read_or_empty(&roots_file)?) != roots {
+            let said = roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (target, text) = (roots_file.clone(), roots_text(&roots));
+            steps.push(step(
+                ("write", "wrote"),
+                format!(
+                    "{} with {said}, where ohjaa looks for repositories",
+                    roots_file.display()
+                ),
+                Vec::new(),
+                move || home::write_file(&target, &text, None),
+            ));
+        }
+    } else if !roots_file.is_file() {
+        eprintln!(
+            "ohjaa apply: note: {} does not exist, so `ohjaa collect` and `ohjaa lessons` \
+             look for repositories from where they run; name the folder that holds them \
+             once: ohjaa apply --root <dir>",
+            roots_file.display()
+        );
+    }
 
     let ignore = global.excludes_file()?;
     let ignore_now = read_or_empty(&ignore)?;
@@ -842,19 +905,48 @@ pub fn undo(dry_run: bool) -> Result<i32> {
     }
 
     // The record goes last: an undo that fails before it can run again.
+    // What it holds that this undo does not take back stays in it, never
+    // dropped unread, and undo says it is not done.
+    let kept: Record = record
+        .iter()
+        .filter(|(key, _)| !taken_back(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
     let record_file = record_path(&home);
-    if record_file.exists() {
+    let note = (!kept.is_empty()).then(|| {
+        format!(
+            "not all undone: {} keeps what this ohjaa does not take back ({})",
+            record_file.display(),
+            kept.keys().cloned().collect::<Vec<_>>().join(", ")
+        )
+    });
+    if record_file.exists() && kept.is_empty() {
         steps.push(step(
             ("remove", "removed"),
             record_file.display().to_string(),
             Vec::new(),
             move || remove_if_present(&record_file),
         ));
+    } else if kept.len() < record.len() {
+        let target = home.clone();
+        steps.push(step(
+            ("write", "wrote"),
+            format!(
+                "{} with only what this ohjaa does not take back",
+                record_file.display()
+            ),
+            Vec::new(),
+            move || write_record(&target, &kept),
+        ));
     }
+    let code = if note.is_some() { crate::INCOMPLETE } else { 0 };
 
     if steps.is_empty() {
         println!("ohjaa apply --undo: nothing to undo");
-        return Ok(0);
+        if let Some(note) = &note {
+            println!("ohjaa apply --undo: {note}");
+        }
+        return Ok(code);
     }
     let mut done = Vec::new();
     for step in steps {
@@ -877,7 +969,20 @@ pub fn undo(dry_run: bool) -> Result<i32> {
             lock.as_ref(),
         );
     }
-    Ok(0)
+    if let Some(note) = &note {
+        println!("ohjaa apply --undo: {note}");
+    }
+    Ok(code)
+}
+
+/// Whether undo takes back what `key` records: the ignore block, the
+/// terminal's line and the agents' knowledge blocks, each as apply wrote
+/// them.
+fn taken_back(key: &str) -> bool {
+    key.starts_with("ignore_")
+        || key == "zshrc"
+        || key.starts_with("zshrc_")
+        || key.starts_with("instructions_")
 }
 
 #[cfg(test)]
@@ -949,6 +1054,33 @@ mod tests {
         assert_eq!(plan.contents, format!("{LAUNCH_COMMENT}\n{moved}\n"));
         assert_eq!(plan.removed, [LAUNCH_COMMENT.to_owned(), line()]);
         assert_eq!(zshrc_with_launcher(&plan.contents, &moved), None);
+    }
+
+    /// Apply's comment above its line, in the words an earlier apply wrote:
+    /// apply says it anew in place, and undo takes it out with the line.
+    #[test]
+    fn an_ohjaa_comment_above_the_line_is_applys_own() {
+        let earlier = format!(
+            "alias ll='ls -l'\n# Route claude/codex through ohjaa (written by `ohjaa apply`).\n{}\n",
+            line()
+        );
+        let plan = zshrc_with_launcher(&earlier, &line()).unwrap();
+        assert_eq!(
+            plan.contents,
+            format!("alias ll='ls -l'\n{LAUNCH_COMMENT}\n{}\n", line())
+        );
+        assert_eq!(plan.added, [LAUNCH_COMMENT.to_owned()]);
+        assert_eq!(zshrc_with_launcher(&plan.contents, &line()), None);
+        let undone = zshrc_without_launcher(&earlier, &[], false).unwrap();
+        assert_eq!(undone.contents, "alias ll='ls -l'\n");
+        // A comment of the person's own, above it, that names no ohjaa stays.
+        let theirs = format!("# my shell\n{}\n", line());
+        assert_eq!(
+            zshrc_without_launcher(&theirs, &[], false)
+                .unwrap()
+                .contents,
+            "# my shell\n"
+        );
     }
 
     #[test]

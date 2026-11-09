@@ -2,9 +2,9 @@
 //! opens, gathered into one snapshot that `ohjaa line` and `ohjaa digest`
 //! read. Four parts, each asked once, at the same time:
 //!
-//! - `github`: the pull requests updated in the owners of the clones under
-//!   the roots, one search through `gh api graphql`, at most
-//!   [`MAX_GH_CALLS`] calls;
+//! - `github`: the pull requests updated in the owners of the fleet's clones
+//!   under the roots (those with `.toimija/repo.yaml`), one search through
+//!   `gh api graphql`, at most [`MAX_GH_CALLS`] calls;
 //! - `usage`: what vessa reads in the transcripts of the sessions ended
 //!   lately, joined by the agent's own session ids ohjaa found at leaving;
 //! - `typed`: the first words the person typed in each of those sessions,
@@ -322,9 +322,9 @@ pub fn write(dirs: &Dirs, collected: &Collected) -> Result<()> {
 }
 
 /// Ask every source, each on its own thread, and keep what a failed one
-/// held before. `repos` are the git repositories under the roots (whose
-/// owners on GitHub are asked about); GitHub and vessa are asked about what
-/// happened since `from_ms`.
+/// held before. `repos` are the git repositories under the roots: GitHub is
+/// asked about the owners of the fleet's among them. GitHub and vessa are
+/// asked about what happened since `from_ms`.
 pub fn collect(
     dirs: &Dirs,
     repos: Result<Vec<PathBuf>, String>,
@@ -378,22 +378,47 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, Answer<T>>) -> Answer<T> 
         .unwrap_or_else(|_| Err("its reader panicked".to_owned()))
 }
 
-/// The owners on GitHub of the clones under the roots, from each one's
-/// origin (one `git config` each): whose pull requests to show. A clone
-/// whose config cannot be read is said beside them.
+/// The owners on GitHub of the fleet's clones under the roots, those that
+/// declare themselves in `.toimija/repo.yaml` (as `ohjaa system` counts the
+/// fleet), from each one's origin: whose pull requests to show. A clone of
+/// someone else's project under a root is no part of the fleet, so its
+/// owner never fills the search. Each clone's config is read once (one `git
+/// config`), all at the same time; one that cannot be read is said beside
+/// them.
 fn owners(repos: &[PathBuf]) -> (Vec<String>, Vec<String>) {
+    let fleet: Vec<&PathBuf> = repos
+        .iter()
+        .filter(|repo| repo.join(".toimija/repo.yaml").is_file())
+        .collect();
+    let read: Vec<Result<Option<String>, String>> = std::thread::scope(|scope| {
+        fleet
+            .iter()
+            .map(|repo| {
+                scope.spawn(move || {
+                    let listing =
+                        gitconfig::clone_listing(repo).map_err(|error| format!("{error:#}"))?;
+                    Ok(gitconfig::fetch_url(&listing, "origin")
+                        .as_deref()
+                        .and_then(home::RepoId::parse)
+                        .filter(|id| id.host.as_deref() == Some("github.com"))
+                        .map(|id| id.owner.to_ascii_lowercase()))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err("its reader panicked".to_owned()))
+            })
+            .collect()
+    });
     let mut owners = BTreeSet::new();
     let mut gaps = Vec::new();
-    for repo in repos {
-        match gitconfig::clone_listing(repo) {
-            Ok(listing) => owners.extend(
-                gitconfig::fetch_url(&listing, "origin")
-                    .as_deref()
-                    .and_then(home::RepoId::parse)
-                    .filter(|id| id.host.as_deref() == Some("github.com"))
-                    .map(|id| id.owner.to_ascii_lowercase()),
-            ),
-            Err(error) => gaps.push(format!("{error:#}")),
+    for answer in read {
+        match answer {
+            Ok(owner) => owners.extend(owner),
+            Err(why) => gaps.push(why),
         }
     }
     (owners.into_iter().collect(), gaps)
@@ -415,7 +440,8 @@ fn github(owners: &[String], from_ms: i64) -> Result<(Vec<Pr>, Vec<String>), Str
         return Ok((
             Vec::new(),
             vec![
-                "no clone under the roots has its origin on GitHub, so no owner to ask it about"
+                "no clone of the fleet under the roots (one with .toimija/repo.yaml) has its origin on \
+                 GitHub, so no owner to ask it about"
                     .to_owned(),
             ],
         ));

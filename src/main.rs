@@ -235,8 +235,9 @@ enum Cmd {
     /// and the first words typed in each, and the secret-shaped tokens vessa
     /// found in agent sessions.
     #[command(after_help = "Each part asked once, at the same time:\n  \
-        github    gh api graphql: the pull requests updated in the owners of the clones under\n            \
-        the roots (one git config per clone), at most 2 calls\n  \
+        github    gh api graphql: the pull requests updated in the owners of the fleet's\n            \
+        clones under the roots (those with .toimija/repo.yaml; one git config each),\n            \
+        at most 2 calls\n  \
         vessa     vessa usage --json --input <transcript>…: only the sessions ended lately\n  \
         messages  vessa messages --json --since …: the first words typed in each of them\n  \
         secrets   vessa secrets --json --since …: where and how many, never a value\n\
@@ -270,8 +271,10 @@ enum Cmd {
         3  refused: an ohjaa that is not the one on PATH (see --bin)\n  \
         4  applied, except an agent's own instruction file apply cannot write (a\n     \
            block it cannot tell from the rest): each is named, with why, on every\n     \
-           apply and dry run until it is fixed by hand; `ohjaa doctor` names it too\n\n\
+           apply and dry run until it is fixed by hand; `ohjaa doctor` names it too;\n     \
+           or --undo did not take back all applied.toml holds, and kept the rest\n\n\
         Writes in the home (~/.config/ohjaa):\n  \
+        roots         from --root: where the repositories are (collect and lessons read it)\n  \
         applied.toml  what apply changes outside the home, kept before each change\n  \
         .git/         the home's history: what apply changed, one commit (made on\n                \
         the home's first commit; never pushed)\n\
@@ -285,8 +288,10 @@ enum Cmd {
         ~/.config/opencode/AGENTS.md (none is created); each decision\n                         \
         rewrites it where it is\n\
         <ohjaa> is the ohjaa on PATH (or --bin), by absolute path. --undo puts the\n\
-        changes back as they were, and removes applied.toml; the history stays.\n\n\
-        Checks before a push are sykli's: `sykli hook install` in each repository.")]
+        changes back as they were, and removes applied.toml; the roots and the\n\
+        history stay.\n\n\
+        Checks before a push are sykli's: `sykli hook install --pre-push` in each\n\
+        repository.")]
     Apply {
         /// Print every change, and make none.
         #[arg(long)]
@@ -1920,8 +1925,8 @@ fn default_drafter() -> String {
         .unwrap_or_else(|| "claude -p".to_owned())
 }
 
-/// The git repositories a report reads: those under the roots.
-fn report_repos(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+/// The git repositories under the roots, for `collect`.
+fn repos_under_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     roots::git_repos(&roots::load(roots, git_root_for_roots(roots).as_deref()))
 }
 
@@ -2457,7 +2462,7 @@ fn cmd_intake(
     Ok(if finished { 0 } else { INCOMPLETE })
 }
 
-// ---- launching --------------------------------------------------------------
+// ---- the briefing's scope ------------------------------------------------------
 
 /// A `--scope` path as given: a relative path is taken from the current
 /// directory, `~/` from the home directory.
@@ -2556,7 +2561,9 @@ fn main() {
         Cmd::Digest { since, no_collect } => {
             human::digest(&cli.root, repos(&cli.root), since.as_deref(), *no_collect)
         }
-        Cmd::Collect { background } => human::collect_now(report_repos(&cli.root), *background),
+        Cmd::Collect { background } => {
+            human::collect_now(repos_under_roots(&cli.root), *background)
+        }
         Cmd::Graph { id } => cmd_graph(id),
         Cmd::Apply { dry_run, bin, undo } => {
             if *undo {
@@ -2564,6 +2571,7 @@ fn main() {
             } else {
                 apply::apply(apply::Options {
                     dry_run: *dry_run,
+                    roots: &cli.root,
                     bin: bin.as_deref(),
                 })
             }

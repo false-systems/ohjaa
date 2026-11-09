@@ -1047,7 +1047,7 @@ impl Asker {
             return Err(format!("the checkout {} is gone", checkout.display()));
         }
         let slug = github_slug(checkout)?;
-        if !knowledge::on_path("gh") {
+        if crate::home::on_path("gh").is_none() {
             return Err("gh is not on PATH".to_owned());
         }
         let view = gh(

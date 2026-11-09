@@ -3192,7 +3192,8 @@ impl Fixture {
             "Decide me.",
         );
         let clone = self.dir.join("sykli");
-        fs::create_dir_all(&clone).unwrap();
+        fs::create_dir_all(clone.join(".toimija")).unwrap();
+        fs::write(clone.join(".toimija/repo.yaml"), "repo:\n  name: sykli\n").unwrap();
         run_git(&clone, &["init", "-q", "-b", "main"]);
         run_git(
             &clone,
@@ -3673,6 +3674,7 @@ fn what_could_not_be_read_is_said_never_an_all_clear() {
     let fixture = Fixture::new("human-unread");
     fixture.human_view(false);
     let valvo = fixture.make_git_repo("valvo");
+    fs::write(valvo.join(".toimija/repo.yaml"), "repo:\n  name: valvo\n").unwrap();
     fs::write(valvo.join(".git/config"), "[[[ not git's\n").unwrap();
     fixture.make_repo("broken");
     let (stdout, _, code) = output_of(fixture.person().arg("collect"));
@@ -3934,12 +3936,12 @@ fn hold(path: &Path) -> fs::File {
     held
 }
 
-/// collect asks GitHub about the owners on GitHub of the clones under the
-/// roots, each found from its origin: the fixture's clone of
-/// false-systems/sykli, and never the owner of a clone whose origin is
-/// elsewhere.
+/// collect asks GitHub about the owners on GitHub of the fleet's clones
+/// under the roots (those with `.toimija/repo.yaml`), each found from its
+/// origin: the fixture's clone of false-systems/sykli. Never the owner of a
+/// clone of someone else's project, on GitHub or elsewhere.
 #[test]
-fn collect_asks_github_about_the_owners_of_the_clones_under_the_roots() {
+fn collect_asks_github_about_the_owners_of_the_fleets_clones() {
     if !git_available() {
         return;
     }
@@ -3953,6 +3955,18 @@ fn collect_asks_github_about_the_owners_of_the_clones_under_the_roots() {
             "add",
             "origin",
             "https://gitlab.com/someone/elsewhere.git",
+        ],
+    );
+    // A clone of someone else's project on GitHub: no part of the fleet.
+    let upstream = fixture.make_git_repo("upstream");
+    fs::remove_dir_all(upstream.join(".toimija")).unwrap();
+    run_git(
+        &upstream,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/busy-org/upstream.git",
         ],
     );
     let calls = fixture.dir.join("gh-calls");
@@ -3970,12 +3984,13 @@ fn collect_asks_github_about_the_owners_of_the_clones_under_the_roots() {
     );
     assert!(asked.contains("q=org:false-systems is:pr"), "{asked}");
     assert!(!asked.contains("someone"), "{asked}");
+    assert!(!asked.contains("busy-org"), "{asked}");
     fixture.cleanup();
 }
 
-/// The nit: a git that fails is no missing clone. The branch stays as it
-/// was last read (the first review's finding 2, at the CLI), and the reason
-/// says the clone could not be read.
+/// The nit: a git that fails is no missing clone. When no clone's config
+/// can be read, whose pull requests to ask GitHub for is unknown, never
+/// none, and the reason says the clone could not be read.
 #[test]
 fn a_git_that_fails_is_said_as_that_never_as_a_missing_clone() {
     if !git_available() {
