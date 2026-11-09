@@ -1216,8 +1216,17 @@ work, in every session), then lesson (what a correction taught), then fact
 each the one last confirmed (`as_of`) first. The filling stops at the first
 node that does not fit, and the briefing ends by naming the rest by id, so an
 agent can read the one it needs: ``Not shown, to fit what an agent reliably
-reads: lima, vm. `ohjaa graph <id>` prints one.`` No node is ever cut short. `ohjaa check` still
-measures all of it.
+reads: lima, vm. `ohjaa graph <id>` prints one.`` No node is ever cut short.
+
+`ohjaa check` measures the briefing each agent set up on this machine gets
+here, as a launch here would brief it: an agent whose own instructions hold
+mine and machine, current, is not charged for them. One line per agent says
+its size and where it gets mine and machine; one over the budget is flagged,
+and told how to stop carrying them when that is why (`briefing pi 10443 of
+8000 characters; mine and machine are carried in the briefing: ~/.pi/agent/AGENTS.md
+does not exist`). With no agent set up, it measures all of the knowledge. A
+launch over the budget names its agent on stderr (`ohjaa: pi's briefing: the
+knowledge is …`).
 
 For agents not launched through ohjaa, `ohjaa brief --write <file>` writes the
 Knowledge as a generated block into an instruction file such as `CLAUDE.md` or

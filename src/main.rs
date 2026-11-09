@@ -813,6 +813,17 @@ struct Briefed {
     /// Where mine and machine come from, and where this repository's lessons
     /// are, said once after all the knowledge.
     source: Option<String>,
+    /// How long the knowledge section would be with every node it shows in
+    /// full, its lines about mine, machine and lessons included: what the
+    /// budget is judged against.
+    full: usize,
+    /// What stderr says when the budget cut it.
+    over: Option<String>,
+    /// For a person: where this agent gets mine and machine from.
+    mine_machine: Option<String>,
+    /// Whether the briefing carries mine and machine, the agent's own
+    /// instructions not holding them current.
+    carried: bool,
 }
 
 /// The line that says the repository's AGENTS.md holds `count` of its
@@ -864,15 +875,37 @@ fn knowledge_briefing_for(
     for error in fk::validate_set(&loaded.nodes) {
         eprintln!("ohjaa: knowledge does not hold together: {error}");
     }
-    let flags = knowledge::flags(&loaded, dirs.repo_root.as_deref(), knowledge::today());
+    let briefed = briefing_of(dirs, &loaded, scopes, agent, in_agents_md)?;
+    if let Some(over) = &briefed.over {
+        // Each agent is briefed apart (mine and machine may come from its
+        // own instructions), so the agent this is is named.
+        match agent.and_then(|(command, _)| instructions::target_of(command)) {
+            Some(target) => eprintln!("ohjaa: {}'s briefing: {over}", target.agent),
+            None => eprintln!("ohjaa: {over}"),
+        }
+    }
+    Ok(briefed)
+}
+
+/// [`knowledge_briefing_for`] of knowledge already loaded, saying nothing:
+/// what `ohjaa check` measures for each agent, exactly as a launch would
+/// brief it.
+fn briefing_of(
+    dirs: &Dirs,
+    loaded: &knowledge::Loaded,
+    scopes: &[Scope],
+    agent: Option<(&str, &[String])>,
+    in_agents_md: bool,
+) -> Result<Briefed> {
+    let flags = knowledge::flags(loaded, dirs.repo_root.as_deref(), knowledge::today());
     let home = [Scope::Mine, Scope::Machine];
-    let current = knowledge::in_scopes(&loaded, scopes);
+    let current = knowledge::in_scopes(loaded, scopes);
     // Mine and machine, as the agent's own file would hold them now, and
     // whether it does.
     let own = agent
         .filter(|_| current.iter().any(|located| home.contains(&located.scope)))
         .and_then(|(agent, args)| {
-            let compact = knowledge::render_compact(&loaded, &home, knowledge::DEFAULT_BUDGET);
+            let compact = knowledge::render_compact(loaded, &home, knowledge::DEFAULT_BUDGET);
             instructions::source(agent, args, &compact).map(|source| (source, compact))
         });
     let left_out = match &own {
@@ -890,7 +923,7 @@ fn knowledge_briefing_for(
     // checked out, which the agent reads, or not yet.
     let standing = scopes
         .contains(&Scope::Repo)
-        .then(|| lessons::Standing::read(dirs, &loaded))
+        .then(|| lessons::Standing::read(dirs, loaded))
         .flatten();
     let in_file: Vec<&fk::Located> = current
         .iter()
@@ -949,7 +982,7 @@ fn knowledge_briefing_for(
     // superseded, while its removal waits: said, whatever reads the file.
     let still = standing
         .as_ref()
-        .map(|standing| standing.still_said(&loaded))
+        .map(|standing| standing.still_said(loaded))
         .unwrap_or_default();
     let lessons = {
         let lines: Vec<String> = lessons.into_iter().chain(still).collect();
@@ -971,9 +1004,8 @@ fn knowledge_briefing_for(
         &notes,
         knowledge::DEFAULT_BUDGET.saturating_sub(room),
     );
-    if let Some(over) = within.over(knowledge::DEFAULT_BUDGET) {
-        eprintln!("ohjaa: {over}");
-    }
+    let over = within.over(knowledge::DEFAULT_BUDGET);
+    let full = within.full + room;
     let kept = |located: &fk::Located| within.kept.iter().any(|kept| std::ptr::eq(*kept, located));
     let delivered = current
         .iter()
@@ -1020,10 +1052,22 @@ fn knowledge_briefing_for(
         (Some(lessons), Some(source)) => Some(format!("{lessons}\n{source}")),
         (lessons, source) => lessons.or(source),
     };
+    let mine_machine = own.as_ref().map(|(source, _)| match source {
+        instructions::Source::OwnFile { file, .. } => {
+            format!("mine and machine come from {}", file.display())
+        }
+        instructions::Source::Briefing { why, .. } => {
+            format!("mine and machine are carried in the briefing: {why}")
+        }
+    });
     Ok(Briefed {
         text: within.text,
         delivered,
         source,
+        full,
+        over,
+        carried: matches!(own, Some((instructions::Source::Briefing { .. }, _))),
+        mine_machine,
     })
 }
 
@@ -1088,6 +1132,7 @@ fn knowledge_for_work(
         mut text,
         mut delivered,
         source,
+        ..
     } = knowledge_briefing_for(dirs, &Scope::ALL, agent, true)?;
     for repo in scoped {
         let mut scoped_dirs = dirs.clone();
@@ -1096,6 +1141,7 @@ fn knowledge_for_work(
             text: knowledge,
             delivered: nodes,
             source: still,
+            ..
         } = knowledge_briefing_for(&scoped_dirs, &[Scope::Repo], None, false)?;
         // The preamble is said once, before the first knowledge of all; each
         // repository adds its section, with what its AGENTS.md still says of
@@ -2437,10 +2483,56 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
     for flag in &flags {
         println!("flag     {}: {}", flag.id(), flag.describe());
     }
-    let size = knowledge::render(&loaded, &flags).len();
-    let over = size > budget;
-    if over {
-        println!("flag     the briefing is {size} characters, over the budget of {budget}: merge or retire");
+    // What each agent set up on this machine is briefed with here, measured
+    // as a launch here briefs it: one whose own instructions hold mine and
+    // machine gets them there, not in the briefing. With no agent set up,
+    // all of the knowledge.
+    let agents: Vec<instructions::Target> = instructions::targets()
+        .into_iter()
+        .filter(|target| target.installed)
+        .collect();
+    let (mut size, mut over) = (0, false);
+    if agents.is_empty() {
+        size = knowledge::render(&loaded, &flags).len();
+        over = size > budget;
+        if over {
+            println!(
+                "flag     the briefing is {size} characters, over the budget of {budget}: merge or \
+                 retire"
+            );
+        }
+    }
+    for target in &agents {
+        let briefed = briefing_of(&dirs, &loaded, &Scope::ALL, Some((target.key, &[])), true)?;
+        size = size.max(briefed.full);
+        let whence = briefed
+            .mine_machine
+            .as_deref()
+            .map(|said| format!("; {said}"))
+            .unwrap_or_default();
+        println!(
+            "briefing {:<9}{} of {budget} characters{whence}",
+            target.key, briefed.full
+        );
+        if briefed.full > budget {
+            over = true;
+            let fix = match (&briefed.mine_machine, &target.file) {
+                (Some(_), None) if briefed.carried => format!(
+                    ", or create {} and run `ohjaa apply`, so that {} reads mine and machine there",
+                    target.usual.display(),
+                    target.agent
+                ),
+                (Some(_), Some(_)) if briefed.carried => {
+                    ", or run `ohjaa apply` to rewrite the block in its own instructions".to_owned()
+                }
+                _ => String::new(),
+            };
+            println!(
+                "flag     the briefing {} gets here is {} characters, over the budget of {budget}: \
+                 merge or retire{fix}",
+                target.agent, briefed.full
+            );
+        }
     }
     let (waiting, broken_proposals) = knowledge::pending(&dirs, &loaded)?;
     for broken in &broken_proposals {

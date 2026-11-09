@@ -2347,6 +2347,81 @@ fn check_reports_broken_nodes_and_flags() {
     fixture.cleanup();
 }
 
+/// `ohjaa check` measures the briefing each agent set up here gets, as a
+/// launch here briefs it: one whose own instructions hold mine and machine
+/// is not charged for them; one with no such file carries them, is flagged
+/// when that puts it over, and is told how to stop carrying them.
+#[test]
+fn check_measures_the_briefing_each_agent_gets() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("check-agents");
+    let repo = fixture.make_git_repo("work");
+    let (ours, mine) = (
+        fixture.dir.join("ours/knowledge"),
+        fixture.dir.join("config/ohjaa/mine"),
+    );
+    let team = "Team rule. ".repeat(400).trim_end().to_owned();
+    let taste = "Keep it short. ".repeat(300).trim_end().to_owned();
+    fixture.node(&ours, "team", "decision", &team);
+    fixture.node(&mine, "short", "taste", &taste);
+    // Claude Code's own instructions hold mine, current; pi is set up here
+    // and has no instructions file.
+    let claude = fixture.dir.join("home/.claude/CLAUDE.md");
+    fs::create_dir_all(claude.parent().unwrap()).unwrap();
+    fs::write(&claude, applied_block(&[&format!("- taste: {taste}")])).unwrap();
+    let pi = fixture.dir.join("home/.pi/agent");
+    fs::create_dir_all(&pi).unwrap();
+    let (stdout, _, code) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert_eq!(code, Some(0), "flags alone are not errors: {stdout}");
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no `{prefix}` line: {stdout}"))
+            .to_owned()
+    };
+    let size = |line: &str| -> usize { line.split_whitespace().nth(2).unwrap().parse().unwrap() };
+    let claude_line = line("briefing claude ");
+    assert!(
+        claude_line.ends_with(&format!(
+            " of 8000 characters; mine and machine come from {}",
+            claude.display()
+        )),
+        "{stdout}"
+    );
+    let pi_line = line("briefing pi ");
+    assert!(
+        pi_line.ends_with(&format!(
+            " of 8000 characters; mine and machine are carried in the briefing: {} does not \
+             exist",
+            pi.join("AGENTS.md").display()
+        )),
+        "{stdout}"
+    );
+    // The team's part alone fits; with mine carried too, pi's does not.
+    let (claude_size, pi_size) = (size(&claude_line), size(&pi_line));
+    assert!(claude_size < 8000 && pi_size > 8000, "{stdout}");
+    assert!(pi_size - claude_size > taste.len(), "{stdout}");
+    assert_eq!(
+        line("flag     the briefing"),
+        format!(
+            "flag     the briefing pi gets here is {pi_size} characters, over the budget of \
+             8000: merge or retire, or create {} and run `ohjaa apply`, so that pi reads mine \
+             and machine there",
+            pi.join("AGENTS.md").display()
+        )
+    );
+    // Agents not set up here are not measured.
+    assert!(!stdout.contains("briefing codex"), "{stdout}");
+    assert!(
+        line("summary").ends_with(&format!("briefing {pi_size}/8000")),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
+
 #[test]
 fn brief_write_replaces_only_its_own_block() {
     if !git_available() {
