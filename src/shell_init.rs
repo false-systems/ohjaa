@@ -1,5 +1,5 @@
-//! `ohjaa shell-init zsh`: the launcher that routes `claude` and `codex`
-//! through `ohjaa run`, printed for `~/.zshrc` to eval, and the human view's
+//! `ohjaa shell-init zsh`: the launcher that routes `claude`, `codex`, `pi`
+//! and `opencode` through `ohjaa run`, printed for `~/.zshrc` to eval, and the human view's
 //! line for a terminal's opening.
 
 use anyhow::Result;
@@ -38,6 +38,10 @@ mod tests {
             "claude:-p|claude:--print|claude:-c|claude:--continue|claude:-r|claude:--resume) return 1 ;;",
             "_ohjaa_task=(--task \"$1\")",
             "command claude \"$@\"",
+            "command codex \"$@\"",
+            "command pi \"$@\"",
+            "command opencode \"$@\"",
+            "opencode:-c|opencode:--continue|opencode:-s|opencode:--session",
         ] {
             assert!(LAUNCH_ZSH.contains(rule), "{rule}");
         }

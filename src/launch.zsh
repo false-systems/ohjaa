@@ -1,4 +1,5 @@
-# Route everyday `claude` and `codex` through `ohjaa run` (workflow step 1 · Start).
+# Route everyday `claude`, `codex`, `pi` and `opencode` through `ohjaa run`
+# (workflow step 1 · Start).
 #
 # Printed by `ohjaa shell-init zsh`; `ohjaa apply` loads it from ~/.zshrc with
 #   [[ -x <ohjaa> ]] && eval "$(<ohjaa> shell-init zsh)"
@@ -16,7 +17,7 @@
 _ohjaa_at_terminal() { [[ -t 0 && -t 1 ]]; }
 
 # Decide whether this invocation should go through ohjaa.
-#   $1    the agent: claude | codex
+#   $1    the agent: claude | codex | pi | opencode
 #   $@:2  the arguments you typed after it
 # Return 0 to wrap, 1 to run the agent directly.
 _ohjaa_should_wrap() {
@@ -37,24 +38,60 @@ _ohjaa_should_wrap() {
       *:-h|*:--help|*:--version|*:-V|*:-v) return 1 ;;
       claude:-p|claude:--print|claude:-c|claude:--continue|claude:-r|claude:--resume) return 1 ;;
       codex:resume|codex:fork) return 1 ;;
+      # pi 1.4: one-shots, a session resumed, named or forked, and the flags
+      # that print or export something and exit.
+      pi:-p|pi:--print|pi:-c|pi:--continue|pi:-r|pi:--resume|pi:--session|pi:--session-id|pi:--fork|pi:--export|pi:--list-models) return 1 ;;
+      # opencode 2.2: a session continued, and the flags that print and exit.
+      opencode:-c|opencode:--continue|opencode:-s|opencode:--session|opencode:--completions|opencode:--wizard) return 1 ;;
     esac
   done
+  # pi's --mode json and rpc are for programs, not a person.
+  if [[ $agent == pi ]]; then
+    local mode=${argv[(Ie)--mode]}
+    (( mode )) && [[ ${argv[mode+1]-} != text ]] && return 1
+  fi
   case $agent:${1-} in
     claude:mcp|claude:config|claude:doctor|claude:update|claude:install|claude:login|claude:logout|claude:setup-token|claude:migrate-installer|claude:plugin) return 1 ;;
     codex:exec|codex:e|codex:login|codex:logout|codex:mcp|codex:mcp-server|codex:app-server|codex:completion|codex:debug|codex:apply|codex:a|codex:cloud|codex:features|codex:sandbox|codex:help|codex:proto) return 1 ;;
+    pi:install|pi:remove|pi:uninstall|pi:update|pi:list|pi:config|pi:auth|pi:mcp) return 1 ;;
   esac
+  # opencode's first argument that is not a flag is a subcommand, else the
+  # folder to start in. Only the TUI, `mini` and a folder start a session a
+  # person types into; `run` and the rest stay direct.
+  if [[ $agent == opencode ]]; then
+    local first
+    first=$(_ohjaa_opencode_first "$@")
+    case $first in
+      ''|mini) ;;
+      upgrade|update|uninstall|acp|api|debug|auth|mcp|plugin|models|stats|run|session|service|reload|pair|serve) return 1 ;;
+      *) [[ -d $first ]] || return 1 ;;
+    esac
+  fi
   return 0
 }
 
-# toimija gives the agent its briefing as the final prompt argument, so a prompt
-# you typed must not travel as a second one. Split the arguments into the flags
-# that pass through (_ohjaa_pass) and your prompt, which becomes the session's
-# task (_ohjaa_task). Flags that take a value are listed so their value isn't
-# mistaken for a prompt. Returns 1 when it can't tell (two or more prompt-like
-# arguments).
+# Print opencode's first argument that is neither a flag nor a flag's value.
+_ohjaa_opencode_first() {
+  while (( $# )); do
+    case $1 in
+      --server|--prompt|-s|--session|--log-level|--completions|-m|--model|--agent|--replay-limit) shift ;;
+      -*) ;;
+      *) print -r -- "$1"; return ;;
+    esac
+    shift
+  done
+}
+
+# toimija gives the agent its briefing as the final prompt argument (opencode's
+# after --prompt), so a prompt you typed must not travel as a second one. Split
+# the arguments into the flags that pass through (_ohjaa_pass) and your prompt,
+# which becomes the session's task (_ohjaa_task). Flags that take a value are
+# listed so their value isn't mistaken for a prompt. Returns 1 when it can't
+# tell (two or more prompt-like arguments).
 _ohjaa_split() {
   local agent=$1; shift
   local -a value_flags
+  local places=0
   case $agent in
     claude) value_flags=(--model --permission-mode --add-dir --agent --agents --settings
                          --setting-sources --mcp-config --session-id --fallback-model
@@ -64,10 +101,37 @@ _ohjaa_split() {
     codex)  value_flags=(-c --config -m --model -p --profile --local-provider -s --sandbox
                          -C --cd --add-dir --enable --disable -a --ask-for-approval
                          --remote --remote-auth-token-env -i --image) ;;
+    pi)     value_flags=(--provider --model --api-key --system-prompt --append-system-prompt
+                         --mode --session-dir -n --name --models -t --tools -xt --exclude-tools
+                         --thinking -e --extension --skill --prompt-template --theme --use-theme
+                         --tui-mode) ;;
+    opencode) value_flags=(--server --log-level -m --model --agent --replay-limit) ;;
   esac
   _ohjaa_pass=() _ohjaa_task=()
   while (( $# )); do
-    if [[ $1 == -* ]]; then
+    if [[ $agent == opencode && ( $1 == --prompt || $1 == --prompt=* ) ]]; then
+      # opencode's prompt is a flag's value, and toimija's --prompt would
+      # replace yours: it becomes the task.
+      (( ${#_ohjaa_task} )) && return 1
+      if [[ $1 == --prompt=* ]]; then
+        _ohjaa_task=(--task "${1#--prompt=}")
+      elif (( $# > 1 )); then
+        _ohjaa_task=(--task "$2"); shift
+      fi
+    elif [[ $agent == pi && $1 == @* ]]; then
+      # A file pi attaches to the first message: it goes with the briefing.
+      _ohjaa_pass+=("$1")
+    elif [[ $agent == opencode && $1 != -* ]]; then
+      # `mini`, else the folder opencode starts in: ohjaa launches from that
+      # folder instead, so the briefing and the session are that folder's.
+      if (( ++places == 1 )) && [[ $1 == mini ]]; then
+        _ohjaa_pass+=("$1")
+      elif [[ -z $_ohjaa_dir && -d $1 ]]; then
+        _ohjaa_dir=$1
+      else
+        return 1
+      fi
+    elif [[ $1 == -* ]]; then
       _ohjaa_pass+=("$1")
       if (( ${value_flags[(Ie)$1]} )) && (( $# > 1 )); then
         _ohjaa_pass+=("$2"); shift
@@ -110,4 +174,30 @@ codex() {
     print -u2 "ohjaa: not wrapped (more than one prompt-like argument); put the prompt first, or use: command codex …"
   fi
   command codex "$@"
+}
+
+pi() {
+  local -a _ohjaa_pass _ohjaa_task
+  if _ohjaa_should_wrap pi "$@"; then
+    if _ohjaa_split pi "$@"; then
+      _ohjaa_launch pi; return
+    fi
+    print -u2 "ohjaa: not wrapped (more than one prompt-like argument); put the prompt first, or use: command pi …"
+  fi
+  command pi "$@"
+}
+
+opencode() {
+  local -a _ohjaa_pass _ohjaa_task
+  local _ohjaa_dir
+  if _ohjaa_should_wrap opencode "$@"; then
+    if _ohjaa_split opencode "$@"; then
+      if [[ -n $_ohjaa_dir ]]; then
+        ( builtin cd -q -- "$_ohjaa_dir" && _ohjaa_launch opencode ); return
+      fi
+      _ohjaa_launch opencode; return
+    fi
+    print -u2 "ohjaa: not wrapped (two prompts, or a second folder); use: command opencode …"
+  fi
+  command opencode "$@"
 }

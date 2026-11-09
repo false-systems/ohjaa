@@ -7114,6 +7114,104 @@ claude
     );
 }
 
+/// pi and opencode typed at a terminal go through ohjaa as claude and codex
+/// do. opencode takes its prompt after `--prompt` and the folder to start in
+/// as its argument: the prompt becomes the task, and ohjaa launches from that
+/// folder, so the briefing is the folder's.
+#[test]
+fn the_launcher_routes_pi_and_opencode_too() {
+    if !Path::new("/bin/zsh").exists() && !Path::new("/usr/bin/zsh").exists() {
+        eprintln!("skipping the launcher's rules: zsh is not installed here");
+        return;
+    }
+    let sandbox = Sandbox::new("shell-pi-opencode");
+    let bin = sandbox.dir.join("bin");
+    write_executable(&bin.join("pi"), "#!/bin/sh\necho \"direct-pi $*\"\n");
+    write_executable(
+        &bin.join("opencode"),
+        "#!/bin/sh\necho \"direct-opencode $*\"\n",
+    );
+    let (repo, _) = sandbox.repo("acme", "widget", &[]);
+    fs::create_dir(repo.join("sub")).unwrap();
+    let script = r#"
+eval "$(ohjaa shell-init zsh)"
+_ohjaa_at_terminal() { true; }
+ohjaa() { print -r -- "ohjaa $* (in ${PWD:t})"; }
+pi
+pi "fix the parser"
+pi --model sonnet:high @notes.md "do x"
+pi --mode text "y"
+pi -p hi
+pi --continue
+pi --session abc
+pi --fork abc
+pi --mode json
+pi auth check --provider zai
+pi a b
+opencode
+opencode --prompt "fix it" --auto
+opencode --prompt=again
+opencode sub
+opencode sub --prompt there
+opencode mini -m p/m
+opencode run hi
+opencode -c
+opencode --session s1
+opencode models
+opencode nowhere
+opencode sub other
+OHJAA_WRAP=0 pi
+OHJAA_SESSION=s opencode
+print -r -- "still in ${PWD:t}"
+"#;
+    let output = sandbox
+        .command("zsh", &repo)
+        .args(["-f", "-c", script])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&output);
+    assert_eq!(
+        stdout,
+        "ohjaa run pi --intent interactive -- (in widget)\n\
+         ohjaa run pi --intent interactive --task fix the parser -- (in widget)\n\
+         ohjaa run pi --intent interactive --task do x -- --model sonnet:high @notes.md (in widget)\n\
+         ohjaa run pi --intent interactive --task y -- --mode text (in widget)\n\
+         direct-pi -p hi\n\
+         direct-pi --continue\n\
+         direct-pi --session abc\n\
+         direct-pi --fork abc\n\
+         direct-pi --mode json\n\
+         direct-pi auth check --provider zai\n\
+         direct-pi a b\n\
+         ohjaa run opencode --intent interactive -- (in widget)\n\
+         ohjaa run opencode --intent interactive --task fix it -- --auto (in widget)\n\
+         ohjaa run opencode --intent interactive --task again -- (in widget)\n\
+         ohjaa run opencode --intent interactive -- (in sub)\n\
+         ohjaa run opencode --intent interactive --task there -- (in sub)\n\
+         ohjaa run opencode --intent interactive -- mini -m p/m (in widget)\n\
+         direct-opencode run hi\n\
+         direct-opencode -c\n\
+         direct-opencode --session s1\n\
+         direct-opencode models\n\
+         direct-opencode nowhere\n\
+         direct-opencode sub other\n\
+         direct-pi \n\
+         direct-opencode \n\
+         still in widget\n",
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("ohjaa: not wrapped (more than one prompt-like argument); put the prompt first, or use: command pi …"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "ohjaa: not wrapped (two prompts, or a second folder); use: command opencode …"
+        ),
+        "{stderr}"
+    );
+}
+
 /// "We don't want to run git git git": each command's own git processes, as
 /// git's trace2 counts them, within its budget. Every case first proves it
 /// measured something real (a positive control): the trace holds the git

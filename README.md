@@ -1563,11 +1563,21 @@ ohjaa run codex --intent "change the parser" -- --model o3
 
 ## Agents launched from the root
 
-The launcher `ohjaa apply` puts in `~/.zshrc` routes `claude` and `codex`
-typed at a terminal through `ohjaa run` in any folder, the home folder as much
-as a repository: the team's knowledge (ours) reaches an agent only through
-the briefing, since an agent's own instruction file holds mine and machine
-alone. Outside every repository the session is the folder's.
+The launcher `ohjaa apply` puts in `~/.zshrc` routes `claude`, `codex`, `pi`
+and `opencode` typed at a terminal through `ohjaa run` in any folder, the home
+folder as much as a repository: the team's knowledge (ours) reaches an agent
+only through the briefing, since an agent's own instruction file holds mine
+and machine alone. Outside every repository the session is the folder's.
+
+One-shots, maintenance commands and resumed sessions stay direct: `pi -p`,
+`pi --continue`, `--resume`, `--session`, `--fork`, `--mode json|rpc` and pi's
+subcommands; `opencode run`, `-c`, `--session` and every opencode subcommand
+but `mini`. A prompt typed with `opencode --prompt` becomes the task, since
+toimija gives opencode its briefing there. A folder named to opencode
+(`opencode valvo`) is where ohjaa launches from, so the briefing and the
+session are that folder's; a name that is not a folder stays direct. Files pi
+attaches with `@file` travel with the briefing. `command pi …` or
+`OHJAA_WRAP=0` bypasses it, as for the others.
 
 Launch agents from the folder that holds your repositories. You can give a goal
 without choosing the repositories first:

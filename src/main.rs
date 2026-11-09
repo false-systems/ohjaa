@@ -504,8 +504,8 @@ enum Cmd {
         #[arg(long, value_name = "SECONDS", default_value_t = 1800)]
         wait: u64,
     },
-    /// Print the shell functions that route `claude` and `codex` through
-    /// `ohjaa run`. Load them with: eval "$(ohjaa shell-init zsh)"
+    /// Print the shell functions that route `claude`, `codex`, `pi` and
+    /// `opencode` through `ohjaa run`. Load them with: eval "$(ohjaa shell-init zsh)"
     ShellInit {
         /// zsh is the only one.
         shell: String,
