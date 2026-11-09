@@ -80,36 +80,39 @@ struct Row {
 }
 
 fn table() -> [Row; 4] {
-    let stores = crate::usage::Stores::from_env();
+    let var = |key: &str| {
+        std::env::var_os(key)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let home = var("HOME");
+    let below = |folder: &str| home.as_ref().map(|home| home.join(folder));
     // opencode 2.1.4: `OPENCODE_CONFIG_DIR`, when it is not empty, else
     // `$XDG_CONFIG_HOME/opencode`.
-    let opencode = std::env::var_os("OPENCODE_CONFIG_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            knowledge::config_home()
-                .ok()
-                .map(|dir| dir.join("opencode"))
-        });
+    let opencode = var("OPENCODE_CONFIG_DIR").or_else(|| {
+        knowledge::config_home()
+            .ok()
+            .map(|dir| dir.join("opencode"))
+    });
     [
         Row {
             agent: "Claude Code",
             key: "claude",
-            dir: stores.claude,
+            dir: var("CLAUDE_CONFIG_DIR").or_else(|| below(".claude")),
             names: &["CLAUDE.md"],
             moved_by: "CLAUDE_CONFIG_DIR",
         },
         Row {
             agent: "Codex",
             key: "codex",
-            dir: stores.codex,
+            dir: var("CODEX_HOME").or_else(|| below(".codex")),
             names: &["AGENTS.override.md", "AGENTS.md"],
             moved_by: "CODEX_HOME",
         },
         Row {
             agent: "pi",
             key: "pi",
-            dir: stores.pi,
+            dir: var("PI_CODING_AGENT_DIR").or_else(|| below(".pi/agent")),
             names: &[
                 "AGENTS.override.md",
                 "AGENTS.md",

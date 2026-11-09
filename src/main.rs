@@ -22,10 +22,8 @@ mod process;
 mod repo_docs;
 mod roots;
 mod scan;
-mod sessions;
 mod shell_init;
 mod system;
-mod usage;
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -254,13 +252,8 @@ enum Cmd {
         #[arg(long, hide = true)]
         background: bool,
     },
-    /// Import explicit usage attribution or export session history for analysis.
-    Usage {
-        #[command(subcommand)]
-        action: UsageCmd,
-    },
     /// A knowledge node and its neighbours: what it builds on, what builds on
-    /// it, what it replaced, and which sessions were briefed with it.
+    /// it and what it replaced.
     Graph { id: String },
     /// Write the knowledge into each agent's own instruction file, the line a
     /// terminal runs as it opens into ~/.zshrc, and the ignore block into
@@ -356,73 +349,6 @@ enum LessonsCmd {
     },
 }
 
-#[derive(Subcommand)]
-enum UsageCmd {
-    /// Attach a native-session snapshot. Reimports replace, never add totals.
-    Import {
-        file: PathBuf,
-        /// Wrapper session ID; defaults to OHJAA_SESSION inside a run.
-        #[arg(long)]
-        session: Option<String>,
-    },
-    /// Versioned JSON export; no database access needed by consumers.
-    Export {
-        #[arg(long)]
-        session: Option<String>,
-    },
-}
-
-/// Rows of the session log that could not be read while checking a usage
-/// receipt was not attributed twice, named so they can be looked at.
-fn report_unreadable_rows(ids: &[String]) {
-    if !ids.is_empty() {
-        eprintln!(
-            "ohjaa: session log row(s) {} could not be read; skipped when checking this \
-             receipt is not attributed to another session",
-            ids.join(", ")
-        );
-    }
-}
-
-fn cmd_usage(action: &UsageCmd) -> Result<i32> {
-    let dirs = dirs()?;
-    let open = || sessions::Store::open(&sessions::store_path(&dirs.state));
-    match action {
-        UsageCmd::Import { file, session } => {
-            let id = session.clone().map(Ok).unwrap_or_else(current_session_id)?;
-            anyhow::ensure!(sessions::is_valid_id(&id), "invalid session id");
-            let skipped = open()?.attach_usage(&id, usage::Receipt::read(file)?)?;
-            report_unreadable_rows(&skipped);
-            println!("recorded usage snapshot for {id}");
-            Ok(0)
-        }
-        UsageCmd::Export { session } => {
-            // Read, then let the log go before writing: a reader that stops
-            // reading must never hold every other ohjaa off the log.
-            // Opened only to read: with no log yet there is nothing to
-            // export, and none is created.
-            let (mut records, unreadable) =
-                sessions::Reader::open(&sessions::store_path(&dirs.state))?.all()?;
-            if let Some(id) = session {
-                records.retain(|s| s.id == *id);
-                anyhow::ensure!(
-                    !unreadable.contains(id),
-                    "session {id} is unreadable in the log"
-                );
-                anyhow::ensure!(!records.is_empty(), "session {id} not found");
-            }
-            // One session asked for and found is complete, whatever other rows hold.
-            let complete = unreadable.is_empty() || session.is_some();
-            let mut out = serde_json::to_vec_pretty(&serde_json::json!({
-                "schema": "ohjaa-sessions.v1", "sessions": records, "unreadable": unreadable
-            }))?;
-            out.push(b'\n');
-            std::io::stdout().lock().write_all(&out)?;
-            Ok(if complete { 0 } else { INCOMPLETE })
-        }
-    }
-}
-
 fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     let mut command = Command::new("git");
     command.args(args);
@@ -506,8 +432,6 @@ fn dirs() -> Result<Dirs> {
 /// A knowledge section of a briefing.
 struct Briefed {
     text: String,
-    /// Exactly which nodes it delivers, and those the agent's own file did.
-    delivered: Vec<sessions::Delivered>,
     /// Where mine and machine come from, and where this repository's lessons
     /// are, said once after all the knowledge.
     source: Option<String>,
@@ -672,34 +596,6 @@ fn knowledge_briefing_for(
         eprintln!("ohjaa: {over}");
     }
     let kept = |located: &fk::Located| within.kept.iter().any(|kept| std::ptr::eq(*kept, located));
-    let delivered = current
-        .iter()
-        .filter_map(|located| {
-            let via = if kept(located) {
-                None
-            } else if held(located) {
-                // Delivered by the agent's own file.
-                left_out.map(|(file, _)| file.to_string_lossy().into_owned())
-            } else if in_lessons(located) {
-                // Delivered by the repository's AGENTS.md.
-                standing
-                    .as_ref()
-                    .map(|standing| standing.agents_md.to_string_lossy().into_owned())
-            } else {
-                // Named only by count.
-                return None;
-            };
-            Some(sessions::Delivered {
-                id: located.node.id.clone(),
-                scope: located.scope.name().to_owned(),
-                as_of: located.node.as_of.to_string(),
-                repo: (located.scope == Scope::Repo)
-                    .then(|| dirs.repo_root.as_ref().map(|p| repo_key(p)))
-                    .flatten(),
-                via,
-            })
-        })
-        .collect();
     let source = own.as_ref().map(|(source, compact)| {
         let repeated: Vec<&str> = within
             .kept
@@ -719,7 +615,6 @@ fn knowledge_briefing_for(
     };
     Ok(Briefed {
         text: within.text,
-        delivered,
         source,
     })
 }
@@ -780,18 +675,13 @@ fn knowledge_for_work(
     dirs: &Dirs,
     scoped: &[PathBuf],
     agent: Option<(&str, &[String])>,
-) -> Result<(String, Vec<sessions::Delivered>)> {
-    let Briefed {
-        mut text,
-        mut delivered,
-        source,
-    } = knowledge_briefing_for(dirs, &Scope::ALL, agent, true)?;
+) -> Result<String> {
+    let Briefed { mut text, source } = knowledge_briefing_for(dirs, &Scope::ALL, agent, true)?;
     for repo in scoped {
         let mut scoped_dirs = dirs.clone();
         scoped_dirs.repo_root = Some(repo.clone());
         let Briefed {
             text: knowledge,
-            delivered: nodes,
             source: still,
         } = knowledge_briefing_for(&scoped_dirs, &[Scope::Repo], None, false)?;
         // The preamble is said once, before the first knowledge of all; each
@@ -815,7 +705,6 @@ fn knowledge_for_work(
                 repo.display()
             ));
         }
-        delivered.extend(nodes);
     }
     if !scoped.is_empty() && text.len() > knowledge::DEFAULT_BUDGET {
         eprintln!(
@@ -833,7 +722,7 @@ fn knowledge_for_work(
         text.push_str(&source);
         text.push('\n');
     }
-    Ok((text, delivered))
+    Ok(text)
 }
 
 /// The sessions toimija sees in the other worktrees of the clone `root` is
@@ -967,7 +856,7 @@ fn cmd_brief(
         return Ok(0);
     }
     let (scoped, unscoped) = scoped_repos(scope, dirs.repo_root.as_deref());
-    let (knowledge, _) = knowledge_for_work(&dirs, &scoped, agent.map(|agent| (agent, &[][..])))?;
+    let knowledge = knowledge_for_work(&dirs, &scoped, agent.map(|agent| (agent, &[][..])))?;
     for path in &unscoped {
         eprintln!("ohjaa: --scope {path} is not inside a Git repository; no repository knowledge or context was read there");
     }
@@ -1009,52 +898,6 @@ fn cmd_brief(
     } else {
         INCOMPLETE
     })
-}
-
-// ---- the session log ---------------------------------------------------------
-
-/// Open the session log, or say why not. The log is never a reason to stop.
-fn session_store(dirs: &Dirs) -> Option<sessions::Store> {
-    match sessions::Store::open(&sessions::store_path(&dirs.state)) {
-        Ok(store) => Some(store),
-        Err(error) => {
-            eprintln!("ohjaa: {error}; carrying on without the session log");
-            None
-        }
-    }
-}
-
-/// Open the session log only to read it, or say why not: what only reads
-/// the log never writes it (#41).
-fn session_reader(dirs: &Dirs) -> Option<sessions::Reader> {
-    match sessions::Reader::open(&sessions::store_path(&dirs.state)) {
-        Ok(log) => Some(log),
-        Err(error) => {
-            eprintln!("ohjaa: {error}; carrying on without the session log");
-            None
-        }
-    }
-}
-
-fn repo_key(repo: &Path) -> String {
-    std::fs::canonicalize(repo)
-        .unwrap_or_else(|_| repo.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// The session named in the environment, as an earlier `ohjaa run` set it.
-fn current_session_id() -> Result<String> {
-    let id = std::env::var(sessions::SESSION_ENV).map_err(|_| {
-        anyhow::anyhow!(
-            "no --session given, and {} is not set",
-            sessions::SESSION_ENV
-        )
-    })?;
-    if !sessions::is_valid_id(&id) {
-        bail!("{} is not a session id: `{id}`", sessions::SESSION_ENV);
-    }
-    Ok(id)
 }
 
 fn cmd_graph(id: &str) -> Result<i32> {
@@ -1137,33 +980,6 @@ fn cmd_graph(id: &str) -> Result<i32> {
             replaced_by.join(", ")
         }
     );
-    if let Some(log) = session_reader(&dirs) {
-        if let Ok((all, _)) = log.all() {
-            let briefed: Vec<&sessions::Session> = all
-                .iter()
-                .rev()
-                .filter(|s| s.delivered.iter().any(|d| d.id == id))
-                .collect();
-            let recent: Vec<String> = briefed
-                .iter()
-                .take(5)
-                .map(|s| {
-                    let repo = Path::new(&s.repo)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    format!("{} ({repo})", s.id)
-                })
-                .collect();
-            let _ = writeln!(
-                out,
-                "briefed in    {} session(s){}{}",
-                briefed.len(),
-                if recent.is_empty() { "" } else { ", latest: " },
-                recent.join(", ")
-            );
-        }
-    }
     print!("{out}");
     Ok(0)
 }
@@ -1972,35 +1788,6 @@ fn cmd_intake(
     } else {
         sources.iter().map(String::as_str).collect()
     };
-    // Sessions never drafted from, ended or not (`None`: the log could not be
-    // read). Read in one short, read-only open of the log; no store is held
-    // across the slow calls below.
-    let undrafted: Option<Vec<sessions::Session>> = session_reader(&dirs)
-        .and_then(|log| log.all().ok())
-        .map(|(all, _)| all.into_iter().filter(|s| !s.drafted).collect());
-    // Those that ended are queued: the agent's own handover, and what was
-    // said in that session's window, even when the window lies before the
-    // cursor.
-    let queued: Vec<sessions::Session> = undrafted
-        .iter()
-        .flatten()
-        .filter(|s| s.left.is_some())
-        .cloned()
-        .collect();
-    // A session is drafted from with its transcript window, so only a run
-    // that reads transcripts takes it on.
-    let reads_transcripts = sources.contains(&"transcripts");
-    let queued = if reads_transcripts {
-        queued
-    } else {
-        if !queued.is_empty() {
-            eprintln!(
-                "ohjaa: {} ended session(s) wait for a run that reads transcripts",
-                queued.len()
-            );
-        }
-        Vec::new()
-    };
     // What earlier runs handled, read first: a retry reads back to the oldest
     // candidate set aside.
     let mut handled = intake::read_handled(&dirs)?;
@@ -2026,7 +1813,6 @@ fn cmd_intake(
     let mut gaps: Vec<String> = Vec::new();
     // The sources that could not all be read: they hold the cursor.
     let mut warned: Vec<&str> = Vec::new();
-    let mut transcripts_read_cleanly = false;
     let mut candidates = Vec::new();
     let git_repos = || -> Result<Vec<PathBuf>> {
         let roots = roots::load(roots, git_root().as_deref());
@@ -2064,23 +1850,11 @@ fn cmd_intake(
     for source in &sources {
         let before = warnings.len();
         if *source == "transcripts" {
-            // One pass, from the earliest point anything needs: the cursor,
-            // or the start of the oldest queued session.
-            let from = queued
-                .iter()
-                .map(|s| s.started_ms - 1)
-                .min()
-                .map_or(since, |earliest| earliest.min(since));
-            let said = intake::transcripts(from, &mut warnings, &mut gaps);
-            transcripts_read_cleanly = warnings.len() == before;
-            // What was said after `since`, and before it in a queued
-            // session's window: only those are read, and pre-filtered.
+            let said = intake::transcripts(since, &mut warnings, &mut gaps);
+            let transcripts_read_cleanly = warnings.len() == before;
             let said: Vec<intake::Said> = said
                 .into_iter()
-                .filter(|said| {
-                    said.candidate.at_ms > since
-                        || intake::within_sessions(&said.candidate, &queued)
-                })
+                .filter(|said| said.candidate.at_ms > since)
                 .collect();
             let (kept, sifted) = intake::sift(said, prefilter);
             // A vessa that listed nothing because it failed has said so; no
@@ -2107,14 +1881,6 @@ fn cmd_intake(
                 warned.push(source);
             }
         }
-    }
-    if !queued.is_empty() {
-        candidates.extend(intake::handover_candidates(&queued));
-        candidates.extend(intake::observed_candidates(&queued));
-        eprintln!(
-            "ohjaa: {} ended session(s) queued for drafting",
-            queued.len()
-        );
     }
     for warning in &warnings {
         eprintln!("ohjaa: intake: {warning}");
@@ -2327,20 +2093,6 @@ fn cmd_intake(
         }
     }
     handled.done_retrying();
-    // A session is drafted from once every candidate of it is handled, in
-    // however many runs, and only when its whole window was read: a
-    // transcript that could not be read leaves it queued for the next run.
-    let sessions: Option<Vec<intake::Undrafted>> = undrafted.as_ref().map(|all| {
-        all.iter()
-            .map(|s| intake::Undrafted {
-                id: s.id.clone(),
-                started_ms: s.started_ms,
-                members: (reads_transcripts && s.left.is_some())
-                    .then(|| intake::members(s, &found)),
-                whole: transcripts_read_cleanly,
-            })
-            .collect()
-    });
     // The cursor is one for every source: it moves only after a run that
     // read them all, none with a warning.
     let every_source = ["transcripts", "reviews", "reverts"]
@@ -2351,19 +2103,9 @@ fn cmd_intake(
         started,
         complete: every_source && warnings.is_empty(),
     };
-    let settled = intake::settle(&found, &mut handled, sessions.as_deref(), window);
+    let settled = intake::settle(&found, &mut handled, window);
     if let Some(cursor) = settled.cursor {
         intake::write_cursor(&dirs, cursor)?;
-    }
-    if !settled.drafted.is_empty() {
-        // Opened again only for this short write, after the drafter is done.
-        if let Some(store) = session_store(&dirs) {
-            for id in &settled.drafted {
-                if let Err(error) = store.update(id, |s| s.drafted = true) {
-                    eprintln!("ohjaa: {error}");
-                }
-            }
-        }
     }
     intake::write_handled(&dirs, &handled)?;
     // Every run says what is set aside, by time and source.
@@ -2553,7 +2295,6 @@ fn main() {
         Cmd::Lessons {
             action: LessonsCmd::Publish { repos, dry_run },
         } => cmd_lessons_publish(&cli.root, repos, *dry_run),
-        Cmd::Usage { action } => cmd_usage(action),
         Cmd::Line => {
             human::line(&cli.root);
             Ok(0)
