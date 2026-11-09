@@ -1224,9 +1224,8 @@ decision in full, then the rest by priority while it fits: taste (how you
 work, in every session), then lesson (what a correction taught), then fact
 (the nearest to what can be found out again, and the first to go stale),
 each the one last confirmed (`as_of`) first. The filling stops at the first
-node that does not fit, and the briefing ends by naming the rest by id, so an
-agent can read the one it needs: ``Not shown, to fit what an agent reliably
-reads: lima, vm. `ohjaa graph <id>` prints one.`` No node is ever cut short.
+node that does not fit, and the briefing ends with the count of the rest,
+``3 more: `ohjaa list` ``. No node is ever cut short.
 
 `ohjaa check` measures the briefing each agent set up on this machine gets
 here, as a launch here would brief it: an agent whose own instructions hold
@@ -1270,7 +1269,7 @@ Knowledge (ohjaa, mine and machine): what the person you work for has decided an
 
 Past the briefing's budget (8,000 characters) it degrades as the briefing
 does: every decision in full, then taste, lesson and fact while they fit,
-then the rest named by id, as the briefing names them, and apply says so.
+then the rest by count, ``30 more: `ohjaa list` ``, and apply says so.
 After each decision the block is rewritten wherever it is (moved, or
 between your own lines), and only where it is: a block you take out stays
 out until the next apply. `apply --undo` takes it out and puts back exactly
@@ -1314,7 +1313,7 @@ Mine and machine (41 nodes) are not repeated here: Claude Code has them from its
 ```
 
 A block over its own budget holds every decision and the rest by priority,
-as above. The nodes it names only by id are then carried by the briefing,
+as above. The nodes it names only by count are then carried by the briefing,
 within the briefing's budget, and the line says so (`Mine and machine:
 Claude Code has 41 of their 42 nodes from its own instructions, …, whose
 ohjaa block is current; the other 1 is above.`). A flagged node is still
@@ -1537,7 +1536,7 @@ With no concrete task, it acknowledges and waits: the wrapper already recorded
 entry. Orientation precedes the first task change; handover belongs at work
 completion or session exit, not after every conversational reply. No node is
 cut short to save tokens: past the budget the briefing names what it leaves
-out by id, and no new index, database or model call is needed.
+out by count, and no new index, database or model call is needed.
 
 The root list is derived as the sibling directories of your git root (outside
 a repo, the folder you are in), unless `~/.config/ohjaa/roots` or `--root`

@@ -34,7 +34,7 @@ pub const FACT_TTL_DAYS: i64 = 90;
 /// The briefing is read before every action; past this size it stops being
 /// read. Going over is a signal to merge and prune. Past it, the briefing and
 /// the agents' block keep every decision in full and the rest by
-/// priority (`keep_rank`) for as long as it fits, and name what is left by id: a
+/// priority (`keep_rank`) for as long as it fits, and name what is left by count: a
 /// degrade, never a node cut short.
 pub const DEFAULT_BUDGET: usize = 8_000;
 
@@ -473,7 +473,7 @@ pub const PREAMBLE: &str =
 /// The briefing limited to some scopes, in full: a file other people read
 /// gets only shared Knowledge, never one person's `mine` or `machine`.
 pub fn render_scopes(loaded: &Loaded, flags: &[Flag], scopes: &[Scope]) -> String {
-    render_nodes(&in_scopes(loaded, scopes), flags, &[], &[])
+    render_nodes(&in_scopes(loaded, scopes), flags, &[], 0)
 }
 
 /// The current nodes of `scopes`, in briefing order.
@@ -490,7 +490,7 @@ pub struct Within<'a> {
     pub text: String,
     /// The nodes it shows, in briefing order.
     pub kept: Vec<&'a Located>,
-    /// The nodes it names only by id.
+    /// The nodes it names only by count.
     pub more: usize,
     /// How long the rendering of every node would be.
     pub full: usize,
@@ -524,12 +524,12 @@ impl Within<'_> {
             (true, more) => Some(format!(
                 "the knowledge is {full} characters, and its decisions alone are over the {said} \
                  an agent will reliably read: the briefing holds every decision, in {len} \
-                 characters, and names the other {more} only by id; {advice}"
+                 characters, and names the other {more} by count; {advice}"
             )),
             (false, 0) => None,
             (false, more) => Some(format!(
                 "the knowledge is {full} characters, over the {said} an agent will reliably \
-                 read: the briefing holds {holds}, and names the other {more} only by id; {advice}"
+                 read: the briefing holds {holds}, and names the other {more} by count; {advice}"
             )),
         }
     }
@@ -546,8 +546,8 @@ pub fn render_within<'a>(
     notes: &Notes,
     budget: usize,
 ) -> Within<'a> {
-    within(nodes, budget, |kept, left| {
-        render_nodes(kept, flags, notes, left)
+    within(nodes, budget, |kept, more| {
+        render_nodes(kept, flags, notes, more)
     })
 }
 
@@ -567,16 +567,16 @@ fn keep_rank(located: &Located) -> (u8, std::cmp::Reverse<Date>) {
 }
 
 /// `nodes` (in briefing order), rendered by `render` (what it shows, and
-/// what it leaves out, named by id) within `budget`: all of them when they
+/// how many it names only by count) within `budget`: all of them when they
 /// fit; else every decision, then the rest by [`keep_rank`] for as long as
-/// the rendering, with the names of what is left, still fits. The filling
+/// the rendering, with the count of what is left, still fits. The filling
 /// stops at the first that does not fit: a later, shorter one never jumps it.
 fn within<'a>(
     nodes: Vec<&'a Located>,
     budget: usize,
-    render: impl Fn(&[&'a Located], &[&'a Located]) -> String,
+    render: impl Fn(&[&'a Located], usize) -> String,
 ) -> Within<'a> {
-    let text = render(&nodes, &[]);
+    let text = render(&nodes, 0);
     let full = text.len();
     if full <= budget {
         return Within {
@@ -593,54 +593,39 @@ fn within<'a>(
         .collect();
     let mut rest: Vec<usize> = (0..nodes.len()).filter(|&at| !keep[at]).collect();
     rest.sort_by_key(|&at| keep_rank(nodes[at]));
-    let chosen = |keep: &[bool], kept: bool| -> Vec<&'a Located> {
+    let chosen = |keep: &[bool]| -> Vec<&'a Located> {
         nodes
             .iter()
             .zip(keep)
-            .filter(|(_, is)| **is == kept)
+            .filter(|(_, kept)| **kept)
             .map(|(located, _)| *located)
             .collect()
     };
-    let mut text = render(&chosen(&keep, true), &chosen(&keep, false));
+    let mut more = rest.len();
+    let mut text = render(&chosen(&keep), more);
     for at in rest {
         keep[at] = true;
-        let candidate = render(&chosen(&keep, true), &chosen(&keep, false));
+        let candidate = render(&chosen(&keep), more - 1);
         if candidate.len() > budget {
             keep[at] = false;
             break;
         }
+        more -= 1;
         text = candidate;
     }
-    let left = chosen(&keep, false);
     Within {
         text,
-        kept: chosen(&keep, true),
-        more: left.len(),
+        kept: chosen(&keep),
+        more,
         full,
         budget,
     }
 }
 
-/// The line naming the nodes a rendering leaves out to fit, by id, so an
-/// agent can read the one it needs. Empty when none is left out.
-fn left_line(left: &[&Located]) -> String {
-    if left.is_empty() {
-        return String::new();
-    }
-    let ids: Vec<&str> = left
-        .iter()
-        .map(|located| located.node.id.as_str())
-        .collect();
-    format!(
-        "Not shown, to fit what an agent reliably reads: {}. `ohjaa graph <id>` prints one.\n",
-        ids.join(", ")
-    )
-}
-
-/// These nodes as the briefing shows them, then the names of those it does
-/// not ([`left_line`]). Empty when there are none of either.
-fn render_nodes(nodes: &[&Located], flags: &[Flag], notes: &Notes, left: &[&Located]) -> String {
-    if nodes.is_empty() && left.is_empty() {
+/// These nodes as the briefing shows them, then the count of those it does
+/// not. Empty when there are none of either.
+fn render_nodes(nodes: &[&Located], flags: &[Flag], notes: &Notes, more: usize) -> String {
+    if nodes.is_empty() && more == 0 {
         return String::new();
     }
     let mut out = String::from(PREAMBLE);
@@ -675,8 +660,8 @@ fn render_nodes(nodes: &[&Located], flags: &[Flag], notes: &Notes, left: &[&Loca
             let _ = writeln!(out, "  ! {}", flag.describe());
         }
     }
-    if !left.is_empty() {
-        let _ = write!(out, "\n{}", left_line(left));
+    if more > 0 {
+        let _ = write!(out, "\n{more} more: `ohjaa list`\n");
     }
     out
 }
@@ -844,7 +829,7 @@ pub struct Compact {
     pub text: String,
     /// The nodes it holds, one line each.
     pub shown: usize,
-    /// The nodes it names only by id, being over the budget.
+    /// The nodes it names only by count, being over the budget.
     pub more: usize,
     /// The ids of the nodes it holds, in briefing order.
     pub held: Vec<String>,
@@ -859,7 +844,7 @@ impl Compact {
                 if self.shown == 1 { "" } else { "s" }
             ),
             more => format!(
-                "{} of {} nodes, the other {more} only by id: over the {DEFAULT_BUDGET}-character \
+                "{} of {} nodes, the other {more} by count: over the {DEFAULT_BUDGET}-character \
                  budget, merge or retire some",
                 self.shown,
                 self.shown + more
@@ -884,13 +869,15 @@ pub fn render_compact(loaded: &Loaded, scopes: &[Scope], budget: usize) -> Compa
             held: Vec::new(),
         };
     }
-    let within = within(current, budget, |kept, left| {
+    let within = within(current, budget, |kept, more| {
         let mut text = format!("{INSTRUCTIONS_PREAMBLE}\n");
         for located in kept {
             let words: Vec<&str> = located.node.body.split_whitespace().collect();
             let _ = writeln!(text, "- {}: {}", located.node.kind.name(), words.join(" "));
         }
-        text.push_str(&left_line(left));
+        if more > 0 {
+            let _ = writeln!(text, "{more} more: `ohjaa list`");
+        }
         text
     });
     Compact {
@@ -1358,7 +1345,7 @@ pub fn cannot_accept(dirs: &Dirs, loaded: &Loaded, pending: &Pending) -> Option<
 /// its scope's heading not counted.
 pub fn briefing_size(located: &Located) -> usize {
     let heading = format!("\n{}:\n", scope_heading(located.scope)).len();
-    render_nodes(&[located], &[], &[], &[]).len() - PREAMBLE.len() - heading
+    render_nodes(&[located], &[], &[], 0).len() - PREAMBLE.len() - heading
 }
 
 /// How many characters `node` takes in an agent's own instructions
@@ -2026,12 +2013,7 @@ mod tests {
     fn the_compact_block_is_one_line_a_node_and_over_budget_keeps_every_decision() {
         let mut loaded = Loaded::default();
         for located in [
-            located(
-                Scope::Machine,
-                "lima",
-                Kind::Fact,
-                "Lima is\nhere, and every Linux build and test runs in its VM, never on this Mac.",
-            ),
+            located(Scope::Machine, "lima", Kind::Fact, "Lima is\nhere."),
             located(
                 Scope::Mine,
                 "rust",
@@ -2058,8 +2040,7 @@ mod tests {
             all.text,
             format!(
                 "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only. No Python.\n\
-                 - taste: Answer first.\n- decision: Builds in /tmp.\n- fact: Lima is here, and every \
-                 Linux build and test runs in its VM, never on this Mac.\n"
+                 - taste: Answer first.\n- decision: Builds in /tmp.\n- fact: Lima is here.\n"
             ),
             "briefing order, mine and machine only, no origins"
         );
@@ -2070,14 +2051,13 @@ mod tests {
             tight.text,
             format!(
                 "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only. No Python.\n\
-                 - taste: Answer first.\n- decision: Builds in /tmp.\nNot shown, to fit what an \
-                 agent reliably reads: lima. `ohjaa graph <id>` prints one.\n"
+                 - taste: Answer first.\n- decision: Builds in /tmp.\n1 more: `ohjaa list`\n"
             )
         );
         assert_eq!((tight.shown, tight.more), (3, 1));
         assert_eq!(
             tight.summary(),
-            "3 of 4 nodes, the other 1 only by id: over the 8000-character budget, merge or \
+            "3 of 4 nodes, the other 1 by count: over the 8000-character budget, merge or \
              retire some"
         );
         // Decisions alone over it: still every one, in full.
@@ -2099,12 +2079,7 @@ mod tests {
         let short = located(Scope::Mine, "short", Kind::Decision, "Rust.");
         let taste = located(Scope::Mine, "small", Kind::Taste, "Keep it small.");
         let big = located(Scope::Mine, "big", Kind::Taste, &"Keep it. ".repeat(30));
-        let fact = located(
-            Scope::Machine,
-            "lima",
-            Kind::Fact,
-            &"Lima is here. ".repeat(8),
-        );
+        let fact = located(Scope::Machine, "lima", Kind::Fact, "Lima is here.");
         let said = |nodes: Vec<&Located>, budget: usize| {
             let within = render_within(nodes, &[], &[], budget);
             let over = within.over(budget);
@@ -2112,7 +2087,7 @@ mod tests {
         };
         // It fits: nothing is said.
         assert_eq!(said(vec![&taste], DEFAULT_BUDGET).0, None);
-        // One node over: every decision, the taste, and the fact by id.
+        // One node over: every decision, the taste, and the fact by count.
         let full = render_scopes(
             &Loaded {
                 nodes: vec![rule.clone(), taste.clone(), fact.clone()],
@@ -2127,18 +2102,18 @@ mod tests {
             over.unwrap(),
             format!(
                 "the knowledge is {full} characters, over the {} an agent will reliably read: \
-                 the briefing holds every decision and 1 more, and names the other 1 only by id; \
+                 the briefing holds every decision and 1 more, and names the other 1 by count; \
                  merge or retire some (`ohjaa check`)",
                 full - 1
             )
         );
         // The decisions fit, the first of the rest does not.
-        let (over, full, _) = said(vec![&short, &big, &fact], 500);
+        let (over, full, _) = said(vec![&short, &big, &fact], 450);
         assert_eq!(
             over.unwrap(),
             format!(
-                "the knowledge is {full} characters, over the 500 an agent will reliably read: \
-                 the briefing holds its decisions alone, and names the other 2 only by id; merge \
+                "the knowledge is {full} characters, over the 450 an agent will reliably read: \
+                 the briefing holds its decisions alone, and names the other 2 by count; merge \
                  or retire some (`ohjaa check`)"
             )
         );
@@ -2149,7 +2124,7 @@ mod tests {
             format!(
                 "the knowledge is {full} characters, and its decisions alone are over the 100 an \
                  agent will reliably read: the briefing holds every decision, in {len} \
-                 characters, and names the other 2 only by id; merge or retire some (`ohjaa check`)"
+                 characters, and names the other 2 by count; merge or retire some (`ohjaa check`)"
             )
         );
         // Decisions, and nothing else, over it.
@@ -2166,14 +2141,9 @@ mod tests {
 
     /// Over the budget, a degrade and not a cliff: every decision in full,
     /// then taste, lesson and fact, each newest first, for as long as they
-    /// fit with the names of the rest; then those names.
+    /// fit with the count of the rest; then that count.
     #[test]
     fn over_the_budget_the_block_keeps_every_decision_then_taste_lesson_fact_newest_first() {
-        // As long as real nodes are: naming one costs less than showing it.
-        const LIMA: &str =
-            "Lima is here, and every Linux build and test runs in its VM, never on this Mac itself.";
-        const MENU: &str = "A menu of next steps at the end of a turn is stopping: keep working \
-                            through what is still in scope.";
         let dated = |scope, id, kind, as_of: &str, body| {
             let mut node = located(scope, id, kind, body);
             node.node.as_of = date(as_of);
@@ -2209,8 +2179,20 @@ mod tests {
                     "2026-10-27",
                     "Keep it small.",
                 ),
-                dated(Scope::Mine, "menu", Kind::Lesson, "2026-10-27", MENU),
-                dated(Scope::Machine, "lima", Kind::Fact, "2026-09-27", LIMA),
+                dated(
+                    Scope::Mine,
+                    "menu",
+                    Kind::Lesson,
+                    "2026-10-27",
+                    "A menu is stopping.",
+                ),
+                dated(
+                    Scope::Machine,
+                    "lima",
+                    Kind::Fact,
+                    "2026-09-27",
+                    "Lima is here.",
+                ),
                 dated(
                     Scope::Machine,
                     "vm",
@@ -2222,52 +2204,65 @@ mod tests {
             ..Loaded::default()
         };
         let scopes = [Scope::Mine, Scope::Machine];
+        let start = INSTRUCTIONS_PREAMBLE.len() + 1;
         let block = |budget| {
             let compact = render_compact(&loaded, &scopes, budget);
             (compact.text, compact.shown, compact.more)
         };
-        let (rust, box_rule) = ("- decision: Rust only.", "- decision: Builds in /tmp.");
-        let (answer, small) = ("- taste: Answer first.", "- taste: Keep it small.");
-        let (menu, lima) = (format!("- lesson: {MENU}"), format!("- fact: {LIMA}"));
-        let vm = "- fact: The VM's /tmp empties.";
-        let text = |lines: &[&str], left: &[&str]| {
-            let mut text = format!("{INSTRUCTIONS_PREAMBLE}\n");
-            for line in lines {
-                text.push_str(line);
-                text.push('\n');
-            }
-            if !left.is_empty() {
-                text.push_str(&format!(
-                    "Not shown, to fit what an agent reliably reads: {}. `ohjaa graph <id>` \
-                     prints one.\n",
-                    left.join(", ")
-                ));
-            }
-            text
-        };
         // All of it fits: briefing order, as it always was.
-        let all = text(&[rust, answer, small, &menu, box_rule, &lima, vm], &[]);
+        let all = format!(
+            "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only.\n- taste: Answer first.\n\
+             - taste: Keep it small.\n- lesson: A menu is stopping.\n- decision: Builds in /tmp.\n\
+             - fact: Lima is here.\n- fact: The VM's /tmp empties.\n"
+        );
+        assert_eq!(all.len(), start + 181);
         assert_eq!(block(all.len()), (all.clone(), 7, 0));
-        // One node over the budget: the oldest fact goes, and is named.
-        let six = text(&[rust, answer, small, &menu, box_rule, vm], &["lima"]);
-        assert!(six.len() < all.len());
-        assert_eq!(block(all.len() - 1), (six, 6, 1));
+        // One node over the budget: the oldest fact goes, and is counted.
+        assert_eq!(
+            block(all.len() - 1),
+            (
+                format!(
+                    "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only.\n- taste: Answer first.\n\
+                     - taste: Keep it small.\n- lesson: A menu is stopping.\n\
+                     - decision: Builds in /tmp.\n- fact: The VM's /tmp empties.\n\
+                     1 more: `ohjaa list`\n"
+                ),
+                6,
+                1
+            )
+        );
         // The lesson does not fit: the filling stops there, though the
         // oldest fact, shorter, would have fitted after it.
-        let four = text(&[rust, answer, small, box_rule], &["menu", "lima", "vm"]);
-        assert!(menu.len() > lima.len());
-        let lima_fits = four.len() + lima.len() + 1 - "lima, ".len();
-        assert_eq!(block(lima_fits), (four, 4, 3));
+        assert_eq!(
+            block(start + 148),
+            (
+                format!(
+                    "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only.\n- taste: Answer first.\n\
+                     - taste: Keep it small.\n- decision: Builds in /tmp.\n3 more: `ohjaa list`\n"
+                ),
+                4,
+                3
+            )
+        );
         // The newest taste first.
-        let three = text(&[rust, small, box_rule], &["answer", "menu", "lima", "vm"]);
-        assert_eq!(block(three.len()), (three, 3, 4));
-        // The decisions alone over it: every one, in full, and the rest named.
+        assert_eq!(
+            block(start + 96),
+            (
+                format!(
+                    "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only.\n- taste: Keep it small.\n\
+                     - decision: Builds in /tmp.\n4 more: `ohjaa list`\n"
+                ),
+                3,
+                4
+            )
+        );
+        // The decisions alone over it: every one, in full, and the rest counted.
         assert_eq!(
             block(10),
             (
-                text(
-                    &[rust, box_rule],
-                    &["answer", "small", "menu", "lima", "vm"]
+                format!(
+                    "{INSTRUCTIONS_PREAMBLE}\n- decision: Rust only.\n\
+                     - decision: Builds in /tmp.\n5 more: `ohjaa list`\n"
                 ),
                 2,
                 5

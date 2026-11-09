@@ -914,7 +914,7 @@ fn review_shows_a_readable_card_and_concise_success_without_hiding_history_failu
     let said = tty.all();
     assert!(said.contains("is not in the home's history"), "{said}");
     let words = said.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(words.contains("Agent instructions include 17 of 42 saved rules in full; 25 are only named, by id, because the text exceeds 8000 characters."), "{said}");
+    assert!(words.contains("Agent instructions include 18 of 42 saved rules in full; 24 are only named by count because the text exceeds 8000 characters."), "{said}");
     assert!(words.contains("No saved knowledge was removed."), "{said}");
     assert!(
         fs::read_to_string(tty.config().join("mine/another-rule.md"))

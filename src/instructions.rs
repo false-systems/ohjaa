@@ -453,8 +453,9 @@ pub fn sync(concise: bool) -> Vec<String> {
         ));
         if compact.more > 0 {
             said.push(format!(
-                "Agent instructions include {} of {} saved rules in full; {} are only named, by id, because the text exceeds {} \
-                 characters. No saved knowledge was removed. See `ohjaa list` to review it.",
+                "Agent instructions include {} of {} saved rules in full; {} are only named by \
+                 count because the text exceeds {} characters. No saved knowledge was removed. \
+                 See `ohjaa list` to review it.",
                 compact.shown,
                 compact.shown + compact.more,
                 compact.more,
