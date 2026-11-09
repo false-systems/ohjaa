@@ -214,8 +214,6 @@ pub struct NativeSession {
     pub testimony: bool,
 }
 
-impl Native {}
-
 /// The `source` of a native session only the agent's environment named.
 pub const ENV_SOURCE: &str = "env";
 

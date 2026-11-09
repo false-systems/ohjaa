@@ -15,30 +15,22 @@
         "README.md",
         "rust-toolchain.toml",
         "scripts/vendor-faija-knowledge.sh",
-        "src/adopt.rs",
         "src/apply.rs",
         "src/collect.rs",
-        "src/derived.rs",
         "src/doctor.rs",
         "src/evidence.rs",
         "src/flat_toml.rs",
-        "src/gate.rs",
         "src/gitconfig.rs",
         "src/home.rs",
-        "src/hook.rs",
         "src/human.rs",
         "src/instructions.rs",
         "src/intake.rs",
-        "src/integrated.rs",
         "src/knowledge.rs",
         "src/lessons.rs",
         "src/lessons/spelling.rs",
-        "src/lifecycle.rs",
         "src/main.rs",
-        "src/mark.rs",
         "src/process.rs",
         "src/repo_docs.rs",
-        "src/report.rs",
         "src/roots.rs",
         "src/scan.rs",
         "src/sessions.rs",
@@ -55,7 +47,11 @@
         "vendor/faija-knowledge.contract",
         "vendor/faija-knowledge/Cargo.toml",
         "vendor/faija-knowledge/src/lib.rs"
-      ]
+      ],
+      "env": {
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build",
+        "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target"
+      }
     },
     {
       "name": "clippy",
@@ -74,30 +70,22 @@
         "README.md",
         "rust-toolchain.toml",
         "scripts/vendor-faija-knowledge.sh",
-        "src/adopt.rs",
         "src/apply.rs",
         "src/collect.rs",
-        "src/derived.rs",
         "src/doctor.rs",
         "src/evidence.rs",
         "src/flat_toml.rs",
-        "src/gate.rs",
         "src/gitconfig.rs",
         "src/home.rs",
-        "src/hook.rs",
         "src/human.rs",
         "src/instructions.rs",
         "src/intake.rs",
-        "src/integrated.rs",
         "src/knowledge.rs",
         "src/lessons.rs",
         "src/lessons/spelling.rs",
-        "src/lifecycle.rs",
         "src/main.rs",
-        "src/mark.rs",
         "src/process.rs",
         "src/repo_docs.rs",
-        "src/report.rs",
         "src/roots.rs",
         "src/scan.rs",
         "src/sessions.rs",
@@ -114,7 +102,11 @@
         "vendor/faija-knowledge.contract",
         "vendor/faija-knowledge/Cargo.toml",
         "vendor/faija-knowledge/src/lib.rs"
-      ]
+      ],
+      "env": {
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build",
+        "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target"
+      }
     },
     {
       "name": "test",
@@ -133,30 +125,22 @@
         "README.md",
         "rust-toolchain.toml",
         "scripts/vendor-faija-knowledge.sh",
-        "src/adopt.rs",
         "src/apply.rs",
         "src/collect.rs",
-        "src/derived.rs",
         "src/doctor.rs",
         "src/evidence.rs",
         "src/flat_toml.rs",
-        "src/gate.rs",
         "src/gitconfig.rs",
         "src/home.rs",
-        "src/hook.rs",
         "src/human.rs",
         "src/instructions.rs",
         "src/intake.rs",
-        "src/integrated.rs",
         "src/knowledge.rs",
         "src/lessons.rs",
         "src/lessons/spelling.rs",
-        "src/lifecycle.rs",
         "src/main.rs",
-        "src/mark.rs",
         "src/process.rs",
         "src/repo_docs.rs",
-        "src/report.rs",
         "src/roots.rs",
         "src/scan.rs",
         "src/sessions.rs",
@@ -173,7 +157,11 @@
         "vendor/faija-knowledge.contract",
         "vendor/faija-knowledge/Cargo.toml",
         "vendor/faija-knowledge/src/lib.rs"
-      ]
+      ],
+      "env": {
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build",
+        "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target"
+      }
     }
   ]
 }

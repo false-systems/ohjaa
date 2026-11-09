@@ -92,118 +92,6 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
-/// Whether a validation is of work on its way to the observed branch, or of
-/// what is already on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ValidationKind {
-    Candidate,
-    Integrated,
-}
-
-/// The receipt sykli wrote for a validation: its path, and its sha256 as
-/// sykli gave it (the name it keeps the receipt under, or its status).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReceiptRef {
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub digest: Option<String>,
-}
-
-/// A validation requested from inside a session (`ohjaa gate`). It is a
-/// reference, never an outcome: what became of the run is sykli's to say,
-/// and while no receipt is recorded sykli is asked again whenever it is
-/// shown. Written before sykli is asked; sykli's run id and the receipt are
-/// filled in as sykli gives them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ValidationRef {
-    /// ohjaa's id for the request (`rq-…`).
-    pub request: String,
-    /// sykli's id for the run, once sykli gave one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run: Option<String>,
-    /// Integrated: HEAD was the observed branch's tip as this clone last saw
-    /// it (`origin/<branch>`); candidate: anything else.
-    pub kind: ValidationKind,
-    /// The checkout it was requested in.
-    pub repo: String,
-    /// HEAD when it was requested, and its tree.
-    pub commit: String,
-    pub tree: String,
-    /// The contract it was requested against.
-    pub contract: String,
-    /// The contract's hash: the one its `sykli.lock` pins, else the one sykli
-    /// reported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contract_digest: Option<String>,
-    /// The lock's digest, as sykli reported it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lock_digest: Option<String>,
-    pub requested_ms: i64,
-    /// The receipt sykli wrote for it, once there is one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub receipt: Option<ReceiptRef>,
-    /// The clone's git common dir: sykli keeps its runs there, so they can be
-    /// asked about from any checkout of the clone once this one is gone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub common: Option<String>,
-    /// The branch the entry observes, as this clone last saw it when the
-    /// validation was requested: never a statement about the remote now.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observed_branch: Option<ObservedBranch>,
-    /// What sykli says ran: the tree, and whether anything beside it was
-    /// dirty. It may differ from `tree`: a run of uncommitted changes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ran: Option<Ran>,
-    /// Recorded, then never handed to sykli, and why (an integrated
-    /// validation whose checkout could not be made, say): said, never
-    /// left to read as a run that is merely late.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub not_dispatched: Option<String>,
-}
-
-/// `origin/<branch>` in the requesting clone, as of its last update there.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObservedBranch {
-    pub name: String,
-    /// Where `origin/<branch>` was; `None` when the clone has no such ref.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tip: Option<String>,
-    /// When it last moved in this clone (its reflog, else its file).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated_ms: Option<i64>,
-}
-
-/// The subject of a run, in sykli's words.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Ran {
-    pub tree: String,
-    pub dirty: bool,
-}
-
-impl ValidationRef {
-    /// Integrated only when sykli says the run was of exactly the commit's
-    /// tree, nothing dirty beside it, and the commit was the observed
-    /// branch's tip as this clone saw it; a candidate otherwise, and until
-    /// sykli has said what ran.
-    pub fn settle_kind(&mut self) {
-        let at_tip = self
-            .observed_branch
-            .as_ref()
-            .and_then(|branch| branch.tip.as_deref())
-            == Some(self.commit.as_str());
-        let exact = self
-            .ran
-            .as_ref()
-            .is_some_and(|ran| !ran.dirty && ran.tree == self.tree);
-        self.kind = if at_tip && exact {
-            ValidationKind::Integrated
-        } else {
-            ValidationKind::Candidate
-        };
-    }
-}
-
 /// One phase of work: a commit, and what sykli saw on it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Phase {
@@ -350,8 +238,6 @@ pub struct Left {
     pub native: Option<crate::usage::Native>,
 }
 
-impl Left {}
-
 /// A repository a session named with `--scope`, as it stood at entering. It
 /// is observed like the one the session was launched in: its sessions counted
 /// at launch, its commits and pull request at leaving.
@@ -451,9 +337,6 @@ pub struct Session {
     /// refusal is said, never shown as "not collected".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_refused: Option<String>,
-    /// Validations requested from inside the session, oldest first.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub validations: Vec<ValidationRef>,
     /// The agent's own sessions its environment named when it read back or
     /// handed over from inside this one, first named first: several after a
     /// `/clear`. Leaving adds them to `left.native`. Older records have none.
@@ -1044,49 +927,6 @@ fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), Sto
     Ok(())
 }
 
-/// A fresh id for a validation request (`ohjaa gate`), in the same style.
-pub fn new_request_id(at_ms: i64) -> String {
-    format!("rq-{at_ms}-{}", std::process::id())
-}
-
-/// The pid of the ohjaa that started a session, from its id.
-pub fn pid_of(id: &str) -> Option<u32> {
-    let (_, pid) = id.strip_prefix("oh-")?.rsplit_once('-')?;
-    pid.parse().ok().filter(|pid| *pid > 0)
-}
-
-/// What a session still open in the log is, observed now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Open {
-    /// Its ohjaa still runs, or that cannot be told: it is left alone.
-    Running,
-    /// Its ohjaa is gone, but the session's own process group still runs (or
-    /// that cannot be told): its agent outlived its ohjaa. Not an orphan;
-    /// its leaving will not be recorded.
-    OhjaaGone,
-    /// Its ohjaa is gone, and so is its process group (or none was
-    /// recorded): an orphan.
-    Orphaned,
-}
-
-/// Observe an open session now: its ohjaa by the pid in its id, then its
-/// process group (`pgid`). A process is never declared gone on a guess.
-pub fn observe_open(session: &Session) -> Open {
-    let Some(pid) = pid_of(&session.id) else {
-        return Open::Running;
-    };
-    if pid == std::process::id()
-        || crate::process::ohjaa_alive(pid, session.started_ms) != Some(false)
-    {
-        return Open::Running;
-    }
-    let started = session.group_started_ms.unwrap_or(session.started_ms);
-    match session.pgid {
-        Some(pgid) if crate::process::group_alive(pgid, started) != Some(false) => Open::OhjaaGone,
-        _ => Open::Orphaned,
-    }
-}
-
 /// Session ids are names, never paths.
 pub fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
@@ -1104,17 +944,6 @@ pub fn clock(ms: i64) -> String {
     let full = rfc3339(ms.div_euclid(1000));
     // "2026-09-26T10:02:03Z" → "2026-09-26 10:02 UTC"
     format!("{} {} UTC", &full[..10], &full[11..16])
-}
-
-/// How much of a run sykli reused from its cache instead of running it, said
-/// apart from what ran: ` (1 of 3 tasks cached)`, ` (all 2 tasks cached)`,
-/// or nothing when every task ran (or the receipt does not say).
-pub fn describe_cached(evidence: &Evidence) -> String {
-    match (evidence.cached, evidence.tasks) {
-        (0, _) => String::new(),
-        (cached, tasks) if cached >= tasks => format!(" (all {cached} tasks cached)"),
-        (cached, tasks) => format!(" ({cached} of {tasks} tasks cached)"),
-    }
 }
 
 pub fn describe_check(check: &Check) -> String {
@@ -1302,7 +1131,6 @@ mod tests {
             task: None,
             pgid: None,
             group_started_ms: None,
-            validations: Vec::new(),
             native_env: Vec::new(),
         }
     }

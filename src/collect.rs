@@ -1,12 +1,10 @@
 //! `ohjaa collect`: what the human view cannot work out while a terminal
 //! opens, gathered into one snapshot that `ohjaa line` and `ohjaa digest`
-//! read. Five parts, each asked once, at the same time:
+//! read. Four parts, each asked once, at the same time:
 //!
-//! - `local`: the marks on each entry's branch and the open sessions as ohjaa
-//!   finds them now (the marks' git and sykli, and `ps`), from
-//!   [`report::build_marks`];
-//! - `github`: the pull requests updated in the entries' owners, one search
-//!   through `gh api graphql`, at most [`MAX_GH_CALLS`] calls;
+//! - `github`: the pull requests updated in the owners of the fleet's clones
+//!   under the roots (those with `.toimija/repo.yaml`), one search through
+//!   `gh api graphql`, at most [`MAX_GH_CALLS`] calls;
 //! - `usage`: what vessa reads in the transcripts of the sessions ended
 //!   lately, joined by the agent's own session ids ohjaa found at leaving;
 //! - `typed`: the first words the person typed in each of those sessions,
@@ -24,8 +22,7 @@
 //! itself, as it speaks, and `ohjaa digest` asks for the fleet itself. Each
 //! part says when it was read, what it could not read, and, when it could
 //! not answer, why; a part that failed keeps what it held before, as of
-//! then, and so does a branch whose marks could not be read, and every
-//! branch when the entries themselves could not be listed.
+//! then.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -37,8 +34,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::knowledge::Dirs;
-use crate::sessions::{self, Check, Session};
-use crate::{home, intake, mark, process, report, usage};
+use crate::sessions::{self, Session};
+use crate::{gitconfig, home, intake, process, usage};
 
 pub const SCHEMA: &str = "ohjaa-collected.v1";
 
@@ -87,8 +84,6 @@ pub fn lock_path(dirs: &Dirs) -> PathBuf {
 pub struct Collected {
     pub schema: String,
     pub at_ms: i64,
-    #[serde(default)]
-    pub local: Part<Local>,
     #[serde(default)]
     pub github: Part<Vec<Pr>>,
     /// By ohjaa session id.
@@ -253,43 +248,6 @@ impl<T: Clone> Part<T> {
     }
 }
 
-/// What ohjaa works out here: the marks, and the open sessions now.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Local {
-    pub branches: Vec<Branch>,
-    /// Open sessions whose ohjaa is gone while their process group runs on.
-    #[serde(default)]
-    pub gone: Vec<String>,
-    /// Open sessions whose ohjaa and process group are both gone.
-    #[serde(default)]
-    pub orphaned: Vec<String>,
-}
-
-/// An entry's branch, as its marks say, tip first.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Branch {
-    /// `owner/name`.
-    pub slug: String,
-    pub branch: String,
-    /// Where this clone last saw origin's copy of it.
-    pub tip: Option<String>,
-    /// The commits above the first proven one, and of them how many failed
-    /// and how many sykli could say nothing about.
-    pub unproven: usize,
-    pub failed: usize,
-    pub unknown: usize,
-    /// The oldest of them.
-    pub oldest: Option<String>,
-    /// The walk stopped before a proven commit: more may lie below.
-    pub more: bool,
-    /// When its marks were last read: what it says is as of then.
-    #[serde(default)]
-    pub as_of_ms: Option<i64>,
-    /// Why its marks could not be read this time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Pr {
     /// `owner/name`.
@@ -364,8 +322,9 @@ pub fn write(dirs: &Dirs, collected: &Collected) -> Result<()> {
 }
 
 /// Ask every source, each on its own thread, and keep what a failed one
-/// held before. `repos` are the git repositories under the roots (for the
-/// marks); GitHub and vessa are asked about what happened since `from_ms`.
+/// held before. `repos` are the git repositories under the roots: GitHub is
+/// asked about the owners of the fleet's among them. GitHub and vessa are
+/// asked about what happened since `from_ms`.
 pub fn collect(
     dirs: &Dirs,
     repos: Result<Vec<PathBuf>, String>,
@@ -373,20 +332,34 @@ pub fn collect(
     now_ms: i64,
 ) -> Collected {
     let before = read(dirs).unwrap_or_default();
-    let owners = owners();
-    let known = &before.local.value.branches;
     let ended = ended_since(dirs, from_ms);
     let ended = || ended.as_deref().map_err(String::clone);
     let mut collected = std::thread::scope(|scope| {
-        let local = scope.spawn(|| repos.map(|repos| local(dirs, &repos, known, now_ms)));
-        let github = scope.spawn(|| github(&owners?, from_ms));
+        let github = scope.spawn(|| {
+            let (owners, mut gaps) = owners(&repos?);
+            // No owner found, but not every clone could be read: whose pull
+            // requests to ask for is unknown, never "none".
+            if let (true, Some(first)) = (owners.is_empty(), gaps.first()) {
+                return Err(format!(
+                    "{} under the roots could not be read, so whose pull requests to ask \
+                     GitHub for is unknown: {first}",
+                    if gaps.len() == 1 {
+                        "1 clone".to_owned()
+                    } else {
+                        format!("{} clones", gaps.len())
+                    }
+                ));
+            }
+            let (prs, more) = github(&owners, from_ms)?;
+            gaps.extend(more);
+            Ok((prs, gaps))
+        });
         let usage = scope.spawn(|| usage(ended()?));
         let typed = scope.spawn(|| typed(ended()?, now_ms));
         let secrets = scope.spawn(|| secrets(&before.secrets.value, from_ms, now_ms));
         Collected {
             schema: SCHEMA.to_owned(),
             at_ms: now_ms,
-            local: Part::read(joined(local), &before.local, now_ms, None),
             github: Part::read(joined(github), &before.github, now_ms, Some(from_ms)),
             usage: Part::read(joined(usage), &before.usage, now_ms, Some(from_ms)),
             typed: Part::read(joined(typed), &before.typed, now_ms, Some(from_ms)),
@@ -405,99 +378,50 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, Answer<T>>) -> Answer<T> 
         .unwrap_or_else(|_| Err("its reader panicked".to_owned()))
 }
 
-/// The marks and the open sessions, as `ohjaa report --marks` finds them;
-/// what it could not read is said beside them, and a branch whose marks
-/// could not be read keeps what `known` said of it.
-fn local(dirs: &Dirs, repos: &[PathBuf], known: &[Branch], now_ms: i64) -> (Local, Vec<String>) {
-    let report = report::build_marks(dirs, repos, now_ms - report::WEEK_MS, now_ms);
-    let branches = branches(&report.marks, report.unlisted.as_deref(), known, now_ms);
-    let open = |pick: fn(&report::Untold) -> bool| {
-        report
-            .open
-            .iter()
-            .filter(|s| pick(s))
-            .map(|s| s.id.clone())
-            .collect()
-    };
-    let local = Local {
-        branches,
-        gone: open(|s| s.ohjaa_gone),
-        orphaned: open(|s| s.orphaned),
-    };
-    (local, report.gaps)
-}
-
-/// Each entry's branch now. When the entries themselves could not be listed
-/// (`unlisted`, why), no entry's absence says anything: every branch known
-/// stays as it was last read, with why it was not read this time.
-pub fn branches(
-    marks: &[(String, Result<mark::Marks, String>)],
-    unlisted: Option<&str>,
-    known: &[Branch],
-    now_ms: i64,
-) -> Vec<Branch> {
-    match unlisted {
-        Some(why) => known
-            .iter()
-            .map(|last| Branch {
-                error: Some(why.to_owned()),
-                ..last.clone()
-            })
-            .collect(),
-        None => marks
-            .iter()
-            .map(|(slug, marked)| branch(slug, marked, known, now_ms))
-            .collect(),
-    }
-}
-
-/// An entry's branch now, or, when its marks cannot be read, as it was last
-/// read: a branch that failed stays failed until a read says otherwise.
-pub fn branch(
-    slug: &str,
-    marked: &Result<mark::Marks, String>,
-    known: &[Branch],
-    now_ms: i64,
-) -> Branch {
-    let marks = match marked {
-        Ok(marks) => marks,
-        Err(why) => {
-            let last = known
-                .iter()
-                .find(|b| b.slug == slug && b.as_of_ms.is_some())
-                .cloned();
-            return Branch {
-                slug: slug.to_owned(),
-                error: Some(why.clone()),
-                ..last.unwrap_or_default()
-            };
-        }
-    };
-    let unproven = marks.unproven();
-    let count = |is: fn(&Check) -> bool| unproven.iter().filter(|w| is(&w.check)).count();
-    Branch {
-        slug: slug.to_owned(),
-        branch: marks.gate.branch.clone(),
-        tip: marks.commits.first().map(|w| w.commit.clone()),
-        unproven: unproven.len(),
-        failed: count(|c| matches!(c, Check::Failed { .. })),
-        unknown: count(|c| matches!(c, Check::Unverified { .. })),
-        oldest: unproven.last().map(|w| w.commit.clone()),
-        more: matches!(marks.ended, mark::Ended::Cap | mark::Ended::NotAsked),
-        as_of_ms: Some(now_ms),
-        error: None,
-    }
-}
-
-/// The owners of the workflow home's entries: whose pull requests to show.
-fn owners() -> Result<Vec<String>, String> {
-    let home = home::ohjaa_home().map_err(|error| format!("{error:#}"))?;
-    let entries = home::entry_dirs(&home).map_err(|error| format!("{error:#}"))?;
-    let owners: BTreeSet<String> = entries
+/// The owners on GitHub of the fleet's clones under the roots, those that
+/// declare themselves in `.toimija/repo.yaml` (as `ohjaa system` counts the
+/// fleet), from each one's origin: whose pull requests to show. A clone of
+/// someone else's project under a root is no part of the fleet, so its
+/// owner never fills the search. Each clone's config is read once (one `git
+/// config`), all at the same time; one that cannot be read is said beside
+/// them.
+fn owners(repos: &[PathBuf]) -> (Vec<String>, Vec<String>) {
+    let fleet: Vec<&PathBuf> = repos
         .iter()
-        .filter_map(|(slug, _)| slug.split_once('/').map(|(owner, _)| owner.to_owned()))
+        .filter(|repo| repo.join(".toimija/repo.yaml").is_file())
         .collect();
-    Ok(owners.into_iter().collect())
+    let read: Vec<Result<Option<String>, String>> = std::thread::scope(|scope| {
+        fleet
+            .iter()
+            .map(|repo| {
+                scope.spawn(move || {
+                    let listing =
+                        gitconfig::clone_listing(repo).map_err(|error| format!("{error:#}"))?;
+                    Ok(gitconfig::fetch_url(&listing, "origin")
+                        .as_deref()
+                        .and_then(home::RepoId::parse)
+                        .filter(|id| id.host.as_deref() == Some("github.com"))
+                        .map(|id| id.owner.to_ascii_lowercase()))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err("its reader panicked".to_owned()))
+            })
+            .collect()
+    });
+    let mut owners = BTreeSet::new();
+    let mut gaps = Vec::new();
+    for answer in read {
+        match answer {
+            Ok(owner) => owners.extend(owner),
+            Err(why) => gaps.push(why),
+        }
+    }
+    (owners.into_iter().collect(), gaps)
 }
 
 /// The search: every pull request in `owners` updated since `from_ms` (to
@@ -515,7 +439,11 @@ fn github(owners: &[String], from_ms: i64) -> Result<(Vec<Pr>, Vec<String>), Str
     if owners.is_empty() {
         return Ok((
             Vec::new(),
-            vec!["the workflow home has no entries, so no owner to ask GitHub about".to_owned()],
+            vec![
+                "no clone of the fleet under the roots (one with .toimija/repo.yaml) has its origin on \
+                 GitHub, so no owner to ask it about"
+                    .to_owned(),
+            ],
         ));
     }
     let search = search(owners, from_ms);
@@ -1418,77 +1346,6 @@ mod tests {
         assert!(!answered.failed());
         let partly = Part::read(Ok((vec![3], vec!["a page".into()])), &before, 9, None);
         assert!(partly.failed(), "a gap is no all-clear");
-    }
-
-    /// Review of #63, finding 2: a branch whose marks cannot be read stays
-    /// as it was last read, with its time and why, until a read says
-    /// otherwise.
-    #[test]
-    fn a_branch_that_cannot_be_read_stays_as_it_was_last_read() {
-        let known = vec![Branch {
-            slug: "false-systems/habitat".into(),
-            branch: "main".into(),
-            tip: Some("86bd44c0".into()),
-            unproven: 3,
-            failed: 1,
-            oldest: Some("1a2b3c4d".into()),
-            as_of_ms: Some(5_000),
-            ..Branch::default()
-        }];
-        let unread = Err("git: cannot run".to_owned());
-        let kept = branch("false-systems/habitat", &unread, &known, 9_000);
-        assert_eq!(
-            (kept.unproven, kept.failed, kept.as_of_ms),
-            (3, 1, Some(5_000))
-        );
-        assert_eq!(kept.error.as_deref(), Some("git: cannot run"));
-        let never = branch("false-systems/valvo", &unread, &known, 9_000);
-        assert_eq!((never.unproven, never.as_of_ms), (0, None));
-        assert!(never.error.is_some());
-    }
-
-    /// Second review of #63, finding 1: when the entries cannot be listed
-    /// (or the workflow home cannot be found), every branch known stays as
-    /// it was last read, with why; none is dropped, and no pseudo-entry
-    /// takes their place.
-    #[test]
-    fn every_branch_stays_as_last_read_when_the_entries_cannot_be_listed() {
-        let known = vec![
-            Branch {
-                slug: "false-systems/sykli".into(),
-                branch: "main".into(),
-                tip: Some("5fcdeef0".into()),
-                unproven: 1,
-                failed: 1,
-                oldest: Some("5fcdeef0".into()),
-                as_of_ms: Some(5_000),
-                ..Branch::default()
-            },
-            Branch {
-                slug: "false-systems/ohjaa".into(),
-                branch: "main".into(),
-                as_of_ms: Some(5_000),
-                ..Branch::default()
-            },
-        ];
-        let why = "the entries cannot be listed: cannot read /h/repos/false-systems";
-        let kept = branches(&[], Some(why), &known, 9_000);
-        assert_eq!(kept.len(), 2);
-        for (kept, last) in kept.iter().zip(&known) {
-            assert_eq!(
-                (&kept.slug, kept.unproven, kept.failed, kept.as_of_ms),
-                (&last.slug, last.unproven, last.failed, Some(5_000))
-            );
-            assert_eq!(kept.error.as_deref(), Some(why));
-        }
-        // Listed: an entry gone from the home is gone from the marks.
-        let listed = vec![(
-            "false-systems/ohjaa".to_owned(),
-            Err::<mark::Marks, _>("git: cannot run".to_owned()),
-        )];
-        let now = branches(&listed, None, &known, 9_000);
-        assert_eq!(now.len(), 1);
-        assert_eq!(now[0].slug, "false-systems/ohjaa");
     }
 
     #[test]

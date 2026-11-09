@@ -29,7 +29,7 @@ fn derived_roots(git_root: Option<&Path>) -> Vec<PathBuf> {
     }
 }
 
-fn parse_config(contents: &str) -> Vec<PathBuf> {
+pub fn parse_config(contents: &str) -> Vec<PathBuf> {
     contents
         .lines()
         .filter_map(|line| {

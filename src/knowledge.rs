@@ -157,7 +157,7 @@ pub fn clone_key(repo: &Path) -> PathBuf {
     let common = repo
         .ancestors()
         .find(|dir| dir.join(".git").exists())
-        .and_then(|dir| crate::hook::common_dir_in(dir, None, None));
+        .and_then(crate::gitconfig::common_dir_in);
     let key = common.unwrap_or_else(|| repo.to_path_buf());
     std::fs::canonicalize(&key).unwrap_or(key)
 }
@@ -383,29 +383,9 @@ impl Flag {
     }
 }
 
-pub fn on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(name);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            candidate
-                .metadata()
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        }
-        #[cfg(not(unix))]
-        {
-            candidate.is_file()
-        }
-    })
-}
-
 fn holds(predicate: &Predicate, repo_root: Option<&Path>) -> bool {
     match predicate {
-        Predicate::Command(name) => on_path(name),
+        Predicate::Command(name) => crate::home::on_path(name).is_some(),
         Predicate::Path(path) => {
             let resolved = if path.starts_with('/') || path.starts_with("~/") {
                 expand_home(path)

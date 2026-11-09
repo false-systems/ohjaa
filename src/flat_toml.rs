@@ -150,26 +150,6 @@ pub fn quote(value: &str) -> String {
     out
 }
 
-/// Refuse keys other than `allowed` in `table`, so a misspelt key is an error
-/// rather than a setting silently not applied.
-pub fn only_keys(tables: &Tables, table: &str, allowed: &[&str]) -> Result<(), String> {
-    match tables
-        .get(table)
-        .and_then(|keys| keys.keys().find(|key| !allowed.contains(&key.as_str())))
-    {
-        Some(key) => Err(format!(
-            "unknown key {key}{}; the keys read here are {}",
-            if table.is_empty() {
-                String::new()
-            } else {
-                format!(" in [{table}]")
-            },
-            allowed.join(", ")
-        )),
-        None => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,13 +209,5 @@ mod tests {
         for text in ["k = truer\n", "k = True\n", "k = true false\n"] {
             assert!(parse(text).is_err(), "{text:?}");
         }
-    }
-
-    #[test]
-    fn unknown_keys_are_named() {
-        let tables = parse("branch = \"main\"\nbrnch = \"x\"\n").unwrap();
-        let error = only_keys(&tables, "", &["branch"]).unwrap_err();
-        assert!(error.contains("brnch"), "{error}");
-        assert!(only_keys(&parse("branch = \"main\"\n").unwrap(), "", &["branch"]).is_ok());
     }
 }

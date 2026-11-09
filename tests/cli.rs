@@ -2931,42 +2931,6 @@ fn no_repositories_under_the_roots_holds_the_cursor_and_says_so() {
 
 // ---- where work happens (audit 2026-10-09): each test failed before its fix ----
 
-/// A clone of a bare origin whose `main` has one commit, as `origin/main`.
-fn clone_with_origin(fixture: &Fixture, name: &str) -> PathBuf {
-    let origin = fixture.dir.join(format!("{name}-origin.git"));
-    let status = Command::new("git")
-        .args(["init", "-q", "--bare", "-b", "main"])
-        .arg(&origin)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let repo = fixture.dir.join(name);
-    let status = Command::new("git")
-        .args(["clone", "-q"])
-        .arg(&origin)
-        .arg(&repo)
-        .output()
-        .unwrap();
-    assert!(status.status.success());
-    run_git(&repo, &["config", "user.email", "ohjaa@example.invalid"]);
-    run_git(&repo, &["config", "user.name", "Ohjaa Test"]);
-    // Long before the session, as far as reflog times say.
-    for args in [
-        &["commit", "-q", "--allow-empty", "-m", "init"][..],
-        &["push", "-q", "origin", "HEAD:main"],
-    ] {
-        let status = Command::new("git")
-            .args(args)
-            .env("GIT_COMMITTER_DATE", "@1000000000 +0000")
-            .current_dir(&repo)
-            .output()
-            .unwrap();
-        assert!(status.status.success(), "{status:?}");
-    }
-    run_git(&repo, &["remote", "set-head", "origin", "main"]);
-    repo
-}
-
 /// Two sessions launched at once in one checkout of a new repository, x
 /// and y, each making a worktree and a commit there while the other is in
 /// the checkout, one after the other (`after`: the mark it waits for).
@@ -3105,231 +3069,6 @@ fn a_wait_that_ran_out_in_the_two_sessions_test_never_passes_it() {
     fixture.cleanup();
 }
 
-#[test]
-fn a_window_with_more_commits_than_a_report_judges_says_so() {
-    if !git_available() {
-        return;
-    }
-    let fixture = Fixture::new("report-cap");
-    let repo = fixture.make_git_repo("work");
-    let status = Command::new("sh")
-        .args([
-            "-c",
-            "i=0; while [ $i -lt 101 ]; do git commit -q --allow-empty -m c$i || exit 1; i=$((i+1)); done",
-        ])
-        .current_dir(&repo)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let (stdout, _, code) = output_of(
-        fixture
-            .ohjaa()
-            .arg("--root")
-            .arg(&fixture.dir)
-            .arg("report")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
-            .current_dir(&repo),
-    );
-    assert_eq!(code, Some(4), "{stdout}");
-    assert!(
-        stdout.contains("of 100 first-parent commit(s) in 1 repository")
-            && stdout.contains(
-                "work: only the newest 100 default-branch commits in the window were judged"
-            )
-            && stdout.contains("The rest: 0 verified · 100 without a sykli contract"),
-        "{stdout}"
-    );
-    fixture.cleanup();
-}
-
-/// `command` run under a pseudo-terminal, as a person's shell would run it,
-/// with its output; `None` where `script` is not there to make one.
-fn under_a_terminal(command: &Command) -> Option<String> {
-    let mut line = vec![command.get_program().to_string_lossy().into_owned()];
-    line.extend(command.get_args().map(|a| a.to_string_lossy().into_owned()));
-    let quoted = line
-        .iter()
-        .map(|word| format!("'{}'", word.replace('\'', "'\\''")))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut script = Command::new("script");
-    if cfg!(target_os = "macos") {
-        script.args(["-q", "/dev/null", "sh", "-c", &quoted]);
-    } else {
-        script.args(["-qec", &quoted, "/dev/null"]);
-    }
-    for (key, value) in command.get_envs() {
-        match value {
-            Some(value) => script.env(key, value),
-            None => script.env_remove(key),
-        };
-    }
-    if let Some(dir) = command.get_current_dir() {
-        script.current_dir(dir);
-    }
-    let output = script.stdin(std::process::Stdio::null()).output().ok()?;
-    Some(String::from_utf8_lossy(&output.stdout).replace('\r', ""))
-}
-
-/// What a command could change in the log: its digest, its size and when it
-/// was last written.
-fn log_stamp(log: &Path) -> (String, u64, std::time::SystemTime) {
-    use sha2::{Digest, Sha256};
-    let meta = fs::metadata(log).unwrap();
-    (
-        format!("{:x}", Sha256::digest(fs::read(log).unwrap())),
-        meta.len(),
-        meta.modified().unwrap(),
-    )
-}
-
-/// `ohjaa report --json` is `ohjaa-marks.v1`, for other tools to read, and
-/// it moves nothing: not the session log, not the report's bookmarks, even
-/// at a terminal, where the report for people does mark the week.
-#[test]
-fn report_json_is_ohjaa_marks_v1_and_writes_nothing() {
-    if !git_available() {
-        return;
-    }
-    let fixture = Fixture::new("marks-json");
-    let repo = clone_with_origin(&fixture, "work");
-    let (_, stderr, code) = output_of(
-        fixture
-            .ohjaa()
-            .args([
-                "propose",
-                "--scope",
-                "ours",
-                "--id",
-                "rust-only",
-                "--kind",
-                "decision",
-                "--origin",
-                "2026-09-16: 'we dont do python'",
-                "Code is Rust.",
-            ])
-            .current_dir(&repo),
-    );
-    assert_eq!(code, Some(0), "{stderr}");
-    let state = fixture.dir.join("state/ohjaa");
-    let log = state.join("sessions.redb");
-    let at = state.join("report-at");
-    fs::write(&at, "1000\n").unwrap();
-    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    fs::File::options()
-        .write(true)
-        .open(&at)
-        .unwrap()
-        .set_modified(hour_ago)
-        .unwrap();
-    let stamps = || (log.exists(), log_stamp(&at));
-    let before = stamps();
-    let mut command = fixture.ohjaa();
-    command
-        .arg("--root")
-        .arg(&fixture.dir)
-        .args(["report", "--json"])
-        .env("OHJAA_STUB_SYKLI_COMMIT", "1")
-        .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
-        .current_dir(&repo);
-    let (stdout, stderr, code) = output_of(&mut command);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    assert_eq!(
-        stamps(),
-        before,
-        "report --json wrote the log or a bookmark"
-    );
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["schema"], "ohjaa-marks.v1");
-    let keys = |value: &serde_json::Value| {
-        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
-        keys.sort();
-        keys
-    };
-    assert_eq!(
-        keys(&json),
-        [
-            "complete",
-            "entries",
-            "generated",
-            "proposals",
-            "report",
-            "schema",
-            "sessions",
-            "unlisted"
-        ]
-    );
-    assert_eq!(json["entries"], serde_json::json!([]), "no entries here");
-    // No entries, and listed: none in the home, not none read.
-    assert_eq!(json["unlisted"], serde_json::Value::Null);
-    assert_eq!(json["proposals"]["listed"], true);
-    let waiting = &json["proposals"]["waiting"][0];
-    assert_eq!(keys(waiting), ["name", "repo", "scope", "since", "title"]);
-    assert_eq!(waiting["name"], "rust-only");
-    assert_eq!(waiting["scope"], "ours");
-    assert_eq!(waiting["title"], "Code is Rust.");
-    assert_eq!(json["report"]["schema"], "ohjaa-report.v1");
-    // Its keys stay (ohjaa-marks.v1 only gains keys), saying ohjaa launches
-    // no session to judge.
-    assert_eq!(
-        json["report"]["sessions_without_testimony"],
-        serde_json::json!([])
-    );
-    assert_eq!(json["report"]["bypasses"]["judged"], false);
-    assert!(json["report"]["bypasses"]["why"]
-        .as_str()
-        .unwrap()
-        .contains("no longer launches agents"));
-
-    // `--marks`: the same view without the window, its keys the same.
-    let mut marks_only = fixture.ohjaa();
-    marks_only
-        .arg("--root")
-        .arg(&fixture.dir)
-        .args(["report", "--json", "--marks"])
-        .env("OHJAA_STUB_SYKLI_COMMIT", "1")
-        .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
-        .current_dir(&repo);
-    let (stdout, stderr, code) = output_of(&mut marks_only);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let marks: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(keys(&marks), keys(&json));
-    assert_eq!(marks["report"], serde_json::Value::Null);
-    assert_eq!(marks["proposals"], json["proposals"]);
-    assert_eq!(stamps(), before, "report --json --marks wrote");
-    if let Some(said) = under_a_terminal(&marks_only) {
-        assert!(said.contains("ohjaa-marks.v1"), "{said}");
-        assert_eq!(
-            stamps(),
-            before,
-            "report --json --marks at a terminal wrote"
-        );
-    }
-
-    // At a terminal too: `--json` is never the person's report.
-    if let Some(said) = under_a_terminal(&command) {
-        assert!(said.contains("ohjaa-marks.v1"), "{said}");
-        assert_eq!(stamps(), before, "report --json at a terminal wrote");
-        assert!(!state.join("report-shown-at").exists());
-        // The control: the report for people, at the same terminal, is
-        // the week's.
-        let mut human = fixture.ohjaa();
-        human
-            .arg("--root")
-            .arg(&fixture.dir)
-            .arg("report")
-            .env("OHJAA_STUB_SYKLI_COMMIT", "1")
-            .env("OHJAA_STUB_VESSA_JSON", fixture.dir.join("vessa.json"))
-            .current_dir(&repo);
-        let said = under_a_terminal(&human).unwrap();
-        assert!(said.contains("ohjaa report, "), "{said}");
-        assert!(state.join("report-shown-at").exists(), "{said}");
-        assert_ne!(log_stamp(&at), before.1, "the week was marked");
-        assert!(!log.exists(), "the log is only read, never made");
-    }
-    fixture.cleanup();
-}
-
 // ---- KATANA D4 ----------------------------------------------------------------
 
 /// `ohjaa usage export` (ohjaa-sessions.v1) from `repo`.
@@ -3443,12 +3182,18 @@ impl Fixture {
         self.human_view_with(more, 0);
     }
 
+    /// A clone whose origin is on GitHub (whose owner's pull requests the
+    /// stub gh answers), and a proposal that waits for the person: what needs
+    /// their attention.
     fn human_view_with(&self, more: bool, extra: u64) {
-        let entry = self.dir.join("config/ohjaa/repos/false-systems/sykli");
-        fs::create_dir_all(&entry).unwrap();
-        fs::write(entry.join("repo.toml"), "branch = \"main\"\n").unwrap();
+        waiting_proposal(
+            &self.dir.join("state/ohjaa/proposals/mine"),
+            "decide-me",
+            "Decide me.",
+        );
         let clone = self.dir.join("sykli");
-        fs::create_dir_all(&clone).unwrap();
+        fs::create_dir_all(clone.join(".toimija")).unwrap();
+        fs::write(clone.join(".toimija/repo.yaml"), "repo:\n  name: sykli\n").unwrap();
         run_git(&clone, &["init", "-q", "-b", "main"]);
         run_git(
             &clone,
@@ -3674,12 +3419,8 @@ fn quiet_startup_retains_unread_pull_requests_across_days() {
     fixture.human_view(false);
     fixture.make_git_repo("work");
     output_of(fixture.person().arg("collect"));
-    // The rendering fixture has activity but no outstanding branch notices.
-    let path = fixture.human_dir().join("collected.json");
-    let mut collected: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    collected["local"]["value"]["branches"] = serde_json::json!([]);
-    fs::write(path, serde_json::to_string(&collected).unwrap()).unwrap();
+    // The rendering fixture has activity, and nothing waits for a decision.
+    fs::remove_file(fixture.dir.join("state/ohjaa/proposals/mine/decide-me.md")).unwrap();
     let day = |date: &str| on_a_terminal(fixture.person().arg("line").env("OHJAA_TODAY", date)).0;
     assert_eq!(day("2026-10-27"), "");
     assert_eq!(day("2026-10-28"), "");
@@ -3901,16 +3642,10 @@ impl Fixture {
             }
         };
         back(&mut snapshot["at_ms"]);
-        for part in ["local", "github", "usage", "typed", "secrets"] {
+        for part in ["github", "usage", "typed", "secrets"] {
             back(&mut snapshot[part]["as_of_ms"]);
         }
         back(&mut snapshot["secrets"]["value"]["read_ms"]);
-        for branch in snapshot["local"]["value"]["branches"]
-            .as_array_mut()
-            .unwrap()
-        {
-            back(&mut branch["as_of_ms"]);
-        }
         fs::write(&path, snapshot.to_string()).unwrap();
     }
 
@@ -3927,8 +3662,8 @@ impl Fixture {
     }
 }
 
-/// Finding 1: an entry that cannot be marked, or repositories whose sessions
-/// cannot be listed, are said as what could not be read, in the day's
+/// Finding 1: a clone whose config cannot be read, or repositories whose
+/// sessions cannot be listed, are said as what could not be read, in the day's
 /// digest and the full one, and the digest exits 4: never an all-clear.
 /// Finding 6: the fleet is not in the snapshot; the digest asks for it.
 #[test]
@@ -3938,9 +3673,9 @@ fn what_could_not_be_read_is_said_never_an_all_clear() {
     }
     let fixture = Fixture::new("human-unread");
     fixture.human_view(false);
-    let valvo = fixture.dir.join("config/ohjaa/repos/false-systems/valvo");
-    fs::create_dir_all(&valvo).unwrap();
-    fs::write(valvo.join("repo.toml"), "branch = \"main\"\n").unwrap();
+    let valvo = fixture.make_git_repo("valvo");
+    fs::write(valvo.join(".toimija/repo.yaml"), "repo:\n  name: valvo\n").unwrap();
+    fs::write(valvo.join(".git/config"), "[[[ not git's\n").unwrap();
     fixture.make_repo("broken");
     let (stdout, _, code) = output_of(fixture.person().arg("collect"));
     assert_eq!(code, Some(4), "{stdout}");
@@ -3950,11 +3685,9 @@ fn what_could_not_be_read_is_said_never_an_all_clear() {
     let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
     assert_eq!(code, Some(4), "{digest}");
     for said in [
-        "! marks",
+        "! GitHub",
         "1 could not be read",
-        "false-systems/valvo",
-        "! sykli",
-        "main: no verified passing result for 1 recent commit",
+        "valvo",
         "could not be scanned",
     ] {
         assert!(digest.contains(said), "missing `{said}`: {digest}");
@@ -3967,7 +3700,7 @@ fn what_could_not_be_read_is_said_never_an_all_clear() {
             .env("OHJAA_TODAY", "2026-10-27"),
     );
     assert!(
-        daily.contains("Missing or incomplete information: repository checks"),
+        daily.contains("Missing or incomplete information: pull requests"),
         "{daily}"
     );
     assert!(daily.contains("Refresh: ohjaa collect"), "{daily}");
@@ -4008,70 +3741,6 @@ fn what_the_days_digest_left_out_is_what_ohjaa_digest_shows() {
         "seen in full: {again}"
     );
     fixture.cleanup();
-}
-
-#[test]
-fn startup_keeps_liveness_warnings_with_long_recorded_goals() {
-    for orphaned in [false, true] {
-        let fixture = Fixture::new("line-long-liveness-goal");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        let goal = "Keep this complete recorded goal available. ".repeat(40);
-        fs::create_dir_all(fixture.dir.join("state/ohjaa")).unwrap();
-        {
-            let db = redb::Database::create(fixture.dir.join("state/ohjaa/sessions.redb")).unwrap();
-            let tx = db.begin_write().unwrap();
-            let session = serde_json::json!({
-                "id": "long-liveness-goal", "agent": "codex", "repo": "/synthetic/ohjaa",
-                "intent": "interactive", "started_ms": now - 172_800_000, "delivered": [],
-                "readback": {"at_ms": now - 172_800_000, "text": goal}
-            })
-            .to_string();
-            tx.open_table(redb::TableDefinition::<&str, &[u8]>::new("sessions"))
-                .unwrap()
-                .insert("long-liveness-goal", session.as_bytes())
-                .unwrap();
-            tx.commit().unwrap();
-        }
-        let mut snapshot = serde_json::json!({"schema": "ohjaa-collected.v1", "at_ms": now});
-        for part in ["local", "github", "usage", "typed", "secrets"] {
-            snapshot[part] = serde_json::json!({"as_of_ms": now});
-        }
-        snapshot["local"]["value"] = if orphaned {
-            serde_json::json!({"branches": [], "orphaned": ["long-liveness-goal"]})
-        } else {
-            serde_json::json!({"branches": [], "gone": ["long-liveness-goal"]})
-        };
-        fs::create_dir_all(fixture.human_dir()).unwrap();
-        fs::write(
-            fixture.human_dir().join("collected.json"),
-            snapshot.to_string(),
-        )
-        .unwrap();
-        let (daily, code) = on_a_terminal(fixture.person().arg("line"));
-        eprintln!("Synthetic liveness startup (orphaned={orphaned}):\n{daily}");
-        assert_eq!(code, Some(0));
-        let words = daily.split_whitespace().collect::<Vec<_>>().join(" ");
-        let warning = if orphaned {
-            "Neither the agent nor its supervisor was found running"
-        } else {
-            "Agent still running without its Ohjaa supervisor"
-        };
-        assert!(words.contains(warning), "{daily}");
-        assert!(!daily.contains("ohjaa session"), "{daily}");
-        assert!(daily.lines().count() <= 15, "{daily}");
-        assert!(
-            daily.lines().all(|line| line.chars().count() <= 100),
-            "{daily}"
-        );
-        let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
-        assert_eq!(code, Some(0), "{digest}");
-        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(words.contains(goal.trim()), "{digest}");
-        fixture.cleanup();
-    }
 }
 
 #[test]
@@ -4223,23 +3892,12 @@ fn terminals_opened_together_say_a_line_once() {
             .env("OHJAA_TODAY", "2026-10-27"),
     );
     run_session(&fixture, &repo, "exit 0");
-    let clone = fixture.dir.join("sykli");
-    run_git(
-        &clone,
-        &[
-            "-c",
-            "user.email=o@example.invalid",
-            "-c",
-            "user.name=O",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "two",
-        ],
+    // Something new: one more proposal waits.
+    waiting_proposal(
+        &fixture.dir.join("state/ohjaa/proposals/mine"),
+        "decide-me-too",
+        "Decide me too.",
     );
-    run_git(&clone, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-    output_of(fixture.person().arg("collect"));
     let claim = fixture.human_dir().join("seen.lock");
     let held = fs::File::create(&claim).unwrap();
     {
@@ -4258,7 +3916,11 @@ fn terminals_opened_together_say_a_line_once() {
     };
     assert_eq!(line(), "", "another terminal is saying it");
     drop(held);
-    assert!(line().contains("sykli main: no passing verification recorded"));
+    let said = line();
+    assert!(
+        said.contains("1 proposed agent instruction awaits your decision"),
+        "{said}"
+    );
     assert_eq!(line(), "");
     fixture.cleanup();
 }
@@ -4274,64 +3936,61 @@ fn hold(path: &Path) -> fs::File {
     held
 }
 
-/// Finding 1: when the entries themselves cannot be listed, every branch
-/// stays as it was last read, said with that time, and nothing like an
-/// entry named `(entries)` takes their place.
+/// collect asks GitHub about the owners on GitHub of the fleet's clones
+/// under the roots (those with `.toimija/repo.yaml`), each found from its
+/// origin: the fixture's clone of false-systems/sykli. Never the owner of a
+/// clone of someone else's project, on GitHub or elsewhere.
 #[test]
-fn a_branch_stays_as_last_read_when_the_entries_cannot_be_listed() {
+fn collect_asks_github_about_the_owners_of_the_fleets_clones() {
     if !git_available() {
         return;
     }
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = Fixture::new("human-unlisted");
+    let fixture = Fixture::new("human-owners");
     fixture.human_view(false);
-    let (stdout, stderr, code) = output_of(fixture.person().arg("collect"));
+    let elsewhere = fixture.make_git_repo("elsewhere");
+    run_git(
+        &elsewhere,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://gitlab.com/someone/elsewhere.git",
+        ],
+    );
+    // A clone of someone else's project on GitHub: no part of the fleet.
+    let upstream = fixture.make_git_repo("upstream");
+    fs::remove_dir_all(upstream.join(".toimija")).unwrap();
+    run_git(
+        &upstream,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/busy-org/upstream.git",
+        ],
+    );
+    let calls = fixture.dir.join("gh-calls");
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .person()
+            .arg("collect")
+            .env("OHJAA_STUB_GH_CALLS", &calls),
+    );
     assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let owner = fixture.dir.join("config/ohjaa/repos/false-systems");
-    fs::set_permissions(&owner, fs::Permissions::from_mode(0o000)).unwrap();
-    let unlisted = output_of(fixture.person().arg("collect"));
-    let marks = output_of(fixture.person().args(["report", "--json", "--marks"]));
-    fs::set_permissions(&owner, fs::Permissions::from_mode(0o755)).unwrap();
-    let (stdout, stderr, code) = unlisted;
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    // Review of #67, finding 3: `ohjaa-marks.v1` says why no entry is
-    // listed, in its own key.
-    let (stdout, stderr, code) = marks;
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(
-        (&json["complete"], &json["entries"]),
-        (&serde_json::json!(false), &serde_json::json!([]))
-    );
+    let asked = fs::read_to_string(&calls).unwrap_or_default();
     assert!(
-        json["unlisted"]
-            .as_str()
-            .is_some_and(|why| why.starts_with("the entries cannot be listed: cannot read")),
-        "{stdout}"
+        asked.contains("api graphql"),
+        "GitHub was never asked: {asked}"
     );
-    let snapshot = fs::read_to_string(fixture.human_dir().join("collected.json")).unwrap();
-    assert!(!snapshot.contains("(entries)"), "{snapshot}");
-    let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
-    assert_eq!(code, Some(4), "{digest}");
-    let mut rows = digest.lines().skip_while(|line| !line.contains("! sykli"));
-    let first = rows
-        .next()
-        .unwrap_or_else(|| panic!("sykli dropped from what stays: {digest}"));
-    let still_open = std::iter::once(first)
-        .chain(rows.take_while(|line| line.starts_with("    ")))
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(
-        still_open.contains("main: no verified passing result for 1 recent commit")
-            && still_open.contains("Could not refresh:"),
-        "{digest}"
-    );
+    assert!(asked.contains("q=org:false-systems is:pr"), "{asked}");
+    assert!(!asked.contains("someone"), "{asked}");
+    assert!(!asked.contains("busy-org"), "{asked}");
     fixture.cleanup();
 }
 
-/// The nit: a git that fails is no missing clone. The branch stays as it
-/// was last read (the first review's finding 2, at the CLI), and the reason
-/// says the clone could not be read.
+/// The nit: a git that fails is no missing clone. When no clone's config
+/// can be read, whose pull requests to ask GitHub for is unknown, never
+/// none, and the reason says the clone could not be read.
 #[test]
 fn a_git_that_fails_is_said_as_that_never_as_a_missing_clone() {
     if !git_available() {
@@ -4358,19 +4017,20 @@ fn a_git_that_fails_is_said_as_that_never_as_a_missing_clone() {
     assert_eq!(code, Some(4), "{stdout}{stderr}");
     let snapshot = fs::read_to_string(fixture.human_dir().join("collected.json")).unwrap();
     assert!(
-        !snapshot.contains("no clone under the roots has it as origin"),
+        !snapshot.contains("no clone under the roots has its origin on GitHub"),
         "{snapshot}"
     );
     assert!(
-        snapshot.contains("may have it as origin could not be read")
+        snapshot.contains("1 clone under the roots could not be read, so whose pull requests")
             && snapshot.contains("git is broken here"),
         "{snapshot}"
     );
     let (digest, _, code) = output_of(fixture.person().args(["digest", "--no-collect"]));
     assert_eq!(code, Some(4), "{digest}");
+    let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        digest.contains("main: no verified passing result for 1 recent commit")
-            && digest.contains("Could not refresh:"),
+        words.contains("Pull request activity: unavailable")
+            && words.contains("git is broken here"),
         "{digest}"
     );
     fixture.cleanup();
@@ -4747,50 +4407,5 @@ fn malformed_secrets_coverage_is_incomplete_and_keeps_the_retry_boundary() {
         .as_str()
         .unwrap()
         .contains("unreadable-path list"));
-    fixture.cleanup();
-}
-
-/// `ohjaa adopt --help` says what an entry holds. It said the entry kept the
-/// gate "copied from the repository's sykli.json", while every commit's gate
-/// is derived from that commit, and `ohjaa doctor` calls such a copy never
-/// read.
-#[test]
-fn adopt_help_says_the_entry_keeps_no_copy_of_a_gate() {
-    let fixture = Fixture::new("adopt-help");
-    let (stdout, stderr, code) = output_of(fixture.ohjaa().args(["adopt", "--help"]));
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let said = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        said.contains(
-            "The entry keeps no copy of a gate: every commit's gate is derived from that \
-             commit's own sykli.json, else from what `sykli init` writes for its tree"
-        ),
-        "{stdout}"
-    );
-    // A commit whose contract is a sykli.rs is not handed to sykli init: it
-    // has no gate (`Holds::Emitter`).
-    assert!(
-        said.contains("a commit whose only contract is a sykli.rs has none"),
-        "{stdout}"
-    );
-    assert!(!said.contains("copied from"), "{stdout}");
-    fixture.cleanup();
-}
-
-/// The pre-push hook hands sykli the gate derived from the pushed commit,
-/// not a copy kept in the entry, which ohjaa no longer writes or reads.
-#[test]
-fn hook_help_hands_sykli_the_gate_derived_from_the_pushed_commit() {
-    let fixture = Fixture::new("hook-help");
-    let (stdout, stderr, code) = output_of(fixture.ohjaa().args(["hook", "--help"]));
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let said = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(!said.contains("<entry>/sykli.json"), "{stdout}");
-    assert!(!said.contains("an entry without a gate"), "{stdout}");
-    assert!(
-        said.contains("--contract <gate>")
-            && said.contains("<gate> is the gate derived from the pushed commit"),
-        "{stdout}"
-    );
     fixture.cleanup();
 }
