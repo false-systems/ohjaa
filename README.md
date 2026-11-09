@@ -1222,8 +1222,11 @@ For agents not launched through ohjaa, `ohjaa brief --write <file>` writes the
 Knowledge as a generated block into an instruction file such as `CLAUDE.md` or
 `AGENTS.md`, and leaves everything else in the file alone.
 
-Your general knowledge (mine, machine) reaches every agent's own global
-instruction file the same way, from one source, the nodes in the home.
+The team's knowledge and yours (ours, mine, machine) reach every agent's own
+global instruction file the same way, from one source, the nodes. Every agent
+reads its own file wherever it starts; a workplace file in the folder above
+the repositories is not read by Codex or opencode, which stop at a
+repository's root (tested with each agent, 2026-11-09).
 `ohjaa apply` writes the block into each of these that exists, where the
 agent itself finds it, and creates none:
 
@@ -1242,7 +1245,7 @@ without origins:
 
 ```
 <!-- ohjaa:knowledge begin: mine and machine, written by `ohjaa apply` and after each decision, … -->
-Knowledge (ohjaa, mine and machine): what the person you work for has decided and knows. …
+Knowledge (ohjaa): what your team and the person you work for have decided and know. …
 - decision: Code is Rust, or Elixir/Erlang.
 - fact: Linux and eBPF builds and tests run in the Lima VM.
 <!-- ohjaa:knowledge end -->
@@ -1290,19 +1293,19 @@ same, the briefing leaves out what the block holds and says where it is, in
 one line, with the file's full path:
 
 ```
-Mine and machine (41 nodes) are not repeated here: Claude Code has them from its own instructions, /Users/you/.claude/CLAUDE.md, whose ohjaa block is current.
+The team's, mine and machine (41 nodes) are not repeated here: Claude Code has them from its own instructions, /Users/you/.claude/CLAUDE.md, whose ohjaa block is current.
 ```
 
 A block over its own budget holds every decision and the rest by priority,
 as above. The nodes it names only by count are then carried by the briefing,
-within the briefing's budget, and the line says so (`Mine and machine:
-Claude Code has 41 of their 42 nodes from its own instructions, …, whose
+within the briefing's budget, and the line says so (`The team's, mine and
+machine: Claude Code has 41 of their 42 nodes from its own instructions, …, whose
 ohjaa block is current; the other 1 is above.`). A flagged node is still
 repeated, with its flag, since the block carries no flags (`Flagged, so
 repeated above: <id>.`).
 
-The briefing carries mine and machine, within its budget, and its one line
-says why (`Mine and machine are carried here, not left to Codex's own
+The briefing carries the team's, mine and machine, within its budget, and its
+one line says why (`The team's, mine and machine are carried here, not left to Codex's own
 instructions: /Users/you/.codex/AGENTS.md does not exist.`), when:
 
 - the file is missing, holds no block, holds a block apply did not write, holds
@@ -1565,9 +1568,7 @@ ohjaa run codex --intent "change the parser" -- --model o3
 
 The launcher `ohjaa apply` puts in `~/.zshrc` routes `claude` and `codex`
 typed at a terminal through `ohjaa run` in any folder, the home folder as much
-as a repository: the team's knowledge (ours) reaches an agent only through
-the briefing, since an agent's own instruction file holds mine and machine
-alone. Outside every repository the session is the folder's.
+as a repository. Outside every repository the session is the folder's.
 
 Launch agents from the folder that holds your repositories. You can give a goal
 without choosing the repositories first:
@@ -1676,7 +1677,7 @@ starts it.
                                     a block marked "ohjaa apply" holds .sykli/, .teko/ and .ohjaa/
 ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.pi/agent/AGENTS.md,
 ~/.config/opencode/AGENTS.md        each that exists: a block marked "ohjaa:knowledge"
-                                    holds mine and machine (see "Keeping it true")
+                                    holds ours, mine and machine (see "Keeping it true")
 ```
 
 ```bash
@@ -2424,7 +2425,7 @@ each in full, with what ohjaa keeps where.
   and the change stands. Outside the
   home, `ohjaa apply` changes only one `include.path` in git's global config,
   a marked block in git's global excludes file, one line of `~/.zshrc`, and a
-  marked block of mine and machine knowledge (`ohjaa:knowledge`) in each
+  marked block of the team's, mine and machine knowledge (`ohjaa:knowledge`) in each
   agent's own global instruction file that already exists outside every
   repository (Claude Code's `~/.claude/CLAUDE.md`, Codex's
   `~/.codex/AGENTS.md`, pi's `~/.pi/agent/AGENTS.md`, opencode's

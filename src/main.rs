@@ -392,7 +392,7 @@ enum Cmd {
         git's global excludes  a block marked \"ohjaa apply\" holding .sykli/ .teko/ .ohjaa/\n  \
         ~/.zshrc               [[ -x <ohjaa> ]] && eval \"$(<ohjaa> shell-init zsh)\", in place\n                         \
         of a line that sources ~/projects/ohjaa-launch.zsh\n  \
-        each agent's own       a block marked \"ohjaa:knowledge\" holding mine and machine\n  \
+        each agent's own       a block marked \"ohjaa:knowledge\" holding the team's, mine and machine\n  \
         instruction file       knowledge, in each that exists outside every repository:\n                         \
         ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.pi/agent/AGENTS.md,\n                         \
         ~/.config/opencode/AGENTS.md (none is created); each decision\n                         \
@@ -865,10 +865,10 @@ fn knowledge_briefing_for(
         eprintln!("ohjaa: knowledge does not hold together: {error}");
     }
     let flags = knowledge::flags(&loaded, dirs.repo_root.as_deref(), knowledge::today());
-    let home = [Scope::Mine, Scope::Machine];
+    let home = instructions::OWN_FILE_SCOPES;
     let current = knowledge::in_scopes(&loaded, scopes);
-    // Mine and machine, as the agent's own file would hold them now, and
-    // whether it does.
+    // What the agent's own file holds (the team's, mine and machine), as it
+    // would hold it now, and whether it does.
     let own = agent
         .filter(|_| current.iter().any(|located| home.contains(&located.scope)))
         .and_then(|(agent, args)| {
@@ -1044,14 +1044,14 @@ fn source_line(
     };
     match source {
         instructions::Source::OwnFile { agent, file } if compact.more == 0 => format!(
-            "Mine and machine ({} node{}) are not repeated here: {agent} has them from its own \
+            "The team's, mine and machine ({} node{}) are not repeated here: {agent} has them from its own \
              instructions, {}, whose ohjaa block is current.{flagged}",
             compact.shown,
             if compact.shown == 1 { "" } else { "s" },
             file.display()
         ),
         instructions::Source::OwnFile { agent, file } => format!(
-            "Mine and machine: {agent} has {} of their {} nodes from its own instructions, {}, \
+            "The team's, mine and machine: {agent} has {} of their {} nodes from its own instructions, {}, \
              whose ohjaa block is current; the other {} {} above{}.{flagged}",
             compact.shown,
             compact.shown + compact.more,
@@ -1066,7 +1066,7 @@ fn source_line(
         ),
         instructions::Source::Briefing { agent, why } => {
             format!(
-                "Mine and machine are carried here, not left to {agent}'s own instructions: {why}."
+                "The team's, mine and machine are carried here, not left to {agent}'s own instructions: {why}."
             )
         }
     }

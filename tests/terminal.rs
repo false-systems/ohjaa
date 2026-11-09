@@ -1010,8 +1010,8 @@ fn each_decision_is_one_commit_in_the_home_and_rewrites_the_agents_block() {
         format!(
             "<!-- ohjaa:knowledge begin: mine and machine, written by `ohjaa apply` and after \
              each decision, removed by `ohjaa apply --undo`; edit the nodes (`ohjaa list`), not \
-             this block -->\nKnowledge (ohjaa, mine and machine): what the person you work for \
-             has decided and knows. Follow it; if an entry looks wrong or stale, say so instead \
+             this block -->\nKnowledge (ohjaa): what your team and the person you work for \
+             have decided and know. Follow it; if an entry looks wrong or stale, say so instead \
              of quietly working around it. Propose changes with `ohjaa propose`; only a person \
              makes them current.\n{body}<!-- ohjaa:knowledge end -->\n"
         )

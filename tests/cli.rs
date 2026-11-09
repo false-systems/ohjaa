@@ -506,8 +506,8 @@ fn applied_block(lines: &[&str]) -> String {
     format!(
         "<!-- ohjaa:knowledge begin: mine and machine, written by `ohjaa apply` and after each \
          decision, removed by `ohjaa apply --undo`; edit the nodes (`ohjaa list`), not this \
-         block -->\nKnowledge (ohjaa, mine and machine): what the person you work for has \
-         decided and knows. Follow it; if an entry looks wrong or stale, say so instead of \
+         block -->\nKnowledge (ohjaa): what your team and the person you work for have \
+         decided and know. Follow it; if an entry looks wrong or stale, say so instead of \
          quietly working around it. Propose changes with `ohjaa propose`; only a person makes \
          them current.\n{}\n<!-- ohjaa:knowledge end -->\n",
         lines.join("\n")
@@ -1222,7 +1222,11 @@ fn the_briefing_leaves_out_what_the_agents_own_file_holds_current() {
     fixture.node(&machine, "lima", "fact", "Lima is here.");
     let file = fixture.dir.join("home/.claude/CLAUDE.md");
     fs::create_dir_all(file.parent().unwrap()).unwrap();
-    let current = applied_block(&["- decision: Rust only.", "- fact: Lima is here."]);
+    let current = applied_block(&[
+        "- decision: Team rule.",
+        "- decision: Rust only.",
+        "- fact: Lima is here.",
+    ]);
     fs::write(&file, format!("# My notes\n\n{current}")).unwrap();
     let brief = |agent: &str| {
         let (stdout, stderr, code) = output_of(
@@ -1240,7 +1244,7 @@ fn the_briefing_leaves_out_what_the_agents_own_file_holds_current() {
     assert_eq!(
         brief("claude"),
         format!(
-            "{KNOWLEDGE_PREAMBLE}{ours_part}\nMine and machine (2 nodes) are not repeated here: \
+            "The team's, mine and machine (3 nodes) are not repeated here: \
              Claude Code has them from its own instructions, {file_shown}, whose ohjaa block is \
              current.\n"
         )
@@ -1258,9 +1262,9 @@ fn the_briefing_leaves_out_what_the_agents_own_file_holds_current() {
     assert_eq!(
         brief("claude"),
         format!(
-            "{KNOWLEDGE_PREAMBLE}{ours_part}\nThis machine:\n- [fact] Lima is here.\n  \
+            "{KNOWLEDGE_PREAMBLE}\nThis machine:\n- [fact] Lima is here.\n  \
              (lima · as of 2026-09-20)\n  ! may no longer hold: \
-             command:no-such-command-ohjaa-test is false\n\nMine and machine (2 nodes) are not \
+             command:no-such-command-ohjaa-test is false\n\nThe team's, mine and machine (3 nodes) are not \
              repeated here: Claude Code has them from its own instructions, {file_shown}, whose \
              ohjaa block is current. Flagged, so repeated above: lima.\n"
         )
@@ -1284,7 +1288,7 @@ fn the_briefing_leaves_out_what_the_agents_own_file_holds_current() {
     // Carried in full, and why.
     let carried = |agent: &str, why: &str| {
         format!(
-            "{full}\nMine and machine are carried here, not left to {agent}'s own \
+            "{full}\nThe team's, mine and machine are carried here, not left to {agent}'s own \
              instructions: {why}.\n"
         )
     };
@@ -1371,14 +1375,14 @@ fn the_briefing_leaves_out_what_the_agents_own_file_holds_current() {
     // Codex reads its override first, where there is one.
     fs::create_dir_all(codex.parent().unwrap()).unwrap();
     fs::write(&codex, &current).unwrap();
-    let ours_and_line = |file: &Path| {
+    let only_the_line = |file: &Path| {
         format!(
-            "{KNOWLEDGE_PREAMBLE}{ours_part}\nMine and machine (2 nodes) are not repeated here: \
-             Codex has them from its own instructions, {}, whose ohjaa block is current.\n",
+            "The team's, mine and machine (3 nodes) are not repeated here: Codex has them from \
+             its own instructions, {}, whose ohjaa block is current.\n",
             file.display()
         )
     };
-    assert_eq!(brief("codex"), ours_and_line(&codex));
+    assert_eq!(brief("codex"), only_the_line(&codex));
     let wins = codex.with_file_name("AGENTS.override.md");
     fs::write(&wins, "# Override\n").unwrap();
     assert_eq!(
@@ -1426,7 +1430,11 @@ fn run_leaves_out_what_the_agents_own_file_holds_and_records_where_it_was() {
     fs::create_dir_all(file.parent().unwrap()).unwrap();
     fs::write(
         &file,
-        applied_block(&["- decision: Rust only.", "- fact: Lima is here."]),
+        applied_block(&[
+            "- decision: Team rule.",
+            "- decision: Rust only.",
+            "- fact: Lima is here.",
+        ]),
     )
     .unwrap();
     let (_, stderr, code) = output_of(
@@ -1437,12 +1445,14 @@ fn run_leaves_out_what_the_agents_own_file_holds_and_records_where_it_was() {
     );
     assert_eq!(code, Some(0), "{stderr}");
     let briefing = fixture.argv().join("\n");
+    // The team's rules are in the agent's own file with the person's: the
+    // briefing repeats none of them.
     assert!(
         briefing.contains(&format!(
-            "\nMine and machine (2 nodes) are not repeated here: Claude Code has them from its \
-             own instructions, {}, whose ohjaa block is current.\n",
+            "The team's, mine and machine (3 nodes) are not repeated here: Claude Code has them \
+             from its own instructions, {}, whose ohjaa block is current.\n",
             file.display()
-        )) && briefing.contains("- [decision] Team rule.")
+        )) && !briefing.contains("Team rule.")
             && !briefing.contains("Rust only.")
             && !briefing.contains("Lima is here."),
         "{briefing}"
@@ -1454,7 +1464,7 @@ fn run_leaves_out_what_the_agents_own_file_holds_and_records_where_it_was() {
     assert_eq!(
         export["sessions"][0]["delivered"],
         serde_json::json!([
-            {"id": "team", "scope": "ours", "as_of": "2026-09-20"},
+            {"id": "team", "scope": "ours", "as_of": "2026-09-20", "via": file.to_str().unwrap()},
             {"id": "rust", "scope": "mine", "as_of": "2026-09-20", "via": file.to_str().unwrap()},
             {"id": "lima", "scope": "machine", "as_of": "2026-09-20", "via": file.to_str().unwrap()},
         ])
@@ -1506,7 +1516,7 @@ fn a_node_the_agents_block_cuts_is_carried_by_the_briefing() {
         stdout,
         format!(
             "{KNOWLEDGE_PREAMBLE}\nThis machine:\n- [fact] {lima}\n  (lima · as of 2026-09-10)\n\
-             \nMine and machine: Claude Code has 41 of their 42 nodes from its own instructions, \
+             \nThe team's, mine and machine: Claude Code has 41 of their 42 nodes from its own instructions, \
              {}, whose ohjaa block is current; the other 1 is above.\n",
             file.display()
         )
@@ -1563,14 +1573,14 @@ fn an_agent_that_will_not_read_its_own_file_is_briefed_in_full() {
     fs::write(&file, &current).unwrap();
     let left_out = |agent: &str, file: &Path| {
         format!(
-            "Mine and machine (1 node) are not repeated here: {agent} has them from its own \
+            "The team's, mine and machine (1 node) are not repeated here: {agent} has them from its own \
              instructions, {}, whose ohjaa block is current.",
             file.display()
         )
     };
     let carried = |why: &str| {
         format!(
-            "Mine and machine are carried here, not left to Claude Code's own instructions: \
+            "The team's, mine and machine are carried here, not left to Claude Code's own instructions: \
              {why}."
         )
     };
@@ -1588,7 +1598,7 @@ fn an_agent_that_will_not_read_its_own_file_is_briefed_in_full() {
         let briefing = fixture.argv().join("\n");
         let line = briefing
             .lines()
-            .find(|line| line.starts_with("Mine and machine"))
+            .find(|line| line.starts_with("The team's, mine and machine"))
             .unwrap_or_else(|| panic!("no line about mine and machine: {briefing}"))
             .to_owned();
         (line, briefing.contains("- [decision] Rust only."))
@@ -1645,7 +1655,7 @@ fn an_agent_that_will_not_read_its_own_file_is_briefed_in_full() {
         assert_eq!(code, Some(0), "{stderr}");
         stdout
             .lines()
-            .find(|line| line.starts_with("Mine and machine"))
+            .find(|line| line.starts_with("The team's, mine and machine"))
             .unwrap_or_else(|| panic!("{stdout}"))
             .to_owned()
     };
@@ -1735,13 +1745,13 @@ fn every_agents_own_switch_and_a_relative_folder_carry_mine_and_machine() {
     }
     let left_out = |agent: &str, file: &Path| {
         format!(
-            "Mine and machine (1 node) are not repeated here: {agent} has them from its own \
+            "The team's, mine and machine (1 node) are not repeated here: {agent} has them from its own \
              instructions, {}, whose ohjaa block is current.",
             file.display()
         )
     };
     let carried = |agent: &str, why: &str| {
-        format!("Mine and machine are carried here, not left to {agent}'s own instructions: {why}.")
+        format!("The team's, mine and machine are carried here, not left to {agent}'s own instructions: {why}.")
     };
     let run = |agent: &str, args: &[&str], env: &[(&str, &str)]| {
         let mut command = fixture.ohjaa();
@@ -1757,7 +1767,7 @@ fn every_agents_own_switch_and_a_relative_folder_carry_mine_and_machine() {
         let briefing = fixture.argv().join("\n");
         let line = briefing
             .lines()
-            .find(|line| line.starts_with("Mine and machine"))
+            .find(|line| line.starts_with("The team's, mine and machine"))
             .unwrap_or_else(|| panic!("no line about mine and machine: {briefing}"))
             .to_owned();
         (line, briefing.contains("- [decision] Rust only."))
@@ -1892,8 +1902,7 @@ fn the_line_says_how_many_the_briefing_could_only_count() {
     }
     let fixture = Fixture::new("both-cut");
     let repo = fixture.make_git_repo("work");
-    let (ours, mine, machine) = (
-        fixture.dir.join("ours/knowledge"),
+    let (mine, machine) = (
         fixture.dir.join("config/ohjaa/mine"),
         fixture.dir.join("config/ohjaa/machine"),
     );
@@ -1919,14 +1928,15 @@ fn the_line_says_how_many_the_briefing_could_only_count() {
     fs::create_dir_all(file.parent().unwrap()).unwrap();
     fs::write(&file, applied_block(&lines)).unwrap();
     let line = format!(
-        "Mine and machine: Claude Code has 41 of their 43 nodes from its own instructions, {}, \
+        "The team's, mine and machine: Claude Code has 41 of their 43 nodes from its own instructions, {}, \
          whose ohjaa block is current; the other 2 are above, 1 of them only by count.",
         file.display()
     );
-    // Sized so that the briefing holds the team's taste and the newer fact,
-    // and the older only by count.
+    // Sized so that the briefing holds the repository's taste (no agent's
+    // own file holds a repository's knowledge) and the newer fact, and the
+    // older only by count.
     let team = "y".repeat(7000 - line.len());
-    fixture.node(&ours, "team", "taste", &team);
+    fixture.node(&repo.join(".ohjaa/knowledge"), "team", "taste", &team);
     let (stdout, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -1937,8 +1947,9 @@ fn the_line_says_how_many_the_briefing_could_only_count() {
     assert_eq!(
         stdout,
         format!(
-            "{KNOWLEDGE_PREAMBLE}\nOurs: decided by the team, binding everywhere:\n\
-             - [taste] {team}\n  (team · as of 2026-09-20)\n\nThis machine:\n- [fact] {vm}\n  \
+            "{KNOWLEDGE_PREAMBLE}\nThis repository:\n\
+             - [taste] {team}\n  (team · as of 2026-09-20 · not yet in AGENTS.md)\n\n\
+             This machine:\n- [fact] {vm}\n  \
              (vm · as of 2026-09-12)\n\n1 more: `ohjaa list`\n\n{line}\n"
         )
     );
@@ -1960,7 +1971,7 @@ fn the_line_about_mine_and_machine_is_inside_the_budget() {
     );
     let pi = fixture.dir.join("home/.pi/agent/AGENTS.md");
     let line = format!(
-        "Mine and machine are carried here, not left to pi's own instructions: {} does not \
+        "The team's, mine and machine are carried here, not left to pi's own instructions: {} does not \
          exist.",
         pi.display()
     );

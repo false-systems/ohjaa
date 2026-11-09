@@ -46,7 +46,9 @@ fn check_instructions(found: &mut Findings) {
     let compact = match crate::instructions::home_knowledge() {
         Ok((compact, _)) => compact,
         Err(error) => {
-            found.drift(format!("cannot read mine and machine knowledge: {error:#}"));
+            found.drift(format!(
+                "cannot read the knowledge for agents' own files: {error:#}"
+            ));
             return;
         }
     };

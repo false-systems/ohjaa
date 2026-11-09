@@ -819,7 +819,7 @@ pub fn write_block(existing: &str, briefing: &str) -> Result<String> {
 
 /// What opens the block in an agent's own instruction file.
 pub const INSTRUCTIONS_PREAMBLE: &str =
-    "Knowledge (ohjaa, mine and machine): what the person you work for has decided and knows. \
+    "Knowledge (ohjaa): what your team and the person you work for have decided and know. \
      Follow it; if an entry looks wrong or stale, say so instead of quietly working around it. \
      Propose changes with `ohjaa propose`; only a person makes them current.";
 
