@@ -2204,9 +2204,10 @@ fn show_acceptance(
     dirs: &Dirs,
     pending: &knowledge::Pending,
     loaded: &knowledge::Loaded,
+    waiting: &[knowledge::Pending],
     plain: bool,
 ) {
-    if let Some(why) = knowledge::cannot_accept(dirs, loaded, pending) {
+    if let Some(why) = knowledge::cannot_accept(dirs, loaded, pending, waiting) {
         let advice = format!("{why}. Reject it, or propose it again as it should be now.");
         if plain {
             review_text("  Cannot be accepted as it stands: ", &advice);
@@ -2314,7 +2315,7 @@ fn cmd_review(list: bool) -> Result<i32> {
     if list {
         for (pending, of) in &reviewed {
             show_pending(pending, of.as_deref(), &loaded, &waiting, &tally);
-            show_acceptance(&dirs, pending, &loaded, false);
+            show_acceptance(&dirs, pending, &loaded, &waiting, false);
         }
         println!(
             "\n{} waiting; decide with `ohjaa review` at a terminal",
@@ -2345,7 +2346,7 @@ fn cmd_review(list: bool) -> Result<i32> {
             &tally,
             true,
         );
-        show_acceptance(&dirs, pending, &current, true);
+        show_acceptance(&dirs, pending, &current, &still_waiting, true);
         let accepting = loop {
             print!("\n  [a]ccept  [r]eject  [s]kip  [d]etails  [q]uit > ");
             std::io::stdout().flush()?;
@@ -2577,7 +2578,7 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
     // retired or moved while it waits: said now, not at the decision.
     let mut stuck = 0;
     for pending in &waiting {
-        if let Some(why) = knowledge::cannot_accept(&dirs, &loaded, pending) {
+        if let Some(why) = knowledge::cannot_accept(&dirs, &loaded, pending, &waiting) {
             let id = &pending.node.id;
             println!(
                 "flag     proposal {id} cannot be accepted as it stands: {why}. Reject it \

@@ -1309,10 +1309,17 @@ fn replacing(loaded: &Loaded, node: &Node) -> Result<(Vec<Located>, Vec<PathBuf>
 }
 
 /// Why `pending` cannot be accepted as it stands, judged against the
-/// knowledge as it is now exactly as [`accept`] judges it, writing nothing:
-/// `None` when it can. A proposal can stop holding together while it waits,
-/// when what it names is replaced, retired or moved to another scope.
-pub fn cannot_accept(dirs: &Dirs, loaded: &Loaded, pending: &Pending) -> Option<String> {
+/// knowledge as it is now as [`accept`] judges it, writing nothing: `None`
+/// when it can. A proposal can stop holding together while it waits, when
+/// what it names is replaced, retired or moved to another scope. One that
+/// builds on a proposal still `waiting` is judged beside it, as [`propose`]
+/// judged it: it can be accepted once that one is, no reason to reject it.
+pub fn cannot_accept(
+    dirs: &Dirs,
+    loaded: &Loaded,
+    pending: &Pending,
+    waiting: &[Pending],
+) -> Option<String> {
     let there;
     let loaded = match (&pending.repo, pending.scope) {
         (Some(repo), Scope::Repo) if Some(repo) != dirs.repo_root.as_ref() => {
@@ -1334,7 +1341,21 @@ pub fn cannot_accept(dirs: &Dirs, loaded: &Loaded, pending: &Pending) -> Option<
         Ok((replaced, _)) => replaced,
         Err(error) => return Some(format!("{error:#}")),
     };
-    let problems: Vec<String> = misfits(loaded, pending.scope, &node, &replaced, &[])
+    let beside: Vec<Located> = node
+        .refines
+        .iter()
+        .filter(|base| loaded.get(base).is_none())
+        .filter_map(|base| {
+            waiting
+                .iter()
+                .find(|p| p.node.id == **base && (p.scope != Scope::Repo || p.repo == pending.repo))
+        })
+        .map(|p| Located {
+            scope: p.scope,
+            node: p.node.clone(),
+        })
+        .collect();
+    let problems: Vec<String> = misfits(loaded, pending.scope, &node, &replaced, &beside)
         .into_iter()
         .map(|error| error.detail)
         .collect();
@@ -1623,7 +1644,7 @@ mod tests {
                 .into_iter()
                 .find(|p| p.node.id == "new-rule")
                 .unwrap();
-            cannot_accept(&sandbox.dirs, &loaded, &one)
+            cannot_accept(&sandbox.dirs, &loaded, &one, &[])
         };
         assert_eq!(pending_now(), None, "it holds together as proposed");
         // The node it replaces moves to the team's knowledge.
@@ -1649,6 +1670,35 @@ mod tests {
         assert_eq!(
             pending_now().as_deref(),
             Some("supersedes `old-rule`, which does not exist")
+        );
+    }
+
+    /// One building on a proposal still waiting is not stuck: it can be
+    /// accepted once that one is, so nothing tells the person to reject it
+    /// (the review of #90).
+    #[test]
+    fn a_proposal_building_on_one_still_waiting_is_not_said_to_be_stuck() {
+        let sandbox = Sandbox::new("waits-on");
+        sandbox
+            .propose(sandbox.proposal(Scope::Mine, "base"))
+            .unwrap();
+        let mut refinement = sandbox.proposal(Scope::Mine, "base-in-codex");
+        refinement.refines = Some("base".to_owned());
+        sandbox.propose(refinement).unwrap();
+        let loaded = load(&sandbox.dirs).unwrap();
+        let (waiting, _) = pending(&sandbox.dirs, &loaded).unwrap();
+        let one = waiting
+            .iter()
+            .find(|p| p.node.id == "base-in-codex")
+            .unwrap();
+        assert_eq!(cannot_accept(&sandbox.dirs, &loaded, one, &waiting), None);
+        // Its base gone, it no longer holds together.
+        reject(&sandbox.dirs, "base").unwrap();
+        let loaded = load(&sandbox.dirs).unwrap();
+        let (waiting, _) = pending(&sandbox.dirs, &loaded).unwrap();
+        assert_eq!(
+            cannot_accept(&sandbox.dirs, &loaded, &waiting[0], &waiting).as_deref(),
+            Some("refines `base`, which is not in the set")
         );
     }
 

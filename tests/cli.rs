@@ -2444,7 +2444,6 @@ fn a_waiting_proposal_is_judged_against_the_knowledge_as_it_is_now() {
         "decision",
         "Kill only your own processes.",
     );
-    fixture.node(&mine, "base", "taste", "Keep it short.");
     let propose = |args: &[&str]| {
         let (stdout, stderr, code) =
             output_of(fixture.ohjaa().arg("propose").args(args).current_dir(&repo));
@@ -2462,6 +2461,19 @@ fn a_waiting_proposal_is_judged_against_the_knowledge_as_it_is_now() {
         "--supersedes",
         "old-rule",
         "Kill only PIDs you started.",
+    ]);
+    // One building on a proposal still waiting holds together: it can be
+    // accepted once that one is (the review of #90).
+    propose(&[
+        "--scope",
+        "mine",
+        "--id",
+        "base",
+        "--kind",
+        "taste",
+        "--origin",
+        "a test",
+        "Keep it short.",
     ]);
     propose(&[
         "--scope",
@@ -2491,6 +2503,7 @@ fn a_waiting_proposal_is_judged_against_the_knowledge_as_it_is_now() {
         "{stdout}"
     );
     assert!(!stdout.contains("proposal shorter"), "{stdout}");
+    assert!(!stdout.contains("proposal base"), "{stdout}");
     let (_, _, code) = output_of(
         fixture
             .ohjaa()
