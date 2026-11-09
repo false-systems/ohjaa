@@ -2017,8 +2017,10 @@ impl Known {
 }
 
 /// The id of the node among `nodes` that the node `id` may repeat, if any:
-/// one present ([`Present::holds`]), of the same scope (and, for a repo one,
-/// the same repository), whose title its own says mostly again ([`near`]);
+/// one present ([`Present::holds`]) whose title its own says mostly again
+/// ([`near`]): of ours, mine or machine, whatever the scope of `id` (one person's
+/// rule can say again what the team decided, and the other way), or of the
+/// same repository;
 /// the nearest, and of those as near the first. The node it refines,
 /// current or waiting, and those it supersedes, are not compared: a
 /// refinement is meant to say its base again, and to add to it.
@@ -2034,7 +2036,8 @@ fn nearest<'a>(
     nodes
         .filter(|present| present.holds() && present.id != id)
         .filter(|present| {
-            present.scope == scope && (scope != Scope::Repo || present.repo.as_deref() == repo)
+            present.scope != Scope::Repo
+                || (scope == Scope::Repo && present.repo.as_deref() == repo)
         })
         .filter(|present| refines != Some(present.id.as_str()) && !supersedes.contains(&present.id))
         .filter_map(|present| near(&words, &present.words).map(|score| (score, present)))
@@ -3609,7 +3612,7 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_may_repeat_only_what_is_present_in_its_own_scope_and_repository() {
+    fn a_draft_may_repeat_what_is_present_across_scopes_but_not_another_repository() {
         use Scope::{Mine, Ours, Repo};
         let present = known(&[
             (
@@ -3650,8 +3653,11 @@ mod tests {
             )),
             of("rauha-linux-only")
         );
-        // The same words in another scope, or of another repository, are
-        // another lesson (the review of #61: `tapio-linux-only`).
+        // Across ours, mine and machine the same words are marked: one
+        // person's rule can say again what the team decided (ten personal
+        // proposals repeated the team's rules, 2026-11-09), and a person
+        // decides. Of another repository they are another lesson (the
+        // review of #61: `tapio-linux-only`).
         assert_eq!(
             repeats(proposing(
                 Mine,
@@ -3660,7 +3666,8 @@ mod tests {
                 None,
                 &[]
             )),
-            None
+            of("start-sessions-through-ohjaa-run"),
+            "near a team proposal, from mine"
         );
         assert_eq!(
             repeats(proposing(

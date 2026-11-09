@@ -1085,6 +1085,28 @@ fn check_fits(
     replaced: &[Located],
     beside: &[Located],
 ) -> Result<()> {
+    let problems: Vec<String> = misfits(loaded, scope, node, replaced, beside)
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect();
+    if !problems.is_empty() {
+        return refuse(format!(
+            "refused, it would not hold together:\n  {}",
+            problems.join("\n  ")
+        ));
+    }
+    Ok(())
+}
+
+/// The set rules a change would break that involve `node` or what it
+/// replaces ([`check_fits`]).
+fn misfits(
+    loaded: &Loaded,
+    scope: Scope,
+    node: &Node,
+    replaced: &[Located],
+    beside: &[Located],
+) -> Vec<fk::SetError> {
     let mut set: Vec<Located> = loaded
         .nodes
         .iter()
@@ -1102,18 +1124,10 @@ fn check_fits(
     let touched: Vec<&str> = std::iter::once(node.id.as_str())
         .chain(replaced.iter().map(|r| r.node.id.as_str()))
         .collect();
-    let problems: Vec<String> = fk::validate_set(&set)
+    fk::validate_set(&set)
         .into_iter()
         .filter(|error| touched.contains(&error.id.as_str()))
-        .map(|error| error.to_string())
-        .collect();
-    if !problems.is_empty() {
-        return refuse(format!(
-            "refused, it would not hold together:\n  {}",
-            problems.join("\n  ")
-        ));
-    }
-    Ok(())
+        .collect()
 }
 
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
@@ -1247,17 +1261,7 @@ pub fn accept(dirs: &Dirs, id: &str, today: Date) -> Result<Outcome> {
     let mut node = pending.node.clone();
     node.status = Status::Current;
     node.as_of = today;
-    let mut replaced = Vec::new();
-    let mut replaced_files = Vec::new();
-    for target in &node.supersedes {
-        let (old, file) = loaded
-            .unique(target)?
-            .with_context(|| format!("supersedes `{target}`, which does not exist"))?;
-        let mut old = old.clone();
-        old.node.status = Status::Superseded;
-        replaced.push(old);
-        replaced_files.push(file.to_path_buf());
-    }
+    let (replaced, replaced_files) = replacing(&loaded, &node)?;
     check_fits(&loaded, pending.scope, &node, &replaced, &[])?;
 
     let dir = target_dir(dirs, pending.scope, pending.repo.as_deref())?;
@@ -1299,6 +1303,69 @@ pub fn accept(dirs: &Dirs, id: &str, today: Date) -> Result<Outcome> {
         node,
     });
     Ok(outcome)
+}
+
+/// The nodes accepting `node` supersedes, marked superseded, and their files.
+fn replacing(loaded: &Loaded, node: &Node) -> Result<(Vec<Located>, Vec<PathBuf>)> {
+    let mut replaced = Vec::new();
+    let mut files = Vec::new();
+    for target in &node.supersedes {
+        let (old, file) = loaded
+            .unique(target)?
+            .with_context(|| format!("supersedes `{target}`, which does not exist"))?;
+        let mut old = old.clone();
+        old.node.status = Status::Superseded;
+        replaced.push(old);
+        files.push(file.to_path_buf());
+    }
+    Ok((replaced, files))
+}
+
+/// Why `pending` cannot be accepted as it stands, judged against the
+/// knowledge as it is now exactly as [`accept`] judges it, writing nothing:
+/// `None` when it can. A proposal can stop holding together while it waits,
+/// when what it names is replaced, retired or moved to another scope.
+pub fn cannot_accept(dirs: &Dirs, loaded: &Loaded, pending: &Pending) -> Option<String> {
+    let there;
+    let loaded = match (&pending.repo, pending.scope) {
+        (Some(repo), Scope::Repo) if Some(repo) != dirs.repo_root.as_ref() => {
+            let mut elsewhere = dirs.clone();
+            elsewhere.repo_root = Some(repo.clone());
+            match load(&elsewhere) {
+                Ok(loaded) => {
+                    there = loaded;
+                    &there
+                }
+                Err(error) => return Some(format!("{error:#}")),
+            }
+        }
+        _ => loaded,
+    };
+    let mut node = pending.node.clone();
+    node.status = Status::Current;
+    let replaced = match replacing(loaded, &node) {
+        Ok((replaced, _)) => replaced,
+        Err(error) => return Some(format!("{error:#}")),
+    };
+    let problems: Vec<String> = misfits(loaded, pending.scope, &node, &replaced, &[])
+        .into_iter()
+        .map(|error| error.detail)
+        .collect();
+    (!problems.is_empty()).then(|| problems.join("; "))
+}
+
+/// How many characters `located` takes in a briefing ([`render_nodes`]),
+/// its scope's heading not counted.
+pub fn briefing_size(located: &Located) -> usize {
+    let heading = format!("\n{}:\n", scope_heading(located.scope)).len();
+    render_nodes(&[located], &[], &[], &[]).len() - PREAMBLE.len() - heading
+}
+
+/// How many characters `node` takes in an agent's own instructions
+/// ([`render_compact`]): one line.
+pub fn compact_size(node: &Node) -> usize {
+    let words: Vec<&str> = node.body.split_whitespace().collect();
+    format!("- {}: {}\n", node.kind.name(), words.join(" ")).len()
 }
 
 /// Drop a proposal that never became Knowledge.
@@ -1560,6 +1627,56 @@ mod tests {
         let error = sandbox.propose(mine).unwrap_err().to_string();
         assert!(error.contains("cross-scope-supersedes"), "{error}");
         assert!(!sandbox.dirs.proposals.join("mine/my-rule.md").exists());
+    }
+
+    /// A proposal can stop holding together while it waits: here what it
+    /// replaces moved from mine to ours (as the team's rules did on
+    /// 2026-11-07). That is said before anyone decides, exactly as accepting
+    /// it would refuse it.
+    #[test]
+    fn a_proposal_that_stopped_holding_together_is_said_before_the_decision() {
+        let sandbox = Sandbox::new("stuck");
+        sandbox
+            .propose(sandbox.proposal(Scope::Mine, "old-rule"))
+            .unwrap();
+        accept(&sandbox.dirs, "old-rule", date("2026-09-01")).unwrap();
+        let mut successor = sandbox.proposal(Scope::Mine, "new-rule");
+        successor.supersedes = vec!["old-rule".to_owned()];
+        sandbox.propose(successor).unwrap();
+        let pending_now = || {
+            let loaded = load(&sandbox.dirs).unwrap();
+            let (waiting, _) = pending(&sandbox.dirs, &loaded).unwrap();
+            let one = waiting
+                .into_iter()
+                .find(|p| p.node.id == "new-rule")
+                .unwrap();
+            cannot_accept(&sandbox.dirs, &loaded, &one)
+        };
+        assert_eq!(pending_now(), None, "it holds together as proposed");
+        // The node it replaces moves to the team's knowledge.
+        let from = target_dir(&sandbox.dirs, Scope::Mine, None)
+            .unwrap()
+            .join("old-rule.md");
+        let to = target_dir(&sandbox.dirs, Scope::Ours, None).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::rename(&from, to.join("old-rule.md")).unwrap();
+        assert_eq!(
+            pending_now().as_deref(),
+            Some("a mine node cannot supersede `old-rule` in ours")
+        );
+        let refused = accept(&sandbox.dirs, "new-rule", date("2026-09-24"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("a mine node cannot supersede `old-rule` in ours"),
+            "{refused}"
+        );
+        // What it replaces gone altogether.
+        std::fs::remove_file(to.join("old-rule.md")).unwrap();
+        assert_eq!(
+            pending_now().as_deref(),
+            Some("supersedes `old-rule`, which does not exist")
+        );
     }
 
     #[test]

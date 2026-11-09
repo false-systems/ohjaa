@@ -2422,6 +2422,127 @@ fn check_measures_the_briefing_each_agent_gets() {
     fixture.cleanup();
 }
 
+/// A waiting proposal is judged against the knowledge as it is now: `check`
+/// flags one that can no longer be accepted, and `review --list` says why on
+/// its card. One that can be says what accepting it would add, and a node it
+/// builds on that was replaced since is named with what replaced it.
+#[test]
+fn a_waiting_proposal_is_judged_against_the_knowledge_as_it_is_now() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("waiting-now");
+    let repo = fixture.make_git_repo("work");
+    let (ours, mine) = (
+        fixture.dir.join("ours/knowledge"),
+        fixture.dir.join("config/ohjaa/mine"),
+    );
+    fixture.node(
+        &mine,
+        "old-rule",
+        "decision",
+        "Kill only your own processes.",
+    );
+    fixture.node(&mine, "base", "taste", "Keep it short.");
+    let propose = |args: &[&str]| {
+        let (stdout, stderr, code) =
+            output_of(fixture.ohjaa().arg("propose").args(args).current_dir(&repo));
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+    };
+    propose(&[
+        "--scope",
+        "mine",
+        "--id",
+        "new-rule",
+        "--kind",
+        "decision",
+        "--origin",
+        "a test",
+        "--supersedes",
+        "old-rule",
+        "Kill only PIDs you started.",
+    ]);
+    propose(&[
+        "--scope",
+        "mine",
+        "--id",
+        "shorter",
+        "--kind",
+        "taste",
+        "--origin",
+        "a test",
+        "--refines",
+        "base",
+        "Keep answers to three lines.",
+    ]);
+    // Since then the rule it replaces moved to the team's knowledge, and
+    // the taste the other builds on was replaced.
+    fs::create_dir_all(&ours).unwrap();
+    fs::rename(mine.join("old-rule.md"), ours.join("old-rule.md")).unwrap();
+    fs::write(
+        mine.join("base.md"),
+        "+++\nid = \"base\"\nkind = \"taste\"\nstatus = \"superseded\"\nas_of = 2026-09-20\n\
+         origin = [\"a test\"]\n+++\nKeep it short.\n",
+    )
+    .unwrap();
+    fs::write(
+        mine.join("brief.md"),
+        "+++\nid = \"brief\"\nkind = \"taste\"\nstatus = \"current\"\nas_of = 2026-09-20\n\
+         origin = [\"a test\"]\nsupersedes = [\"base\"]\n+++\nKeep answers brief.\n",
+    )
+    .unwrap();
+
+    let (stdout, _, code) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert_eq!(code, Some(0), "a flag is not an error: {stdout}");
+    assert!(
+        stdout.contains(
+            "flag     proposal new-rule cannot be accepted as it stands: a mine node cannot \
+             supersede `old-rule` in ours. Reject it (`ohjaa reject new-rule`), or propose it \
+             again as it should be now\n"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("proposal shorter"), "{stdout}");
+    let (_, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["check", "--strict"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(1));
+
+    let (stdout, stderr, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["review", "--list"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains(
+            "    cannot be accepted as it stands: a mine node cannot supersede `old-rule` in \
+             ours. Reject it, or propose it again as it should be now.\n"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "    refines: base (replaced since by brief; read that one first, it may already \
+             say this)\n"
+        ),
+        "{stdout}"
+    );
+    // The taste is one line in each agent's own instructions.
+    let line = "- taste: Keep answers to three lines.\n".len();
+    assert!(
+        stdout.contains(&format!(
+            "    size: about +{line} characters in each agent's own instructions, which hold "
+        )),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
+
 #[test]
 fn brief_write_replaces_only_its_own_block() {
     if !git_available() {
@@ -2776,7 +2897,7 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
         serde_json::json!([
             drafted("ours", None, "start-agents-through-ohjaa-run", None),
             drafted("mine", None, "code-is-rust-or-elixir", None),
-            // Near current knowledge, of another scope: another lesson.
+            // Near current knowledge of another scope: marked too.
             drafted("ours", None, "rust-elixir-only-everywhere", None),
             drafted("ours", None, "read-back-briefing-and-leave-handover", None),
             drafted("ours", None, "read-briefing-and-leave-handover", None),
@@ -2869,7 +2990,8 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
          start-sessions-through-ohjaa-run\n",
         // Near current knowledge of its scope.
         "proposed code-is-rust-or-elixir, a possible duplicate of rust-elixir-only\n",
-        "proposed rust-elixir-only-everywhere\n",
+        // Near current knowledge of another scope: marked too, a person decides.
+        "proposed rust-elixir-only-everywhere, a possible duplicate of rust-elixir-only\n",
         "proposed read-back-briefing-and-leave-handover\n",
         // Near a draft written earlier in the same answer,
         "proposed read-briefing-and-leave-handover, a possible duplicate of \
@@ -2882,10 +3004,10 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
         // The same words of another repository are another lesson.
         "proposed tapio-linux-only\n",
         "proposed lima-for-linux\n",
-        "9 proposal(s) waiting for review (`ohjaa review`), 4 of them possible duplicates, 0 \
+        "9 proposal(s) waiting for review (`ohjaa review`), 5 of them possible duplicates, 0 \
          draft(s) refused",
         "possible duplicates: of read-back-briefing-and-leave-handover ×2, of rust-elixir-only \
-         ×1, of start-sessions-through-ohjaa-run ×1",
+         ×2, of start-sessions-through-ohjaa-run ×1",
     ] {
         assert!(stdout.contains(line), "{line}\n{stdout}");
     }
