@@ -502,6 +502,15 @@ const KNOWLEDGE_PREAMBLE: &str =
 
 /// The block `ohjaa apply` writes into an agent's own instruction file,
 /// holding these lines.
+/// The line a briefing or an agent's block ends its knowledge with when it
+/// leaves nodes out to fit: their ids.
+fn not_shown(ids: &[&str]) -> String {
+    format!(
+        "Not shown, to fit what an agent reliably reads: {}. `ohjaa graph <id>` prints one.",
+        ids.join(", ")
+    )
+}
+
 fn applied_block(lines: &[&str]) -> String {
     format!(
         "<!-- ohjaa:knowledge begin: mine and machine, written by `ohjaa apply` and after each \
@@ -1188,12 +1197,13 @@ fn the_briefing_keeps_every_decision_then_fills_its_budget_by_priority() {
              - [taste] {small}\n  (small · as of 2026-09-20)\n\
              - [lesson] {menu}\n  (menu · as of 2026-09-20)\n\
              \nThis machine:\n- [fact] {vm}\n  (vm · as of 2026-09-20)\n\
-             \n1 more: `ohjaa list`\n"
+             \n{}\n",
+            not_shown(&["lima"])
         )
     );
     assert!(
         stderr.contains(
-            "the briefing holds every decision and 4 more, and names the other 1 by count; \
+            "the briefing holds every decision and 4 more, and names the other 1 only by id; \
              merge or retire some (`ohjaa check`)"
         ),
         "{stderr}"
@@ -1489,8 +1499,8 @@ fn a_node_the_agents_block_cuts_is_carried_by_the_briefing() {
     let lima = "Lima is here. ".repeat(25).trim_end().to_owned();
     fixture.node_as_of(&machine, "lima", "fact", "2026-09-10", &lima);
     // What apply writes: every decision, every taste, and the oldest fact
-    // by count, over the 8,000 characters.
-    lines.push("1 more: `ohjaa list`".to_owned());
+    // by id, over the 8,000 characters.
+    lines.push(not_shown(&["lima"]));
     let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     let file = fixture.dir.join("home/.claude/CLAUDE.md");
     fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -1884,7 +1894,7 @@ fn every_agents_own_switch_and_a_relative_folder_carry_mine_and_machine() {
 }
 
 /// The agent's block and the briefing both cut: the line says how many of
-/// the nodes the file does not hold the briefing names only by count.
+/// the nodes the file does not hold the briefing names only by id.
 #[test]
 fn the_line_says_how_many_the_briefing_could_only_count() {
     if !git_available() {
@@ -1912,19 +1922,19 @@ fn the_line_says_how_many_the_briefing_could_only_count() {
     );
     fixture.node_as_of(&machine, "lima", "fact", "2026-09-10", &lima);
     fixture.node_as_of(&machine, "vm", "fact", "2026-09-12", &vm);
-    // The block: every decision and taste, both facts by count.
-    lines.push("2 more: `ohjaa list`".to_owned());
+    // The block: every decision and taste, both facts by id.
+    lines.push(not_shown(&["lima", "vm"]));
     let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     let file = fixture.dir.join("home/.claude/CLAUDE.md");
     fs::create_dir_all(file.parent().unwrap()).unwrap();
     fs::write(&file, applied_block(&lines)).unwrap();
     let line = format!(
         "Mine and machine: Claude Code has 41 of their 43 nodes from its own instructions, {}, \
-         whose ohjaa block is current; the other 2 are above, 1 of them only by count.",
+         whose ohjaa block is current; the other 2 are above, 1 of them only by id.",
         file.display()
     );
     // Sized so that the briefing holds the team's taste and the newer fact,
-    // and the older only by count.
+    // and the older only by id.
     let team = "y".repeat(7000 - line.len());
     fixture.node(&ours, "team", "taste", &team);
     let (stdout, stderr, code) = output_of(
@@ -1939,7 +1949,8 @@ fn the_line_says_how_many_the_briefing_could_only_count() {
         format!(
             "{KNOWLEDGE_PREAMBLE}\nOurs: decided by the team, binding everywhere:\n\
              - [taste] {team}\n  (team · as of 2026-09-20)\n\nThis machine:\n- [fact] {vm}\n  \
-             (vm · as of 2026-09-12)\n\n1 more: `ohjaa list`\n\n{line}\n"
+             (vm · as of 2026-09-12)\n\n{}\n\n{line}\n",
+            not_shown(&["lima"])
         )
     );
     fixture.cleanup();
@@ -1964,12 +1975,14 @@ fn the_line_about_mine_and_machine_is_inside_the_budget() {
          exist.",
         pi.display()
     );
+    // As long as a real fact: naming it costs less than showing it.
+    let lima = "Lima is here. ".repeat(12).trim_end().to_owned();
     // Sized so that the nodes fit the 8,000 characters alone, and with the
     // line are 10 over.
-    let pad = "x".repeat(7513 - line.len());
+    let pad = "x".repeat(7513 - line.len() - (lima.len() - 13));
     fixture.node(&mine, "rust", "decision", "Rust only.");
     fixture.node(&mine, "pad", "taste", &pad);
-    fixture.node_as_of(&machine, "lima", "fact", "2026-09-10", "Lima is here.");
+    fixture.node_as_of(&machine, "lima", "fact", "2026-09-10", &lima);
     let (stdout, stderr, code) = output_of(
         fixture
             .ohjaa()
@@ -1982,10 +1995,11 @@ fn the_line_about_mine_and_machine_is_inside_the_budget() {
         format!(
             "{KNOWLEDGE_PREAMBLE}\nMine: how the person you work for likes to work:\n\
              - [decision] Rust only.\n  (rust · as of 2026-09-20)\n- [taste] {pad}\n  \
-             (pad · as of 2026-09-20)\n\n1 more: `ohjaa list`\n\n{line}\n"
+             (pad · as of 2026-09-20)\n\n{}\n\n{line}\n",
+            not_shown(&["lima"])
         )
     );
-    assert_eq!(stdout.len(), 8000 - 35);
+    assert!(stdout.len() <= 8000, "{}", stdout.len());
     fixture.cleanup();
 }
 
@@ -6594,12 +6608,15 @@ fn a_briefing_too_big_for_one_command_line_argument_is_refused_clearly() {
     fixture.node(&mine, "big", "fact", &"long knowledge ".repeat(450));
     let (_, stderr, code) = launch();
     assert_eq!(code, Some(0), "{stderr}");
-    // A fact past the budget is named by count, not sent. (The budget holds the
+    // A fact past the budget is named by id, not sent. (The budget holds the
     // line saying why Codex is briefed with mine and machine, too.)
     fixture.node(&mine, "huge", "fact", &"long knowledge ".repeat(8_000));
     let (_, stderr, code) = launch();
     assert_eq!(code, Some(0), "{stderr}");
-    assert!(stderr.contains("\n1 more: `ohjaa list`\n"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("\n{}\n", not_shown(&["huge"]))),
+        "{stderr}"
+    );
     assert_eq!(stderr.matches("long knowledge").count(), 450);
     // Every decision is sent in full, however long. Linux caps one argument
     // at 128 KiB, and the briefing is one, twice.

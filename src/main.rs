@@ -989,7 +989,7 @@ fn knowledge_briefing_for(
                     .as_ref()
                     .map(|standing| standing.agents_md.to_string_lossy().into_owned())
             } else {
-                // Named only by count.
+                // Named only by id.
                 return None;
             };
             Some(sessions::Delivered {
@@ -1029,7 +1029,7 @@ fn knowledge_briefing_for(
 
 /// The one line about where mine and machine come from. For the agent's own
 /// file: how many nodes it holds, and when it holds not all of them, that
-/// the others are above, `counted` of them only by count; `repeated`, the
+/// the others are above, `counted` of them only by id; `repeated`, the
 /// ones it holds that are above too, being flagged.
 fn source_line(
     source: &instructions::Source,
@@ -1061,7 +1061,7 @@ fn source_line(
             if counted == 0 {
                 String::new()
             } else {
-                format!(", {counted} of them only by count")
+                format!(", {counted} of them only by id")
             }
         ),
         instructions::Source::Briefing { agent, why } => {
