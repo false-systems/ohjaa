@@ -1327,8 +1327,8 @@ impl Sandbox {
     }
 }
 
-/// The person's general knowledge (mine, machine) reaches each agent's own
-/// global instruction file, in a block apply writes, rewrites where it is
+/// The team's knowledge and the person's (ours, mine, machine) reach each
+/// agent's own global instruction file, in a block apply writes, rewrites where it is
 /// and `--undo` takes out, leaving every hand-written byte as it was. No
 /// file is created, and none inside a repository is written. What apply and
 /// adopt change in the home is a commit in its history each.
@@ -1364,8 +1364,22 @@ fn apply_writes_the_knowledge_block_into_each_agents_own_file_and_undo_takes_it_
         "fact",
         "Lima is here.",
     );
-    let lines = "- decision: Code is Rust or Elixir.\n- taste: Answer first.\n\
-                 - fact: Lima is here.\n<!-- ohjaa:knowledge end -->\n";
+    // The team's knowledge goes there too: every agent reads its own file
+    // wherever it starts, which a workplace file above the repositories is not.
+    let ours = sandbox.dir.join("ours");
+    fs::write(
+        sandbox.config().join("ours"),
+        format!("{}\n", ours.display()),
+    )
+    .unwrap();
+    knowledge_node(
+        &ours.join("knowledge"),
+        "team-rule",
+        "decision",
+        "Team rule.",
+    );
+    let lines = "- decision: Team rule.\n- decision: Code is Rust or Elixir.\n\
+                 - taste: Answer first.\n- fact: Lima is here.\n<!-- ohjaa:knowledge end -->\n";
 
     let output = sandbox.ohjaa(&["apply", "--dry-run", "--root", &sandbox.projects()]);
     let (stdout, stderr) = text(&output);
@@ -1373,7 +1387,7 @@ fn apply_writes_the_knowledge_block_into_each_agents_own_file_and_undo_takes_it_
     for file in [&claude, &codex] {
         assert!(
             stdout.contains(&format!(
-                "would write the knowledge block (3 nodes) into {}",
+                "would write the knowledge block (4 nodes) into {}",
                 file.display()
             )),
             "{stdout}"
@@ -1424,7 +1438,7 @@ fn apply_writes_the_knowledge_block_into_each_agents_own_file_and_undo_takes_it_
     assert!(
         history[0].starts_with("apply: ")
             && history[0].contains(&format!(
-                "\nwrote the knowledge block (3 nodes) into {}",
+                "\nwrote the knowledge block (4 nodes) into {}",
                 claude.display()
             )),
         "{history:#?}"
@@ -1448,7 +1462,7 @@ fn apply_writes_the_knowledge_block_into_each_agents_own_file_and_undo_takes_it_
     let (stdout, _) = text(&output);
     assert!(
         stdout.contains(&format!(
-            "rewrote the knowledge block (4 nodes) in {}",
+            "rewrote the knowledge block (5 nodes) in {}",
             claude.display()
         )),
         "{stdout}"

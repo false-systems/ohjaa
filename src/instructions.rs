@@ -1,6 +1,6 @@
-//! Each agent's own global instruction file, so that an agent launched
-//! without ohjaa still reads the person's general knowledge (mine, machine),
-//! from one source: the nodes in the home.
+//! Each agent's own global instruction file, so that every agent, however it
+//! was launched, reads the team's knowledge and the person's (ours, mine,
+//! machine: [`OWN_FILE_SCOPES`]), from one source: the nodes.
 //!
 //! | agent       | the file it reads, the first that exists                          |
 //! |-------------|-------------------------------------------------------------------|
@@ -23,8 +23,8 @@
 //! ([`home::lock`]), so the block holds what was last decided.
 //!
 //! An agent `ohjaa run` launches whose own file holds that block, current
-//! (byte for byte the one apply would write now), is not briefed with mine
-//! and machine a second time ([`source`]): the briefing says where they are.
+//! (byte for byte the one apply would write now), is not briefed with that
+//! knowledge a second time ([`source`]): the briefing says where it is.
 
 use std::path::{Path, PathBuf};
 
@@ -394,20 +394,21 @@ pub fn inside_repository(file: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The home's own knowledge (mine, machine) as an agent's file holds it, and
-/// the files that could not be read as nodes.
+/// What each agent's own file holds: the team's knowledge and the person's
+/// (ours, mine, machine). Every agent reads its own file wherever it starts;
+/// a workplace file above the repositories is not read by Codex or opencode,
+/// which stop at a repository's root (tested 2026-11-09).
+pub const OWN_FILE_SCOPES: [Scope; 3] = [Scope::Ours, Scope::Mine, Scope::Machine];
+
+/// The knowledge an agent's own file holds ([`OWN_FILE_SCOPES`]), and the
+/// files that could not be read as nodes.
 pub fn home_knowledge() -> Result<(Compact, Vec<Broken>)> {
     let dirs = Dirs {
-        ours_checkout: None,
         repo_root: None,
         ..Dirs::resolve(None)?
     };
     let loaded = knowledge::load(&dirs)?;
-    let compact = knowledge::render_compact(
-        &loaded,
-        &[Scope::Mine, Scope::Machine],
-        knowledge::DEFAULT_BUDGET,
-    );
+    let compact = knowledge::render_compact(&loaded, &OWN_FILE_SCOPES, knowledge::DEFAULT_BUDGET);
     Ok((compact, loaded.broken))
 }
 

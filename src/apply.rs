@@ -926,7 +926,7 @@ fn instruction_steps(record: &Record) -> Result<(Vec<Step>, Vec<String>)> {
     }
     if compact.more > 0 || compact.text.len() > crate::knowledge::DEFAULT_BUDGET {
         eprintln!(
-            "ohjaa apply: warning: mine and machine knowledge is over the {} characters an \
+            "ohjaa apply: warning: the knowledge for agents' own files (the team's, mine and machine) is over the {} characters an \
              agent's own instruction file holds; the block holds {}",
             crate::knowledge::DEFAULT_BUDGET,
             compact.summary()
