@@ -104,13 +104,9 @@ nodes; older records without that identity still read.
   does. Original spacing and code indentation are preserved; the terminal
   handles visual wrapping without reformatting quoted commands or literals.
   Replacements, refinements and possible duplicates stay visible before
-  the choice, judged against the knowledge as it is now: a node it builds on
-  or replaces that was replaced since is named with what replaced it, which
-  may already say the same. A proposal that no longer holds together (what it
-  replaces moved to another scope, or is gone) says so and why, as accepting
-  it would refuse it; `ohjaa check` flags it too. Any other says what
-  accepting it adds where agents read it, beside how much of the 8,000
-  characters is in use there now. Type `a` to accept, `r` to dismiss, `s` or
+  the choice. A proposal that no longer holds together (what it replaces moved
+  to another scope, or is gone) says so and why, as accepting it would refuse
+  it; `ohjaa check` flags it too. Type `a` to accept, `r` to dismiss, `s` or
   Enter to leave it for later, `d` for the original identifier and proposal
   file, or `q` to stop.
   Full action names and uppercase work too. Invalid input (including `aq`)
@@ -269,12 +265,9 @@ nothing, and that is how a node that does not reach agents gets noticed.
 person.** Every draft costs a person a review, and only a person decides
 what is Knowledge, so the drafter's answer is checked too, and nothing in it
 is dropped. A draft whose title says mostly what the title of a present node
-says is written like any other proposal, and said to be a *possible
-duplicate* of that node, the nearest one. Nodes of ours, mine and machine are
-compared with each other, whatever the draft's scope: one person's rule can
-say again what the team decided. A repo node is compared only within its own
-repository (the one a repo draft names, else the one intake runs in): the
-same words of another repository are another lesson. Present
+of its own scope says (for a repo one, of its own repository: the one it
+names, else the one intake runs in) is written like any other proposal, and
+said to be a *possible duplicate* of that node, the nearest one. Present
 means current, or proposed and waiting; a superseded or retired node is not.
 The node a draft refines, current or waiting, and those it supersedes, are
 not compared: a refinement says its base again by design, and is kept as

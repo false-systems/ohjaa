@@ -2410,8 +2410,7 @@ fn check_measures_the_briefing_each_agent_gets() {
 
 /// A waiting proposal is judged against the knowledge as it is now: `check`
 /// flags one that can no longer be accepted, and `review --list` says why on
-/// its card. One that can be says what accepting it would add, and a node it
-/// builds on that was replaced since is named with what replaced it.
+/// its card. One that still holds together is not flagged.
 #[test]
 fn a_waiting_proposal_is_judged_against_the_knowledge_as_it_is_now() {
     if !git_available() {
@@ -2461,22 +2460,9 @@ fn a_waiting_proposal_is_judged_against_the_knowledge_as_it_is_now() {
         "base",
         "Keep answers to three lines.",
     ]);
-    // Since then the rule it replaces moved to the team's knowledge, and
-    // the taste the other builds on was replaced.
+    // Since then the rule it replaces moved to the team's knowledge.
     fs::create_dir_all(&ours).unwrap();
     fs::rename(mine.join("old-rule.md"), ours.join("old-rule.md")).unwrap();
-    fs::write(
-        mine.join("base.md"),
-        "+++\nid = \"base\"\nkind = \"taste\"\nstatus = \"superseded\"\nas_of = 2026-09-20\n\
-         origin = [\"a test\"]\n+++\nKeep it short.\n",
-    )
-    .unwrap();
-    fs::write(
-        mine.join("brief.md"),
-        "+++\nid = \"brief\"\nkind = \"taste\"\nstatus = \"current\"\nas_of = 2026-09-20\n\
-         origin = [\"a test\"]\nsupersedes = [\"base\"]\n+++\nKeep answers brief.\n",
-    )
-    .unwrap();
 
     let (stdout, _, code) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
     assert_eq!(code, Some(0), "a flag is not an error: {stdout}");
@@ -2511,21 +2497,7 @@ fn a_waiting_proposal_is_judged_against_the_knowledge_as_it_is_now() {
         ),
         "{stdout}"
     );
-    assert!(
-        stdout.contains(
-            "    refines: base (replaced since by brief; read that one first, it may already \
-             say this)\n"
-        ),
-        "{stdout}"
-    );
-    // The taste is one line in each agent's own instructions.
-    let line = "- taste: Keep answers to three lines.\n".len();
-    assert!(
-        stdout.contains(&format!(
-            "    size: about +{line} characters in each agent's own instructions, which hold "
-        )),
-        "{stdout}"
-    );
+    assert_eq!(stdout.matches("cannot be accepted").count(), 1, "{stdout}");
     fixture.cleanup();
 }
 
@@ -2883,7 +2855,7 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
         serde_json::json!([
             drafted("ours", None, "start-agents-through-ohjaa-run", None),
             drafted("mine", None, "code-is-rust-or-elixir", None),
-            // Near current knowledge of another scope: marked too.
+            // Near current knowledge, of another scope: another lesson.
             drafted("ours", None, "rust-elixir-only-everywhere", None),
             drafted("ours", None, "read-back-briefing-and-leave-handover", None),
             drafted("ours", None, "read-briefing-and-leave-handover", None),
@@ -2976,8 +2948,7 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
          start-sessions-through-ohjaa-run\n",
         // Near current knowledge of its scope.
         "proposed code-is-rust-or-elixir, a possible duplicate of rust-elixir-only\n",
-        // Near current knowledge of another scope: marked too, a person decides.
-        "proposed rust-elixir-only-everywhere, a possible duplicate of rust-elixir-only\n",
+        "proposed rust-elixir-only-everywhere\n",
         "proposed read-back-briefing-and-leave-handover\n",
         // Near a draft written earlier in the same answer,
         "proposed read-briefing-and-leave-handover, a possible duplicate of \
@@ -2990,10 +2961,10 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
         // The same words of another repository are another lesson.
         "proposed tapio-linux-only\n",
         "proposed lima-for-linux\n",
-        "9 proposal(s) waiting for review (`ohjaa review`), 5 of them possible duplicates, 0 \
+        "9 proposal(s) waiting for review (`ohjaa review`), 4 of them possible duplicates, 0 \
          draft(s) refused",
         "possible duplicates: of read-back-briefing-and-leave-handover ×2, of rust-elixir-only \
-         ×2, of start-sessions-through-ohjaa-run ×1",
+         ×1, of start-sessions-through-ohjaa-run ×1",
     ] {
         assert!(stdout.contains(line), "{line}\n{stdout}");
     }

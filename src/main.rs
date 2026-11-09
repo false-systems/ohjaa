@@ -2139,22 +2139,11 @@ fn show_pending_relationships(
     plain: bool,
 ) {
     let node = &pending.node;
-    // What a node it names is now: current, still waiting, or gone; one
-    // replaced since is named with what replaced it, which may already say
-    // what this one does.
+    // What a node it names is now: current, still waiting, or gone.
     let standing = |id: &str| {
-        let successor = loaded.nodes.iter().find(|l| {
-            l.node.status == Status::Current && l.node.supersedes.iter().any(|old| old == id)
-        });
         if let Some(located) = loaded.get(id).filter(|l| l.node.status != Status::Proposed) {
             let first = located.node.body.lines().next().unwrap_or("");
-            match successor.filter(|_| located.node.status == Status::Superseded) {
-                Some(by) => format!(
-                    "{id} (replaced since by {}; read that one first, it may already say this)",
-                    by.node.id
-                ),
-                None => format!("{id} ({}: {first})", located.node.status.name()),
-            }
+            format!("{id} ({}: {first})", located.node.status.name())
         } else if waiting.iter().any(|p| p.node.id == id) {
             format!("{id} (waiting too)")
         } else {
@@ -2209,73 +2198,22 @@ fn show_pending_relationships(
     }
 }
 
-/// Whether `pending` can be accepted as it stands, and what accepting it
-/// costs where agents read it: the characters it adds (less those of what it
-/// replaces), beside how much of the budget is in use there now.
+/// When `pending` cannot be accepted as it stands, why: said before the
+/// choice, as accepting it would refuse it.
 fn show_acceptance(
     dirs: &Dirs,
     pending: &knowledge::Pending,
     loaded: &knowledge::Loaded,
     plain: bool,
-) -> Result<()> {
-    let say = |label: &str, text: &str| {
-        if plain {
-            review_text(&format!("  {label}: "), text);
-        } else {
-            println!("    {}: {text}", label.to_lowercase());
-        }
-    };
+) {
     if let Some(why) = knowledge::cannot_accept(dirs, loaded, pending) {
-        say(
-            "Cannot be accepted as it stands",
-            &format!("{why}. Reject it, or propose it again as it should be now."),
-        );
-        return Ok(());
+        let advice = format!("{why}. Reject it, or propose it again as it should be now.");
+        if plain {
+            review_text("  Cannot be accepted as it stands: ", &advice);
+        } else {
+            println!("    cannot be accepted as it stands: {advice}");
+        }
     }
-    let replaced: Vec<&fk::Located> = pending
-        .node
-        .supersedes
-        .iter()
-        .filter_map(|id| loaded.get(id))
-        .filter(|located| located.node.status == Status::Current)
-        .collect();
-    let budget = knowledge::DEFAULT_BUDGET;
-    let said = match pending.scope {
-        // Mine and machine are read from each agent's own instructions.
-        Scope::Mine | Scope::Machine => {
-            let added = knowledge::compact_size(&pending.node) as i64
-                - replaced
-                    .iter()
-                    .map(|located| knowledge::compact_size(&located.node) as i64)
-                    .sum::<i64>();
-            let in_use =
-                knowledge::render_compact(loaded, &[Scope::Mine, Scope::Machine], usize::MAX)
-                    .text
-                    .len();
-            format!(
-                "about {added:+} characters in each agent's own instructions, which hold \
-                 {in_use} of the {budget} an agent reliably reads"
-            )
-        }
-        Scope::Ours | Scope::Repo => {
-            let located = fk::Located {
-                scope: pending.scope,
-                node: pending.node.clone(),
-            };
-            let added = knowledge::briefing_size(&located) as i64
-                - replaced
-                    .iter()
-                    .map(|located| knowledge::briefing_size(located) as i64)
-                    .sum::<i64>();
-            let in_use = largest_briefing(dirs, loaded)?;
-            format!(
-                "about {added:+} characters in the briefing, where the largest an agent gets \
-                 here is {in_use} of the {budget} it reliably reads"
-            )
-        }
-    };
-    say("Size", &said);
-    Ok(())
 }
 
 /// Preserve the text being decided on, including literal spacing and code
@@ -2376,7 +2314,7 @@ fn cmd_review(list: bool) -> Result<i32> {
     if list {
         for (pending, of) in &reviewed {
             show_pending(pending, of.as_deref(), &loaded, &waiting, &tally);
-            show_acceptance(&dirs, pending, &loaded, false)?;
+            show_acceptance(&dirs, pending, &loaded, false);
         }
         println!(
             "\n{} waiting; decide with `ohjaa review` at a terminal",
@@ -2407,7 +2345,7 @@ fn cmd_review(list: bool) -> Result<i32> {
             &tally,
             true,
         );
-        show_acceptance(&dirs, pending, &current, true)?;
+        show_acceptance(&dirs, pending, &current, true);
         let accepting = loop {
             print!("\n  [a]ccept  [r]eject  [s]kip  [d]etails  [q]uit > ");
             std::io::stdout().flush()?;
@@ -2558,18 +2496,6 @@ fn measured(
             Ok((target, briefed))
         })
         .collect()
-}
-
-/// The largest briefing an agent set up here gets, else all the knowledge.
-fn largest_briefing(dirs: &Dirs, loaded: &knowledge::Loaded) -> Result<usize> {
-    let agents = measured(dirs, loaded)?;
-    Ok(match agents.iter().map(|(_, briefed)| briefed.full).max() {
-        Some(largest) => largest,
-        None => {
-            let flags = knowledge::flags(loaded, dirs.repo_root.as_deref(), knowledge::today());
-            knowledge::render(loaded, &flags).len()
-        }
-    })
 }
 
 fn cmd_check(budget: usize, strict: bool) -> Result<i32> {

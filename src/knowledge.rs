@@ -1341,20 +1341,6 @@ pub fn cannot_accept(dirs: &Dirs, loaded: &Loaded, pending: &Pending) -> Option<
     (!problems.is_empty()).then(|| problems.join("; "))
 }
 
-/// How many characters `located` takes in a briefing ([`render_nodes`]),
-/// its scope's heading not counted.
-pub fn briefing_size(located: &Located) -> usize {
-    let heading = format!("\n{}:\n", scope_heading(located.scope)).len();
-    render_nodes(&[located], &[], &[], 0).len() - PREAMBLE.len() - heading
-}
-
-/// How many characters `node` takes in an agent's own instructions
-/// ([`render_compact`]): one line.
-pub fn compact_size(node: &Node) -> usize {
-    let words: Vec<&str> = node.body.split_whitespace().collect();
-    format!("- {}: {}\n", node.kind.name(), words.join(" ")).len()
-}
-
 /// Drop a proposal that never became Knowledge.
 pub fn reject(dirs: &Dirs, id: &str) -> Result<Outcome> {
     let loaded = load(dirs)?;
