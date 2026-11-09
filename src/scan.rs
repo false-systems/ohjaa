@@ -76,17 +76,6 @@ impl Session {
     pub fn occupies(&self) -> bool {
         self.liveness != "closed" && self.pid_check != "dead"
     }
-
-    /// True when this session's occupancy is inferred rather than observed.
-    ///
-    /// Anything that is neither `active` nor `closed`: `stale`, a liveness this
-    /// build does not recognise, or none at all. Matching only `stale` would
-    /// render the others unlabelled and so indistinguishable from an observed
-    /// `active` session — presenting inferred occupancy as observed activity,
-    /// which is the same overclaim this module exists to avoid, mirrored.
-    pub fn is_quiet(&self) -> bool {
-        self.liveness != "active" && self.liveness != "closed"
-    }
 }
 
 /// One repo's scan result, or the scan of sessions outside every repo.
@@ -409,23 +398,6 @@ mod tests {
     }
 
     #[test]
-    fn a_quiet_session_still_occupies_the_checkout() {
-        // Toimija reports `stale` for BOTH a dead process and a live one that
-        // has simply been quiet past the threshold — its own test is named
-        // `open_marker_past_threshold_is_stale_even_if_pid_alive`. An agent
-        // thinking for ninety minutes must not read as an empty checkout.
-        let raw = payload(
-            r#"{"id":"1-2","agent":["codex"],"worktree":"/tmp/r",
-                "liveness":"stale","last_seen_at":1}"#,
-        );
-        let scan = parse(Path::new(REPO), &raw, 100_000).unwrap();
-        let session = &scan.sessions[0];
-        assert!(session.occupies(), "stale is not proof of absence");
-        assert!(session.is_quiet(), "and its uncertainty must be visible");
-        assert_eq!(scan.occupying().count(), 1);
-    }
-
-    #[test]
     fn a_closed_session_does_not_occupy_the_checkout() {
         // An explicit close needs no process evidence.
         let raw = payload(r#"{"id":"1-2","worktree":"/tmp/r","liveness":"closed"}"#);
@@ -449,34 +421,6 @@ mod tests {
             assert_eq!(scan.sessions[0].pid_check, pid_check);
             assert_eq!(scan.occupying().count(), usize::from(occupies));
         }
-    }
-
-    #[test]
-    fn an_unrecognised_liveness_is_treated_as_occupying() {
-        // A verdict this build does not know is not permission to assume the
-        // checkout is free.
-        let raw = payload(r#"{"id":"1-2","worktree":"/tmp/r","liveness":"suspended"}"#);
-        let scan = parse(Path::new(REPO), &raw, 100).unwrap();
-        assert!(scan.sessions[0].occupies());
-        assert!(
-            scan.sessions[0].is_quiet(),
-            "an unrecognised verdict is uncertain, and must not render like an observed active one"
-        );
-    }
-
-    #[test]
-    fn a_missing_liveness_is_uncertain_not_active() {
-        let raw = payload(r#"{"id":"1-2","worktree":"/tmp/r"}"#);
-        let scan = parse(Path::new(REPO), &raw, 100).unwrap();
-        assert!(scan.sessions[0].occupies());
-        assert!(scan.sessions[0].is_quiet());
-    }
-
-    #[test]
-    fn an_observed_active_session_is_not_marked_uncertain() {
-        let raw = payload(r#"{"id":"1-2","worktree":"/tmp/r","liveness":"active"}"#);
-        let scan = parse(Path::new(REPO), &raw, 100).unwrap();
-        assert!(!scan.sessions[0].is_quiet());
     }
 
     #[test]

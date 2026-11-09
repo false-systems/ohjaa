@@ -1,6 +1,6 @@
 repo:
   name: ohjaa
-  role: internal tool — steering knowledge for agents; holds what the people they work for know and have decided, briefs every agent with it before it acts, and keeps a machine-local log of every session it runs
+  role: internal tool — steering knowledge for agents; holds what the people they work for know and have decided, and writes it into each agent's own instruction file
   not:
     - message bus
     - scheduler
@@ -35,7 +35,6 @@ boundaries:
   - "Ohjaa stores Knowledge, in git, and a machine-local session log. Everything else is derived when asked; the human view's snapshot is the one cache. No knowledge index and no daemon."
   - "The workflow lives in the home (~/.config/ohjaa), outside every repository. No file, hook or config of a repository's checkout is written."
   - "Observe, mark and flag; never refuse for the workflow. Only a repository's own hooks refuse."
-  - "`ohjaa run` stays the parent of the session until it ends. Session states are observed, not declared."
   - "Agents propose; only a person makes Knowledge current, retires it or rejects it. What ohjaa writes into a repository names no tool, and a public one is sent nothing that names a private one."
   - "Cross-repo yes, messaging no: no request/response between agents, no presence, no dispatch."
   - "Network only through gh, the drafter, and git to GitHub to deliver repo knowledge. Every other command works from the filesystem and local CLIs."

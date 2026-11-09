@@ -486,17 +486,6 @@ impl World {
         briefing
     }
 
-    /// `ohjaa run <agent> --dry-run -- <args>`: the briefing it would give,
-    /// which it says on stderr.
-    fn run_dry(&self, agent: &str, args: &[&str]) -> String {
-        let mut run = self.ohjaa(&self.checkout);
-        run.args(["run", agent, "--intent", "work", "--dry-run", "--"])
-            .args(args);
-        let (stdout, stderr, code) = self.run(&mut run);
-        assert_eq!(code, Some(0), "{stdout}{stderr}");
-        stderr
-    }
-
     /// Write `text` at `path` in the checkout, its folders made.
     fn put(&self, path: &str, text: &str) {
         let file = self.checkout.join(path);
@@ -1240,48 +1229,6 @@ fn carried(briefing: &str, why: &str) -> bool {
 }
 
 #[test]
-fn claude_code_is_left_the_lessons_only_when_claude_md_imports_agents_md() {
-    let world = merged_world("claude");
-    // No CLAUDE.md: Claude Code 2.1.311 falls back to AGENTS.md only where no
-    // CLAUDE.md is found at the root or above, which ohjaa does not rely on.
-    let briefing = world.brief(Some("claude"), &[]);
-    assert!(carried(&briefing, "@AGENTS.md"), "{briefing}");
-    // Named in prose, or imported inside a fence: not read.
-    world.put("CLAUDE.md", "Read AGENTS.md before you start.\n");
-    let briefing = world.brief(Some("claude"), &[]);
-    assert!(carried(&briefing, "does not import"), "{briefing}");
-    world.put("CLAUDE.md", "# Notes\n\n```\n@AGENTS.md\n```\n");
-    let briefing = world.brief(Some("claude"), &[]);
-    assert!(carried(&briefing, "does not import"), "{briefing}");
-    // Imported: left to it.
-    world.put("CLAUDE.md", "# Notes\n\n@AGENTS.md\n");
-    let briefing = world.brief(Some("claude"), &[]);
-    assert!(left(&briefing), "{briefing}");
-    assert!(briefing.contains("Claude Code"), "{briefing}");
-    // But no project instructions load at all.
-    let briefing = world.brief(Some("claude"), &[("CLAUDE_CODE_SIMPLE", "1")]);
-    assert!(carried(&briefing, "CLAUDE_CODE_SIMPLE"), "{briefing}");
-    let briefing = world.run_dry("claude", &["--bare"]);
-    assert!(carried(&briefing, "--bare"), "{briefing}");
-    let briefing = world.run_dry("claude", &["--setting-sources", "user"]);
-    assert!(carried(&briefing, "project"), "{briefing}");
-    // Imported from .claude/CLAUDE.md, relative to it.
-    fs::remove_file(world.checkout.join("CLAUDE.md")).unwrap();
-    world.put(".claude/CLAUDE.md", "@../AGENTS.md\n");
-    assert!(left(&world.brief(Some("claude"), &[])));
-    fs::remove_file(world.checkout.join(".claude/CLAUDE.md")).unwrap();
-    // The person's setting loads AGENTS.md beside CLAUDE.md.
-    fs::create_dir_all(world.home.join(".claude")).unwrap();
-    fs::write(
-        world.home.join(".claude/settings.json"),
-        r#"{"pluginConfigs":{"cc-plugin-agents-md@builtin":{"options":{"instructionFiles":"claude-md-and-agents-md"}}}}"#,
-    )
-    .unwrap();
-    let briefing = world.brief(Some("claude"), &[]);
-    assert!(left(&briefing), "{briefing}");
-}
-
-#[test]
 fn codex_is_left_the_lessons_unless_an_override_or_its_byte_cap_hides_them() {
     let world = merged_world("codex");
     let briefing = world.brief(Some("codex"), &[]);
@@ -1300,54 +1247,6 @@ fn codex_is_left_the_lessons_unless_an_override_or_its_byte_cap_hides_them() {
     .unwrap();
     let briefing = world.brief(Some("codex"), &[]);
     assert!(carried(&briefing, "project_doc_max_bytes"), "{briefing}");
-}
-
-#[test]
-fn an_agent_not_known_to_read_agents_md_gets_the_lessons_carried() {
-    let world = merged_world("unknown");
-    assert!(carried(&world.brief(None, &[]), "no agent"));
-    assert!(carried(&world.brief(Some("gemini"), &[]), "gemini"));
-    assert!(left(&world.brief(Some("pi"), &[])));
-    assert!(carried(&world.run_dry("pi", &["-nc"]), "-nc"));
-    assert!(left(&world.brief(Some("opencode"), &[])));
-    assert!(carried(
-        &world.brief(
-            Some("opencode"),
-            &[("OPENCODE_DISABLE_PROJECT_CONFIG", "1")]
-        ),
-        "OPENCODE_DISABLE_PROJECT_CONFIG"
-    ));
-}
-
-#[test]
-fn the_session_log_says_via_agents_md_only_when_the_agent_reads_it() {
-    let world = merged_world("vialog");
-    let via = |agent: &str| -> serde_json::Value {
-        let mut run = world.ohjaa(&world.checkout);
-        run.args(["run", agent, "--intent", "work"]);
-        let (stdout, stderr, code) = world.run(&mut run);
-        assert_eq!(code, Some(0), "{stdout}{stderr}");
-        let mut export = world.ohjaa(&world.checkout);
-        export.args(["usage", "export"]);
-        let (export, _, _) = world.run(&mut export);
-        let export: serde_json::Value = serde_json::from_str(&export).unwrap();
-        let sessions = export["sessions"].as_array().unwrap();
-        let node = sessions.last().unwrap()["delivered"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|node| node["id"] == "widget-uses-rust")
-            .cloned()
-            .unwrap_or_else(|| panic!("not delivered: {export}"));
-        node["via"].clone()
-    };
-    let agents = world.checkout.join("AGENTS.md");
-    assert_eq!(via("codex"), agents.to_str().unwrap());
-    assert_eq!(
-        via("claude"),
-        serde_json::Value::Null,
-        "carried by the briefing"
-    );
 }
 
 #[test]

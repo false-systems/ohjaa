@@ -1,12 +1,8 @@
-//! `ohjaa shell-init zsh`: the launcher that routes `claude` and `codex`
-//! through `ohjaa run`, printed for `~/.zshrc` to eval, and the human view's
-//! line for a terminal's opening.
+//! `ohjaa shell-init zsh`: the human view's line for a terminal's opening,
+//! printed for `~/.zshrc` to eval. Agents start as they are typed: the rules
+//! reach each through its own instruction file (`ohjaa apply`).
 
 use anyhow::Result;
-
-/// The launcher, printed by `ohjaa shell-init zsh`. Its rules are the
-/// person's own: see the comments in the file.
-const LAUNCH_ZSH: &str = include_str!("launch.zsh");
 
 /// Run once, as the eval runs: a terminal opening. `ohjaa line` says nothing
 /// in an agent's shell or without a terminal, so it needs no guard here.
@@ -21,7 +17,7 @@ pub fn shell_init(shell: &str) -> Result<i32> {
         eprintln!("ohjaa shell-init: only zsh is supported, not {shell}");
         return Ok(2);
     }
-    print!("{LAUNCH_ZSH}{LINE_ZSH}");
+    print!("{LINE_ZSH}");
     Ok(0)
 }
 
@@ -30,30 +26,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_launcher_is_the_one_the_person_wrote() {
-        // The rules are verbatim; only the header says how it is loaded now.
-        for rule in [
-            "[[ ${OHJAA_WRAP:-1} == 0 || -n $OHJAA_SESSION ]] && return 1",
-            "_ohjaa_at_terminal || return 1",
-            "claude:-p|claude:--print|claude:-c|claude:--continue|claude:-r|claude:--resume) return 1 ;;",
-            "_ohjaa_task=(--task \"$1\")",
-            "command claude \"$@\"",
-        ] {
-            assert!(LAUNCH_ZSH.contains(rule), "{rule}");
-        }
-        assert!(LAUNCH_ZSH.contains("shell-init zsh"));
-        assert!(!LAUNCH_ZSH.contains("source ~/projects/ohjaa-launch.zsh"));
-        // Every folder is wrapped: the team's knowledge reaches an agent only
-        // through the briefing, so no folder may skip it.
-        assert!(!LAUNCH_ZSH.contains("git rev-parse"));
-        assert!(!LAUNCH_ZSH.contains("$HOME/projects"));
-    }
-
-    #[test]
     fn the_line_runs_once_as_the_shell_starts_and_can_be_switched_off() {
         let lines: Vec<&str> = LINE_ZSH.lines().filter(|l| !l.starts_with('#')).collect();
         assert!(lines.contains(&"[[ ${OHJAA_LINE:-1} == 0 ]] || ohjaa line"));
         // Never inside a function: it runs at the eval, once.
         assert!(!LINE_ZSH.contains("() {"));
+    }
+
+    #[test]
+    fn no_agent_is_wrapped() {
+        for agent in ["claude", "codex", "pi", "opencode"] {
+            assert!(!LINE_ZSH.contains(&format!("{agent}()")), "{agent}");
+        }
+        assert!(!LINE_ZSH.contains("ohjaa run"));
     }
 }
