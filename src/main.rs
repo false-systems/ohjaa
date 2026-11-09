@@ -2521,11 +2521,12 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
         println!("flag     {}: {}", flag.id(), flag.describe());
     }
     let agents = measured(&dirs, &loaded)?;
-    let (mut size, mut over) = (0, false);
+    // `over`: how many budget flags are said, one per agent over the budget.
+    let (mut size, mut over) = (0, 0usize);
     if agents.is_empty() {
         size = knowledge::render(&loaded, &flags).len();
-        over = size > budget;
-        if over {
+        over = usize::from(size > budget);
+        if over > 0 {
             println!(
                 "flag     the briefing is {size} characters, over the budget of {budget}: merge or \
                  retire"
@@ -2544,7 +2545,7 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
             target.key, briefed.full
         );
         if briefed.full > budget {
-            over = true;
+            over += 1;
             let fix = match (&briefed.mine_machine, &target.file) {
                 (Some(_), None) if briefed.carried => format!(
                     ", or create {} and run `ohjaa apply`, so that {} reads mine and machine there",
@@ -2657,10 +2658,10 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
         "summary  {current} current, {} waiting for a decision, {errors} error(s), {} flag(s), \
          {suggestions} suggestion(s), briefing {size}/{budget}",
         waiting.len(),
-        flags.len() + usize::from(over) + stuck
+        flags.len() + over + stuck
     );
     Ok(
-        if errors > 0 || (strict && (!flags.is_empty() || over || stuck > 0)) {
+        if errors > 0 || (strict && (!flags.is_empty() || over > 0 || stuck > 0)) {
             1
         } else {
             0

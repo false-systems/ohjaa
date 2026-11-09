@@ -2359,6 +2359,9 @@ fn check_measures_the_briefing_each_agent_gets() {
     fs::write(&claude, applied_block(&[&format!("- taste: {taste}")])).unwrap();
     let pi = fixture.dir.join("home/.pi/agent");
     fs::create_dir_all(&pi).unwrap();
+    // opencode is set up here too, with no instructions file either.
+    let opencode = fixture.dir.join("config/opencode");
+    fs::create_dir_all(&opencode).unwrap();
     let (stdout, _, code) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
     assert_eq!(code, Some(0), "flags alone are not errors: {stdout}");
     let line = |prefix: &str| {
@@ -2399,10 +2402,23 @@ fn check_measures_the_briefing_each_agent_gets() {
             pi.join("AGENTS.md").display()
         )
     );
+    assert!(
+        line("flag     the briefing opencode gets here is ").contains(&format!(
+            "or create {} and run `ohjaa apply`",
+            opencode.join("AGENTS.md").display()
+        )),
+        "{stdout}"
+    );
     // Agents not set up here are not measured.
     assert!(!stdout.contains("briefing codex"), "{stdout}");
+    // The summary counts each agent's flag (the review of #90).
+    let summary = line("summary");
+    assert!(summary.contains(", 2 flag(s),"), "{stdout}");
     assert!(
-        line("summary").ends_with(&format!("briefing {pi_size}/8000")),
+        summary.ends_with(&format!(
+            "briefing {}/8000",
+            pi_size.max(size(&line("briefing opencode ")))
+        )),
         "{stdout}"
     );
     fixture.cleanup();
