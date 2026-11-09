@@ -366,12 +366,14 @@ pub enum Flag {
     Failing { id: String, predicate: String },
     /// A fact not re-confirmed for longer than [`FACT_TTL_DAYS`].
     Stale { id: String, days: i64 },
+    /// The body names, in backticks, an `ohjaa` command this ohjaa lacks.
+    NoCommand { id: String, command: String },
 }
 
 impl Flag {
     pub fn id(&self) -> &str {
         match self {
-            Flag::Failing { id, .. } | Flag::Stale { id, .. } => id,
+            Flag::Failing { id, .. } | Flag::Stale { id, .. } | Flag::NoCommand { id, .. } => id,
         }
     }
 
@@ -379,6 +381,9 @@ impl Flag {
         match self {
             Flag::Failing { predicate, .. } => format!("may no longer hold: {predicate} is false"),
             Flag::Stale { days, .. } => format!("fact last confirmed {days} days ago"),
+            Flag::NoCommand { command, .. } => {
+                format!("names `ohjaa {command}`, which this ohjaa does not have")
+            }
         }
     }
 }
@@ -400,7 +405,31 @@ fn holds(predicate: &Predicate, repo_root: Option<&Path>) -> bool {
     }
 }
 
-pub fn flags(loaded: &Loaded, repo_root: Option<&Path>, today: Date) -> Vec<Flag> {
+/// The `ohjaa <command>` each code span of `body` names that is not in `own`,
+/// once each. A rule that names a command which is gone asks every agent
+/// for something it cannot do.
+fn missing_commands(body: &str, own: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // Every second piece between backticks is a code span.
+    for span in body.split('`').skip(1).step_by(2) {
+        let mut words = span.split_whitespace();
+        if words.next() != Some("ohjaa") {
+            continue;
+        }
+        let Some(command) = words.next() else {
+            continue;
+        };
+        let named = command.starts_with(|c: char| c.is_ascii_lowercase())
+            && command.chars().all(|c| c.is_ascii_lowercase() || c == '-');
+        if named && !own.iter().any(|known| known == command) && !out.iter().any(|o| o == command) {
+            out.push(command.to_owned());
+        }
+    }
+    out
+}
+
+/// `own` is the commands this ohjaa has.
+pub fn flags(loaded: &Loaded, repo_root: Option<&Path>, today: Date, own: &[String]) -> Vec<Flag> {
     let mut out = Vec::new();
     for located in &loaded.nodes {
         let node = &located.node;
@@ -420,6 +449,12 @@ pub fn flags(loaded: &Loaded, repo_root: Option<&Path>, today: Date) -> Vec<Flag
             out.push(Flag::Stale {
                 id: node.id.clone(),
                 days,
+            });
+        }
+        for command in missing_commands(&node.body, own) {
+            out.push(Flag::NoCommand {
+                id: node.id.clone(),
+                command,
             });
         }
     }
@@ -1730,7 +1765,7 @@ mod tests {
         accept(&sandbox.dirs, "old-fact", date("2026-01-01")).unwrap();
 
         let loaded = load(&sandbox.dirs).unwrap();
-        let found = flags(&loaded, None, date("2026-09-24"));
+        let found = flags(&loaded, None, date("2026-09-24"), &[]);
         assert_eq!(found.len(), 2, "{found:?}");
         let briefing = render(&loaded, &found);
         assert!(
@@ -1742,7 +1777,7 @@ mod tests {
 
         confirm(&sandbox.dirs, "old-fact", date("2026-09-24")).unwrap();
         let loaded = load(&sandbox.dirs).unwrap();
-        assert_eq!(flags(&loaded, None, date("2026-09-24")).len(), 1);
+        assert_eq!(flags(&loaded, None, date("2026-09-24"), &[]).len(), 1);
     }
 
     #[test]

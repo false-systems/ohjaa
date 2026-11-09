@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use faija_knowledge::{self as fk, Kind, Scope, Status};
 
 use knowledge::{Dirs, Outcome, Proposal};
@@ -485,7 +485,12 @@ fn knowledge_briefing_for(
     for error in fk::validate_set(&loaded.nodes) {
         eprintln!("ohjaa: knowledge does not hold together: {error}");
     }
-    let flags = knowledge::flags(&loaded, dirs.repo_root.as_deref(), knowledge::today());
+    let flags = knowledge::flags(
+        &loaded,
+        dirs.repo_root.as_deref(),
+        knowledge::today(),
+        &own_commands(),
+    );
     let home = instructions::OWN_FILE_SCOPES;
     let current = knowledge::in_scopes(&loaded, scopes);
     // What the agent's own file holds (the team's, mine and machine), as it
@@ -1615,6 +1620,15 @@ fn cmd_lessons_publish(roots: &[PathBuf], repos: &[PathBuf], dry_run: bool) -> R
     Ok(if complete { 0 } else { INCOMPLETE })
 }
 
+/// The commands this ohjaa has, as clap knows them.
+fn own_commands() -> Vec<String> {
+    Cli::command()
+        .get_subcommands()
+        .map(|command| command.get_name().to_owned())
+        .chain(["help".to_owned()])
+        .collect()
+}
+
 fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
     let dirs = dirs()?;
     let loaded = knowledge::load(&dirs)?;
@@ -1633,7 +1647,12 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
         println!("error    {error}");
         errors += 1;
     }
-    let flags = knowledge::flags(&loaded, dirs.repo_root.as_deref(), knowledge::today());
+    let flags = knowledge::flags(
+        &loaded,
+        dirs.repo_root.as_deref(),
+        knowledge::today(),
+        &own_commands(),
+    );
     for flag in &flags {
         println!("flag     {}: {}", flag.id(), flag.describe());
     }
@@ -1667,6 +1686,23 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
         }
         Ok(evidence) => {
             let today = knowledge::today();
+            // How far the counts reach: a count from an intake that has not
+            // read lately is not measured, and must not read as zero.
+            match intake::read_cursor(&dirs) {
+                Ok(None) => println!(
+                    "evidence no intake has run here: how often each was re-taught is unknown, \
+                     not zero (`ohjaa intake`)"
+                ),
+                Ok(Some(at)) => println!(
+                    "evidence counted from what people said up to {}; nothing later was read \
+                     (`ohjaa intake`)",
+                    intake::clock(at)
+                ),
+                Err(error) => {
+                    println!("error    {error:#}");
+                    errors += 1;
+                }
+            }
             let mut nodes: Vec<&fk::Located> = loaded
                 .nodes
                 .iter()

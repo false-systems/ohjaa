@@ -4409,3 +4409,65 @@ fn malformed_secrets_coverage_is_incomplete_and_keeps_the_retry_boundary() {
         .contains("unreadable-path list"));
     fixture.cleanup();
 }
+
+/// 2026-11-09: the rules told every agent to use `ohjaa run` and `ohjaa
+/// gate` a day after both were removed, and check said nothing.
+#[test]
+fn check_flags_a_current_node_that_names_an_ohjaa_command_this_ohjaa_lacks() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("check-own-commands");
+    let repo = fixture.make_git_repo("work");
+    let mine = fixture.dir.join("config/ohjaa/mine");
+    fixture.node(
+        &mine,
+        "launch",
+        "decision",
+        "Start through `ohjaa no-such-command --scope x`. Propose with `ohjaa propose`.",
+    );
+    let (stdout, _, code) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert_eq!(code, Some(0), "a flag is not an error: {stdout}");
+    assert!(
+        stdout.contains(
+            "flag     launch: names `ohjaa no-such-command`, which this ohjaa does not have"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("`ohjaa propose`"), "{stdout}");
+    let (_, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["check", "--strict"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(1));
+    fixture.cleanup();
+}
+
+/// "re-taught 0 times" from an intake that has not read lately is not
+/// measured, and check must not let it read as zero.
+#[test]
+fn check_says_how_far_intake_read_so_no_count_reads_as_zero() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("check-intake-reach");
+    let repo = fixture.make_git_repo("work");
+    let mine = fixture.dir.join("config/ohjaa/mine");
+    fixture.node(&mine, "fine", "taste", "Fine.");
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert!(
+        stdout.contains("evidence no intake has run here: how often each was re-taught is unknown"),
+        "{stdout}"
+    );
+    let state = fixture.dir.join("state/ohjaa");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("intake-since"), "2026-10-12T23:13:15.000Z\n").unwrap();
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert!(
+        stdout.contains("evidence counted from what people said up to 2026-10-12 23:13 UTC"),
+        "{stdout}"
+    );
+    fixture.cleanup();
+}
