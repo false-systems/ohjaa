@@ -203,7 +203,7 @@ pub struct NativeSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
     /// The agent's own environment claimed it, in `ohjaa oriented` or `ohjaa
-    /// handover` run from inside the session ([`FromEnv`]). Its `source` is
+    /// handover` (gone since) run from inside the session ([`FromEnv`]). Its `source` is
     /// [`ENV_SOURCE`], and it is `testimony`, when no transcript's launch
     /// prompt named it too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -221,7 +221,7 @@ pub const ENV_SOURCE: &str = "env";
 
 /// One of the agent's own sessions as its environment named it: the variable
 /// the agent sets in each shell it runs for its tools, read by `ohjaa
-/// oriented` or `ohjaa handover` run in one. Claude Code sets
+/// oriented` or `ohjaa handover` (gone since) run in one. Claude Code sets
 /// `CLAUDE_CODE_SESSION_ID` (its parent's id in a subagent's shell, and the
 /// new id after a `/clear`), Codex `CODEX_THREAD_ID`, pi `PI_SESSION_ID`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

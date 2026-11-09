@@ -81,12 +81,10 @@ enum Cmd {
         /// Include knowledge and context for these repositories (repeatable).
         #[arg(long, value_name = "PATH", conflicts_with = "write")]
         scope: Vec<String>,
-        /// The agent the briefing is for, as `ohjaa run` names it (claude,
-        /// codex, pi, opencode): as run does, what that agent's own
-        /// instruction file holds current is left out, unless its
-        /// environment says it will not read the file, and the briefing
-        /// says where mine and machine come from. The arguments `ohjaa run
-        /// … -- <args>` would give the agent are not known here.
+        /// The agent the briefing is for (claude, codex, pi, opencode): what
+        /// that agent's own instruction file holds current is left out,
+        /// unless its environment says it will not read the file, and the
+        /// briefing says where the rest comes from.
         #[arg(long, value_name = "COMMAND", conflicts_with = "write")]
         agent: Option<String>,
         /// Write the knowledge as a generated block into this file (repeatable),
@@ -247,7 +245,7 @@ enum Cmd {
     #[command(
         after_help = "When the snapshot is more than 5 minutes old it starts a collect \
         and waits for it at most 10 s; past that it shows the snapshot it has, and the collect \
-        goes on in the background. Who is live is asked now, as `ohjaa fleet` asks.\n\n\
+        goes on in the background. Who is live is asked of each repository's toimija now.\n\n\
         Exit codes:\n  \
         0  everything could be read\n  \
         4  something could not be read (it says what), or nothing was collected yet"
@@ -652,8 +650,7 @@ fn lessons_line(count: usize, agents_md: &Path, agent: &str, how: &str) -> Strin
 
 /// The knowledge section of the briefing for these scopes, within its
 /// budget (the one line about mine and machine included), and exactly which
-/// nodes it delivers. For `agent`, the command `ohjaa run` launches and the
-/// arguments it gives it: when that agent reads its own instruction file
+/// nodes it delivers. For `agent`, the agent's command and its arguments: when that agent reads its own instruction file
 /// and the file holds mine and machine current, the briefing leaves out
 /// what the file holds, but for a flagged node, and carries what it does
 /// not; either way that is said, in one line. Broken files are reported on
@@ -1049,7 +1046,7 @@ fn selected_perimeter(
 }
 
 fn scoped_perimeter_text(view: &system::SystemView, here: &Path) -> String {
-    format!("{}\n\nOnly the launch repository, declared scope and sessions reaching them are included.\nOther repositories were not scanned. Use `ohjaa system` or `ohjaa fleet` for a\nfleet-wide question; after expanding scope, use `ohjaa brief --scope <path>`.\nUse the delivered facts instead of repeating discovery. Refresh session observations\nbefore editing if work has moved on since this briefing.\n", system::briefing(view, here))
+    format!("{}\n\nOnly the launch repository, declared scope and sessions reaching them are included.\nOther repositories were not scanned. Use `ohjaa system` or `toimija sessions` for a\nfleet-wide question; after expanding scope, use `ohjaa brief --scope <path>`.\nUse the delivered facts instead of repeating discovery. Refresh session observations\nbefore editing if work has moved on since this briefing.\n", system::briefing(view, here))
 }
 
 fn cmd_brief(
@@ -1202,11 +1199,11 @@ fn repo_key(repo: &Path) -> String {
         .into_owned()
 }
 
-/// The session this command runs inside, named by `ohjaa run`.
+/// The session named in the environment, as an earlier `ohjaa run` set it.
 fn current_session_id() -> Result<String> {
     let id = std::env::var(sessions::SESSION_ENV).map_err(|_| {
         anyhow::anyhow!(
-            "not inside an ohjaa session: start the agent with `ohjaa run` (it sets {})",
+            "no --session given, and {} is not set",
             sessions::SESSION_ENV
         )
     })?;

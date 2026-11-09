@@ -610,7 +610,6 @@ fn ended(
                 .join(", ")
         ));
     }
-    parts.push(format!("Inspect: ohjaa session {}", clean(&session.id)));
     event(
         Kind::Ended {
             told: readback && handover,
@@ -1178,7 +1177,7 @@ fn build(
         if local.gone.contains(id) {
             let text = |brief| {
                 format!("Agent still running without its Ohjaa supervisor{found}; later work is not observed: \
-                {} · Inspect: ohjaa session {id}", open_context(session, brief))
+                {}", open_context(session, brief))
             };
             let mut item = standing(
                 Kind::Gone,
@@ -1192,7 +1191,7 @@ fn build(
         } else if local.orphaned.contains(id) {
             let text = |brief| {
                 format!("Neither the agent nor its supervisor was found running{found}; final result unknown: \
-                {} · Inspect: ohjaa session {id}", open_context(session, brief))
+                {}", open_context(session, brief))
             };
             let mut item = standing(
                 Kind::Orphaned,
@@ -1211,12 +1210,12 @@ fn build(
                 &session.repo,
                 format!(
                     "Session record still open after {}: {who} · This is an unclosed record, \
-                     not proof of failed or stuck work · Inspect: ohjaa session {id}",
+                     not proof of failed or stuck work",
                     open_age(now_ms - session.started_ms)
                 ),
             );
             item.brief = Some(format!(
-                "Record still open after {} (may still be active): {} · Inspect: ohjaa session {id}",
+                "Record still open after {} (may still be active): {}",
                 open_age(now_ms - session.started_ms),
                 open_context(session, true)
             ));
@@ -1874,7 +1873,7 @@ fn daily(
     Some((lines.join("\n") + "\n", more > 0))
 }
 
-/// Who is live, as `ohjaa fleet` finds them now, and how many scans could
+/// Who is live, as each repository's toimija finds them now, and how many scans could
 /// not look.
 pub struct Fleet {
     live: Vec<String>,
@@ -2642,7 +2641,6 @@ mod tests {
             "may still be active",
             "no task description recorded",
             "not active yet",
-            "ohjaa session still-open",
         ] {
             assert!(words.contains(context), "missing {context}:\n{daily}");
         }
@@ -2716,12 +2714,11 @@ mod tests {
         assert!(view.incomplete());
         let digest = full(&view, &Window::at(NOW - 3 * DAY_MS), None, None, NOW);
         assert!(digest.contains("unreadable-session.jsonl"), "{digest}");
-        for i in 0..4 {
-            assert!(
-                digest.contains(&format!("ohjaa session open-{i}")),
-                "{digest}"
-            );
-        }
+        assert_eq!(
+            digest.matches("This is an unclosed record").count(),
+            4,
+            "{digest}"
+        );
         assert_eq!(
             view.events
                 .iter()
@@ -3175,7 +3172,6 @@ mod tests {
             "{digest}"
         );
         assert!(!digest.contains("no task description recorded"), "{digest}");
-        assert!(digest.contains("ohjaa session ongoing-chat"), "{digest}");
     }
 
     #[test]
@@ -3193,7 +3189,6 @@ mod tests {
             "{daily}"
         );
         assert!(!daily.contains("  !"), "{daily}");
-        assert!(daily.contains("ohjaa session long-context"), "{daily}");
         assert!(daily.lines().count() <= DAILY_LINES, "{daily}");
         let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -3238,8 +3233,7 @@ mod tests {
             for text in [
                 warning,
                 "last recorded goal:",
-                "ohjaa session long-liveness-goal",
-                "ohjaa session following-open-record",
+                "recorded task: \"fix the parser\"",
             ] {
                 assert!(
                     words.contains(text),
@@ -3289,7 +3283,6 @@ mod tests {
         assert!(view.events[0]
             .text
             .contains("recorded launch intent: \"fix the parser\""));
-        assert!(view.events[0].text.contains("Inspect: ohjaa session typed"));
         collected.typed.value.clear();
         let fallback = build(&[session], Ok(Vec::new()), Some(&collected), NOW, 0);
         assert!(fallback.events[0]
@@ -3381,7 +3374,6 @@ mod tests {
         assert!(digest.contains("fingerprint 1a2b3c4d"));
         assert!(digest.contains("native-session"));
         assert!(digest.contains("you typed it"));
-        assert!(digest.contains("Inspect: ohjaa session a"));
         let read = advance(&view, &seen, Some(&collected), NOW + 200, Shown::Full, "d");
         assert!(after(&view, &read.full_from(NOW + 300)).is_empty());
     }
@@ -3449,7 +3441,11 @@ mod tests {
         );
         assert_eq!(tomorrow.full_from(NOW + DAY_MS), from);
         let digest = full(&view, &tomorrow.full_from(NOW + DAY_MS), None, None, NOW);
-        assert!(digest.contains("ohjaa session finished"), "{digest}");
+        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains(&format!("ended {}", clock(NOW - HOUR_MS))),
+            "{digest}"
+        );
         assert!(digest.contains("#7 merged"), "{digest}");
     }
 
@@ -3503,7 +3499,6 @@ mod tests {
         for expected in [
             "task not recorded",
             "process exited successfully (code 0)",
-            "ohjaa session inspect-me",
             "personal agent instructions",
             "not failed code",
             "Cached input is counted separately",
@@ -3857,7 +3852,7 @@ mod tests {
             said("killed"),
             format!(
                 "claude \"fix the parser\" · killed (signal 9) · elapsed 60m · ended {} · \
-                no task confirmation or completion note recorded · Inspect: ohjaa session killed",
+                no task confirmation or completion note recorded",
                 clock(NOW - HOUR_MS)
             )
         );
@@ -3865,14 +3860,17 @@ mod tests {
             said("orphan"),
             format!(
                 "claude \"fix the parser\" · orphaned · ended {} · \
-                no task confirmation or completion note recorded · Inspect: ohjaa session orphan",
+                no task confirmation or completion note recorded",
                 clock(NOW - HOUR_MS)
             )
         );
         assert_eq!(
             said("costed"),
-            format!("claude \"fix the parser\" · process exited successfully (code 0) · elapsed 60m · \
-                ended {} · no task confirmation recorded · 115k tokens + 2.9M cache reads · Inspect: ohjaa session costed", clock(NOW-HOUR_MS))
+            format!(
+                "claude \"fix the parser\" · process exited successfully (code 0) · elapsed 60m · \
+                ended {} · no task confirmation recorded · 115k tokens + 2.9M cache reads",
+                clock(NOW - HOUR_MS)
+            )
         );
     }
 
@@ -4233,7 +4231,6 @@ mod tests {
             .find(|item| item.kind == Kind::OpenLong)
             .unwrap();
         assert!(notice.text.contains(&open.intent));
-        assert!(notice.text.contains("ohjaa session long"));
     }
 
     #[test]

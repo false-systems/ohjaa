@@ -4060,10 +4060,7 @@ fn startup_keeps_liveness_warnings_with_long_recorded_goals() {
             "Agent still running without its Ohjaa supervisor"
         };
         assert!(words.contains(warning), "{daily}");
-        assert!(
-            daily.contains("ohjaa session long-liveness-goal"),
-            "{daily}"
-        );
+        assert!(!daily.contains("ohjaa session"), "{daily}");
         assert!(daily.lines().count() <= 15, "{daily}");
         assert!(
             daily.lines().all(|line| line.chars().count() <= 100),
