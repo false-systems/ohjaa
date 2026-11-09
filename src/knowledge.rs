@@ -157,7 +157,7 @@ pub fn clone_key(repo: &Path) -> PathBuf {
     let common = repo
         .ancestors()
         .find(|dir| dir.join(".git").exists())
-        .and_then(|dir| crate::hook::common_dir_in(dir, None, None));
+        .and_then(crate::gitconfig::common_dir_in);
     let key = common.unwrap_or_else(|| repo.to_path_buf());
     std::fs::canonicalize(&key).unwrap_or(key)
 }

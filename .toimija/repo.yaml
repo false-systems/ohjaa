@@ -34,7 +34,7 @@ boundaries:
   - "Ohjaa holds Knowledge; toimija reports facts. Never reimplement what toimija derives: shell out to its CLI and read its --json."
   - "Ohjaa stores Knowledge, in git, and a machine-local session log. Everything else is derived when asked; the human view's snapshot is the one cache. No knowledge index and no daemon."
   - "The workflow lives in the home (~/.config/ohjaa), outside every repository. No file, hook or config of a repository's checkout is written."
-  - "Observe, mark and flag; never refuse for the workflow. Only a repository's own hooks refuse."
+  - "Ohjaa checks nothing and refuses nothing for the workflow: the checks a commit must pass, and refusing a push without them, are sykli's, through the repository's own hooks."
   - "Agents propose; only a person makes Knowledge current, retires it or rejects it. What ohjaa writes into a repository names no tool, and a public one is sent nothing that names a private one."
   - "Cross-repo yes, messaging no: no request/response between agents, no presence, no dispatch."
   - "Network only through gh, the drafter, and git to GitHub to deliver repo knowledge. Every other command works from the filesystem and local CLIs."

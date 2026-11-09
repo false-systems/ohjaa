@@ -24,14 +24,16 @@ ohjaa check                            # validate, and flag what may no longer h
 ohjaa lessons publish --dry-run        # repo knowledge into each repository's own AGENTS.md
 ohjaa intake                           # draft proposals from what people said
 ohjaa brief --scope ../other-repo      # the Knowledge and context for a repository
-ohjaa report                           # commits on a default branch without passing evidence
 ohjaa line                             # for a terminal's opening: what is new since you looked
 ohjaa digest                           # what happened, for you: all of it
 ohjaa system                           # what every tool in the fleet is, derived now
-ohjaa adopt ~/projects/sykli           # give a repo an entry: the branch ohjaa observes, and the build settings its gate gives cargo
 ohjaa doctor                           # what differs from what apply would make it
-ohjaa gate                             # prove HEAD: run this repo's gate, as a push is judged
 ```
+
+The checks a commit must pass are the repository's own, in its `sykli.json`:
+`sykli run` proves HEAD, and `sykli hook install` makes the repository's
+pre-push hook refuse a push to its default branch without a passing receipt.
+Ohjaa runs no check and installs no hook.
 
 ## Why
 
@@ -127,13 +129,13 @@ nodes; older records without that identity still read.
   Each decision on it (`accept`, `reject`, `retire`, `confirm`, and each one
   `review` makes) is one commit, with your git identity, saying what and why:
   `accept code-is-rust: Code is Rust or Elixir.`, then the kind, the scope and
-  each `why:` of its origin; a retirement carries its `--why`. `ohjaa apply`,
-  `apply --undo` and `adopt` commit what they change in the home the same way.
+  each `why:` of its origin; a retirement carries its `--why`. `ohjaa apply` and
+  `apply --undo` commit what they change in the home the same way.
   A commit that fails (another git holding the index, no identity) is said,
   and the decision stands; the next commit takes it in. `git -C
   ~/.config/ohjaa log` is the history of what you decided.
   - One change at a time: each decision (its write, its commit and the
-    agents' block below), apply and adopt holds the home's lock
+    agents' block below) and apply holds the home's lock
     (`.git/ohjaa.lock`), so decisions made at once are a commit each, in turn.
     The home's git holds it too, for as long as it runs (the lock is its
     stdin): an ohjaa killed while it commits leaves its git to finish (it
@@ -146,8 +148,8 @@ nodes; older records without that identity still read.
     signing. A hook git's config defines by name (`hook.<name>.command`)
     still runs under git 2.54, which has no switch for all of them, but git
     gives it /dev/null for its stdin, so nothing it leaves holds the lock.
-  - Only what ohjaa keeps there is committed: `mine/`, `machine/`, `repos/`,
-    `git/`, `roots`, `applied.toml`, `ours` and `drafter`, by an allowlist in
+  - Only what ohjaa keeps there is committed: `mine/`, `machine/`, `roots`,
+    `applied.toml`, `ours` and `drafter`, by an allowlist in
     the repository's own `.git/info/exclude` (the home holds no `.gitignore`).
     A `.DS_Store`, an editor's swap or backup file, a half-done write's
     temporary file, or a file of your own beside them never is.
@@ -169,7 +171,7 @@ ohjaa intake --source transcripts --dry-run   # show the prompt, send nothing
 ohjaa intake --since 2026-10-01 --no-prefilter  # every message, not only likely corrections
 ```
 
-`ohjaa intake` reads four sources:
+`ohjaa intake` reads three sources:
 
 - **Transcripts:** what people wrote in agent sessions (Claude Code, Codex,
   pi), through `vessa messages --since <cursor> --json`
@@ -182,7 +184,6 @@ ohjaa intake --since 2026-10-01 --no-prefilter  # every message, not only likely
   counted, never sent.
 - **Reviews:** human comments on pull requests and issues, through `gh`.
 - **Reverts:** reverted commits on each repository's current branch.
-- **Report:** what the bypass report finds (see below).
 
 **A local pre-filter comes first** (no network). Most of what people write
 to agents is the work, not a correction. Of what vessa lists, only what looks
@@ -200,8 +201,7 @@ lenient, and its recall low, so it is never silent:
   again: a `--since` before the cursor, with `--no-prefilter` or with rules
   changed since. A rule change does not reach back by itself; that would need
   a record of every message read, not only of those sent.
-- PR comments, reverts, the report, handovers and observed failures are not
-  filtered.
+- PR comments, reverts, handovers and observed failures are not filtered.
 
 **Secret-looking tokens are redacted before the drafter: a best effort over
 known shapes, not a guarantee.** People paste credentials to agents. As each
@@ -326,7 +326,7 @@ source was read, a run says `nothing new to draft from` and exits 0. Only one
 intake runs at a time: a second says `intake already running` and exits 3.
 
 **One cursor covers every source** (`intake-since`). It moves only after a run
-that read all four sources, none with a warning, and then only past
+that read all three sources, none with a warning, and then only past
 candidates that were handled, never back.
 - A run with `--source`, or with a warning, leaves the cursor where it was,
   and says so: where it stays, since when, and which source holds it. So a
@@ -356,7 +356,6 @@ candidates that were handled, never back.
     code. Waiting cannot read it, and a hold would keep the window before
     every later write, so it would never end. Once vessa reads the store,
     `ohjaa intake --source transcripts --since <its first day>` reads it back.
-- The report's own gaps are said, and do not hold the cursor.
 - A first run, with no cursor yet, keeps the start of its window (fourteen
   days back) as the cursor before it drafts.
 - A `--since` before the cursor reads that stretch again, and sends once more
@@ -442,47 +441,6 @@ origin, say) did not re-teach it.
 ohjaa never changes a node itself. Rewording, deciding, confirming and
 retiring stay a person's.
 
-## The report: commits without passing evidence
-
-```bash
-ohjaa report                    # the last 7 days
-ohjaa report --since 30d --json # ohjaa-report.v1
-```
-
-`ohjaa report` derives, now, the marks on every entry's branch (see "Observe,
-mark, flag" below) and, for the window, the **commits on a default branch
-without passing evidence**:
-
-- For every git repository under the roots, these are the first-parent
-  commits its default branch (`origin/<default>`, else the local one; for a
-  repository with an entry, `origin/<the entry's branch>`) gained in the
-  window, by commit time, at most 100 per repository.
-- Each is checked with `sykli verify --commit` against every receipt of its
-  tree, in every checkout and under the git common dir, and against the
-  entry's gate when the repository has an entry (else the contract in the
-  commit). It passes when any one of them verifies.
-- Listed: what sykli refused, and what was never run in a checkout that
-  still exists.
-- The rest are counted by why: verified (and how many of those reused tasks
-  from sykli's cache, `verified_reusing_cache`); no sykli contract; made in
-  a checkout that is gone, with no receipt kept (merge commits among them);
-  sykli could not say. A window over the cap is said.
-
-Ohjaa launches no agents, so no session is judged against a launch. The
-JSON keeps its keys, as `ohjaa-marks.v1` only gains them:
-`sessions_without_testimony` is empty, and `bypasses` is `{"judged": false,
-"why": …}`.
-
-A capped window and a root with no repositories are gaps. A report with
-gaps says them, and exits 4: it is never a clean week. `ohjaa report`
-records when a complete report was last shown (`$XDG_STATE_HOME/ohjaa/report-at`
-and `report-shown-at`), but only when it printed to a terminal: never for
-`--json`, a script or an agent.
-
-`ohjaa intake` takes the report as its fourth source (`--source report`): a
-refused or unchecked commit on a default branch becomes an `observed`
-candidate. What could not be checked never does.
-
 ## The human view: what happened, for the person
 
 ```bash
@@ -496,9 +454,8 @@ An agent learns the state of the work from its briefing. A person learns it
 here. It records only: nothing is sent to anyone, decided or refused.
 
 - **`ohjaa line`** shows only matters needing attention or a decision:
-  failed or missing verification, observations that could not be read,
-  sessions without an observed final state, long-open sessions, and proposed
-  agent instructions waiting for you. The first terminal of a local day
+  observations that could not be read, long-open session records, possible
+  secrets in agent sessions, and proposed agent instructions waiting for you. The first terminal of a local day
   shows up to 15 lines of attention; later terminals show a short notice
   only when attention changes. With no attention it is silent, even when
   sessions ended or pull requests were merged. Silence is not a claim that
@@ -507,8 +464,8 @@ here. It records only: nothing is sent to anyone, decided or refused.
 - **Opening a terminal never marks activity read.** The first startup
   anchors the unread window, even when quiet; subsequent days do not move
   that window. Existing unread positions from older versions are retained.
-- **Saved checks and open records mean different things.** Startup identifies
-  an old background update and gives `ohjaa collect` to refresh saved checks;
+- **Saved status and open records mean different things.** Startup identifies
+  an old background update and gives `ohjaa collect` to refresh saved status;
   session records are read now. An unknown or incomplete secrets scan is not
   a finding and cannot establish an all-clear. An old, unclosed session record
   may still be active: age alone does not mean it is stuck. The digest separates
@@ -558,7 +515,8 @@ here. It records only: nothing is sent to anyone, decided or refused.
   pull requests, proposed instructions and who is live. Each ended session
   in the log has its recorded intent, end time and elapsed time. A pull request has its URL. Its "Now" says
   who is live on this machine, then the pull requests GitHub last said were
-  open in the entries' owners (updated in the window the snapshot read),
+  open in the owners of the clones under the roots (updated in the window
+  the snapshot read),
   the last updated first: the repository, the number, the author, whether it
   is a draft, its title, how long ago it last changed and its URL. That is
   where teammates' work shows, from any machine: a session that pushes its
@@ -589,15 +547,13 @@ here. It records only: nothing is sent to anyone, decided or refused.
   age of live session records. A refresh that cannot start is reported.
   `ohjaa digest` collects first when the snapshot is more than
   5 minutes old, and waits for it at most 10 s.
-- **`ohjaa collect`** asks five sources once, at the same time. A source
+- **`ohjaa collect`** asks four sources once, at the same time. A source
   that fails keeps what it held before, and is said to be as of then.
-  - The marks and the open sessions, as `ohjaa report --marks` finds them. A
-    branch whose marks cannot be read keeps what it was last read as, and so
-    does every branch when the entries themselves cannot be listed. An entry
-    whose clone git could not read is said as that, never as one with no
-    clone.
   - GitHub: one `gh api graphql` search for the pull requests updated in the
-    owners of the workflow home's entries, at most 2 calls. It reads from
+    owners on GitHub of the clones under the roots, at most 2 calls. Each
+    clone's origin is read with one `git config`; a clone git cannot read is
+    said, and when no owner was found and one could not be read, whose pull
+    requests to ask for is unknown, never none. It reads from
     where the next digest begins, by GitHub's clock (2 hours earlier, for
     what is indexed late), at least a day back and at most a week. A digest
     whose window starts earlier says `pull requests only since …`. A
@@ -632,30 +588,17 @@ Vessa against synthetic native records, checking excerpts, private findings,
 partial coverage, preserved retry boundaries and recovery. No repository is
 built or fetched implicitly.
 - **What could not be read is said, never an all-clear.** A source that did
-  not answer, or could not read all it asked (an entry that cannot be
-  marked, a page of pull requests not asked for, vessa's partial usage, the
+  not answer, or could not read all it asked (a clone whose config git
+  cannot read, a page of pull requests not asked for, vessa's partial usage, the
   fleet's failed scans), is said where the view is read, with how old what
-  it holds is: `! marks  1 could not be read, as of 08:12 UTC: …`. `ohjaa
-  collect` and `ohjaa digest` then exit 4, as `ohjaa report` does. The line
+  it holds is: `! GitHub  1 could not be read, as of 08:12 UTC: …`. `ohjaa
+  collect` and `ohjaa digest` then exit 4. The line
   says each failure of a source once, and a different failure of it again.
 
 What stays until it is resolved comes first, in this order:
 
-1. a branch with a failed commit;
-2. what is unknown: a source that could not be read, a session still running
-   with its ohjaa gone, an orphan, a commit sykli could say nothing about;
-3. a branch whose recent commits have no recorded verified passing result;
-4. what waits for a person: a session open more than a day.
-
-Missing verification does not by itself mean tests failed. Failures are
-counted explicitly, and an unavailable source remains unknown. Local
-verified receipts and remote CI results are different observations. Branch
-details identify the repository, latest observed commit, oldest commit
-without a passing result, and when those facts were checked. Inspect them
-with `ohjaa report --marks`. Before running `ohjaa gate`, use a checkout of
-that repository at the recorded commit: the command proves the current
-checkout's `HEAD`, not whichever branch a notice names. Ohjaa does not switch
-checkouts on your behalf.
+1. what is unknown: a source that could not be read;
+2. what waits for a person: a session record open more than a day.
 
 An agent's process exit describes the process, not task completion or test
 results. Code 0 is successful process exit; another code has no inferred
@@ -666,9 +609,7 @@ An `interactive` or empty launch intent is labelled **task not recorded**,
 not assumed idle. A launch outside a repository says so and names its folder
 and declared repository scopes, when recorded.
 
-A branch is said as it was last read: when that was not just now, with its
-age (`, as of 05:00 UTC (unread since)`), and it stays until a read resolves
-it. A branch is said again when its tip moves. What happened is said once:
+What happened is said once:
 - each session that ended, with how it ended, how long it ran, whether it
   read back and handed over, what landed, its pull request and its token usage;
 - the pull requests merged into a default branch;
@@ -695,12 +636,11 @@ it was created today or has waited since that date.
 Lines wrap at 100 characters, except URLs kept intact for opening or copying.
 Details wrap rather than disappear; the
 short startup notice always retains `ohjaa digest` as its inspection action.
-Digest source dates are separate for repository verification, GitHub pull
-requests and Vessa token usage. These are human-readable changes only: no
+Digest source dates are separate for GitHub pull requests, Vessa token
+usage, message excerpts and the secrets scan. These are human-readable changes only: no
 machine schema, observation, receipt or authority is changed.
 Lines use plain words with no colour, and
-ids appear only where a person needs one: a session to look at with `ohjaa
-session <id>`, a commit, a pull request, a proposal. Text from a source (a
+ids appear only where a person needs one: a pull request, a proposal. Text from a source (a
 title, an intent, a tool's error) has every control character and bidi
 control replaced with U+FFFD before it reaches the terminal.
 
@@ -715,9 +655,9 @@ control replaced with U+FFFD before it reaches the terminal.
   result cannot be skipped because a digest read an older snapshot;
 - `seen.lock`, which the terminal saying the line, and `ohjaa digest`
   moving the cursor, hold with `flock(2)`;
-- `collected.json`, the snapshot: the marks and open sessions, GitHub's pull
-  requests and vessa's usage, each with when it was read and what it could
-  not read;
+- `collected.json`, the snapshot: GitHub's pull requests, vessa's usage,
+  the first words typed and the secrets scan, each with when it was read and
+  what it could not read;
 - `collect.lock`, which the one running collect holds with `flock(2)`.
 
 Deleting them loses no knowledge. The view then starts from the last day.
@@ -737,14 +677,12 @@ switch over, once this ohjaa is installed:
 
 Not carried over: viemari's lifecycle view (Intent, session, change,
 validation, each sykli run asked by id), its rework and lead-time measures,
-pull request reviews, and direct pushes that are proven. `ohjaa report` and
-`ohjaa graph` show the depth.
+pull request reviews, and direct pushes that are proven. `ohjaa graph` shows
+the depth.
 
 In particular, viemari's day listed each failed validation a session asked
-sykli for (`FAILED: test`). This view does not ask sykli about validation
-runs, so their absence here is **not a pass**: a failed run shows here only
-as the mark of a commit on an entry's branch (`main: 1 commit needs passing
-checks (1 failed)`).
+sykli for (`FAILED: test`). This view asks sykli nothing, so their absence
+here is **not a pass**: what a commit passed is sykli's to say.
 
 ## Session usage
 
@@ -1100,689 +1038,72 @@ coverage: scanned 17/18 repo(s)
 
 ## The workflow home: applied from outside the repos
 
-The agent workflow (the gate, the hooks, the terminal's line) is a workflow thing,
-not something to merge into product repositories. Ohjaa keeps it in its home
-and applies it to repositories from outside; nothing is installed on a
-repository or written into one. Only repositories whose remote names an entry
-run ohjaa's hooks, and only the hooks they need: `git status`, `commit` and
-`fetch` start no ohjaa at all unless the repository has a hook of its own
-there, and a Homebrew tap, Cargo's git cache or a personal project never
-starts it.
+Ohjaa keeps what it writes for you in its home and applies it from outside:
+nothing is installed on a repository or written into one.
 
 ```
 ~/.config/ohjaa/                    ($XDG_CONFIG_HOME/ohjaa)
-  repos/<owner>/<repo>/             lower case
-    repo.toml     branch = "main"   the branch ohjaa observes, and [cargo_env]: what each
-                                    cargo task of its gate is given (KATANA D10)
-    hooks/pre-push, hooks/<name>    exec '<ohjaa>' hook <name> "$@": pre-push, and each
-                                    hook this entry's clones have of their own
-    gated.config                    core.hooksPath = that hooks/ folder
-  git/config                        includeIf "hasconfig:remote.*.url:<pattern>" per entry
-  roots                             where apply and doctor look (from the first apply's --root)
+  mine/ machine/ ours drafter       knowledge and settings
+  roots                             where ohjaa looks for repositories (written by hand)
   applied.toml                      what apply changed outside the home, for --undo
-  mine/ machine/ ours drafter       (knowledge and settings, as before)
   .git/                             the home's history: one commit per decision on mine
-                                    or machine, per apply and per adopt; never pushed
-~/.gitconfig                        [include] path = ~/.config/ohjaa/git/config (once)
+                                    or machine, and per apply; never pushed
 ~/.config/git/ignore                git's global excludes (or core.excludesFile):
                                     a block marked "ohjaa apply" holds .sykli/, .teko/ and .ohjaa/
+~/.zshrc                            the terminal's line: [[ -x <ohjaa> ]] && eval "$(<ohjaa> shell-init zsh)"
 ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.pi/agent/AGENTS.md,
 ~/.config/opencode/AGENTS.md        each that exists: a block marked "ohjaa:knowledge"
                                     holds ours, mine and machine (see "Keeping it true")
 ```
 
 ```bash
-ohjaa apply --root ~/projects --dry-run # the first time: name where the repositories are
-ohjaa apply --root ~/projects          # the home's files, the include, the ignore block, ~/.zshrc,
-                                       # the agents' knowledge blocks; then a commit in the home
-ohjaa apply                            # later runs read the roots it wrote down
-ohjaa apply --undo                     # put back what apply changed; entries, roots, history stay
-ohjaa apply --prune                    # also remove dispatchers no clone needs any more
-ohjaa adopt ~/projects/taso            # entry: origin's default branch, and [cargo_env]
-ohjaa gate                             # prove HEAD: run this repo's gate, as a push is judged
-ohjaa gate --print                     # the contract and the commands, run nothing
+ohjaa apply --dry-run                  # every change, none made
+ohjaa apply                            # the ignore block, ~/.zshrc, the agents' knowledge
+                                       # blocks; then a commit in the home
+ohjaa apply --undo                     # put back what apply changed; the history stays
 ohjaa doctor                           # read-only; exits 4 on drift
 ```
 
-**Scoped by remote.** Git's global config gets one line, an `include` of
-`git/config`. That file has, for each entry, `includeIf
-"hasconfig:remote.*.url:…"` sections (git 2.36+) that include the entry's own
-`gated.config`, which sets `core.hooksPath` to the entry's own `hooks/`. The
-patterns are host-agnostic and case-insensitive (`**/o/r`, `**/o/r.git`,
-`**/o/r/`, `**/o/r.git/`, and the same after `*:` for scp-like URLs, plus a
-short form for each global `insteadOf` rule), because a pattern that misses
-leaves a push unobserved, while one that matches too much only costs a
-process that finds no entry. Any remote of a clone counts. A `pushurl`, a
-repository-local `insteadOf`, or the repository's own `core.hooksPath`
-(perusta, selko and vartio set one) is not seen by the patterns: `ohjaa doctor`
-checks, clone by clone, that git really resolves `core.hooksPath` to the
-entry's hooks. The
-generated files are written atomically and checked with `git config --file
-… --list` first, since an unreadable one would break every git command.
+`apply` runs the ohjaa on PATH (or `--bin`), by its absolute path, in the
+terminal's line; another binary running it is refused (exit 3), so a `cargo
+run` never points the line at itself. Every change is planned before any is
+made, and each is recorded in `applied.toml` before it is made, so `--undo`
+puts back exactly what was there, even after an apply that failed midway.
 
-**The dispatcher** (`ohjaa hook <name>`) finds the repository by the URL git
-pushes to. On pre-push, with an entry, a push that moves the entry's branch
-is observed: it is handed, quietly, to `sykli hook pre-push --contract
-<the pushed commit's gate> --branch <entry's branch> <remote> <url>`. Nothing is
-refused for it (see "Observe, mark, flag"). Then, for every hook, the
-dispatcher runs the repository's own hook, `<common dir>/hooks/<name>`, with
-the same arguments and the same stdin, and exits with its status: a
-repository's own hook still refuses what it refuses. `push-to-checkout`, `proc-receive` and
-`fsmonitor-watchman` never get a dispatcher, because a file of that name
-changes what git does. The dispatchers exec ohjaa, and the pre-push one hands
-the push to sykli, by the paths `apply` found on PATH, so a git client started
-without your PATH (a GUI) runs them too.
+**The checks a commit must pass are sykli's**, from the repository's own
+`sykli.json` and `sykli.lock`: `sykli run` proves HEAD, `sykli verify
+--commit` says what proves a commit, and `sykli hook install` makes the
+repository's pre-push hook refuse a push to its default branch without a
+passing receipt. Ohjaa runs no check, keeps no gate and installs no hook.
 
-**Few git processes.** Facts are worked out once and passed down. A hook that
-only chains starts no git: git runs it from the work tree's root, and the
-common directory comes from the repository's layout. What ohjaa reads of a
-clone's commits (a commit, its tree, its own `sykli.json` and `sykli.lock`)
-comes from one `git cat-file --batch` per clone, asked one object at a time
-and ended when the command is done with it (a launch's, before the session
-runs), never fetching. pre-push starts that one: the pushed commit's gate,
-and, when sykli does not accept the push and the clone holds receipts, its
-tree, for one `sykli verify`; it hands sykli `--repo-root` and
-`--git-common-dir` when sykli takes them.
-`ohjaa gate` starts one (the repository's config; its gate is derived from the
-checkout's files), and inside a session, or in a checkout with no
-`sykli.json`, one more (HEAD, its tree and the branch tip); asking sykli about
-a pending run starts none;
-`doctor` two for the machine (`git --version`, the global config with
-includes) and at most two per clone (its config, with `insteadOf` applied in
-Rust, and for an entry's clone the tip's gate);
-adopt asks sykli only for its `--help`. A gate `sykli init` writes for a tree (a commit with no
-contract of its own, see "The gate of a commit") costs, every time a commit
-is judged by it (once per tree in one ohjaa process, never kept), two more
-(its scratch checkout's `git init` and `git read-tree -u`) and one `sykli
-init`, which asks git twice more (`rev-parse` and `ls-files`, in the scratch
-checkout): about 0.2 s for ohjaa's tree. `report --json --marks` on the
-home of 2026-10-27 (three such entries, ohjaa, vessa and faija, each asked
-for its tip) starts about 12 git processes more than it would without them
-(43 against 31), and takes about 0.7 s more (1.8–2.0 s against 1.1–1.25 s),
-each time it runs; so does each briefing in such a repository, for its tip
-and HEAD.
-The briefing's flag costs at most three (the clone's config, which the drift
-warnings share, and the clone's `git cat-file --batch`, which walks the branch
-and reads the gate of each commit sykli is asked about) and one `sykli
-verify`; the report's marks, and `report --json --marks`, two per entry (its
-clone's config and the walk), and `sykli verify` only for a commit with a
-receipt of its tree that says it passed. The briefing's validation lines start
-no git (HEAD is read from git's files, the gates of the tip and HEAD through
-the walk's process) and ask `sykli status --commit` about the tip
-and HEAD; a launch that asks for an integrated validation starts at most three
-more for the clone's validation checkout (made: `worktree add` and `status`;
-reused: `checkout -f`, `clean` and `status`; two more where the commit has
-submodules, `submodule deinit` and `submodule foreach`; and it all again, made
-from nothing, when the reset or its check fails). A pre-push of any other branch than the
-observed one reads the session log and the clone's ref as files, for a base
-that moved: no process. The home's history costs two per commit (`add -A`
-and `commit`, with git's automatic maintenance off, which would start one
-more, detached) and one more once, the home's `git init`: a decision on mine
+**Few git processes.** `apply` and `doctor` read git's global config in one
+process (`git config --global --includes --list`) and no clone. The home's
+history costs two per commit (`add -A` and `commit`, with git's automatic
+maintenance off) and one more once, the home's `git init`: a decision on mine
 or machine starts those beside the one that finds the repository it runs in,
-and apply starts them when it changed something, adopt each time; the
-agents' instruction files are read and written without git. `tests/config_home.rs`
-holds these budgets, and `tests/terminal.rs` a decision's.
+and apply starts them when it changed something. The agents' instruction
+files are read and written without git. `ohjaa collect` reads each clone's
+config under the roots once, to find the owners whose pull requests GitHub is
+asked about. `tests/config_home.rs` holds these budgets, and
+`tests/terminal.rs` a decision's.
 
-**`ohjaa gate`** proves HEAD: it runs the gate a push is judged by, from the
-repository root: `mkdir -p .sykli && sykli run <contract> --json >
-.sykli/receipt.json && sykli verify .sykli/receipt.json --contract <contract>
---commit HEAD`, where the contract is the gate of what the checkout runs (see
-"The gate of a commit"): derived from the checkout's own `sykli.json` and
-`sykli.lock`, read as files; in a checkout with no `sykli.json`, HEAD's gate,
-derived as every commit's is (what `sykli init` writes for HEAD's tree, when
-HEAD has no contract of its own: it declares what HEAD tracks, so it proves
-HEAD as committed, and the gate says to commit first); or the repository's
-own `sykli.json` when origin names no entry. When those two
-files are HEAD's, that is exactly HEAD's gate; when they are edited (an input
-added, as one must before committing it), it is the gate the commit they
-will be in has, so the receipt proves that commit (a receipt names the
-contract it ran under, and every commit is judged by the gate derived from
-it). Where git converts line endings on checkout, the checkout's bytes can
-differ from the commit's, and such a receipt reads as another contract's:
-unproven, never a false pass. It prints the contract, where it comes from, and every command, and
-exits with sykli's status; `--print` runs nothing and writes nothing (it names
-where the run keeps the gate, and says when it is not written yet). The
-receipt is in that worktree (`.sykli/receipt.json`, and the copy `sykli run`
-writes under `.sykli/receipts/`), and sykli keeps it, too, in the run's own
-folder under the clone's common dir (`<git common dir>/sykli/runs/<run>/
-rcpt_<sha256>.json`; `sykli status --run` names it, and `verify --commit`
-judges it from any worktree of the clone), and `sykli hook pre-push` copies
-the one that proved a push into `<git common dir>/sykli/receipts/`. Those two
-outlive the worktree: the push and the marks find the proof there once the
-worktree is removed, as it is after its pull request merges (sykli keeps at
-most `SYKLI_RUN_BUDGET` runs per clone, 100 by default, the oldest pruned
-first). Agents are taught this one command.
+### From ohjaa's gate
 
-Inside a session the log holds (`OHJAA_SESSION`, which only the removed
-`ohjaa run` set), the gate first writes the
-request into the session's record (`validations`, in `ohjaa-sessions.v1`),
-before sykli is asked, and says so; outside one it says the request is not
-recorded. A `ValidationRef` holds:
+Ohjaa's gate, its hooks, its marks and `ohjaa report` are gone: the gate is
+sykli's own now. An ohjaa from before this one wrote hook dispatchers into
+the home and an `include.path` into git's global config that runs them; the
+new ohjaa has no `ohjaa hook`, so that include must go first, or every push
+fails. Once, in this order:
 
-| field | what | from |
-|---|---|---|
-| `request` | ohjaa's id for the request, `rq-<ms>-<pid>` | ohjaa, at once |
-| `repo`, `commit`, `tree` | the checkout, HEAD and its tree | git, at once |
-| `common` | the clone's git common dir, where sykli keeps its runs | the layout, at once |
-| `observed_branch` | `{name, tip, updated_ms}`: the entry's branch, where `origin/<branch>` was in this clone, and when it last moved here (its reflog): never a statement about the remote now | git and the reflog, at once |
-| `contract`, `contract_digest` | the gate, and the hash its `sykli.lock` pins (else the one sykli reports) | the lock, at once |
-| `requested_ms` | when | ohjaa, at once |
-| `run` | sykli's run id, once sykli gives one | sykli |
-| `ran` | `{tree, dirty}`: what sykli says ran (a run of uncommitted changes runs another tree, dirty) | sykli |
-| `kind` | `candidate`; `integrated` only once sykli says the run was of exactly the commit's tree, nothing dirty beside it, and the commit was `observed_branch.tip`; a validation ohjaa asks for of a landing is `integrated` from the start (a checkout of exactly that commit; see "The integrated State") | from the above |
-| `not_dispatched` | why a recorded request was never handed to sykli (its checkout could not be made or verified clean, a sykli without `--detach`, or the ohjaa that recorded it stopped first: "requested, never dispatched (ohjaa stopped before asking sykli); asked again as request …"); absent once it was. An integrated request with neither `run` nor `not_dispatched` is one whose ohjaa stopped between recording it and handing it over, and is said so | ohjaa |
-| `lock_digest` | the lock's sha256, as sykli reports it | sykli |
-| `receipt` | `{path, digest}`: the receipt sykli keeps of the run (`.sykli/receipts/rcpt_<sha256>.json`, digest as sykli names it), else `.sykli/receipt.json` without a digest; for an integrated validation, ohjaa's copy of it in its state (`integrated/<clone>/receipts/<request>.json`), made before the validation checkout is reset for another run, with sykli's digest | sykli |
+1. With the old ohjaa still installed: `ohjaa apply --undo`. It removes the
+   include, the dispatchers and the rest of what that apply wrote.
+2. Install this ohjaa, then `ohjaa apply`: the ignore block, the terminal's
+   line and the agents' knowledge blocks, nothing else.
+3. In each repository whose pushes should be checked: `sykli hook install`.
 
-Never an outcome: no state, verdict or check is stored. With a sykli that has
-durable runs (KATANA D3, detected from `sykli run --help` naming `--detach`
-and `sykli status --help` naming `--run`), the gate hands the run over
-detached, `sykli run <contract> --detach --json`, which answers `{schema:
-"sykli-run.v1", run}` once sykli has recorded the run; the run id goes into the
-record at once, then the gate asks `sykli status --run <id> --json`
-(`sykli-run-status.v1`, handed `--repo-root` and `--git-common-dir` when sykli
-takes them) until the run ends, says sykli's answer, records what ran and the
-receipt it names (a relative path is taken from the checkout), saves it as
-`.sykli/receipt.json` and verifies it as above. It waits at most `--wait`
-seconds (30 minutes by default). A run still going then, or one sykli says
-ended in any state but `completed` (interrupted, lost, indeterminate), is not
-proven and not failed: the gate says so and exits 75, and the run stays
-recorded for whoever asks next. Only a completed run whose receipt does not
-pass is a failure. Should the gate or its session be stopped meanwhile, the
-run goes on in sykli. With any other sykli the gate runs in the foreground,
-as always, and fills in the run id only if the receipt names one. The D3
-shapes are read as KATANA's DECISIONS.md writes them; the tests drive them
-with a stub, and a real sykli with durable runs is not released yet.
-
-### The gate of a commit
-
-A copy of a repository's contract drifts the moment the repository changes it.
-The audit of 2026-10-26 found sykli's copy, made on 10-14, making `sykli run`
-refuse on main, and 18 of sykli's last 50 commits, passed under its own
-`sykli.json` (CI included), marked as another contract's. So an entry keeps no
-copy of a contract its repository has. The gate of commit C is derived from C:
-
-- the repository's `sykli.json` at C, and the `sykli.lock` beside it, read
-  from the commit itself through the clone's one `git cat-file --batch`
-  (never a work tree, which another session may be editing; only `ohjaa
-  gate`, which runs its checkout, derives from the checkout's files);
-- with the entry's `[cargo_env]` given to each cargo task that does not say
-  where it builds (KATANA D10, below). When no task is given a line, the gate
-  is that contract and lock as they are, byte for byte;
-- written as files, outside the repository and never in the config home, for
-  sykli reads a contract and the `sykli.lock` beside it from files. A gate a
-  run that outlives the ohjaa that started it names (`ohjaa gate`, an
-  integrated validation) is kept in ohjaa's state, keyed by the SHA-256 of
-  the gate and its lock: `$XDG_STATE_HOME/ohjaa/derived/<digest>/sykli.json`
-  and `sykli.lock`, beside the clones' validation folders. Every other gate
-  sykli only reads (a receipt to verify, a push to judge, what applies to a
-  commit) is read from there when a run kept it, else written into a folder
-  of that ohjaa's own under `$TMPDIR`, removed when it is done: the marks, the
-  report and `ohjaa gate --print` write nothing that stays, and work with a
-  config home that cannot be written. A gate given lines is written as sykli
-  canonicalises a contract (keys sorted, no blanks), so its file's SHA-256 is
-  the hash sykli pins;
-- locked (a `sykli.lock` beside it pinning it) only when the repository's own
-  lock pins its contract at C. A lock that does not (the contract changed
-  without `sykli lock`) never pins the gate: a gate given lines gets a lock
-  pinning the repository's own contract, which the gate is not, and a gate
-  given none keeps the repository's lock as it is, so sykli refuses the gate
-  as it refuses the repository's own. A repository with no lock gets none.
-  What the repository did not lock, ohjaa does not lock.
-- read by the entries of C's top tree: a `sykli.json` (or `sykli.lock`) that
-  is a symbolic link or no file, or one a partial clone lacks (ohjaa never
-  fetches), is said, never read as no contract.
-
-It is a function of C and the entry alone: the same C always gives the same
-gate, and a contract changed at C gives another, in another folder, with no
-adopt in between. `ohjaa gate`, the pre-push hook, the marks, the flags a
-session's record raises at leaving and the integrated validation all judge C
-by it, and it is the same bytes wherever and whenever it is written.
-
-**A commit with no contract of its own** (no `sykli.json`, and no
-`sykli.rs`: ohjaa, vessa and faija today) is judged by what `sykli init`
-writes for its tree, given the entry's lines as a repository's own contract
-is, and locked as sykli init locked it. sykli init declares every file the
-tree tracks (sykli#89), so a file added is declared by the gate of the commit
-that adds it, with no adopt in between: a copy kept beside `repo.toml`, as
-adopt once wrote with `sykli init --contract`, drifted the moment a file was
-added. sykli is asked, by the sykli that judges the commit, in a **scratch
-checkout** of exactly that tree: a repository of its own in a folder of the
-ohjaa process's own under `$TMPDIR`, borrowing the clone's objects
-(`objects/info/alternates`, read only), the tree read into its index and
-work tree (`git init`, then `git read-tree -u`; no hook runs, nothing is
-fetched), then `sykli init --contract <folder>/sykli.json`, handed that
-checkout's facts; the folder goes when the process ends. Nothing is written
-into the clone (no linked worktree), the config home or the state, so the
-marks and the report can ask it. sykli init is asked again every time the
-commit is judged (once per tree in one ohjaa process, in memory), and what it
-writes is never kept to be read back: a run that outlives ohjaa (`ohjaa
-gate`, an integrated validation) names its gate in `derived/<digest>/` as
-any other, and that file is read only where it is, byte for byte, the gate
-derived now. A sykli whose init writes another contract for a tree gives the
-tree another gate, and a run under the one before reads as another
-contract's. No receipt proves such a commit but one of a run under its
-gate: there is no contract of its own to verify one against. What sykli init
-cannot write a gate for (no `Cargo.toml`, `package.json` or `go.mod`) has
-none, in sykli's words. An ohjaa killed while sykli init runs (a report, a
-hook or a gate keep the default disposition) leaves its private folder,
-scratch checkout and all; the next ohjaa that makes one first removes those
-of every ohjaa that is gone (`ohjaa-gates-<pid>-<n>`, this user's, its pid
-unknown to kill(2)).
-
-An entry adopted before keeps working with no adopt: the copy it holds
-(`sykli.json` and `sykli.lock` beside `repo.toml`) is never read, doctor
-notes it, and `ohjaa adopt --force` removes it. A receipt of a run under
-that copy proves a commit only where the copy is the gate derived now (as
-when it was written by `sykli init` for that commit's files); else it reads
-as another contract's: unproven, never failed. A commit with only a
-`sykli.rs` (as toimija's first ones) has a contract of its own that no gate
-is derived from: it is judged by nothing, and marked unproven
-(`could_not_say`, "no sykli contract (sykli.json) in …"), never failed.
-
-**A pass under the repository's own contract proves C too.** A run of C's own
-`sykli.json` and lock, as they are (CI's `sykli run sykli.json`, or an
-agent's), ran the same tasks and inputs as the gate, without the `[cargo_env]`
-lines. Its receipt names that contract's hash (and that lock's digest; a
-receipt from an older sykli names none), so ohjaa verifies it against them,
-read from the commit: `sykli verify <receipt> --contract sykli.json --commit
-<C>`, run in the clone, which checks the lock. A lock digest a receipt does
-name has to be C's lock's. Every other receipt is
-verified against the gate. One under any other contract (a copy from before,
-an older gate) stays `other_contract`. The mark says which contract proved it
-(below).
-
-### Observe, mark, flag
-
-Nothing is refused for the workflow's sake. A push is observed, each commit on
-an entry's branch is marked, and what is not proven is flagged to the people
-and agents who build on it. Only a repository's own hooks refuse.
-
-**Observe.** A push that moves the entry's branch is handed to `sykli hook
-pre-push` against the pushed commit's gate, with its output kept back, for at most
-15 seconds. When sykli accepts it, nothing is said. sykli looks for a receipt
-only in the worktree that pushes, so when it does not accept the push, the
-commit is asked about as the marks ask (every worktree's receipts, its tree
-from the git process that read its gate, one `sykli verify`, by the sykli the
-dispatcher names):
-a commit proven in another worktree is a quiet push too. Otherwise (no
-receipt of the commit's tree, a failed one, one under another contract), or
-when sykli cannot judge it (no sykli, one without `--contract` and
-`--branch`, a commit with no gate: only a `sykli.rs`, or a tree sykli init
-writes none for; sykli out of time), the push goes on,
-and one line says so, after the repository's own hook:
-
-```
-ohjaa: UNPROVEN push to main (no receipt in this worktree is a run of its tree). It is pushed and flagged; prove it with: ohjaa gate
-```
-
-When ohjaa cannot observe the push at all (no workflow home, an entry it
-cannot read), the push goes on with `ohjaa: UNOBSERVED push to <owner/repo>:
-<why>`.
-
-**Mark.** Each commit on the entry's branch is, derived now and stored never:
-- ✓ **proven**: sykli accepted a receipt of its tree against the commit's
-  gate (`sykli verify <receipt> --contract <its gate> --commit <sha>` exits
-  0), or, for a run of the commit's own `sykli.json`, against that (`--contract
-  sykli.json --commit <sha>`);
-- ✗ **failed**: the newest run of its tree here failed (its receipt says so,
-  or sykli refused it for its outcome or evidence);
-- ? **unproven**: no receipt of its tree here; or it passed under another
-  contract or lock than the commit's gate and its own (a copy kept from
-  before, the gate of an older contract); or sykli could not say, or no gate
-  judges it (only a `sykli.rs`, or a tree sykli init writes no gate for).
-
-✓ means exactly that sykli accepted a receipt for this tree against the
-commit's gate or its own contract, and says which: `(own sykli.json)` after
-the commit in `ohjaa report`, `contract` in `ohjaa-marks.v1`. sykli verified
-the receipt's identity against this commit;
-the outcome is the receipt's claim. Receipts are unsigned files that any
-local session can write, and `sykli verify` checks a receipt against the
-commit's tree, its contract and its lock, not by running the tree again: a
-forged receipt can make a commit look proven (one cheap forgery, editing
-`tree_oid`, is filed on sykli). A mark is evidence from this machine's
-sessions, not a CI result.
-
-The walk starts where the clone last saw origin (`refs/remotes/origin/
-<branch>`: no fetch, no network), and goes back along first parents to the
-first proven commit, at most 50, tip first. The commits, and the gate of each
-one sykli is asked about, come from the clone's one `git cat-file --batch`
-(first parent by first parent; a shallow clone ends where its history does);
-receipts are read as files, from the clone's layout: what sykli keeps under
-the common dir, which outlives every worktree (`<common>/sykli/receipts/`,
-what its hook kept for accepted pushes, and `<common>/sykli/runs/<run>/`, the
-receipt each run concluded with), and, in every worktree, `.sykli/receipts/`
-and `.sykli/receipt.json`; a receipt kept in two places under its digest's
-name is read once, the same bytes being the same receipt (another file under
-that name never hides it, and one sykli named that cannot be read is a gap
-in the report). A forge's merge of an up-to-date pull request has the tree
-of its head, so a receipt of the head proves the merge, also once the
-worktree the head was proven in is removed. The marks are as of the last update of `origin/<branch>`
-here, which its reflog dates and says the kind of (a fetch, or a push from
-this clone). `ohjaa report` shows the marks of every entry, and `ohjaa report
---marks` only them:
-
-```
-Marks on each entry's branch, tip first (✓ proven · ✗ failed · ? unproven):
-- false-systems/taso main (origin/main as of a fetch at 2026-10-13 09:12 UTC): ? 4be01c2 ✗ 77a1f0e ✓ 0c9d3b1
-```
-
-**Flag.** When the entry's branch is not proven at its tip, `ohjaa brief`
-opens with it, before anything else:
-
-```
-FLAG: main of false-systems/taso is unproven since 77a1f0e (2 commits: ? 4be01c2, ✗ 77a1f0e; origin/main as of a fetch at 2026-10-13 09:12 UTC). Start by running `ohjaa gate` on main and fix forward what fails.
-```
-
-When some of those commits ran under another contract, it says the branch
-is "not proven against its current gate" (or "has never been proven against
-its current gate"), and how many ran under another one. A failed run counts
-as the commit's failure only under its gate (or its own contract), as a
-pass does: one under any other contract is `other_contract`, never ✗.
-
-The flags a session's record raises at leaving (a broken `origin/main`, its
-own refused work) judge a repository with an entry by its gate too.
-
-### The integrated State, candidates, and a base that moved
-
-A candidate's pass proves the State that lands only when the trees are the
-same: sykli binds a receipt to a tree. A fast-forward lands the candidate's
-own tree; a merge onto a branch that moved on lands a State no run has seen.
-ohjaa never carries a result across trees. It asks sykli, with a sykli that
-has `sykli status --commit` (KATANA D3; detected from `sykli status --help`),
-and says five states apart, each as sykli's word:
-
-| state | what sykli says |
-|---|---|
-| candidate passed / failed | a current receipt of HEAD's tree (HEAD not the observed tip) passed / failed |
-| integrated passed / failed | a current receipt of the observed branch's tip's tree passed / failed |
-| integrated unverified | no current receipt of the tip's tree (none at all, a run pending, results that disagree, or sykli could not say) |
-
-(A candidate with no current receipt is `candidate unverified`.)
-
-**Asking for it.** When a landing reaches the observed branch, ohjaa asks
-sykli to validate the integrated State, once sykli has no current receipt of
-its tree under the gate (`sykli status --commit <tip> --contract <gate>
---json` says `none`) and no request of it stands:
-
-- **at leaving**, for each commit the session saw land on `origin/<branch>`
-  that the branch still sits at;
-- **at launch**, in the briefing, for the tip the marks walk found (`ohjaa
-  run` only: `ohjaa brief` asks for nothing, and `--dry-run` says it would).
-
-One ohjaa at a time decides and asks, per clone: it takes the clone's lock
-(`$XDG_STATE_HOME/ohjaa/integrated/<clone>/lock`, flock(2), so a crash never
-leaves it held; a launch waits at most 20 s for another, then asks for
-nothing and says so) and reads the log again under it. Two launches at once
-in two worktrees of one clone ask sykli once; the other says "ohjaa asked
-sykli to validate it at …". A request that **stands** is not repeated: one
-handed to sykli (a run id) or one that could not be (`not_dispatched`), in
-the last ten minutes. A request recorded and **never dispatched** (its ohjaa
-stopped between recording it and handing it over: neither a run id nor
-`not_dispatched`) is said as "requested, never dispatched (ohjaa stopped
-before asking sykli)", never as asked, and is asked again at the next launch
-at once, however old; the old request says it was replaced.
-
-The request is a `ValidationRef` of kind `integrated`, written into the
-session's record **before** sykli is asked (invariant A; at launch, with the
-entering record). Then ohjaa hands sykli the run in the clone's **one
-rolling validation checkout**, `$XDG_STATE_HOME/ohjaa/integrated/<clone>/
-checkout`, a linked worktree of the clone (git keeps its admin folder in
-`<common>/worktrees/`; no file, hook or config of the repository is
-written). Before every run it is:
-
-1. **left alone while a run there may still be going**: the newest run
-   handed over in it is asked about (`sykli status --run`). The checkout is
-   **busy**, nothing is reset under it, no request is recorded, and the line
-   says "the validation checkout is busy with sykli run … so none is asked
-   for now" (a later launch asks), whenever sykli says the run is requested
-   or running; or any of its tasks is still running, or any attempt has not
-   finished (a run sykli calls `lost`, its coordinator gone, may still have
-   one); or any attempt's process group still has a member (a task that left
-   a process behind); or sykli cannot say what became of the run, or cannot
-   be asked. A run that is gone for good keeps it busy until a person removes
-   the checkout folder (the line says which); the next launch then makes it
-   afresh;
-2. **its last run's receipt kept**: when that run has ended, the receipt it
-   names (in the checkout's `.sykli/receipts/`) is copied into
-   `integrated/<clone>/receipts/<request>.json` and recorded in that
-   request's `receipt`, with sykli's digest, so no evidence lives only in a
-   checkout;
-3. **reset to exactly the landed commit**: `git -c core.hooksPath=/dev/null
-   checkout -q -f --detach <commit>`; where the commit has submodules,
-   `submodule deinit -q -f --all`, so each is as a fresh checkout has it (not
-   populated: its work tree, ignored files and changes go; nothing is
-   fetched, and the gate initialises what it needs); then `clean -q -ffdx -e
-   /.sykli` (sykli's own folder at the top stays, everything else another
-   run left goes: build folders, untracked and changed files, and a `.sykli`
-   folder deeper down);
-4. **verified**: HEAD is the commit; `git status --porcelain=v1
-   --untracked-files=all --ignored --ignore-submodules=none -- .
-   ':(exclude).sykli'` says nothing; and, with submodules, `submodule foreach
-   --recursive` finds none populated. When the reset or the check fails, the
-   checkout is made again from nothing (`worktree remove --force`, then
-   `worktree add --detach --force`) and verified again: a leftover never
-   blocks validation for good. Only when that fails too is the request
-   recorded as not dispatched, and why.
-
-Then `sykli run <its gate> --detach --json` there (the gate derived from the
-landed commit, recorded as the request's `contract`). Its run id is filled in, or,
-when the run could not be handed over, why (`not_dispatched`). Because the
-checkout is the clone's, sykli's run and receipt are the clone's: `sykli
-status --commit` finds them from any checkout, and so do the marks. One
-checkout per clone, however many landings: nothing piles up.
-
-**Cargo's target dir.** `~/.cargo/config.toml` may point every checkout at
-one shared `build.target-dir`, and sykli hands a task only PATH, HOME and
-TMPDIR, so cargo would build there, and take another tree's newer artifacts
-for fresh. ohjaa writes `integrated/<clone>/.cargo/config.toml` (`[build]
-target-dir = "<that folder>/target"`) above the checkout: cargo reads the
-config of every folder above the one it runs in, and a deeper one wins over
-`$CARGO_HOME/config.toml`, so this checkout's builds, and only its, go to
-`integrated/<clone>/target`. Nothing is written into the repository or the
-checkout. A repository's own `.cargo/config.toml` still wins, as it would
-anywhere.
-
-(sykli keeps a run's journal in the clone's common dir, and its receipt both
-in the checkout it ran in and beside the journal, which the marks read: the
-copy in ohjaa's state is kept all the same.) Leaving never reads the validation
-checkout's reflog (nothing is made in it), and it is not counted as a
-sibling checkout. A sykli without `status --commit` or `run --detach` is
-asked for nothing, and the line says so.
-
-The briefing says it after the flag (and the launch on stderr):
-
-```
-Validation here (sykli's word, asked at launch; integrated: what is on the observed branch, candidate: HEAD on its way there):
-- integrated unverified: main of acme/widget at 4be01c2: sykli has no current receipt of its tree; ohjaa asks sykli to validate it: request rq-…, recorded in this session before sykli is asked
-- candidate passed: HEAD 9c0d1e2 (feat/parser): a current sykli receipt of its tree passed
-- base moved since validation: HEAD 9c0d1e2 was validated when origin/main was at 0c9d3b1; it is at 4be01c2 now: its merge is a State no run has seen (flagged, never refused)
-```
-
-**A base that moved.** A `ValidationRef` records where `origin/<branch>` was
-when the candidate was validated. When HEAD's newest validation saw it
-elsewhere than it is now, the briefing says "base moved since validation",
-and so does a push of that commit to any other branch than the observed one
-(read from files only: the log, read-only and never waited on, and the
-clone's ref; a log a writer holds at that moment is not read, and nothing is
-said):
-
-```
-ohjaa: base moved since validation: 9c0d1e2 (feat/parser) was validated when origin/main was at 0c9d3b1; it is at 4be01c2 now: its merge is a State no run has seen (flagged, never refused). It is pushed; validate the integrated State once it lands.
-```
-
-Flagged, never refused (observe-mark-flag). A push to the observed branch
-itself is a fast-forward of the commit sykli's hook judges, so its own tree
-is the State that lands.
-
-### `ohjaa report --json`: `ohjaa-marks.v1`
-
-One machine-readable view for other tools. Computing it writes nothing (a
-gate sykli verifies against goes into a folder of the report's own under
-`$TMPDIR`, removed before it exits): not
-the session log (opened read-only), not the report's bookmarks
-(`report-at`, `report-shown-at`), even at a terminal. Exits 4 when the
-report has gaps, as the text does.
-
-The full report reads every repository's default-branch window and asks vessa
-for its header listing (about half a second; at most 15 s): on a root of
-about 50 repositories, some 500 git processes.
-`ohjaa report --json --marks` is the view to read often: the same document
-with `report` null, from two git processes per entry (its clone's config and
-the walk) and a `sykli verify` only for a commit whose receipt says it passed;
-no window, no vessa.
-
-```
-{
-  "schema": "ohjaa-marks.v1",
-  "generated": "<RFC 3339>",
-  "complete": true,                      // false: something could not be read
-  "unlisted": null | "<why>",            // why no entry could be listed (the workflow home
-                                         // cannot be found, or its entries cannot be read)
-  "entries": [{                          // every entry in the home; none, with complete
-                                         // false and unlisted saying why, when they cannot
-                                         // be listed
-    "repo": "owner/name",
-    "branch": "main", "ref": "origin/main",
-    "tip": "<sha>" | null,               // where origin/main is here
-    "clone": "<the clone walked>",       // the one whose origin/main moved last
-    "updated": "<RFC 3339>" | null,      // when origin/main last moved here
-    "updated_by": "fetch" | "push" | null,
-    "ended": "proven" | "root" | "cap" | "not_asked",
-    "proven_at_tip": false,
-    "commits": [{                        // tip first, down to the first proven one, at most 50
-      "sha": "…", "tree": "…",
-      "mark": "proven" | "failed" | "unproven",
-      "code": "proven" | "failed" | "other_contract" | "no_receipt"
-            | "no_receipt_checkout_gone" | "could_not_say" | "stale",
-      "why": "…" | null,                 // for a person; null when proven
-      "author": "…", "authored": "<RFC 3339>", "subject": "…",
-      "contract": "derived" | "own" | null, // a proven commit: the contract its receipt
-                                         // ran under: the commit's gate (from its own
-                                         // sykli.json, or what sykli init writes for its
-                                         // tree), or its own sykli.json; "stored", the
-                                         // entry's copy, is no longer given (2026-10-27)
-      "tasks": 3 | null, "cached": 1 | null // a proven commit: the accepted receipt's tasks, and
-                                         // how many it reused from sykli's cache
-    }],
-    "error": null | "why it has no marks" // then the rest are null and commits is []
-  }],
-  "proposals": {                         // waiting for a person's decision
-    "listed": true,                      // false, with "why", when they could not be read
-    "waiting": [{ "scope": "ours", "name": "…", "title": "<first line>",
-                  "since": "YYYY-MM-DD", "repo": "<path>" | null }]
-  },
-  "sessions": [{                         // still open, or closed as orphaned in the window
-    "id": "…", "agent": "…", "repo": "…", "intent": "…",
-    "started": "<RFC 3339>",
-    "state": "open"                      // never left (ohjaa runs no sessions now: these are older)
-           | "ohjaa_gone"                // its ohjaa is gone, its process group runs on
-           | "orphaned"                  // closed as orphaned, or ohjaa and group both gone now
-  }],
-  "report": { "schema": "ohjaa-report.v1", … } | null  // the window's lists; null with --marks
-}
-```
-
-The keys `ohjaa-marks.v1` had when viemäri was built on it (2026-10-13)
-never go; `integrated` (per entry and per commit) and, on 2026-10-26, the
-commits' `contract` were added since, and on 2026-10-27 the top-level
-`unlisted`, so a
-reader of the earlier shape keeps working. `judgements` was added on
-2026-10-14 (#46) and removed with `ohjaa judge` on 2026-10-26: nothing ever
-read it and no Judgement was ever recorded, so the schema kept its name.
-From now on, `ohjaa-marks.v1` only gains keys.
-
-`ended` says why the walk stopped: at a proven commit, at the branch's first
-commit, after 50, or before a commit only sykli could judge with no `sykli
-verify` left to ask. `src/report.rs` pins this shape in a test.
-
-**`apply`** runs as the `ohjaa` on PATH (anything else is refused unless
-`--bin` names it, so a `cargo run` cannot re-point every hook). It refuses,
-before changing anything, when git's global `core.hooksPath` is set (in the
-global file or a file it includes): it would run in every repository and
-override the scoped one; `--force` removes it from the global file. It does
-not guess where the repositories are: with no `roots` file it refuses until
-`--root <dir>` names the folder that holds them, writes that down in `roots`,
-so what it finds never depends on where it runs, and it only ever adds
-dispatchers (a spare
-costs a process, a missing one silently skips a check); `--prune` removes
-spares. Each change is recorded before it is made, so `--undo` can put back
-exactly what was there even after an apply that failed. The line it puts in
-`~/.zshrc` (it prints `ohjaa line` as a terminal opens), in place of the old `source ~/projects/ohjaa-launch.zsh`,
-is guarded like that one was: `[[ -x <ohjaa> ]] && eval "$(<ohjaa>
-shell-init zsh)"`.
-
-**`adopt`** writes the entry: `repo.toml`, with the branch (origin's default
-one, else `--branch`) and `[cargo_env]` (below). It keeps no copy of a
-contract the repository has at that branch (not the working tree, which
-another session may be editing): every commit's gate is derived from the
-commit, and a copy an earlier adopt kept is removed. That holds for a
-repository with no `sykli.json` of its own as well: each commit's gate is
-what `sykli init` writes for its tree, asked when it is needed, so adopt only
-checks that the sykli on PATH can write a contract outside a repository
-(`sykli init --help` names `--contract`) and refuses when it cannot. Then it regenerates `git/` and writes the entry's
-dispatchers. It never touches git's global config, and takes no lock in the
-repository.
-
-**One build directory per worktree (KATANA D10).** A shared Cargo target dir
-(`~/.cargo/config.toml`'s `build.target-dir`, or a build-dir) lets a gate in
-one worktree run a binary another worktree built, and a receipt then claims a
-pass for code that never ran. So each task of the gate whose command runs
-cargo (a word of it is `cargo`) is given these, in its `env`, as sykli's
-README recommends, one for each of the two places cargo builds in (the target
-dir, and the build dir that holds its intermediate artifacts, test binaries
-among them). They are the entry's `[cargo_env]`, which adopt writes into
-`repo.toml`, and a derived gate is given them when it is derived; an entry
-written before has none, and gets these:
-
-```toml
-[cargo_env]
-CARGO_TARGET_DIR = "${worktree_cache}/cargo-target"
-CARGO_BUILD_BUILD_DIR = "${worktree_cache}/cargo-build"
-```
-
-A task that explicitly chooses its target directory gets **neither** line:
-Cargo's build directory defaults under that target, so its layout stays intact.
-This includes `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` in `env` or
-`inherit`, a certain assignment on every direct Cargo invocation, or
-`--target-dir` / `--config build.target-dir=…` on every invocation.
-A task that chooses only `CARGO_BUILD_BUILD_DIR` (including
-`--config build.build-dir=…`) gets only the target-directory line.
-
-Command detection is deliberately conservative, not a shell interpreter.
-A leading unconditional `export NAME=value`, separated by semicolons or
-newlines and followed by direct Cargo commands, counts. Conditional exports,
-subshells, comments, heredocs, unsets, wrappers and dynamically evaluated
-commands do not establish that every Cargo invocation receives the setting.
-Uncertain cases get the defaults; a command's own assignment still overrides
-them when it actually runs. An assignment before one Cargo invocation says
-nothing about the next. Explicit `env` and `inherit` remain the way to declare
-settings for complex commands. Tasks with no Cargo word are untouched.
-Only the gate changes, never the repository's contract or an agent's own
-Cargo commands. A derived gate is locked as "The gate of a commit" says.
-
-The lines are given only when every sykli that runs the gate expands the
-placeholder: the one on PATH and the one the pre-push dispatcher runs (as
-`apply` recorded it). A sykli that does names `${worktree_cache}` in `sykli
-run --help`, matched as that token, never as a sentence. An older one passes
-it on as written, and cargo would build in a `${worktree_cache}/` folder
-inside the work tree, so then adopt writes an empty `[cargo_env]`, saying why
-in `repo.toml`, and says so.
-
-`ohjaa doctor` says, for each entry with a clone under the roots, which
-contract judges its branch's tip: the gate derived from the tip's own
-`sykli.json`, or from what `sykli init` writes for its tree (asked in a
-scratch checkout; doctor keeps nothing), and the tasks
-given lines. It flags (drift) a tip whose `sykli.lock` does not pin its `sykli.json`
-(sykli refuses the gate, as it refuses the repository's own); an empty
-`[cargo_env]` while every sykli knows the placeholder and the gate has cargo
-tasks ("gate runs may share a target dir across worktrees"; `ohjaa adopt
---force` writes the lines; a note while one does not); and lines, or a task of
-the repository's own, naming `${worktree_cache}` while a sykli that runs the
-gate does not expand it, by its path: a sykli downgraded after adopt builds in
-the work tree. A copy an entry still holds beside `repo.toml` is noted as
-never read. Adding the lines changes the gate's digest, so receipts from before read as another
-contract's; a run of the repository's own contract is still its own.
+The old entries (`~/.config/ohjaa/repos/`) and derived gates
+(`$XDG_STATE_HOME/ohjaa/derived/`) are read by nothing now, and can be
+removed.
 
 ## Boundaries in full
 
@@ -1809,14 +1130,8 @@ each in full, with what ohjaa keeps where.
   and its lock (`lessons.lock`): knowledge, not a cache. The **session log**,
   in redb at `$XDG_STATE_HOME/ohjaa/sessions.redb`,
   is machine-local history of what each session was briefed, read back,
-  committed, finished and handed over, plus explicitly attributed usage receipts, the ids of the agent's own sessions found at leaving in its transcripts (read, never written) and those its environment claimed from inside the session while it was open (the agent's testimony, never outranking what was found), and references to the validations `ohjaa gate` and ohjaa itself requested (sykli's run ids and receipts, never outcomes) — deleting it loses no knowledge, it never
-  blocks a launch, and a broken log is reported, never replaced. Beside it,
-  `$XDG_STATE_HOME/ohjaa` holds one validation folder per clone
-  (`integrated/<clone>/`: the clone's one rolling validation checkout, the
-  cargo target dir that checkout builds in, and copies of its runs'
-  receipts), the lock that lets one ohjaa at a time ask for a clone's
-  validation, and the gates derived from commits that a run outliving its
-  ohjaa names (`derived/<digest>/`). It also holds intake's cursor
+  committed, finished and handed over, plus explicitly attributed usage receipts, the ids of the agent's own sessions found at leaving in its transcripts (read, never written) and those its environment claimed from inside the session while it was open (the agent's testimony, never outranking what was found) — deleting it loses no knowledge, and a broken log is reported, never
+  replaced. Beside it, `$XDG_STATE_HOME/ohjaa` holds intake's cursor
   (`intake-since`), intake's progress (`intake-handled`: a version line; per
   candidate the drafter answered for or failed on, its time and a digest of
   its words, never the words, and for a failure how often and why in ohjaa's
@@ -1826,15 +1141,13 @@ each in full, with what ohjaa keeps where.
   message a person re-taught it with, by its time, a digest of its words and
   its session's id, never the words, and when a draft last cited it; history
   like the session log, read by `ohjaa list`, `check` and `review`, never by
-  a briefing, a gate or a report), the report's two times (`report-at`,
-  `report-shown-at`), and the human view's
+  a briefing), and the human view's
   folder (`human/`: `seen.json`, what the person last saw and when, the keys
   of what was said in the last two hours, where the next digest begins and
   where the earliest of what a day's digest left out begins, each with the
   keys of what GitHub said in the two hours before it; `collected.json`,
   the snapshot `ohjaa collect` writes of what `ohjaa line` cannot derive
-  without git or the network, namely the marks and open sessions, GitHub's
-  pull requests, vessa's usage of the sessions ended lately, the first
+  without git or the network, namely GitHub's pull requests, vessa's usage of the sessions ended lately, the first
   words the person typed in each of them (the person's own words shown
   back to them, as vessa prints them with secrets scrubbed, cut to about
   70 characters and kept only for the window the digest shows, never
@@ -1848,63 +1161,41 @@ each in full, with what ohjaa keeps where.
   no knowledge: intake then reads its default window again, and sends once
   more what is still in it, the counts of re-teaching start again, and the
   human view starts from the last day.
-  Everything else — fleet, perimeter, coverage, marks — is derived now and
-  stored never, but in the human view's snapshot: a copy that is said with
-  its age wherever it is shown, read only by `ohjaa line`, `ohjaa digest`
-  and `ohjaa collect` (which keeps from it, as of then, what a source or a
-  branch held when that cannot be read again), never by a briefing, a gate
-  or a report. No knowledge index and no daemon; that snapshot is the one
+  Everything else — fleet, perimeter, coverage — is derived now and stored
+  never, but in the human view's snapshot: a copy that is said with its age
+  wherever it is shown, read only by `ohjaa line`, `ohjaa digest` and `ohjaa
+  collect` (which keeps from it, as of then, what a source held when that
+  cannot be read again), never by a briefing. No knowledge index and no daemon; that snapshot is the one
   cache.
 - **The workflow lives in the home, outside every repository.**
-  `~/.config/ohjaa` holds each repository's entry (`repos/<owner>/<repo>/`:
-  `repo.toml`, the branch ohjaa observes and the env lines its gate gives
-  cargo tasks, plus its generated hooks folder and `gated.config`; every
-  commit's gate is derived, from its own `sykli.json` and `sykli.lock`, or
-  from `sykli init` on its tree for a repository with none, plus the
-  entry's env lines, and ohjaa keeps no stored gate), the generated `git/`
-  config and `roots`. Only
-  repositories whose remote names an entry run ohjaa's hooks, and only the
-  hooks that entry needs; no other git command anywhere starts ohjaa, and
-  ohjaa works its git facts out once instead of asking git again. The home
-  is also a local git repository, its history: ohjaa makes it with its first
-  commit (or uses the one the home already is), never gives it a remote and
-  never pushes it, and commits there, with the person's git identity, each
-  decision on mine or machine knowledge and each `apply`, `apply --undo` and
-  `adopt` (`git add -A`, then `git commit`), each under the home's lock
-  (`.git/ohjaa.lock`) and holding only what ohjaa keeps there (an allowlist
-  in the repository's own `.git/info/exclude`); a commit that fails is said,
-  and the change stands. Outside the
-  home, `ohjaa apply` changes only one `include.path` in git's global config,
-  a marked block in git's global excludes file, one line of `~/.zshrc`, and a
-  marked block of the team's, mine and machine knowledge (`ohjaa:knowledge`) in each
-  agent's own global instruction file that already exists outside every
-  repository (Claude Code's `~/.claude/CLAUDE.md`, Codex's
-  `~/.codex/AGENTS.md`, pi's `~/.pi/agent/AGENTS.md`, opencode's
-  `~/.config/opencode/AGENTS.md`, each where the agent finds it; none is
-  created, no text around the block is touched, and a block apply did not
-  write is the person's and stays), records each before making it, and
-  `apply --undo` puts them back; each decision rewrites that block where it
-  is, and nowhere else; `ohjaa
-  adopt` writes only in the home. Nothing is installed on or written into a
-  repository but what git keeps beside it: the clone's one validation
-  checkout, a linked worktree kept in ohjaa's state
-  directory (`$XDG_STATE_HOME/ohjaa/integrated/<clone>/checkout`, whose admin
-  folder git keeps in the clone's `.git/worktrees/`), and, while repo
-  knowledge is delivered, a worktree off the remote's branch
-  (`$XDG_STATE_HOME/ohjaa/lessons/.work/`), removed once its branch is pushed.
-  No file, hook or config of a repository's checkout is written; `ohjaa
-  lessons publish` takes out of it the `.ohjaa/knowledge/` files a person
-  accepted before, once they are in a pull request, and
-  the dispatcher always runs a repository's own hooks after observing.
-- **Observe, mark and flag; never refuse for the workflow.** A push to an
-  entry's branch is handed to sykli and, when sykli does not prove it,
-  pushed and flagged, never stopped; only a repository's own hooks refuse.
-  Each commit on that branch is marked proven, failed or unproven from the
-  receipts on disk, and a briefing opens with the flag while the branch is
-  not proven at its tip. A landing on it whose tree sykli has no current
-  receipt of is validated as the integrated State (a durable sykli run,
-  recorded before it is asked for), and a candidate validated on a base the
-  branch has moved from since is flagged, never refused.
+  `~/.config/ohjaa` holds the knowledge scopes, `roots`, and apply's record.
+  The home is also a local git repository, its history: ohjaa makes it with
+  its first commit (or uses the one the home already is), never gives it a
+  remote and never pushes it, and commits there, with the person's git
+  identity, each decision on mine or machine knowledge and each `apply` and
+  `apply --undo` (`git add -A`, then `git commit`), each under the home's
+  lock (`.git/ohjaa.lock`) and holding only what ohjaa keeps there (an
+  allowlist in the repository's own `.git/info/exclude`); a commit that
+  fails is said, and the change stands. Outside the home, `ohjaa apply`
+  changes only a marked block in git's global excludes file, one line of
+  `~/.zshrc`, and a marked block of the team's, mine and machine knowledge
+  (`ohjaa:knowledge`) in each agent's own global instruction file that
+  already exists outside every repository (Claude Code's
+  `~/.claude/CLAUDE.md`, Codex's `~/.codex/AGENTS.md`, pi's
+  `~/.pi/agent/AGENTS.md`, opencode's `~/.config/opencode/AGENTS.md`, each
+  where the agent finds it; none is created, no text around the block is
+  touched, and a block apply did not write is the person's and stays),
+  records each before making it, and `apply --undo` puts them back; each
+  decision rewrites that block where it is, and nowhere else. Nothing is
+  installed on or written into a repository but, while repo knowledge is
+  delivered, a worktree off the remote's branch
+  (`$XDG_STATE_HOME/ohjaa/lessons/.work/`), removed once its branch is
+  pushed. No file, hook or config of a repository's checkout is written;
+  `ohjaa lessons publish` takes out of it the `.ohjaa/knowledge/` files a
+  person accepted before, once they are in a pull request.
+- **Ohjaa checks nothing and refuses nothing for the workflow.** The checks
+  a commit must pass, and the refusal of a push without them, are sykli's,
+  from the repository's own contract and hooks.
 - **Ohjaa runs no sessions.** Agents start as they are typed and read the
   Knowledge from their own instruction files; the note for the next agent is
   `toimija handover`. Imported usage is separately labelled source testimony;
@@ -1934,7 +1225,8 @@ each in full, with what ohjaa keeps where.
   git to GitHub with gh's credentials** — in `ohjaa intake` (review
   comments, drafting), when a session leaves (its branch's pull request,
   bounded, recorded as unknown when gh cannot say), in `ohjaa collect` (one
-  search for the pull requests of the entries' owners, at most two calls;
+  search for the pull requests of the owners of the clones under the roots,
+  at most two calls;
   its vessa calls, at most three, one each for usage, messages and
   secrets, are local), and after a person's decision on repo knowledge and
   in `ohjaa lessons publish` (gh: the repository's visibility, the person's
@@ -1949,11 +1241,10 @@ each in full, with what ohjaa keeps where.
 
 ## Tests
 
-`cargo test` runs against stand-ins for sykli, toimija, vessa, gh and the
-agents, in a sandboxed home, never the person's own. With `cargo fmt --check`
+`cargo test` runs against stand-ins for toimija, vessa, gh and the agents, in a sandboxed home, never the person's own. With `cargo fmt --check`
 and `cargo clippy --all-targets -- -D warnings`, it is what CI runs. The same
 three are the repository's `sykli.json` (with every input it reads, pinned in
-`sykli.lock`), the contract `ohjaa gate` runs on a person's machine; a second
+`sykli.lock`), the contract `sykli run` runs on a person's machine; a second
 CI job installs sykli and runs that contract too, advisory until the plain
 cargo job is removed on purpose. A new source or test file goes into its
 inputs (`sykli init --force` rewrites them), or `sykli run` refuses.
@@ -1983,9 +1274,6 @@ have none of them:
   OHJAA_TEST_VESSA=/absolute/path/to/vessa cargo test --test cli real_vessa_producer -- --ignored
   ```
 
-- `tests/config_home.rs`, `real_sykli_*`: what a flag says and what a mark
-  is, in the real sykli's judgement
-  (`OHJAA_TEST_SYKLI=<path> cargo test --test config_home -- --ignored`).
 
 ## What it will never do
 

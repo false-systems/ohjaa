@@ -6,28 +6,20 @@
 //! agent *before* it acts, together with the live perimeter of the fleet.
 //! Agents may propose Knowledge; only a person makes it current.
 
-mod adopt;
 mod apply;
 mod collect;
-mod derived;
 mod doctor;
 mod evidence;
 mod flat_toml;
-mod gate;
 mod gitconfig;
 mod home;
-mod hook;
 mod human;
 mod instructions;
 mod intake;
-mod integrated;
 mod knowledge;
 mod lessons;
-mod lifecycle;
-mod mark;
 mod process;
 mod repo_docs;
-mod report;
 mod roots;
 mod scan;
 mod sessions;
@@ -35,7 +27,7 @@ mod shell_init;
 mod system;
 mod usage;
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -180,7 +172,7 @@ enum Cmd {
         /// pre-filter takes for a correction or a repeated instruction.
         #[arg(long)]
         no_prefilter: bool,
-        /// transcripts, reviews, reverts or report (repeatable). Default: all four.
+        /// transcripts, reviews or reverts (repeatable). Default: all three.
         #[arg(long = "source", value_name = "SOURCE")]
         sources: Vec<String>,
         /// The command that drafts: it reads the prompt on stdin and prints a
@@ -202,27 +194,6 @@ enum Cmd {
         /// each, alone, three times.
         #[arg(long)]
         retry_failed: bool,
-    },
-    /// What went around the workflow: the marks on each entry's branch (✓
-    /// proven, ✗ failed, ? unproven, tip first), sessions without read-back or
-    /// handover, default-branch commits without passing evidence, and agent
-    /// sessions run without ohjaa (through vessa). Derived now; exits 4 when it
-    /// could not read everything.
-    Report {
-        /// The window: `7d`, `24h`, a date or an RFC 3339 time.
-        #[arg(long, default_value = "7d")]
-        since: String,
-        /// Print `ohjaa-marks.v1` JSON instead (see the README): the marks,
-        /// the proposals waiting for a person, the sessions still open or
-        /// orphaned, and the window's report. Writes nothing, not even the
-        /// report's bookmark.
-        #[arg(long)]
-        json: bool,
-        /// The marks alone (with --json, also the proposals and the open
-        /// sessions): no window, no vessa; two git processes per entry, and
-        /// sykli verify only where a receipt says it passed.
-        #[arg(long)]
-        marks: bool,
     },
     /// For a terminal's opening: only matters needing attention or your decision.
     /// Silent when there are none. Activity stays unread for `ohjaa digest`.
@@ -260,18 +231,18 @@ enum Cmd {
         no_collect: bool,
     },
     /// Gather what `ohjaa line` cannot work out at a terminal's opening into
-    /// its snapshot: the marks and open sessions, GitHub's pull requests,
-    /// vessa's usage of recent sessions and the first words typed in each,
-    /// and the secret-shaped tokens vessa found in agent sessions.
+    /// its snapshot: GitHub's pull requests, vessa's usage of recent sessions
+    /// and the first words typed in each, and the secret-shaped tokens vessa
+    /// found in agent sessions.
     #[command(after_help = "Each part asked once, at the same time:\n  \
-        marks     as `ohjaa report --marks` finds them (git, sykli, ps)\n  \
-        github    gh api graphql: the pull requests updated in the entries' owners, at most 2 calls\n  \
+        github    gh api graphql: the pull requests updated in the owners of the clones under\n            \
+        the roots (one git config per clone), at most 2 calls\n  \
         vessa     vessa usage --json --input <transcript>…: only the sessions ended lately\n  \
         messages  vessa messages --json --since …: the first words typed in each of them\n  \
         secrets   vessa secrets --json --since …: where and how many, never a value\n\
         vessa is asked at most 3 times. The first words are kept only for the window the digest\n\
-        shows. A part that fails keeps what it held before, said as of then, and so does a branch\n\
-        whose marks cannot be read. Writes $XDG_STATE_HOME/ohjaa/human/collected.json,\n\
+        shows. A part that fails keeps what it held before, said as of then.\n\
+        Writes $XDG_STATE_HOME/ohjaa/human/collected.json,\n\
         holding human/collect.lock while it runs.\n\n\
         Exit codes:\n  \
         0  every part answered, and read all it asked for\n  \
@@ -290,31 +261,21 @@ enum Cmd {
     /// A knowledge node and its neighbours: what it builds on, what builds on
     /// it, what it replaced, and which sessions were briefed with it.
     Graph { id: String },
-    /// Apply the workflow from the home (~/.config/ohjaa), outside every
-    /// repository: git runs ohjaa's hooks only in repositories whose remote
-    /// names an entry. Also the global ignore block and the shell launcher.
-    /// Idempotent; --undo takes it all back.
+    /// Write the knowledge into each agent's own instruction file, the line a
+    /// terminal runs as it opens into ~/.zshrc, and the ignore block into
+    /// git's global excludes. Idempotent; --undo takes it all back.
     #[command(after_help = "Exit codes:\n  \
         0  applied, undone, or nothing to change\n  \
-        1  git is older than 2.36, or a change could not be made\n  \
-        2  refused: no roots file and no --root (apply does not guess where the\n     \
-           repositories are: run it once with --root <dir>)\n  \
-        3  refused: a global core.hooksPath (see --force), an ohjaa that is not the\n     \
-           one on PATH (see --bin), or --prune without a roots file\n  \
+        1  a change could not be made\n  \
+        3  refused: an ohjaa that is not the one on PATH (see --bin)\n  \
         4  applied, except an agent's own instruction file apply cannot write (a\n     \
            block it cannot tell from the rest): each is named, with why, on every\n     \
            apply and dry run until it is fixed by hand; `ohjaa doctor` names it too\n\n\
-        Writes in the home:\n  \
-        repos/<o>/<r>/hooks/<name>    exec <ohjaa> hook <name> \"$@\": pre-push, and each\n                                \
-        hook that entry's clones under the roots have of their own\n  \
-        repos/<o>/<r>/gated.config    core.hooksPath = that entry's hooks/\n  \
-        git/config                    includeIf \"hasconfig:remote.*.url:<pattern>\" per entry\n  \
-        roots                         from --root on the first run: where the repositories are\n  \
-        applied.toml                  what apply changes outside the home, kept before each change\n  \
-        .git/                         the home's history: what apply changed, one commit (made\n                                \
-        on the home's first commit; never pushed)\n\
+        Writes in the home (~/.config/ohjaa):\n  \
+        applied.toml  what apply changes outside the home, kept before each change\n  \
+        .git/         the home's history: what apply changed, one commit (made on\n                \
+        the home's first commit; never pushed)\n\
         Changes outside it, and nothing else:\n  \
-        git's global config    [include] path = <home>/git/config (once)\n  \
         git's global excludes  a block marked \"ohjaa apply\" holding .sykli/ .teko/ .ohjaa/\n  \
         ~/.zshrc               [[ -x <ohjaa> ]] && eval \"$(<ohjaa> shell-init zsh)\", in place\n                         \
         of a line that sources ~/projects/ohjaa-launch.zsh\n  \
@@ -323,113 +284,25 @@ enum Cmd {
         ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.pi/agent/AGENTS.md,\n                         \
         ~/.config/opencode/AGENTS.md (none is created); each decision\n                         \
         rewrites it where it is\n\
-        <ohjaa> is the ohjaa on PATH (or --bin), and the pre-push dispatchers name\n\
-        the sykli on PATH, both by absolute path. Dispatchers are only added;\n\
-        --prune removes the ones no clone needs. --undo puts the changes back\n\
-        as they were (a hooksPath --force removed comes back at the end of [core],\n\
-        a global config apply created is removed), and removes what apply wrote\n\
-        in the home except the entries, the roots and the history.")]
+        <ohjaa> is the ohjaa on PATH (or --bin), by absolute path. --undo puts the\n\
+        changes back as they were, and removes applied.toml; the history stays.\n\n\
+        Checks before a push are sykli's: `sykli hook install` in each repository.")]
     Apply {
         /// Print every change, and make none.
         #[arg(long)]
         dry_run: bool,
-        /// Remove a global core.hooksPath (it would run in every repository).
-        #[arg(long)]
-        force: bool,
-        /// Also remove dispatchers no clone under the roots needs (needs a roots file).
-        #[arg(long, conflicts_with = "undo")]
-        prune: bool,
-        /// The ohjaa the hooks and the launcher run, instead of the one on PATH.
+        /// The ohjaa the terminal's line runs, instead of the one on PATH.
         #[arg(long, value_name = "PATH", conflicts_with = "undo")]
         bin: Option<PathBuf>,
-        /// Take back what apply changed outside the home, and what it generated.
+        /// Take back what apply changed outside the home.
         #[arg(long)]
         undo: bool,
     },
-    /// Report what differs from what `apply` would make it and, clone by
-    /// clone, whether git runs ohjaa's hooks where an entry says it should.
-    /// Read-only.
+    /// Report what differs from what `apply` would make it. Read-only.
     #[command(after_help = "Exit codes:\n  \
         0  healthy\n  \
-        4  drift: a line marked DRIFT says what, and what fixes it\n\n\
-        For each clone under the roots whose remote names an entry: git must\n\
-        resolve its core.hooksPath to <home>/hooks (a pattern that missed, or the\n\
-        repository's own core.hooksPath, means its pushes are not observed), and\n\
-        each hook of its own must have a dispatcher (else git skips it).")]
+        4  drift: a line marked DRIFT says what, and what fixes it")]
     Doctor,
-    /// Write a repository's entry into the home: `repo.toml`, with the branch
-    /// ohjaa observes (origin's default branch) and the `[cargo_env]` its gate
-    /// gives cargo tasks; then regenerate the home's git config. The entry
-    /// keeps no copy of a gate: every commit's gate is derived from that
-    /// commit's own sykli.json, else from what `sykli init` writes for its
-    /// tree, and a commit whose only contract is a sykli.rs has none; --force
-    /// removes a copy an earlier adopt kept. Neither git's
-    /// global config nor the repository is written.
-    Adopt {
-        /// The repository (any directory inside it).
-        path: PathBuf,
-        /// The branch to observe, when origin/HEAD does not name it.
-        #[arg(long)]
-        branch: Option<String>,
-        /// Rewrite an existing entry.
-        #[arg(long)]
-        force: bool,
-    },
-    /// The git hook dispatcher every hook in <home>/hooks execs. pre-push
-    /// observes a push to the entry's branch, when the home has an entry for
-    /// the repository, and never refuses it; every hook then runs the
-    /// repository's own hook, with the same arguments and stdin.
-    #[command(after_help = "Exit codes:\n  \
-        0  the repository's own hook, if any, passed\n  \
-        2  not a git hook, or the repository's own hooks cannot be found\n  \
-        N  otherwise, the repository's own hook's status\n\n\
-        The repository is found by the URL git pushes to; its entry is\n\
-        <home>/repos/<owner>/<repo>/. A push that moves the entry's branch is\n\
-        handed, quietly, to\n  \
-        sykli hook pre-push --contract <gate> --branch <branch> <remote> <url>\n\
-        for at most 15 s, where <gate> is the gate derived from the pushed commit\n\
-        (its own sykli.json, else what sykli init writes for its tree), written\n\
-        outside the repository. When sykli does not accept it, the commit is asked\n\
-        about as the marks ask (a receipt in any worktree of the clone). When that\n\
-        does not prove it either, or sykli cannot judge it (no sykli, one without\n\
-        --contract and --branch, a commit with no gate: only a sykli.rs, or a tree\n\
-        sykli init writes none for), the push goes on and\n\
-        one line flags it: ohjaa: UNPROVEN push to <branch> (<why>). A push ohjaa\n\
-        cannot observe at all (no workflow home, an unreadable entry) goes on\n\
-        with: ohjaa: UNOBSERVED push to <owner/repo>: <why>. The repository's\n\
-        own hook is $(git rev-parse --git-common-dir)/hooks/<name>, run when\n\
-        executable; it still refuses what it refuses.")]
-    Hook {
-        /// The git hook's name, e.g. pre-push.
-        name: String,
-        /// The arguments git passed to the hook.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<std::ffi::OsString>,
-    },
-    /// Prove HEAD: run the gate for the repository here, as a push to its
-    /// observed branch is judged: the contract of the entry origin names (else the
-    /// repository's own sykli.json), run into .sykli/receipt.json and verified
-    /// for HEAD. Prints the contract and every command it runs.
-    #[command(after_help = "Exit codes:\n  \
-        0  passed: .sykli/receipt.json verifies for HEAD, so HEAD is proven\n  \
-        N  sykli's status: the run or the verify failed\n  \
-        2  no gate here: origin names no entry, and there is no sykli.json\n  \
-        75 not proven and not failed: a durable sykli run is still going after\n     \
-        --wait, or sykli says it ended without completing; it is recorded\n\n\
-        Runs, from the repository root:\n  \
-        mkdir -p .sykli && sykli run <contract> --json > .sykli/receipt.json &&\n  \
-        sykli verify .sykli/receipt.json --contract <contract> --commit HEAD\n\
-        With a sykli that has durable runs (sykli run --detach), the run is\n\
-        handed over detached and asked about by its id until it ends.")]
-    Gate {
-        /// Print the contract and the commands, and run nothing.
-        #[arg(long)]
-        print: bool,
-        /// With durable sykli runs: how long to wait for the run, in seconds,
-        /// before saying it is still running (exit 75; the run goes on).
-        #[arg(long, value_name = "SECONDS", default_value_t = 1800)]
-        wait: u64,
-    },
     /// Print what a terminal runs as it opens: `ohjaa line`. Load it with:
     /// eval "$(ohjaa shell-init zsh)"
     ShellInit {
@@ -959,18 +832,15 @@ fn knowledge_for_work(
 }
 
 /// The sessions toimija sees in the other worktrees of the clone `root` is
-/// a checkout of (from the clone's layout; never `folder` itself, nor a
-/// checkout ohjaa made to validate an integrated State), each asked as the
-/// launch checkout is, side by side.
+/// a checkout of (from the clone's layout; never `folder` itself), each
+/// asked as the launch checkout is, side by side.
 fn clone_scans(root: &Path, folder: &Path) -> Vec<Scan> {
     let Ok(common) = gitconfig::common_dir(root) else {
         return Vec::new();
     };
-    let ours = lifecycle::validation_checkouts();
-    let others: Vec<PathBuf> = lifecycle::layout_checkouts(&common)
+    let others: Vec<PathBuf> = gitconfig::layout_checkouts(&common)
         .into_iter()
         .filter(|checkout| checkout != folder && checkout.is_dir())
-        .filter(|checkout| ours.as_ref().is_none_or(|ours| !checkout.starts_with(ours)))
         .collect();
     std::thread::scope(|scope| {
         others
@@ -1097,37 +967,6 @@ fn cmd_brief(
         eprintln!("ohjaa: --scope {path} is not inside a Git repository; no repository knowledge or context was read there");
     }
     let here = dirs.repo_root.clone().unwrap_or(std::env::current_dir()?);
-    // The entry's branch unproven at its tip comes first of all, then the
-    // last session's warnings; its record after the knowledge.
-    if !knowledge_only {
-        if let Some(top) = dirs.repo_root.as_deref() {
-            let launch = mark::at_launch(top);
-            if let Some(flag) = &launch.flag {
-                println!("{flag}\n");
-            }
-            // What sykli says of the tip and of HEAD here; nothing is asked for.
-            if let Some(marks) = &launch.marks {
-                let caps = integrated::Caps::ask();
-                let all = session_reader(&dirs)
-                    .and_then(|log| log.all().ok())
-                    .map(|(all, _)| all)
-                    .unwrap_or_default();
-                let head = gitconfig::read_head(top, &marks.gate.common);
-                let view = integrated::at_launch(
-                    marks,
-                    &launch.sykli,
-                    head.as_ref()
-                        .map(|(commit, branch)| (commit.as_str(), branch.as_deref())),
-                    &all,
-                    &caps,
-                );
-                let text = view.briefing();
-                if !text.is_empty() {
-                    println!("{text}");
-                }
-            }
-        }
-    }
     if knowledge.is_empty() {
         println!("No knowledge recorded yet (`ohjaa propose`, then `ohjaa review`).");
     } else {
@@ -2086,34 +1925,6 @@ fn report_repos(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     roots::git_repos(&roots::load(roots, git_root_for_roots(roots).as_deref()))
 }
 
-fn cmd_report(roots: &[PathBuf], since: &str, json: bool, marks: bool) -> Result<i32> {
-    let dirs = dirs()?;
-    let now_ms = intake::now_seconds() * 1000;
-    let since_ms = report::parse_since(since, now_ms)?;
-    let repos = report_repos(roots)?;
-    let report = if marks {
-        report::build_marks(&dirs, &repos, since_ms, now_ms)
-    } else {
-        report::build(&dirs, &repos, since_ms, now_ms)
-    };
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report::to_json(&report))?
-        );
-    } else {
-        print!("{}", report::render(&report));
-    }
-    // A report a person read at a terminal was said; a complete one is the
-    // week's. Never one for a script or an agent, nor the marks alone.
-    if !json && !marks && std::io::stdout().is_terminal() {
-        if let Err(error) = report::shown(&dirs, now_ms, report.complete()) {
-            eprintln!("ohjaa: {error:#}");
-        }
-    }
-    Ok(if report.complete() { 0 } else { INCOMPLETE })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn cmd_intake(
     roots: &[PathBuf],
@@ -2152,7 +1963,7 @@ fn cmd_intake(
         intake::write_cursor(&dirs, since)?;
     }
     let sources: Vec<&str> = if sources.is_empty() {
-        vec!["transcripts", "reviews", "reverts", "report"]
+        vec!["transcripts", "reviews", "reverts"]
     } else {
         sources.iter().map(String::as_str).collect()
     };
@@ -2242,17 +2053,7 @@ fn cmd_intake(
                     intake::reverts(&repos, from, warnings)
                 }
             }
-            "report" => {
-                // What the report finds going around the workflow: real
-                // failures and bypasses only. What it could not read is said,
-                // and does not hold the cursor back.
-                let report = report::build(&dirs, &git_repos()?, from, started);
-                for gap in &report.gaps {
-                    eprintln!("ohjaa: intake: report: not read: {gap}");
-                }
-                report::candidates(&report)
-            }
-            other => bail!("`{other}` is not a source: transcripts, reviews, reverts or report"),
+            other => bail!("`{other}` is not a source: transcripts, reviews or reverts"),
         })
     };
     for source in &sources {
@@ -2537,7 +2338,7 @@ fn cmd_intake(
     });
     // The cursor is one for every source: it moves only after a run that
     // read them all, none with a warning.
-    let every_source = ["transcripts", "reviews", "reverts", "report"]
+    let every_source = ["transcripts", "reviews", "reverts"]
         .iter()
         .all(|source| sources.contains(source));
     let window = intake::Window {
@@ -2677,7 +2478,7 @@ fn scoped_repos(scope: &[String], launch: Option<&Path>) -> (Vec<PathBuf>, Vec<S
     let mut repos: Vec<PathBuf> = Vec::new();
     let mut unscoped = Vec::new();
     for raw in scope {
-        match lifecycle::repo_of(&scope_path(raw)) {
+        match gitconfig::repo_of(&scope_path(raw)) {
             Some(repo) if launch.as_ref() == Some(&repo) => {}
             Some(repo) => {
                 if !repos.contains(&repo) {
@@ -2707,18 +2508,6 @@ fn scope_reaches(session: &scan::Session, dir: &Path) -> bool {
 }
 
 fn main() {
-    // `ohjaa hook <name> ARGS…` hands git's arguments on exactly as git gave
-    // them. Through clap, one that looks like an ohjaa flag (`--root`) would be
-    // taken as one, so the dispatcher's path goes around it; `--help` still
-    // goes through clap.
-    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if argv.len() >= 3 && argv[1] == "hook" && !argv[2].to_string_lossy().starts_with('-') {
-        let code = hook::run(&argv[2].to_string_lossy(), &argv[3..]).unwrap_or_else(|error| {
-            eprintln!("ohjaa hook: {error:#}");
-            2
-        });
-        std::process::exit(code);
-    }
     let cli = Cli::parse();
     let result = match &cli.command {
         Cmd::Brief {
@@ -2760,7 +2549,6 @@ fn main() {
             action: LessonsCmd::Publish { repos, dry_run },
         } => cmd_lessons_publish(&cli.root, repos, *dry_run),
         Cmd::Usage { action } => cmd_usage(action),
-        Cmd::Report { since, json, marks } => cmd_report(&cli.root, since, *json, *marks),
         Cmd::Line => {
             human::line(&cli.root);
             Ok(0)
@@ -2770,37 +2558,18 @@ fn main() {
         }
         Cmd::Collect { background } => human::collect_now(report_repos(&cli.root), *background),
         Cmd::Graph { id } => cmd_graph(id),
-        Cmd::Apply {
-            dry_run,
-            force,
-            prune,
-            bin,
-            undo,
-        } => {
+        Cmd::Apply { dry_run, bin, undo } => {
             if *undo {
                 apply::undo(*dry_run)
             } else {
-                apply::apply(
-                    apply::Options {
-                        dry_run: *dry_run,
-                        force: *force,
-                        prune: *prune,
-                        bin: bin.as_deref(),
-                    },
-                    &cli.root,
-                    git_root_for_roots(&cli.root).as_deref(),
-                )
+                apply::apply(apply::Options {
+                    dry_run: *dry_run,
+                    bin: bin.as_deref(),
+                })
             }
         }
-        Cmd::Doctor => doctor::doctor(&cli.root, git_root_for_roots(&cli.root).as_deref()),
-        Cmd::Adopt {
-            path,
-            branch,
-            force,
-        } => adopt::adopt(path, branch.as_deref(), *force),
-        Cmd::Hook { name, args } => hook::run(name, args),
+        Cmd::Doctor => doctor::doctor(),
         Cmd::ShellInit { shell } => shell_init::shell_init(shell),
-        Cmd::Gate { print, wait } => gate::gate_here(*print, std::time::Duration::from_secs(*wait)),
         Cmd::Intake {
             since,
             no_prefilter,

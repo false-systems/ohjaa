@@ -1,23 +1,19 @@
 //! `ohjaa apply` and `ohjaa apply --undo`.
 //!
-//! `apply` writes the home's generated files (each entry's `hooks/` and
-//! `gated.config`, `git/config`, and `roots` on a first run) and changes
-//! these things outside it, and only those: one `include.path` in git's
-//! global config, a marked block in git's global excludes file, the launcher
-//! line in `~/.zshrc`, and the knowledge block in each agent's own global
-//! instruction file that exists ([`crate::instructions`]). Each is recorded in
-//! `applied.toml` before it is made (what the zshrc line replaced, whether a
-//! file, a blank line or a final newline was there), so `--undo` puts back
-//! exactly what was there, even after an apply that failed midway. What it
-//! changed is then one commit in the home's history ([`home::commit`]); a
-//! failed commit is said, and the change stands.
+//! `apply` changes these things outside the home, and only those: a marked
+//! block in git's global excludes file, the terminal's line in `~/.zshrc`,
+//! and the knowledge block in each agent's own global instruction file that
+//! exists ([`crate::instructions`]). Each is recorded in `applied.toml`
+//! before it is made (what the zshrc line replaced, whether a file, a blank
+//! line or a final newline was there), so `--undo` puts back exactly what
+//! was there, even after an apply that failed midway. What it changed is
+//! then one commit in the home's history ([`home::commit`]); a failed commit
+//! is said, and the change stands.
 //!
 //! Every change is planned before any is made: a refusal leaves nothing half
-//! applied, and `--dry-run` prints the same plan. Dispatchers are only ever
-//! added: a spare one costs a process, a missing one silently skips a check,
-//! so only `--prune` (with the roots written down) or `--undo` removes them.
+//! applied, and `--dry-run` prints the same plan.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -25,9 +21,6 @@ use anyhow::{Context, Result};
 use crate::flat_toml;
 use crate::gitconfig;
 use crate::home;
-use crate::hook::{
-    dispatcher, dispatcher_target, on_path, quote_path, Dispatch, HOOK_NAMES, NOT_DISPATCHED,
-};
 
 /// The change was refused.
 const REFUSED: i32 = 3;
@@ -35,7 +28,7 @@ const REFUSED: i32 = 3;
 /// The launcher line: the ohjaa that ran `apply`, by its path, guarded like
 /// the line it replaces, so a shell where that ohjaa is gone starts quietly.
 pub fn launch_line(ohjaa: &Path) -> String {
-    let quoted = quote_path(ohjaa);
+    let quoted = home::quote_path(ohjaa);
     format!("[[ -x {quoted} ]] && eval \"$({quoted} shell-init zsh)\"")
 }
 
@@ -47,8 +40,8 @@ pub fn launch_target(line: &str) -> Option<PathBuf> {
     (launch_line(&path) == line).then_some(path)
 }
 
-pub const LAUNCH_COMMENT: &str = "# Route claude/codex through ohjaa (written by `ohjaa apply`). \
-                                  Bypass: command claude, or OHJAA_WRAP=0.";
+pub const LAUNCH_COMMENT: &str =
+    "# What needs your attention, as a terminal opens (written by `ohjaa apply`).";
 /// The line that sourced the launcher before it was part of ohjaa.
 const OLD_LAUNCHER: &str = "ohjaa-launch.zsh";
 
@@ -81,12 +74,6 @@ fn read_record(home: &Path) -> Result<Record> {
     let mut record = tables.remove("").unwrap_or_default();
     record.remove("schema");
     Ok(record)
-}
-
-/// The sykli the pre-push dispatchers hand pushes to, as `apply` recorded
-/// it; `None` before apply has found one.
-pub fn recorded_sykli(home: &Path) -> Result<Option<PathBuf>> {
-    Ok(read_record(home)?.get("sykli").map(PathBuf::from))
 }
 
 fn write_record(home: &Path, record: &Record) -> Result<()> {
@@ -355,17 +342,14 @@ fn zshrc_lines(plan: &ZshrcPlan) -> String {
 
 pub struct Options<'a> {
     pub dry_run: bool,
-    pub force: bool,
-    /// Also remove dispatchers no clone under the roots needs.
-    pub prune: bool,
-    /// The ohjaa the hooks and the launcher run, instead of the one on PATH.
+    /// The ohjaa the terminal's line runs, instead of the one on PATH.
     pub bin: Option<&'a Path>,
 }
 
-/// The ohjaa the dispatchers and the launcher line run: `--bin`, else the
-/// `ohjaa` on PATH as found (a link kept a link). A different binary running
-/// apply (a `cargo run`, a `target/` build) would re-point every dispatcher
-/// at itself, so that is refused unless `--bin` names it.
+/// The ohjaa the terminal's line runs: `--bin`, else the `ohjaa` on PATH as
+/// found (a link kept a link). A different binary running apply (a `cargo
+/// run`, a `target/` build) would point the line at itself, so that is
+/// refused unless `--bin` names it.
 fn chosen_ohjaa(bin: Option<&Path>) -> std::result::Result<PathBuf, String> {
     if let Some(bin) = bin {
         let bin = std::path::absolute(bin).unwrap_or_else(|_| bin.to_path_buf());
@@ -375,10 +359,10 @@ fn chosen_ohjaa(bin: Option<&Path>) -> std::result::Result<PathBuf, String> {
             Err(format!("--bin {} is not an executable file", bin.display()))
         };
     }
-    let Some(found) = on_path("ohjaa") else {
+    let Some(found) = home::on_path("ohjaa") else {
         return Err(
-            "ohjaa is not on PATH, so the hooks would have no ohjaa to run; \
-                    install it, or name the binary with --bin <path>"
+            "ohjaa is not on PATH, so the terminal's line would have no ohjaa to run; \
+             install it, or name the binary with --bin <path>"
                 .to_owned(),
         );
     };
@@ -387,8 +371,8 @@ fn chosen_ohjaa(bin: Option<&Path>) -> std::result::Result<PathBuf, String> {
         .map_err(|error| format!("cannot tell which ohjaa is running: {error}"))?;
     if std::fs::canonicalize(&found).ok().as_deref() != Some(running.as_path()) {
         return Err(format!(
-            "this ohjaa ({}) is not the one on PATH ({}); every dispatcher and the launcher \
-             line would run it. Run the ohjaa on PATH, or name the binary with --bin <path>",
+            "this ohjaa ({}) is not the one on PATH ({}); the terminal's line would run \
+             it. Run the ohjaa on PATH, or name the binary with --bin <path>",
             running.display(),
             found.display()
         ));
@@ -398,18 +382,14 @@ fn chosen_ohjaa(bin: Option<&Path>) -> std::result::Result<PathBuf, String> {
 
 /// The record entries a step makes, kept before the step runs, so an apply
 /// that fails midway can still be undone. The first value of an undo key is
-/// the one undo needs; `ohjaa` and `sykli` say what the dispatchers run now.
+/// the one undo needs.
 fn keep_record(home: &Path, entries: &[(String, String)]) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
     let mut record = read_record(home)?;
     for (key, value) in entries {
-        if key == "ohjaa" || key == "sykli" {
-            record.insert(key.clone(), value.clone());
-        } else {
-            record.entry(key.clone()).or_insert_with(|| value.clone());
-        }
+        record.entry(key.clone()).or_insert_with(|| value.clone());
     }
     write_record(home, &record)
 }
@@ -419,101 +399,8 @@ fn lacks_final_newline(text: &str) -> bool {
     !text.is_empty() && !text.ends_with('\n')
 }
 
-fn roots_text(roots: &[PathBuf]) -> String {
-    let mut text = String::from(
-        "# Where ohjaa looks for repositories (apply, doctor, fleet, report): one\n\
-         # directory per line. Written by `ohjaa apply` on its first run.\n",
-    );
-    for root in roots {
-        text.push_str(&format!("{}\n", root.display()));
-    }
-    text
-}
-
-/// The home's lock for one apply: taken once, when apply first changes the
-/// home (flock would block on a second take in the same process).
-#[derive(Default)]
-struct HomeLock {
-    tried: bool,
-    held: Option<crate::process::FileLock>,
-}
-
-impl HomeLock {
-    fn take(&mut self, home: &Path) {
-        if !std::mem::replace(&mut self.tried, true) {
-            self.held = home::lock(home);
-        }
-    }
-}
-
-/// Read git's global config once; when an unreadable generated file breaks
-/// that (every git command fails then, apply's own among them), remove what
-/// git cannot read and read again: apply writes it anew below. The removal
-/// changes the home, so it is made under the home's lock (`lock`), taken
-/// here before any refusal: that home exists already, since a file apply
-/// generated is in it.
-fn global_facts(home: &Path, repair: bool, lock: &mut HomeLock) -> Result<gitconfig::GlobalFacts> {
-    match gitconfig::GlobalFacts::read() {
-        Ok(facts) => Ok(facts),
-        Err(error) if repair => {
-            lock.take(home);
-            let mut generated = vec![gitconfig::include_file(home)];
-            generated.extend(
-                gitconfig::entry_names(home)?
-                    .into_iter()
-                    .map(|entry| gitconfig::entry_gated(&entry.dir)),
-            );
-            let mut removed = false;
-            for path in generated {
-                if path.is_file() && gitconfig::check_git_config(&path).is_err() {
-                    std::fs::remove_file(&path)
-                        .with_context(|| format!("cannot remove {}", path.display()))?;
-                    println!(
-                        "ohjaa apply: removed {}, which git could not read; it is written again below",
-                        path.display()
-                    );
-                    removed = true;
-                }
-            }
-            if !removed {
-                return Err(error);
-            }
-            gitconfig::GlobalFacts::read()
-        }
-        Err(error) => Err(error),
-    }
-}
-
-pub fn apply(
-    options: Options<'_>,
-    explicit_roots: &[PathBuf],
-    git_root: Option<&Path>,
-) -> Result<i32> {
+pub fn apply(options: Options<'_>) -> Result<i32> {
     let home = std::path::absolute(home::ohjaa_home()?)?;
-    // Where the repositories are is written down once, by the person: a
-    // guess from the current directory (a home folder whose `.oh-my-zsh` is
-    // a repository) would leave every clone unscanned, and a later --prune
-    // would strip their dispatchers.
-    let roots_file = crate::roots::config_path().context("no config home")?;
-    if explicit_roots.is_empty() && !roots_file.is_file() {
-        let guess = crate::roots::load(&[], git_root)
-            .into_iter()
-            .map(|root| home::absolute(root).display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!(
-            "ohjaa apply: refusing: {} does not exist, so where your repositories are is not \
-             written down, and apply does not guess (from here it would have used {guess}). \
-             Name the folder that holds them once: ohjaa apply --root <dir>",
-            roots_file.display()
-        );
-        return Ok(2);
-    }
-    let version = gitconfig::require_git()?;
-    let mut lock = HomeLock::default();
-    let global = global_facts(&home, !options.dry_run, &mut lock)?;
-    let mut steps: Vec<Step> = Vec::new();
-
     let ohjaa = match chosen_ohjaa(options.bin) {
         Ok(ohjaa) => ohjaa,
         Err(why) => {
@@ -521,198 +408,12 @@ pub fn apply(
             return Ok(REFUSED);
         }
     };
-    let sykli = on_path("sykli");
-    if sykli.is_none() {
-        eprintln!(
-            "ohjaa apply: warning: sykli is not on PATH; pushes to an entry's branch are \
-             refused until it is (and apply runs again)"
-        );
-    }
-    let dispatch = Dispatch {
-        ohjaa: ohjaa.clone(),
-        sykli: sykli.clone(),
-    };
-    let mut dispatch_record = vec![("ohjaa".to_owned(), ohjaa.to_string_lossy().into_owned())];
-    if let Some(sykli) = &sykli {
-        dispatch_record.push(("sykli".to_owned(), sykli.to_string_lossy().into_owned()));
-    }
-
-    // A global core.hooksPath runs in every repository and overrides the one
-    // ohjaa scopes to gated ones: refused unless --force says to remove it.
-    if let Some((path, direct, origin)) = global.hooks_path() {
-        if !options.force {
-            eprintln!(
-                "ohjaa apply: refusing: git's global core.hooksPath is {path}. It runs in every \
-                 repository and overrides the core.hooksPath ohjaa gives the observed ones, so \
-                 their pushes would not be observed. Move what it does into the repositories' own hooks \
-                 (ohjaa's dispatchers chain to them), or remove it with: ohjaa apply --force"
-            );
-            return Ok(REFUSED);
-        }
-        if !direct {
-            eprintln!(
-                "ohjaa apply: refusing: git's global core.hooksPath ({path}) is set in {origin}, \
-                 a file git's global config includes; ohjaa edits only the global file \
-                 itself, so remove it there"
-            );
-            return Ok(REFUSED);
-        }
-        let record = vec![("hooks_path_removed".to_owned(), path.clone())];
-        steps.push(step(
-            ("remove", "removed"),
-            format!("git's global core.hooksPath ({path})"),
-            record,
-            || home::unset_global("core.hooksPath", None),
-        ));
-    }
-
-    // The roots: written down on the first run, so the hooks apply finds
-    // never depend on where it is run from.
-    let configured = roots_file.is_file();
-    let roots: Vec<PathBuf> = crate::roots::load(explicit_roots, git_root)
-        .into_iter()
-        .map(|root| std::path::absolute(&root).unwrap_or(root))
-        .collect();
-    let repos = crate::roots::git_repos(&roots)?;
-    let roots_said = roots
-        .iter()
-        .map(|root| root.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    if options.prune && !configured {
-        eprintln!(
-            "ohjaa apply: refusing --prune: it removes dispatchers no clone under the roots \
-             needs, so the roots must be written down, and {} does not exist (apply writes it \
-             on a run that finds repositories)",
-            roots_file.display()
-        );
-        return Ok(REFUSED);
-    }
-    // Past every refusal: what apply plans, makes and commits is one change
-    // to the home, never interleaved with a decision's or an adopt's. A dry
-    // run writes nothing, the lock's file included. (A repair above took
-    // the lock already.)
-    if !options.dry_run {
-        lock.take(&home);
-    }
-    if !configured {
-        if repos.is_empty() {
-            eprintln!(
-                "ohjaa apply: warning: {roots_said} holds no repositories, so {} is not \
-                 written; pass the folder that holds them with --root <dir>",
-                roots_file.display()
-            );
-        } else {
-            let (target, text) = (roots_file.clone(), roots_text(&roots));
-            steps.push(step(
-                ("write", "wrote"),
-                format!(
-                    "{} with {roots_said}, the roots apply and doctor scan (edit it to change them)",
-                    roots_file.display()
-                ),
-                Vec::new(),
-                move || home::write_file(&target, &text, None),
-            ));
-        }
-    }
-
-    // Each entry's dispatchers: pre-push, and each hook its clones have of
-    // their own. Only ever added here; --prune (or --undo) removes.
-    let gated = gitconfig::gated_clones(&home, &repos)?;
-    for (entry, needed) in gitconfig::needed_hooks(&home, &gated)? {
-        let hooks = gitconfig::entry_hooks(&entry);
-        let mut write = Vec::new();
-        let mut spare = Vec::new();
-        for name in HOOK_NAMES {
-            let path = hooks.join(name);
-            let current = std::fs::read_to_string(&path).ok();
-            if needed.contains(name) {
-                if current.as_deref() != Some(dispatcher(name, &dispatch).as_str())
-                    || !gitconfig::executable(&path)
-                {
-                    write.push(name);
-                }
-            } else if current.is_some_and(|text| dispatcher_target(name, &text).is_some()) {
-                spare.push(name);
-            }
-        }
-        if !write.is_empty() {
-            let (dir, target, names) = (hooks.clone(), dispatch.clone(), write.clone());
-            steps.push(step(
-                ("write", "wrote"),
-                format!(
-                    "{} dispatcher{} into {} (exec {}): {}",
-                    write.len(),
-                    if write.len() == 1 { "" } else { "s" },
-                    hooks.display(),
-                    ohjaa.display(),
-                    write.join(", ")
-                ),
-                dispatch_record.clone(),
-                move || {
-                    for name in names {
-                        home::write_file(&dir.join(name), &dispatcher(name, &target), Some(0o755))?;
-                    }
-                    Ok(())
-                },
-            ));
-        }
-        if !spare.is_empty() && options.prune {
-            let (dir, names) = (hooks.clone(), spare.clone());
-            steps.push(step(
-                ("remove", "removed"),
-                format!(
-                    "dispatchers no clone under the roots needs from {}: {}",
-                    hooks.display(),
-                    spare.join(", ")
-                ),
-                Vec::new(),
-                move || {
-                    names
-                        .iter()
-                        .try_for_each(|name| remove_if_present(&dir.join(name)))
-                },
-            ));
-        }
-    }
-
-    // The generated git config: one includeIf per entry remote pattern, each
-    // including that entry's gated.config.
-    for (path, text) in gitconfig::generated(&home, &global.rewrites())? {
-        if read_or_empty(&path)? != text {
-            let (target, contents) = (path.clone(), text);
-            steps.push(step(
-                ("write", "wrote"),
-                path.display().to_string(),
-                Vec::new(),
-                move || gitconfig::write_generated(&target, &contents),
-            ));
-        }
-    }
-    let include = gitconfig::include_file(&home);
-    if !global.includes(&include) {
-        let target = gitconfig::global_write_target()?;
-        let value = include.to_string_lossy().into_owned();
-        steps.push(step(
-            ("add", "added"),
-            format!(
-                "include.path = {value} to git's global config, {} (git {}.{}: repositories \
-                 whose remote names an entry run ohjaa's hooks, no other does)",
-                target.display(),
-                version.0,
-                version.1
-            ),
-            vec![
-                ("include".to_owned(), value.clone()),
-                (
-                    "gitconfig".to_owned(),
-                    target.to_string_lossy().into_owned(),
-                ),
-                ("gitconfig_created".to_owned(), flag(!target.exists())),
-            ],
-            move || home::add_global("include.path", &value),
-        ));
-    }
+    // Past the refusal: what apply plans, makes and commits is one change to
+    // the home, never interleaved with a decision's. A dry run writes
+    // nothing, the lock's file included.
+    let lock = (!options.dry_run).then(|| home::lock(&home)).flatten();
+    let global = gitconfig::GlobalFacts::read()?;
+    let mut steps: Vec<Step> = Vec::new();
 
     let ignore = global.excludes_file()?;
     let ignore_now = read_or_empty(&ignore)?;
@@ -784,17 +485,6 @@ pub fn apply(
         0
     };
 
-    // Which ohjaa and sykli the dispatchers run: adopt writes an entry's
-    // dispatchers with them, whatever else this run changes.
-    if !options.dry_run {
-        let record = read_record(&home)?;
-        if dispatch_record
-            .iter()
-            .any(|(key, value)| record.get(key) != Some(value))
-        {
-            keep_record(&home, &dispatch_record)?;
-        }
-    }
     if steps.is_empty() {
         match &except {
             None => println!(
@@ -836,10 +526,10 @@ pub fn apply(
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        home::commit_and_say(&home, &message, "ohjaa apply", lock.held.as_ref());
+        home::commit_and_say(&home, &message, "ohjaa apply", lock.as_ref());
         println!("ohjaa apply: {except}");
     } else {
-        home::commit_and_say(&home, &message, "ohjaa apply", lock.held.as_ref());
+        home::commit_and_say(&home, &message, "ohjaa apply", lock.as_ref());
     }
     Ok(code)
 }
@@ -1029,7 +719,7 @@ fn as_it_was(text: String, newline: bool) -> String {
 }
 
 /// `ohjaa apply --undo`: take back exactly what apply changed, and remove
-/// what it generated. `repos/` entries and `roots` stay.
+/// its record. The home's history stays.
 pub fn undo(dry_run: bool) -> Result<i32> {
     let home = std::path::absolute(home::ohjaa_home()?)?;
     let lock = (!dry_run).then(|| home::lock(&home)).flatten();
@@ -1040,44 +730,6 @@ pub fn undo(dry_run: bool) -> Result<i32> {
     let newline = |key: &str| record.get(key).is_none_or(|value| value == "true");
     let mut steps: Vec<Step> = Vec::new();
     let global = gitconfig::GlobalFacts::read()?;
-
-    let include = recorded("include")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| gitconfig::include_file(&home));
-    if global.includes(&include) {
-        let value = include.to_string_lossy().into_owned();
-        let created = yes("gitconfig_created");
-        let file = recorded("gitconfig").map(PathBuf::from);
-        steps.push(step(
-            ("remove", "removed"),
-            format!("include.path = {value} from git's global config"),
-            Vec::new(),
-            move || {
-                home::unset_global("include.path", Some(&value))?;
-                // A global config that apply created is removed, not left empty.
-                match file {
-                    Some(file) if created && read_or_empty(&file)?.trim().is_empty() => {
-                        remove_if_present(&file)
-                    }
-                    _ => Ok(()),
-                }
-            },
-        ));
-    }
-    if let Some(path) = recorded("hooks_path_removed") {
-        if global.hooks_path().is_none() {
-            steps.push(step(
-                ("restore", "restored"),
-                format!(
-                    "git's global core.hooksPath = {path}, which apply --force removed (at \
-                     the end of [core])"
-                ),
-                Vec::new(),
-                move || home::set_global("core.hooksPath", &path),
-            ));
-        }
-    }
-
     let ignore = match recorded("ignore_file") {
         Some(file) => PathBuf::from(file),
         None => global.excludes_file()?,
@@ -1189,56 +841,14 @@ pub fn undo(dry_run: bool) -> Result<i32> {
         }
     }
 
-    // What apply generated: each entry's dispatchers (only files that still
-    // are one) and gated.config, the git config, the record; then the
-    // folders, if nothing else is in them.
-    let mut generated: Vec<PathBuf> = Vec::new();
-    let mut folders: Vec<PathBuf> = Vec::new();
-    for entry in gitconfig::entry_names(&home)? {
-        let hooks = gitconfig::entry_hooks(&entry.dir);
-        generated.extend(
-            HOOK_NAMES
-                .into_iter()
-                .filter(|name| {
-                    std::fs::read_to_string(hooks.join(name))
-                        .is_ok_and(|text| dispatcher_target(name, &text).is_some())
-                })
-                .map(|name| hooks.join(name)),
-        );
-        generated.push(gitconfig::entry_gated(&entry.dir));
-        folders.push(hooks);
-    }
-    generated.extend([gitconfig::include_file(&home), record_path(&home)]);
-    folders.push(gitconfig::git_dir(&home));
-    generated.retain(|path| path.exists());
-    if !generated.is_empty() {
+    // The record goes last: an undo that fails before it can run again.
+    let record_file = record_path(&home);
+    if record_file.exists() {
         steps.push(step(
             ("remove", "removed"),
-            format!(
-                "what apply generated in {}: {}",
-                home.display(),
-                generated
-                    .iter()
-                    .map(|path| path
-                        .strip_prefix(&home)
-                        .unwrap_or(path)
-                        .display()
-                        .to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            record_file.display().to_string(),
             Vec::new(),
-            move || {
-                generated
-                    .iter()
-                    .try_for_each(|path| remove_if_present(path))?;
-                for folder in folders.into_iter().filter(|folder| folder.exists()) {
-                    if let Err(error) = std::fs::remove_dir(&folder) {
-                        eprintln!("ohjaa apply --undo: kept {}: {error}", folder.display());
-                    }
-                }
-                Ok(())
-            },
+            move || remove_if_present(&record_file),
         ));
     }
 
@@ -1259,10 +869,7 @@ pub fn undo(dry_run: bool) -> Result<i32> {
     if dry_run {
         println!("ohjaa apply --undo: dry run; nothing was changed");
     } else {
-        println!(
-            "ohjaa apply --undo: kept the entries in {}, the roots and the home's history",
-            home.join("repos").display()
-        );
+        println!("ohjaa apply --undo: kept the home's history");
         home::commit_and_say(
             &home,
             &history_message("apply --undo", &done),
@@ -1271,56 +878,6 @@ pub fn undo(dry_run: bool) -> Result<i32> {
         );
     }
     Ok(0)
-}
-
-/// For `adopt`: the generated git files brought up to date, and, once apply
-/// has run (its record names the ohjaa the dispatchers run), the entry's own
-/// dispatchers: pre-push and each hook of `own` it lacks. Says what it
-/// changed.
-pub fn regenerate(
-    home: &Path,
-    entry: &Path,
-    own: &[&'static str],
-    rewrites: &[gitconfig::Rewrite],
-) -> Result<Vec<String>> {
-    let mut said = Vec::new();
-    for (path, text) in gitconfig::generated(home, rewrites)? {
-        if read_or_empty(&path)? != text {
-            gitconfig::write_generated(&path, &text)?;
-            said.push(format!("wrote {}", path.display()));
-        }
-    }
-    let record = read_record(home)?;
-    let Some(ohjaa) = record.get("ohjaa").map(PathBuf::from) else {
-        said.push("no dispatchers yet: `ohjaa apply` has not run".to_owned());
-        return Ok(said);
-    };
-    let dispatch = Dispatch {
-        ohjaa,
-        sykli: record.get("sykli").map(PathBuf::from),
-    };
-    let hooks = gitconfig::entry_hooks(entry);
-    let mut wanted: BTreeSet<&str> = own
-        .iter()
-        .copied()
-        .filter(|name| !NOT_DISPATCHED.contains(name))
-        .collect();
-    wanted.insert("pre-push");
-    let missing: Vec<&str> = wanted
-        .into_iter()
-        .filter(|name| !hooks.join(name).is_file())
-        .collect();
-    for name in &missing {
-        home::write_file(&hooks.join(name), &dispatcher(name, &dispatch), Some(0o755))?;
-    }
-    if !missing.is_empty() {
-        said.push(format!(
-            "wrote dispatchers into {}: {}",
-            hooks.display(),
-            missing.join(", ")
-        ));
-    }
-    Ok(said)
 }
 
 #[cfg(test)]

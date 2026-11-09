@@ -69,7 +69,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-  # The same checks as the repository's sykli.json, the contract `ohjaa gate`
+  # The same checks as the repository's sykli.json, the contract `sykli run`
   # runs on a person's machine: one list, run in both places. Advisory while
   # it proves itself on these runners; the `rust` job above stays the check
   # that counts until it is removed on purpose.

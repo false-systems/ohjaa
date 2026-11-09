@@ -181,28 +181,7 @@ pub struct Ran {
     pub dirty: bool,
 }
 
-impl ValidationRef {
-    /// Integrated only when sykli says the run was of exactly the commit's
-    /// tree, nothing dirty beside it, and the commit was the observed
-    /// branch's tip as this clone saw it; a candidate otherwise, and until
-    /// sykli has said what ran.
-    pub fn settle_kind(&mut self) {
-        let at_tip = self
-            .observed_branch
-            .as_ref()
-            .and_then(|branch| branch.tip.as_deref())
-            == Some(self.commit.as_str());
-        let exact = self
-            .ran
-            .as_ref()
-            .is_some_and(|ran| !ran.dirty && ran.tree == self.tree);
-        self.kind = if at_tip && exact {
-            ValidationKind::Integrated
-        } else {
-            ValidationKind::Candidate
-        };
-    }
-}
+impl ValidationRef {}
 
 /// One phase of work: a commit, and what sykli saw on it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1044,49 +1023,6 @@ fn note_latest(tx: &redb::WriteTransaction, session: &Session) -> Result<(), Sto
     Ok(())
 }
 
-/// A fresh id for a validation request (`ohjaa gate`), in the same style.
-pub fn new_request_id(at_ms: i64) -> String {
-    format!("rq-{at_ms}-{}", std::process::id())
-}
-
-/// The pid of the ohjaa that started a session, from its id.
-pub fn pid_of(id: &str) -> Option<u32> {
-    let (_, pid) = id.strip_prefix("oh-")?.rsplit_once('-')?;
-    pid.parse().ok().filter(|pid| *pid > 0)
-}
-
-/// What a session still open in the log is, observed now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Open {
-    /// Its ohjaa still runs, or that cannot be told: it is left alone.
-    Running,
-    /// Its ohjaa is gone, but the session's own process group still runs (or
-    /// that cannot be told): its agent outlived its ohjaa. Not an orphan;
-    /// its leaving will not be recorded.
-    OhjaaGone,
-    /// Its ohjaa is gone, and so is its process group (or none was
-    /// recorded): an orphan.
-    Orphaned,
-}
-
-/// Observe an open session now: its ohjaa by the pid in its id, then its
-/// process group (`pgid`). A process is never declared gone on a guess.
-pub fn observe_open(session: &Session) -> Open {
-    let Some(pid) = pid_of(&session.id) else {
-        return Open::Running;
-    };
-    if pid == std::process::id()
-        || crate::process::ohjaa_alive(pid, session.started_ms) != Some(false)
-    {
-        return Open::Running;
-    }
-    let started = session.group_started_ms.unwrap_or(session.started_ms);
-    match session.pgid {
-        Some(pgid) if crate::process::group_alive(pgid, started) != Some(false) => Open::OhjaaGone,
-        _ => Open::Orphaned,
-    }
-}
-
 /// Session ids are names, never paths.
 pub fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
@@ -1104,17 +1040,6 @@ pub fn clock(ms: i64) -> String {
     let full = rfc3339(ms.div_euclid(1000));
     // "2026-09-26T10:02:03Z" → "2026-09-26 10:02 UTC"
     format!("{} {} UTC", &full[..10], &full[11..16])
-}
-
-/// How much of a run sykli reused from its cache instead of running it, said
-/// apart from what ran: ` (1 of 3 tasks cached)`, ` (all 2 tasks cached)`,
-/// or nothing when every task ran (or the receipt does not say).
-pub fn describe_cached(evidence: &Evidence) -> String {
-    match (evidence.cached, evidence.tasks) {
-        (0, _) => String::new(),
-        (cached, tasks) if cached >= tasks => format!(" (all {cached} tasks cached)"),
-        (cached, tasks) => format!(" ({cached} of {tasks} tasks cached)"),
-    }
 }
 
 pub fn describe_check(check: &Check) -> String {

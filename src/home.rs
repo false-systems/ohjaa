@@ -1,33 +1,20 @@
 //! The workflow home: `$XDG_CONFIG_HOME/ohjaa` (else `~/.config/ohjaa`).
 //!
-//! The agent workflow (the gate, the hooks, the launcher) lives here, outside
-//! the product repositories, and is applied to them from outside. Nothing is
-//! installed on, or merged into, a repository.
-//!
 //! ```text
 //! ~/.config/ohjaa/
-//!   repos/<owner>/<repo>/            lower case
-//!     repo.toml    branch = "main"   the branch ohjaa observes, and [cargo_env]: the env
-//!                                    each cargo task of the gate is given (KATANA D10)
-//!     sykli.json   a gate an earlier adopt stored: never read (adopt --force removes it)
-//!     hooks/<name>                   exec <ohjaa> hook <name> "$@", for pre-push
-//!                                    and each hook the entry's clones have
-//!     gated.config                   core.hooksPath = that hooks/ folder
-//!   git/config                       includeIf per entry remote -> its gated.config
-//!   roots                            where apply and doctor look
-//!   applied.toml                     what apply changed, for `apply --undo`
-//!   .git/                            the home's history: a local repository, never
-//!                                    pushed, one commit per decision on mine or
-//!                                    machine and per apply and adopt ([`commit`])
+//!   mine/ machine/   the person's and this machine's knowledge
+//!   ours             where the team's knowledge is checked out
+//!   drafter          the command intake drafts with, when set
+//!   roots            where ohjaa looks for repositories
+//!   applied.toml     what apply changed, for `apply --undo`
+//!   .git/            the home's history: a local repository, never pushed,
+//!                    one commit per decision on mine or machine and per
+//!                    apply ([`commit`])
 //! ```
 //!
-//! The knowledge scopes (`mine/`, `machine/`) and the `ours` and `drafter`
-//! files live in the same directory and are not touched here; the history
-//! holds them too.
-//!
-//! A repository is found by its remote: `git@github.com:o/r.git`,
+//! A repository is named by its remote: `git@github.com:o/r.git`,
 //! `https://github.com/o/r` and `ssh://git@github.com/o/r.git` are all
-//! `github.com/o/r`, and its entry is `repos/o/r/`.
+//! `github.com/o/r` ([`RepoId`]).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -35,8 +22,6 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::derived::Overlay;
-use crate::flat_toml;
 use crate::knowledge::config_home;
 use crate::process;
 
@@ -116,156 +101,6 @@ impl RepoId {
     }
 }
 
-/// A repository's entry: the branch ohjaa observes and the env its gate
-/// gives cargo tasks. The gate for a commit is derived from the commit: its
-/// own `sykli.json`, else what `sykli init` writes for its tree
-/// ([`crate::derived`]). The entry keeps no gate of its own.
-#[derive(Debug, Clone)]
-pub struct Entry {
-    pub dir: PathBuf,
-    /// The branch ohjaa observes, judged by the gate.
-    pub branch: String,
-    /// `[cargo_env]`: what each cargo task of a derived gate is given.
-    pub overlay: Overlay,
-}
-
-impl Entry {
-    /// The copy an earlier adopt stored, `sykli.json` beside `repo.toml`:
-    /// never read (no gate is a copy), and removed by `adopt --force`.
-    pub fn stored(&self) -> PathBuf {
-        self.dir.join("sykli.json")
-    }
-
-    pub fn has_stored(&self) -> bool {
-        self.stored().is_file()
-    }
-}
-
-/// `repos/<owner>/<name>`, lower case: owners and repositories are
-/// case-insensitive on GitHub, and some file systems are not.
-pub fn entry_dir(home: &Path, id: &RepoId) -> PathBuf {
-    home.join("repos")
-        .join(id.owner.to_ascii_lowercase())
-        .join(id.name.to_ascii_lowercase())
-}
-
-/// What `repo.toml` holds: the branch, and the env the gate gives cargo
-/// tasks (`[cargo_env]`; `none` says why it holds no line).
-pub fn repo_toml(id: &RepoId, branch: &str, overlay: &Overlay, none: Option<&str>) -> String {
-    format!(
-        "# ohjaa's entry for {}, written by `ohjaa adopt`. ohjaa observes this branch. Each\n\
-         # commit is judged by the gate derived from its own sykli.json (and sykli.lock), with\n\
-         # [cargo_env] below; a commit without one, by what sykli init writes for its tree.\n\
-         branch = {}\n{}",
-        id.slug(),
-        flat_toml::quote(branch),
-        overlay.toml(none)
-    )
-}
-
-fn parse_repo_toml(text: &str) -> std::result::Result<(String, Overlay), String> {
-    let tables = flat_toml::parse(text)?;
-    if let Some(table) = tables
-        .keys()
-        .find(|name| !name.is_empty() && *name != "cargo_env")
-    {
-        return Err(format!(
-            "unknown table [{table}]; repo.toml holds branch and [cargo_env]"
-        ));
-    }
-    flat_toml::only_keys(&tables, "", &["branch"])?;
-    let branch = tables[""]
-        .get("branch")
-        .ok_or("no branch = \"…\"")?
-        .to_owned();
-    if branch.is_empty() || branch.starts_with('-') || branch.chars().any(char::is_whitespace) {
-        return Err(format!("{branch:?} is not a branch name"));
-    }
-    let overlay = Overlay::from_table(tables.get("cargo_env"))?;
-    Ok((
-        branch
-            .strip_prefix("refs/heads/")
-            .unwrap_or(&branch)
-            .to_owned(),
-        overlay,
-    ))
-}
-
-/// The entry at `dir`, `Ok(None)` when there is none. A directory with files
-/// but no readable `repo.toml` is an error, never "no entry": the gate it
-/// holds must not be skipped because its branch cannot be read.
-pub fn read_entry(dir: &Path) -> Result<Option<Entry>> {
-    let path = dir.join("repo.toml");
-    match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            let (branch, overlay) = parse_repo_toml(&text)
-                .map_err(|why| anyhow::anyhow!("{}: {why}", path.display()))?;
-            Ok(Some(Entry {
-                dir: dir.to_path_buf(),
-                branch,
-                overlay,
-            }))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let holds_files = std::fs::read_dir(dir)
-                .map(|mut entries| entries.next().is_some())
-                .unwrap_or(false);
-            if holds_files {
-                bail!("{} has files but no repo.toml", dir.display());
-            }
-            Ok(None)
-        }
-        Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
-    }
-}
-
-/// The entry for `id`. Owners and repositories are case-insensitive on
-/// GitHub, so `False-Systems/Ohjaa` finds `repos/false-systems/ohjaa/` on
-/// any file system.
-pub fn find_entry(home: &Path, id: &RepoId) -> Result<Option<Entry>> {
-    let exact = entry_dir(home, id);
-    if exact.is_dir() {
-        return read_entry(&exact);
-    }
-    let wanted = id.slug();
-    match entry_dirs(home)?
-        .into_iter()
-        .find(|(slug, _)| slug.eq_ignore_ascii_case(&wanted))
-    {
-        Some((_, dir)) => read_entry(&dir),
-        None => Ok(None),
-    }
-}
-
-/// Every entry directory under `repos/`, as `(owner/name, dir)`.
-pub fn entry_dirs(home: &Path) -> Result<Vec<(String, PathBuf)>> {
-    let repos = home.join("repos");
-    let mut found = Vec::new();
-    let owners = match std::fs::read_dir(&repos) {
-        Ok(owners) => owners,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(found),
-        Err(error) => {
-            return Err(error).with_context(|| format!("cannot read {}", repos.display()))
-        }
-    };
-    for owner in owners.flatten().filter(|e| e.path().is_dir()) {
-        let names = std::fs::read_dir(owner.path())
-            .with_context(|| format!("cannot read {}", owner.path().display()))?;
-        for name in names.flatten().filter(|e| e.path().is_dir()) {
-            found.push((
-                format!(
-                    "{}/{}",
-                    owner.file_name().to_string_lossy(),
-                    name.file_name().to_string_lossy()
-                ),
-                name.path(),
-            ));
-        }
-    }
-    found.sort();
-    Ok(found)
-}
-
 /// Run git and return its trimmed stdout, `Ok(None)` when it exits 1 (git
 /// config's "not set"), an error otherwise.
 pub fn git_value(args: &[&str], cwd: Option<&Path>) -> Result<Option<String>> {
@@ -283,59 +118,6 @@ pub fn value_of(command: &mut Command, args: &[&str]) -> Result<Option<String>> 
         Some(0) => Ok(Some(output.stdout_text().trim().to_owned())),
         Some(1) if output.stderr.is_empty() => Ok(None),
         _ => bail!("git {} failed: {}", args.join(" "), output.failure_detail()),
-    }
-}
-
-/// `git config --global …`, run outside every repository: with `--includes`,
-/// a repository's `includeIf` (ohjaa's own among them) would otherwise count
-/// as global wherever the command happens to run.
-fn global_git(args: &[&str]) -> Result<Option<String>> {
-    let (mut command, full) = global_command(args);
-    value_of(&mut command, &full)
-}
-
-fn global_command<'a>(args: &[&'a str]) -> (Command, Vec<&'a str>) {
-    let mut full = vec!["config", "--global"];
-    full.extend_from_slice(args);
-    let mut command = Command::new("git");
-    command.args(&full).current_dir("/");
-    for var in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-    ] {
-        command.env_remove(var);
-    }
-    (command, full)
-}
-
-pub fn set_global(key: &str, value: &str) -> Result<()> {
-    global_git(&[key, value])?
-        .map(|_| ())
-        .with_context(|| format!("git config --global {key} did not take"))
-}
-
-/// Add one more value to a global setting.
-pub fn add_global(key: &str, value: &str) -> Result<()> {
-    global_git(&["--add", key, value])?
-        .map(|_| ())
-        .with_context(|| format!("git config --global --add {key} did not take"))
-}
-
-/// Remove the global setting's values equal to `value` (all of them when
-/// `None`). Git drops a section left empty.
-pub fn unset_global(key: &str, value: Option<&str>) -> Result<()> {
-    let mut args = vec!["--unset-all", key];
-    if let Some(value) = value {
-        args = vec!["--fixed-value", "--unset-all", key, value];
-    }
-    let (mut command, full) = global_command(&args);
-    let output = process::run(&mut command, None, process::LOCAL).context("cannot run git")?;
-    match output.status.code() {
-        // Exit 5: nothing to unset, which is what was wanted.
-        Some(0 | 5) => Ok(()),
-        _ => bail!("git {} failed: {}", full.join(" "), output.failure_detail()),
     }
 }
 
@@ -410,16 +192,14 @@ pub fn lock(home: &Path) -> Option<process::FileLock> {
 const EXCLUDE_BEGIN: &str = "# >>> ohjaa: the home's history holds only what ohjaa keeps here";
 const EXCLUDE_END: &str = "# <<< ohjaa";
 /// Everything is left out, then what ohjaa keeps in the home is let in
-/// (the knowledge scopes, the entries, the generated git config, the roots,
-/// apply's record, and the `ours` and `drafter` settings), and what an
+/// (the knowledge scopes, the roots, apply's record, and the `ours` and
+/// `drafter` settings), and what an
 /// editor, the Finder or a half-done write leaves among those is left out
 /// again.
 const EXCLUDE: &[&str] = &[
     "/*",
     "!/mine/",
     "!/machine/",
-    "!/repos/",
-    "!/git/",
     "!/roots",
     "!/applied.toml",
     "!/ours",
@@ -763,6 +543,21 @@ pub fn write_checked(
     })
 }
 
+/// The first `name` on PATH, as the shell finds it: made absolute, never
+/// resolved, so `~/.cargo/bin/ohjaa` stays that and a reinstall keeps the
+/// launcher line working.
+pub fn on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|path| crate::gitconfig::executable(path))
+        .map(|path| std::path::absolute(&path).unwrap_or(path))
+}
+
+/// `path` quoted for a POSIX shell.
+pub fn quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,45 +606,6 @@ mod tests {
             "/a/..",
         ] {
             assert_eq!(RepoId::parse(url), None, "{url:?}");
-        }
-    }
-
-    #[test]
-    fn repo_toml_holds_the_branch_and_the_cargo_env_and_nothing_else() {
-        let id = RepoId::parse("git@github.com:acme/widget.git").unwrap();
-        let standard = Overlay::standard();
-        assert_eq!(
-            parse_repo_toml(&repo_toml(&id, "main", &standard, None)).unwrap(),
-            ("main".to_owned(), standard.clone())
-        );
-        let none = repo_toml(
-            &id,
-            "main",
-            &Overlay::default(),
-            Some("no sykli expands it"),
-        );
-        assert!(parse_repo_toml(&none).unwrap().1.is_empty(), "{none}");
-        // An entry written before [cargo_env]: the standard lines.
-        assert_eq!(
-            parse_repo_toml("branch = \"refs/heads/trunk\"").unwrap(),
-            ("trunk".to_owned(), standard)
-        );
-        for (text, why) in [
-            ("", "no branch"),
-            ("branch = \"\"", "not a branch name"),
-            (
-                "branch = \"main\"\ncontract = \"x\"",
-                "unknown key contract",
-            ),
-            ("[gate]\nbranch = \"main\"", "unknown table"),
-            (
-                "branch = \"main\"\n[cargo_env]\nRUSTFLAGS = \"x\"",
-                "unknown key RUSTFLAGS",
-            ),
-            ("branch = main", "only \"text\" values"),
-        ] {
-            let error = parse_repo_toml(text).unwrap_err();
-            assert!(error.contains(why), "{text:?}: {error}");
         }
     }
 
@@ -905,42 +661,6 @@ mod tests {
             repository_dirs(&plain),
             (plain.join(".git"), plain.join(".git"))
         );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// `sharing.toml` said how `ohjaa judge` shared its notes; with the
-    /// command gone, one left in an entry is never read, whatever it holds.
-    #[test]
-    fn a_sharing_toml_left_beside_repo_toml_is_never_read() {
-        let dir = std::env::temp_dir().join(format!("ohjaa-sharing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("repo.toml"), "branch = \"main\"\n").unwrap();
-        std::fs::write(dir.join("sharing.toml"), "visibility = 1\n").unwrap();
-        assert_eq!(read_entry(&dir).unwrap().unwrap().branch, "main");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn an_entry_directory_without_repo_toml_is_an_error_not_an_absence() {
-        let dir = std::env::temp_dir().join(format!("ohjaa-entry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(
-            read_entry(&dir).unwrap().is_none(),
-            "no directory: no entry"
-        );
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(
-            read_entry(&dir).unwrap().is_none(),
-            "empty directory: no entry"
-        );
-        std::fs::write(dir.join("sykli.json"), "{}").unwrap();
-        let error = read_entry(&dir).unwrap_err().to_string();
-        assert!(error.contains("no repo.toml"), "{error}");
-        std::fs::write(dir.join("repo.toml"), "branch = \"main\"\n").unwrap();
-        let entry = read_entry(&dir).unwrap().unwrap();
-        assert_eq!(entry.branch, "main");
-        assert!(entry.has_stored());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
