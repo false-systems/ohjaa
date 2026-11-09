@@ -7,7 +7,7 @@
 //! nothing is stored, and the view cannot be staler than the moment it was
 //! computed. An agent gets this perimeter at launch (inside toimija's
 //! composed launch prompt) and can re-derive it any time with `ohjaa system`
-//! and `ohjaa fleet` — pull, never push.
+//! and `toimija sessions` — pull, never push.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -232,7 +232,7 @@ pub fn briefing(view: &SystemView, here: &Path) -> String {
 
     let mut out = String::from(
         "System perimeter (derived by ohjaa at launch; re-derive with\n\
-         `ohjaa system`, session observations via `ohjaa fleet`):\n\n\
+         `ohjaa system`, who is live via `toimija sessions`):\n\n\
          Repositories — each tool self-declares its role in its repo:\n",
     );
     for tool in &view.tools {

@@ -1,35 +1,33 @@
 # ohjaa
 
-**Steering knowledge for agents, handed to them before they act.** *Ohjaa* is
+**Steering knowledge for agents, in the files they already read.** *Ohjaa* is
 Finnish for *steer*.
 
 Toimija reports facts and refuses to decide. Ohjaa holds the other half: what
 the people an agent works for **know and have decided**. That covers the
 decisions, facts, taste and lessons that
 [`faija-ontology.v2`](https://github.com/false-systems/faija) calls
-**Knowledge**. Every agent launched through ohjaa starts with that Knowledge,
-followed by context for its launch repository and declared scope. The full
-fleet remains available on demand.
+**Knowledge**. `ohjaa apply` writes the team's Knowledge and the person's into
+each agent's own instruction file (Claude Code, Codex, pi, opencode), and a
+repository's own lessons go into its `AGENTS.md`: every agent reads them
+wherever it starts, however it was started. Ohjaa runs no sessions; the note
+for the next agent is `toimija handover`.
 
 ```bash
-ohjaa run claude --intent "…"          # brief the agent, then hand off to toimija
-ohjaa run claude --intent-id in-…      # continue that Intent in a new session
-ohjaa brief --agent claude             # the briefing an agent gets here
-ohjaa brief --scope ../other-repo       # retrieve context after expanding scope
+ohjaa apply                            # write the Knowledge into each agent's own instruction file
 ohjaa propose --scope ours --id rust-only --kind decision \
       --origin "2026-09-16: 'we dont do python'" "Code is Rust or Elixir/Erlang."
 ohjaa review                           # a person decides what becomes current
+ohjaa list                             # the Knowledge that applies here
+ohjaa graph rust-only                  # a node and its neighbours
+ohjaa check                            # validate, and flag what may no longer hold
 ohjaa lessons publish --dry-run        # repo knowledge into each repository's own AGENTS.md
 ohjaa intake                           # draft proposals from what people said
-ohjaa report                           # what went around the workflow this week
+ohjaa brief --scope ../other-repo      # the Knowledge and context for a repository
+ohjaa report                           # commits on a default branch without passing evidence
 ohjaa line                             # for a terminal's opening: what is new since you looked
 ohjaa digest                           # what happened, for you: all of it
-ohjaa check                            # validate, and flag what may no longer hold
-ohjaa session                          # the record of the last ended session here, or of one by id
-ohjaa graph rust-only                  # a node, its neighbours, who was briefed with it
-ohjaa fleet                            # who is live, across every repo
 ohjaa system                           # what every tool in the fleet is, derived now
-ohjaa apply                            # apply the workflow from ~/.config/ohjaa, outside every repo
 ohjaa adopt ~/projects/sykli           # give a repo an entry: the branch ohjaa observes, and the build settings its gate gives cargo
 ohjaa doctor                           # what differs from what apply would make it
 ohjaa gate                             # prove HEAD: run this repo's gate, as a push is judged
@@ -444,7 +442,7 @@ origin, say) did not re-teach it.
 ohjaa never changes a node itself. Rewording, deciding, confirming and
 retiring stay a person's.
 
-## The bypass report: what went around the workflow
+## The report: commits without passing evidence
 
 ```bash
 ohjaa report                    # the last 7 days
@@ -452,96 +450,38 @@ ohjaa report --since 30d --json # ohjaa-report.v1
 ```
 
 `ohjaa report` derives, now, the marks on every entry's branch (see "Observe,
-mark, flag" below) and three lists for the window:
+mark, flag" below) and, for the window, the **commits on a default branch
+without passing evidence**:
 
-- **Sessions without read-back or handover:** ended sessions in the log that
-  never ran `ohjaa oriented`, or left no `ohjaa handover`.
-- **Commits on a default branch without passing evidence.**
-  - For every git repository under the roots, these are the first-parent
-    commits its default branch (`origin/<default>`, else the local one; for a
-    repository with an entry, `origin/<the entry's branch>`) gained in the
-    window, by commit time, at most 100 per repository.
-  - Each is checked with `sykli verify --commit` against every receipt of its
-    tree, in every checkout and under the git common dir, and against the
-    entry's gate when the repository has an entry (else the contract in the
-    commit). It passes when any one of them verifies.
-  - Listed: what sykli refused, and what was never run in a checkout that
-    still exists.
-  - The rest are counted by why: verified (and how many of those reused
-    tasks from sykli's cache, `verified_reusing_cache`); no sykli contract; made in a
-    checkout that is gone, with no receipt kept (merge commits among them);
-    sykli could not say. A window over the cap is said.
-- **Agent sessions a person started without ohjaa:** with `vessa` on PATH,
-  the top-level Claude, Codex and pi sessions that vessa's header listing
-  (`vessa sessions --json --headers`, `vessa-session-headers.v1`) lists in
-  the window and no `ohjaa run` launched. opencode is not judged: vessa
-  does not read its sessions.
-  - A session belongs to a launch that recorded its id: what leaving found
-    by its launch prompt (`left.native`; see "The agent's own sessions"),
-    the launch's usage receipt, or what its agent's environment claimed from
-    inside it (for a launch that left, as its leaving kept it; for one
-    still open, `native_env`; an id claimed after a launch ended never
-    counts). A launch with an id of its own claims no other session. A
-    session named by several launches (resumed in each) is each one's.
-  - A claim never outranks an observation: an id another launch's prompt
-    or receipt names is not the claiming launch's, and counts for nothing
-    there.
-  - Only a launch with no id of its own falls back to time and folder: it
-    claims at most one session, the same agent, in the launch's repository
-    or below, started while the launch ran (from 5 s before it was logged
-    until it left, or now while it runs). An agent can write its first
-    record minutes into its launch.
-  - When more than one could be a launch's, the one whose transcript was
-    last written closest to the launch's end is its own (for a launch still
-    running, or closed as an orphan, the one that started closest to it).
-    Each session is any launch's at most once, and the same list always
-    gives the same answer.
-  - Each session a launch claimed is said with how: counted by way in the
-    text (an environment's id as claimed by the agent), where each one
-    taken by time and folder alone is named; in `--json`,
-    `bypasses.matched`, each `{agent, id, session, by, testimony}`, `by` one
-    of `launch_prompt`, `receipt`, `env` and `time_and_folder`, and
-    `testimony` true for a receipt's or the agent's word. A session named
-    several ways is said by the surest: launch prompt, then receipt, then
-    the agent's claim.
-  - Headless runs bypass nothing and are only counted: `claude -p`
-    (`entrypoint` `sdk-…`), `codex exec` (`originator` naming exec), and
-    intake's own drafter with them. A pi transcript does not say how pi was
-    started, so a `pi -p` run counts as a person's session.
-  - A session vessa could not date or place is listed apart, not judged.
-  - A vessa too old for `--headers` (before vessa#5: exit 2, nothing
-    listed) leaves the list not judged, and the report says to update it.
-    The slow full listing is never read instead.
+- For every git repository under the roots, these are the first-parent
+  commits its default branch (`origin/<default>`, else the local one; for a
+  repository with an entry, `origin/<the entry's branch>`) gained in the
+  window, by commit time, at most 100 per repository.
+- Each is checked with `sykli verify --commit` against every receipt of its
+  tree, in every checkout and under the git common dir, and against the
+  entry's gate when the repository has an entry (else the contract in the
+  commit). It passes when any one of them verifies.
+- Listed: what sykli refused, and what was never run in a checkout that
+  still exists.
+- The rest are counted by why: verified (and how many of those reused tasks
+  from sykli's cache, `verified_reusing_cache`); no sykli contract; made in
+  a checkout that is gone, with no receipt kept (merge commits among them);
+  sykli could not say. A window over the cap is said.
 
-Every warning vessa gives about what it read, a vessa exit other than 0 or
-4, an undated session, a capped window, and a root with no repositories is
-a gap. A report with gaps says them, and exits 4: it is never a clean week.
+Ohjaa launches no agents, so no session is judged against a launch. The
+JSON keeps its keys, as `ohjaa-marks.v1` only gains them:
+`sessions_without_testimony` is empty, and `bypasses` is `{"judged": false,
+"why": …}`.
 
-Once a week, at an `ohjaa run` a person starts at a terminal, the report is
-read while the agent works, and three lines of it are said after the
-session's record, never in the agent's briefing. The week is marked only
-when that report was complete. One with a gap is said again at most once a
-day, and its last line says what the gap is, so it can be fixed (for
-example ``incomplete: vessa is too old for `sessions --headers`; update
-it``). Only those two times are kept (`$XDG_STATE_HOME/ohjaa/report-at` and
-`report-shown-at`), like intake's cursor. `ohjaa report` records them too,
-but only when it printed to a terminal: never for `--json`, a script or an
-agent.
+A capped window and a root with no repositories are gaps. A report with
+gaps says them, and exits 4: it is never a clean week. `ohjaa report`
+records when a complete report was last shown (`$XDG_STATE_HOME/ohjaa/report-at`
+and `report-shown-at`), but only when it printed to a terminal: never for
+`--json`, a script or an agent.
 
-```
-ohjaa: weekly report, 2026-10-03 to 2026-10-10: 2 session(s) without read-back or handover · 1 commit(s) on a default branch without passing evidence · 1 agent session(s) started without ohjaa
-ohjaa:   first: 3dbaafd on origin/main in selko: FAILED sykli verify: refused: outcome …
-ohjaa:   `ohjaa report` lists them all; the next summary is in 7 days.
-```
-
-`ohjaa intake` takes the report as its fourth source (`--source report`).
-These become `observed` candidates:
-
-- a session that never read back;
-- a refused or unchecked commit on a default branch;
-- a session a person started without ohjaa.
-
-What could not be checked or judged never does.
+`ohjaa intake` takes the report as its fourth source (`--source report`): a
+refused or unchecked commit on a default branch becomes an `observed`
+candidate. What could not be checked never does.
 
 ## The human view: what happened, for the person
 
@@ -616,8 +556,7 @@ here. It records only: nothing is sent to anyone, decided or refused.
   and an unchanged re-scan does not replay the same alert.
 - **`ohjaa digest`** shows attention details, unread agent sessions and
   pull requests, proposed instructions and who is live. Each ended session
-  has its full recorded intent, end time, elapsed time and an inspection
-  command, `ohjaa session <id>`. A pull request has its URL. Its "Now" says
+  in the log has its recorded intent, end time and elapsed time. A pull request has its URL. Its "Now" says
   who is live on this machine, then the pull requests GitHub last said were
   open in the entries' owners (updated in the window the snapshot read),
   the last updated first: the repository, the number, the author, whether it
@@ -790,7 +729,7 @@ switch over, once this ohjaa is installed:
 
 1. Remove the two lines `viemari shell-init` added to `~/.zshrc`, the comment
    and `command -v viemari >/dev/null && viemari line`. `ohjaa shell-init zsh`
-   now ends with `[[ ${OHJAA_LINE:-1} == 0 ]] || ohjaa line`, and the line
+   prints `[[ ${OHJAA_LINE:-1} == 0 ]] || ohjaa line`, and the line
    `ohjaa apply` wrote already evals it.
 2. Run `ohjaa collect` once. Startup then shows attention only; use
    `ohjaa digest` to read activity and details.
@@ -798,399 +737,36 @@ switch over, once this ohjaa is installed:
 
 Not carried over: viemari's lifecycle view (Intent, session, change,
 validation, each sykli run asked by id), its rework and lead-time measures,
-pull request reviews, and direct pushes that are proven. `ohjaa session`,
-`ohjaa report` and `ohjaa graph` show the depth.
+pull request reviews, and direct pushes that are proven. `ohjaa report` and
+`ohjaa graph` show the depth.
 
 In particular, viemari's day listed each failed validation a session asked
 sykli for (`FAILED: test`). This view does not ask sykli about validation
 runs, so their absence here is **not a pass**: a failed run shows here only
 as the mark of a commit on an entry's branch (`main: 1 commit needs passing
-checks (1 failed)`). `ohjaa session <id>` shows the validations a session asked for.
-
-## Sessions: entering to leaving
-
-`ohjaa run` runs each agent session through five states, and stays its parent
-until it ends so the last one always happens:
-
-```
-1 entering → 2 oriented → 3 working, phase 1 … n → 4 finished work → 5 leaving
-```
-
-| State | What happens | Written by |
-|---|---|---|
-| 1 entering | knowledge, the last session here, lifecycle instructions, and scoped context | ohjaa |
-| 2 oriented | the agent reads back what it knows: `ohjaa oriented "<goal; rules; who else>"` | the agent |
-| 3 working | small phases, each a commit and, where the repo has a sykli contract, a `sykli run` on it | observed from git, `.sykli/receipts` in every checkout `git worktree list` names, and `<git common dir>/sykli/receipts` (the receipt sykli keeps of each push it accepted, which outlives a removed worktree): the commits a reflog (a checkout's HEAD, or a branch) shows created since entering and still reachable, never ones a pull or merge brought in, nor one an amend or rebase replaced (a rebase's replayed commits are made anew, and count). A commit is the session's own only where that can be shown (see below); every other one made meanwhile is recorded as observed, not attributed |
-| 4 finished | the pull request of the branch this session's newest commit on a branch was made on (by name, then by commit once a squash merge deleted the branch; when the branch, its worktree and its remote-tracking branch are all gone, even after `git fetch --prune`, its commits made here are found in the object store and the pull request is searched for by the newest: when one holds it they are shown `on no branch now`, otherwise (a stash, say) they are left out; none asked when it made no commit on a branch), and what `sykli verify --commit` says about its head; every commit that reached the default branch during the session, checked the same way | observed through `gh`, git and sykli |
-| 5 leaving | the record: observed part, then the handover (`ohjaa handover`) | ohjaa, and the agent's testimony |
-
-States are **observed, not declared**: the agent writes only its read-back and
-its handover, and the record shows them as its words. Leaving always writes the
-record, crash or not; a missing handover is recorded as none. Only losing ohjaa
-itself (a SIGKILL, a crash, a restart) skips leaving. The session runs in a
-process group of its own (`toimija run` leads it, the agent stays in it), and
-its entering record names that group (`pgid`, with when it was made) before
-toimija runs at all: the child says its pid, ohjaa records it, and only then
-does the child exec. So a later launch tells the session apart from its ohjaa:
-
-- ohjaa gone, the group's leader still running: **still running** (`STILL
-  RUNNING:` at the top of the briefing, and `ohjaa_gone` in `report --json`).
-  Its agent outlived its ohjaa and may still be changing things; the session
-  is left open, and its leaving will not be recorded.
-- ohjaa and the leader both gone (or an older record with no group): the next
-  launch closes it as `orphaned (observed at next launch)`, queues it for
-  `ohjaa intake`, and opens its briefing with it when it ran here.
-
-The leader decides, not every member: toimija waits for its agent, so a
-process the agent left behind in the group (a background shell, a server)
-does not keep a dead session running. A leader that exited and was not reaped
-yet is gone, and a process with that pid in another group, or one that
-started after the group was made, is another process, the id reused. Under a
-wrapper without job control (`sh -c 'ohjaa run …'`) at a terminal, the session
-shares ohjaa's process group instead (see the signals below), and has no
-group of its own to be told apart by: a later launch judges it by its ohjaa
-alone, as before. Only the absence is observed, never a cause, and an orphan
-ranks by when it started: a session that really ended after that stays the
-last session here.
-
-**Intent.** An Intent has an id of its own (`in-<ms>-<pid>`, minted in real
-milliseconds, so never a session's `oh-<ms>-<pid>`): `ohjaa run --intent
-"…"` mints one, and `ohjaa run <agent> --intent-id <id>` continues it in a new
-session, its text coming from the newest session that carries it unless
-`--intent` gives another. An id no session in the log carries is refused
-(exit 3); a log that cannot be read never refuses a launch, and the briefing
-says the continuation is unchecked. An Intent may span repositories: one last
-worked on in another repository is continued, and that is said on the
-terminal and in the briefing ("continued from session oh-…, which worked on
-it in <repo>"). The briefing names both ids ("This session is oh-…; its
-intent is in-…, new"), the record and the next briefing show it (`intent
-fix the parser (intent in-…)`), and `--task` is recorded as given. Older
-records have no intent id.
-
-The briefing includes the current intent's full text, including on continuation,
-so a concrete goal is assigned work even without `--task`. An explicit `--task`
-specifies work within that goal and stays separate; a placeholder intent such
-as `interactive` without a task leaves the agent waiting for an assignment.
-To start the turn, a concrete intent uses Toimija's task transport when no
-explicit task is supplied. The Ohjaa session still records only the explicit
-`--task` as its task; the goal remains its intent. Empty, `unknown` and
-`interactive` intents do not start a turn on their own.
-
-**Validations.** `ohjaa gate` inside a session writes a validation reference
-into the session's record before it asks sykli (see `ohjaa gate` below): a
-reference, never an outcome. The record and the next briefing list each one
-in the observed part, before the handover: its request, kind, commit and
-tree (and the tree sykli ran, when it is not exactly the commit's, or was
-dirty), then sykli's run id and receipt (path and sha256) as recorded. One
-with a run id and no receipt yet is pending: at leaving, when an orphan is
-closed, in `ohjaa session` and in every briefing, sykli is asked about it
-(`sykli status --run <id> --json`, once per run) and its answer is shown as
-sykli's (`sykli says run … is running: 1 running, 1 pending`), never stored.
-sykli is asked from the checkout the run was requested in, else from any
-checkout of its clone that is left (sykli keeps its runs in the clone's
-common dir, which outlives a removed worktree), handed `--repo-root` and
-`--git-common-dir` when it takes them. A run that ended in any state but
-`completed` (interrupted, lost, indeterminate) is said as not proven and not
-failed. A pending validation outlives its session: every briefing in the
-clone names those earlier sessions left pending ("Validations earlier
-sessions here left pending:"), until sykli says the run ended; one sykli
-cannot be asked about is named for a week from its request, then counted. A
-sykli without `sykli status --run` is said to be one that cannot be asked.
-
-The next session here, and in every repository it named with `--scope` (never
-one it was only found working in), is briefed with the last session's record:
-
-```
-session oh-1790… · claude · selko · 2026-09-26 10:02 UTC → 2026-09-26 11:47 UTC · ended: clean (exit 0)
-─ observed (written by ohjaa; the agent cannot change it) ─
-intent        retry uploads
-knew          14 knowledge node(s) delivered · read back at 10:04 UTC
-phases        a1b2c3d receipt: passed · d4e5f6a receipt: passed · 0718abc receipt: failed · 9c0d1e2 receipt: passed
-finished      https://github.com/…/pull/57 (open) · head 9c0d1e2: verified: passed (sykli verify --commit)
-─ handover (the agent's own words) ─
-unfinished    Windows paths in uploader/retry.rs
-next agent    Dima owns the queue; ask first
-surprised by  the fixture helper silently skips when git is missing
-```
-
-A receipt's `outcome` is its own claim, and the record says it as one
-(`receipt: passed`). A task sykli reused from its cache instead of running is
-said apart, never folded into passed: `receipt: passed (1 of 3 tasks cached)`,
-`receipt: cached (all 2 tasks cached)`, in the record, the briefing's work
-line and the marks; a receipt is filed under the tree that ran (a run sykli's
-pre-commit hook makes before the commit is that tree's run), and a passing run
-outranks a newer failing or dirty one. Only sykli says a commit passed. It is
-asked about the pull request's head; about the tip of every push of the
-session's that reached the default branch (pushed from here to
-`origin/<default>`, or made here and now on the local one; a fetch is not a
-landing), which is what a pre-push Boundary gates; and about the commit
-`origin/<default>` is left at when a push from this clone put it there,
-whoever pushed. The commits before a tip are shown as their receipts' word.
-Leaving runs `sykli verify <receipt> --contract sykli.json --commit <sha>` in a
-checkout at that commit with nothing beside it, when there is one, else where
-the receipt is. What sykli can do is read from the flags `sykli verify --help`
-lists, never from its sentences: one that lists `--commit` judges the commit
-alone, nothing from the checkout (sykli#67 as merged), and one that also lists
-`--json` is asked for its `sykli-verify.v1` verdict, whose trust tiers say what
-it established. A pass stands on the receipt's identity against the commit:
-its schema, contract, source (the commit's tree and inputs) and the records'
-consistency. The outcome is the receipt's claim, as sykli's own trust
-statement says (receipts are unsigned), read from the verdict's
-`claimed_outcome` (an older sykli without it: its `outcome` check) whether
-sykli lists it as established or not:
-
-| sykli says | the record says | flag |
-|---|---|---|
-| exit 0; with `--json`, a verdict that judged the commit, verified it, established its schema, contract, source and consistency, and that says the receipt claims `passed` or `cached` | `verified: passed` | no |
-| exit 0 with `--json`, but a verdict that does not prove it (another schema, another subject, an identity tier not established, no claimed pass) | `unverified: …` | no |
-| exit 1 or 3: refused the commit (another tree, a dirty run, an input the commit does not have, a failed outcome, contradictory records) | `FAILED sykli verify: …` | **yes** |
-| exit 4: it passed under another contract or lock than the one it is judged by now | `unproven: it ran under another contract than the gate's (…)` | **yes** where it is `origin/<default>`'s tip; otherwise no |
-| exit 2: it could not verify (a bad revision, arguments, not a receipt) | `unverified: sykli verify could not verify: …` | no |
-| any other end: a crash, a kill, no answer in time | `unverified: …` | no |
-| no `--commit` (`sykli verify --help` lists no such flag) | `unverified: sykli has no --commit` | no |
-| — the commit has no sykli contract | `unverified: no sykli contract …` | no |
-| — no receipt names the commit's tree (the commit has a contract) | `unchecked` | **yes** where it is `origin/<default>`'s tip; otherwise no |
-| — no receipt, and the checkout it was made in is gone with its `.sykli/` | `unchecked: … the checkout it was made in is gone` | no: it cannot be observed |
-
-A refusal of the session's own work **flags the record**, and so does the tip
-`origin/<default>` was left at when sykli refused it or it was never run where
-there is a contract (and the checkout it was made in, where a receipt would be,
-still exists): a broken main is the repository's state, whoever pushed it
-(another session sharing the clone, a person by hand), so it is said either way,
-as `observed, not attributed` when it is not shown to be this session's. Only
-the session's own refused work becomes an intake candidate. The record opens
-with its flags, leaving ends by saying them again (`ohjaa: flagged: …`), and
-the next briefing here, `ohjaa brief` included, opens with them before the
-knowledge and before the handover. "`origin/main` at `<sha>`" is said only of
-the commit the branch sits at, when the record is written and again when a
-briefing is made; once the branch has moved on, the session's own refused
-commit is said as having reached it, and a tip it only observed is no longer
-said:
-
-```
-WARNING from the last session here (oh-1791…, claude, ended 2026-10-09 21:30 UTC):
-- origin/main at 3dbaafd in selko has no passing evidence — check before building on it (FAILED sykli verify: refused: outcome expected passed …)
-```
-
-An earlier session's flag about a branch here keeps opening the briefing for as
-long as that branch still sits at the commit it flagged (`WARNING from an
-earlier session here (…), still true`), so a quiet session in between cannot
-hide a broken main; so does one a root session saw in a repository it only
-found (`WARNING from a session that observed this repository`). Each tip is
-said once.
-
-The records live in a **session log**, redb at
-`~/.local/state/ohjaa/sessions.redb`, on this machine only. Knowledge never
-lives there, so deleting the log loses no knowledge. A busy or broken log never
-blocks a launch; a broken one is reported and left alone, never replaced. A new
-log is made whole beside its path and only then put in place, by a hard link or
-else an exclusive rename (FAT has no hard links), so two launches making it at
-once never take the other's half-made log for a broken one. Where the
-filesystem has neither (exFAT on macOS), the log is made in place, never over
-one, and the launch says why once. What a launch stopped while making the log
-left beside it is removed by a later one.
-`ohjaa intake` drafts proposals from each ended session once: its handover,
-what was said in its window, and what ohjaa observed going wrong in it (source
-`observed`): its own work that sykli refused at the default branch or a pull
-request head (never what could not be checked, nor what is not shown to be the
-session's); a non-zero exit; a missing handover; an orphaned session. Those are
-facts, not anyone's words, and the drafter is told so. A session is marked
-drafted from once the drafter has answered for each of its candidates, in
-however many runs that takes, and only by a run that read every transcript;
-until then it stays queued (one set aside keeps it queued, so that a retry
-finds it).
-
-Signals and the terminal, while a session runs (unix). The session's process
-group is apart from ohjaa's, so ohjaa does with the terminal what a
-job-control shell does with a job's, at every moment, not only at the start:
-
-- **While ohjaa's job is in the foreground**, the session's group holds the
-  terminal: the agent reads it, and **Ctrl-C** (and Ctrl-backslash) reaches it
-  directly. ohjaa does not pass it on again: a second Ctrl-C makes agents like
-  `claude` quit instead of interrupt.
-- **Ctrl-Z** (or the agent suspending itself) stops the session, then ohjaa's
-  job with the same signal, once ohjaa has the terminal back, so the shell
-  sees the job stopped. The same goes for a session that reads or writes the
-  terminal from the background (`ohjaa run … &`): the shell shows the job
-  `suspended (tty input)`. `fg` gives the session the terminal again and
-  continues it; `bg` continues it without. A stop ohjaa sees only after `fg`
-  has brought its job back (`bg`, then `fg` at once; or ohjaa stopped alone)
-  stops nothing: the session gets the terminal, and what is typed next
-  reaches the agent, not the shell.
-- **SIGINT and SIGQUIT sent to ohjaa** while the session does not hold the
-  terminal (no terminal at all, or ohjaa's job not in the foreground) are
-  passed to the session's group, each time: nothing else can bring it one.
-- **SIGTERM, SIGHUP, SIGUSR1, SIGUSR2** sent to ohjaa are survived and passed
-  to the session's group once each, with a SIGCONT, so a stopped session can
-  act on them: Ctrl-Z, then `kill %1`, ends it at once. To stop a session from
-  outside, send SIGTERM to ohjaa, or SIGINT to the session's process group
-  (its record's `pgid`).
-- **Under a wrapper without job control** (`sh -c 'ohjaa run …'`) at a
-  terminal, nobody would give the terminal back should ohjaa be killed while
-  the session held it, so the session shares ohjaa's process group, as it
-  always did, and the terminal is not handed over.
-- **After the session ends**, the terminal is ohjaa's group's again, and any
-  of these signals cuts leaving short (the tools still running are killed)
-  and the record is still written, with what was known by then; the normal
-  dispositions come back once it is saved.
-- **Before printing the exit record**, ohjaa restores the terminal settings
-  saved before the session first got the foreground, and disables mouse,
-  focus and extended-keyboard reporting left behind by an agent that did not
-  clean up. This also runs when the session was killed but ohjaa survived.
-  Recovery uses the controlling terminal, not redirected output, and never
-  clears scrollback, discards input or changes a terminal another foreground
-  job now owns.
-- **SIGKILL** cannot be caught: it loses the leaving. The session's group
-  outlives it, and the next launch says whether it still runs (above).
+checks (1 failed)`).
 
 ## Session usage
 
-Usage stays in the existing session log. It is **imported source testimony**,
-separate from ohjaa's observed work and from provider billing. No new service,
-database or sibling-repository dependency is required.
+Ohjaa runs no sessions now: the session log holds the sessions it ran
+before, and only the gate's records are added to it. Agent usage is vessa's.
+What is in the log can still be read:
 
 ```bash
-# A local collector such as Vessa creates a native-session snapshot.
-vessa receipt --input /path/to/session.jsonl > /tmp/session-usage.json
-ohjaa usage import /tmp/session-usage.json --session oh-EXISTING-ID
 ohjaa usage export > /tmp/ohjaa-sessions.json
+ohjaa usage import /tmp/session-usage.json --session oh-EXISTING-ID
 ```
-
-Inside a run, `usage import` defaults to `OHJAA_SESSION`. To pick up a receipt
-automatically when the agent command ends, use `ohjaa run ... --usage-file
-/path/to/fresh-receipt.json`. Ohjaa passes that path as `OHJAA_USAGE_FILE`; the
-launched command or its wrapper must write an `agent-usage.v1` receipt there,
-and its `agent` must be the basename of the command ohjaa launched (a wrapper
-launched as the agent claims its own name, not `claude`). A refused receipt is
-recorded as `refused: <reason>`, never as not collected.
-Native agent transcripts are not that receipt format. Existing paths are
-refused so an old receipt cannot be accidentally reused. Missing/invalid
-receipts are reported and never change the agent's exit status. No automatic
-time-window or directory matching is performed between concurrent sessions.
-
-For Codex launches, ohjaa also passes the generated `OHJAA_SESSION`, the
-resolved `XDG_STATE_HOME`, and optional `OHJAA_USAGE_FILE` through per-session
-`shell_environment_policy.set` overrides. Codex tool commands can run in a
-persistent daemon that did not inherit the wrapper environment. Toimija passes
-its own handshake independently. Neither wrapper modifies global Codex config
-or relaxes environment filtering or sandbox permissions. Existing sessions need
-a fresh wrapped launch; no session is recovered by guessing from directory or
-time. See [Codex's configuration reference](https://developers.openai.com/codex/config-reference/).
-
-`agent-usage.v1` is a cumulative snapshot of one native session. It contains
-`agent`, `session_id`, `source`, `observed_at_ms`, `complete`, `limitations`,
-and `entries` grouped by `provider` and `model`. Each entry has nullable
-`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
-`estimated_usd_micros`, `estimate_basis`, `credits` and `billed`. Input excludes
-cache categories. An amount is `{unit, micros, source}`: credit units are
-provider-specific; billed units are currencies. `null` means unknown, never
-zero. Estimates require their rate basis; amounts require their source.
-
-Imports validate the shape and agent, not the truth of a provider claim.
-Repeating an identical snapshot changes nothing; a newer snapshot replaces
-the earlier one, rather than adding its cumulative totals. Stale/conflicting
-snapshots are refused. A native session can belong to only one wrapper
-session; after resuming it, update that original association rather than
-double-attribute its entire history to a second run. This first contract does
-not split a native session's consumption across several wrapper runs.
-
-### The agent's own sessions
-
-Ohjaa records which of the agent's own sessions a session ran, so a
-consumer such as vessa can join its accounting without an imported receipt
-(D7). It has two ways to know, and records what each says: what it
-observes, and what the agent claims (law 3: a claim is testimony, never
-evidence).
-
-The agent's claim is its own environment. Each agent sets its session's id
-in every shell it starts for its tools: Claude Code `CLAUDE_CODE_SESSION_ID`
-(the new id after a `/clear`; in a subagent's shell, its parent's), Codex
-`CODEX_THREAD_ID`, pi `PI_SESSION_ID`. `ohjaa oriented` and `ohjaa
-handover`, run in such a shell while the session is open, record the id
-the launched agent's variable holds (only that agent's: a codex started
-from a Claude shell inherits Claude's) at `native_env`, each `{agent,
-session_id, at_ms}`, once, first named first. After the session has left,
-the id is said and not recorded: a shell that outlived the session (a tmux
-server started inside it) may be another session's. A value that is no
-session id is said and not recorded. An agent that never reads back or
-hands over claims nothing, and any shell can set the variable, so a claim
-never outranks what ohjaa observed.
-
-What ohjaa observes is the launch prompt. At leaving, and at the launch
-that closes a session as orphaned, it looks for the launch prompt in the
-agent's transcripts. It reads the
-agent's transcripts written since the launch, never writing them: Claude
-Code's `projects/<folder>/<id>.jsonl` (`$CLAUDE_CONFIG_DIR`, else
-`~/.claude`), Codex's `sessions/…/rollout-….jsonl` (`$CODEX_HOME`, else
-`~/.codex`) and pi's `sessions/<folder>/….jsonl` (`$PI_CODING_AGENT_DIR`,
-else `~/.pi/agent`). A transcript whose header names another folder (Codex's
-and pi's first record, Claude's first record with a folder and a time) is
-read no further.
-
-A native session is named only when its transcript was given the launch
-prompt that names this session: the briefing's `This session is <id>;`,
-which toimija gives the agent as its launch prompt. That is the first
-message naming a session before the agent's first reply: a user message
-(for Codex, a developer message too), behind whatever the agent's own
-records put first. It is never a later message, a compaction summary, a
-command's or a shell's output (`<local-command-…>`, `<bash-…>`), a tool's
-output or a paste. Time and folder alone name nothing.
-
-- A resumed native session (its transcript began before the launch) is
-  named, with `resumed: true`, when its launch prompt naming this session
-  was said within a minute of the launch. A message into an older session
-  later resumes nothing. Every session a native session ran in names it, so
-  its usage must not be added once per session. "Before the launch" is the
-  launch's own instant, to the millisecond (`launched_ms` in the record), as
-  the agents time their records: a session begun at 12:00:00.300 and resumed
-  at 12:00:00.900 is resumed, though both fall in the launch's second, the
-  one the session's id and its time windows are built on.
-- A fork is named, with `forked_from`, when its parent is named for this
-  session and it began before the session was last seen. That is now at
-  leaving, and at an orphan close the latest time the orphan's record
-  shows. A fork another launch made is that launch's: Claude marks each copy
-  in a fork `forkedFrom`, so a fork's own launch prompt names its launch.
-  Codex copies its parent's records into a fork restamped and unmarked, so
-  a Codex (or pi) fork in which any prompt names another session is never
-  named here.
-- A subagent's work is its parent's. Claude's subagent transcripts are never
-  read, and a Codex subagent's rollout names its root thread.
-- Two native sessions each given the launch prompt name neither: the record
-  says `ambiguous`, with their ids.
-- Otherwise the record says why none is named: `not looked for` (opencode
-  keeps its sessions in SQLite; other commands keep no transcripts ohjaa
-  knows), or `none found`, with how many transcripts in the folder it read.
-  `--no-briefing` gives no launch prompt to look for. Neither does pi unless
-  toimija's `agents:` config gives it a prompt.
-
-Both are recorded together at `left.native`: `sessions`, each `{agent,
-session_id, source, resumed?, forked_from?, env?, testimony?}` (the
-receipts' `agent` and `session_id`), `why` and `disagreement`. Each id is
-there once. `source` is the transcript holding its launch prompt; `env:
-true` says the environment claimed it too. An id only the environment
-claimed has `source: "env"` and `testimony: true`: the agent's word, not
-ohjaa's observation. `why` says why no transcript named one, or, beside
-named ones, what could not be read. When the launch prompt named sessions
-and the environment claimed only others, the observation wins: the claimed
-ids are left out of `sessions`, and `disagreement` names both (a `/clear`
-before the first read-back looks the same, so the claim stays in
-`native_env`). `ohjaa session` shows them, each claim said as the agent's,
-and for a session still open what its environment claimed so far.
 
 `usage export` emits `ohjaa-sessions.v1`, with `sessions` and `unreadable`.
 Each session is its record as the log holds it; what later versions added is
-additive and absent from older records: `intent_id` and `task`, `pgid` and
-`group_started_ms` (the session's process group), `launched_ms` (the launch's
-own instant; `started_ms` is its second), `native_env` and `left.native` (the agent's own sessions, above), `validations` (see
-`ohjaa gate`, and the integrated validations of "The integrated State",
-with `not_dispatched`), and a delivered node's `via`: the agent's own
-instruction file that held it at launch, so the briefing left it out (see
-"Keeping it true"). A node the budget left out is not in `delivered`. A log an ohjaa with `ohjaa judge` wrote (removed
-2026-10-26) still holds that command's tables, `judgements` and
-`judgement_responses`; it opens and is written as any other, and those
-tables are never read and left as they were. Unreadable records produce exit 4. `--session ID` selects one record. Existing
-records without usage remain readable and explicitly show "not collected".
-Exports contain private session context; choose their destination accordingly.
+additive and absent from older records. A log an ohjaa with `ohjaa judge`
+wrote (removed 2026-10-26) still holds that command's tables, `judgements`
+and `judgement_responses`; it opens and is written as any other, and those
+tables are never read and left as they were. Unreadable records produce exit
+4. `--session ID` selects one record. `usage import` attaches an
+`agent-usage.v1` receipt to a session in the log; a refused receipt is
+recorded as `refused: <reason>`, never as not collected. Exports contain
+private session context; choose their destination accordingly.
 
 ## Keeping it true
 
@@ -1284,8 +860,8 @@ dotfiles repository (`git --git-dir=~/.dotfiles --work-tree=~`) has no `.git`
 above the file, so ohjaa cannot see that a file is in it: give such an
 agent's file no block by putting one of your own there.
 
-An agent launched through ohjaa is not given this knowledge twice. `ohjaa run
-<agent>` reads that one agent's own file (no git), found where the agent
+`ohjaa brief --agent <agent>` does not repeat this knowledge. It reads that
+one agent's own file (no git), found where the agent
 itself finds it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR`
 and `OPENCODE_CONFIG_DIR` move it), and compares its block with the block
 apply would write now, byte for byte, never by a time. When the two are the
@@ -1332,8 +908,8 @@ instructions: /Users/you/.codex/AGENTS.md does not exist.`), when:
 
 For any command but `claude`, `codex`, `pi` and `opencode` nothing is said.
 The line is part of the knowledge section, and counts toward its budget.
-`ohjaa brief --agent <command>` prints the briefing that agent gets; it
-knows the environment, not the arguments `ohjaa run … -- <args>` would pass.
+`ohjaa brief --agent <command>` knows the environment, not the arguments the
+agent is started with.
 
 ## Repo knowledge: the repository's own AGENTS.md
 
@@ -1492,146 +1068,21 @@ repository, its visibility, each line it would add and what a line would
 name, from AGENTS.md as last fetched there, and fetches, writes and sends
 nothing. It exits 4 while anything is not delivered.
 
-## The fleet and the perimeter
+## The perimeter
 
 `ohjaa system` derives what every tool in the fleet is, from each repo's own
-`.toimija/repo.yaml`. `ohjaa fleet` reports who is live, from `toimija
-sessions` in each repo and `toimija sessions --outside-repos` for the sessions
-running outside any repo (listed under "outside any repository", by folder).
-Both are **derived now, stored never**: a derived view cannot be staler than
-the moment it was computed. The fleet is this machine's, and says so: what
-teammates work on elsewhere is their open pull requests, which `ohjaa digest`
-lists under "Now" (claiming work stays in GitHub; see "What it will never
-do"). `ohjaa run` and `ohjaa brief` include only the launch
-repository and repositories named by `--scope`, after the Knowledge. Sessions
-outside repositories are included when they are in the launch folder or their
-declared scope reaches a selected repository. Other repositories are explicitly
-unobserved; `ohjaa system` and `ohjaa fleet` still derive the full fleet.
-
-`run` reuses its launch preflight scans when composing the briefing. It does not
-ask Toimija for every repository's context or repeat the session scans. Coverage
-failures remain visible and selected-repository launch checks still refuse to
-launch blind. `brief --scope PATH` can retrieve context when a task grows; it
-does not declare session scope, so declare it with `toimija intent` before work.
-Missing scope repositories produce exit 4 from `brief`, never an empty success.
-
-The briefing tells an agent to use delivered facts instead of repeating discovery.
-With no concrete task, it acknowledges and waits: the wrapper already recorded
-entry. Orientation precedes the first task change; handover belongs at work
-completion or session exit, not after every conversational reply. No node is
-cut short to save tokens: past the budget the briefing names what it leaves
-out by count, and no new index, database or model call is needed.
+`.toimija/repo.yaml`: **derived now, stored never**, so it cannot be staler
+than the moment it was computed. Who is live in a repository is `toimija
+sessions`; what teammates work on elsewhere is their open pull requests, which
+`ohjaa digest` lists under "Now" (claiming work stays in GitHub; see "What it
+will never do"). `ohjaa brief` includes only the repository it runs in and
+repositories named by `--scope`, after the Knowledge: `brief --scope PATH`
+retrieves context when a task grows. Missing scope repositories produce exit 4
+from `brief`, never an empty success.
 
 The root list is derived as the sibling directories of your git root (outside
 a repo, the folder you are in), unless `~/.config/ohjaa/roots` or `--root`
-overrides it. A root that does not exist is an error, never an empty fleet.
-
-## Two agents, one checkout
-
-```bash
-# terminal 1
-ohjaa run codex --intent "change the parser" --task "fix the lexer" --scope src/parser/
-# terminal 2, same directory
-ohjaa run claude --intent "refresh the guide"
-# everything after `--` reaches the agent command itself
-ohjaa run codex --intent "change the parser" -- --model o3
-```
-
-- Each agent gets its own toimija session.
-- Knowledge and lifecycle context travel as `toimija run --briefing`, separately
-  from `--task`. With an updated Toimija, an idle Codex launch opens without a
-  model acknowledgement turn; the first user message still receives the briefing.
-  Explicit tasks and other agents retain prompt delivery. Update Toimija before
-  using this version of Ohjaa; older versions reject the new flag rather than
-  silently dropping context.
-- The briefing `ohjaa run` hands toimija opens with the line
-  `<!-- ohjaa-briefing v1 -->`. It says where ohjaa's words begin, so a
-  reader of transcripts can tell a launch's task from the briefing toimija
-  appends after it (vessa cuts there). It is matched byte for byte: a change
-  is a new version, never an edit. `ohjaa brief --agent <command>` prints
-  the same briefing without it, and `brief --write` never writes it into a
-  file.
-- `--dry-run` prints the exact command it would exec, without launching.
-- If toimija cannot fully read the sessions, or does not report its coverage,
-  ohjaa refuses to launch blind.
-- Sessions are counted across **every worktree of the clone**, not only the
-  checkout a session is launched in: toimija keeps each worktree's apart, so
-  ohjaa asks it in each one the clone's layout names (side by side; never in
-  ohjaa's own validation checkouts), says them on stderr (`ohjaa: 1 more
-  session(s) in other worktrees of this clone at launch: 1790-42 (codex,
-  widget-lexer)`), and names them in the briefing ("Sessions in the other
-  worktrees of this clone at launch"). One that cannot be read is said, never
-  shown as none; it does not refuse the launch. At leaving, what was made in
-  another worktree while one of them ran there is not attributed.
-
-## Agents launched from the root
-
-The launcher `ohjaa apply` puts in `~/.zshrc` routes `claude` and `codex`
-typed at a terminal through `ohjaa run` in any folder, the home folder as much
-as a repository. Outside every repository the session is the folder's.
-
-Launch agents from the folder that holds your repositories. You can give a goal
-without choosing the repositories first:
-
-```bash
-cd ~/projects
-ohjaa run codex --intent "reduce Toimija's Git pressure"
-```
-
-The agent receives that goal, identifies the repositories it needs, and declares
-each with `toimija intent "<why>" --scope <repo>` before working there. This makes
-its scope visible to other sessions; Ohjaa's launch-time attribution remains as
-described below. When repositories are known at launch, name them with `--scope`:
-
-```bash
-cd ~/projects
-ohjaa run claude --intent "rename the flag everywhere" --scope ~/projects/a --scope ~/projects/b
-```
-
-ohjaa briefs it with your Knowledge, each scoped repo's Knowledge and context,
-and the last session in this folder. With no repository selected, it adds no
-repository roster. It hands the session to toimija, which opens it outside every repo: no
-packet, but visible — `ohjaa fleet` lists it under "outside any repository".
-Every repository named with `--scope` is treated like the one a session is
-launched in:
-
-- **at launch**, ohjaa counts the sessions live in each scoped repo, and
-  refuses to launch blind if it cannot read them;
-- **at leaving**, it records, per scoped repo, the commits the agent made there
-  (with what sykli saw on each) and the branch's pull request;
-- **the other way round**, a session launched inside a repo counts the sessions
-  from the root whose `--scope` names it (`ohjaa fleet` lists them under
-  "outside any repository", with their scope);
-- **the next agent there** is briefed with it: "the last session here" is the
-  one that ended last, launched in that repo or elsewhere with a `--scope`
-  naming it, and one launched elsewhere says where it was launched.
-
-**Observed, not asserted (law 3).** One rule: in a repository the session was
-launched in or named with `--scope`, a commit made during the session is its
-own unless another session was there at that second — in the checkout it was
-launched in, a session launched in that checkout; in any other checkout or
-branch of the clone, old or new, any session in the clone (sessions in the log,
-and live ones toimija saw at launch). Only its own commits are its phases, its
-pull request and its lessons. Everything else made during the session is
-recorded as `observed … not attributed`, with the session it shared the place
-with (`shared with oh-… in work, …`). Known limit: a person's own commit in a
-place the session holds alone looks exactly like the agent's, and is credited
-to the session.
-
-A repository nobody named is observed when a commit was made in it: at leaving,
-ohjaa looks at the repositories directly in the launch folder (and in any folder
-`--scope` named that is not itself a repository), and records each where a
-commit was made, or pushed from, during the session, in any of its worktrees,
-as **found, not named**. Nothing in a found repository is attributed to the
-session: it is not its phases or lessons, no pull request is looked up, and the
-session never becomes that repository's "last session here" (a broken main it
-saw there is still said, as the repository's state). Name repositories with
-`--scope` wherever you can. A `--scope` path that is neither in a repository
-nor a folder is named as unobserved. Scope can be named from inside a repo too, for
-a second repository an agent will touch.
-
-A toimija too old to list sessions outside repos makes ohjaa refuse to launch
-from the root, and makes `ohjaa fleet` incomplete — never quietly empty.
+overrides it. A root that does not exist is an error, never an empty list.
 
 ## Coverage is a fact
 
@@ -1643,13 +1094,13 @@ coverage: scanned 17/18 repo(s)
     somerepo: not a Git repository
 ```
 
-- `ohjaa fleet` exits `4` when coverage is incomplete.
+- `ohjaa system` exits `4` when coverage is incomplete.
 - A session toimija reports as `stale` stays visible, with its age, because
   "quiet for ninety minutes" and "gone" look the same from outside.
 
 ## The workflow home: applied from outside the repos
 
-The agent workflow (the gate, the hooks, the launcher) is a workflow thing,
+The agent workflow (the gate, the hooks, the terminal's line) is a workflow thing,
 not something to merge into product repositories. Ohjaa keeps it in its home
 and applies it to repositories from outside; nothing is installed on a
 repository or written into one. Only repositories whose remote names an entry
@@ -1705,7 +1156,7 @@ process that finds no entry. Any remote of a clone counts. A `pushurl`, a
 repository-local `insteadOf`, or the repository's own `core.hooksPath`
 (perusta, selko and vartio set one) is not seen by the patterns: `ohjaa doctor`
 checks, clone by clone, that git really resolves `core.hooksPath` to the
-entry's hooks, and `ohjaa run` warns at launch in such a repository. The
+entry's hooks. The
 generated files are written atomically and checked with `git config --file
 … --list` first, since an unreadable one would break every git command.
 
@@ -1802,7 +1253,8 @@ worktree is removed, as it is after its pull request merges (sykli keeps at
 most `SYKLI_RUN_BUDGET` runs per clone, 100 by default, the oldest pruned
 first). Agents are taught this one command.
 
-Inside an `ohjaa run` session (`OHJAA_SESSION`), the gate first writes the
+Inside a session the log holds (`OHJAA_SESSION`, which only the removed
+`ohjaa run` set), the gate first writes the
 request into the session's record (`validations`, in `ohjaa-sessions.v1`),
 before sykli is asked, and says so; outside one it says the request is not
 recorded. A `ValidationRef` holds:
@@ -2015,9 +1467,8 @@ Marks on each entry's branch, tip first (✓ proven · ✗ failed · ? unproven)
 - false-systems/taso main (origin/main as of a fetch at 2026-10-13 09:12 UTC): ? 4be01c2 ✗ 77a1f0e ✓ 0c9d3b1
 ```
 
-**Flag.** When the entry's branch is not proven at its tip, the briefing of
-`ohjaa run` (after its sentinel line) and of `ohjaa brief` opens with it,
-before anything else, and the launch says it on stderr:
+**Flag.** When the entry's branch is not proven at its tip, `ohjaa brief`
+opens with it, before anything else:
 
 ```
 FLAG: main of false-systems/taso is unproven since 77a1f0e (2 commits: ? 4be01c2, ✗ 77a1f0e; origin/main as of a fetch at 2026-10-13 09:12 UTC). Start by running `ohjaa gate` on main and fix forward what fails.
@@ -2224,7 +1675,7 @@ no window, no vessa.
   "sessions": [{                         // still open, or closed as orphaned in the window
     "id": "…", "agent": "…", "repo": "…", "intent": "…",
     "started": "<RFC 3339>",
-    "state": "open"                      // its ohjaa runs, or that cannot be told
+    "state": "open"                      // never left (ohjaa runs no sessions now: these are older)
            | "ohjaa_gone"                // its ohjaa is gone, its process group runs on
            | "orphaned"                  // closed as orphaned, or ohjaa and group both gone now
   }],
@@ -2256,8 +1707,8 @@ so what it finds never depends on where it runs, and it only ever adds
 dispatchers (a spare
 costs a process, a missing one silently skips a check); `--prune` removes
 spares. Each change is recorded before it is made, so `--undo` can put back
-exactly what was there even after an apply that failed. The launcher line it
-puts in `~/.zshrc`, in place of the old `source ~/projects/ohjaa-launch.zsh`,
+exactly what was there even after an apply that failed. The line it puts in
+`~/.zshrc` (it prints `ohjaa line` as a terminal opens), in place of the old `source ~/projects/ohjaa-launch.zsh`,
 is guarded like that one was: `[[ -x <ohjaa> ]] && eval "$(<ohjaa>
 shell-init zsh)"`.
 
@@ -2454,11 +1905,10 @@ each in full, with what ohjaa keeps where.
   receipt of is validated as the integrated State (a durable sykli run,
   recorded before it is asked for), and a candidate validated on a base the
   branch has moved from since is flagged, never refused.
-- **`ohjaa run` stays the parent of the session until it ends**, so leaving
-  always writes its record, whatever the exit. Session states are observed, not
-  declared: the agent's lifecycle testimony is its read-back (`ohjaa oriented`)
-  and handover (`ohjaa handover`). Imported usage is separately labelled source
-  testimony; it never becomes observed work or authoritative billing.
+- **Ohjaa runs no sessions.** Agents start as they are typed and read the
+  Knowledge from their own instruction files; the note for the next agent is
+  `toimija handover`. Imported usage is separately labelled source testimony;
+  it never becomes observed work or authoritative billing.
 - **Agents propose; only a person makes Knowledge current**, retires it or
   rejects it. Ours is reviewed in a pull request before any agent reads it.
   Repo knowledge a person accepts goes into the repository's AGENTS.md
@@ -2536,23 +1986,6 @@ have none of them:
 - `tests/config_home.rs`, `real_sykli_*`: what a flag says and what a mark
   is, in the real sykli's judgement
   (`OHJAA_TEST_SYKLI=<path> cargo test --test config_home -- --ignored`).
-- `tests/loop.rs`: the whole loop, walked once, in a sandbox of its own.
-  `ohjaa run` briefs a stand-in claude through the real toimija. The agent
-  reads back, commits in a worktree, proves it with `ohjaa gate` (the real
-  sykli), pushes to a bare origin's main and hands over. sykli's pre-push
-  hook accepts the push, and the marks say ✓. Once the worktree is removed
-  and the hook's copy is set aside, they still say ✓, from the receipt sykli
-  kept of the run. `ohjaa intake` drafts a proposal
-  (a stand-in drafter) from a correction the real vessa finds in the agent's
-  transcript. A person accepts it at a terminal, and the next briefing
-  carries it with the handover. Then a commit whose test fails is pushed:
-  it is marked ✗, and the next briefing opens with the flag. Measured on
-  2026-10-27, it takes 8 to 16 seconds on macOS and 3 to 8 on Linux:
-
-```bash
-OHJAA_TEST_SYKLI=$(command -v sykli) OHJAA_TEST_TOIMIJA=$(command -v toimija) \
-  OHJAA_TEST_VESSA=$(command -v vessa) cargo test --test loop -- --ignored
-```
 
 ## What it will never do
 

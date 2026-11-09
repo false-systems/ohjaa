@@ -23,11 +23,6 @@ pub const LOCAL: Duration = Duration::from_secs(60);
 /// with what it already knows.
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
-/// Async-signal-safe: a single atomic store.
-pub fn cancel() {
-    CANCELLED.store(true, Ordering::SeqCst);
-}
-
 pub fn cancelled() -> bool {
     CANCELLED.load(Ordering::SeqCst)
 }
@@ -441,29 +436,6 @@ fn leads(listing: &str, pgid: u32, started_ms: i64, now: i64) -> bool {
 /// `ps`, by its path: never whichever `ps` PATH finds first, which anything
 /// in a session may put there.
 pub const PS: &str = "/bin/ps";
-
-/// Whether process group `pgid` still has a member (kill(2) with signal 0
-/// to the group): `None` when that cannot be told.
-pub fn group_exists(pgid: u32) -> Option<bool> {
-    #[cfg(unix)]
-    {
-        let group = libc::pid_t::try_from(pgid).ok().filter(|g| *g > 1)?;
-        // SAFETY: signal 0 sends nothing.
-        if unsafe { libc::kill(-group, 0) } == 0 {
-            return Some(true);
-        }
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => Some(false),
-            Some(libc::EPERM) => Some(true),
-            _ => None,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pgid;
-        None
-    }
-}
 
 /// An exclusive lock on a file, held until it is dropped: flock(2), so it
 /// goes with the process however that ends, and a crash never leaves one
