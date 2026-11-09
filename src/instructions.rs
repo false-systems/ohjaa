@@ -22,7 +22,7 @@
 //! stays out). Each decision does so under the home's lock
 //! ([`home::lock`]), so the block holds what was last decided.
 //!
-//! An agent `ohjaa run` launches whose own file holds that block, current
+//! An agent whose own file holds that block, current
 //! (byte for byte the one apply would write now), is not briefed with that
 //! knowledge a second time ([`source`]): the briefing says where it is.
 
@@ -184,7 +184,7 @@ pub fn block_in(text: &str, compact: &Compact) -> Result<Block> {
     })
 }
 
-/// Where the agent `ohjaa run` launches gets mine and machine from.
+/// Where an agent gets mine and machine from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Its own instruction file holds them, current: the briefing leaves

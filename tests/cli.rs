@@ -2779,8 +2779,7 @@ fn no_repositories_under_the_roots_holds_the_cursor_and_says_so() {
 
 /// What an agent's shell carries (the list `ohjaa line --help` names): a
 /// person's terminal has none, and these tests may run in an agent's.
-const AGENT_MARKERS: [&str; 17] = [
-    "OHJAA_SESSION",
+const AGENT_MARKERS: [&str; 16] = [
     "TOIMIJA_SESSION",
     "TOIMIJA_RUN",
     "CLAUDECODE",
@@ -3029,7 +3028,7 @@ fn line_says_nothing_and_moves_nothing_without_a_person_at_a_terminal() {
     let (stdout, _, code) = output_of(fixture.person().arg("line"));
     assert_eq!((stdout.as_str(), code), ("", Some(0)), "piped: nothing");
     for marker in [
-        "OHJAA_SESSION",
+        "TOIMIJA_SESSION",
         "CLAUDECODE",
         "CODEX_THREAD_ID",
         "CODEX_CI",

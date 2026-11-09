@@ -68,10 +68,9 @@ const DAILY_LINES: usize = 15;
 const OPEN_SHOWN: usize = 20;
 
 /// What the shells an agent runs its tools in carry, each set by the agent
-/// (or by `ohjaa run` and `toimija run` around it), never by a person's own
+/// (or by `toimija run` around it), never by a person's own
 /// startup files. A variable a person may set (`CODEX_HOME`) is not one.
-pub const AGENT_MARKERS: [&str; 17] = [
-    "OHJAA_SESSION",
+pub const AGENT_MARKERS: [&str; 16] = [
     "TOIMIJA_SESSION",
     "TOIMIJA_RUN",
     // Claude Code.
@@ -164,7 +163,7 @@ fn old(at_ms: Option<i64>, now_ms: i64) -> bool {
 const SEEN_SCHEMA: &str = "ohjaa-seen.v1";
 
 /// Where a stretch of what happened begins, by each source's own clock:
-/// the session log is read now, GitHub as far as the snapshot read it.
+/// the proposals are read now, GitHub as far as the snapshot read it.
 /// GitHub's begins [`OVERLAP_MS`] earlier, for what its search indexes
 /// late: what the digest that ended here said of those two hours (`said`)
 /// is not said again.

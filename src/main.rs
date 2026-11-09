@@ -197,12 +197,12 @@ enum Cmd {
     /// Silent when there are none. Activity stays unread for `ohjaa digest`.
     #[command(
         after_help = "Prints, reads and moves nothing unless stdout is a terminal and no agent \
-        session's marker is set (OHJAA_SESSION, TOIMIJA_SESSION, TOIMIJA_RUN, CLAUDECODE, \
+        session's marker is set (TOIMIJA_SESSION, TOIMIJA_RUN, CLAUDECODE, \
         CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, CODEX_SESSION_ID, \
         CODEX_CI, CODEX_SANDBOX, CODEX_SANDBOX_NETWORK_DISABLED, CODEX_MANAGED_BY_NPM, \
         PI_SESSION_ID, PI_CODING_AGENT, OPENCODE, OPENCODE_SESSION_ID, AI_AGENT): an agent's \
         shell reads ~/.zshrc too. Terminals opened together say a line once.\n\n\
-        Starts no git and touches no network: it reads the session log and the proposals, and \
+        Starts no git and touches no network: it reads the proposals, and \
         the rest from the snapshot `ohjaa collect` writes, said with its age when it is older \
         than 15 minutes. Then it starts one `ohjaa collect` in the background, unless one \
         runs; startup never waits for it. Notices are shown once per day or when they change. \
