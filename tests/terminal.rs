@@ -1,11 +1,8 @@
-//! `ohjaa run` at a real terminal: a job-control shell (zsh, else bash) on a
-//! pseudo-terminal of its own, driven as a person would, with a stub
-//! toimija that execs the agent (a shell script that logs what reaches it).
-//! The session runs in a process group of its own; these hold ohjaa to what
-//! a shell does with a job's terminal, at every moment, not only at spawn.
+//! A person.s decisions at a real terminal: a job-control shell (zsh, else
+//! bash) on a pseudo-terminal of its own, driven as a person would.
 //!
 //! Sandboxed like the CLI tests: HOME, XDG_CONFIG_HOME, XDG_STATE_HOME,
-//! OHJAA_OURS, GIT_CONFIG_GLOBAL and PATH; no real toimija, agent or ohjaa
+//! OHJAA_OURS, GIT_CONFIG_GLOBAL and PATH; no real toimija or ohjaa
 //! state. Skipped, and said so, where there is no shell, pty or git; in CI
 //! (`CI` set) that fails instead, so an image without them cannot go green.
 
@@ -13,7 +10,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -21,48 +18,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// `run` execs the agent; with STUB_TOIMIJA_CHILD it runs it as a child in
-/// its own group and passes on TERM, HUP and INT to it as TERM, the way the
-/// real `toimija run` does.
+/// Never the real toimija: no sessions anywhere, no context.
 const TOIMIJA_STUB: &str = r#"#!/bin/sh
 case "$1" in
   sessions) echo '{"sessions":[],"warnings":[],"coverage":{"status":"available"}}';;
   context) echo '{}';;
-  run)
-    while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
-    shift
-    [ -n "${STUB_TOIMIJA_CHILD:-}" ] || exec "$@"
-    exec 3<&0
-    "$@" <&3 3<&- &
-    child=$!
-    trap 'kill -TERM $child 2>/dev/null' TERM HUP INT
-    while kill -0 $child 2>/dev/null; do wait $child; status=$?; done
-    exit $status;;
 esac
-"#;
-
-/// Logs what reaches it to $AGENT_LOG (and says it on its terminal): its
-/// start (pid, parent), each line it reads, INT (then exits 7) and TERM
-/// (exits 143). With AGENT_DEVTTY it reads and writes /dev/tty instead of
-/// its stdin and stdout, as an agent with redirected output does.
-const AGENT: &str = r#"#!/bin/sh
-say() {
-  echo "$*" >> "$AGENT_LOG"
-  if [ -n "${AGENT_DEVTTY:-}" ]; then echo "$*" > /dev/tty; else echo "$*"; fi
-}
-trap 'say AGENT-INT; exit 7' INT
-trap 'say AGENT-TERM; exit 143' TERM
-say "AGENT-START $$ $PPID"
-while :; do
-  if [ -n "${AGENT_DEVTTY:-}" ]; then IFS= read -r line < /dev/tty; else IFS= read -r line; fi
-  rc=$?
-  if [ $rc -eq 0 ]; then
-    say "AGENT-READ:[$line]"
-  else
-    say "AGENT-READ-FAILED $rc"
-    sleep 1
-  fi
-done
 "#;
 
 struct Terminal {
@@ -184,7 +145,6 @@ impl Terminal {
         }
         let dir = fs::canonicalize(&dir).unwrap();
         write_executable(&dir.join("bin/toimija"), TOIMIJA_STUB);
-        write_executable(&dir.join("bin/agent"), AGENT);
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ohjaa"), dir.join("bin/ohjaa")).unwrap();
         // The weekly report is not due: nothing but the session is read.
         let now_ms = std::time::SystemTime::now()
@@ -228,7 +188,6 @@ impl Terminal {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("TERM", "dumb")
             .env("PS1", prompt)
-            .env("AGENT_LOG", dir.join("agent.log"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -321,11 +280,6 @@ impl Terminal {
         false
     }
 
-    /// The agent's own log.
-    fn log(&self) -> String {
-        fs::read_to_string(self.dir.join("agent.log")).unwrap_or_default()
-    }
-
     /// The shell is at its prompt and answers: `echo` of a sum it works out,
     /// so the typed line never matches itself.
     fn shell_answers(&mut self, seconds: u64) -> bool {
@@ -334,78 +288,18 @@ impl Terminal {
     }
 
     fn report(&self) -> String {
-        format!(
-            "--- terminal ---\n{}\n--- agent log ---\n{}",
-            self.all(),
-            self.log()
-        )
+        format!("--- terminal ---\n{}", self.all())
     }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        // Whatever is left of the sessions on this terminal goes with it.
-        if let Some(line) = self
-            .log()
-            .lines()
-            .filter_map(|line| line.strip_prefix("AGENT-START "))
-            .next_back()
-        {
-            for pid in line.split_whitespace() {
-                if let Ok(pid) = pid.parse::<i32>() {
-                    // SAFETY: plain kill(2) of this test's own processes.
-                    unsafe {
-                        libc::kill(pid, libc::SIGKILL);
-                    }
-                }
-            }
-        }
         let _ = self.shell.kill();
         let _ = self.shell.wait();
         if !std::thread::panicking() {
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
-}
-
-/// A Rust agent fixture, run only in a child copy of this test executable.
-/// It deliberately omits the cleanup an agent killed in raw mode cannot do.
-#[test]
-fn terminal_mode_agent() {
-    let Some(end) = std::env::var_os("OHJAA_TERMINAL_MODE_AGENT") else {
-        return;
-    };
-    fs::write(
-        std::env::var_os("AGENT_LOG").unwrap(),
-        format!("AGENT-START {} {}\n", std::process::id(), unsafe {
-            libc::getppid()
-        }),
-    )
-    .unwrap();
-    let mut terminal = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .unwrap();
-    let fd = terminal.as_raw_fd();
-    // SAFETY: this fixture has its own controlling pseudo-terminal.
-    let mut settings = unsafe { std::mem::zeroed::<libc::termios>() };
-    assert_eq!(unsafe { libc::tcgetattr(fd, &mut settings) }, 0);
-    assert_ne!(settings.c_oflag & libc::OPOST, 0);
-    unsafe {
-        libc::cfmakeraw(&mut settings);
-        assert_eq!(libc::tcsetattr(fd, libc::TCSANOW, &settings), 0);
-    }
-    terminal
-        .write_all(b"\x1b[?1003h\x1b[?1004h\x1b[>1uAGENT-RAW\n")
-        .unwrap();
-    terminal.flush().unwrap();
-    if end == "kill" {
-        // SAFETY: only this disposable fixture process is killed.
-        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
-        unreachable!();
-    }
-    std::process::exit(0);
 }
 
 // ---- a person's decisions, at a terminal ------------------------------------
