@@ -85,18 +85,15 @@ In the order a person meets them:
 
 ## How it fits
 
-Ohjaa is one of a family of four small tools for working with coding
-agents. Each one works alone.
+Ohjaa is one of four small tools for working with coding agents. Each one works
+alone.
 
-- **toimija**: facts about a repository, for agents.
-- **sykli**: declared checks, and proof that they passed.
-- **ohjaa**: what agents are told, decided by a person.
-- **vessa**: what agents used.
+<img src="docs/assets/loop.svg" alt="A piece of work moves through five steps: start, check, review, land, deploy. toimija starts it, sykli does the other four, ohjaa holds what agents know, and vessa counts what agents used." width="100%">
 
-Ohjaa also defines the file format the knowledge is kept in,
-[`knowledge-node.v1`](docs/knowledge-node-v1.md), and the concepts behind
-it, in [docs/ontology.md](docs/ontology.md). Another tool can read and
-write the same files.
+- **toimija** starts the session and gives the agent the facts of the repository.
+- **sykli** runs the declared checks, keeps the proof, and reviews, lands and deploys the work.
+- **ohjaa** holds what agents are told. A person decides it.
+- **vessa** counts what agents used.
 
 ## What it does not do
 
@@ -111,10 +108,8 @@ write the same files.
 
 ## More
 
-- [docs/reference.md](docs/reference.md): every command, the file formats,
-  and where ohjaa keeps what.
-- [docs/knowledge-node-v1.md](docs/knowledge-node-v1.md): the knowledge
-  file format.
-- [docs/ontology.md](docs/ontology.md): what the concepts mean.
-- [AGENTS.md](AGENTS.md): the guide for coding agents working on ohjaa.
-- [LICENSE](LICENSE): MIT.
+- [Reference](docs/reference.md): every command, the file formats, and where ohjaa keeps what.
+- [Knowledge file format](docs/knowledge-node-v1.md): what one piece of knowledge looks like on disk.
+- [Ontology](docs/ontology.md): what the concepts mean.
+- [Agent guide](AGENTS.md): for agents that work on ohjaa itself.
+- [Licence](LICENSE): MIT.
