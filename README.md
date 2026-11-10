@@ -7,6 +7,10 @@ have decided and learned as small knowledge files, and writes the current
 ones into each coding agent's own instruction file. *Ohjaa* is Finnish for
 *steer*.
 
+It is for someone who works with coding agents such as Claude Code, Codex, pi
+or opencode and is tired of giving each one the same correction again. You
+need git, Rust to install it from source, and at least one agent CLI.
+
 Coding agents start every session knowing nothing about your world: which
 languages you use, where builds run, what you already said no to. So you
 correct them, and then you correct the next one the same way. A correction
@@ -18,33 +22,45 @@ Only a person at a terminal makes it current.
 
 ## See it
 
+<img src="docs/assets/see-it.svg" alt="Two commands and their output. ohjaa propose records a lesson, which waits for a person to accept it. ohjaa check then flags the fact containers-run-in-podman, which may no longer hold because the podman command is missing, and reports 2 current, 1 waiting for a decision and 1 flag." width="100%">
+
 An agent proposes a lesson. `ohjaa check` then validates the knowledge, and
-flags a fact whose condition is no longer true on this machine:
+flags a fact whose condition is no longer true on this machine.
+
+<details><summary>The same, as text</summary>
 
 ```console
 $ ohjaa propose --scope mine --id ask-before-adding-a-dependency --kind lesson \
     --origin "review comment: 'why is this crate here?'" \
     "Ask before adding a dependency."
 proposed ask-before-adding-a-dependency: waiting for a person to accept it
+ohjaa: ~/.local/state/ohjaa/proposals/mine/ask-before-adding-a-dependency.md
 
 $ ohjaa check
 flag     containers-run-in-podman: may no longer hold: command:podman is false
 evidence no intake has run here: how often each was re-taught is unknown, not zero (`ohjaa intake`)
 evidence code-is-rust: re-taught 0 times since 2026-11-10
 evidence containers-run-in-podman: re-taught 0 times since 2026-11-10
+scope    ours     (no home here)
+scope    repo     (no home here)
 scope    mine     ~/.config/ohjaa/mine
 scope    machine  ~/.config/ohjaa/machine
-summary  2 current, 1 waiting for a decision, 0 error(s), 1 flag(s), 0 suggestion(s), briefing 608/8000
+summary  2 current, 1 waiting for a decision, 0 error(s), 1 flag(s), 0 suggestion(s), briefing 599/8000
 ```
+
+</details>
 
 The proposal waits outside every repository until a person runs
 `ohjaa review`.
 
 ## Install
 
-Ohjaa builds from source with cargo. It needs the Rust toolchain named in
-`rust-toolchain.toml` (1.98, with rustfmt and clippy); rustup installs it by
-itself when you build. It runs on macOS and Linux.
+Ohjaa runs on macOS and Linux. Windows is not supported: under WSL it runs as
+the Linux program, beside agents that run inside WSL.
+
+Today ohjaa builds from source with cargo. It needs the Rust toolchain named
+in `rust-toolchain.toml` (1.98, with rustfmt and clippy); rustup installs it
+by itself when you build.
 
 ```bash
 git clone https://github.com/false-systems/ohjaa
@@ -55,6 +71,14 @@ cargo install --path .
 Ohjaa is not on crates.io yet. Once it is published, `cargo install ohjaa`
 installs it with Rust 1.98 or newer; until then, use the commands above.
 
+No release is published yet. Once one is, this line installs a prebuilt
+binary to `~/.local/bin` after checking it against the release's checksums,
+with `v<version>` being the release's tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/false-systems/ohjaa/main/install.sh | sh -s -- v<version>
+```
+
 Ohjaa also needs `git`. Some commands call other programs when they are
 there: `gh` to read pull requests and to deliver a repository's lessons,
 `vessa` to read what people wrote in agent sessions, `toimija` to say who is
@@ -62,7 +86,18 @@ working where, and an agent CLI such as `claude -p` to draft proposals.
 
 ## Use
 
-In the order a person meets them:
+A 60-second start:
+
+```bash
+# Propose your first rule. It waits; nothing is told to an agent yet.
+ohjaa propose --scope mine --id code-is-rust --kind decision \
+    --origin "we keep one language" "Code is Rust. Ask before adding another."
+ohjaa review           # accept it: only a person at a terminal can
+ohjaa apply --dry-run  # see what would go into each agent's instruction file
+ohjaa apply            # write it; `ohjaa apply --undo` takes it all back
+```
+
+The commands, in the order a person meets them:
 
 - `ohjaa apply`: write the current knowledge into each agent's own
   instruction file. `--dry-run` shows every change first; `--undo` takes it
@@ -94,6 +129,8 @@ alone.
 - **sykli** runs the declared checks, keeps the proof, and reviews, lands and deploys the work.
 - **ohjaa** holds what agents are told. A person decides it.
 - **vessa** counts what agents used.
+
+[Your first loop](https://github.com/false-systems/toimija/blob/main/docs/first-loop.md) walks one change through all four tools.
 
 ## What it does not do
 

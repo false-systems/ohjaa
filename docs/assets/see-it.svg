@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 552" fill="none" role="img" aria-labelledby="t d">
+<title id="t">ohjaa propose, then ohjaa check</title>
+<desc id="d">Two commands and their output. ohjaa propose records a lesson that waits for a person to accept it. ohjaa check then flags a fact, containers-run-in-podman, that may no longer hold because the podman command is not there, and sums up: 2 current, 1 waiting for a decision, 1 flag.</desc>
+<rect width="1200" height="552" fill="#f1ebdc"/>
+<g stroke="#171715" stroke-width="2"><path d="M40 40H56M48 32V48M1144 512H1160M1152 504V520"/></g>
+<g stroke="#b9b3a5" stroke-width="1"><path d="M64 96H1136M64 132H1136M64 168H1136M64 204H1136M64 240H1136M64 276H1136M64 312H1136M64 348H1136M64 384H1136M64 420H1136M64 456H1136M64 492H1136M64 528H1136"/></g>
+<rect x="64" y="278" width="6" height="32" fill="#d4aa4e"/>
+<g font-family="'Geist Mono', ui-monospace, Menlo, Consolas, monospace" font-size="20">
+<text x="84" y="86" fill="#171715" font-weight="600"><tspan fill="#c75b36">$</tspan> ohjaa propose --scope mine --id ask-before-adding-a-dependency --kind lesson \</text>
+<text x="132" y="122" fill="#171715" font-weight="600">--origin "review comment: 'why is this crate here?'" \</text>
+<text x="132" y="158" fill="#171715" font-weight="600">"Ask before adding a dependency."</text>
+<text x="84" y="194" fill="#57594f">proposed ask-before-adding-a-dependency: waiting for a person to accept it</text>
+<text x="84" y="266" fill="#171715" font-weight="600"><tspan fill="#c75b36">$</tspan> ohjaa check</text>
+<text x="84" y="302" fill="#171715">flag<tspan x="192">containers-run-in-podman: may no longer hold: command:podman is false</tspan></text>
+<text x="84" y="338" fill="#57594f">evidence<tspan x="192">no intake has run here: how often each was re-taught is unknown, not zero …</tspan></text>
+<text x="84" y="374" fill="#57594f">evidence<tspan x="192">code-is-rust: re-taught 0 times since 2026-11-10</tspan></text>
+<text x="84" y="410" fill="#57594f">evidence<tspan x="192">containers-run-in-podman: re-taught 0 times since 2026-11-10</tspan></text>
+<text x="84" y="446" fill="#57594f">scope<tspan x="192">mine</tspan><tspan x="300">~/.config/ohjaa/mine</tspan></text>
+<text x="84" y="482" fill="#57594f">scope<tspan x="192">machine</tspan><tspan x="300">~/.config/ohjaa/machine</tspan></text>
+<text x="84" y="518" fill="#57594f">summary<tspan x="192">2 current, 1 waiting for a decision, 0 error(s), 1 flag(s), …</tspan></text>
+</g>
+</svg>
