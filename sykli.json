@@ -7,6 +7,7 @@
       "inputs": [
         ".gitattributes",
         ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
         ".gitignore",
         ".toimija/repo.yaml",
         "AGENTS.md",
@@ -84,6 +85,8 @@
         "fixtures/knowledge-node.v1/sets/supersedes-live-node/ours/proposed-way.md",
         "fixtures/knowledge-node.v1/sets/unexplained-supersession/expected.toml",
         "fixtures/knowledge-node.v1/sets/unexplained-supersession/ours/orphan.md",
+        "install.sh",
+        "installer/test.sh",
         "rust-toolchain.toml",
         "src/apply.rs",
         "src/collect.rs",
@@ -126,6 +129,7 @@
       "inputs": [
         ".gitattributes",
         ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
         ".gitignore",
         ".toimija/repo.yaml",
         "AGENTS.md",
@@ -203,6 +207,8 @@
         "fixtures/knowledge-node.v1/sets/supersedes-live-node/ours/proposed-way.md",
         "fixtures/knowledge-node.v1/sets/unexplained-supersession/expected.toml",
         "fixtures/knowledge-node.v1/sets/unexplained-supersession/ours/orphan.md",
+        "install.sh",
+        "installer/test.sh",
         "rust-toolchain.toml",
         "src/apply.rs",
         "src/collect.rs",
@@ -245,6 +251,7 @@
       "inputs": [
         ".gitattributes",
         ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
         ".gitignore",
         ".toimija/repo.yaml",
         "AGENTS.md",
@@ -322,6 +329,8 @@
         "fixtures/knowledge-node.v1/sets/supersedes-live-node/ours/proposed-way.md",
         "fixtures/knowledge-node.v1/sets/unexplained-supersession/expected.toml",
         "fixtures/knowledge-node.v1/sets/unexplained-supersession/ours/orphan.md",
+        "install.sh",
+        "installer/test.sh",
         "rust-toolchain.toml",
         "src/apply.rs",
         "src/collect.rs",
@@ -354,6 +363,14 @@
         "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build",
         "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target"
       }
+    },
+    {
+      "name": "installer",
+      "run": "sh -n install.sh && sh installer/test.sh",
+      "inputs": [
+        "install.sh",
+        "installer/test.sh"
+      ]
     }
   ]
 }
