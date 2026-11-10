@@ -107,4 +107,4 @@ one works alone.
 - [docs/reference.md](docs/reference.md): every command, the file formats,
   and where ohjaa keeps what.
 - [AGENTS.md](AGENTS.md): the guide for coding agents working on ohjaa.
-- [LICENSE](LICENSE): Apache-2.0.
+- [LICENSE](LICENSE): MIT.
