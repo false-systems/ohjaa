@@ -2851,7 +2851,7 @@ fn graphql_page_at(now: i64, more: bool, extra: u64) -> String {
             {"number": 16, "title": "docs: nothing refuses \u{1b}[2J", "url": "https://github.com/x/16",
              "createdAt": at(3600), "mergedAt": null, "closedAt": null,
              "baseRefName": "main", "author": {"login": "devuser"}, "mergedBy": null,
-             "repository": repo("faija")},
+             "repository": repo("vessa")},
             {},
         ],
     }}});

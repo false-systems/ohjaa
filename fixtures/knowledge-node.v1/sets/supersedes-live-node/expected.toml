@@ -1,0 +1,2 @@
+errors = [{ code = "supersedes-live-node", id = "new-way" }]
+briefing = ["new-way", "old-way"]

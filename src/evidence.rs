@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use faija_knowledge::{Date, Node, Scope};
+use knowledge_node::{Date, Node, Scope};
 use serde::{Deserialize, Serialize};
 
 use crate::intake::Key;
@@ -418,8 +418,8 @@ mod tests {
 
         let node = |id: &str, as_of: &str| Node {
             id: id.to_owned(),
-            kind: faija_knowledge::Kind::Decision,
-            status: faija_knowledge::Status::Current,
+            kind: knowledge_node::Kind::Decision,
+            status: knowledge_node::Status::Current,
             as_of: date(as_of),
             origin: vec!["a test".to_owned()],
             supersedes: Vec::new(),

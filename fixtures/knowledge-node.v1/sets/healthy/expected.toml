@@ -1,0 +1,10 @@
+errors = []
+briefing = [
+  "rust-elixir-only",
+  "use-widget",
+  "plain-english",
+  "lessons-from-reverts",
+  "uploader-owner",
+  "answer-first",
+  "lima-for-linux",
+]

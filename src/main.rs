@@ -2,7 +2,7 @@
 //!
 //! Toimija reports facts and refuses to decide. Ohjaa holds the other half:
 //! the graph of what the people an agent works for know and have decided
-//! (faija-ontology.v2, knowledge-node.v1), and it hands that graph to every
+//! (knowledge-node.v1), and it hands that graph to every
 //! agent *before* it acts, together with the live perimeter of the fleet.
 //! Agents may propose Knowledge; only a person makes it current.
 
@@ -31,7 +31,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faija_knowledge::{self as fk, Kind, Scope, Status};
+use knowledge_node::{self as fk, Kind, Scope, Status};
 
 use knowledge::{Dirs, Outcome, Proposal};
 use scan::{ago, scan_repo, Coverage, Scan};

@@ -1,0 +1,3 @@
+# Fixture bytes are the contract (a frozen digest pins them): never let Git
+# rewrite line endings or whitespace in them.
+fixtures/** -text

@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use faija_knowledge::Scope;
+use knowledge_node::Scope;
 
 use crate::home;
 use crate::knowledge::{self, Broken, Compact, Dirs};
