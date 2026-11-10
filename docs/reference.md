@@ -200,7 +200,7 @@ Nothing is installed on a repository or written into a checkout.
   applied.toml                      what apply changed outside the home, for --undo
   .git/                             the home's history; never pushed
 ~/.config/git/ignore                git's global excludes (or core.excludesFile):
-                                    a block marked "ohjaa apply"
+                                    a block marked "ohjaa apply" holding .sykli/ and .ohjaa/
 ~/.zshrc                            one line: [[ -x <ohjaa> ]] && eval "$(<ohjaa> shell-init zsh)"
 each agent's own instruction file   a block marked "ohjaa:knowledge"
 ```
@@ -219,8 +219,8 @@ ohjaa doctor              # read-only; exits 4 on drift
 - **The terminal's line.** One line in `~/.zshrc` runs `ohjaa line` as a
   terminal opens. zsh is the only shell.
 - **The ignore block.** A marked block in git's global excludes file ignores
-  the working folders of the family's tools, `.sykli/` and `.ohjaa/` among
-  them.
+  `.sykli/` (sykli's receipts) and `.ohjaa/` (lessons that sit in a
+  checkout), in every repository.
 
 Every change is planned before any is made, and each is recorded in
 `applied.toml` before it is made. So `--undo` puts back exactly what was

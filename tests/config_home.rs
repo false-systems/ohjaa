@@ -340,7 +340,7 @@ fn apply_dry_run_says_every_change_and_makes_none() {
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
     for said in [
         format!(
-            "would add .sykli/ .teko/ .ohjaa/ to {}",
+            "would add .sykli/ .ohjaa/ to {}",
             sandbox.dir.join("config/git/ignore").display()
         ),
         format!("would change {}", sandbox.home().join(".zshrc").display()),
@@ -1487,44 +1487,45 @@ fn apply_runs_the_ohjaa_on_path_unless_bin_names_another() {
         .contains(&format!("[[ -x '{elsewhere}' ]]")));
 }
 
-/// The ignore block holds `.sykli/`, `.teko/` and `.ohjaa/`. A block an
-/// earlier apply wrote with fewer is brought up to date in place, and undo
-/// still puts back exactly what was there before the first apply.
+/// The ignore block holds `.sykli/` and `.ohjaa/`, and nothing else. A block
+/// that holds fewer folders, or one more, is brought up to date in place, and
+/// undo still puts back exactly what was there before the first apply.
 #[test]
 fn an_older_ignore_block_is_upgraded_in_place_and_undo_is_exact() {
-    let sandbox = Sandbox::new("teko");
+    let sandbox = Sandbox::new("ignore");
     let (repo, _) = sandbox.repo("acme", "any", &[]);
     fs::create_dir_all(sandbox.dir.join("config/git")).unwrap();
     fs::write(sandbox.dir.join("config/git/ignore"), "*.swp\n").unwrap();
     sandbox.apply();
     let ignore = sandbox.read("config/git/ignore");
-    assert!(ignore.contains("\n.sykli/\n.teko/\n.ohjaa/\n"), "{ignore}");
-    sandbox.git(&repo, &["check-ignore", "-q", ".teko/state.json"]);
+    assert!(ignore.contains("\n.sykli/\n.ohjaa/\n"), "{ignore}");
+    assert_eq!(
+        ignore.lines().filter(|line| line.ends_with('/')).count(),
+        2,
+        "the block ignores two folders: {ignore}"
+    );
     sandbox.git(&repo, &["check-ignore", "-q", ".sykli/receipt.json"]);
     sandbox.git(
         &repo,
         &["check-ignore", "-q", ".ohjaa/knowledge/a-lesson.md"],
     );
 
-    // As each earlier apply left it: `.sykli/` only, then `.sykli/` and
-    // `.teko/`, the block on machines applied before `.ohjaa/` was added.
+    // A block with one folder missing, and one with a folder ohjaa does not
+    // write.
     for older in [
-        ignore.replace(".sykli/\n.teko/\n.ohjaa/\n", ".sykli/\n"),
-        ignore.replace(".sykli/\n.teko/\n.ohjaa/\n", ".sykli/\n.teko/\n"),
+        ignore.replace(".sykli/\n.ohjaa/\n", ".sykli/\n"),
+        ignore.replace(".sykli/\n.ohjaa/\n", ".sykli/\n.other/\n.ohjaa/\n"),
     ] {
         fs::write(sandbox.dir.join("config/git/ignore"), &older).unwrap();
         let output = sandbox.ohjaa(&["doctor"]);
         let (stdout, _) = text(&output);
         assert!(
-            stdout.contains("holds an older ohjaa block; it should ignore .sykli/ .teko/ .ohjaa/"),
+            stdout.contains("holds an older ohjaa block; it should ignore .sykli/ .ohjaa/"),
             "{stdout}"
         );
         let output = sandbox.ohjaa(&["apply"]);
         let (stdout, _) = text(&output);
-        assert!(
-            stdout.contains("added .sykli/ .teko/ .ohjaa/ to"),
-            "{stdout}"
-        );
+        assert!(stdout.contains("added .sykli/ .ohjaa/ to"), "{stdout}");
         assert_eq!(
             sandbox.read("config/git/ignore"),
             ignore,

@@ -42,16 +42,17 @@ pub fn launch_target(line: &str) -> Option<PathBuf> {
 
 pub const LAUNCH_COMMENT: &str =
     "# What needs your attention, as a terminal opens (written by `ohjaa apply`).";
-/// The line that sourced the launcher before it was part of ohjaa.
+/// A line that sources a launcher script of this name is replaced by apply's own.
 const OLD_LAUNCHER: &str = "ohjaa-launch.zsh";
 
 pub const IGNORE_BEGIN: &str =
     "# >>> ohjaa apply: workflow files no repository tracks (edits inside are replaced)";
 const IGNORE_END: &str = "# <<< ohjaa apply";
 /// What every repository ignores without being told: the workflow's own files.
-/// `.ohjaa/` is a repository's accepted lessons left in its checkout; untracked,
-/// it would count in sykli's tree digest, and no receipt would match a commit.
-pub const IGNORED: &[&str] = &[".sykli/", ".teko/", ".ohjaa/"];
+/// `.sykli/` holds sykli's receipts. `.ohjaa/` holds accepted lessons that sit
+/// in a checkout; untracked, they would count in sykli's tree digest, and no
+/// receipt would match a commit.
+pub const IGNORED: &[&str] = &[".sykli/", ".ohjaa/"];
 
 const RECORD_SCHEMA: &str = "ohjaa-applied.v1";
 
@@ -995,18 +996,18 @@ mod tests {
         alias el='vi ~/projects/ohjaa-launch.zsh'\n";
 
     fn line() -> String {
-        launch_line(Path::new("/Users/x/.cargo/bin/ohjaa"))
+        launch_line(Path::new("/home/dev/.cargo/bin/ohjaa"))
     }
 
     #[test]
     fn the_launcher_line_is_guarded_and_names_its_ohjaa() {
         assert_eq!(
             line(),
-            "[[ -x '/Users/x/.cargo/bin/ohjaa' ]] && eval \"$('/Users/x/.cargo/bin/ohjaa' shell-init zsh)\""
+            "[[ -x '/home/dev/.cargo/bin/ohjaa' ]] && eval \"$('/home/dev/.cargo/bin/ohjaa' shell-init zsh)\""
         );
         assert_eq!(
             launch_target(&line()).as_deref(),
-            Some(Path::new("/Users/x/.cargo/bin/ohjaa"))
+            Some(Path::new("/home/dev/.cargo/bin/ohjaa"))
         );
         assert_eq!(launch_target("eval \"$(ohjaa shell-init zsh)\""), None);
     }
@@ -1106,7 +1107,7 @@ mod tests {
 
     #[test]
     fn the_ignore_block_is_added_once_replaced_in_place_and_taken_out() {
-        let block = format!("{IGNORE_BEGIN}\n.sykli/\n.teko/\n.ohjaa/\n{IGNORE_END}\n");
+        let block = format!("{IGNORE_BEGIN}\n.sykli/\n.ohjaa/\n{IGNORE_END}\n");
         assert_eq!(ignore_with_block("").unwrap(), (block.clone(), false));
         let mine = "*.swp\n.DS_Store\n";
         let (added, blank) = ignore_with_block(mine).unwrap();
