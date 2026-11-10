@@ -52,6 +52,9 @@ cd ohjaa
 cargo install --path .
 ```
 
+Ohjaa is not on crates.io yet. Once it is published, `cargo install ohjaa`
+installs it with Rust 1.98 or newer; until then, use the commands above.
+
 Ohjaa also needs `git`. Some commands call other programs when they are
 there: `gh` to read pull requests and to deliver a repository's lessons,
 `vessa` to read what people wrote in agent sessions, `toimija` to say who is

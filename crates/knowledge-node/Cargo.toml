@@ -5,6 +5,12 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT"
 description = "knowledge-node.v1: parse and validate units of Knowledge."
+repository = "https://github.com/false-systems/ohjaa"
+keywords = ["knowledge", "parser", "validation"]
+categories = ["parser-implementations"]
+# Source only: the conformance test reads the repository's fixtures, which are
+# outside this crate, so it cannot run from the package.
+include = ["src/**", "Cargo.toml"]
 
 [dependencies]
 toml = "1.1"
