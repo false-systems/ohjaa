@@ -65,7 +65,7 @@ Knowledge is ordered **ours → repo → mine → machine**, then **decision →
 → taste → lesson**. A personal node never supersedes a shared one, and shared
 knowledge never builds on personal knowledge. Ohjaa defines the format and those rules in
 [knowledge-node-v1.md](knowledge-node-v1.md). The reference implementation
-is the crate `crates/knowledge-node`, and the golden fixtures are in
+is the crate `crates/knowledge-node` (package `ohjaa-knowledge-node`), and the golden fixtures are in
 `fixtures/knowledge-node.v1/`. [ontology.md](ontology.md) says what the
 concepts mean.
 

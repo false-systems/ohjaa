@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use knowledge_node::{briefing, parse_node, validate_set, ErrorCode, Located, Scope};
+use ohjaa_knowledge_node::{briefing, parse_node, validate_set, ErrorCode, Located, Scope};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/knowledge-node.v1")
