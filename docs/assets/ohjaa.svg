@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" fill="none" role="img" aria-labelledby="t d">
+<title id="t">ohjaa</title>
+<desc id="d">A dashed boundary holds accepted knowledge as solid squares. A proposal waits outside, and a circle, the person, stands at the boundary between them.</desc>
+<rect width="1200" height="360" fill="#f1ebdc"/>
+<g stroke="#171715" stroke-width="2">
+<path d="M40 40H56M48 32V48M1144 320H1160M1152 312V328"/>
+<path d="M64 286H560" stroke="#b9b3a5"/>
+<path d="M820 50H1130V310H820Z" stroke-dasharray="6 8"/>
+<path d="M860 90H930V160H860Z" fill="#171715"/>
+<path d="M950 90H1020V160H950Z" fill="#171715"/>
+<path d="M1040 90H1110V160H1040Z" fill="#d4aa4e"/>
+<path d="M860 190H930V260H860Z" fill="#171715"/>
+<path d="M690 190H760V260H690Z" stroke-dasharray="6 8"/>
+<path d="M760 225H794"/>
+<circle cx="820" cy="225" r="26" fill="#c75b36" stroke="none"/>
+<path d="M846 225H860"/>
+</g>
+<text x="64" y="188" font-family="Geist, 'Helvetica Neue', Arial, sans-serif" font-size="132" font-weight="600" letter-spacing="-7" fill="#171715">ohjaa</text>
+<text x="66" y="254" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="24" fill="#57594f">WHAT AGENTS KNOW. A PERSON DECIDES.</text>
+
+</svg>
