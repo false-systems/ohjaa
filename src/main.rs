@@ -206,11 +206,11 @@ enum Cmd {
         the rest from the snapshot `ohjaa collect` writes, said with its age when it is older \
         than 15 minutes. Then it starts one `ohjaa collect` in the background, unless one \
         runs; startup never waits for it. Notices are shown once per day or when they change. \
-        Opening a terminal does not consume session or pull-request history. Always exits 0."
+        Opening a terminal does not consume pull-request history. Always exits 0."
     )]
     Line,
-    /// Attention details and unread activity: sessions, pull requests, proposed
-    /// instructions and who is live. Reading it at a terminal marks activity seen.
+    /// Attention details and unread activity: pull requests, proposed instructions
+    /// and who is live. Reading it at a terminal marks activity seen.
     #[command(
         after_help = "When the snapshot is more than 5 minutes old it starts a collect \
         and waits for it at most 10 s; past that it shows the snapshot it has, and the collect \
@@ -229,18 +229,14 @@ enum Cmd {
         no_collect: bool,
     },
     /// Gather what `ohjaa line` cannot work out at a terminal's opening into
-    /// its snapshot: GitHub's pull requests, vessa's usage of recent sessions
-    /// and the first words typed in each, and the secret-shaped tokens vessa
+    /// its snapshot: GitHub's pull requests and the secret-shaped tokens vessa
     /// found in agent sessions.
     #[command(after_help = "Each part asked once, at the same time:\n  \
         github    gh api graphql: the pull requests updated in the owners of the fleet's\n            \
         clones under the roots (those with .toimija/repo.yaml; one git config each),\n            \
         at most 2 calls\n  \
-        vessa     vessa usage --json --input <transcript>…: only the sessions ended lately\n  \
-        messages  vessa messages --json --since …: the first words typed in each of them\n  \
         secrets   vessa secrets --json --since …: where and how many, never a value\n\
-        vessa is asked at most 3 times. The first words are kept only for the window the digest\n\
-        shows. A part that fails keeps what it held before, said as of then.\n\
+        A part that fails keeps what it held before, said as of then.\n\
         Writes $XDG_STATE_HOME/ohjaa/human/collected.json,\n\
         holding human/collect.lock while it runs.\n\n\
         Exit codes:\n  \
