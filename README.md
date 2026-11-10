@@ -89,8 +89,7 @@ contributes its repo knowledge, all of it, labelled with its path, within a
 budget of its own (every decision in full; see "Keeping it true"): the agent
 is not working there, and need not read that AGENTS.md. Global knowledge is
 delivered once, not repeated for each repo. No keyword matcher drops a
-decision. Session records preserve the repository identity of delivered repo
-nodes; older records without that identity still read.
+decision.
 
 ## Agents propose, a person decides
 
@@ -201,7 +200,7 @@ lenient, and its recall low, so it is never silent:
   again: a `--since` before the cursor, with `--no-prefilter` or with rules
   changed since. A rule change does not reach back by itself; that would need
   a record of every message read, not only of those sent.
-- PR comments, reverts, handovers and observed failures are not filtered.
+- PR comments and reverts are not filtered.
 
 **Secret-looking tokens are redacted before the drafter: a best effort over
 known shapes, not a guarantee.** People paste credentials to agents. As each
@@ -313,7 +312,7 @@ fourteen days measured on 2026-10-26; none passed the pre-filter).
 batch is split in halves, down to the candidate it fails on. That candidate
 is tried again in later runs. After failing alone three times it is set
 aside, and said by its time and source in every run after. Its record is kept
-until the drafter answers for it, and a session holding one stays queued.
+until the drafter answers for it.
 `--retry-failed` sends every set-aside candidate again: it reads back to the
 oldest one, however far the cursor has moved past it. One that fails again
 stays set aside. A run stops when it gets no answer at all, or when two
@@ -352,8 +351,7 @@ candidates that were handled, never back.
     read.
   - A store vessa knows of and never reads (`coverage.gaps`; today
     opencode's SQLite, named only when written in the window) is said on
-    every run and holds nothing: not the cursor, not a session, not the exit
-    code. Waiting cannot read it, and a hold would keep the window before
+    every run and holds nothing: not the cursor, not the exit code. Waiting cannot read it, and a hold would keep the window before
     every later write, so it would never end. Once vessa reads the store,
     `ohjaa intake --source transcripts --since <its first day>` reads it back.
 - A first run, with no cursor yet, keeps the start of its window (fourteen
@@ -387,8 +385,7 @@ re-teaching nothing.
 
 **Its answer is checked.** A re-teaching is kept only when:
 - it names a candidate of the batch, and that candidate is a person's words: a
-  message in an agent session or a review comment, never an observed failure,
-  a handover or a revert;
+  message in an agent session or a review comment, never a revert;
 - its id is one current node the drafter was shown with that candidate: a
   repo node only with a candidate from its repository, and an id defined in
   two scopes is not one node.
@@ -402,7 +399,7 @@ re-teaching it records by node, time and source, never the words
 (`re-taught rust-elixir-only (2026-09-21T10:00:00Z claude)`), and counts them
 by node at its end.
 
-**Kept as history**, like the session log, in
+**Kept as history** in
 `$XDG_STATE_HOME/ohjaa/knowledge-evidence.json` (`ohjaa-knowledge-evidence.v1`).
 Per node (its scope and id, and for a repo node its clone, so every worktree
 of a clone shares its count and another repository's node of the same id has
@@ -441,265 +438,69 @@ origin, say) did not re-teach it.
 ohjaa never changes a node itself. Rewording, deciding, confirming and
 retiring stay a person's.
 
-## The human view: what happened, for the person
+## The human view: what needs you, and what happened
 
 ```bash
 ohjaa line            # at terminal startup: attention only, otherwise silent
-ohjaa digest          # attention details and unread activity; marks activity seen at a terminal
+ohjaa digest          # attention details and unread pull requests; marks them seen at a terminal
 ohjaa digest --since 7d   # a window instead; the cursor stays
 ohjaa collect         # gather the snapshot `line` reads (it starts this itself when it is old)
 ```
 
-An agent learns the state of the work from its briefing. A person learns it
-here. It records only: nothing is sent to anyone, decided or refused.
+It records only: nothing is sent to anyone, decided or refused. Ohjaa runs
+no sessions and keeps no record of any: what an agent did in a working copy
+is in `toimija history`, and what it used is vessa's.
 
-- **`ohjaa line`** shows only matters needing attention or a decision:
-  observations that could not be read, possible secrets in agent sessions, and proposed agent instructions waiting for you. The first terminal of a local day
-  shows up to 15 lines of attention; later terminals show a short notice
-  only when attention changes. With no attention it is silent, even when
-  sessions ended or pull requests were merged. Silence is not a claim that
-  every system is healthy. Terminals opened together say a notice once:
-  the one that claims `seen.lock` says it.
-- **Opening a terminal never marks activity read.** The first startup
-  anchors the unread window, even when quiet; subsequent days do not move
-  that window. Existing unread positions from older versions are retained.
-- **Saved status is said with its age.** Startup identifies an old background
-  update and gives `ohjaa collect` to refresh it; session records are read
-  now. An unknown or incomplete secrets scan is not a finding and cannot
-  establish an all-clear. A session record the removed `ohjaa run` left open
-  is history, not attention: nothing can close it, and no agent is behind it.
-  Proposed instructions are labelled as not active until you decide.
-- **Startup is a summary, not a diagnostic dump.** Unreadable saved sources are
-  grouped by what is missing, with one refresh command; paths and detailed
-  reasons stay in `ohjaa digest`. Possible secrets
-  are labelled as unconfirmed pattern matches, not confirmed credential leaks
-  or a count of unique credentials. Full findings, individual inspection
-  commands, source dates, and incomplete coverage remain in the digest.
-- **Your own credentials are an alarm.** A Vessa that compares with the
-  credentials this machine holds (its report says what it compared with,
-  `compared_with`) lists only those as findings, each naming where the
-  credential is kept (`held`: `environment variable …`, `~/.aws/credentials`,
-  gh's login). Each one is attention whatever rule the detector gave it:
-  startup says "Your credentials reached agent sessions: N occurrences;
-  rotate them", and the digest names each place it is kept and each session.
-  Such a report replaces what an earlier Vessa listed of every other
-  secret-shaped string, so that noise leaves the snapshot at the first collect;
-  Vessa counts those strings itself (`candidates`) and ohjaa shows none of
-  them. The paragraphs below describe an earlier Vessa's findings.
-- **A match count is not a leaked-key count.** Startup separates recognizable
-  key-format matches from secret-labelled values and unclassified rules. Generic
-  random-string matches alone stay in the digest, not in startup attention. When Vessa
-  reports context, it says how many occurrences are in signature/encrypted
-  fields, without suppressing those matches. Older reports leave context
-  unknown; partial context is a lower bound, never a complete total. Timestamp
-  gaps are counted separately from other coverage issues when available.
-  Counts are occurrences, not distinct credentials; no validity is inferred.
-- **Redaction is not credential detection.** Generic random-string
-  (`mixed_token`) occurrences remain scan evidence in the digest but do not
-  trigger startup credential alerts, regardless of context. The heuristic
-  checks string length and character mixtures; that alone cannot distinguish
-  keys from identifiers, encoded data or examples. Unknown context stays unknown,
-  never known-safe, and all counts remain inspectable. Known
-  key formats, secret-labelled values, unknown rules, and incomplete
-  coverage still need attention. No detector or redaction rule is disabled,
-  and opening a quiet terminal does not consume the underlying evidence.
-  A changed reviewable subset has its own attention identity and observed
-  scan time: reading metadata earlier does not acknowledge later candidates,
-  and an unchanged re-scan does not replay the same alert.
-- **`ohjaa digest`** shows attention details, unread agent sessions and
-  pull requests, proposed instructions and who is live. Each ended session
-  in the log has its recorded intent, end time and elapsed time. A pull request has its URL. Its "Now" says
-  who is live on this machine, then the pull requests GitHub last said were
-  open in the owners of the fleet's clones under the roots (updated in the
-  window the snapshot read),
-  the last updated first: the repository, the number, the author, whether it
-  is a draft, its title, how long ago it last changed and its URL. That is
-  where teammates' work shows, from any machine: a session that pushes its
-  branch and opens a draft pull request as it starts is listed there. At
-  most 20 are listed, the rest counted; GitHub never read is said under
-  "Sources", never as none open. Reading a digest
-  at a person's terminal marks activity seen under `seen.lock`; piping it,
-  using `--since`, or running it inside an agent session does not. A digest
-  that cannot claim the lock within 2 s shows the same information but
-  leaves the cursor unchanged.
+- **`ohjaa line`** shows only what needs attention or a decision: a source
+  that could not be read, possible secrets in agent sessions, and proposed
+  agent instructions waiting for you. The first terminal of a local day
+  shows up to 15 lines; later terminals show a short notice only when
+  attention changes. With none it is silent, even when pull requests were
+  merged. Silence is not a claim that every system is healthy. Terminals
+  opened together say a notice once: the one that claims `seen.lock`.
+- **`ohjaa digest`** shows the attention in full, the pull requests merged,
+  opened and closed since you last read one, one waiting proposal in
+  rotation, and "Now": who toimija says is live on this machine, then the
+  pull requests GitHub last said were open in the owners of the fleet's
+  clones, the last updated first, at most 20 listed and the rest counted.
+  That is where teammates' work shows. A pull request opened and merged in
+  the same stretch is said once, as merged. Reading a digest at a person's
+  terminal marks activity seen; piping it, `--since`, or running it inside
+  an agent session does not.
 - **Only a person sees it.** `line` prints, reads, writes and starts nothing
-  unless stdout is a terminal and no agent session's marker is set:
-  `OHJAA_SESSION`, `TOIMIJA_SESSION`, `TOIMIJA_RUN`, `CLAUDECODE`,
-  `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`,
-  `CODEX_SESSION_ID`, `CODEX_CI`, `CODEX_SANDBOX`,
-  `CODEX_SANDBOX_NETWORK_DISABLED`, `CODEX_MANAGED_BY_NPM`, `PI_SESSION_ID`,
-  `PI_CODING_AGENT`, `OPENCODE`, `OPENCODE_SESSION_ID` and `AI_AGENT`. These
-  are the variables the agents here set in the shells they run tools in, and
-  an agent's shell reads `~/.zshrc` too. A variable a person sets
-  themselves, such as `CODEX_HOME`, is not a marker. `ohjaa digest` moves
-  the cursor by the same rule, and never with `--since`.
-- **`line` starts no git and touches no network.** It reads the session log
-  and the proposals itself. Everything else comes from the snapshot `ohjaa
-  collect` writes. When the snapshot is older than 15 minutes, `line` starts
-  one collect in the background, detached, unless one is running, and says
-  what cached observations it has with their dates. Routine background
-  refresh alone is not an attention item. Cached observations are not the
-  age of live session records. A refresh that cannot start is reported.
-  `ohjaa digest` collects first when the snapshot is more than
-  5 minutes old, and waits for it at most 10 s.
-- **`ohjaa collect`** asks four sources once, at the same time. A source
+  unless stdout is a terminal and no agent's marker is set
+  (`ohjaa line --help` lists them): an agent's shell reads `~/.zshrc` too.
+- **`line` starts no git and touches no network.** It reads the proposals
+  itself and everything else from the snapshot `ohjaa collect` writes, said
+  with its age. When the snapshot is older than 15 minutes, `line` starts
+  one collect in the background. `ohjaa digest` collects first when it is
+  more than 5 minutes old, and waits at most 10 s.
+- **`ohjaa collect`** asks two sources once, at the same time. A source
   that fails keeps what it held before, and is said to be as of then.
-  - GitHub: one `gh api graphql` search for the pull requests updated in the
-    owners on GitHub of the fleet's clones under the roots, those that
-    declare themselves in `.toimija/repo.yaml` (as `ohjaa system` counts the
-    fleet), at most 2 calls: a clone of someone else's project never fills
-    the search. Each one's origin is read with one `git config`, all at once; a clone git cannot read is
-    said, and when no owner was found and one could not be read, whose pull
-    requests to ask for is unknown, never none. It reads from
-    where the next digest begins, by GitHub's clock (2 hours earlier, for
-    what is indexed late), at least a day back and at most a week. A digest
-    whose window starts earlier says `pull requests only since …`. A
-    digest's pull requests begin those 2 hours earlier too, without what the
-    last digest said of them, so one GitHub indexed late is said once.
-  - vessa: `vessa usage --json --input <transcript>…` over the transcripts of
-    the sessions that ended since then, found at leaving (`left.native`). It
-    never reads every transcript.
-  - Message excerpts: one `vessa messages --json` call for sessions ended
-    lately, matched by observed native agent/session IDs and launch/end times.
-    The first non-empty message leads the session row; the full recorded
-    launch intent and inspection action remain available. Sessions without
-    an excerpt keep their intent. Excerpts are scrubbed by Vessa (never
-    requested with `--raw`), cut at a word to about 70 characters and retained
-    only within the digest's window.
+  - GitHub: one `gh api graphql` search, at most 2 calls, for the pull
+    requests updated in the owners of the fleet's clones under the roots
+    (those with `.toimija/repo.yaml`). It reads from where the next digest
+    begins, 2 hours earlier for what GitHub indexes late, at least a day
+    back and at most a week.
   - Secrets: one `vessa secrets --json` scan from the last complete scan,
     with a five-minute overlap. Only locations, rules, counts, where a held
-    credential is kept, and optional SHA-256 fingerprint prefixes are kept,
-    never secret values. New findings
-    are attention notices; opening a terminal does not consume their digest
-    details. The digest's **Secrets seen** section names the native session,
-    whose words contained the finding, its time, rule and fingerprint.
-    Rotate findings that are real keys. Malformed, unavailable or partial
-    scan coverage stays unknown/incomplete and does not advance the last
-    complete-scan boundary. An older snapshot with no scan says so too.
-
-The secrets scan requires a Vessa that implements `vessa-secrets.v1`. Without
-it, collection and the digest report incomplete coverage (exit 4), not an
-empty successful scan. Default consumer tests use a stand-in for controlled
-failure cases. The opt-in real-producer test below runs an independently built
-Vessa against synthetic native records, checking excerpts, private findings,
-partial coverage, preserved retry boundaries and recovery. No repository is
-built or fetched implicitly.
+    credential is kept, and SHA-256 fingerprint prefixes are kept, never a
+    value. One of this machine's own credentials is an alarm; broad pattern
+    matches are evidence in the digest, not startup attention. It needs a
+    vessa with `vessa-secrets.v1`.
 - **What could not be read is said, never an all-clear.** A source that did
-  not answer, or could not read all it asked (a clone whose config git
-  cannot read, a page of pull requests not asked for, vessa's partial usage, the
-  fleet's failed scans), is said where the view is read, with how old what
-  it holds is: `! GitHub  1 could not be read, as of 08:12 UTC: …`. `ohjaa
-  collect` and `ohjaa digest` then exit 4. The line
-  says each failure of a source once, and a different failure of it again.
+  not answer, or could not read all it asked, is said with how old what it
+  holds is, and `ohjaa collect` and `ohjaa digest` exit 4. The line says
+  each failure of a source once, and a different failure of it again.
 
-What stays until it is resolved is what is unknown: a source that could not
-be read.
+Lines wrap at 100 characters, except URLs. Text from outside (a title, a
+tool's error) has every control character and bidi control replaced with
+U+FFFD before it reaches the terminal.
 
-An agent's process exit describes the process, not task completion or test
-results. Code 0 is successful process exit; another code has no inferred
-cause. Elapsed time includes idle time. A task confirmation records that the
-agent understood the task and rules; a completion note records what changed
-and what remains. Missing notes are missing documentation, not failed code.
-An `interactive` or empty launch intent is labelled **task not recorded**,
-not assumed idle. A launch outside a repository says so and names its folder
-and declared repository scopes, when recorded.
-
-What happened is said once:
-- each session that ended, with how it ended, how long it ran, whether it
-  read back and handed over, what landed, its pull request and its token usage;
-- the pull requests merged into a default branch;
-- those opened or closed.
-
-A pull request opened and merged in the same stretch is said once, as merged.
-
-**Token usage** comes from Vessa. It is joined by the agent's own
-session ids ohjaa found in the transcripts at leaving. It is unknown, never
-zero, unless every one of the session's own sessions was read. Usage is given
-in tokens, with cache reads apart (`115k tokens + 2.9M cache reads`). The
-collector reads Vessa's token-only `vessa-usage.v2` exports and also accepts
-the token fields of older v1 exports. It ignores legacy spending fields and
-never shows currency estimates, including from a previously saved snapshot.
-
-**Proposed agent instructions:** startup shows the waiting count and the
-`ohjaa review` command, which lets a person read complete proposals and
-decide what becomes an instruction. This is instruction review, not code
-review. The digest shows one waiting proposal in rotation, with its complete
-first-line summary before its id. It explains the scope (personal, shared,
-repository or machine) and labels the instruction's date without claiming
-it was created today or has waited since that date.
-
-Lines wrap at 100 characters, except URLs kept intact for opening or copying.
-Details wrap rather than disappear; the
-short startup notice always retains `ohjaa digest` as its inspection action.
-Digest source dates are separate for GitHub pull requests, Vessa token
-usage, message excerpts and the secrets scan. These are human-readable changes only: no
-machine schema, observation, receipt or authority is changed.
-Lines use plain words with no colour, and
-ids appear only where a person needs one: a pull request, a proposal. Text from a source (a
-title, an intent, a tool's error) has every control character and bidi
-control replaced with U+FFFD before it reaches the terminal.
-
-**State**, in `$XDG_STATE_HOME/ohjaa/human/`:
-- `seen.json`, the cursor: when the person last saw the view, the keys of
-  attention they saw and activity read in full (within the overlap), where
-  unread activity begins and any older unread position retained from a
-  previous version (each with the keys of what GitHub said in the 2 hours
-  before it and sessions shown at the boundary second), and the day it was
-  shown;
-  new cursors also keep the secrets scan's own boundary, so a background
-  result cannot be skipped because a digest read an older snapshot;
-- `seen.lock`, which the terminal saying the line, and `ohjaa digest`
-  moving the cursor, hold with `flock(2)`;
-- `collected.json`, the snapshot: GitHub's pull requests, vessa's usage,
-  the first words typed and the secrets scan, each with when it was read and
-  what it could not read;
-- `collect.lock`, which the one running collect holds with `flock(2)`.
-
-Deleting them loses no knowledge. The view then starts from the last day.
-
-### From viemari
-
-`ohjaa line` replaces `viemari line`; its facts were ohjaa's already. To
-switch over, once this ohjaa is installed:
-
-1. Remove the two lines `viemari shell-init` added to `~/.zshrc`, the comment
-   and `command -v viemari >/dev/null && viemari line`. `ohjaa shell-init zsh`
-   prints `[[ ${OHJAA_LINE:-1} == 0 ]] || ohjaa line`, and the line
-   `ohjaa apply` wrote already evals it.
-2. Run `ohjaa collect` once. Startup then shows attention only; use
-   `ohjaa digest` to read activity and details.
-3. Archive viemari. Its state, `~/.local/state/viemari/`, can then be removed.
-
-Not carried over: viemari's lifecycle view (Intent, session, change,
-validation, each sykli run asked by id), its rework and lead-time measures,
-pull request reviews, and direct pushes that are proven. `ohjaa graph` shows
-the depth.
-
-In particular, viemari's day listed each failed validation a session asked
-sykli for (`FAILED: test`). This view asks sykli nothing, so their absence
-here is **not a pass**: what a commit passed is sykli's to say.
-
-## Session usage
-
-Ohjaa runs no sessions now: the session log holds the sessions it ran
-before, and only the gate's records are added to it. Agent usage is vessa's.
-What is in the log can still be read:
-
-```bash
-ohjaa usage export > /tmp/ohjaa-sessions.json
-ohjaa usage import /tmp/session-usage.json --session oh-EXISTING-ID
-```
-
-`usage export` emits `ohjaa-sessions.v1`, with `sessions` and `unreadable`.
-Each session is its record as the log holds it; what later versions added is
-additive and absent from older records. A log an ohjaa with `ohjaa judge`
-wrote (removed 2026-10-26) still holds that command's tables, `judgements`
-and `judgement_responses`; it opens and is written as any other, and those
-tables are never read and left as they were. Unreadable records produce exit
-4. `--session ID` selects one record. `usage import` attaches an
-`agent-usage.v1` receipt to a session in the log; a refused receipt is
-recorded as `refused: <reason>`, never as not collected. Exports contain
-private session context; choose their destination accordingly.
+**State**, in `$XDG_STATE_HOME/ohjaa/human/`: `seen.json` (what the person
+last saw, and where unread activity begins), `collected.json` (the
+snapshot), and the two `flock(2)` locks beside them. Deleting them loses no
+knowledge; the view then starts from the last day.
 
 ## Keeping it true
 
@@ -708,6 +509,9 @@ what may no longer hold:
 
 - a `holds_while` predicate that is false right now;
 - a **fact** not re-confirmed for 90 days (`ohjaa confirm <id>`);
+- a node whose text names, in backticks, an `ohjaa` command this ohjaa does not
+  have (`ohjaa run`, once it was removed): the rule asks for what no agent can
+  do;
 - a briefing longer than an agent will reliably read (8,000 characters). The
   fix is to merge or retire nodes.
 
@@ -715,7 +519,9 @@ A flag never hides a node. The briefing shows it with the flag beside it.
 
 It also says, per current node, how often a person had to teach it again, and
 suggests rewording what keeps being re-taught and re-confirming what nothing
-touches: suggestions, never flags (see *Does knowledge work?* above).
+touches: suggestions, never flags (see *Does knowledge work?* above). Before
+those counts it says up to when intake read what people said, or that it never
+ran here: a count from an intake that has not read is unknown, not zero.
 
 Until the knowledge is merged or retired back under the budget, the briefing
 degrades rather than falls off a cliff, and says so on stderr. It keeps every
@@ -971,8 +777,7 @@ This repository's lessons are carried here, though its AGENTS.md holds 14 of the
 | opencode 2.1.4 | always | `OPENCODE_DISABLE_PROJECT_CONFIG` or `OPENCODE_CONFIG_PROJECT_DISABLE` set; `--server` |
 | any other, or `brief` without `--agent` | never | always |
 
-The session log records a node as delivered through AGENTS.md only when it
-was left to it. A line the checked-out AGENTS.md still holds of a node
+A line the checked-out AGENTS.md still holds of a node
 retired or superseded, while its removal waits, is said, whatever the
 agent, and for a scoped repository too:
 
@@ -1086,31 +891,6 @@ each of the fleet's clones under the roots once, at the same time, to find
 the owners whose pull requests GitHub is asked about. `tests/config_home.rs` holds these budgets, and
 `tests/terminal.rs` a decision's.
 
-### From ohjaa's gate
-
-Ohjaa's gate, its hooks, its marks and `ohjaa report` are gone: the gate is
-sykli's own now. An ohjaa from before this one wrote hook dispatchers into
-the home and an `include.path` into git's global config that runs them; the
-new ohjaa has no `ohjaa hook`, so that include must go first, or every push
-fails. Once, in this order:
-
-1. With the old ohjaa still installed: `ohjaa apply --undo`. It removes the
-   include, the dispatchers and the rest of what that apply wrote.
-2. Install this ohjaa, then `ohjaa apply`: the ignore block, the terminal's
-   line and the agents' knowledge blocks, nothing else.
-3. Remove the checkouts the old ohjaa made to validate what landed: each
-   `/ohjaa/integrated/<clone>/checkout` is a worktree of its
-   clone (`git -C <clone> worktree remove --force <checkout>`), which `ohjaa
-   brief` would otherwise scan as another session's.
-4. In each repository whose pushes should be checked: `sykli hook install
-   --pre-push` (without `--pre-push` it installs a pre-commit hook too, and
-   every commit runs the whole contract).
-
-The old entries (`~/.config/ohjaa/repos/`), derived gates
-(`/ohjaa/derived/`) and validation folders
-(`/ohjaa/integrated/`) are read by nothing now, and can be
-removed.
-
 ## Boundaries in full
 
 AGENTS.md and `.toimija/repo.yaml` carry these boundaries in short; this is
@@ -1118,14 +898,13 @@ each in full, with what ohjaa keeps where.
 
 - One Rust crate producing a single `ohjaa` binary. Dependencies stay minimal —
   `anyhow`, `clap`, `serde`, `serde_json`, the vendored `faija-knowledge`
-  (knowledge-node.v1), `redb` (the session log) and `libc` (signal
-  dispositions while a session runs, and the kernel's word on processes) — and
-  every addition needs a reason. Tests
+  (knowledge-node.v1), and `libc` (`flock(2)`, process groups for what ohjaa starts, the local time
+  zone) — and every addition needs a reason. Tests
   alone also use `sha2` and `serde_yaml` (the parser toimija reads
   `.toimija/repo.yaml` with, so a config toimija cannot parse fails CI here).
 - **Ohjaa holds Knowledge; toimija reports facts.** Never reimplement anything
   toimija derives — shell out to its CLI and consume its `--json`.
-- **Ohjaa stores two things.** Knowledge, as knowledge-node.v1 files in the
+- **Ohjaa stores Knowledge.** Knowledge, as knowledge-node.v1 files in the
   scope directories plus proposals waiting for a person, is the truth and lives
   in git: ours in its repository, repo in the repository's own AGENTS.md (its
   `## Lessons`, one line per node, through a pull request ohjaa opens), mine
@@ -1133,11 +912,8 @@ each in full, with what ohjaa keeps where.
   its why, and where its line went, in `$XDG_STATE_HOME/ohjaa/lessons/<clone>/`
   (the nodes and `delivery.json`; `<clone>` the clone's common git directory),
   beside the worktrees a delivery writes in while it runs (`lessons/.work/`)
-  and its lock (`lessons.lock`): knowledge, not a cache. The **session log**,
-  in redb at `$XDG_STATE_HOME/ohjaa/sessions.redb`,
-  is machine-local history of what each session was briefed, read back,
-  committed, finished and handed over, plus explicitly attributed usage receipts, the ids of the agent's own sessions found at leaving in its transcripts (read, never written) and those its environment claimed from inside the session while it was open (the agent's testimony, never outranking what was found) — deleting it loses no knowledge, and a broken log is reported, never
-  replaced. Beside it, `$XDG_STATE_HOME/ohjaa` holds intake's cursor
+  and its lock (`lessons.lock`): knowledge, not a cache. Beside it,
+  `$XDG_STATE_HOME/ohjaa` holds intake's cursor
   (`intake-since`), intake's progress (`intake-handled`: a version line; per
   candidate the drafter answered for or failed on, its time and a digest of
   its words, never the words, and for a failure how often and why in ohjaa's
@@ -1145,19 +921,15 @@ each in full, with what ohjaa keeps where.
   the lock that lets one intake run at a time (`intake.lock`), what intake
   saw of each current node (`knowledge-evidence.json`: per node, each
   message a person re-taught it with, by its time, a digest of its words and
-  its session's id, never the words, and when a draft last cited it; history
-  like the session log, read by `ohjaa list`, `check` and `review`, never by
+  its session's id, never the words, and when a draft last cited it; history,
+  read by `ohjaa list`, `check` and `review`, never by
   a briefing), and the human view's
   folder (`human/`: `seen.json`, what the person last saw and when, the keys
   of what was said in the last two hours, where the next digest begins and
   where the earliest of what a day's digest left out begins, each with the
   keys of what GitHub said in the two hours before it; `collected.json`,
   the snapshot `ohjaa collect` writes of what `ohjaa line` cannot derive
-  without git or the network, namely GitHub's pull requests, vessa's usage of the sessions ended lately, the first
-  words the person typed in each of them (the person's own words shown
-  back to them, as vessa prints them with secrets scrubbed, cut to about
-  70 characters and kept only for the window the digest shows, never
-  longer), and where and how often vessa's secrets scan found
+  without git or the network, namely GitHub's pull requests and where and how often vessa's secrets scan found
   secret-shaped tokens in agent sessions (places and counts, never a
   value), each with when it was read and what it could not read; and two
   empty lock files, neither a cache: `seen.lock`, held while the cursor is
@@ -1204,8 +976,7 @@ each in full, with what ohjaa keeps where.
   from the repository's own contract and hooks.
 - **Ohjaa runs no sessions.** Agents start as they are typed and read the
   Knowledge from their own instruction files; the note for the next agent is
-  `toimija handover`. Imported usage is separately labelled source testimony;
-  it never becomes observed work or authoritative billing.
+  `toimija handover`. Agent token usage is vessa's.
 - **Agents propose; only a person makes Knowledge current**, retires it or
   rejects it. Ours is reviewed in a pull request before any agent reads it.
   Repo knowledge a person accepts goes into the repository's AGENTS.md
@@ -1222,20 +993,16 @@ each in full, with what ohjaa keeps where.
   repository by itself.
 - **Cross-repo yes, messaging no.** Permanently refused: request/response
   between agents, presence, and dispatch (assigning work to an agent).
-  Knowledge is not a message — it carries its time, its why and whose it is. A
-  session's handover is a record for whoever comes next, shown in the next
-  briefing, never a message to a particular agent. The human view (`ohjaa
+  Knowledge is not a message — it carries its time, its why and whose it is. The human view (`ohjaa
   line`, `ohjaa digest`) is a record a person reads at their own terminal,
   never a notification.
 - **Network only through `gh`, the drafter and, to deliver repo knowledge,
   git to GitHub with gh's credentials** — in `ohjaa intake` (review
-  comments, drafting), when a session leaves (its branch's pull request,
-  bounded, recorded as unknown when gh cannot say), in `ohjaa collect` (one
+  comments, drafting), in `ohjaa collect` (one
   search for the pull requests of the owners of the fleet's clones under the
   roots,
   at most two calls;
-  its vessa calls, at most three, one each for usage, messages and
-  secrets, are local), and after a person's decision on repo knowledge and
+  its one vessa call, for secrets, is local), and after a person's decision on repo knowledge and
   in `ohjaa lessons publish` (gh: the repository's visibility, the person's
   private repositories and name once a run, its open lessons pull request,
   `pr create`; git: one fetch and one push to the repository on GitHub, by
@@ -1268,20 +1035,6 @@ holds a copy of every descriptor the test process has open until that child
 execs, so a file the test process wrote itself, closed and even renamed
 can still be open for writing in such a child at the moment it runs.
 
-Tests that need the real tools are ignored by default, since CI's runners
-have none of them:
-
-- `tests/cli.rs`, `real_vessa_producer_*`: the actual Vessa command reads only
-  a synthetic HOME, while Ohjaa collects and renders its output. Requires a
-  Vessa implementing `vessa-secrets.v1` that compares with the machine's
-  credentials (`compared_with`); the test gives it its key as a secret-named
-  variable. Older versions fail visibly:
-
-  ```bash
-  OHJAA_TEST_VESSA=/absolute/path/to/vessa cargo test --test cli real_vessa_producer -- --ignored
-  ```
-
-
 ## What it will never do
 
 - **No messaging between agents, no request/response, no presence.** A message
@@ -1289,5 +1042,4 @@ have none of them:
   message: it carries its time, its why and whose it is, and a person reviewed
   it.
 - **No scheduler and no dispatch.** Claiming work stays in GitHub issues and
-  pull requests. A handover is a record for whoever comes next here, shown in
-  the next briefing, never a message addressed to a particular agent.
+  pull requests.

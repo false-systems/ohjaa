@@ -1,30 +1,20 @@
 //! `ohjaa collect`: what the human view cannot work out while a terminal
 //! opens, gathered into one snapshot that `ohjaa line` and `ohjaa digest`
-//! read. Four parts, each asked once, at the same time:
+//! read. Two parts, each asked once, at the same time:
 //!
 //! - `github`: the pull requests updated in the owners of the fleet's clones
 //!   under the roots (those with `.toimija/repo.yaml`), one search through
 //!   `gh api graphql`, at most [`MAX_GH_CALLS`] calls;
-//! - `usage`: what vessa reads in the transcripts of the sessions ended
-//!   lately, joined by the agent's own session ids ohjaa found at leaving;
-//! - `typed`: the first words the person typed in each of those sessions,
-//!   from one `vessa messages --json`, joined the same way, cut short, and
-//!   kept only for the window the digest shows;
 //! - `secrets`: where vessa's secrets scan found secret-shaped tokens in
 //!   agent sessions, and how many, never a value: one `vessa secrets --json`
 //!   from where the last scan that read everything ended.
 //!
-//! vessa is asked at most three times, once for each of its parts, and only
-//! when there is something to ask: never `usage` or `messages` without a
-//! session that ended lately.
-//!
-//! The session log and the proposals are not in it: the view reads them
-//! itself, as it speaks, and `ohjaa digest` asks for the fleet itself. Each
+//! The proposals are not in it: the view reads them itself, as it speaks, and `ohjaa digest` asks for the fleet itself. Each
 //! part says when it was read, what it could not read, and, when it could
 //! not answer, why; a part that failed keeps what it held before, as of
 //! then.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -34,8 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::knowledge::Dirs;
-use crate::sessions::{self, Session};
-use crate::{gitconfig, home, intake, process, usage};
+use crate::{gitconfig, home, intake, process};
 
 pub const SCHEMA: &str = "ohjaa-collected.v1";
 
@@ -47,9 +36,6 @@ const GH_TIMEOUT: Duration = Duration::from_secs(30);
 /// vessa reads only the transcripts it is given, a fraction of a second
 /// each; a vessa that hangs costs a collect this, never more.
 const VESSA_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// The most sessions whose usage one collect asks vessa about, newest first.
-const MAX_USAGE_SESSIONS: usize = 50;
 
 const SEARCH: &str = "query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 100, after: $after) {
@@ -86,14 +72,6 @@ pub struct Collected {
     pub at_ms: i64,
     #[serde(default)]
     pub github: Part<Vec<Pr>>,
-    /// By ohjaa session id.
-    #[serde(default)]
-    pub usage: Part<BTreeMap<String, TokenUsage>>,
-    /// The first words the person typed in each session ended lately, by
-    /// ohjaa session id: their own words, shown back to them, kept only for
-    /// the window the digest shows ([`Collected::keep_window`]).
-    #[serde(default)]
-    pub typed: Part<BTreeMap<String, Typed>>,
     /// Where vessa found secret-shaped tokens in agent sessions, and how
     /// many: never a value.
     #[serde(default)]
@@ -101,25 +79,14 @@ pub struct Collected {
 }
 
 impl Collected {
-    /// What the snapshot keeps of the person's words and of the secrets
-    /// found, only for the window the digest shows, from `from_ms`: never
+    /// What the snapshot keeps of the secrets found, only for the window the digest shows, from `from_ms`: never
     /// longer, and that holds what a read that failed keeps too.
     pub fn keep_window(&mut self, from_ms: i64) {
-        self.typed.value.retain(|_, typed| typed.ended_ms > from_ms);
         self.secrets
             .value
             .findings
             .retain(|finding| finding.at_ms.unwrap_or(finding.found_ms) >= from_ms);
     }
-}
-
-/// The first words a person typed in a session, cut at a word to about
-/// [`EXCERPT_CHARS`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Typed {
-    pub text: String,
-    /// When its session ended: it is kept while that is in the window.
-    pub ended_ms: i64,
 }
 
 /// What vessa's secrets scan found, and up to when it read everything.
@@ -182,20 +149,6 @@ impl Finding {
         )
     }
 }
-
-/// One message a person wrote, as `vessa messages --json` lists it: what
-/// the first words of a session are taken from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Heard {
-    pub agent: String,
-    pub session: String,
-    pub at_ms: i64,
-    pub text: String,
-}
-
-/// The first words typed in a session are cut at a word to about this many
-/// characters, `…` included.
-pub const EXCERPT_CHARS: usize = 70;
 
 /// A secrets scan begins this long before the last one that read
 /// everything: a record written as that one read is read again, and is the
@@ -289,17 +242,6 @@ impl Pr {
     }
 }
 
-/// Token usage for one ohjaa session, unknown (`None`) unless every one
-/// of the agent's own sessions it ran was found.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenUsage {
-    /// Input, output and cache writes.
-    pub tokens: Option<u64>,
-    /// Said apart: most of a session's tokens are reads of its cache.
-    #[serde(default)]
-    pub cache_reads: Option<u64>,
-}
-
 /// The last snapshot, unless there is none or it cannot be read as one.
 pub fn read(dirs: &Dirs) -> Option<Collected> {
     let text = std::fs::read_to_string(path(dirs)).ok()?;
@@ -332,8 +274,6 @@ pub fn collect(
     now_ms: i64,
 ) -> Collected {
     let before = read(dirs).unwrap_or_default();
-    let ended = ended_since(dirs, from_ms);
-    let ended = || ended.as_deref().map_err(String::clone);
     let mut collected = std::thread::scope(|scope| {
         let github = scope.spawn(|| {
             let (owners, mut gaps) = owners(&repos?);
@@ -354,15 +294,11 @@ pub fn collect(
             gaps.extend(more);
             Ok((prs, gaps))
         });
-        let usage = scope.spawn(|| usage(ended()?));
-        let typed = scope.spawn(|| typed(ended()?, now_ms));
         let secrets = scope.spawn(|| secrets(&before.secrets.value, from_ms, now_ms));
         Collected {
             schema: SCHEMA.to_owned(),
             at_ms: now_ms,
             github: Part::read(joined(github), &before.github, now_ms, Some(from_ms)),
-            usage: Part::read(joined(usage), &before.usage, now_ms, Some(from_ms)),
-            typed: Part::read(joined(typed), &before.typed, now_ms, Some(from_ms)),
             secrets: Part::read(joined(secrets), &before.secrets, now_ms, Some(from_ms)),
         }
     });
@@ -464,7 +400,7 @@ fn github(owners: &[String], from_ms: i64) -> Result<(Vec<Pr>, Vec<String>), Str
             gaps.push(format!(
                 "{} pull requests were updated since {}; only the {} updated last were read",
                 field("issueCount").as_u64().unwrap_or(0),
-                sessions::clock(from_ms),
+                intake::clock(from_ms),
                 prs.len()
             ));
             break;
@@ -537,162 +473,6 @@ fn pr(node: &Value) -> Option<Pr> {
     })
 }
 
-/// The sessions that ended since `from_ms` and named their agent's own
-/// sessions, the newest [`MAX_USAGE_SESSIONS`]: what vessa is asked about.
-fn ended_since(dirs: &Dirs, from_ms: i64) -> Result<Vec<Session>, String> {
-    let log = sessions::Reader::open(&sessions::store_path(&dirs.state))
-        .map_err(|error| format!("the session log could not be opened: {error}"))?;
-    let (mut logged, _) = log
-        .all()
-        .map_err(|error| format!("the session log could not be read: {error}"))?;
-    drop(log);
-    logged.retain(|s| {
-        s.left.as_ref().is_some_and(|left| {
-            left.ended_ms > from_ms && left.native.as_ref().is_some_and(|n| !n.sessions.is_empty())
-        })
-    });
-    logged.sort_by_key(|s| std::cmp::Reverse(s.left.as_ref().map(|left| left.ended_ms)));
-    logged.truncate(MAX_USAGE_SESSIONS);
-    Ok(logged)
-}
-
-/// The usage of the sessions that ended lately (`logged`), from those
-/// sessions' transcripts alone: vessa is given each transcript, never asked
-/// to read them all.
-fn usage(logged: &[Session]) -> Result<(BTreeMap<String, TokenUsage>, Vec<String>), String> {
-    let transcripts: BTreeSet<&str> = logged
-        .iter()
-        .flat_map(natives)
-        .filter(|n| has_transcript(n))
-        .map(|n| n.source.as_str())
-        .collect();
-    if transcripts.is_empty() {
-        return Ok((BTreeMap::new(), Vec::new()));
-    }
-    let mut command = Command::new("vessa");
-    command.args(["usage", "--json"]);
-    for transcript in &transcripts {
-        command.arg("--input").arg(transcript);
-    }
-    let output = process::run(&mut command, None, VESSA_TIMEOUT)
-        .map_err(|error| vessa_failed("usage", &error))?;
-    // 4 is vessa's "partial": the numbers it printed stand, and it says why.
-    let code = output.status.code();
-    if !matches!(code, Some(0 | 4)) {
-        return Err(format!("vessa usage --json: {}", output.failure_detail()));
-    }
-    let answer: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("vessa usage --json printed no report: {error}"))?;
-    let mut gaps = Vec::new();
-    if code == Some(4) {
-        gaps.push("vessa says its usage evidence is partial".to_owned());
-    }
-    let read = read_usage(&answer, &mut gaps)?;
-    let costs = logged
-        .iter()
-        .map(|s| (s.id.clone(), usage_of(s, &read)))
-        .collect();
-    Ok((costs, gaps))
-}
-
-fn natives(session: &Session) -> impl Iterator<Item = &usage::NativeSession> {
-    session
-        .left
-        .iter()
-        .filter_map(|left| left.native.as_ref())
-        .flat_map(|native| native.sessions.iter())
-}
-
-/// Found in a transcript, not only claimed by the agent's environment.
-fn has_transcript(native: &usage::NativeSession) -> bool {
-    !native.testimony && native.source != usage::ENV_SOURCE && !native.source.is_empty()
-}
-
-/// What vessa read of one native session, as a [`TokenUsage`]. `None`: its id is
-/// in vessa's answer twice, so it is no one's.
-type Read = BTreeMap<(String, String), Option<TokenUsage>>;
-
-/// All of them, or unknown when one is.
-fn sum(mut values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
-    values.try_fold(0u64, |total, value| total.checked_add(value?))
-}
-
-/// Token totals from `vessa-usage.v2`, by agent and native session id.
-/// The former v1 export has the same token fields; its money is ignored.
-pub fn read_usage(answer: &Value, gaps: &mut Vec<String>) -> Result<Read, String> {
-    match answer["schema"].as_str() {
-        Some("vessa-usage.v1" | "vessa-usage.v2") => {}
-        other => {
-            return Err(format!(
-                "vessa answered {}, not vessa-usage.v1 or vessa-usage.v2",
-                other.unwrap_or("without a schema")
-            ))
-        }
-    }
-    let mut read = Read::new();
-    for session in answer["sessions"].as_array().into_iter().flatten() {
-        let (Some(agent), Some(id)) = (session["agent"].as_str(), session["id"].as_str()) else {
-            return Err("vessa's usage names a session without its agent or id".to_owned());
-        };
-        for why in session["limitations"].as_array().into_iter().flatten() {
-            gaps.push(format!("{agent} {id}: {}", why.as_str().unwrap_or("?")));
-        }
-        // A session's usage is its subagents' too.
-        let entries = match session["totals_with_subagents"].as_array() {
-            Some(entries) if !entries.is_empty() => entries,
-            _ => session["totals"]
-                .as_array()
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        };
-        let all = |names: &[&str]| {
-            (!entries.is_empty())
-                .then(|| {
-                    sum(entries
-                        .iter()
-                        .map(|entry| sum(names.iter().map(|name| entry[*name].as_u64()))))
-                })
-                .flatten()
-        };
-        let cost = TokenUsage {
-            tokens: all(&["input_tokens", "output_tokens", "cache_write_tokens"]),
-            cache_reads: all(&["cache_read_tokens"]),
-        };
-        let key = (agent.to_owned(), id.to_owned());
-        if read.insert(key, Some(cost)).is_some() {
-            gaps.push(format!(
-                "{agent} {id} is in vessa's usage twice: no usage is joined to it"
-            ));
-            read.insert((agent.to_owned(), id.to_owned()), None);
-        }
-    }
-    Ok(read)
-}
-
-/// The usage of one ohjaa session: known only when each of its agent's own
-/// sessions has a transcript and vessa read it once.
-pub fn usage_of(session: &Session, read: &Read) -> TokenUsage {
-    let found: Vec<Option<&TokenUsage>> = natives(session)
-        .map(|native| {
-            has_transcript(native)
-                .then(|| read.get(&(native.agent.clone(), native.session_id.clone())))
-                .flatten()
-                .and_then(Option::as_ref)
-        })
-        .collect();
-    let total = |of: fn(&TokenUsage) -> Option<u64>| {
-        found
-            .iter()
-            .try_fold(0u64, |total, cost| total.checked_add(of((*cost)?)?))
-    };
-    let tokens = total(|c| c.tokens);
-    let cache_reads = total(|c| c.cache_reads).filter(|_| tokens.is_some());
-    TokenUsage {
-        cache_reads,
-        tokens,
-    }
-}
-
 /// Why vessa could not be run for `what`.
 pub fn vessa_failed(what: &str, error: &anyhow::Error) -> String {
     let text = format!("{error:#}");
@@ -716,211 +496,6 @@ fn said_on_stderr(output: &process::Output) -> String {
 
 fn exit_of(code: Option<i32>) -> String {
     code.map_or("a signal".to_owned(), |code| code.to_string())
-}
-
-// ---- the first words typed ----------------------------------------------------
-
-/// The form of `vessa messages --json` the first words are read from.
-const VESSA_MESSAGES: &str = "vessa-messages.v1";
-
-/// The furthest back one list of what people wrote reaches: a session begun
-/// before then gets no first words, rather than words that were not its
-/// first.
-const TYPED_REACH_MS: i64 = 7 * 86_400_000;
-
-/// The first words the person typed in each session that ended lately
-/// (`logged`), from one `vessa messages --json` call. vessa scrubs secrets
-/// from what it prints (never asked for `--raw`), and ends a launch's task
-/// at ohjaa's briefing: what it lists is the person's own.
-fn typed(logged: &[Session], now_ms: i64) -> Answer<BTreeMap<String, Typed>> {
-    let asked: Vec<&Session> = logged
-        .iter()
-        .filter(|s| natives(s).any(has_transcript))
-        .collect();
-    let Some(earliest) = asked.iter().map(|s| s.started_ms).min() else {
-        return Ok((BTreeMap::new(), Vec::new()));
-    };
-    let since_ms = (earliest - 1000).max(now_ms - TYPED_REACH_MS);
-    let mut command = Command::new("vessa");
-    command
-        .args(["messages", "--json", "--since"])
-        .arg(intake::rfc3339_ms(since_ms));
-    let output = process::run(&mut command, None, VESSA_TIMEOUT)
-        .map_err(|error| vessa_failed("messages", &error))?;
-    let (heard, gaps) = read_messages(
-        output.status.code(),
-        &output.stdout,
-        &said_on_stderr(&output),
-    )?;
-    Ok((first_typed(&asked, &heard, since_ms), gaps))
-}
-
-#[derive(Deserialize)]
-struct Listed {
-    schema: String,
-    #[serde(default)]
-    messages: Vec<ListedMessage>,
-    #[serde(default)]
-    coverage: Option<ListedCoverage>,
-    #[serde(default)]
-    warnings: Vec<String>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ListedMessage {
-    agent: String,
-    session: String,
-    #[serde(default)]
-    at: Option<String>,
-    #[serde(default)]
-    text: String,
-}
-
-#[derive(Default, Deserialize)]
-struct ListedCoverage {
-    #[serde(default)]
-    gaps: Vec<String>,
-    #[serde(default)]
-    limitations: Vec<String>,
-}
-
-/// vessa's list of what people wrote (`vessa-messages.v1`; its exit `code`,
-/// and `detail`, what it said on stderr), with what it could not list. Exit
-/// 4 is a partial list: what it listed stands, and why is a gap. A message
-/// no time places is left out: it cannot be told first.
-pub fn read_messages(
-    code: Option<i32>,
-    stdout: &[u8],
-    detail: &str,
-) -> Result<(Vec<Heard>, Vec<String>), String> {
-    let exit = exit_of(code);
-    if !matches!(code, Some(0 | 4)) {
-        return Err(if detail.contains("unrecognized subcommand") {
-            format!("this vessa does not list messages: update vessa (exit {exit}: {detail})")
-        } else {
-            format!("vessa messages --json: exit {exit}: {detail}")
-        });
-    }
-    let listed: Listed = serde_json::from_slice(stdout).map_err(|error| {
-        format!("vessa messages --json printed no {VESSA_MESSAGES} ({error}; exit {exit})")
-    })?;
-    if listed.schema != VESSA_MESSAGES {
-        return Err(format!(
-            "vessa answered {}, not {VESSA_MESSAGES}",
-            listed.schema
-        ));
-    }
-    let coverage = listed.coverage.unwrap_or_default();
-    let unread: Vec<&String> = listed
-        .warnings
-        .iter()
-        .chain(&coverage.gaps)
-        .chain(&coverage.limitations)
-        .collect();
-    let mut gaps = Vec::new();
-    if let Some(error) = &listed.error {
-        gaps.push(format!(
-            "vessa failed after listing {} message(s): {error}",
-            listed.messages.len()
-        ));
-    }
-    match unread.as_slice() {
-        [] if code == Some(4) && gaps.is_empty() => gaps.push(format!(
-            "vessa says its list of messages is partial: {detail}"
-        )),
-        [] => {}
-        [one] => gaps.push(format!("vessa could not list every message: {one}")),
-        [first, ..] => gaps.push(format!(
-            "vessa could not list every message, for {} reasons, first: {first}",
-            unread.len()
-        )),
-    }
-    let heard = listed
-        .messages
-        .into_iter()
-        .filter_map(|message| {
-            Some(Heard {
-                at_ms: message.at.as_deref().and_then(intake::parse_time)?,
-                agent: message.agent,
-                session: message.session,
-                text: message.text,
-            })
-        })
-        .collect();
-    Ok((heard, gaps))
-}
-
-/// The first words typed in each of `sessions`, from what vessa listed
-/// after `since_ms`: the earliest message with words in it of one of its
-/// agent's own sessions found in a transcript (as usage is joined), between
-/// its launch and its end. A session begun before the list does gets none:
-/// its first words may lie before it.
-pub fn first_typed(
-    sessions: &[&Session],
-    heard: &[Heard],
-    since_ms: i64,
-) -> BTreeMap<String, Typed> {
-    sessions
-        .iter()
-        .filter_map(|session| {
-            let left = session.left.as_ref()?;
-            let start = session.started_ms - session.started_ms.rem_euclid(1000);
-            if start <= since_ms {
-                return None;
-            }
-            let own: BTreeSet<(&str, &str)> = natives(session)
-                .filter(|native| has_transcript(native))
-                .map(|native| (native.agent.as_str(), native.session_id.as_str()))
-                .collect();
-            let (_, text) = heard
-                .iter()
-                .filter(|said| own.contains(&(said.agent.as_str(), said.session.as_str())))
-                .filter(|said| said.at_ms >= start && said.at_ms < left.ended_ms + 1000)
-                .filter_map(|said| Some((said.at_ms, excerpt(&said.text)?)))
-                .min_by_key(|(at_ms, _)| *at_ms)?;
-            Some((
-                session.id.clone(),
-                Typed {
-                    text,
-                    ended_ms: left.ended_ms,
-                },
-            ))
-        })
-        .collect()
-}
-
-/// `text` with its runs of white space made one space, cut at a word to at
-/// most [`EXCERPT_CHARS`], with `…` when cut. `None`: nothing in it.
-pub fn excerpt(text: &str) -> Option<String> {
-    let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!words.is_empty()).then(|| fit(&words, EXCERPT_CHARS))
-}
-
-/// At most `max` characters, cut after a word with `…` when cut; inside a
-/// word only when the first is longer than all the room.
-pub fn fit(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_owned();
-    }
-    let room = max.saturating_sub(1);
-    let mut out = String::new();
-    for word in text.split(' ') {
-        let width = out.chars().count() + usize::from(!out.is_empty()) + word.chars().count();
-        if width > room {
-            break;
-        }
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(word);
-    }
-    if out.is_empty() {
-        out = text.chars().take(room).collect();
-    }
-    out.push('…');
-    out
 }
 
 // ---- the secrets seen ---------------------------------------------------------
@@ -1144,41 +719,6 @@ pub fn from_ms(next_digest_ms: Option<i64>, now_ms: i64) -> i64 {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn session(id: &str, natives: Value) -> Session {
-        serde_json::from_value(json!({
-            "id": id, "agent": "claude", "repo": "/r/ohjaa", "intent": "x",
-            "started_ms": 1_000, "delivered": [],
-            "left": {
-                "ended_ms": 2_000, "exit": {"how": "code", "code": 0},
-                "finished": {"kind": "no_pull_request"},
-                "native": {"sessions": natives},
-            },
-        }))
-        .unwrap()
-    }
-
-    fn native(agent: &str, id: &str, source: &str) -> Value {
-        json!({"agent": agent, "session_id": id, "source": source})
-    }
-
-    fn vessa(sessions: Value) -> Value {
-        json!({"schema": "vessa-usage.v2", "sessions": sessions, "warnings": []})
-    }
-
-    /// `tokens` of input and `cached` cache reads.
-    fn entry(tokens: u64, cached: u64, usd: Option<u64>) -> Value {
-        json!({"input_tokens": tokens, "output_tokens": 0, "cache_read_tokens": cached,
-               "cache_write_tokens": 0, "estimated_usd_micros": usd})
-    }
-
-    fn cost(tokens: Option<u64>, cache_reads: Option<u64>) -> TokenUsage {
-        TokenUsage {
-            tokens,
-            cache_reads,
-        }
-    }
-
     #[test]
     fn the_search_names_every_owner_and_the_minute() {
         let from = intake::parse_time("2026-10-12T08:30:45Z").unwrap();
@@ -1220,114 +760,6 @@ mod tests {
     }
 
     #[test]
-    fn a_session_costs_what_vessa_read_of_each_of_its_own_sessions() {
-        let s = session(
-            "oh-1",
-            json!([
-                native("claude", "c1", "/t/c1.jsonl"),
-                native("codex", "x1", "/t/x1.jsonl")
-            ]),
-        );
-        let answer = vessa(json!([
-            {"agent": "claude", "id": "c1", "totals": [entry(1_000, 9, None)],
-             "totals_with_subagents": [entry(1_500, 90_000, None)]},
-            {"agent": "codex", "id": "x1", "totals": [entry(500, 10_000, None)]},
-        ]));
-        let read = read_usage(&answer, &mut Vec::new()).unwrap();
-        // A session's usage is its subagents' too; cache reads apart;
-        // No spending is read or calculated.
-        assert_eq!(usage_of(&s, &read), cost(Some(2_000), Some(100_000)));
-    }
-
-    #[test]
-    fn usage_never_joins_another_agent_an_ambiguous_id_or_a_claim() {
-        let answer = vessa(json!([
-            {"agent": "codex", "id": "c1", "totals": [entry(1_000, 0, Some(5))]},
-            {"agent": "claude", "id": "dup", "totals": [entry(1, 0, Some(1))]},
-            {"agent": "claude", "id": "dup", "totals": [entry(2, 0, Some(2))]},
-        ]));
-        let mut gaps = Vec::new();
-        let read = read_usage(&answer, &mut gaps).unwrap();
-        assert!(gaps
-            .iter()
-            .any(|n| n.contains("dup") && n.contains("twice")));
-        let unknown = TokenUsage::default();
-        // Another agent's session of the same id is not this one.
-        let other = session("oh-1", json!([native("claude", "c1", "/t/c1.jsonl")]));
-        assert_eq!(usage_of(&other, &read), unknown);
-        let twice = session("oh-2", json!([native("claude", "dup", "/t/d.jsonl")]));
-        assert_eq!(usage_of(&twice, &read), unknown);
-        // Only the agent's environment named it: no transcript was read.
-        let mut claimed = native("codex", "c1", usage::ENV_SOURCE);
-        claimed["testimony"] = json!(true);
-        assert_eq!(usage_of(&session("oh-3", json!([claimed])), &read), unknown);
-    }
-
-    #[test]
-    fn missing_usage_stays_unknown_and_legacy_spending_is_ignored() {
-        let answer = vessa(json!([
-            {"agent": "claude", "id": "a", "totals": [entry(10, 1, Some(7)), entry(5, 1, None)]},
-            {"agent": "claude", "id": "b", "totals": []},
-            {"agent": "claude", "id": "c", "totals": [entry(3, 4, Some(2))]},
-        ]));
-        let read = read_usage(&answer, &mut Vec::new()).unwrap();
-        let of = |ids: &[&str]| {
-            let natives: Vec<Value> = ids
-                .iter()
-                .map(|id| native("claude", id, &format!("/t/{id}.jsonl")))
-                .collect();
-            usage_of(&session("oh", json!(natives)), &read)
-        };
-        assert_eq!(
-            of(&["a"]),
-            cost(Some(15), Some(2)),
-            "legacy spending does not affect token totals"
-        );
-        assert_eq!(of(&["b"]), TokenUsage::default(), "no totals is unknown");
-        assert_eq!(
-            of(&["c", "missing"]),
-            TokenUsage::default(),
-            "one not found"
-        );
-        assert_eq!(of(&["c"]), cost(Some(3), Some(4)));
-        let wrong = json!({"schema": "vessa-other.v1", "sessions": []});
-        assert!(read_usage(&wrong, &mut Vec::new()).is_err());
-    }
-
-    #[test]
-    fn token_only_v2_and_legacy_v1_have_the_same_token_evidence() {
-        let expected = TokenUsage {
-            tokens: Some(35),
-            cache_reads: Some(400),
-        };
-        let entries = json!([{"input_tokens":20,"output_tokens":10,
-            "cache_write_tokens":5,"cache_read_tokens":400}]);
-        let mut answer = vessa(json!([{"agent":"pi","id":"pi-1",
-            "totals":entries,"limitations":[]}]));
-        let mut gaps = Vec::new();
-        let read = read_usage(&answer, &mut gaps).unwrap();
-        assert_eq!(read[&("pi".into(), "pi-1".into())], Some(expected.clone()));
-        assert!(gaps.is_empty());
-        answer["schema"] = json!("vessa-usage.v1");
-        answer["sessions"][0]["totals"][0]["estimated_usd_micros"] = json!(9_000_000);
-        let legacy = read_usage(&answer, &mut gaps).unwrap();
-        assert_eq!(legacy[&("pi".into(), "pi-1".into())], Some(expected));
-        assert!(gaps.is_empty());
-        answer["sessions"][0]["totals"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("input_tokens");
-        let missing = read_usage(&answer, &mut gaps).unwrap();
-        assert_eq!(
-            missing[&("pi".into(), "pi-1".into())]
-                .as_ref()
-                .unwrap()
-                .tokens,
-            None
-        );
-    }
-
-    #[test]
     fn a_failed_part_keeps_what_it_held_as_of_then() {
         let before = Part {
             as_of_ms: Some(5),
@@ -1364,57 +796,10 @@ mod tests {
         assert_eq!(pr(&json!({})), None);
     }
 
-    // ---- the first words typed, and the secrets seen (Yair, 2026-10-28) ----
+    // ---- the secrets seen (Yair, 2026-10-28) ----
 
     const NOW: i64 = 1_800_000_000_000;
     const HOUR: i64 = 3_600_000;
-
-    /// A session that ran from `start` to `end`, with its agent's own
-    /// sessions `natives`.
-    fn ran(id: &str, start: i64, end: i64, natives: Value) -> Session {
-        let mut session = session(id, natives);
-        session.started_ms = start;
-        session.left.as_mut().unwrap().ended_ms = end;
-        session
-    }
-
-    fn heard(agent: &str, session: &str, at_ms: Option<i64>, text: &str) -> Value {
-        json!({"agent": agent, "session": session, "parent": null, "kind": "message",
-               "id": null, "at": at_ms.map(intake::rfc3339_ms), "cwd": "/r/ohjaa",
-               "text": text, "question": null, "reply": null,
-               "source": "/t/x.jsonl", "line": 1})
-    }
-
-    fn listed(messages: Value, warnings: Value) -> Vec<u8> {
-        json!({"schema": "vessa-messages.v1", "messages": messages, "sessions": [],
-               "coverage": {"gaps": [], "limitations": []}, "warnings": warnings,
-               "redacted": 0, "redacted_by_rule": {}})
-        .to_string()
-        .into_bytes()
-    }
-
-    #[test]
-    fn the_first_words_typed_are_cut_at_a_word_to_about_seventy_characters() {
-        assert_eq!(
-            excerpt("  fix   the\n\tparser  ").as_deref(),
-            Some("fix the parser")
-        );
-        assert_eq!(excerpt(" \n\t "), None);
-        let long = "make the digest show the first thing I typed in each session, not \
-                    its intent, which nobody reads";
-        let cut = excerpt(long).unwrap();
-        assert!(cut.chars().count() <= EXCERPT_CHARS, "{cut}");
-        let kept = cut.strip_suffix('…').expect("said cut");
-        assert!(
-            long.starts_with(kept) && long[kept.len()..].starts_with(' '),
-            "cut at a word: {cut}"
-        );
-        assert!(kept.chars().count() > EXCERPT_CHARS - 15, "about 70: {cut}");
-        // A word longer than all the room is cut inside it.
-        let word = excerpt(&"x".repeat(200)).unwrap();
-        assert_eq!(word.chars().count(), EXCERPT_CHARS);
-        assert!(word.ends_with('…'));
-    }
 
     #[test]
     fn malformed_scan_coverage_does_not_advance_the_complete_scan() {
@@ -1434,98 +819,6 @@ mod tests {
             );
         }
         assert_eq!(before.read_ms, Some(NOW - HOUR));
-    }
-
-    #[test]
-    fn each_session_shows_the_first_words_typed_in_it_by_its_own_agent() {
-        let start = NOW - 3 * HOUR;
-        let end = NOW - HOUR;
-        let own = ran(
-            "oh-1",
-            start,
-            end,
-            json!([native("claude", "c1", "/t/c1.jsonl")]),
-        );
-        let mut claim = native("claude", "c9", usage::ENV_SOURCE);
-        claim["testimony"] = json!(true);
-        let claimed = ran("oh-2", start, end, json!([claim]));
-        let quiet = ran(
-            "oh-3",
-            start,
-            end,
-            json!([native("claude", "c3", "/t/c3.jsonl")]),
-        );
-        let document = listed(
-            json!([
-                heard(
-                    "claude",
-                    "c1",
-                    Some(start - 60_000),
-                    "an earlier run, resumed"
-                ),
-                heard(
-                    "codex",
-                    "c1",
-                    Some(start + 1_000),
-                    "another agent's session"
-                ),
-                heard(
-                    "claude",
-                    "c1/agent-a1",
-                    Some(start + 1_000),
-                    "to a subagent"
-                ),
-                heard("claude", "c1", Some(start + 9_000), "the second thing"),
-                heard("claude", "c1", None, "no time"),
-                heard("claude", "c1", Some(start + 2_000), "   "),
-                heard(
-                    "claude",
-                    "c1",
-                    Some(start + 5_000),
-                    "  the first\n thing  typed "
-                ),
-                heard("claude", "c1", Some(end + 60_000), "after it ended"),
-                heard("claude", "c9", Some(start + 1_000), "only claimed"),
-            ]),
-            json!([]),
-        );
-        let (heard, gaps) = read_messages(Some(0), &document, "").unwrap();
-        assert!(gaps.is_empty(), "{gaps:?}");
-        let typed = first_typed(&[&own, &claimed, &quiet], &heard, start - 1_000);
-        assert_eq!(
-            typed,
-            BTreeMap::from([(
-                "oh-1".to_owned(),
-                Typed {
-                    text: "the first thing typed".into(),
-                    ended_ms: end,
-                }
-            )]),
-            "its own agent's, in its own time, found in its transcript"
-        );
-        // Read from after it began: its first words may lie before, so none.
-        assert!(first_typed(&[&own], &heard, start + 1_000).is_empty());
-    }
-
-    #[test]
-    fn a_message_list_vessa_cannot_give_is_said() {
-        let old = read_messages(Some(2), b"", "error: unrecognized subcommand 'messages'");
-        assert!(old.unwrap_err().contains("update vessa"));
-        let broken = read_messages(Some(0), b"{\"schema\": \"vessa-mess", "");
-        assert!(broken.unwrap_err().contains("vessa-messages.v1"));
-        let other = json!({"schema": "vessa-messages.v2", "messages": []}).to_string();
-        assert!(read_messages(Some(0), other.as_bytes(), "").is_err());
-        let failed = read_messages(Some(1), b"", "vessa: disk on fire").unwrap_err();
-        assert!(failed.contains("disk on fire"), "{failed}");
-        // Partial: what it listed stands, and what it could not read is said.
-        let partial = listed(
-            json!([heard("claude", "c1", Some(NOW), "hi")]),
-            json!(["/h/.codex/sessions/r.jsonl: Permission denied (os error 13)"]),
-        );
-        let (heard, gaps) = read_messages(Some(4), &partial, "vessa: partial").unwrap();
-        assert_eq!(heard.len(), 1);
-        assert_eq!(gaps.len(), 1, "{gaps:?}");
-        assert!(gaps[0].contains("Permission denied"), "{gaps:?}");
     }
 
     fn scan(complete: bool, unreadable: Value, findings: Value) -> Vec<u8> {
@@ -1837,18 +1130,9 @@ mod tests {
     }
 
     #[test]
-    fn first_words_and_secrets_are_kept_only_for_the_window_the_digest_shows() {
+    fn secrets_are_kept_only_for_the_window_the_digest_shows() {
         let from = NOW - 24 * HOUR;
         let mut collected = Collected::default();
-        for (id, ended_ms) in [("before", from - 1), ("in", from + 1)] {
-            collected.typed.value.insert(
-                id.into(),
-                Typed {
-                    text: "words".into(),
-                    ended_ms,
-                },
-            );
-        }
         let finding = |at_ms: Option<i64>, found_ms: i64| Finding {
             agent: "claude".into(),
             session: "s".into(),
@@ -1866,7 +1150,6 @@ mod tests {
             finding(None, from + 1),
         ];
         collected.keep_window(from);
-        assert_eq!(collected.typed.value.keys().collect::<Vec<_>>(), vec!["in"]);
         let kept: Vec<(Option<i64>, i64)> = collected
             .secrets
             .value

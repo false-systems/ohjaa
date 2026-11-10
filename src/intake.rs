@@ -62,6 +62,14 @@ pub fn rfc3339_ms(at_ms: i64) -> String {
     format!("{}.{:03}Z", &at[..at.len() - 1], at_ms.rem_euclid(1000))
 }
 
+/// A time for people. Always UTC, and always says so: a bare 23:53 reads as
+/// local time to anyone east or west of Greenwich.
+pub fn clock(ms: i64) -> String {
+    let full = rfc3339(ms.div_euclid(1000));
+    // "2026-09-26T10:02:03Z" → "2026-09-26 10:02 UTC"
+    format!("{} {} UTC", &full[..10], &full[11..16])
+}
+
 pub fn now_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1042,126 +1050,6 @@ pub fn reverts(repos: &[PathBuf], since_ms: i64, warnings: &mut Vec<String>) -> 
     out
 }
 
-// ---- sessions ---------------------------------------------------------------
-
-/// What each ended session's agent said at leaving, as candidates. Its
-/// testimony, not a fact: the drafter weighs it, and a person decides.
-pub fn handover_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candidate> {
-    let mut out = Vec::new();
-    for session in sessions {
-        let Some(handover) = &session.handover else {
-            continue;
-        };
-        for (label, value) in [
-            ("unfinished", &handover.unfinished),
-            ("for the next agent", &handover.next),
-            ("surprised by", &handover.surprised),
-        ] {
-            if let Some(value) = value.as_deref().and_then(clean) {
-                out.push(Candidate {
-                    source: "handover",
-                    at_ms: handover.at_ms,
-                    at: rfc3339(handover.at_ms.div_euclid(1000)),
-                    place: session.repo.clone(),
-                    who: session.agent.clone(),
-                    context: format!("session {} ({}), its handover", session.id, session.intent),
-                    text: format!("{label}: {value}"),
-                    session: Some(session.id.clone()),
-                });
-            }
-        }
-    }
-    out
-}
-
-/// What ohjaa observed going wrong in each ended session, as candidates: its
-/// own commit that sykli refused at the default branch or a pull request head
-/// (its flags: never what could not be checked, nor what is not shown to be
-/// its); an agent that exited non-zero; a missing handover; a session whose
-/// ohjaa was gone before leaving. Observed facts, not anyone's words: the
-/// drafter weighs them like any candidate, and a person decides.
-pub fn observed_candidates(sessions: &[crate::sessions::Session]) -> Vec<Candidate> {
-    use crate::sessions::Exit;
-    let mut out = Vec::new();
-    for session in sessions {
-        let Some(left) = &session.left else {
-            continue;
-        };
-        // Only the session's own refused work is a lesson: a broken tip it is
-        // not shown to have pushed, or one never checked, is said, not taught.
-        let mut seen: Vec<String> = crate::sessions::flags(session)
-            .into_iter()
-            .filter(|flag| flag.own)
-            .map(|flag| format!("{} ({})", flag.headline, flag.why))
-            .collect();
-        if left.orphaned {
-            seen.push(
-                "its ohjaa was gone before leaving; the session was closed as orphaned at \
-                 a later launch, and nothing it did was observed"
-                    .to_owned(),
-            );
-        } else {
-            match left.exit {
-                Exit::Code { code: 0 } => {}
-                Exit::Code { code } => seen.push(format!("the agent exited with code {code}")),
-                Exit::Signal { signal } => {
-                    seen.push(format!("the agent was killed by signal {signal}"))
-                }
-                Exit::Unknown => seen.push("the agent's exit could not be observed".to_owned()),
-            }
-            if session.handover.is_none() {
-                seen.push("the agent left no handover".to_owned());
-            }
-        }
-        for what in seen {
-            out.push(Candidate {
-                source: "observed",
-                at_ms: left.ended_ms,
-                at: rfc3339(left.ended_ms.div_euclid(1000)),
-                place: session.repo.clone(),
-                who: "ohjaa".to_owned(),
-                context: format!(
-                    "session {} ({}, {}), observed by ohjaa, not said by anyone",
-                    session.id, session.agent, session.intent
-                ),
-                text: format!("in session {}: {what}", session.id),
-                session: Some(session.id.clone()),
-            });
-        }
-    }
-    out
-}
-
-/// Whether a transcript candidate falls inside this session: its time window,
-/// in its repository (or below it).
-fn in_window(candidate: &Candidate, session: &crate::sessions::Session) -> bool {
-    let ended = session.left.as_ref().map_or(i64::MAX, |left| left.ended_ms);
-    candidate.at_ms >= session.started_ms
-        && candidate.at_ms <= ended
-        && Path::new(&candidate.place).starts_with(&session.repo)
-}
-
-/// Whether what was said falls inside one of these sessions.
-pub fn within_sessions(candidate: &Candidate, sessions: &[crate::sessions::Session]) -> bool {
-    sessions.iter().any(|session| in_window(candidate, session))
-}
-
-/// Every candidate found that is this session's: what was said in its window
-/// and repository, its handover, and what ohjaa observed in it. The session
-/// is drafted from once each of them has been handled, in however many runs.
-pub fn members(session: &crate::sessions::Session, found: &[Candidate]) -> Vec<Key> {
-    let own = std::slice::from_ref(session);
-    let said = found
-        .iter()
-        .filter(|c| SAID.contains(&c.source) && in_window(c, session));
-    handover_candidates(own)
-        .iter()
-        .chain(&observed_candidates(own))
-        .chain(said)
-        .map(Candidate::key)
-        .collect()
-}
-
 // ---- secrets ----------------------------------------------------------------
 //
 // What people paste to agents includes credentials: the review of #56 found
@@ -1390,11 +1278,7 @@ fn names_a_secret(word: &str) -> bool {
 const INSTRUCTIONS: &str = "\
 You maintain a knowledge graph that steers coding agents (Claude, Codex) for the
 people they work for. Below are candidates: messages people wrote while working
-with agents, comments on pull requests, reverted commits, and failures ohjaa
-observed in agent sessions (source \"observed\": work that reached the default
-branch without passing evidence, a non-zero exit, a missing handover, a session
-cut off). An observed failure is a fact, not anyone's words: cite it as observed,
-and draft from it only a lesson that would have prevented it. Find the ones that
+with agents, comments on pull requests and reverted commits. Find the ones that
 carry durable knowledge an agent should have known: a correction of how an agent
 behaved, a decision, a fact about the environment, a preference about how work
 is done, or a lesson from something that went wrong. Draft each as a node.
@@ -1417,7 +1301,7 @@ Python\", \"use Lima\", \"I asked you twice\"). For such a candidate, name each
 current node it re-teaches in \"reteaches\", by the candidate's number, and draft
 nothing for it, unless it also adds to the node: then draft a refinement too.
 Only a person's words re-teach (a message in an agent session, a review
-comment), never an observed failure, a handover or a revert. Name only nodes
+comment), never a revert. Name only nodes
 listed with status current, by their exact ids.
 
 Scopes:
@@ -2425,26 +2309,11 @@ pub fn draft_pending(
     drafted
 }
 
-/// A session not yet drafted from, as one run sees it.
-#[derive(Debug, Clone)]
-pub struct Undrafted {
-    pub id: String,
-    pub started_ms: i64,
-    /// Its candidates among those found, when this run took it on (it has
-    /// ended, and the run reads transcripts). It brings them back to every
-    /// run until each is handled. `None` while it waits.
-    pub members: Option<Vec<Key>>,
-    /// The run read its whole window: only then is it drafted from.
-    pub whole: bool,
-}
-
 /// What a run leaves behind, once it has drafted what it could.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settled {
     /// Where the cursor moves to, when it moves.
     pub cursor: Option<i64>,
-    /// The sessions taken on every candidate of which is now handled.
-    pub drafted: Vec<String>,
     /// Candidates found and not handled: the next run's work.
     pub left: usize,
 }
@@ -2485,35 +2354,19 @@ pub struct Window {
 
 /// Settle a run, and forget what no later run can find again.
 ///
-/// A queued session brings its own candidates back to every run until each
-/// is handled. Any other candidate comes back only while it lies after the
-/// cursor, so the first of them not handled holds the cursor: it moves past
-/// the handled candidates found after `since`, up to that one, or to
-/// `started` when none is left. It moves only after a complete run, and
-/// never to `since` or before. `sessions` is every session not yet drafted
-/// from, or `None` when the log could not be read; then nothing is
-/// forgotten.
-pub fn settle(
-    found: &[Candidate],
-    handled: &mut Handled,
-    sessions: Option<&[Undrafted]>,
-    window: Window,
-) -> Settled {
+/// A candidate comes back only while it lies after the cursor, so the first
+/// not handled holds the cursor: it moves past the handled candidates found
+/// after `since`, up to that one, or to `started` when none is left. It moves
+/// only after a complete run, and never to `since` or before.
+pub fn settle(found: &[Candidate], handled: &mut Handled, window: Window) -> Settled {
     let Window {
         since,
         started,
         complete,
     } = window;
-    let returning: std::collections::HashSet<Key> = sessions
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|s| s.members.as_ref())
-        .flatten()
-        .copied()
-        .collect();
     let first_held = found
         .iter()
-        .filter(|c| !handled.contains(c) && !returning.contains(&c.key()))
+        .filter(|c| !handled.contains(c))
         .map(|c| c.at_ms)
         .min();
     let through = found
@@ -2529,36 +2382,14 @@ pub fn settle(
     }
     .map(|at| at.min(started))
     .filter(|at| *at > since);
-    let drafted: Vec<String> = sessions
-        .unwrap_or_default()
-        .iter()
-        .filter(|s| {
-            s.whole
-                && s.members
-                    .as_ref()
-                    .is_some_and(|members| members.iter().all(|key| handled.answered.contains(key)))
-        })
-        .map(|s| s.id.clone())
-        .collect();
     let left = found.iter().filter(|c| !handled.contains(c)).count();
-    // A key can come back only from a cursor source after the cursor, from a
-    // session not yet drafted from (never before it started), or from what
-    // this run found. Everything else is forgotten.
-    if let (Some(cursor), Some(sessions)) = (cursor, sessions) {
-        let floor = sessions
-            .iter()
-            .filter(|s| !drafted.contains(&s.id))
-            .map(|s| s.started_ms)
-            .min()
-            .unwrap_or(i64::MAX);
+    // A key can come back only from after the cursor, or from what this run
+    // found. Everything else is forgotten.
+    if let Some(cursor) = cursor {
         let seen: std::collections::HashSet<Key> = found.iter().map(Candidate::key).collect();
-        handled.retain(|key| key.at_ms > cursor || key.at_ms >= floor || seen.contains(key));
+        handled.retain(|key| key.at_ms > cursor || seen.contains(key));
     }
-    Settled {
-        cursor,
-        drafted,
-        left,
-    }
+    Settled { cursor, left }
 }
 
 fn handled_path(dirs: &Dirs) -> PathBuf {
@@ -4524,11 +4355,7 @@ mod tests {
             session: None,
         };
         let (old, a, b, z) = (c(3, "old"), c(10, "a"), c(20, "b"), c(30, "c"));
-        let settle_with = |found: &[Candidate],
-                           done: &[&Candidate],
-                           sessions: Option<&[Undrafted]>,
-                           since,
-                           complete| {
+        let settle_with = |found: &[Candidate], done: &[&Candidate], since, complete| {
             let mut handled = Handled::default();
             handled.answered.extend(done.iter().map(|c| c.key()));
             let window = Window {
@@ -4536,40 +4363,28 @@ mod tests {
                 started: 100,
                 complete,
             };
-            settle(found, &mut handled, sessions, window)
+            settle(found, &mut handled, window)
         };
         let found = [a.clone(), b.clone(), z.clone()];
         // The first candidate not handled holds it.
-        let held = settle_with(&found, &[&a, &z], None, 5, true);
+        let held = settle_with(&found, &[&a, &z], 5, true);
         assert_eq!((held.cursor, held.left), (Some(10), 1));
         // Nothing left: to where the run started, but only when every
         // source was read; after a warning, or a run of some sources, it
         // stays: it is one cursor for all of them.
         assert_eq!(
-            settle_with(&found, &[&a, &b, &z], None, 5, true).cursor,
+            settle_with(&found, &[&a, &b, &z], 5, true).cursor,
             Some(100)
         );
-        assert_eq!(
-            settle_with(&found, &[&a, &b, &z], None, 5, false).cursor,
-            None
-        );
+        assert_eq!(settle_with(&found, &[&a, &b, &z], 5, false).cursor, None);
         // Nothing handled after `since`: it stays.
-        assert_eq!(settle_with(&found, &[], None, 5, true).cursor, None);
-        // An older candidate no session brings back holds it where it is...
+        assert_eq!(settle_with(&found, &[], 5, true).cursor, None);
+        // An older candidate not handled holds it where it is.
         let found = [old.clone(), a.clone()];
-        assert_eq!(settle_with(&found, &[&a], None, 5, true).cursor, None);
-        // ...and one a queued session brings back does not.
-        let queued = [Undrafted {
-            id: "oh-1".to_owned(),
-            started_ms: 1,
-            members: Some(vec![old.key()]),
-            whole: true,
-        }];
-        let settled = settle_with(&found, &[&a], Some(&queued), 5, true);
-        assert_eq!((settled.cursor, settled.drafted.len()), (Some(100), 0));
+        assert_eq!(settle_with(&found, &[&a], 5, true).cursor, None);
         // A window that begins after the run started moves nothing.
         assert_eq!(
-            settle_with(std::slice::from_ref(&a), &[&a], None, 200, true).cursor,
+            settle_with(std::slice::from_ref(&a), &[&a], 200, true).cursor,
             None
         );
         // Where a run reads from: `--since`, else the cursor, else the

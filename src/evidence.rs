@@ -14,7 +14,7 @@
 //! asking whether what nothing touches still holds. Suggestions only: ohjaa
 //! never changes a node itself.
 //!
-//! It is history, like the session log
+//! It is history
 //! (`$XDG_STATE_HOME/ohjaa/knowledge-evidence.json`): deleting it loses no
 //! knowledge, only the counts. A message answered for again (its progress
 //! lost, or sent again with `--retry-failed`) is the same key, and counts

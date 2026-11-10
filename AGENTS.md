@@ -8,9 +8,9 @@ This is **ohjaa**, an internal False Systems tool. Toimija reports facts and ref
 
 These mirror `.toimija/repo.yaml`; keep both in sync.
 
-- One Rust crate, one `ohjaa` binary. Dependencies: anyhow, clap, serde, serde_json, the vendored faija-knowledge, redb (the session log) and libc; tests also sha2 and serde_yaml. Every addition needs a reason.
+- One Rust crate, one `ohjaa` binary. Dependencies: anyhow, clap, serde, serde_json, the vendored faija-knowledge and libc; tests also sha2 and serde_yaml. Every addition needs a reason.
 - Ohjaa holds Knowledge; toimija reports facts. Never reimplement what toimija derives: shell out to its CLI and read its --json.
-- Ohjaa stores Knowledge, in git, and a machine-local session log. Everything else is derived when asked; the human view's snapshot is the one cache. No knowledge index and no daemon.
+- Ohjaa stores Knowledge, in git. Everything else is derived when asked; the human view's snapshot is the one cache. No knowledge index and no daemon.
 - The workflow lives in the home (~/.config/ohjaa), outside every repository. No file, hook or config of a repository's checkout is written.
 - Ohjaa checks nothing and refuses nothing for the workflow: the checks a commit must pass, and refusing a push without them, are sykli's, through the repository's own hooks.
 - Agents propose; only a person makes Knowledge current, retires it or rejects it. What ohjaa writes into a repository names no tool, and a public one is sent nothing that names a private one.

@@ -90,8 +90,7 @@ const REPOS: &str = concat!(
 
 const AGENTS: &str = "# Agent guide\n\nRead this first.\n\n## Languages\n\nRust.\n";
 
-/// Never the real toimija: no sessions anywhere, no context, and `run`
-/// ends at once, so `ohjaa run` records a session and its briefing.
+/// Never the real toimija: no sessions anywhere, no context.
 const TOIMIJA_STUB: &str = r#"#!/bin/sh
 case "$1" in
   sessions) echo '{"sessions":[],"warnings":[],"coverage":{"status":"available"}}';;

@@ -3,7 +3,7 @@
 //! person's real knowledge.
 //!
 //! The stub differentiates per repo by cwd (`*broken*`) and per invocation by
-//! environment, so one script covers fleet, refusal and launch paths.
+//! environment, so one script covers the fleet and its refusals.
 
 #![cfg(unix)]
 
@@ -12,10 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const STUB: &str = r#"#!/bin/sh
-# The window between the spawn and the record: ohjaa killed at once.
-if [ -n "${OHJAA_STUB_KILL_PARENT:-}" ] && [ "$1" = run ]; then kill -9 "$PPID"; fi
 printf '%s|%s\n' "$PWD" "$*" >> "$OHJAA_STUB_CALLS"
-if [ "$1" = run ]; then printf '%s\n' "$@" > "$OHJAA_STUB_ARGV"; fi
 case "$PWD" in
   *broken*) echo "boom: not a Git repository" >&2; exit 1;;
 esac
@@ -39,23 +36,10 @@ case "$1" in
     exit 0;;
   context) cat "${OHJAA_STUB_CONTEXT:?}"; exit 0;;
 esac
-# Anything else is `run`. With OHJAA_STUB_RUN_AGENT set it runs the agent
-# command after `--`, as toimija would; its exit status is what ohjaa returns.
-if [ -n "${OHJAA_STUB_RUN_AGENT:-}" ]; then
-  while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
-  shift
-  exec "$@"
-fi
-exit "${OHJAA_STUB_EXIT:-0}"
+exit 0
 "#;
 
-/// Never the real gh: no network, and a controlled answer. With
-/// OHJAA_STUB_GH_PR_BRANCH set, the branch of that name has a pull request
-/// (state OHJAA_STUB_GH_PR_STATE, default OPEN) whose head is that branch's
-/// commit here; `pr view` with no branch asks about the one checked out.
-/// `pr list --search <sha>` finds a merged pull request for
-/// OHJAA_STUB_GH_PR_SEARCH only (or the sha in the file
-/// OHJAA_STUB_GH_PR_SEARCH_FILE names). `api graphql` answers with the file
+/// Never the real gh: no network, and a controlled answer. `api graphql` answers with the file
 /// OHJAA_STUB_GH_GRAPHQL names, each call counted in `$HOME/gh-graphql-calls`;
 /// without it, gh is not logged in.
 const GH_STUB: &str = r#"#!/bin/sh
@@ -66,79 +50,18 @@ if [ "$1 $2" = "api graphql" ] && [ -n "${OHJAA_STUB_GH_GRAPHQL:-}" ]; then
   cat "$OHJAA_STUB_GH_GRAPHQL"
   exit 0
 fi
-if [ "$1 $2" = "pr list" ]; then
-  sha=""
-  while [ $# -gt 0 ]; do case "$1" in --search) sha="$2"; shift;; esac; shift; done
-  if [ -n "${OHJAA_STUB_GH_PR_SEARCH_FILE:-}" ] && [ -f "$OHJAA_STUB_GH_PR_SEARCH_FILE" ]; then
-    OHJAA_STUB_GH_PR_SEARCH=$(cat "$OHJAA_STUB_GH_PR_SEARCH_FILE")
-  fi
-  if [ -n "$sha" ] && [ "$sha" = "${OHJAA_STUB_GH_PR_SEARCH:-}" ]; then
-    printf '[{"url":"https://github.com/o/r/pull/8","state":"MERGED","headRefOid":"%s"}]\n' "$sha"
-  else
-    echo '[]'
-  fi
-  exit 0
-fi
-if [ -n "${OHJAA_STUB_GH_PR_BRANCH:-}" ]; then
-  case "$3" in -*|"") branch="$(git branch --show-current)";; *) branch="$3";; esac
-  if [ "$branch" = "$OHJAA_STUB_GH_PR_BRANCH" ]; then
-    head=$(git rev-parse --verify -q "refs/heads/$branch" || git rev-parse --verify -q "refs/remotes/origin/$branch")
-    printf '{"url":"https://github.com/o/r/pull/7","state":"%s","headRefOid":"%s"}\n' \
-      "${OHJAA_STUB_GH_PR_STATE:-OPEN}" "$head"
-    exit 0
-  fi
-  echo "no pull requests found for branch \"$branch\"" >&2
-  exit 1
-fi
 echo "gh: To get started with GitHub CLI, please run:  gh auth login" >&2
 exit 4
 "#;
 
-/// Never the real sykli. `verify --help` names `--commit` only with
-/// OHJAA_STUB_SYKLI_COMMIT set, and no sentence ohjaa could lean on.
-/// `verify <receipt> --contract <c> --commit <sha>` judges the commit alone,
-/// as every sykli with `--commit` does (sykli#67 as merged), checking in
-/// sykli's order and words: the contract the receipt was made under, that it
-/// ran exactly that commit's tree, cleanly, and then its outcome.
-const SYKLI_STUB: &str = r#"#!/bin/sh
-printf '%s|%s\n' "$PWD" "$*" >> "${OHJAA_STUB_SYKLI_CALLS:-/dev/null}"
-if [ "$1" = verify ] && [ "$2" = --help ]; then
-  echo "Usage: sykli verify [OPTIONS] <RECEIPT>"
-  echo "      --contract <CONTRACT>  Path to sykli.rs or a sykli-contract.v1 JSON file"
-  if [ -n "${OHJAA_STUB_SYKLI_COMMIT:-}" ]; then
-    echo "      --commit <REV>  Also require a clean run of this commit"
-  fi
-  exit 0
-fi
-[ "$1" = verify ] || exit 2
-receipt="$2"; shift 2
-sha=""
-while [ $# -gt 0 ]; do
-  case "$1" in --commit) sha="$2"; shift;; esac
-  shift
-done
-[ -n "$sha" ] || { echo "refused: commit expected a --commit" >&2; exit 2; }
-grep -q '"contract_hash":"forged"' "$receipt" && { echo "refused: contract expected c but got forged" >&2; exit 4; }
-tree=$(git rev-parse "$sha^{tree}") || exit 2
-ran=$(sed -n 's/.*"tree_oid":"\([0-9a-f]*\)".*/\1/p' "$receipt" | head -1)
-[ "$ran" = "$tree" ] || { echo "refused: commit expected $tree (the tree of commit $sha) but got $ran" >&2; exit 3; }
-grep -q '"dirty":false' "$receipt" || { echo "refused: clean expected a clean run but got dirty true" >&2; exit 3; }
-grep -q '"outcome":"passed"' "$receipt" || { echo "refused: outcome expected passed or cached with complete task records but got failed with 0 task records" >&2; exit 1; }
-exit 0
-"#;
-
-/// Never the real vessa. Its header listing, `sessions --json --headers`,
-/// prints the file OHJAA_STUB_VESSA_JSON names, else no sessions; it lists
-/// no other sessions, so a report that asked for the full listing would
-/// fail. `messages` lists, as
+/// Never the real vessa. `messages` lists, as
 /// `vessa-messages.v1`, every line of `$HOME/vessa-messages.jsonl` (one
 /// message each, as vessa writes them), whatever its `--since`: intake
 /// windows what it is given too. Each call's arguments go to
 /// `$HOME/vessa-calls`. With `$HOME/vessa-gap` or `$HOME/vessa-warning` (each
 /// a JSON string) the list is partial, with that gap (a store vessa does not
 /// read) or source warning (one it could not read), and it exits 4. With
-/// `$HOME/vessa-old` it is a vessa older than `messages`. `usage` prints
-/// `$HOME/vessa-usage.json`, else no sessions, its arguments logged too.
+/// `$HOME/vessa-old` it is a vessa older than `messages`.
 /// `secrets` answers `vessa-secrets.v1`: `$HOME/vessa-secrets.json` as it
 /// is, else a whole scan that found nothing, and exits with what
 /// `$HOME/vessa-secrets-exit` holds (else 0); with `$HOME/vessa-old-secrets`
@@ -180,18 +103,8 @@ if [ "$1" = messages ]; then
   [ "$code" = 4 ] && echo "vessa: partial message list (exit 4): 1 source warning, 0 limitations" >&2
   exit "$code"
 fi
-if [ "$1" = usage ]; then
-  printf '%s\n' "$*" >> "$HOME/vessa-calls"
-  if [ -f "$HOME/vessa-usage.json" ]; then cat "$HOME/vessa-usage.json"
-  else echo '{"schema":"vessa-usage.v2","sessions":[],"warnings":[]}'; fi
-  exit 0
-fi
-[ "$*" = "sessions --json --headers" ] || { echo "vessa stub: not the header listing: $*" >&2; exit 64; }
-if [ -n "${OHJAA_STUB_VESSA_JSON:-}" ]; then
-  cat "$OHJAA_STUB_VESSA_JSON"
-else
-  echo '{"schema":"vessa-session-headers.v1","sessions":[],"warnings":[]}'
-fi
+echo "vessa stub: not messages or secrets: $*" >&2
+exit 64
 "#;
 
 /// A source warning from vessa (`$HOME/vessa-warning`): a transcript it could
@@ -318,9 +231,6 @@ impl Fixture {
         // Never the real gh: no network, and a controlled answer.
         let gh = stub_dir.join("gh");
         write_executable(&gh, GH_STUB);
-        // Never the real sykli: `verify --help` names --commit only on demand.
-        let sykli = stub_dir.join("sykli");
-        write_executable(&sykli, SYKLI_STUB);
         // Never the real vessa: no native sessions unless a test lists some.
         let vessa = stub_dir.join("vessa");
         write_executable(&vessa, VESSA_STUB);
@@ -410,7 +320,6 @@ impl Fixture {
             .env("XDG_STATE_HOME", self.dir.join("state"))
             .env("OHJAA_OURS", self.dir.join("ours"))
             .env("OHJAA_TODAY", "2026-09-24")
-            .env("OHJAA_STUB_ARGV", self.dir.join("argv.txt"))
             .env("OHJAA_STUB_CALLS", self.dir.join("calls.txt"))
             .env("OHJAA_STUB_SESSIONS", self.dir.join("sessions.json"))
             .env("OHJAA_STUB_OUTSIDE_SESSIONS", self.dir.join("outside.json"))
@@ -2324,65 +2233,6 @@ fn check_counts_an_unreadable_proposal_as_an_error() {
     fixture.cleanup();
 }
 
-// ---- the session lifecycle ---------------------------------------------------
-
-/// A stand-in `claude`: it keeps its launch prompt in its transcript, as
-/// Claude Code does, in the sandbox HOME. The real launch prompt is
-/// toimija's, with ohjaa's briefing in it; the stub toimija passes none, so
-/// this one says the briefing's handshake from `OHJAA_SESSION` itself
-/// (with OHJAA_FAKE_NATIVE empty, it keeps no transcript). With
-/// OHJAA_FAKE_ORIENTED or OHJAA_FAKE_HANDED set it then reads back or hands
-/// over with `$OHJAA_FAKE_OHJAA`, from a shell whose CLAUDE_CODE_SESSION_ID is
-/// that, as Claude Code's tool shells have it (`-`: none); two ids are a
-/// `/clear` between them. With OHJAA_FAKE_KILL_OHJAA set it then kills the
-/// ohjaa that launched it. Its records carry the time to the fraction of a
-/// second (`%N`), as Claude Code's do: leaving compares them with the
-/// launch's own instant.
-const FAKE_CLAUDE: &str = r#"#!/bin/sh
-dir="$HOME/.claude/projects/-work"
-mkdir -p "$dir"
-now=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
-if [ -n "${OHJAA_FAKE_NATIVE:-}" ]; then
-printf '{"type":"user","sessionId":"%s","cwd":"%s","timestamp":"%s","isSidechain":false,"message":{"role":"user","content":"How this session works (ohjaa):\\nThis session is %s; its intent is in-1, new."}}\n' \
-  "$OHJAA_FAKE_NATIVE" "$(pwd -P)" "$now" "$OHJAA_SESSION" >> "$dir/$OHJAA_FAKE_NATIVE.jsonl"
-fi
-if [ "${OHJAA_FAKE_ORIENTED:-}" = "-" ]; then
-  env -u CLAUDE_CODE_SESSION_ID "$OHJAA_FAKE_OHJAA" oriented 'goal: x; rules: y; nobody' || exit 9
-elif [ -n "${OHJAA_FAKE_ORIENTED:-}" ]; then
-  CLAUDE_CODE_SESSION_ID="$OHJAA_FAKE_ORIENTED" "$OHJAA_FAKE_OHJAA" oriented 'goal: x; rules: y; nobody' || exit 9
-fi
-if [ -n "${OHJAA_FAKE_HANDED:-}" ]; then
-  CLAUDE_CODE_SESSION_ID="$OHJAA_FAKE_HANDED" "$OHJAA_FAKE_OHJAA" handover --next 'z' || exit 9
-fi
-if [ -n "${OHJAA_FAKE_KILL_OHJAA:-}" ]; then kill -9 "$PPID"; fi
-exit 0
-"#;
-
-fn fake_claude(fixture: &Fixture) {
-    let path = fixture.stub_dir.join("claude");
-    write_executable(&path, FAKE_CLAUDE);
-}
-
-/// `ohjaa run` whose stub toimija really runs `sh -c <script>` as the agent.
-fn run_session(fixture: &Fixture, repo: &Path, script: &str) -> (String, String, Option<i32>) {
-    output_of(
-        fixture
-            .ohjaa()
-            .args([
-                "run",
-                "sh",
-                "--intent",
-                "retry uploads",
-                "--no-briefing",
-                "--",
-                "-c",
-                script,
-            ])
-            .env("OHJAA_STUB_RUN_AGENT", "1")
-            .current_dir(repo),
-    )
-}
-
 #[test]
 fn graph_shows_a_nodes_neighbours() {
     if !git_available() {
@@ -2925,166 +2775,11 @@ fn no_repositories_under_the_roots_holds_the_cursor_and_says_so() {
     fixture.cleanup();
 }
 
-// ---- review fixes: each test failed before its fix -----------------------------
-
-// ---- review of #38: each test failed before its fix ---------------------------
-
-// ---- where work happens (audit 2026-10-09): each test failed before its fix ----
-
-/// Two sessions launched at once in one checkout of a new repository, x
-/// and y, each making a worktree and a commit there while the other is in
-/// the checkout, one after the other (`after`: the mark it waits for).
-/// Never at once: two `git worktree add`s in one repository race in git
-/// itself, each reading the other's admin folder while it is written
-/// ("fatal: failed to read .git/worktrees/y/commondir"). Neither agent
-/// waits for the other for ever: one that stops early still says it is
-/// done, and each gives up on a mark that is not there `deadline` seconds
-/// after it started (the other's `ohjaa run` never started it). y waits
-/// `y_late` seconds more before its git. The two runs' outputs, x's first.
-fn shared_checkout(fixture: &Fixture, deadline: u64, y_late: u64) -> [std::process::Output; 2] {
-    let repo = fixture.make_git_repo("work");
-    let mark = |name: &str| fixture.dir.join(name);
-    let agent = |me: &str, other: &str, after: Option<&str>, late: u64| {
-        let turn = after.map_or_else(String::new, |after| {
-            format!("wait_for '{}'", mark(after).display())
-        });
-        format!(
-            "set -e
-            trap \"touch '{done}'\" EXIT
-            deadline=$(( $(date +%s) + {deadline} ))
-            wait_for() {{
-              while [ ! -e \"$1\" ]; do
-                [ \"$(date +%s)\" -lt \"$deadline\" ] || {{ echo \"{me}: no $1 within {deadline} s\" >&2; exit 1; }}
-                sleep 0.1
-              done
-            }}
-            touch '{started}'
-            wait_for '{their_start}'
-            sleep 1
-            {turn}
-            sleep {late}
-            git worktree add -q -b {me} '{wt}'
-            cd '{wt}' && echo {me} > {me}.txt && git add {me}.txt && git commit -q -m {me}
-            git rev-parse --short=7 HEAD > '{sha}'
-            touch '{done}'
-            wait_for '{their_done}'
-            touch '{end}'",
-            started = mark(&format!("{me}-started")).display(),
-            their_start = mark(&format!("{other}-started")).display(),
-            wt = fixture.dir.join("_worktrees").join(me).display(),
-            sha = mark(&format!("{me}-sha")).display(),
-            done = mark(&format!("{me}-done")).display(),
-            their_done = mark(&format!("{other}-done")).display(),
-            end = mark(&format!("{me}-end")).display(),
-        )
-    };
-    let launch = |me: &str, other: &str, after: Option<&str>, late: u64| {
-        fixture
-            .ohjaa()
-            .args([
-                "run",
-                "sh",
-                "--intent",
-                me,
-                "--no-briefing",
-                "--",
-                "-c",
-                &agent(me, other, after, late),
-            ])
-            .env("OHJAA_STUB_RUN_AGENT", "1")
-            .current_dir(&repo)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap()
-    };
-    let x = launch("x", "y", None, 0);
-    let y = launch("y", "x", Some("x-done"), y_late);
-    [x, y].map(|child| child.wait_with_output().unwrap())
-}
-
-/// What the two sessions of [`shared_checkout`] must have recorded: neither
-/// claims the other's commit, and each says why. Only for two agents that
-/// did all their work: both runs exited 0 (`ohjaa run` returns its agent's
-/// exit) and both agents got to their last step, past every wait. One that
-/// gave up waiting left before the other's commit, which then proves
-/// nothing.
-fn neither_claims_the_others_commit(fixture: &Fixture, outputs: &[std::process::Output; 2]) {
-    let records: Vec<String> = outputs
-        .iter()
-        .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
-        .collect();
-    for (output, me) in outputs.iter().zip(["x", "y"]) {
-        assert!(
-            output.status.success() && fixture.dir.join(format!("{me}-end")).exists(),
-            "{me} did not do all its work ({}):\n{}",
-            output.status,
-            records.join("\n")
-        );
-    }
-    let sha = |me: &str| {
-        fs::read_to_string(fixture.dir.join(format!("{me}-sha")))
-            .unwrap_or_else(|error| {
-                panic!("{me} made no commit ({error}):\n{}", records.join("\n"))
-            })
-            .trim()
-            .to_owned()
-    };
-    for (record, theirs) in records.iter().zip(["y", "x"]) {
-        let phases = record
-            .lines()
-            .find(|l| l.starts_with("phases"))
-            .unwrap_or_else(|| panic!("a record without phases:\n{}", records.join("\n")));
-        assert!(
-            !phases.contains(&sha(theirs)),
-            "a session never claims the other's commit: {phases}\n{record}"
-        );
-        assert!(
-            record.contains("shared        with oh-"),
-            "and says why: {record}"
-        );
-    }
-}
-
-#[test]
-fn a_wait_that_ran_out_in_the_two_sessions_test_never_passes_it() {
-    if !git_available() {
-        return;
-    }
-    // y is later than x's deadline (the re-review of #59, 130 s against
-    // 120): x gives up waiting for y to be done, after its own commit, and
-    // leaves; y commits once x is gone. The commits were not made while
-    // both sessions were there, so this must not pass.
-    let fixture = Fixture::new("shared-late");
-    let outputs = shared_checkout(&fixture, 3, 6);
-    let judged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        neither_claims_the_others_commit(&fixture, &outputs)
-    }));
-    assert!(
-        judged.is_err(),
-        "x gave up and left before y's commit, and the test passed:\n{}\n{}",
-        String::from_utf8_lossy(&outputs[0].stderr),
-        String::from_utf8_lossy(&outputs[1].stderr)
-    );
-    fixture.cleanup();
-}
-
-// ---- KATANA D4 ----------------------------------------------------------------
-
-/// `ohjaa usage export` (ohjaa-sessions.v1) from `repo`.
-fn export_of(fixture: &Fixture, repo: &Path) -> serde_json::Value {
-    let (stdout, stderr, code) =
-        output_of(fixture.ohjaa().args(["usage", "export"]).current_dir(repo));
-    assert_eq!(code, Some(0), "{stderr}");
-    serde_json::from_str(&stdout).unwrap()
-}
-
 // ---- the human view: `ohjaa line`, `ohjaa digest`, `ohjaa collect` --------
 
 /// What an agent's shell carries (the list `ohjaa line --help` names): a
 /// person's terminal has none, and these tests may run in an agent's.
-const AGENT_MARKERS: [&str; 17] = [
-    "OHJAA_SESSION",
+const AGENT_MARKERS: [&str; 16] = [
     "TOIMIJA_SESSION",
     "TOIMIJA_RUN",
     "CLAUDECODE",
@@ -3329,12 +3024,11 @@ fn line_says_nothing_and_moves_nothing_without_a_person_at_a_terminal() {
     }
     let fixture = Fixture::new("line-guard");
     fixture.human_view(false);
-    let repo = fixture.make_git_repo("work");
-    run_session(&fixture, &repo, "exit 0");
+    fixture.make_git_repo("work");
     let (stdout, _, code) = output_of(fixture.person().arg("line"));
     assert_eq!((stdout.as_str(), code), ("", Some(0)), "piped: nothing");
     for marker in [
-        "OHJAA_SESSION",
+        "TOIMIJA_SESSION",
         "CLAUDECODE",
         "CODEX_THREAD_ID",
         "CODEX_CI",
@@ -3457,7 +3151,6 @@ fn line_starts_no_git_and_touches_no_network() {
     let fixture = Fixture::new("line-quiet");
     fixture.human_view(false);
     let repo = fixture.make_git_repo("work");
-    run_session(&fixture, &repo, "exit 0");
     output_of(fixture.person().arg("collect"));
     // Every program it could start, each logging that it was started.
     let shims = fixture.dir.join("shims");
@@ -3848,8 +3541,7 @@ fn the_days_first_terminal_gets_its_digest_from_an_old_snapshot() {
     }
     let fixture = Fixture::new("human-old");
     fixture.human_view(false);
-    let repo = fixture.make_git_repo("work");
-    run_session(&fixture, &repo, "exit 0");
+    fixture.make_git_repo("work");
     output_of(fixture.person().arg("collect"));
     fixture.age_snapshot(9);
     let (daily, _) = on_a_terminal(
@@ -3883,7 +3575,7 @@ fn terminals_opened_together_say_a_line_once() {
     }
     let fixture = Fixture::new("human-claim");
     fixture.human_view(false);
-    let repo = fixture.make_git_repo("work");
+    fixture.make_git_repo("work");
     output_of(fixture.person().arg("collect"));
     on_a_terminal(
         fixture
@@ -3891,7 +3583,6 @@ fn terminals_opened_together_say_a_line_once() {
             .arg("line")
             .env("OHJAA_TODAY", "2026-10-27"),
     );
-    run_session(&fixture, &repo, "exit 0");
     // Something new: one more proposal waits.
     waiting_proposal(
         &fixture.dir.join("state/ohjaa/proposals/mine"),
@@ -4180,114 +3871,6 @@ fn secrets_report(
     .to_string()
 }
 
-/// Explicit opt-in: no build or runtime dependency on Vessa's repository.
-/// The real producer reads only the synthetic HOME made by this fixture.
-#[test]
-#[ignore = "set OHJAA_TEST_VESSA to an independently built Vessa binary"]
-fn real_vessa_producer_preserves_findings_excerpts_and_partial_retry_boundaries() {
-    let binary =
-        fs::canonicalize(std::env::var_os("OHJAA_TEST_VESSA").expect("set OHJAA_TEST_VESSA"))
-            .unwrap();
-    let fixture = Fixture::new("real-vessa");
-    fixture.human_view(false);
-    let repo = fixture.make_git_repo("work");
-    fixture
-        .set_context(r#"{"repo":{"name":"work","role":"synthetic integration","not_roles":[]}}"#);
-    fake_claude(&fixture);
-    let native = "7b45bb32-2a03-4ca5-8db4-425edc153b16";
-    let (stdout, stderr, code) = output_of(
-        fixture
-            .ohjaa()
-            .args(["run", "claude", "--intent", "interactive"])
-            .env("OHJAA_STUB_RUN_AGENT", "1")
-            .env("OHJAA_FAKE_NATIVE", native)
-            .current_dir(&repo),
-    );
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let started = export_of(&fixture, &repo)["sessions"][0]["started_ms"]
-        .as_i64()
-        .unwrap()
-        / 1000;
-    let secret = ["s", "k-", &"a1".repeat(12)].concat();
-    let transcript = fixture
-        .dir
-        .join(format!("home/.claude/projects/-work/{native}.jsonl"));
-    let records = [
-        serde_json::json!({"type":"user","sessionId":native,"cwd":repo,"timestamp":utc(started),"isSidechain":false,"message":{"role":"user","content":"Keep this synthetic input readable."}}),
-        serde_json::json!({"type":"assistant","sessionId":native,"timestamp":utc(started),"uuid":"synthetic-answer","requestId":"synthetic-request","message":{"id":"synthetic-answer","role":"assistant","model":"synthetic-model","content":[{"type":"text","text":"Synthetic response."}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}),
-        serde_json::json!({"type":"user","sessionId":native,"timestamp":utc(started),"message":{"role":"user","content":[{"type":"tool_result","content":secret}]}}),
-    ].iter().map(|v| format!("{v}\n")).collect::<String>();
-    fs::write(&transcript, &records).unwrap();
-    fs::remove_file(fixture.stub_dir.join("vessa")).unwrap();
-    std::os::unix::fs::symlink(binary, fixture.stub_dir.join("vessa")).unwrap();
-    // The planted key is one of this machine's credentials, as a
-    // secret-named variable: vessa finds only those.
-    let person = || {
-        let mut command = fixture.person();
-        command
-            .env("XDG_DATA_HOME", fixture.dir.join("data"))
-            .env("FIXTURE_API_KEY", &secret);
-        command
-    };
-    let snapshot = || -> serde_json::Value {
-        serde_json::from_str(
-            &fs::read_to_string(fixture.human_dir().join("collected.json")).unwrap(),
-        )
-        .unwrap()
-    };
-    let (stdout, stderr, code) = output_of(person().arg("collect"));
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let first = snapshot();
-    let found = &first["secrets"]["value"]["findings"];
-    assert_eq!(found.as_array().unwrap().len(), 1, "{first}");
-    assert_eq!(found[0]["session"], native);
-    assert_eq!(found[0]["where"], "tool_output");
-    assert_eq!(found[0]["rule"], "openai");
-    assert_eq!(found[0]["held"], "environment variable FIXTURE_API_KEY");
-    assert_eq!(found[0]["count"], 1);
-    let complete_at = first["secrets"]["value"]["read_ms"].as_i64().unwrap();
-    assert!(
-        first
-            .to_string()
-            .contains("Keep this synthetic input readable."),
-        "{first}"
-    );
-    assert!(!first.to_string().contains(&secret));
-    let (digest, stderr, code) = output_of(person().args(["digest", "--no-collect"]));
-    assert_eq!(code, Some(0), "{digest}{stderr}");
-    assert!(
-        digest.contains("Keep this synthetic input readable."),
-        "{digest}"
-    );
-    let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        words.contains("your credential from environment variable FIXTURE_API_KEY (openai) ×1"),
-        "{digest}"
-    );
-    assert!(!digest.contains(&secret));
-    fs::write(&transcript, format!("{records}{{broken\n")).unwrap();
-    let (stdout, stderr, code) = output_of(person().arg("collect"));
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    let partial = snapshot();
-    assert_eq!(partial["secrets"]["value"]["read_ms"], complete_at);
-    assert_eq!(
-        partial["secrets"]["value"]["findings"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    let (digest, stderr, code) = output_of(person().args(["digest", "--no-collect"]));
-    assert_eq!(code, Some(4), "{digest}{stderr}");
-    assert!(digest.contains("could not read"), "{digest}");
-    assert!(!digest.contains(&secret));
-    fs::write(&transcript, records).unwrap();
-    let (stdout, stderr, code) = output_of(person().arg("collect"));
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    assert!(snapshot()["secrets"]["value"]["read_ms"].as_i64().unwrap() > complete_at);
-    fixture.cleanup();
-}
-
 /// Yair, 2026-10-28: what the secrets scan cannot read is never an
 /// all-clear. An older vessa (no `secrets`), a scan that could not read
 /// everything (exit 4) and an answer that is no report are each said in the
@@ -4407,5 +3990,67 @@ fn malformed_secrets_coverage_is_incomplete_and_keeps_the_retry_boundary() {
         .as_str()
         .unwrap()
         .contains("unreadable-path list"));
+    fixture.cleanup();
+}
+
+/// 2026-11-09: the rules told every agent to use `ohjaa run` and `ohjaa
+/// gate` a day after both were removed, and check said nothing.
+#[test]
+fn check_flags_a_current_node_that_names_an_ohjaa_command_this_ohjaa_lacks() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("check-own-commands");
+    let repo = fixture.make_git_repo("work");
+    let mine = fixture.dir.join("config/ohjaa/mine");
+    fixture.node(
+        &mine,
+        "launch",
+        "decision",
+        "Start through `ohjaa no-such-command --scope x`. Propose with `ohjaa propose`.",
+    );
+    let (stdout, _, code) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert_eq!(code, Some(0), "a flag is not an error: {stdout}");
+    assert!(
+        stdout.contains(
+            "flag     launch: names `ohjaa no-such-command`, which this ohjaa does not have"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("`ohjaa propose`"), "{stdout}");
+    let (_, _, code) = output_of(
+        fixture
+            .ohjaa()
+            .args(["check", "--strict"])
+            .current_dir(&repo),
+    );
+    assert_eq!(code, Some(1));
+    fixture.cleanup();
+}
+
+/// "re-taught 0 times" from an intake that has not read lately is not
+/// measured, and check must not let it read as zero.
+#[test]
+fn check_says_how_far_intake_read_so_no_count_reads_as_zero() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new("check-intake-reach");
+    let repo = fixture.make_git_repo("work");
+    let mine = fixture.dir.join("config/ohjaa/mine");
+    fixture.node(&mine, "fine", "taste", "Fine.");
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert!(
+        stdout.contains("evidence no intake has run here: how often each was re-taught is unknown"),
+        "{stdout}"
+    );
+    let state = fixture.dir.join("state/ohjaa");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("intake-since"), "2026-10-12T23:13:15.000Z\n").unwrap();
+    let (stdout, _, _) = output_of(fixture.ohjaa().arg("check").current_dir(&repo));
+    assert!(
+        stdout.contains("evidence counted from what people said up to 2026-10-12 23:13 UTC"),
+        "{stdout}"
+    );
     fixture.cleanup();
 }

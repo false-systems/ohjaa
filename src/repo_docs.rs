@@ -1,4 +1,4 @@
-//! Whether the agent `ohjaa run` launches reads the repository's own
+//! Whether an agent reads the repository's own
 //! AGENTS.md, where its lessons are ([`crate::lessons`]): the briefing leaves
 //! the lessons to that file only for an agent shown to read it, the rule
 //! [`crate::instructions::source`] keeps for mine and machine. Anything
@@ -60,8 +60,8 @@ pub enum Reads {
 /// Codex's `project_doc_max_bytes` when nothing sets it (Codex 0.164.0).
 pub const CODEX_PROJECT_DOC_MAX_BYTES: usize = 32_768;
 
-/// For `agent` (the command `ohjaa run` launches and what follows it, or
-/// `None` for `ohjaa brief` without `--agent`), launched in `launch` inside
+/// For `agent` (its command and what follows it, or `None` for `ohjaa brief`
+/// without `--agent`), launched in `launch` inside
 /// the repository at `root`, whether it reads `root`'s AGENTS.md as far as
 /// `end` (the byte where the last lesson's line ends in it).
 pub fn reads(agent: Option<(&str, &[String])>, root: &Path, launch: &Path, end: usize) -> Reads {

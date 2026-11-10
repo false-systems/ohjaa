@@ -17,10 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// Never the real toimija: no live sessions (unless a test writes a
-/// checkout's `sessions --json` into `$SANDBOX/toimija-sessions/<its folder
-/// name>`), so `ohjaa run --dry-run` gets as far as its warnings; `run` runs
-/// the agent command after `--`, as toimija does, and keeps its argv in
-/// `$SANDBOX/toimija-argv`.
+/// checkout.s `sessions --json` into `$SANDBOX/toimija-sessions/<its folder
+/// name>`).
 const TOIMIJA_STUB: &str = r#"#!/bin/sh
 case "$1" in
   sessions)
@@ -29,11 +27,6 @@ case "$1" in
     if [ -f "$listed" ]; then cat "$listed"
     else echo '{"sessions":[],"warnings":[],"coverage":{"status":"available"}}'; fi;;
   context) echo '{}';;
-  run)
-    printf '%s\n' "$@" > "$SANDBOX/toimija-argv"
-    while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
-    shift
-    exec "$@";;
 esac
 "#;
 

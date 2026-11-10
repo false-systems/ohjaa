@@ -11,17 +11,14 @@
 //! and no agent session's marker is set ([`person_watching`]): an agent's
 //! shell reads `~/.zshrc` too.
 //!
-//! `line` starts no git and touches no network. It reads the session log
-//! and the proposals itself, and the rest from the snapshot `ohjaa collect`
+//! `line` starts no git and touches no network. It reads the proposals
+//! itself, and the rest from the snapshot `ohjaa collect`
 //! writes ([`crate::collect`]), which it starts in the background when the
 //! snapshot is old. What the snapshot says is said with how old it is, and
 //! what it could not read is said as that, never as an all-clear.
 //!
-//! What stays until it is resolved comes first, in this order: a branch
-//! with a failed commit; what is unknown (a source that could not be read,
-//! a session whose ohjaa is gone, an orphan, a commit sykli could say
-//! nothing about); a branch whose commits lack evidence; what waits for a
-//! person (a session open a day).
+//! What stays until it is resolved comes first: a source that could not be
+//! read.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -33,9 +30,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::collect::{self, Collected, Finding, Part, Pr, TokenUsage, Typed};
+use crate::collect::{self, Collected, Finding, Part, Pr};
+use crate::intake::clock;
 use crate::knowledge::{self, Dirs};
-use crate::sessions::{self, clock, Exit, Finished, Left, Session};
 use crate::{process, scan};
 
 const MINUTE_MS: i64 = 60_000;
@@ -71,10 +68,9 @@ const DAILY_LINES: usize = 15;
 const OPEN_SHOWN: usize = 20;
 
 /// What the shells an agent runs its tools in carry, each set by the agent
-/// (or by `ohjaa run` and `toimija run` around it), never by a person's own
+/// (or by `toimija run` around it), never by a person's own
 /// startup files. A variable a person may set (`CODEX_HOME`) is not one.
-pub const AGENT_MARKERS: [&str; 17] = [
-    "OHJAA_SESSION",
+pub const AGENT_MARKERS: [&str; 16] = [
     "TOIMIJA_SESSION",
     "TOIMIJA_RUN",
     // Claude Code.
@@ -167,7 +163,7 @@ fn old(at_ms: Option<i64>, now_ms: i64) -> bool {
 const SEEN_SCHEMA: &str = "ohjaa-seen.v1";
 
 /// Where a stretch of what happened begins, by each source's own clock:
-/// the session log is read now, GitHub as far as the snapshot read it.
+/// the proposals are read now, GitHub as far as the snapshot read it.
 /// GitHub's begins [`OVERLAP_MS`] earlier, for what its search indexes
 /// late: what the digest that ended here said of those two hours (`said`)
 /// is not said again.
@@ -319,10 +315,6 @@ enum Kind {
     /// A source that could not be read, or not all of it.
     Source,
     // What happened.
-    /// `told`: it read back and handed over.
-    Ended {
-        told: bool,
-    },
     Merged,
     Opened,
     Closed,
@@ -436,26 +428,6 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-fn amount(n: u64) -> String {
-    match n {
-        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
-        n if n >= 1_000 => format!("{}k", n / 1_000),
-        n => n.to_string(),
-    }
-}
-
-/// `115k tokens + 2.9M cache reads`: most of a session's
-/// tokens are reads of its cache, said apart.
-fn usage_text(usage: &TokenUsage) -> Option<String> {
-    let tokens = usage.tokens?;
-    Some(match usage.cache_reads {
-        Some(cached) if cached > 0 => {
-            format!("{} tokens + {} cache reads", amount(tokens), amount(cached))
-        }
-        _ => format!("{} tokens", amount(tokens)),
-    })
-}
-
 fn proposal_key(waiting: &Waiting) -> String {
     format!("proposal:{}:{}", waiting.scope, waiting.name)
 }
@@ -494,86 +466,6 @@ fn event(kind: Kind, key: String, at_ms: i64, github: bool, repo: &str, text: St
         text,
         brief: None,
     }
-}
-
-/// How a session ended, and what it left out, in a few words.
-fn ended(
-    session: &Session,
-    left: &Left,
-    usage: Option<&TokenUsage>,
-    typed: Option<&Typed>,
-) -> Item {
-    let typed = typed.filter(|typed| !typed.text.trim().is_empty());
-    let mut parts = vec![format!(
-        "{} \"{}\"",
-        clean(&session.agent),
-        clean(typed.map_or(session.intent.as_str(), |typed| typed.text.as_str()))
-    )];
-    if typed.is_some() {
-        parts.push(format!(
-            "recorded launch intent: \"{}\"",
-            clean(&session.intent)
-        ));
-    } else if session.intent.trim().is_empty() || session.intent.trim() == "interactive" {
-        parts.push("task not recorded".to_owned());
-    }
-    parts.push(match (left.orphaned, left.exit) {
-        (true, _) => "orphaned".to_owned(),
-        (_, Exit::Code { code: 0 }) => "process exited successfully (code 0)".to_owned(),
-        (_, Exit::Code { code }) => {
-            format!("process exited with code {code}; cause not recorded here")
-        }
-        (_, Exit::Signal { signal }) => format!("killed (signal {signal})"),
-        (_, Exit::Unknown) => "exit unknown".to_owned(),
-    });
-    if !left.orphaned {
-        parts.push(format!(
-            "elapsed {}",
-            span(left.ended_ms - session.started_ms)
-        ));
-    }
-    parts.push(format!("ended {}", clock(left.ended_ms)));
-    let (readback, handover) = (session.readback.is_some(), session.handover.is_some());
-    match (readback, handover) {
-        (false, false) => parts.push("no task confirmation or completion note recorded".to_owned()),
-        (false, true) => parts.push("no task confirmation recorded".to_owned()),
-        (true, false) => parts.push("no completion note recorded".to_owned()),
-        (true, true) => {}
-    }
-    if !left.landed.is_empty() {
-        parts.push(format!("{} landed", left.landed.len()));
-    }
-    if let Finished::PullRequest { state, .. } = &left.finished {
-        parts.push(format!("PR {}", clean(state).to_lowercase()));
-    }
-    parts.extend(usage.and_then(usage_text));
-    if session.outside_repo {
-        parts.push(format!(
-            "outside a repository; launch folder: {}",
-            clean(&session.repo)
-        ));
-    }
-    if !session.scoped.is_empty() {
-        parts.push(format!(
-            "declared repositories: {}",
-            session
-                .scoped
-                .iter()
-                .map(|scope| clean(&scope.repo))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    event(
-        Kind::Ended {
-            told: readback && handover,
-        },
-        format!("session:{}", session.id),
-        left.ended_ms,
-        false,
-        &session.repo,
-        parts.join(" · "),
-    )
 }
 
 /// A pull request's opening, and its merge or close. A merge into another
@@ -867,11 +759,7 @@ fn grouped_count(count: u64) -> String {
 
 /// Only collected sources: live-log and proposal failures retain their own warnings.
 fn saved_source(item: &Item) -> bool {
-    item.kind == Kind::Source
-        && matches!(
-            item.repo.as_str(),
-            "snapshot" | "GitHub" | "vessa" | "messages" | "secrets"
-        )
+    item.kind == Kind::Source && matches!(item.repo.as_str(), "snapshot" | "GitHub" | "secrets")
 }
 
 fn saved_sources_summary(items: &[&Item]) -> Option<String> {
@@ -881,8 +769,6 @@ fn saved_sources_summary(items: &[&Item]) -> Option<String> {
         .map(|item| match item.repo.as_str() {
             "snapshot" => "saved status (including secrets scan)",
             "GitHub" => "pull requests",
-            "vessa" => "token usage",
-            "messages" => "session excerpts",
             "secrets" => "secrets scan",
             _ => unreachable!("saved_source admits only the collected sources above"),
         })
@@ -900,8 +786,6 @@ fn saved_sources_summary(items: &[&Item]) -> Option<String> {
 fn source<T>(name: &str, part: &Part<T>, now_ms: i64, unread: &mut Vec<String>) -> Option<Item> {
     let meaning = match name {
         "GitHub" => "Pull request activity",
-        "vessa" => "Token usage",
-        "messages" => "Session message excerpts",
         "secrets" => "Secrets scan",
         other => other,
     };
@@ -952,11 +836,9 @@ fn source_key(name: &str, failures: &[&String]) -> String {
     format!("source:{name}:{}", words.join(" | "))
 }
 
-/// Everything the view can say now: from the session log, the proposals
-/// and the snapshot (when there is one), at `now_ms` on the person's day
+/// Everything the view can say now: from the proposals and the snapshot (when there is one), at `now_ms` on the person's day
 /// number `day`.
 fn build(
-    logged: &[Session],
     waiting: Result<Vec<Waiting>, String>,
     collected: Option<&Collected>,
     now_ms: i64,
@@ -973,7 +855,7 @@ fn build(
                 Class::Unknown,
                 "source:snapshot".to_owned(),
                 "snapshot",
-                "Pull requests and usage have not been collected yet. Read status: ohjaa collect"
+                "Pull requests and the secrets scan have not been collected yet. Read status: ohjaa collect"
                     .to_owned(),
             );
             item.brief = Some("Nothing collected yet. Refresh: ohjaa collect".to_owned());
@@ -982,8 +864,6 @@ fn build(
         }
         Some(snapshot) => {
             standing_items.extend(source("GitHub", &snapshot.github, now_ms, &mut unread));
-            standing_items.extend(source("vessa", &snapshot.usage, now_ms, &mut unread));
-            standing_items.extend(source("messages", &snapshot.typed, now_ms, &mut unread));
             let mut secrets = snapshot.secrets.clone();
             if secrets.as_of_ms.is_none() && secrets.error.is_none() && secrets.gaps.is_empty() {
                 secrets.error = Some("No secrets scan has been collected yet".into());
@@ -992,16 +872,6 @@ fn build(
         }
     }
     let mut events = Vec::new();
-    for session in logged {
-        if let Some(left) = &session.left {
-            events.push(ended(
-                session,
-                left,
-                snapshot.usage.value.get(&session.id),
-                snapshot.typed.value.get(&session.id),
-            ));
-        }
-    }
     for pr in &snapshot.github.value {
         pr_events(pr, &mut events);
     }
@@ -1050,8 +920,6 @@ fn build(
         .map(|c| {
             vec![
                 ("GitHub", c.github.as_of_ms, c.github.from_ms),
-                ("vessa", c.usage.as_of_ms, c.usage.from_ms),
-                ("messages", c.typed.as_of_ms, c.typed.from_ms),
                 ("secrets", c.secrets.as_of_ms, c.secrets.from_ms),
             ]
         })
@@ -1243,11 +1111,10 @@ fn folded(events: Vec<&Item>) -> Vec<&Item> {
         .collect()
 }
 
-/// What happened from `from` on ([`Window::holds`]): my sessions, then what
-/// landed, then the other pull requests, each newest first.
+/// What happened from `from` on ([`Window::holds`]): what landed, then the
+/// other pull requests, each newest first.
 fn after<'a>(view: &'a View, from: &Window) -> Vec<&'a Item> {
     let group = |kind: Kind| match kind {
-        Kind::Ended { .. } => 0,
         Kind::Merged => 1,
         _ => 2,
     };
@@ -1258,21 +1125,6 @@ fn after<'a>(view: &'a View, from: &Window) -> Vec<&'a Item> {
 
 fn count(items: &[&Item], of: impl Fn(Kind) -> bool) -> usize {
     items.iter().filter(|item| of(item.kind)).count()
-}
-
-/// `3 agent sessions ended (1 missing startup notes or handover)`: with `gaps`, how many
-/// of them omitted startup notes or a handover.
-fn sessions_ended(events: &[&Item], gaps: bool) -> Option<String> {
-    let ended = count(events, |k| matches!(k, Kind::Ended { .. }));
-    if ended == 0 {
-        return None;
-    }
-    let untold = count(events, |k| k == Kind::Ended { told: false });
-    let mut text = plural(ended, "agent session ended", "agent sessions ended");
-    if gaps && untold > 0 {
-        text.push_str(&format!(" ({untold} missing startup notes or handover)"));
-    }
-    Some(text)
 }
 
 /// `PRs: 2 merged, 1 opened`.
@@ -1617,9 +1469,8 @@ fn full(
     };
     paragraph(
         &mut out,
-        "Session records and proposed instructions are read now. Pull requests, \
-        token usage, message excerpts and the secrets scan were collected separately; each source \
-        has its own date below.",
+        "Proposed instructions are read now. Pull requests and the secrets scan were \
+        collected separately; each source has its own date below.",
     );
     // GitHub was read from where the snapshot asked, not from `since`.
     let pull_requests_from = view
@@ -1707,11 +1558,6 @@ fn full(
     }
     section(
         &mut out,
-        "Sessions ended",
-        of(&[|k| matches!(k, Kind::Ended { .. })]),
-    );
-    section(
-        &mut out,
         "Pull requests merged",
         of(&[|k| k == Kind::Merged]),
     );
@@ -1720,13 +1566,6 @@ fn full(
         "Pull requests",
         of(&[|k| k == Kind::Opened, |k| k == Kind::Closed]),
     );
-    if let Some(sessions) = sessions_ended(&events, false) {
-        paragraph(&mut out, &format!("{sessions}. A process exit describes the agent process, \
-            not task completion or test results. Missing notes are missing documentation, not failed code. \
-            Elapsed time includes idle time."));
-        paragraph(&mut out, "Token counts include input, output and cache writes. Cached input is counted separately \
-            as cache-read tokens, not filesystem reads or provider charges. Unavailable usage is unknown, not zero.");
-    }
     if let Some(prs) = pull_requests(&events) {
         paragraph(&mut out, &prs);
     }
@@ -1839,8 +1678,6 @@ fn full(
         for (name, at, _) in &view.parts {
             let meaning = match *name {
                 "GitHub" => "pull request activity",
-                "vessa" => "recorded token usage",
-                "messages" => "session message excerpts",
                 "secrets" => "secrets scan coverage",
                 other => other,
             };
@@ -1934,20 +1771,9 @@ fn say_line(roots: &[PathBuf]) -> Result<()> {
     let collected = collect::read(&dirs);
     let collecting =
         old(collected.as_ref().map(|c| c.at_ms), now).then(|| start_collect(&dirs, roots));
-    // A log a writer holds now is read at the next terminal: a terminal
-    // never waits for one.
-    let log = sessions::Reader::open_now(&sessions::store_path(&dirs.state))?;
-    let (logged, unread_records) = log.all()?;
-    drop(log);
     let (today, day) = local_day(now);
-    let mut view = build(&logged, waiting(&dirs), collected.as_ref(), now, day);
+    let mut view = build(waiting(&dirs), collected.as_ref(), now, day);
     let mut failures = Vec::new();
-    if !unread_records.is_empty() {
-        failures.push(format!(
-            "{} agent session record(s) could not be read; other readable records are retained",
-            unread_records.len()
-        ));
-    }
     if let Some(Collecting::Failed(why)) = collecting {
         failures.push(format!("Could not refresh cached status: {}", clean(&why)));
     }
@@ -2053,23 +1879,6 @@ pub fn digest(
         }
     }
     let mut unread = Vec::new();
-    let logged = match sessions::Reader::open(&sessions::store_path(&dirs.state))
-        .and_then(|log| log.all())
-    {
-        Ok((logged, rows)) => {
-            if !rows.is_empty() {
-                unread.push(format!(
-                    "{} session record(s) in the log could not be read",
-                    rows.len()
-                ));
-            }
-            logged
-        }
-        Err(error) => {
-            unread.push(format!("the session log could not be read: {error}"));
-            Vec::new()
-        }
-    };
     let live = fleet_repos
         .map(|repos| fleet(&repos))
         .map_err(|error| format!("{error:#}"));
@@ -2102,7 +1911,7 @@ pub fn digest(
             .map_or(Window::at(now - DAY_MS), |seen| seen.full_from(now))
     });
     let (today, day) = local_day(now);
-    let mut view = build(&logged, waiting(&dirs), collected.as_ref(), now, day);
+    let mut view = build(waiting(&dirs), collected.as_ref(), now, day);
     view.unread.extend(unread);
     let mut out = std::io::stdout().lock();
     out.write_all(full(&view, &from, Some(&live), pending.as_deref(), now).as_bytes())?;
@@ -2164,22 +1973,6 @@ pub fn collect_now(repos: Result<Vec<PathBuf>>, background: bool) -> Result<i32>
                 "pull requests",
             ),
         );
-        say_part(
-            "vessa",
-            &collected.usage,
-            format!(
-                "{} with token usage",
-                plural(collected.usage.value.len(), "session", "sessions")
-            ),
-        );
-        say_part(
-            "messages",
-            &collected.typed,
-            format!(
-                "the first words of {}",
-                plural(collected.typed.value.len(), "session", "sessions")
-            ),
-        );
         let findings = collected.secrets.value.findings.len();
         say_part(
             "secrets",
@@ -2191,10 +1984,7 @@ pub fn collect_now(repos: Result<Vec<PathBuf>>, background: bool) -> Result<i32>
             },
         );
     }
-    let failed = collected.github.failed()
-        || collected.usage.failed()
-        || collected.typed.failed()
-        || collected.secrets.failed();
+    let failed = collected.github.failed() || collected.secrets.failed();
     Ok(if failed { crate::INCOMPLETE } else { 0 })
 }
 
@@ -2283,26 +2073,6 @@ mod tests {
         assert!(parse_since("soon", now).is_err());
     }
 
-    /// A session that started `ago_ms` before NOW and ended `ended_ago`
-    /// before it (`None`: still open), with or without its testimony.
-    fn session(id: &str, ago_ms: i64, ended_ago: Option<i64>, told: bool) -> Session {
-        let mut value = json!({
-            "id": id, "agent": "claude", "repo": "/r/ohjaa", "intent": "fix the parser",
-            "started_ms": NOW - ago_ms, "delivered": [],
-        });
-        if let Some(ended) = ended_ago {
-            value["left"] = json!({
-                "ended_ms": NOW - ended, "exit": {"how": "code", "code": 0},
-                "finished": {"kind": "no_pull_request"},
-            });
-        }
-        if told {
-            value["readback"] = json!({"at_ms": NOW - ago_ms, "text": "goal"});
-            value["handover"] = json!({"at_ms": NOW - ago_ms, "next": "more"});
-        }
-        serde_json::from_value(value).unwrap()
-    }
-
     fn waiting(name: &str, since: &str) -> Waiting {
         Waiting {
             scope: "ours".into(),
@@ -2321,14 +2091,6 @@ mod tests {
                 as_of_ms: Some(at_ms),
                 ..Part::default()
             },
-            usage: Part {
-                as_of_ms: Some(at_ms),
-                ..Part::default()
-            },
-            typed: Part {
-                as_of_ms: Some(at_ms),
-                ..Part::default()
-            },
             secrets: Part {
                 as_of_ms: Some(at_ms),
                 ..Part::default()
@@ -2337,13 +2099,10 @@ mod tests {
     }
 
     #[test]
-    fn startup_explains_saved_status_and_undecided_instructions_and_no_open_record() {
+    fn startup_explains_saved_status_and_undecided_instructions() {
         let mut collected = snapshot(NOW - 2 * DAY_MS);
         collected.secrets = Part::default();
-        let mut open = session("still-open", 2 * DAY_MS, None, false);
-        open.intent = "interactive".into();
         let view = build(
-            &[open],
             Ok(vec![waiting("synthetic-proposal", "2026-10-20")]),
             Some(&collected),
             NOW,
@@ -2361,11 +2120,6 @@ mod tests {
         ] {
             assert!(words.contains(context), "missing {context}:\n{daily}");
         }
-        // A record the removed `ohjaa run` left open: nothing can close it,
-        // so it is history, never attention.
-        assert!(!words.contains("still open"), "{daily}");
-        assert!(!words.contains("may still be active"), "{daily}");
-        assert!(!daily.contains("\"interactive\""), "{daily}");
         assert!(!daily.contains("never read"), "{daily}");
         assert!(view.incomplete());
         assert!(
@@ -2383,7 +2137,7 @@ mod tests {
     fn crowded_startup_groups_unknown_sources_without_a_wall_of_caveats() {
         let mut collected = snapshot(NOW - 2 * DAY_MS);
         let why = "could not read /synthetic/conversations/unreadable-session.jsonl";
-        collected.typed.gaps.push(why.into());
+        collected.github.gaps.push(why.into());
         collected.secrets.gaps.push(why.into());
         collected.secrets.value.findings.push(Finding {
             agent: "codex".into(),
@@ -2392,11 +2146,7 @@ mod tests {
             found_ms: NOW - HOUR_MS,
             ..Finding::default()
         });
-        let logged: Vec<_> = (0..4)
-            .map(|i| session(&format!("open-{i}"), 2 * DAY_MS, None, false))
-            .collect();
         let view = build(
-            &logged,
             Ok(vec![waiting("synthetic-proposal", "2026-10-20")]),
             Some(&collected),
             NOW,
@@ -2410,7 +2160,7 @@ mod tests {
         for text in [
             "Possible credentials: 18,330 unclassified matches",
             "Missing or incomplete information",
-            "session excerpts",
+            "pull requests",
             "secrets scan",
             "not active yet",
             "ohjaa collect",
@@ -2430,7 +2180,6 @@ mod tests {
         assert!(view.incomplete());
         let digest = full(&view, &Window::at(NOW - 3 * DAY_MS), None, None, NOW);
         assert!(digest.contains("unreadable-session.jsonl"), "{digest}");
-        assert!(!digest.contains("unclosed record"), "{digest}");
         assert_eq!(
             view.events
                 .iter()
@@ -2462,7 +2211,7 @@ mod tests {
                 found_ms: NOW,
                 ..Finding::default()
             });
-            let view = view(&[], Some(&collected));
+            let view = view(Some(&collected));
             assert_eq!(daily(&view, &Window::at(NOW - DAY_MS), None, NOW), None);
             assert_eq!(one_line(&news(&view, &Seen::first(NOW))), None);
             let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
@@ -2488,7 +2237,7 @@ mod tests {
             {"agent":"codex","session":"synthetic","cwd":null,"at_ms":null,"where":"person","rule":"openai","count":2,"opaque_count":0,"opaque_native":true,"fingerprint":null,"found_ms":NOW}
         ]});
         let collected: Collected = serde_json::from_value(raw).unwrap();
-        let view = view(&[], Some(&collected));
+        let view = view(Some(&collected));
         let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
             .unwrap()
             .0;
@@ -2514,7 +2263,7 @@ mod tests {
         assert!(digest.contains("mixed_token ×100"), "{digest}");
         let mut partial = collected;
         partial.secrets.value.findings[1].opaque_count = None;
-        let partial_view = self::view(&[], Some(&partial));
+        let partial_view = self::view(Some(&partial));
         let partial_digest = full(&partial_view, &Window::at(NOW - DAY_MS), None, None, NOW);
         let words = partial_digest
             .split_whitespace()
@@ -2537,7 +2286,7 @@ mod tests {
             {"agent":"claude","session":"synthetic","cwd":null,"at_ms":NOW,"where":"agent","rule":"mixed_token","count":100,"opaque_count":100,"opaque_native":true,"fingerprint":null,"found_ms":NOW}
         ]);
         let collected: Collected = serde_json::from_value(raw.clone()).unwrap();
-        let view = view(&[], Some(&collected));
+        let view = view(Some(&collected));
         assert_eq!(daily(&view, &Window::at(NOW - DAY_MS), None, NOW), None);
         assert_eq!(one_line(&news(&view, &Seen::first(NOW))), None);
         let seen = advance(
@@ -2569,7 +2318,7 @@ mod tests {
             raw["secrets"]["value"]["findings"][0]["opaque_count"] = context;
             raw["secrets"]["value"]["findings"][0]["opaque_native"] = native;
             let collected: Collected = serde_json::from_value(raw.clone()).unwrap();
-            let view = self::view(&[], Some(&collected));
+            let view = self::view(Some(&collected));
             let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
             assert!(line.contains(expected), "{rule}: {line}");
         }
@@ -2577,7 +2326,7 @@ mod tests {
         raw["secrets"]["value"]["findings"][0]["opaque_count"] = json!(100);
         raw["secrets"]["gaps"] = json!(["synthetic incomplete scan"]);
         let collected: Collected = serde_json::from_value(raw).unwrap();
-        let view = self::view(&[], Some(&collected));
+        let view = self::view(Some(&collected));
         let daily = self::daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
             .unwrap()
             .0;
@@ -2604,7 +2353,7 @@ mod tests {
             found_ms: NOW - 6 * HOUR_MS,
             ..Finding::default()
         });
-        let old = view(&[], Some(&collected));
+        let old = view(Some(&collected));
         let seen = advance(
             &old,
             &Seen::first(NOW),
@@ -2619,7 +2368,7 @@ mod tests {
         collected.secrets.value.findings[0].rule = "named_secret".into();
         collected.secrets.value.findings[0].count = 1;
         collected.secrets.value.findings[0].opaque_count = Some(0);
-        let next = build(&[], Ok(Vec::new()), Some(&collected), NOW + MINUTE_MS, 0);
+        let next = build(Ok(Vec::new()), Some(&collected), NOW + MINUTE_MS, 0);
         let notice = one_line(&news(&next, &seen)).expect("new review candidate");
         assert!(notice.contains("1 secret-labelled match"), "{notice}");
         let digest = full(
@@ -2639,13 +2388,7 @@ mod tests {
             "d",
         );
         collected.secrets.as_of_ms = Some(NOW + 2 * MINUTE_MS);
-        let same = build(
-            &[],
-            Ok(Vec::new()),
-            Some(&collected),
-            NOW + 2 * MINUTE_MS,
-            0,
-        );
+        let same = build(Ok(Vec::new()), Some(&collected), NOW + 2 * MINUTE_MS, 0);
         assert_eq!(one_line(&news(&same, &read)), None);
         assert!(after(&same, &read.full_from(NOW + 2 * MINUTE_MS)).is_empty());
     }
@@ -2654,8 +2397,6 @@ mod tests {
     fn grouped_startup_fits_even_when_every_source_is_partial() {
         let mut collected = snapshot(NOW - 2 * DAY_MS);
         collected.github.error = Some("synthetic unavailable source".into());
-        collected.typed.error = collected.github.error.clone();
-        collected.usage.error = collected.github.error.clone();
         collected.secrets.error = collected.github.error.clone();
         collected.secrets.as_of_ms = Some(NOW - 3 * DAY_MS);
         collected.secrets.value.findings.push(Finding {
@@ -2663,15 +2404,7 @@ mod tests {
             found_ms: NOW,
             ..Finding::default()
         });
-        let logged: Vec<_> = (0..15)
-            .map(|i| {
-                let mut open = session(&format!("open-{i}"), 2 * DAY_MS, None, false);
-                open.repo = format!("/r/repository-with-a-long-name-{i}");
-                open
-            })
-            .collect();
         let view = build(
-            &logged,
             Ok(vec![waiting("proposal", "2026-10-20")]),
             Some(&collected),
             NOW,
@@ -2704,7 +2437,7 @@ mod tests {
             found_ms: NOW,
             ..Finding::default()
         });
-        let view = view(&[], Some(&collected));
+        let view = view(Some(&collected));
         let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
             .unwrap()
             .0;
@@ -2784,7 +2517,7 @@ mod tests {
             pr(7, 3 * HOUR_MS, Some(HOUR_MS)),
             open_in("habitat", 12, "dima", true, 20 * MINUTE_MS),
         ];
-        let view = view(&[], Some(&collected));
+        let view = view(Some(&collected));
         let now = now_section(&full(&view, &Window::at(NOW - DAY_MS), None, None, NOW));
         for said in [
             "Open pull requests in the team's GitHub organizations updated since",
@@ -2809,7 +2542,7 @@ mod tests {
     fn no_open_pull_request_says_how_to_show_up_and_unread_github_says_nothing() {
         let collected = snapshot(NOW);
         let read = full(
-            &view(&[], Some(&collected)),
+            &view(Some(&collected)),
             &Window::at(NOW - DAY_MS),
             None,
             None,
@@ -2825,7 +2558,7 @@ mod tests {
         let mut unread = snapshot(NOW);
         unread.github = Part::default();
         let digest = full(
-            &view(&[], Some(&unread)),
+            &view(Some(&unread)),
             &Window::at(NOW - DAY_MS),
             None,
             None,
@@ -2846,7 +2579,7 @@ mod tests {
             .map(|n| open_in("sykli", n, "yairfalse", false, n as i64 * MINUTE_MS))
             .collect();
         let now = now_section(&full(
-            &view(&[], Some(&collected)),
+            &view(Some(&collected)),
             &Window::at(NOW - DAY_MS),
             None,
             None,
@@ -2858,31 +2591,6 @@ mod tests {
             now.contains("5 more are open; the 20 updated last are listed."),
             "{now}"
         );
-    }
-
-    #[test]
-    fn first_typed_words_lead_the_session_without_losing_its_recorded_intent() {
-        let mut collected = snapshot(NOW);
-        let session = session("typed", HOUR_MS, Some(1_000), true);
-        collected.typed.value.insert(
-            "typed".into(),
-            Typed {
-                text: "make the parser understandable".into(),
-                ended_ms: NOW - 1_000,
-            },
-        );
-        let view = view(std::slice::from_ref(&session), Some(&collected));
-        assert!(view.events[0]
-            .text
-            .starts_with("claude \"make the parser understandable\""));
-        assert!(view.events[0]
-            .text
-            .contains("recorded launch intent: \"fix the parser\""));
-        collected.typed.value.clear();
-        let fallback = build(&[session], Ok(Vec::new()), Some(&collected), NOW, 0);
-        assert!(fallback.events[0]
-            .text
-            .starts_with("claude \"fix the parser\""));
     }
 
     /// One of this machine's credentials is an alarm whatever rule the
@@ -2904,7 +2612,7 @@ mod tests {
             found_ms: NOW,
             held: Some("environment variable ZAI_API_KEY".into()),
         });
-        let view = view(&[], Some(&collected));
+        let view = view(Some(&collected));
         assert_eq!(
             one_line(&news(&view, &Seen::first(NOW))).unwrap(),
             "ohjaa · Your credentials reached agent sessions: 3 occurrences; rotate them · \
@@ -2945,10 +2653,7 @@ mod tests {
             found_ms: NOW,
             held: None,
         });
-        let view = view(
-            &[session("a", HOUR_MS, Some(1_000), true)],
-            Some(&collected),
-        );
+        let view = view(Some(&collected));
         let initial = Seen::first(NOW);
         let notice = one_line(&news(&view, &initial)).unwrap();
         assert_eq!(
@@ -2976,7 +2681,7 @@ mod tests {
     #[test]
     fn a_scan_finishing_after_a_digest_keeps_its_unread_findings() {
         let initial = snapshot(NOW);
-        let empty = view(&[], Some(&initial));
+        let empty = view(Some(&initial));
         let seen = advance(
             &empty,
             &Seen::first(NOW),
@@ -2996,22 +2701,21 @@ mod tests {
             found_ms: NOW + 1_000,
             ..Finding::default()
         });
-        let found = build(&[], Ok(Vec::new()), Some(&later), NOW + 6_000, 0);
+        let found = build(Ok(Vec::new()), Some(&later), NOW + 6_000, 0);
         assert_eq!(after(&found, &seen.full_from(NOW + 6_000)).len(), 1);
         let read = advance(&found, &seen, Some(&later), NOW + 6_000, Shown::Full, "d");
         assert!(after(&found, &read.full_from(NOW + 7_000)).is_empty());
     }
 
-    fn view(logged: &[Session], collected: Option<&Collected>) -> View {
-        build(logged, Ok(Vec::new()), collected, NOW, 0)
+    fn view(collected: Option<&Collected>) -> View {
+        build(Ok(Vec::new()), collected, NOW, 0)
     }
 
     #[test]
     fn startup_is_attention_only_and_does_not_consume_activity() {
-        let logged = [session("finished", 3 * HOUR_MS, Some(HOUR_MS), false)];
         let mut collected = snapshot(NOW);
         collected.github.value = vec![pr(7, 3 * HOUR_MS, Some(HOUR_MS))];
-        let view = view(&logged, Some(&collected));
+        let view = view(Some(&collected));
         let from = Window::at(NOW - DAY_MS);
         assert_eq!(daily(&view, &from, None, NOW), None);
         assert_eq!(one_line(&news(&view, &Seen::first(NOW))), None);
@@ -3036,45 +2740,21 @@ mod tests {
         );
         assert_eq!(tomorrow.full_from(NOW + DAY_MS), from);
         let digest = full(&view, &tomorrow.full_from(NOW + DAY_MS), None, None, NOW);
-        let words = digest.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            words.contains(&format!("ended {}", clock(NOW - HOUR_MS))),
-            "{digest}"
-        );
         assert!(digest.contains("#7 merged"), "{digest}");
     }
 
     #[test]
-    fn digest_preserves_proposal_meaning_and_explains_session_records() {
+    fn digest_preserves_proposal_meaning() {
         let mut proposal = waiting(&"long-id-".repeat(20), "2026-10-20");
         proposal.scope = "mine".into();
         proposal.title =
             "Keep a complete, understandable instruction instead of cutting away its meaning. "
                 .repeat(3);
-        let mut ended = session("inspect-me", HOUR_MS, Some(MINUTE_MS), false);
-        ended.intent = "interactive".into();
-        ended.outside_repo = true;
-        ended.repo = "/r/projects".into();
-        let view = build(
-            &[ended],
-            Ok(vec![proposal.clone()]),
-            Some(&snapshot(NOW)),
-            NOW,
-            0,
-        );
+        let view = build(Ok(vec![proposal.clone()]), Some(&snapshot(NOW)), NOW, 0);
         let digest = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         let flattened = digest.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(flattened.contains(proposal.title.trim()), "{digest}");
-        for expected in [
-            "task not recorded",
-            "process exited successfully (code 0)",
-            "personal agent instructions",
-            "not failed code",
-            "Cached input is counted separately",
-            "outside a repository",
-        ] {
-            assert!(digest.contains(expected), "missing {expected}: {digest}");
-        }
+        assert!(digest.contains("personal agent instructions"), "{digest}");
     }
 
     #[test]
@@ -3093,41 +2773,12 @@ mod tests {
     }
 
     #[test]
-    fn session_activity_stays_in_the_digest_including_late_records() {
-        let logged = [
-            session("a", 3 * HOUR_MS, Some(HOUR_MS), true),
-            session("b", 3 * HOUR_MS, Some(HOUR_MS), false),
-            session("old", 9 * DAY_MS, Some(8 * DAY_MS), false),
-        ];
-        let collected = snapshot(NOW);
-        let view = view(&logged, Some(&collected));
-        let first = Seen::first(NOW);
-        assert_eq!(one_line(&news(&view, &first)), None);
-        assert_eq!(after(&view, &first.full_from(NOW)).len(), 2);
-        let seen = advance(&view, &first, None, NOW, Shown::Line, "d");
-        assert_eq!(one_line(&news(&view, &seen)), None, "seen is not new");
-        // The record of a session that ended before the person looked, read
-        // after: new once.
-        let mut later = logged.to_vec();
-        later.push(session("late", 2 * HOUR_MS, Some(MINUTE_MS), false));
-        let view = build(&later, Ok(Vec::new()), Some(&collected), NOW + MINUTE_MS, 0);
-        assert_eq!(one_line(&news(&view, &seen)), None);
-        let keys = after(&view, &seen.full_from(NOW))
-            .iter()
-            .map(|item| item.key.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(keys, vec!["session:late", "session:a", "session:b"]);
-        let seen = advance(&view, &seen, None, NOW + MINUTE_MS, Shown::Line, "d");
-        assert_eq!(one_line(&news(&view, &seen)), None);
-    }
-
-    #[test]
     fn what_github_said_before_an_old_snapshot_was_read_is_never_lost() {
         // The person saw a line at NOW from a snapshot collected 5 h before:
         // GitHub is seen only as far as it was read.
         let old = snapshot(NOW - 5 * HOUR_MS);
         let seen = advance(
-            &view(&[], Some(&old)),
+            &view(Some(&old)),
             &Seen::first(NOW),
             Some(&old),
             NOW,
@@ -3137,7 +2788,7 @@ mod tests {
         assert_eq!(seen.github_ms, NOW - 5 * HOUR_MS);
         let mut fresh = snapshot(NOW + MINUTE_MS);
         fresh.github.value = vec![pr(7, 4 * HOUR_MS, Some(4 * HOUR_MS))];
-        let view = build(&[], Ok(Vec::new()), Some(&fresh), NOW + MINUTE_MS, 0);
+        let view = build(Ok(Vec::new()), Some(&fresh), NOW + MINUTE_MS, 0);
         assert_eq!(one_line(&news(&view, &seen)), None);
         // Opened and merged in the same stretch: said once, as merged.
         let events = after(&view, &seen.full_from(NOW));
@@ -3147,15 +2798,11 @@ mod tests {
 
     #[test]
     fn a_line_is_short_and_plain_however_much_is_new() {
-        let logged: Vec<Session> = (0..40)
-            .map(|i| session(&format!("s{i}"), 2 * HOUR_MS, Some(HOUR_MS), i % 2 == 0))
-            .collect();
         let mut collected = snapshot(NOW);
         collected.github.value = (1..60)
             .map(|n| pr(n, HOUR_MS, (n % 3 == 0).then_some(HOUR_MS / 2)))
             .collect();
         let view = build(
-            &logged,
             Ok((0..115)
                 .map(|i| waiting(&format!("p{i}"), "2026-10-20"))
                 .collect()),
@@ -3173,8 +2820,6 @@ mod tests {
             line.trim_end().ends_with("· Details: ohjaa digest"),
             "{line}"
         );
-        // No ids in the line, and nothing raw from outside.
-        assert!(!line.contains("oh-") && !line.contains("s1"), "{line}");
         let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
             .unwrap()
             .0;
@@ -3186,10 +2831,7 @@ mod tests {
             daily.contains("Full details and activity: ohjaa digest"),
             "{daily}"
         );
-        assert!(
-            !daily.contains("sessions ended") && !daily.contains("#1"),
-            "{daily}"
-        );
+        assert!(!daily.contains("#1"), "{daily}");
         for row in full(&view, &Window::at(NOW - DAY_MS), None, None, NOW).lines() {
             assert!(row.chars().count() <= WIDTH, "{row}");
         }
@@ -3224,7 +2866,7 @@ mod tests {
             .map(|name| waiting(name, "2026-10-20"))
             .collect();
         let today = |day: i64| {
-            let view = build(&[], Ok(proposals.clone()), Some(&snapshot(NOW)), NOW, day);
+            let view = build(Ok(proposals.clone()), Some(&snapshot(NOW)), NOW, day);
             let daily = daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
                 .unwrap()
                 .0;
@@ -3243,7 +2885,7 @@ mod tests {
         assert!(today(1).contains("Summary: What b says"));
         assert!(today(2).contains("Summary: What c says"));
         assert!(today(3).contains("Summary: What a says"));
-        let view = build(&[], Ok(proposals), Some(&snapshot(NOW)), NOW, 4);
+        let view = build(Ok(proposals), Some(&snapshot(NOW)), NOW, 4);
         let full = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
         assert!(full.contains("Proposed agent instructions — your decision"));
         assert!(full.contains("3 proposals waiting"), "{full}");
@@ -3257,7 +2899,7 @@ mod tests {
     fn new_proposals_are_news_once() {
         let mut proposals = vec![waiting("a", "2026-10-20")];
         let collected = snapshot(NOW);
-        let view = build(&[], Ok(proposals.clone()), Some(&collected), NOW, 0);
+        let view = build(Ok(proposals.clone()), Some(&collected), NOW, 0);
         let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
         assert!(
             line.contains("1 proposed agent instruction awaits your decision"),
@@ -3267,83 +2909,10 @@ mod tests {
         assert_eq!(one_line(&news(&view, &seen)), None);
         proposals.push(waiting("b", "2026-10-21"));
         proposals.push(waiting("c", "2026-10-21"));
-        let view = build(&[], Ok(proposals), Some(&collected), NOW, 0);
+        let view = build(Ok(proposals), Some(&collected), NOW, 0);
         assert!(one_line(&news(&view, &seen))
             .unwrap()
             .contains("2 proposed agent instructions await your decision"));
-    }
-
-    #[test]
-    fn a_session_says_how_it_ended_what_it_left_out_and_what_it_cost() {
-        let mut gone = session("killed", 2 * HOUR_MS, Some(HOUR_MS), false);
-        gone.left.as_mut().unwrap().exit = Exit::Signal { signal: 9 };
-        let mut orphan = session("orphan", 2 * HOUR_MS, Some(HOUR_MS), false);
-        orphan.left.as_mut().unwrap().orphaned = true;
-        let mut costed = session("costed", 2 * HOUR_MS, Some(HOUR_MS), true);
-        costed.readback = None;
-        let mut collected = snapshot(NOW);
-        collected.usage.value.insert(
-            "costed".into(),
-            TokenUsage {
-                tokens: Some(115_248),
-                cache_reads: Some(2_923_935),
-            },
-        );
-        let view = view(&[gone, orphan, costed], Some(&collected));
-        let said = |id: &str| {
-            view.events
-                .iter()
-                .find(|item| item.key == format!("session:{id}"))
-                .unwrap()
-                .text
-                .clone()
-        };
-        assert_eq!(
-            said("killed"),
-            format!(
-                "claude \"fix the parser\" · killed (signal 9) · elapsed 60m · ended {} · \
-                no task confirmation or completion note recorded",
-                clock(NOW - HOUR_MS)
-            )
-        );
-        assert_eq!(
-            said("orphan"),
-            format!(
-                "claude \"fix the parser\" · orphaned · ended {} · \
-                no task confirmation or completion note recorded",
-                clock(NOW - HOUR_MS)
-            )
-        );
-        assert_eq!(
-            said("costed"),
-            format!(
-                "claude \"fix the parser\" · process exited successfully (code 0) · elapsed 60m · \
-                ended {} · no task confirmation recorded · 115k tokens + 2.9M cache reads",
-                clock(NOW - HOUR_MS)
-            )
-        );
-    }
-
-    #[test]
-    fn a_legacy_snapshot_never_displays_its_currency_estimate() {
-        let usage: TokenUsage = serde_json::from_value(serde_json::json!({
-            "tokens": 115_248, "cache_reads": 2_923_935, "usd_micros": 9_000_000
-        }))
-        .unwrap();
-        assert_eq!(
-            usage_text(&usage).as_deref(),
-            Some("115k tokens + 2.9M cache reads")
-        );
-        let saved = serde_json::to_value(&usage).unwrap();
-        assert_eq!(
-            saved,
-            serde_json::json!({"tokens":115_248,"cache_reads":2_923_935})
-        );
-        let unknown: TokenUsage = serde_json::from_value(serde_json::json!({
-            "tokens": null, "cache_reads": null, "usd_micros": 9_000_000
-        }))
-        .unwrap();
-        assert_eq!(usage_text(&unknown), None);
     }
 
     /// Review of #63, finding 1: what could not be read is said where the
@@ -3352,8 +2921,8 @@ mod tests {
     fn what_could_not_be_read_is_said_and_never_an_all_clear() {
         let mut collected = snapshot(NOW);
         collected.github.error = Some("gh api graphql: not logged in".into());
-        collected.typed.gaps = vec!["could not read one-session.jsonl".into()];
-        let view = view(&[], Some(&collected));
+        collected.secrets.gaps = vec!["could not read one-session.jsonl".into()];
+        let view = view(Some(&collected));
         assert!(view.incomplete());
         let rows: Vec<&str> = view
             .standing
@@ -3364,20 +2933,20 @@ mod tests {
             rows,
             vec![
                 "Pull request activity: unavailable, as of 2027-01-15 08:00 UTC: gh api graphql: not logged in · Retry collecting status: ohjaa collect",
-                "Session message excerpts: 1 could not be read, as of 2027-01-15 08:00 UTC: could not read one-session.jsonl · Retry collecting status: ohjaa collect",
+                "Secrets scan: 1 could not be read, as of 2027-01-15 08:00 UTC: could not read one-session.jsonl · Retry collecting status: ohjaa collect",
             ]
         );
         let line = one_line(&news(&view, &Seen::first(NOW))).unwrap();
         assert!(
-            line.contains("Missing or incomplete information: pull requests, session excerpts")
+            line.contains("Missing or incomplete information: pull requests, secrets scan")
                 && line.ends_with("Details: ohjaa digest\n"),
             "{line}"
         );
         let full = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW);
-        assert!(full.contains("! messages"), "{full}");
+        assert!(full.contains("! secrets"), "{full}");
         assert!(
             full.contains("Sources\n  GitHub (pull request activity) as of 2027-01-15 08:00 UTC")
-                && full.contains("messages (session message excerpts) as of 2027-01-15 08:00 UTC"),
+                && full.contains("secrets (secrets scan coverage) as of 2027-01-15 08:00 UTC"),
             "{full}"
         );
         // Nothing collected yet is unknown too, not nothing.
@@ -3392,11 +2961,11 @@ mod tests {
     }
 
     fn view_of_nothing() -> View {
-        build(&[], Ok(Vec::new()), None, NOW, 0)
+        build(Ok(Vec::new()), None, NOW, 0)
     }
 
     fn view_ok() -> View {
-        build(&[], Ok(Vec::new()), Some(&snapshot(NOW)), NOW, 0)
+        build(Ok(Vec::new()), Some(&snapshot(NOW)), NOW, 0)
     }
 
     /// Finding 3: what the day's digest left out is where `ohjaa digest`
@@ -3405,7 +2974,7 @@ mod tests {
     #[test]
     fn what_the_days_digest_left_out_is_where_ohjaa_digest_starts() {
         let old = snapshot(NOW - 3 * HOUR_MS);
-        let view = view(&[], Some(&old));
+        let view = view(Some(&old));
         let from = Window::at(NOW - DAY_MS);
         let first = Seen::first(NOW);
         let cut = advance(
@@ -3449,7 +3018,7 @@ mod tests {
     #[test]
     fn what_a_days_digest_left_out_stays_until_it_is_read_in_full() {
         let snap = snapshot(NOW);
-        let view = view(&[], Some(&snap));
+        let view = view(Some(&snap));
         let day = |n: i64| NOW + n * DAY_MS;
         let first = advance(
             &view,
@@ -3510,14 +3079,14 @@ mod tests {
     #[test]
     fn unread_history_does_not_turn_into_startup_attention() {
         let earlier = Window::at(NOW - 2 * DAY_MS);
-        let quiet = build(&[], Ok(Vec::new()), Some(&snapshot(NOW)), NOW, 0);
+        let quiet = build(Ok(Vec::new()), Some(&snapshot(NOW)), NOW, 0);
         assert_eq!(
             daily(&quiet, &Window::at(NOW - DAY_MS), Some(&earlier), NOW),
             None
         );
         let mut busy = snapshot(NOW);
         busy.github.value = (1..40).map(|n| pr(n, HOUR_MS, Some(HOUR_MS / 2))).collect();
-        let view = build(&[], Ok(Vec::new()), Some(&busy), NOW, 0);
+        let view = build(Ok(Vec::new()), Some(&busy), NOW, 0);
         assert_eq!(
             daily(&view, &Window::at(NOW - DAY_MS), Some(&earlier), NOW),
             None
@@ -3536,7 +3105,7 @@ mod tests {
     fn a_pull_request_indexed_late_is_in_the_next_digest_and_nothing_twice() {
         let mut before = snapshot(NOW);
         before.github.value = vec![pr(79, 3 * HOUR_MS, Some(30 * MINUTE_MS))];
-        let shown = view(&[], Some(&before));
+        let shown = view(Some(&before));
         let first = Window::at(NOW - DAY_MS);
         assert_eq!(after(&shown, &first).len(), 1, "#79 merged");
         let seen = advance(
@@ -3553,7 +3122,7 @@ mod tests {
             pr(79, 3 * HOUR_MS, Some(30 * MINUTE_MS)),
             pr(80, 2 * HOUR_MS, Some(20 * MINUTE_MS)),
         ];
-        let view = build(&[], Ok(Vec::new()), Some(&later), NOW + HOUR_MS, 0);
+        let view = build(Ok(Vec::new()), Some(&later), NOW + HOUR_MS, 0);
         let next = seen.full_from(NOW + HOUR_MS);
         let keys: Vec<&str> = after(&view, &next)
             .iter()
@@ -3569,7 +3138,7 @@ mod tests {
         long_ago.title = "merged before the overlap".into();
         let mut stale = later.clone();
         stale.github.value.push(long_ago);
-        let view = build(&[], Ok(Vec::new()), Some(&stale), NOW + HOUR_MS, 0);
+        let view = build(Ok(Vec::new()), Some(&stale), NOW + HOUR_MS, 0);
         assert!(after(&view, &seen.full_from(NOW + HOUR_MS)).is_empty());
     }
 
@@ -3582,7 +3151,7 @@ mod tests {
         // the search ran, two seconds after the read began.
         let mut read = snapshot(NOW + 700);
         read.github.value = vec![pr(79, HOUR_MS, Some(0)), pr(78, HOUR_MS, Some(-2_000))];
-        let shown = build(&[], Ok(Vec::new()), Some(&read), NOW + 5_000, 0);
+        let shown = build(Ok(Vec::new()), Some(&read), NOW + 5_000, 0);
         let keys = |view: &View, from: &Window| -> Vec<String> {
             after(view, from)
                 .iter()
@@ -3607,33 +3176,18 @@ mod tests {
         let mut later = read.clone();
         later.at_ms = NOW + HOUR_MS;
         later.github.as_of_ms = Some(NOW + HOUR_MS);
-        let view = build(&[], Ok(Vec::new()), Some(&later), NOW + HOUR_MS, 0);
+        let view = build(Ok(Vec::new()), Some(&later), NOW + HOUR_MS, 0);
         assert!(keys(&view, &seen.full_from(NOW + HOUR_MS)).is_empty());
         assert!(keys(&view, &seen.daily_from(NOW + HOUR_MS)).is_empty());
     }
 
     #[test]
-    fn sessions_at_the_digest_boundary_are_read_once_without_hiding_late_records() {
-        let first = session("first", 10_000, Some(0), true);
-        let shown = view(std::slice::from_ref(&first), None);
-        let seen = advance(&shown, &Seen::first(NOW), None, NOW + 700, Shown::Full, "d");
-        assert!(after(&shown, &seen.full_from(NOW + 800)).is_empty());
-
-        let late = session("late", 9_000, Some(0), true);
-        let next = view(&[first, late], None);
-        let unread = after(&next, &seen.full_from(NOW + 800));
-        assert_eq!(unread.len(), 1);
-        assert_eq!(unread[0].key, "session:late");
-    }
-
-    #[test]
     fn a_stale_concurrent_digest_cannot_undo_a_boundary_acknowledgement() {
-        let empty = view(&[], None);
-        let fresh = view(&[session("just-ended", 10_000, Some(0), true)], None);
+        let empty = view(None);
+        let fresh = view(None);
         let first = advance(&fresh, &Seen::first(NOW), None, NOW + 200, Shown::Full, "d");
         let stale = advance(&empty, &first, None, NOW + 100, Shown::Full, "d");
         assert_eq!(stale.digest.as_ref().unwrap().sessions_ms, NOW + 200);
-        assert!(after(&fresh, &stale.full_from(NOW + 400)).is_empty());
     }
 
     #[test]
@@ -3644,7 +3198,7 @@ mod tests {
         pull_request.url = format!("https://github.com/{}/pull/12345", pull_request.repo);
         let url = pull_request.url.clone();
         collected.github.value.push(pull_request);
-        let view = view(&[], Some(&collected));
+        let view = view(Some(&collected));
         assert!(full(&view, &Window::at(NOW - DAY_MS), None, None, NOW).contains(&url));
     }
 
@@ -3655,8 +3209,8 @@ mod tests {
     fn another_failure_of_a_source_is_said_again_and_the_same_one_is_not() {
         let mut collected = snapshot(NOW);
         collected.github.error = Some("gh api graphql: not logged in".into());
-        collected.typed.gaps = vec!["could not read one-session.jsonl".into()];
-        let first = view(&[], Some(&collected));
+        collected.secrets.gaps = vec!["could not read one-session.jsonl".into()];
+        let first = view(Some(&collected));
         let seen = advance(
             &first,
             &Seen::first(NOW),
@@ -3667,39 +3221,39 @@ mod tests {
         );
         assert_eq!(one_line(&news(&first, &seen)), None);
         collected.github.error = Some("gh api graphql: connection refused".into());
-        let other = view(&[], Some(&collected));
+        let other = view(Some(&collected));
         let line = one_line(&news(&other, &seen)).expect("another failure");
         assert!(
             line.contains("Missing or incomplete information: pull requests"),
             "{line}"
         );
         assert!(
-            !line.contains("session excerpts"),
-            "the excerpts failed the same: {line}"
+            !line.contains("secrets scan"),
+            "the scan failed the same: {line}"
         );
         let seen = advance(&other, &seen, Some(&collected), NOW, Shown::Line, "d");
         collected
-            .typed
+            .secrets
             .gaps
             .push("could not read two-session.jsonl".into());
-        let more = view(&[], Some(&collected));
+        let more = view(Some(&collected));
         let line = one_line(&news(&more, &seen)).expect("one more could not be read");
         assert!(
-            line.contains("Missing or incomplete information: session excerpts"),
+            line.contains("Missing or incomplete information: secrets scan"),
             "{line}"
         );
         assert!(full(&more, &Window::at(NOW - DAY_MS), None, None, NOW)
-            .contains("Session message excerpts: 2 could not be read"));
+            .contains("Secrets scan: 2 could not be read"));
         let seen = advance(&more, &seen, Some(&collected), NOW, Shown::Line, "d");
         // The same cap, read later: its count and time moved, nothing new.
         collected.github.error = None;
         collected.github.gaps =
             vec!["250 pull requests were updated since 2026-10-26 08:00 UTC; only 200 read".into()];
-        let capped = view(&[], Some(&collected));
+        let capped = view(Some(&collected));
         let seen = advance(&capped, &seen, Some(&collected), NOW, Shown::Line, "d");
         collected.github.gaps =
             vec!["261 pull requests were updated since 2026-10-26 08:15 UTC; only 200 read".into()];
-        let later = view(&[], Some(&collected));
+        let later = view(Some(&collected));
         assert_eq!(one_line(&news(&later, &seen)), None);
     }
 
@@ -3708,7 +3262,7 @@ mod tests {
     fn a_window_longer_than_github_was_read_says_so() {
         let mut collected = snapshot(NOW);
         collected.github.from_ms = Some(NOW - DAY_MS);
-        let view = view(&[], Some(&collected));
+        let view = view(Some(&collected));
         let week = full(&view, &Window::at(NOW - 7 * DAY_MS), None, None, NOW);
         assert!(
             week.contains(&format!(
@@ -3733,9 +3287,7 @@ mod tests {
         hostile.author = Some("\u{1b}[2Jx".into());
         collected.github.value = vec![hostile];
         collected.github.error = Some("gh: \u{1b}[31mno".into());
-        let mut intent = session("s", 2 * HOUR_MS, Some(HOUR_MS), true);
-        intent.intent = "\u{1b}]0;title\u{7}".into();
-        let view = view(&[intent], Some(&collected));
+        let view = view(Some(&collected));
         let said = full(&view, &Window::at(NOW - DAY_MS), None, None, NOW)
             + &daily(&view, &Window::at(NOW - DAY_MS), None, NOW)
                 .unwrap()
@@ -3758,7 +3310,7 @@ mod tests {
             proposals: dir.join("proposals"),
             state: dir.clone(),
         };
-        let view = view(&[session("a", 2 * HOUR_MS, Some(HOUR_MS), true)], None);
+        let view = view(None);
         let seen = advance(
             &view,
             &Seen::first(NOW),
