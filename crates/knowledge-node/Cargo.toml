@@ -1,0 +1,10 @@
+[package]
+name = "knowledge-node"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "knowledge-node.v1: parse and validate units of Knowledge."
+
+[dependencies]
+toml = "1.1"

@@ -8,7 +8,7 @@ This is **ohjaa**. Toimija reports facts and refuses to decide; ohjaa holds what
 
 These mirror `.toimija/repo.yaml`; keep both in sync.
 
-- One Rust crate, one `ohjaa` binary. Dependencies: anyhow, clap, serde, serde_json, the vendored faija-knowledge and libc; tests also sha2 and serde_yaml. Every addition needs a reason.
+- One `ohjaa` binary, and beside it the crate of the knowledge-node format, `crates/knowledge-node`. Dependencies: anyhow, clap, serde, serde_json and libc; the format's crate, toml; tests also serde_yaml. Every addition needs a reason.
 - Ohjaa holds Knowledge; toimija reports facts. Never reimplement what toimija derives: shell out to its CLI and read its --json.
 - Ohjaa stores Knowledge, in git. Everything else is derived when asked; the human view's snapshot is the one cache. No knowledge index and no daemon.
 - The workflow lives in the home (~/.config/ohjaa), outside every repository. No file, hook or config of a repository's checkout is written.
@@ -23,7 +23,7 @@ These mirror `.toimija/repo.yaml`; keep both in sync.
 - Output for a person is plain and contextual: name the repository or session, say what happened or is missing, and show how to see more or act.
 - Never run `ohjaa accept`, `reject`, `retire`, `confirm` or `review` for a person, or fake a terminal to get past them, except in a test's own sandbox. Propose with `ohjaa propose`.
 - Before you finish, leave `toimija handover` for the next agent: what is unfinished, what it needs to know, what surprised you.
-- Never edit `vendor/faija-knowledge/`; `scripts/vendor-faija-knowledge.sh` refreshes it.
+- `knowledge-node.v1` is frozen: never edit `fixtures/knowledge-node.v1/`. A change to what a valid node is makes a new format version, with fixtures of its own.
 - Tests never touch the person's real state (the "Tests" section of `docs/reference.md` says what each suite sandboxes), and write a file they will run only through `write_executable`.
 - The gate is this repository's own `sykli.json`, pinned by `sykli.lock`: `sykli run` proves HEAD. After adding a source or test file, add it to every task's inputs and run `sykli lock sykli.json`. A new git process on a hot path needs its budget in `tests/config_home.rs`.
 - Code is Rust or Elixir/Erlang; never add Python, Go or Node.

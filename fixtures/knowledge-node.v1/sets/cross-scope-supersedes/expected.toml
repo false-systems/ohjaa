@@ -1,0 +1,2 @@
+errors = [{ code = "cross-scope-supersedes", id = "my-override" }]
+briefing = ["team-decision"]

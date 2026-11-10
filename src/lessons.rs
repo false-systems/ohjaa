@@ -32,7 +32,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
-use faija_knowledge::{self as fk, Date, Located, Node, Scope, Status};
+use knowledge_node::{self as fk, Date, Located, Node, Scope, Status};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -2191,7 +2191,7 @@ pub fn waiting(state: &Path, repos: &[PathBuf]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faija_knowledge::Kind;
+    use knowledge_node::Kind;
 
     fn node(id: &str, kind: Kind, body: &str) -> Node {
         Node {

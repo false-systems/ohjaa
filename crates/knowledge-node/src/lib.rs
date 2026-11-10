@@ -1,4 +1,4 @@
-//! `knowledge-node.v1`: one unit of Knowledge per file (`faija-ontology.v2`).
+//! `knowledge-node.v1`: one unit of Knowledge per file (see `docs/ontology.md`).
 //!
 //! Parsing, validation and canonical writing only. This crate does no IO, never
 //! evaluates a predicate, and never renders a briefing: those belong to the
@@ -913,7 +913,7 @@ mod tests {
             "path:../x",
             "path:a/../b",
             "path:~/..",
-            "repo-active:rauha",
+            "repo-active:widget",
             "limactl",
         ] {
             assert_eq!(Predicate::parse(bad), None, "{bad}");

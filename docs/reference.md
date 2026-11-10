@@ -25,7 +25,7 @@ Contents:
 
 Knowledge is what the people an agent works for know and have decided:
 decisions, facts, taste and lessons. Each piece is a node, one per file, in
-the [`knowledge-node.v1`](https://github.com/false-systems/faija/blob/main/docs/knowledge-node-v1.md)
+the [`knowledge-node.v1`](knowledge-node-v1.md)
 format: TOML frontmatter, then the body an agent reads.
 
 ```
@@ -63,9 +63,11 @@ folder is `$XDG_STATE_HOME/ohjaa`, by default `~/.local/state/ohjaa`.
 
 Knowledge is ordered **ours → repo → mine → machine**, then **decision → fact
 → taste → lesson**. A personal node never supersedes a shared one, and shared
-knowledge never builds on personal knowledge. Those rules come from faija's
-contract. Ohjaa carries its reference implementation in
-`vendor/faija-knowledge`.
+knowledge never builds on personal knowledge. Ohjaa defines the format and those rules in
+[knowledge-node-v1.md](knowledge-node-v1.md). The reference implementation
+is the crate `crates/knowledge-node`, and the golden fixtures are in
+`fixtures/knowledge-node.v1/`. [ontology.md](ontology.md) says what the
+concepts mean.
 
 ## Commands
 
@@ -810,11 +812,12 @@ coverage: scanned 17/18 repo(s)
 `AGENTS.md` and `.toimija/repo.yaml` carry these boundaries in short. This
 is each in full, with what ohjaa keeps where.
 
-- **One crate, one binary.** One Rust crate produces a single `ohjaa`
-  binary. Its dependencies are `anyhow`, `clap`, `serde`, `serde_json`, the
-  vendored `faija-knowledge` and `libc` (file locks, process groups, the
-  local time zone). Tests alone also use `sha2` and `serde_yaml`. Every
-  addition needs a reason.
+- **One binary.** The `ohjaa` crate produces a single `ohjaa` binary. The
+  knowledge-node format has a crate of its own beside it,
+  `crates/knowledge-node`, which depends only on `toml`. Ohjaa's other
+  dependencies are `anyhow`, `clap`, `serde`, `serde_json` and `libc` (file
+  locks, process groups, the local time zone). Tests alone also use
+  `serde_yaml`. Every addition needs a reason.
 - **Ohjaa holds knowledge; toimija reports facts.** Ohjaa never
   reimplements what toimija derives. It runs toimija's CLI and reads its
   `--json`.
@@ -901,7 +904,7 @@ followed by `sykli lock sykli.json`, or `sykli run` refuses.
 | `tests/lessons.rs` | delivery of repo knowledge, to a local bare repository as the remote: git's `insteadOf` turns the GitHub URL into it, and `GIT_ALLOW_PROTOCOL=file` keeps git off the network should that fail |
 | `tests/instructions.rs` | that `CLAUDE.md` imports `AGENTS.md`, and that both stay small |
 | `tests/repo_config.rs` | that toimija can parse `.toimija/repo.yaml`, and that git ignores toimija's working files |
-| `tests/vendored_knowledge.rs` | that `vendor/faija-knowledge` matches its pinned digest |
+| `crates/knowledge-node/tests/conformance.rs` | nothing: it runs the golden fixtures in `fixtures/knowledge-node.v1/` through the format's crate, and pins their bytes by a digest |
 
 A test writes a stand-in, or any file it then runs, only through its crate's
 `write_executable`, which has `cp` write it. Linux refuses to run a file

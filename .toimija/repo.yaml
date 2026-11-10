@@ -16,7 +16,6 @@ context:
   read_first: []
   safe_to_ignore:
     - target/
-    - vendor/
 
 validation:
   replace_inferred: true
@@ -31,7 +30,7 @@ validation:
   privileged: []
 
 boundaries:
-  - "One Rust crate, one `ohjaa` binary. Dependencies: anyhow, clap, serde, serde_json, the vendored faija-knowledge and libc; tests also sha2 and serde_yaml. Every addition needs a reason."
+  - "One `ohjaa` binary, and beside it the crate of the knowledge-node format, `crates/knowledge-node`. Dependencies: anyhow, clap, serde, serde_json and libc; the format's crate, toml; tests also serde_yaml. Every addition needs a reason."
   - "Ohjaa holds Knowledge; toimija reports facts. Never reimplement what toimija derives: shell out to its CLI and read its --json."
   - "Ohjaa stores Knowledge, in git. Everything else is derived when asked; the human view's snapshot is the one cache. No knowledge index and no daemon."
   - "The workflow lives in the home (~/.config/ohjaa), outside every repository. No file, hook or config of a repository's checkout is written."

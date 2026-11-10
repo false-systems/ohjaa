@@ -6,7 +6,7 @@
 //! Anything outside that subset is an error naming its line, never skipped:
 //! a config file read differently from what its author meant would apply the
 //! wrong gate or undo the wrong change. It is not a TOML parser. The `toml`
-//! crate is already built here, for the vendored faija-knowledge, but
+//! crate is already built here, for the knowledge-node crate, but
 //! depending on it directly would change the crate's dependency list, which
 //! only a person moves (AGENTS.md); until then, this subset.
 

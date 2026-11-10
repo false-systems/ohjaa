@@ -1,0 +1,35 @@
+# Every .md file in this directory, with the result a conforming
+# implementation must give when it parses the file under its own stem.
+
+[valid]
+files = [
+  "crlf-line-endings.md",
+  "delimiter-in-body.md",
+  "every-field.md",
+  "lima-for-linux.md",
+  "rust-elixir-only.md",
+]
+
+[invalid]
+"Bad_Id.md" = "bad-id"
+"bad-reference-id.md" = "bad-id"
+"blank-origin.md" = "empty-origin"
+"broken-toml.md" = "bad-toml"
+"date-with-time.md" = "bad-date"
+"double-supersede.md" = "duplicate-reference"
+"empty-origin.md" = "empty-origin"
+"escaping-path.md" = "bad-predicate"
+"file-name.md" = "id-mismatch"
+"id-as-number.md" = "wrong-type"
+"impossible-date.md" = "bad-toml"
+"leading-blank-line.md" = "missing-frontmatter"
+"no-body.md" = "empty-body"
+"no-frontmatter.md" = "missing-frontmatter"
+"no-origin.md" = "missing-field"
+"origin-as-string.md" = "wrong-type"
+"quoted-date.md" = "bad-date"
+"self-supersede.md" = "self-reference"
+"typo-field.md" = "unknown-field"
+"unclosed.md" = "missing-frontmatter"
+"unknown-kind.md" = "bad-kind"
+"unknown-status.md" = "bad-status"

@@ -15,7 +15,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use faija_knowledge::{Kind, Node, Scope, Status};
+use knowledge_node::{Kind, Node, Scope, Status};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -3302,7 +3302,7 @@ mod tests {
         let loaded = Loaded {
             nodes: current
                 .iter()
-                .map(|(scope, _, id, status)| faija_knowledge::Located {
+                .map(|(scope, _, id, status)| knowledge_node::Located {
                     scope: *scope,
                     node: lesson(id, *status, "A lesson in a scope."),
                 })
@@ -3621,7 +3621,7 @@ mod tests {
                 ("leave-a-handover-always", Status::Retired),
             ]
             .into_iter()
-            .map(|(id, status)| faija_knowledge::Located {
+            .map(|(id, status)| knowledge_node::Located {
                 scope: Mine,
                 node: lesson(id, status, "In a scope."),
             })
@@ -3703,7 +3703,7 @@ mod tests {
     fn a_proposed_node_in_a_scope_directory_is_listed_once() {
         let node = lesson("x-y-z", Status::Proposed, "Committed for review.");
         let loaded = Loaded {
-            nodes: vec![faija_knowledge::Located {
+            nodes: vec![knowledge_node::Located {
                 scope: Scope::Ours,
                 node: node.clone(),
             }],
@@ -3879,7 +3879,7 @@ mod tests {
         // drafter, and must be counted.
         let key = fake(&["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"]);
         let loaded = Loaded {
-            nodes: vec![faija_knowledge::Located {
+            nodes: vec![knowledge_node::Located {
                 scope: Scope::Mine,
                 node: lesson(
                     "use-the-api",
@@ -4129,11 +4129,11 @@ mod tests {
         let secret_repo = format!("/r/project {repo_token}");
         let loaded = Loaded {
             nodes: vec![
-                faija_knowledge::Located {
+                knowledge_node::Located {
                     scope: Scope::Mine,
                     node: lesson(&hidden, Status::Current, "A lesson in a scope."),
                 },
-                faija_knowledge::Located {
+                knowledge_node::Located {
                     scope: Scope::Repo,
                     node: lesson("visible-lesson", Status::Current, "A lesson in a scope."),
                 },

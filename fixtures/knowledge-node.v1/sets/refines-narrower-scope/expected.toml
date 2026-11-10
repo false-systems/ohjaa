@@ -1,0 +1,2 @@
+errors = [{ code = "refines-narrower-scope", id = "repo-rule" }]
+briefing = ["repo-rule", "my-habit", "machine-note"]

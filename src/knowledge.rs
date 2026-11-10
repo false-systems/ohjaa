@@ -1,5 +1,5 @@
 //! The steering graph: what the people an agent works for know and have
-//! decided (faija-ontology.v2, in the knowledge-node.v1 format).
+//! decided (in the knowledge-node.v1 format).
 //!
 //! Toimija reports facts and refuses to decide. This is the other half: the
 //! decisions, taste and lessons that steer an agent *before* it acts. Every
@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use faija_knowledge::{self as fk, Date, Kind, Located, Node, Predicate, Scope, Status};
+use knowledge_node::{self as fk, Date, Kind, Located, Node, Predicate, Scope, Status};
 
 /// A fact not re-confirmed for this long is flagged: facts expire (law 6).
 pub const FACT_TTL_DAYS: i64 = 90;

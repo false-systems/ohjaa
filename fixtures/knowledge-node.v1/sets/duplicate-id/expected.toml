@@ -1,0 +1,2 @@
+errors = [{ code = "duplicate-id", id = "same-name" }]
+briefing = ["same-name", "same-name"]
