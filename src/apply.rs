@@ -198,8 +198,8 @@ pub fn sources_old_launcher(line: &str) -> bool {
         })
 }
 
-/// `current` with the line `desired` (from [`launch_line`]): it replaces the
-/// old `source …/ohjaa-launch.zsh` line, or a launcher line an earlier apply
+/// `current` with the line `desired` (from [`launch_line`]): it replaces a
+/// `source …/ohjaa-launch.zsh` line, or a launcher line an earlier apply
 /// wrote for another path (and the ohjaa comment line just above either),
 /// or is appended when there was none. `None` when nothing needs to change.
 pub fn zshrc_with_launcher(current: &str, desired: &str) -> Option<ZshrcPlan> {

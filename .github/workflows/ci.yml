@@ -24,10 +24,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # Kept from the arc-runner days, when anonymous git-over-HTTPS egress was
-      # rate-limited and broke toimija's CI (PR #203). Ohjaa has no git
-      # dependencies today; it stays so a future one cannot break CI on any
-      # runner. Scoped to false-systems only.
+      # Anonymous git fetches over HTTPS can be rate-limited on a runner.
+      # Ohjaa has no git dependencies; this stays so that one added later
+      # cannot break CI. Scoped to this organisation only.
       - name: Authenticate git dependency fetches
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -82,8 +81,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # The same as the rust job: scoped to false-systems, and needed here to
-      # fetch sykli itself, which is private.
+      # The same as the rust job, and needed here to fetch sykli itself.
       - name: Authenticate git dependency fetches
         env:
           GITHUB_TOKEN: ${{ github.token }}

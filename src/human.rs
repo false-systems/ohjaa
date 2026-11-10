@@ -2915,7 +2915,7 @@ mod tests {
             .contains("2 proposed agent instructions await your decision"));
     }
 
-    /// Review of #63, finding 1: what could not be read is said where the
+    /// What could not be read is said where the
     /// view is read, and makes the digest incomplete; never an all-clear.
     #[test]
     fn what_could_not_be_read_is_said_and_never_an_all_clear() {
@@ -2968,7 +2968,7 @@ mod tests {
         build(Ok(Vec::new()), Some(&snapshot(NOW)), NOW, 0)
     }
 
-    /// Finding 3: what the day's digest left out is where `ohjaa digest`
+    /// What the day's digest left out is where `ohjaa digest`
     /// starts; once read in full, the next starts after it. GitHub's part of
     /// a window is by GitHub's clock: the snapshot's time.
     #[test]
@@ -3012,7 +3012,7 @@ mod tests {
         assert_eq!(read.full_from(NOW).sessions_ms, NOW + HOUR_MS);
     }
 
-    /// Second review of #63, finding 2: what a day's digest left out stays
+    /// What a day's digest left out stays
     /// where `ohjaa digest` begins until it is read in full, whatever the
     /// days' digests after it leave out or not.
     #[test]
@@ -3074,7 +3074,7 @@ mod tests {
         assert_eq!(read.unseen, None, "read in full");
     }
 
-    /// Second review of #63, finding 2: the day's digest points to what an
+    /// The day's digest points to what an
     /// earlier one left out while it is unread, within its lines.
     #[test]
     fn unread_history_does_not_turn_into_startup_attention() {
@@ -3098,7 +3098,7 @@ mod tests {
         );
     }
 
-    /// Second review of #63, finding 3: a pull request GitHub indexes late,
+    /// A pull request GitHub indexes late,
     /// merged before the snapshot the last digest was shown from, is in the
     /// next digest, and what that digest said is not said again.
     #[test]
@@ -3142,7 +3142,7 @@ mod tests {
         assert!(after(&view, &seen.full_from(NOW + HOUR_MS)).is_empty());
     }
 
-    /// Review of #67, finding 1: a pull request at the very end of a
+    /// A pull request at the very end of a
     /// digest's GitHub stretch (merged in the second GitHub was read, or
     /// while its search ran) is said by that digest and not by the next.
     #[test]
@@ -3202,7 +3202,7 @@ mod tests {
         assert!(full(&view, &Window::at(NOW - DAY_MS), None, None, NOW).contains(&url));
     }
 
-    /// Second review of #63, a nit: a source is said in the line for each
+    /// A source is said in the line for each
     /// failure, not once while the first stands; the same failure with its
     /// numbers moved (a count, a time) is the same.
     #[test]
@@ -3257,7 +3257,7 @@ mod tests {
         assert_eq!(one_line(&news(&later, &seen)), None);
     }
 
-    /// Finding 5: a window longer than GitHub was read says so.
+    /// A window longer than GitHub was read says so.
     #[test]
     fn a_window_longer_than_github_was_read_says_so() {
         let mut collected = snapshot(NOW);

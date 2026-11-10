@@ -12,8 +12,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-# knowledge-node.v1, carried rather than fetched: faija is private and publishes
-# nothing. Pinned and drift-checked by `vendor/faija-knowledge.contract` and
+# knowledge-node.v1, carried in the tree, so the build fetches nothing.
+# Pinned and drift-checked by `vendor/faija-knowledge.contract` and
 # `tests/vendored_knowledge.rs`; refresh with the script beside it.
 faija-knowledge = { path = "vendor/faija-knowledge" }
 serde = { version = "1", features = ["derive"] }

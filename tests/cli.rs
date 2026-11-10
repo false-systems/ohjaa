@@ -1211,10 +1211,9 @@ fn a_failing_drafter_stops_intake_without_moving_the_cursor() {
 
 #[test]
 fn a_repository_with_no_commits_yet_is_empty_and_does_not_hold_the_cursor() {
-    // Intake's first real run, 2026-10-27: `git log` refuses a repository
-    // with no commits yet, so the reverts of two such repositories counted
-    // as unread, and held the cursor 336 hours back and the sessions queued
-    // behind it.
+    // `git log` refuses a repository with no commits yet. Such a
+    // repository has no reverts to read: it must not count as unread and
+    // hold the cursor.
     if !git_available() {
         return;
     }
@@ -1278,7 +1277,7 @@ fn a_repository_with_no_commits_yet_is_empty_and_does_not_hold_the_cursor() {
 
 #[test]
 fn only_a_branch_never_committed_to_is_empty_not_one_whose_ref_was_lost() {
-    // The review of #61: git says "does not have any commits yet" for a
+    // git says "does not have any commits yet" for a
     // branch never committed to, and also for one whose ref was lost (a
     // loose ref deleted, `packed-refs` cut short). Only the first is empty.
     if !git_available() {
@@ -1362,9 +1361,8 @@ fn waiting_proposal(dir: &Path, id: &str, body: &str) -> (PathBuf, String) {
 
 #[test]
 fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
-    // Intake's first real run, 2026-10-27, wrote 108 proposals, four of them
-    // one lesson ("read back the briefing and leave a handover"). The review
-    // of #61: refusing what looks repeated drops real lessons for good
+    // A drafter writes one lesson several times over. Refusing what looks
+    // repeated would drop real lessons for good
     // (`quarry-linux-only` as `beacon-linux-only`), and a person is the only
     // one who decides. So each is written, and said to that person.
     if !git_available() {
@@ -1530,8 +1528,8 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
         assert!(stdout.contains(line), "{line}\n{stdout}");
     }
     // Nothing drafted is lost: every draft waits for a person, and nothing
-    // is stored beside it (the re-review of #61: a possible duplicate is
-    // derived when a person reviews).
+    // is stored beside it (a possible duplicate is derived when a person
+    // reviews).
     for (scope, id) in [
         ("ours", "start-agents-through-ohjaa-run"),
         ("mine", "code-is-rust-or-elixir"),
@@ -1639,8 +1637,8 @@ fn answering_drafter(fixture: &Fixture, dir: &Path) -> PathBuf {
 
 #[test]
 fn intake_counts_what_a_person_had_to_teach_again_once_and_list_check_review_show_it() {
-    // Yair, 2026-10-28: the briefing gives agents knowledge, and nothing
-    // measured whether it changes what they do. A node the person keeps
+    // The briefing gives agents knowledge; this measures whether it
+    // changes what they do. A node the person keeps
     // re-teaching is not working; one nothing ever touches may be stale.
     if !git_available() {
         return;
@@ -3014,7 +3012,7 @@ fn on_a_terminal(command: &mut Command) -> (String, Option<i32>) {
     )
 }
 
-/// Audit finding: agent shells used up the digest. Without a terminal, or
+/// An agent's shell must not use up the digest. Without a terminal, or
 /// in an agent's shell at one, `line` prints, reads, writes and starts
 /// nothing.
 #[test]
@@ -3049,9 +3047,8 @@ fn line_says_nothing_and_moves_nothing_without_a_person_at_a_terminal() {
     fixture.cleanup();
 }
 
-/// The ruling: the first `line` of each local day prints the day's digest,
-/// then one line only when something is new. Audit findings: seeing a line
-/// moves the cursor, and sessions without read-back or handover are said.
+/// The first `line` of each local day prints the day's digest,
+/// then one line only when something is new.
 #[test]
 fn startup_is_attention_only_and_activity_stays_unread_until_the_digest() {
     if !git_available() {
@@ -3102,7 +3099,7 @@ fn startup_is_attention_only_and_activity_stays_unread_until_the_digest() {
     fixture.cleanup();
 }
 
-/// The ruling: `line` makes no network call and starts no git process; with
+/// `line` makes no network call and starts no git process; with
 /// a fresh snapshot it starts nothing at all.
 #[test]
 fn quiet_startup_retains_unread_pull_requests_across_days() {
@@ -3246,7 +3243,7 @@ fn a_stale_snapshot_starts_exactly_one_background_collect() {
     fixture.cleanup();
 }
 
-/// depot's, ported: GitHub is asked at most twice, and a source that
+/// GitHub is asked at most twice, and a source that
 /// fails never fails the collect: it is said, as of when it last answered.
 #[test]
 fn collect_asks_github_at_most_twice_and_says_what_failed() {
@@ -3287,7 +3284,7 @@ fn collect_asks_github_at_most_twice_and_says_what_failed() {
     fixture.cleanup();
 }
 
-/// depot's, ported: a state directory the cursor cannot be written to
+/// A state directory the cursor cannot be written to
 /// never repeats the day's digest at every terminal.
 #[test]
 fn a_cursor_that_cannot_be_written_never_repeats_the_days_digest() {
@@ -3321,7 +3318,7 @@ fn shell_init_prints_only_the_line() {
     fixture.cleanup();
 }
 
-// ---- the review of #63 --------------------------------------------------------
+// ---- what could not be read, and what a digest left out --------------------
 
 impl Fixture {
     /// The snapshot as if collected `hours` ago: every part read then.
@@ -3355,10 +3352,10 @@ impl Fixture {
     }
 }
 
-/// Finding 1: a clone whose config cannot be read, or repositories whose
+/// A clone whose config cannot be read, or repositories whose
 /// sessions cannot be listed, are said as what could not be read, in the day's
 /// digest and the full one, and the digest exits 4: never an all-clear.
-/// Finding 6: the fleet is not in the snapshot; the digest asks for it.
+/// The fleet is not in the snapshot; the digest asks for it.
 #[test]
 fn what_could_not_be_read_is_said_never_an_all_clear() {
     if !git_available() {
@@ -3400,7 +3397,7 @@ fn what_could_not_be_read_is_said_never_an_all_clear() {
     fixture.cleanup();
 }
 
-/// Finding 3: what the day's digest left out (`… N more: ohjaa digest`) is
+/// What the day's digest left out (`… N more: ohjaa digest`) is
 /// what `ohjaa digest` shows next.
 #[test]
 fn what_the_days_digest_left_out_is_what_ohjaa_digest_shows() {
@@ -3531,7 +3528,7 @@ fn opaque_entropy_stays_in_the_digest_without_a_startup_credential_alert() {
     fixture.cleanup();
 }
 
-/// Finding 4: the first terminal of a day gets the day's digest from the
+/// The first terminal of a day gets the day's digest from the
 /// snapshot there is, said as of when it was collected, and a collect starts
 /// beside it; nothing waits.
 #[test]
@@ -3566,7 +3563,7 @@ fn the_days_first_terminal_gets_its_digest_from_an_old_snapshot() {
     fixture.cleanup();
 }
 
-/// Finding 7: terminals opened together say a line once: the one that
+/// Terminals opened together say a line once: the one that
 /// claims it says it.
 #[test]
 fn terminals_opened_together_say_a_line_once() {
@@ -3616,7 +3613,7 @@ fn terminals_opened_together_say_a_line_once() {
     fixture.cleanup();
 }
 
-// ---- the second review of #63 -------------------------------------------------
+// ---- locks, late pull requests and unread history --------------------------
 
 /// Hold the flock(2) on `path` until the file is dropped.
 fn hold(path: &Path) -> fs::File {
@@ -3727,7 +3724,7 @@ fn a_git_that_fails_is_said_as_that_never_as_a_missing_clone() {
     fixture.cleanup();
 }
 
-/// Finding 2: what a day's digest left out stays until the person reads it
+/// What a day's digest left out stays until the person reads it
 /// in full: the next day's digest points to it, and `ohjaa digest` shows it.
 #[test]
 fn what_a_days_digest_left_out_is_kept_past_the_next_day() {
@@ -3763,7 +3760,7 @@ fn what_a_days_digest_left_out_is_kept_past_the_next_day() {
     fixture.cleanup();
 }
 
-/// Finding 3: a pull request GitHub indexes late, merged before the
+/// A pull request GitHub indexes late, merged before the
 /// snapshot a digest was shown from, is in the next digest; what the last
 /// digest said already is not said again.
 #[test]
@@ -3784,7 +3781,7 @@ fn a_pull_request_github_indexes_late_is_in_the_next_digest_once() {
         .unwrap();
     };
     page(0);
-    // Review of #67, finding 2: a second or more between writing GitHub's
+    // A second or more between writing GitHub's
     // answer and reading it moves no pull request across the overlap's edge.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     output_of(fixture.person().arg("collect"));
@@ -3837,7 +3834,7 @@ fn a_digest_moves_the_cursor_only_under_the_claim() {
     fixture.cleanup();
 }
 
-// ---- the first words typed, and the secrets seen (Yair, 2026-10-28) ---------
+// ---- the secrets seen -------------------------------------------------------
 
 impl Fixture {
     /// What the stand-in's `vessa secrets --json` answers next, and its exit.
@@ -3871,7 +3868,7 @@ fn secrets_report(
     .to_string()
 }
 
-/// Yair, 2026-10-28: what the secrets scan cannot read is never an
+/// What the secrets scan cannot read is never an
 /// all-clear. An older vessa (no `secrets`), a scan that could not read
 /// everything (exit 4) and an answer that is no report are each said in the
 /// digest, with why, and `collect` and `digest` exit 4.
@@ -3993,8 +3990,8 @@ fn malformed_secrets_coverage_is_incomplete_and_keeps_the_retry_boundary() {
     fixture.cleanup();
 }
 
-/// 2026-11-09: the rules told every agent to use `ohjaa run` and `ohjaa
-/// gate` a day after both were removed, and check said nothing.
+/// A rule that tells an agent to use an `ohjaa` command this ohjaa does not
+/// have asks for what no agent can do: check flags it.
 #[test]
 fn check_flags_a_current_node_that_names_an_ohjaa_command_this_ohjaa_lacks() {
     if !git_available() {

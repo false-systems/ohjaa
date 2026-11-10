@@ -400,7 +400,7 @@ pub fn inside_repository(file: &Path) -> Option<PathBuf> {
 /// What each agent's own file holds: the team's knowledge and the person's
 /// (ours, mine, machine). Every agent reads its own file wherever it starts;
 /// a workplace file above the repositories is not read by Codex or opencode,
-/// which stop at a repository's root (tested 2026-11-09).
+/// which stop at a repository's root.
 pub const OWN_FILE_SCOPES: [Scope; 3] = [Scope::Ours, Scope::Mine, Scope::Machine];
 
 /// The knowledge an agent's own file holds ([`OWN_FILE_SCOPES`]), and the
@@ -515,7 +515,7 @@ fn rewrite(file: &Path, compact: &Compact) -> Result<Rewrite> {
 mod tests {
     use super::*;
 
-    /// The review of #66: without `--standalone`, opencode hands the session
+    /// Without `--standalone`, opencode hands the session
     /// to its background service, which reads its own AGENTS.md with the
     /// environment it was started with. Where this environment moves that
     /// file (OPENCODE_CONFIG_DIR, XDG_CONFIG_HOME), the file ohjaa checks may

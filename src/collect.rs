@@ -796,7 +796,7 @@ mod tests {
         assert_eq!(pr(&json!({})), None);
     }
 
-    // ---- the secrets seen (Yair, 2026-10-28) ----
+    // ---- the secrets seen ----
 
     const NOW: i64 = 1_800_000_000_000;
     const HOUR: i64 = 3_600_000;

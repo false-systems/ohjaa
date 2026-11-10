@@ -466,12 +466,11 @@ fn heard(message: VessaMessage, at_ms: i64, text: String) -> Said {
 // Most of what people write to agents is the work itself, not a correction,
 // and each drafter call costs minutes and tokens. Before the drafter, intake
 // keeps, locally and with no network, only what looks like a correction or a
-// repeated instruction: the archived seula's rules, ported as they were
-// (`phrase-rules.v3`; repeats by `normalized-text.v1`), and a reason given for
+// repeated instruction: a fixed set of phrase rules (`phrase-rules.v3`;
+// repeats by `normalized-text.v1`), and a reason given for
 // refusing a tool call, which is a correction by what it is.
 //
-// Measured on 2026-10-26 its precision was about 65% strict and 87% lenient,
-// and its recall low: it drops corrections. So it is never silent. Every run
+// Its recall is low: it drops corrections. So it is never silent. Every run
 // says how many messages it read, kept (by rule) and dropped (by agent);
 // `--no-prefilter` sends every message; and nothing it drops is kept as
 // handled. Its verdict is not stored either: a message it dropped becomes a
@@ -480,7 +479,7 @@ fn heard(message: VessaMessage, at_ms: i64, text: String) -> Said {
 // with rules changed since). A rule change does not reach back by itself:
 // that would need a record of every message read, not only of those sent.
 
-/// The correction rules, by the name seula reported them under.
+/// The name of the correction rules, as a run reports it.
 pub const PREFILTER: &str = "phrase-rules.v3";
 
 /// Why the pre-filter keeps each message: `correction` (a phrase rule),
@@ -596,8 +595,7 @@ impl Sifted {
     }
 }
 
-/// `reply` is the agent's reply this message follows, if any (seula's
-/// `correction_signal`, unchanged).
+/// `reply` is the agent's reply this message follows, if any.
 fn correction_signal(text: &str, reply: Option<&str>) -> Option<&'static str> {
     let after_response = reply.is_some();
     let asked = reply.is_some_and(asks);
@@ -1052,8 +1050,7 @@ pub fn reverts(repos: &[PathBuf], since_ms: i64, warnings: &mut Vec<String>) -> 
 
 // ---- secrets ----------------------------------------------------------------
 //
-// What people paste to agents includes credentials: the review of #56 found
-// what looks like a live key in one real message. Nothing that goes to the
+// What people paste to agents includes credentials. Nothing that goes to the
 // drafter keeps one. Every candidate's words, and the agent's words before
 // them, are scrubbed as the prompt is made, from every source, with the
 // pre-filter on or off: a token that looks like a secret becomes
@@ -2857,9 +2854,8 @@ mod tests {
     }
 
     #[test]
-    fn seulas_labelled_steering_cases_separate_feedback_from_tasks_and_quotes() {
-        // seula's labelled cases at e0a3016, unchanged: synthetic, not an
-        // accuracy estimate for real archives.
+    fn labelled_steering_cases_separate_feedback_from_tasks_and_quotes() {
+        // Synthetic cases, not an accuracy estimate for real archives.
         for (text, after_response, expected) in [
             ("I already told you to check permissions.", false, true),
             ("You forgot the migration check.", false, true),
@@ -2919,9 +2915,9 @@ mod tests {
     }
 
     #[test]
-    fn seulas_lowercase_and_unpunctuated_steering_keeps_its_traps() {
-        // seula's second table at e0a3016, unchanged: lowercase, no
-        // apostrophes, no commas; paraphrased, none copied from a transcript.
+    fn lowercase_and_unpunctuated_steering_keeps_its_traps() {
+        // Lowercase, no apostrophes, no commas; paraphrased, none copied
+        // from a transcript.
         let statement = Some("I updated the parser and ran its tests.");
         let question = Some("I can also delete the old fixtures. Want me to do that?");
         for (text, reply, expected) in [
@@ -3369,8 +3365,8 @@ mod tests {
     #[test]
     fn titles_are_near_when_they_say_mostly_the_same_words() {
         let near = |a: &str, b: &str| near(&title_words(a), &title_words(b));
-        // Duplicates intake's first real run wrote, 2026-10-27, and one of a
-        // node already current.
+        // Near pairs of the kind a drafter writes, and one of a node already
+        // current.
         for (a, b) in [
             (
                 "read-back-briefing-and-leave-handover",
@@ -3480,7 +3476,7 @@ mod tests {
             of("beacon-linux-only")
         );
         // The same words in another scope, or of another repository, are
-        // another lesson (the review of #61: `quarry-linux-only`).
+        // another lesson (`quarry-linux-only`).
         assert_eq!(
             repeats(proposing(
                 Mine,
@@ -3589,8 +3585,8 @@ mod tests {
 
     #[test]
     fn a_repo_proposal_naming_no_repository_is_compared_in_the_one_it_is_made_in() {
-        // The re-review of #61: `propose` files it under the repository it
-        // runs in, and the comparison looked in none.
+        // `propose` files it under the repository it runs in, so the
+        // comparison looks there.
         let present = known(&[(
             Scope::Repo,
             Some("/r/here"),
@@ -3616,7 +3612,7 @@ mod tests {
 
     #[test]
     fn a_waiting_proposal_is_shown_as_a_possible_duplicate_of_what_came_before_it() {
-        // The re-review of #61: the mark is derived when a person reviews,
+        // The mark is derived when a person reviews,
         // and stored never.
         use Scope::{Mine, Ours, Repo};
         let loaded = Loaded {
@@ -3775,8 +3771,8 @@ mod tests {
 
     #[test]
     fn the_drafter_is_shown_only_the_repositories_its_batch_comes_from() {
-        // The review of #61: every batch carried the waiting proposals of
-        // all eleven repositories.
+        // A batch carries the waiting proposals of its own repositories,
+        // not of every one.
         let present = known(&[
             (Scope::Ours, None, "ours-lesson", Status::Proposed),
             (Scope::Mine, None, "mine-lesson", Status::Current),
@@ -3879,8 +3875,8 @@ mod tests {
 
     #[test]
     fn the_knowledge_shown_is_scrubbed_whole_before_it_is_cut_and_counted() {
-        // The review of #61: a token in a waiting proposal's first line
-        // reached the drafter verbatim, and the count stayed 0.
+        // A token in a waiting proposal's first line must not reach the
+        // drafter, and must be counted.
         let key = fake(&["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"]);
         let loaded = Loaded {
             nodes: vec![faija_knowledge::Located {

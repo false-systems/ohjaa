@@ -816,8 +816,8 @@ fn a_home_that_is_a_linked_worktree_keeps_its_allowlist_to_itself() {
         ],
     );
     knowledge_node(&config.join("mine"), "lima", "fact", "Lima is here.");
-    // The person's own global excludes still keep out what they name (the
-    // review of #68, L1): a merge tool's `.orig` here.
+    // The person's own global excludes still keep out what they name: a merge
+    // tool's `.orig` here.
     fs::create_dir_all(sandbox.dir.join("config/git")).unwrap();
     fs::write(sandbox.dir.join("config/git/ignore"), "*.orig\n").unwrap();
     let strays = [
@@ -928,7 +928,7 @@ fn a_commit_its_ohjaa_was_killed_in_holds_the_homes_lock_until_it_ends() {
     assert!(!before.contains(".claude/CLAUDE.md"), "{before}");
 }
 
-/// The review of #68, M1: nothing the home's git can leave running holds
+/// Nothing the home's git can leave running holds
 /// the home's lock. The person's config turns on what git starts beside
 /// itself: an fsmonitor (`core.fsmonitor`, here as a command, which git runs
 /// on every platform; `true` starts git's own daemon, which lives on), hooks
@@ -1042,7 +1042,7 @@ fn a_block_apply_did_not_write_is_left_as_the_persons() {
     assert_eq!(fs::read_to_string(&codex).unwrap(), theirs);
 }
 
-/// The review of #66: apply ran once with an agent's folder where it usually
+/// Apply ran once with an agent's folder where it usually
 /// is and once moved (`CLAUDE_CONFIG_DIR`, `OPENCODE_CONFIG_DIR`), and wrote a
 /// block into each file. Every file apply writes a block into is recorded, so
 /// undo, run with neither variable, takes back all four and says so; none
@@ -1106,7 +1106,7 @@ fn undo_takes_back_every_file_apply_wrote_a_block_into() {
     }
 }
 
-/// The review of #68, L2: one file named two ways (`~/.claude` a link to
+/// One file named two ways (`~/.claude` a link to
 /// the folder a later `CLAUDE_CONFIG_DIR` names) is one file to apply and to
 /// undo: recorded once, and put back byte for byte.
 #[test]
