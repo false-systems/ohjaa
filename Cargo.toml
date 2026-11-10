@@ -29,7 +29,7 @@ clap = { version = "4", features = ["derive"] }
 # that another tool can read the format without the rest of ohjaa. The version
 # is what the registry resolves: a published ohjaa needs this crate published
 # first.
-knowledge-node = { version = "0.1.0", path = "crates/knowledge-node" }
+knowledge-node = { package = "ohjaa-knowledge-node", version = "0.1.0", path = "crates/knowledge-node" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 [dev-dependencies]
