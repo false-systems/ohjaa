@@ -466,12 +466,11 @@ fn heard(message: VessaMessage, at_ms: i64, text: String) -> Said {
 // Most of what people write to agents is the work itself, not a correction,
 // and each drafter call costs minutes and tokens. Before the drafter, intake
 // keeps, locally and with no network, only what looks like a correction or a
-// repeated instruction: the archived seula's rules, ported as they were
-// (`phrase-rules.v3`; repeats by `normalized-text.v1`), and a reason given for
+// repeated instruction: a fixed set of phrase rules (`phrase-rules.v3`;
+// repeats by `normalized-text.v1`), and a reason given for
 // refusing a tool call, which is a correction by what it is.
 //
-// Measured on 2026-10-26 its precision was about 65% strict and 87% lenient,
-// and its recall low: it drops corrections. So it is never silent. Every run
+// Its recall is low: it drops corrections. So it is never silent. Every run
 // says how many messages it read, kept (by rule) and dropped (by agent);
 // `--no-prefilter` sends every message; and nothing it drops is kept as
 // handled. Its verdict is not stored either: a message it dropped becomes a
@@ -480,7 +479,7 @@ fn heard(message: VessaMessage, at_ms: i64, text: String) -> Said {
 // with rules changed since). A rule change does not reach back by itself:
 // that would need a record of every message read, not only of those sent.
 
-/// The correction rules, by the name seula reported them under.
+/// The name of the correction rules, as a run reports it.
 pub const PREFILTER: &str = "phrase-rules.v3";
 
 /// Why the pre-filter keeps each message: `correction` (a phrase rule),
@@ -596,8 +595,7 @@ impl Sifted {
     }
 }
 
-/// `reply` is the agent's reply this message follows, if any (seula's
-/// `correction_signal`, unchanged).
+/// `reply` is the agent's reply this message follows, if any.
 fn correction_signal(text: &str, reply: Option<&str>) -> Option<&'static str> {
     let after_response = reply.is_some();
     let asked = reply.is_some_and(asks);
@@ -1052,8 +1050,7 @@ pub fn reverts(repos: &[PathBuf], since_ms: i64, warnings: &mut Vec<String>) -> 
 
 // ---- secrets ----------------------------------------------------------------
 //
-// What people paste to agents includes credentials: the review of #56 found
-// what looks like a live key in one real message. Nothing that goes to the
+// What people paste to agents includes credentials. Nothing that goes to the
 // drafter keeps one. Every candidate's words, and the agent's words before
 // them, are scrubbed as the prompt is made, from every source, with the
 // pre-filter on or off: a token that looks like a secret becomes
@@ -2857,9 +2854,8 @@ mod tests {
     }
 
     #[test]
-    fn seulas_labelled_steering_cases_separate_feedback_from_tasks_and_quotes() {
-        // seula's labelled cases at e0a3016, unchanged: synthetic, not an
-        // accuracy estimate for real archives.
+    fn labelled_steering_cases_separate_feedback_from_tasks_and_quotes() {
+        // Synthetic cases, not an accuracy estimate for real archives.
         for (text, after_response, expected) in [
             ("I already told you to check permissions.", false, true),
             ("You forgot the migration check.", false, true),
@@ -2919,9 +2915,9 @@ mod tests {
     }
 
     #[test]
-    fn seulas_lowercase_and_unpunctuated_steering_keeps_its_traps() {
-        // seula's second table at e0a3016, unchanged: lowercase, no
-        // apostrophes, no commas; paraphrased, none copied from a transcript.
+    fn lowercase_and_unpunctuated_steering_keeps_its_traps() {
+        // Lowercase, no apostrophes, no commas; paraphrased, none copied
+        // from a transcript.
         let statement = Some("I updated the parser and ran its tests.");
         let question = Some("I can also delete the old fixtures. Want me to do that?");
         for (text, reply, expected) in [
@@ -3228,7 +3224,7 @@ mod tests {
             "the key thing is to keep the token budget small",
             "password: hunter2",
             "the token count was 1234",
-            "key /Users/yair/.ssh/id_ed25519_github_2026",
+            "key /home/dev/.ssh/id_ed25519_github_2026",
             // Prefixes inside ordinary words, or too short to be keys.
             "use sk-learn, or task-1234567890abcdefghij",
             "the AKIA prefix names an AWS key",
@@ -3241,12 +3237,12 @@ mod tests {
             "image sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
             "a 9f86d081884c7d659a2f.feaa0c55ad01 short id",
             "test_the_cursor_moves_only_past_what_was_handled_and_never_back_2",
-            "/Users/yair/projects/_worktrees/ohjaa-intake-vessa/src/IntakeVessa2/main.rs",
+            "/home/dev/projects/_worktrees/ohjaa-intake-vessa/src/IntakeVessa2/main.rs",
             "~/.codex/sessions/2026/10/26/rollout-2026-10-26T10-00-00-8c1f2e3a.jsonl",
             "ProjectManagementDashboardSettingsController is long but has no digit",
             // A path is judged by the pieces of its names: versioned and dated
             // file names are made of short words.
-            "/Users/yair/Downloads/Ohjaa-1.2.3-macOS-arm64-applesilicon.zip",
+            "/home/dev/Downloads/Ohjaa-1.2.3-macOS-arm64-applesilicon.zip",
             "~/Desktop/2026-10-26T10-20-33Z_Screen-Recording-8c1f2e3a-Final.mov",
         ] {
             assert_eq!(scrub(text), (text.to_owned(), 0), "{text}");
@@ -3369,8 +3365,8 @@ mod tests {
     #[test]
     fn titles_are_near_when_they_say_mostly_the_same_words() {
         let near = |a: &str, b: &str| near(&title_words(a), &title_words(b));
-        // Duplicates intake's first real run wrote, 2026-10-27, and one of a
-        // node already current.
+        // Near pairs of the kind a drafter writes, and one of a node already
+        // current.
         for (a, b) in [
             (
                 "read-back-briefing-and-leave-handover",
@@ -3444,7 +3440,12 @@ mod tests {
             ),
             (Mine, None, "read-back-briefing", Status::Current),
             (Mine, None, "leave-a-handover-always", Status::Retired),
-            (Repo, Some("/r/rauha"), "rauha-linux-only", Status::Proposed),
+            (
+                Repo,
+                Some("/r/beacon"),
+                "beacon-linux-only",
+                Status::Proposed,
+            ),
         ]);
         let repeats = |proposal: Proposal| present.repeated_by(&proposal).map(str::to_owned);
         let of = |id: &str| Some(id.to_owned());
@@ -3467,15 +3468,15 @@ mod tests {
         assert_eq!(
             repeats(proposing(
                 Repo,
-                Some("/r/rauha"),
-                "rauha-is-linux-only",
+                Some("/r/beacon"),
+                "beacon-is-linux-only",
                 None,
                 &[]
             )),
-            of("rauha-linux-only")
+            of("beacon-linux-only")
         );
         // The same words in another scope, or of another repository, are
-        // another lesson (the review of #61: `tapio-linux-only`).
+        // another lesson (`quarry-linux-only`).
         assert_eq!(
             repeats(proposing(
                 Mine,
@@ -3489,8 +3490,8 @@ mod tests {
         assert_eq!(
             repeats(proposing(
                 Repo,
-                Some("/r/tapio"),
-                "tapio-linux-only",
+                Some("/r/quarry"),
+                "quarry-linux-only",
                 None,
                 &[]
             )),
@@ -3584,16 +3585,16 @@ mod tests {
 
     #[test]
     fn a_repo_proposal_naming_no_repository_is_compared_in_the_one_it_is_made_in() {
-        // The re-review of #61: `propose` files it under the repository it
-        // runs in, and the comparison looked in none.
+        // `propose` files it under the repository it runs in, so the
+        // comparison looks there.
         let present = known(&[(
             Scope::Repo,
             Some("/r/here"),
-            "rauha-linux-only",
+            "beacon-linux-only",
             Status::Proposed,
         )]);
-        let unnamed = proposing(Scope::Repo, None, "rauha-is-linux-only", None, &[]);
-        assert_eq!(present.repeated_by(&unnamed), Some("rauha-linux-only"));
+        let unnamed = proposing(Scope::Repo, None, "beacon-is-linux-only", None, &[]);
+        assert_eq!(present.repeated_by(&unnamed), Some("beacon-linux-only"));
         let mut empty = Known::of(&Loaded::default(), &[], Some(Path::new("/r/here")));
         let written = empty.present(&unnamed);
         empty.add(written);
@@ -3601,17 +3602,17 @@ mod tests {
             empty.repeated_by(&proposing(
                 Scope::Repo,
                 Some("/r/here"),
-                "rauha-runs-linux-only",
+                "beacon-runs-linux-only",
                 None,
                 &[]
             )),
-            Some("rauha-is-linux-only")
+            Some("beacon-is-linux-only")
         );
     }
 
     #[test]
     fn a_waiting_proposal_is_shown_as_a_possible_duplicate_of_what_came_before_it() {
-        // The re-review of #61: the mark is derived when a person reviews,
+        // The mark is derived when a person reviews,
         // and stored never.
         use Scope::{Mine, Ours, Repo};
         let loaded = Loaded {
@@ -3647,9 +3648,14 @@ mod tests {
             waiting(Ours, None, "read-briefing-and-leave-handover", "2026-10-26"),
             waiting(Mine, None, "code-is-rust-or-elixir", "2026-10-27"),
             waiting(Mine, None, "always-leave-a-handover", "2026-10-27"),
-            waiting(Repo, Some("/r/tapio"), "tapio-linux-only", "2026-10-27"),
-            waiting(Repo, Some("/r/rauha"), "rauha-linux-only", "2026-10-26"),
-            waiting(Repo, Some("/r/rauha"), "rauha-is-linux-only", "2026-10-27"),
+            waiting(Repo, Some("/r/quarry"), "quarry-linux-only", "2026-10-27"),
+            waiting(Repo, Some("/r/beacon"), "beacon-linux-only", "2026-10-26"),
+            waiting(
+                Repo,
+                Some("/r/beacon"),
+                "beacon-is-linux-only",
+                "2026-10-27",
+            ),
             // As old as each other: the one stored first came before.
             waiting(Ours, None, "start-sessions-through-ohjaa-run", "2026-10-27"),
             waiting(Ours, None, "start-agents-through-ohjaa-run", "2026-10-27"),
@@ -3668,7 +3674,7 @@ mod tests {
                 // Another repository's words are another lesson.
                 None,
                 None,
-                of("rauha-linux-only"),
+                of("beacon-linux-only"),
                 None,
                 of("start-sessions-through-ohjaa-run"),
             ]
@@ -3684,9 +3690,9 @@ mod tests {
                 "read-back-briefing-and-leave-handover",
                 "code-is-rust-or-elixir",
                 "always-leave-a-handover",
-                "tapio-linux-only",
-                "rauha-linux-only",
-                "rauha-is-linux-only",
+                "quarry-linux-only",
+                "beacon-linux-only",
+                "beacon-is-linux-only",
                 "start-sessions-through-ohjaa-run",
                 "start-agents-through-ohjaa-run",
             ]
@@ -3765,22 +3771,22 @@ mod tests {
 
     #[test]
     fn the_drafter_is_shown_only_the_repositories_its_batch_comes_from() {
-        // The review of #61: every batch carried the waiting proposals of
-        // all eleven repositories.
+        // A batch carries the waiting proposals of its own repositories,
+        // not of every one.
         let present = known(&[
             (Scope::Ours, None, "ours-lesson", Status::Proposed),
             (Scope::Mine, None, "mine-lesson", Status::Current),
             (Scope::Machine, None, "machine-fact", Status::Proposed),
             (
                 Scope::Repo,
-                Some("/r/projects/valvo"),
-                "valvo-lesson",
+                Some("/r/projects/meadow"),
+                "meadow-lesson",
                 Status::Proposed,
             ),
             (
                 Scope::Repo,
-                Some("/r/projects/rauha"),
-                "rauha-lesson",
+                Some("/r/projects/beacon"),
+                "beacon-lesson",
                 Status::Proposed,
             ),
             (
@@ -3806,8 +3812,8 @@ mod tests {
                 "ours-lesson",
                 "mine-lesson",
                 "machine-fact",
-                "valvo-lesson",
-                "rauha-lesson",
+                "meadow-lesson",
+                "beacon-lesson",
                 "ohjaa-lesson",
             ]
             .into_iter()
@@ -3822,8 +3828,8 @@ mod tests {
             ids
         };
         assert_eq!(
-            shown(&[candidate("claude", "/r/projects/valvo/formal", "")]),
-            with("valvo-lesson")
+            shown(&[candidate("claude", "/r/projects/meadow/formal", "")]),
+            with("meadow-lesson")
         );
         // A worktree named after its repository, and a pull request's URL.
         assert_eq!(
@@ -3835,34 +3841,42 @@ mod tests {
             with("ohjaa-lesson")
         );
         assert_eq!(
-            shown(&[candidate("review", "https://github.com/o/rauha/pull/3", "")]),
-            with("rauha-lesson")
+            shown(&[candidate(
+                "review",
+                "https://github.com/o/beacon/pull/3",
+                ""
+            )]),
+            with("beacon-lesson")
         );
         // A review, by the repository it was read from.
         assert_eq!(
             shown(&[candidate(
                 "review",
                 "https://github.com/o/x/pull/1",
-                "/r/projects/rauha"
+                "/r/projects/beacon"
             )]),
-            with("rauha-lesson")
+            with("beacon-lesson")
         );
         // The agent's words before a message are no place.
         assert_eq!(
-            shown(&[candidate("claude", "/r/projects", "see /r/projects/valvo/")]),
+            shown(&[candidate(
+                "claude",
+                "/r/projects",
+                "see /r/projects/meadow/"
+            )]),
             everywhere
         );
-        let (text, _) = prompt(&present, &[candidate("claude", "/r/projects/valvo", "")]);
+        let (text, _) = prompt(&present, &[candidate("claude", "/r/projects/meadow", "")]);
         assert!(
-            text.contains("- valvo-lesson [repo/lesson/proposed] in /r/projects/valvo: A lesson"),
+            text.contains("- meadow-lesson [repo/lesson/proposed] in /r/projects/meadow: A lesson"),
             "a repo node is shown with its repository: {text}"
         );
     }
 
     #[test]
     fn the_knowledge_shown_is_scrubbed_whole_before_it_is_cut_and_counted() {
-        // The review of #61: a token in a waiting proposal's first line
-        // reached the drafter verbatim, and the count stayed 0.
+        // A token in a waiting proposal's first line must not reach the
+        // drafter, and must be counted.
         let key = fake(&["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"]);
         let loaded = Loaded {
             nodes: vec![faija_knowledge::Located {
@@ -3911,8 +3925,8 @@ mod tests {
     #[test]
     fn github_remotes_resolve_to_slugs() {
         assert_eq!(
-            github_slug("git@github.com:false-systems/ohjaa.git").as_deref(),
-            Some("false-systems/ohjaa")
+            github_slug("git@github.com:example-org/ohjaa.git").as_deref(),
+            Some("example-org/ohjaa")
         );
         assert_eq!(
             github_slug("https://github.com/o/r").as_deref(),

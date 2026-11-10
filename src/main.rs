@@ -47,8 +47,8 @@ const INCOMPLETE: i32 = 4;
     version,
     about = "Steering knowledge for agents, handed to them before they act.",
     long_about = "Toimija reports facts and refuses to decide. Ohjaa holds what the people \
-                  an agent works for know and have decided, and briefs every agent with it \
-                  at launch. Agents propose; only a person makes knowledge current."
+                  an agent works for know and have decided, and writes it into each \
+                  agent's own instruction file. Agents propose; only a person makes knowledge current."
 )]
 struct Cli {
     /// Where to look for repositories. Repeatable; defaults to the config file,
@@ -268,9 +268,8 @@ enum Cmd {
         .git/         the home's history: what apply changed, one commit (made on\n                \
         the home's first commit; never pushed)\n\
         Changes outside it, and nothing else:\n  \
-        git's global excludes  a block marked \"ohjaa apply\" holding .sykli/ .teko/ .ohjaa/\n  \
-        ~/.zshrc               [[ -x <ohjaa> ]] && eval \"$(<ohjaa> shell-init zsh)\", in place\n                         \
-        of a line that sources ~/projects/ohjaa-launch.zsh\n  \
+        git's global excludes  a block marked \"ohjaa apply\" holding .sykli/ .ohjaa/\n  \
+        ~/.zshrc               [[ -x <ohjaa> ]] && eval \"$(<ohjaa> shell-init zsh)\"\n  \
         each agent's own       a block marked \"ohjaa:knowledge\" holding the team's, mine and machine\n  \
         instruction file       knowledge, in each that exists outside every repository:\n                         \
         ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.pi/agent/AGENTS.md,\n                         \

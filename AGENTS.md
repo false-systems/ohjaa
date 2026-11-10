@@ -2,7 +2,7 @@
 
 Read `.toimija/current.md` before anything else in this repo; it is your workset contract. Under a toimija session your launch prompt names your live packet, which supersedes it.
 
-This is **ohjaa**, an internal False Systems tool. Toimija reports facts and refuses to decide; ohjaa holds what people decided and know (knowledge-node.v1) and writes it into each agent's own instruction file. It runs no sessions and no checks: the gate is sykli's, from each repository's own `sykli.json`. Keep changes small: the value of this repo is what it refuses to become. The README's "Boundaries in full" says what ohjaa keeps where; its other sections say how each command behaves.
+This is **ohjaa**. Toimija reports facts and refuses to decide; ohjaa holds what people decided and know (knowledge-node.v1) and writes it into each agent's own instruction file. It runs no sessions and no checks: the gate is sykli's, from each repository's own `sykli.json`. Keep changes small: the value of this repo is what it refuses to become. `docs/reference.md` says how each command behaves, and its "Boundaries in full" says what ohjaa keeps where; the README is the short introduction for a person.
 
 ## Boundaries
 
@@ -24,7 +24,7 @@ These mirror `.toimija/repo.yaml`; keep both in sync.
 - Never run `ohjaa accept`, `reject`, `retire`, `confirm` or `review` for a person, or fake a terminal to get past them, except in a test's own sandbox. Propose with `ohjaa propose`.
 - Before you finish, leave `toimija handover` for the next agent: what is unfinished, what it needs to know, what surprised you.
 - Never edit `vendor/faija-knowledge/`; `scripts/vendor-faija-knowledge.sh` refreshes it.
-- Tests never touch the person's real state (the README's "Tests" says what each suite sandboxes), and write a file they will run only through `write_executable`.
+- Tests never touch the person's real state (the "Tests" section of `docs/reference.md` says what each suite sandboxes), and write a file they will run only through `write_executable`.
 - The gate is this repository's own `sykli.json`, pinned by `sykli.lock`: `sykli run` proves HEAD. After adding a source or test file, add it to every task's inputs and run `sykli lock sykli.json`. A new git process on a hot path needs its budget in `tests/config_home.rs`.
 - Code is Rust or Elixir/Erlang; never add Python, Go or Node.
 - To update a branch under review, merge `origin/main` into it; never rebase or force-push it. `toimija sessions` shows who else is live.

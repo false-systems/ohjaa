@@ -2469,14 +2469,14 @@ mod tests {
 
     fn pr(number: u64, created_ago: i64, merged_ago: Option<i64>) -> Pr {
         Pr {
-            repo: "false-systems/sykli".into(),
+            repo: "example-org/sykli".into(),
             number,
             title: "Ask git once".into(),
-            url: format!("https://github.com/false-systems/sykli/pull/{number}"),
-            author: Some("yairfalse".into()),
+            url: format!("https://github.com/example-org/sykli/pull/{number}"),
+            author: Some("devuser".into()),
             created_ms: NOW - created_ago,
             merged_ms: merged_ago.map(|ago| NOW - ago),
-            merged_by: merged_ago.map(|_| "yairfalse".into()),
+            merged_by: merged_ago.map(|_| "devuser".into()),
             closed_ms: merged_ago.map(|ago| NOW - ago),
             base: Some("main".into()),
             default_branch: Some("main".into()),
@@ -2488,9 +2488,9 @@ mod tests {
     /// An open pull request in `repo` by `author`, last updated `ago`.
     fn open_in(repo: &str, number: u64, author: &str, draft: bool, ago: i64) -> Pr {
         Pr {
-            repo: format!("false-systems/{repo}"),
+            repo: format!("example-org/{repo}"),
             title: format!("Work in {repo}"),
-            url: format!("https://github.com/false-systems/{repo}/pull/{number}"),
+            url: format!("https://github.com/example-org/{repo}/pull/{number}"),
             author: Some(author.into()),
             draft,
             updated_ms: Some(NOW - ago),
@@ -2513,23 +2513,23 @@ mod tests {
         let mut collected = snapshot(NOW);
         collected.github.from_ms = Some(NOW - DAY_MS);
         collected.github.value = vec![
-            open_in("sykli", 40, "yairfalse", false, 3 * HOUR_MS),
+            open_in("sykli", 40, "devuser", false, 3 * HOUR_MS),
             pr(7, 3 * HOUR_MS, Some(HOUR_MS)),
-            open_in("habitat", 12, "dima", true, 20 * MINUTE_MS),
+            open_in("carpet", 12, "sam", true, 20 * MINUTE_MS),
         ];
         let view = view(Some(&collected));
         let now = now_section(&full(&view, &Window::at(NOW - DAY_MS), None, None, NOW));
         for said in [
             "Open pull requests in the team's GitHub organizations updated since",
             "An open pull request shows who is working on what, from any machine.",
-            "habitat #12 draft by dima: Work in habitat · last updated 20m ago",
-            "Inspect: https://github.com/false-systems/habitat/pull/12",
-            "sykli #40 by yairfalse: Work in sykli · last updated 3h ago",
+            "carpet #12 draft by sam: Work in carpet · last updated 20m ago",
+            "Inspect: https://github.com/example-org/carpet/pull/12",
+            "sykli #40 by devuser: Work in sykli · last updated 3h ago",
         ] {
             assert!(now.contains(said), "missing `{said}`: {now}");
         }
         assert!(
-            now.find("#12 draft by dima") < now.find("#40 by yairfalse"),
+            now.find("#12 draft by sam") < now.find("#40 by devuser"),
             "the last updated comes first: {now}"
         );
         assert!(
@@ -2576,7 +2576,7 @@ mod tests {
     fn the_open_pull_requests_listed_are_bounded_and_the_rest_counted() {
         let mut collected = snapshot(NOW);
         collected.github.value = (1..=25)
-            .map(|n| open_in("sykli", n, "yairfalse", false, n as i64 * MINUTE_MS))
+            .map(|n| open_in("sykli", n, "devuser", false, n as i64 * MINUTE_MS))
             .collect();
         let now = now_section(&full(
             &view(Some(&collected)),
@@ -2601,7 +2601,7 @@ mod tests {
         collected.secrets.value.findings.push(Finding {
             agent: "codex".into(),
             session: "native-session".into(),
-            cwd: Some("/p/habitat".into()),
+            cwd: Some("/p/carpet".into()),
             at_ms: Some(NOW - HOUR_MS),
             place: "person".into(),
             rule: "no_known_shape".into(),
@@ -2642,7 +2642,7 @@ mod tests {
         collected.secrets.value.findings.push(Finding {
             agent: "claude".into(),
             session: "native-session".into(),
-            cwd: Some("/p/habitat".into()),
+            cwd: Some("/p/carpet".into()),
             at_ms: Some(NOW - HOUR_MS),
             place: "person".into(),
             rule: "github".into(),
@@ -2793,7 +2793,7 @@ mod tests {
         // Opened and merged in the same stretch: said once, as merged.
         let events = after(&view, &seen.full_from(NOW));
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].key, "pr:false-systems/sykli#7:merged");
+        assert_eq!(events[0].key, "pr:example-org/sykli#7:merged");
     }
 
     #[test]
@@ -2915,7 +2915,7 @@ mod tests {
             .contains("2 proposed agent instructions await your decision"));
     }
 
-    /// Review of #63, finding 1: what could not be read is said where the
+    /// What could not be read is said where the
     /// view is read, and makes the digest incomplete; never an all-clear.
     #[test]
     fn what_could_not_be_read_is_said_and_never_an_all_clear() {
@@ -2968,7 +2968,7 @@ mod tests {
         build(Ok(Vec::new()), Some(&snapshot(NOW)), NOW, 0)
     }
 
-    /// Finding 3: what the day's digest left out is where `ohjaa digest`
+    /// What the day's digest left out is where `ohjaa digest`
     /// starts; once read in full, the next starts after it. GitHub's part of
     /// a window is by GitHub's clock: the snapshot's time.
     #[test]
@@ -3012,7 +3012,7 @@ mod tests {
         assert_eq!(read.full_from(NOW).sessions_ms, NOW + HOUR_MS);
     }
 
-    /// Second review of #63, finding 2: what a day's digest left out stays
+    /// What a day's digest left out stays
     /// where `ohjaa digest` begins until it is read in full, whatever the
     /// days' digests after it leave out or not.
     #[test]
@@ -3074,7 +3074,7 @@ mod tests {
         assert_eq!(read.unseen, None, "read in full");
     }
 
-    /// Second review of #63, finding 2: the day's digest points to what an
+    /// The day's digest points to what an
     /// earlier one left out while it is unread, within its lines.
     #[test]
     fn unread_history_does_not_turn_into_startup_attention() {
@@ -3098,7 +3098,7 @@ mod tests {
         );
     }
 
-    /// Second review of #63, finding 3: a pull request GitHub indexes late,
+    /// A pull request GitHub indexes late,
     /// merged before the snapshot the last digest was shown from, is in the
     /// next digest, and what that digest said is not said again.
     #[test]
@@ -3128,7 +3128,7 @@ mod tests {
             .iter()
             .map(|item| item.key.as_str())
             .collect();
-        assert_eq!(keys, vec!["pr:false-systems/sykli#80:merged"]);
+        assert_eq!(keys, vec!["pr:example-org/sykli#80:merged"]);
         // Once said, it is not said again; the day's digest is the same.
         let seen = advance(&view, &seen, Some(&later), NOW + HOUR_MS, Shown::Full, "d");
         assert!(after(&view, &seen.full_from(NOW + HOUR_MS)).is_empty());
@@ -3142,7 +3142,7 @@ mod tests {
         assert!(after(&view, &seen.full_from(NOW + HOUR_MS)).is_empty());
     }
 
-    /// Review of #67, finding 1: a pull request at the very end of a
+    /// A pull request at the very end of a
     /// digest's GitHub stretch (merged in the second GitHub was read, or
     /// while its search ran) is said by that digest and not by the next.
     #[test]
@@ -3161,8 +3161,8 @@ mod tests {
         assert_eq!(
             keys(&shown, &Window::at(NOW - DAY_MS)),
             vec![
-                "pr:false-systems/sykli#78:merged",
-                "pr:false-systems/sykli#79:merged"
+                "pr:example-org/sykli#78:merged",
+                "pr:example-org/sykli#79:merged"
             ]
         );
         let seen = advance(
@@ -3202,7 +3202,7 @@ mod tests {
         assert!(full(&view, &Window::at(NOW - DAY_MS), None, None, NOW).contains(&url));
     }
 
-    /// Second review of #63, a nit: a source is said in the line for each
+    /// A source is said in the line for each
     /// failure, not once while the first stands; the same failure with its
     /// numbers moved (a count, a time) is the same.
     #[test]
@@ -3257,7 +3257,7 @@ mod tests {
         assert_eq!(one_line(&news(&later, &seen)), None);
     }
 
-    /// Finding 5: a window longer than GitHub was read says so.
+    /// A window longer than GitHub was read says so.
     #[test]
     fn a_window_longer_than_github_was_read_says_so() {
         let mut collected = snapshot(NOW);

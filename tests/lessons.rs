@@ -80,7 +80,7 @@ const USER: &str = r#"{"login":"octo-gh","name":"Octo Cat"}"#;
 /// to: its own name is no secret there.
 const REPOS: &str = concat!(
     r#"[{"name":"secret-thing","full_name":"octo-gh/secret-thing","visibility":"private"},"#,
-    r#"{"name":"ote","full_name":"acme/ote","visibility":"internal"},"#,
+    r#"{"name":"ink","full_name":"acme/ink","visibility":"internal"},"#,
     r#"{"name":"open-thing","full_name":"acme/open-thing","visibility":"public"}]"#,
     "\n",
     r#"[{"name":"widget","full_name":"acme/widget"},"#,
@@ -966,8 +966,8 @@ fn when_every_line_is_held_nothing_is_pushed() {
     let world = World::new("allheld");
     world.set_visibility("PUBLIC");
     // gh does not list the tool's own repository: it is held back anyway.
-    fs::write(world.dir.join("gh/repos.json"), "[{\"name\":\"ote\"}]\n").unwrap();
-    let held = world.legacy("widget-calls-ote", "fact", "Widget calls ote.");
+    fs::write(world.dir.join("gh/repos.json"), "[{\"name\":\"ink\"}]\n").unwrap();
+    let held = world.legacy("widget-calls-ink", "fact", "Widget calls ink.");
     let tool = world.legacy(
         "widget-knowledge-folder",
         "fact",
@@ -975,7 +975,7 @@ fn when_every_line_is_held_nothing_is_pushed() {
     );
     let (stdout, stderr, code) = world.publish(&[]);
     assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(stdout.contains("`ote`"), "{stdout}");
+    assert!(stdout.contains("`ink`"), "{stdout}");
     assert!(
         stdout.contains("`ohjaa` (the name of this tool, which is private)"),
         "{stdout}"

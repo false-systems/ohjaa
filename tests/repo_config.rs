@@ -1,6 +1,6 @@
 //! `.toimija/repo.yaml` is read by toimija on every packet refresh here. If it
-//! does not parse, every refresh fails and the live packet goes stale — which
-//! c6673a1 did, with one boundary starting with a backtick. Nothing else in CI
+//! does not parse, every refresh fails and the live packet goes stale: one
+//! boundary starting with a backtick is enough. Nothing else in CI
 //! reads the file, so this test parses it with the parser toimija uses.
 
 use std::path::Path;
