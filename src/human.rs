@@ -2469,14 +2469,14 @@ mod tests {
 
     fn pr(number: u64, created_ago: i64, merged_ago: Option<i64>) -> Pr {
         Pr {
-            repo: "false-systems/sykli".into(),
+            repo: "example-org/sykli".into(),
             number,
             title: "Ask git once".into(),
-            url: format!("https://github.com/false-systems/sykli/pull/{number}"),
-            author: Some("yairfalse".into()),
+            url: format!("https://github.com/example-org/sykli/pull/{number}"),
+            author: Some("devuser".into()),
             created_ms: NOW - created_ago,
             merged_ms: merged_ago.map(|ago| NOW - ago),
-            merged_by: merged_ago.map(|_| "yairfalse".into()),
+            merged_by: merged_ago.map(|_| "devuser".into()),
             closed_ms: merged_ago.map(|ago| NOW - ago),
             base: Some("main".into()),
             default_branch: Some("main".into()),
@@ -2488,9 +2488,9 @@ mod tests {
     /// An open pull request in `repo` by `author`, last updated `ago`.
     fn open_in(repo: &str, number: u64, author: &str, draft: bool, ago: i64) -> Pr {
         Pr {
-            repo: format!("false-systems/{repo}"),
+            repo: format!("example-org/{repo}"),
             title: format!("Work in {repo}"),
-            url: format!("https://github.com/false-systems/{repo}/pull/{number}"),
+            url: format!("https://github.com/example-org/{repo}/pull/{number}"),
             author: Some(author.into()),
             draft,
             updated_ms: Some(NOW - ago),
@@ -2513,23 +2513,23 @@ mod tests {
         let mut collected = snapshot(NOW);
         collected.github.from_ms = Some(NOW - DAY_MS);
         collected.github.value = vec![
-            open_in("sykli", 40, "yairfalse", false, 3 * HOUR_MS),
+            open_in("sykli", 40, "devuser", false, 3 * HOUR_MS),
             pr(7, 3 * HOUR_MS, Some(HOUR_MS)),
-            open_in("habitat", 12, "dima", true, 20 * MINUTE_MS),
+            open_in("carpet", 12, "sam", true, 20 * MINUTE_MS),
         ];
         let view = view(Some(&collected));
         let now = now_section(&full(&view, &Window::at(NOW - DAY_MS), None, None, NOW));
         for said in [
             "Open pull requests in the team's GitHub organizations updated since",
             "An open pull request shows who is working on what, from any machine.",
-            "habitat #12 draft by dima: Work in habitat · last updated 20m ago",
-            "Inspect: https://github.com/false-systems/habitat/pull/12",
-            "sykli #40 by yairfalse: Work in sykli · last updated 3h ago",
+            "carpet #12 draft by sam: Work in carpet · last updated 20m ago",
+            "Inspect: https://github.com/example-org/carpet/pull/12",
+            "sykli #40 by devuser: Work in sykli · last updated 3h ago",
         ] {
             assert!(now.contains(said), "missing `{said}`: {now}");
         }
         assert!(
-            now.find("#12 draft by dima") < now.find("#40 by yairfalse"),
+            now.find("#12 draft by sam") < now.find("#40 by devuser"),
             "the last updated comes first: {now}"
         );
         assert!(
@@ -2576,7 +2576,7 @@ mod tests {
     fn the_open_pull_requests_listed_are_bounded_and_the_rest_counted() {
         let mut collected = snapshot(NOW);
         collected.github.value = (1..=25)
-            .map(|n| open_in("sykli", n, "yairfalse", false, n as i64 * MINUTE_MS))
+            .map(|n| open_in("sykli", n, "devuser", false, n as i64 * MINUTE_MS))
             .collect();
         let now = now_section(&full(
             &view(Some(&collected)),
@@ -2601,7 +2601,7 @@ mod tests {
         collected.secrets.value.findings.push(Finding {
             agent: "codex".into(),
             session: "native-session".into(),
-            cwd: Some("/p/habitat".into()),
+            cwd: Some("/p/carpet".into()),
             at_ms: Some(NOW - HOUR_MS),
             place: "person".into(),
             rule: "no_known_shape".into(),
@@ -2642,7 +2642,7 @@ mod tests {
         collected.secrets.value.findings.push(Finding {
             agent: "claude".into(),
             session: "native-session".into(),
-            cwd: Some("/p/habitat".into()),
+            cwd: Some("/p/carpet".into()),
             at_ms: Some(NOW - HOUR_MS),
             place: "person".into(),
             rule: "github".into(),
@@ -2793,7 +2793,7 @@ mod tests {
         // Opened and merged in the same stretch: said once, as merged.
         let events = after(&view, &seen.full_from(NOW));
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].key, "pr:false-systems/sykli#7:merged");
+        assert_eq!(events[0].key, "pr:example-org/sykli#7:merged");
     }
 
     #[test]
@@ -3128,7 +3128,7 @@ mod tests {
             .iter()
             .map(|item| item.key.as_str())
             .collect();
-        assert_eq!(keys, vec!["pr:false-systems/sykli#80:merged"]);
+        assert_eq!(keys, vec!["pr:example-org/sykli#80:merged"]);
         // Once said, it is not said again; the day's digest is the same.
         let seen = advance(&view, &seen, Some(&later), NOW + HOUR_MS, Shown::Full, "d");
         assert!(after(&view, &seen.full_from(NOW + HOUR_MS)).is_empty());
@@ -3161,8 +3161,8 @@ mod tests {
         assert_eq!(
             keys(&shown, &Window::at(NOW - DAY_MS)),
             vec![
-                "pr:false-systems/sykli#78:merged",
-                "pr:false-systems/sykli#79:merged"
+                "pr:example-org/sykli#78:merged",
+                "pr:example-org/sykli#79:merged"
             ]
         );
         let seen = advance(

@@ -63,7 +63,7 @@ const GH: Duration = Duration::from_secs(30);
 const GH_CREATE: Duration = Duration::from_secs(60);
 const FETCH: Duration = Duration::from_secs(120);
 /// A commit and a push run the repository's own hooks, never skipped: in a
-/// fresh worktree a pre-commit that runs clippy on the workspace (tapio's)
+/// fresh worktree a pre-commit that runs clippy on the workspace (quarry's)
 /// builds it first.
 const HOOKS: Duration = Duration::from_secs(900);
 /// How long a delivery waits for another ohjaa's to the same state.
@@ -2367,32 +2367,32 @@ mod tests {
     fn the_deny_list_matches_words_case_blind_and_the_home_path_anywhere() {
         let private = Private {
             repos: vec![
-                "ote".to_owned(),
+                "ink".to_owned(),
                 "secret-thing".to_owned(),
                 "widget".to_owned(),
             ],
             people: vec!["octo-gh".to_owned(), "Octo Cat".to_owned()],
             ..Private::default()
         };
-        let deny = DenyList::build(&private, Some(Path::new("/Users/octocat")), "acme/widget");
+        let deny = DenyList::build(&private, Some(Path::new("/home/octocat")), "acme/widget");
         assert!(
-            deny.matches("a remote note, a quote").is_empty(),
+            deny.matches("a link, a drink, a thinker").is_empty(),
             "inside words"
         );
         assert!(
             deny.matches("the widget repository").is_empty(),
             "its own name"
         );
-        assert_eq!(deny.matches("calls OTE's API").len(), 1);
-        assert_eq!(deny.matches("ote-selko and more").len(), 1);
+        assert_eq!(deny.matches("calls INK's API").len(), 1);
+        assert_eq!(deny.matches("ink-orbit and more").len(), 1);
         assert_eq!(
             deny.matches("see Secret-Thing"),
             vec!["`secret-thing` (the name of a private repository of yours)"]
         );
         assert_eq!(
-            deny.matches("in /users/octocat/x"),
+            deny.matches("in /HOME/Octocat/x"),
             vec![
-                "`/Users/octocat` (your home path)",
+                "`/home/octocat` (your home path)",
                 "`octocat` (your account's name)"
             ]
         );
@@ -2404,15 +2404,15 @@ mod tests {
         assert!(deny.matches("").is_empty());
         assert!(spelling::names_word("é", "e", &[]), "a diacritic is folded");
         assert!(
-            spelling::names_word("x ote", "ote", &[]) && spelling::names_word("ote", "ote", &[])
+            spelling::names_word("x ink", "ink", &[]) && spelling::names_word("ink", "ink", &[])
         );
-        assert!(!spelling::names_word("noted", "ote", &[]));
+        assert!(!spelling::names_word("linked", "ink", &[]));
     }
 
     #[test]
     fn spellings_that_hide_a_private_name_are_still_named() {
         let private = Private {
-            repos: ["selko", "habitat", "toimija", "viemari"]
+            repos: ["orbit", "carpet", "toimija", "depot"]
                 .map(str::to_owned)
                 .to_vec(),
             people: Vec::new(),
@@ -2420,27 +2420,27 @@ mod tests {
         };
         let deny = DenyList::build(&private, None, "acme/widget");
         for hidden in [
-            "tapio's events reach selkod",
-            "two habitats",
+            "quarry's events reach orbitd",
+            "two carpets",
             "the toimijas",
-            "selko2 is next",
-            "flagged UNPROVEN in viemäri",
-            "hab\u{200B}itat with a zero-width space",
-            "hab\u{00AD}itat with a soft hyphen",
-            "hab\u{2060}itat with a word joiner",
-            "h&#97;bitat as an entity",
-            "h&#x61;bitat as a hex entity",
-            "hab<!-- -->itat split by a comment",
-            "**hab**itat split by emphasis",
-            "`hab`itat split by code",
-            "ｈａｂｉｔａｔ in fullwidth",
-            "Ha\u{0308}bitat with a combining mark",
+            "orbit2 is next",
+            "flagged UNPROVEN in dépôt",
+            "car\u{200B}pet with a zero-width space",
+            "car\u{00AD}pet with a soft hyphen",
+            "car\u{2060}pet with a word joiner",
+            "c&#97;rpet as an entity",
+            "c&#x61;rpet as a hex entity",
+            "car<!-- -->pet split by a comment",
+            "**car**pet split by emphasis",
+            "`car`pet split by code",
+            "ｃａｒｐｅｔ in fullwidth",
+            "Ca\u{0308}rpet with a combining mark",
         ] {
             assert!(!deny.matches(hidden).is_empty(), "not named: {hidden}");
         }
         // A letter outside ASCII that no fold reads as one inside it could
         // stand for another (a Cyrillic а, a Greek ο): such a line is held.
-        for odd in ["h\u{0430}bitat with a Cyrillic a", "an \u{3bf}dd letter"] {
+        for odd in ["c\u{0430}rpet with a Cyrillic a", "an \u{3bf}dd letter"] {
             let found = deny.matches(odd);
             assert!(
                 found.iter().any(|named| named.contains("outside ASCII")),
@@ -2448,7 +2448,7 @@ mod tests {
             );
         }
         // What only looks like a name, or is plain text, is not.
-        for plain in ["a habit", "café au lait", "an em dash — and “quotes”"] {
+        for plain in ["a carp", "café au lait", "an em dash — and “quotes”"] {
             assert!(
                 deny.matches(plain).is_empty(),
                 "{plain}: {:?}",
@@ -2460,7 +2460,7 @@ mod tests {
     #[test]
     fn marks_tags_and_links_that_hide_a_name_are_seen_through_or_held() {
         let private = Private {
-            repos: ["secret-thing", "habitat", "ote"]
+            repos: ["secret-thing", "carpet", "ink"]
                 .map(str::to_owned)
                 .to_vec(),
             ..Private::default()
@@ -2468,9 +2468,9 @@ mod tests {
         let deny = DenyList::build(&private, None, "acme/widget");
         for hidden in [
             "Widget calls sec<b></b>ret-thing",
-            "hab<span></span>itat",
-            "hab<wbr>itat",
-            "[hab](x)itat",
+            "car<span></span>pet",
+            "car<wbr>pet",
+            "[car](x)pet",
         ] {
             assert!(
                 deny.matches(hidden)
@@ -2505,13 +2505,13 @@ mod tests {
     #[test]
     fn a_name_inside_camel_case_or_beyond_ascii_is_still_named() {
         assert!(
-            spelling::names_word("SelkoClient", "selko", &[]),
+            spelling::names_word("OrbitClient", "orbit", &[]),
             "a capital starts a word"
         );
-        assert!(spelling::names_word("myOteThing", "ote", &[]));
+        assert!(spelling::names_word("myInkThing", "ink", &[]));
         assert!(
-            !spelling::names_word("remote", "ote", &[])
-                && !spelling::names_word("Xote", "ote", &[])
+            !spelling::names_word("rethink", "ink", &[])
+                && !spelling::names_word("Xink", "ink", &[])
         );
         assert!(spelling::names_word("ask Étienne", "étienne", &[]));
         assert!(spelling::names_word("ÉTIENNE said", "Étienne", &[]));
@@ -2524,7 +2524,7 @@ mod tests {
         let tool = vec!["`ohjaa` (the name of this tool, which is private)".to_owned()];
         assert_eq!(deny.matches("see .ohjaa/knowledge/"), tool);
         assert_eq!(deny.matches("OhjaaCli and ohjaa-marks"), tool);
-        let own = DenyList::build(&Private::default(), None, "false-systems/ohjaa");
+        let own = DenyList::build(&Private::default(), None, "example-org/ohjaa");
         assert!(own.matches("ohjaa").is_empty());
     }
 
@@ -2536,7 +2536,7 @@ mod tests {
             ..Private::default()
         };
         // The person's own public repository: their login is in its URL.
-        let deny = DenyList::build(&private, Some(Path::new("/Users/octocat")), "octocat/site");
+        let deny = DenyList::build(&private, Some(Path::new("/home/octocat")), "octocat/site");
         assert!(deny.matches("a personal octocat repo").is_empty());
         assert_eq!(
             deny.matches("Octo Cat wrote it").len(),
@@ -2544,7 +2544,7 @@ mod tests {
             "their name is still theirs"
         );
         assert_eq!(
-            deny.matches("/Users/octocat/site").len(),
+            deny.matches("/home/octocat/site").len(),
             1,
             "and their home path"
         );
@@ -2591,13 +2591,13 @@ mod tests {
     #[test]
     fn held_lines_are_left_out_and_their_old_text_kept() {
         let mut deny = DenyList::default();
-        deny.add("ote", "the name of a private repository of yours", true);
+        deny.add("ink", "the name of a private repository of yours", true);
         let clean = node("clean", Kind::Fact, "Nothing private.");
-        let named = node("named", Kind::Fact, "Calls ote.");
+        let named = node("named", Kind::Fact, "Calls ink.");
         let first = plan("# G\n", &lines(&[&clean, &named]), &[], Some(&deny));
         assert_eq!(first.held.len(), 1);
         assert_eq!(first.held[0].0, "named");
-        assert!(!first.text.contains("Calls ote."), "{}", first.text);
+        assert!(!first.text.contains("Calls ink."), "{}", first.text);
         assert_eq!(first.changes.added, vec!["clean"]);
         // Already there in its old words: they stay, the new ones are held.
         let old = node("named", Kind::Fact, "Calls nothing.");

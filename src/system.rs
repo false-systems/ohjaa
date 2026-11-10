@@ -328,7 +328,7 @@ mod tests {
     use crate::scan::Coverage;
 
     const CONTEXT: &str =
-        r#"{"repo":{"name":"teko","role":"durable task contract","not_roles":["inbox"]}}"#;
+        r#"{"repo":{"name":"tasker","role":"durable task contract","not_roles":["inbox"]}}"#;
 
     fn tool(name: &str, role: Option<&str>) -> Tool {
         Tool {
@@ -341,8 +341,8 @@ mod tests {
 
     #[test]
     fn a_tool_identity_comes_from_its_own_context_json() {
-        let tool = parse_context(Path::new("/fleet/teko"), CONTEXT).unwrap();
-        assert_eq!(tool.name, "teko");
+        let tool = parse_context(Path::new("/fleet/tasker"), CONTEXT).unwrap();
+        assert_eq!(tool.name, "tasker");
         assert_eq!(tool.role.as_deref(), Some("durable task contract"));
         assert_eq!(tool.not, vec!["inbox".to_string()]);
 
@@ -356,13 +356,13 @@ mod tests {
     /// toimija writes `"role": null` for a repo.yaml that declares no role
     /// (its `RepoInfo.role` is an `Option`): the repo keeps its name and what
     /// it is not, and only its role is unknown. This is toimija's own output,
-    /// byte for byte, for `name: teko` and `not: [inbox]`.
+    /// byte for byte, for `name: tasker` and `not: [inbox]`.
     #[test]
     fn a_repo_that_declares_no_role_keeps_its_name_and_what_it_is_not() {
         const NO_ROLE: &str = r#"{
   "schema": "toimija-identity.v1",
   "repo": {
-    "name": "teko",
+    "name": "tasker",
     "role": null,
     "not_roles": [
       "inbox"
@@ -374,9 +374,9 @@ mod tests {
   }
 }
 "#;
-        let tool = parse_context(Path::new("/fleet/teko-checkout"), NO_ROLE)
+        let tool = parse_context(Path::new("/fleet/tasker-checkout"), NO_ROLE)
             .expect("an identity with no role is still an identity");
-        assert_eq!(tool.name, "teko");
+        assert_eq!(tool.name, "tasker");
         assert_eq!(tool.role, None);
         assert_eq!(tool.not, vec!["inbox".to_string()]);
     }
@@ -385,17 +385,17 @@ mod tests {
     fn the_briefing_preserves_session_liveness_and_marks_home() {
         let mut view = SystemView {
             tools: vec![
-                tool("teko", Some("durable task contract")),
+                tool("tasker", Some("durable task contract")),
                 tool("kelo", None),
             ],
             unknown: vec![PathBuf::from("/fleet/kelo")],
             scans: vec![Scan {
-                repo: PathBuf::from("/fleet/teko"),
+                repo: PathBuf::from("/fleet/tasker"),
                 outside: false,
                 sessions: vec![Session {
                     id: "1-1".into(),
                     agent: "codex".into(),
-                    worktree: PathBuf::from("/fleet/teko"),
+                    worktree: PathBuf::from("/fleet/tasker"),
                     branch: Some("main".into()),
                     intent: "change the parser".into(),
                     scope: vec![],
@@ -409,15 +409,15 @@ mod tests {
             }],
         };
 
-        let text = briefing(&view, Path::new("/fleet/teko"));
-        assert!(text.contains("teko — durable task contract"), "{text}");
+        let text = briefing(&view, Path::new("/fleet/tasker"));
+        assert!(text.contains("tasker — durable task contract"), "{text}");
         assert!(text.contains("you are here"), "{text}");
         assert!(
             text.contains("role not derivable"),
             "an underivable role must not become a guess: {text}"
         );
         assert!(
-            text.contains("codex in teko: \"change the parser\""),
+            text.contains("codex in tasker: \"change the parser\""),
             "{text}"
         );
         assert!(text.contains("(stale; seen 10m ago)"), "{text}");
@@ -444,7 +444,7 @@ mod tests {
         for liveness in ["active", "unknown", "suspended", "closed"] {
             view.scans[0].sessions[0].liveness = liveness.into();
             for text in [
-                briefing(&view, Path::new("/fleet/teko")),
+                briefing(&view, Path::new("/fleet/tasker")),
                 render_system(&view),
             ] {
                 assert!(!text.contains("Live now"), "{text}");
@@ -460,10 +460,10 @@ mod tests {
     #[test]
     fn a_fully_derived_quiet_fleet_is_complete() {
         let mut view = SystemView {
-            tools: vec![tool("teko", Some("durable task contract"))],
+            tools: vec![tool("tasker", Some("durable task contract"))],
             unknown: vec![],
             scans: vec![Scan {
-                repo: PathBuf::from("/fleet/teko"),
+                repo: PathBuf::from("/fleet/tasker"),
                 outside: false,
                 sessions: vec![],
                 warnings: vec![],
@@ -473,7 +473,7 @@ mod tests {
         };
         assert_eq!(view.exit_code(), 0);
 
-        let text = briefing(&view, Path::new("/fleet/teko"));
+        let text = briefing(&view, Path::new("/fleet/tasker"));
         assert!(
             text.contains("No possibly running sessions reported"),
             "{text}"
@@ -484,7 +484,7 @@ mod tests {
             view.scans[0].error = Some("cannot inspect sessions".into());
             assert_eq!(view.exit_code(), 4);
             for text in [
-                briefing(&view, Path::new("/fleet/teko")),
+                briefing(&view, Path::new("/fleet/tasker")),
                 render_system(&view),
             ] {
                 assert!(

@@ -117,8 +117,8 @@ mod tests {
 
     #[test]
     fn derived_roots_are_the_repo_siblings() {
-        let roots = derived_roots(Some(Path::new("/Users/x/projects/toimija")));
-        assert_eq!(roots, vec![PathBuf::from("/Users/x/projects")]);
+        let roots = derived_roots(Some(Path::new("/home/dev/projects/toimija")));
+        assert_eq!(roots, vec![PathBuf::from("/home/dev/projects")]);
     }
 
     #[test]
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn explicit_roots_win() {
         let explicit = vec![PathBuf::from("/tmp/x")];
-        let roots = load(&explicit, Some(Path::new("/Users/x/projects/toimija")));
+        let roots = load(&explicit, Some(Path::new("/home/dev/projects/toimija")));
         assert_eq!(roots, explicit);
     }
 

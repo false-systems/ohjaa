@@ -383,18 +383,18 @@ fn applied_block(lines: &[&str]) -> String {
 #[test]
 fn system_derives_the_fleet_and_exits_incomplete_when_a_role_is_missing() {
     let fixture = Fixture::new("system");
-    fixture.make_repo("teko");
+    fixture.make_repo("tasker");
     fixture.make_repo("kelo");
     fixture.set_context(
-        r#"{"repo":{"name":"teko","role":"durable task contract","not_roles":["inbox"]}}"#,
+        r#"{"repo":{"name":"tasker","role":"durable task contract","not_roles":["inbox"]}}"#,
     );
-    // One canned context for every repo: teko parses, the "kelo" copy does
+    // One canned context for every repo: tasker parses, the "kelo" copy does
     // not (its name mismatches nothing — the stub serves the same file, so
     // kelo derives with the wrong name and no role of its own). To keep the
     // test honest, give kelo an empty repo object instead.
     fs::write(
         fixture.dir.join("context.json"),
-        r#"{"repo":{"name":"teko","role":"durable task contract","not_roles":["inbox"]}}"#,
+        r#"{"repo":{"name":"tasker","role":"durable task contract","not_roles":["inbox"]}}"#,
     )
     .unwrap();
 
@@ -406,7 +406,7 @@ fn system_derives_the_fleet_and_exits_incomplete_when_a_role_is_missing() {
     );
     fixture.cleanup();
 
-    assert!(stdout.contains("teko"), "{stdout}");
+    assert!(stdout.contains("tasker"), "{stdout}");
     assert!(stdout.contains("role: durable task contract"), "{stdout}");
     assert!(stdout.contains("not:  inbox"), "{stdout}");
     // Both repos derive the same canned context, so no role is missing here;
@@ -418,9 +418,9 @@ fn system_derives_the_fleet_and_exits_incomplete_when_a_role_is_missing() {
 #[test]
 fn system_json_lists_tools_with_their_roles() {
     let fixture = Fixture::new("system-json");
-    fixture.make_repo("teko");
+    fixture.make_repo("tasker");
     fixture
-        .set_context(r#"{"repo":{"name":"teko","role":"durable task contract","not_roles":[]}}"#);
+        .set_context(r#"{"repo":{"name":"tasker","role":"durable task contract","not_roles":[]}}"#);
 
     let (stdout, _, code) = output_of(
         fixture
@@ -433,7 +433,7 @@ fn system_json_lists_tools_with_their_roles() {
     assert_eq!(code, Some(0));
     let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let tool = &value["tools"][0];
-    assert_eq!(tool["name"], "teko");
+    assert_eq!(tool["name"], "tasker");
     assert_eq!(tool["role"], "durable task contract");
 }
 
@@ -576,7 +576,7 @@ fn the_briefing_orders_knowledge_by_scope_then_kind() {
         &repo.join(".ohjaa/knowledge"),
         "uploader",
         "fact",
-        "Dima owns the uploader.",
+        "Sam owns the uploader.",
     );
     fixture.node(
         &fixture.dir.join("ours/knowledge"),
@@ -600,7 +600,7 @@ fn the_briefing_orders_knowledge_by_scope_then_kind() {
     let order: Vec<usize> = [
         "Rust only.",
         "Plain English.",
-        "Dima owns",
+        "Sam owns",
         "Answer first.",
         "Lima is here.",
     ]
@@ -1365,14 +1365,14 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
     // Intake's first real run, 2026-10-27, wrote 108 proposals, four of them
     // one lesson ("read back the briefing and leave a handover"). The review
     // of #61: refusing what looks repeated drops real lessons for good
-    // (`tapio-linux-only` as `rauha-linux-only`), and a person is the only
+    // (`quarry-linux-only` as `beacon-linux-only`), and a person is the only
     // one who decides. So each is written, and said to that person.
     if !git_available() {
         return;
     }
     let fixture = Fixture::new("intakedup");
     let repo = fixture.make_git_repo("work");
-    let (rauha, tapio) = (fixture.make_folder("rauha"), fixture.make_folder("tapio"));
+    let (beacon, quarry) = (fixture.make_folder("beacon"), fixture.make_folder("quarry"));
     fixture.node(
         &fixture.dir.join("config/ohjaa/mine"),
         "rust-elixir-only",
@@ -1393,9 +1393,9 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
             .replace('/', "%2F")
     };
     waiting_proposal(
-        &proposals.join("repo").join(encoded(&rauha)),
-        "rauha-linux-only",
-        "Rauha runs on Linux only.",
+        &proposals.join("repo").join(encoded(&beacon)),
+        "beacon-linux-only",
+        "Beacon runs on Linux only.",
     );
     fixture.said(&[
         vessa_line(
@@ -1406,7 +1406,7 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
         ),
         vessa_line(
             "2026-09-20T10:05:00Z",
-            &rauha.display().to_string(),
+            &beacon.display().to_string(),
             "no, we have lima baba",
             None,
         ),
@@ -1434,7 +1434,7 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
                 "pi-sessions-need-a-wrapper-too",
                 Some("start-sessions-through-ohjaa-run"),
             ),
-            drafted("repo", Some(&tapio), "tapio-linux-only", None),
+            drafted("repo", Some(&quarry), "quarry-linux-only", None),
             drafted("machine", None, "lima-for-linux", None),
         ]),
     ];
@@ -1490,11 +1490,11 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
         "{first}"
     );
     assert!(first.contains("Return nothing for a"), "{first}");
-    assert!(!first.contains("rauha-linux-only"), "{first}");
+    assert!(!first.contains("beacon-linux-only"), "{first}");
     assert!(
         second.contains(&format!(
-            "- rauha-linux-only [repo/lesson/proposed] in {}: Rauha runs on Linux only.",
-            rauha.display()
+            "- beacon-linux-only [repo/lesson/proposed] in {}: Beacon runs on Linux only.",
+            beacon.display()
         )),
         "{second}"
     );
@@ -1520,7 +1520,7 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
         // A refinement of a waiting proposal is kept, as refining it.
         "proposed pi-sessions-need-a-wrapper-too\n",
         // The same words of another repository are another lesson.
-        "proposed tapio-linux-only\n",
+        "proposed quarry-linux-only\n",
         "proposed lima-for-linux\n",
         "9 proposal(s) waiting for review (`ohjaa review`), 4 of them possible duplicates, 0 \
          draft(s) refused",
@@ -1560,8 +1560,8 @@ fn a_draft_that_may_repeat_what_is_present_is_written_and_said_to_a_person() {
         }
     }
     assert_eq!(stored, Vec::<PathBuf>::new(), "only proposals are stored");
-    let tapio_dir = proposals.join("repo").join(encoded(&tapio));
-    assert!(tapio_dir.join("tapio-linux-only.md").is_file());
+    let quarry_dir = proposals.join("repo").join(encoded(&quarry));
+    assert!(quarry_dir.join("quarry-linux-only.md").is_file());
     let refinement =
         fs::read_to_string(proposals.join("ours/pi-sessions-need-a-wrapper-too.md")).unwrap();
     assert!(
@@ -2799,7 +2799,7 @@ const AGENT_MARKERS: [&str; 16] = [
 ];
 
 /// One page of GitHub's search: a pull request merged into main an hour
-/// ago and one opened then, in false-systems.
+/// ago and one opened then, in example-org.
 /// With `extra`, that many more merged into sykli's main half an hour ago.
 fn graphql_page(more: bool, extra: u64) -> String {
     graphql_page_at(unix_seconds(), more, extra)
@@ -2839,7 +2839,7 @@ fn utc(unix_s: i64) -> String {
 fn graphql_page_at(now: i64, more: bool, extra: u64) -> String {
     let at = |ago_s: i64| utc(now - ago_s);
     let repo = |name: &str| {
-        serde_json::json!({"nameWithOwner": format!("false-systems/{name}"),
+        serde_json::json!({"nameWithOwner": format!("example-org/{name}"),
                            "defaultBranchRef": {"name": "main"}})
     };
     let mut page = serde_json::json!({"data": {"search": {
@@ -2848,11 +2848,11 @@ fn graphql_page_at(now: i64, more: bool, extra: u64) -> String {
         "nodes": [
             {"number": 76, "title": "Ask git once", "url": "https://github.com/x/76",
              "createdAt": at(7200), "mergedAt": at(3600), "closedAt": at(3600),
-             "baseRefName": "main", "author": {"login": "yairfalse"},
-             "mergedBy": {"login": "yairfalse"}, "repository": repo("sykli")},
+             "baseRefName": "main", "author": {"login": "devuser"},
+             "mergedBy": {"login": "devuser"}, "repository": repo("sykli")},
             {"number": 16, "title": "docs: nothing refuses \u{1b}[2J", "url": "https://github.com/x/16",
              "createdAt": at(3600), "mergedAt": null, "closedAt": null,
-             "baseRefName": "main", "author": {"login": "yairfalse"}, "mergedBy": null,
+             "baseRefName": "main", "author": {"login": "devuser"}, "mergedBy": null,
              "repository": repo("faija")},
             {},
         ],
@@ -2863,14 +2863,14 @@ fn graphql_page_at(now: i64, more: bool, extra: u64) -> String {
             "number": 100 + number, "title": format!("change {number}"),
             "url": format!("https://github.com/x/{}", 100 + number),
             "createdAt": at(1800), "mergedAt": at(1800), "closedAt": at(1800),
-            "baseRefName": "main", "author": {"login": "yairfalse"},
-            "mergedBy": {"login": "yairfalse"}, "repository": repo("sykli")}));
+            "baseRefName": "main", "author": {"login": "devuser"},
+            "mergedBy": {"login": "devuser"}, "repository": repo("sykli")}));
     }
     page.to_string()
 }
 
 impl Fixture {
-    /// The workflow home with an entry of false-systems (whose pull
+    /// The workflow home with an entry of example-org (whose pull
     /// requests are asked for) and a clone of it under the roots, its one
     /// commit at origin/main unproven, and GitHub's answer for the search.
     fn human_view(&self, more: bool) {
@@ -2896,7 +2896,7 @@ impl Fixture {
                 "remote",
                 "add",
                 "origin",
-                "https://github.com/false-systems/sykli.git",
+                "https://github.com/example-org/sykli.git",
             ],
         );
         run_git(
@@ -3092,8 +3092,8 @@ fn startup_is_attention_only_and_activity_stays_unread_until_the_digest() {
     );
     for said in [
         "Pull requests: 1 merged, 1 opened",
-        "#76 merged by yairfalse: Ask git once",
-        "#16 opened by yairfalse: docs: nothing refuses \u{fffd}[2J",
+        "#76 merged by devuser: Ask git once",
+        "#16 opened by devuser: docs: nothing refuses \u{fffd}[2J",
     ] {
         assert!(digest.contains(said), "missing `{said}`: {digest}");
     }
@@ -3133,11 +3133,11 @@ fn quiet_startup_retains_unread_pull_requests_across_days() {
     );
     assert_eq!(code, Some(0));
     assert_eq!(
-        digest.matches("#76 merged by yairfalse").count(),
+        digest.matches("#76 merged by devuser").count(),
         1,
         "{digest}"
     );
-    assert!(digest.contains("#16 opened by yairfalse"), "{digest}");
+    assert!(digest.contains("#16 opened by devuser"), "{digest}");
     let (again, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
     assert!(again.contains("No unread activity recorded"), "{again}");
     fixture.cleanup();
@@ -3246,7 +3246,7 @@ fn a_stale_snapshot_starts_exactly_one_background_collect() {
     fixture.cleanup();
 }
 
-/// viemari's, ported: GitHub is asked at most twice, and a source that
+/// depot's, ported: GitHub is asked at most twice, and a source that
 /// fails never fails the collect: it is said, as of when it last answered.
 #[test]
 fn collect_asks_github_at_most_twice_and_says_what_failed() {
@@ -3283,11 +3283,11 @@ fn collect_asks_github_at_most_twice_and_says_what_failed() {
         digest.contains("GitHub (pull request activity) as of "),
         "{digest}"
     );
-    assert!(digest.contains("#76 merged by yairfalse"), "kept: {digest}");
+    assert!(digest.contains("#76 merged by devuser"), "kept: {digest}");
     fixture.cleanup();
 }
 
-/// viemari's, ported: a state directory the cursor cannot be written to
+/// depot's, ported: a state directory the cursor cannot be written to
 /// never repeats the day's digest at every terminal.
 #[test]
 fn a_cursor_that_cannot_be_written_never_repeats_the_days_digest() {
@@ -3366,9 +3366,9 @@ fn what_could_not_be_read_is_said_never_an_all_clear() {
     }
     let fixture = Fixture::new("human-unread");
     fixture.human_view(false);
-    let valvo = fixture.make_git_repo("valvo");
-    fs::write(valvo.join(".toimija/repo.yaml"), "repo:\n  name: valvo\n").unwrap();
-    fs::write(valvo.join(".git/config"), "[[[ not git's\n").unwrap();
+    let meadow = fixture.make_git_repo("meadow");
+    fs::write(meadow.join(".toimija/repo.yaml"), "repo:\n  name: meadow\n").unwrap();
+    fs::write(meadow.join(".git/config"), "[[[ not git's\n").unwrap();
     fixture.make_repo("broken");
     let (stdout, _, code) = output_of(fixture.person().arg("collect"));
     assert_eq!(code, Some(4), "{stdout}");
@@ -3380,7 +3380,7 @@ fn what_could_not_be_read_is_said_never_an_all_clear() {
     for said in [
         "! GitHub",
         "1 could not be read",
-        "valvo",
+        "meadow",
         "could not be scanned",
     ] {
         assert!(digest.contains(said), "missing `{said}`: {digest}");
@@ -3424,7 +3424,7 @@ fn what_the_days_digest_left_out_is_what_ohjaa_digest_shows() {
     let (digest, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
     for number in [76, 100, 110, 119] {
         assert!(
-            digest.contains(&format!("#{number} merged by yairfalse")),
+            digest.contains(&format!("#{number} merged by devuser")),
             "#{number}: {digest}"
         );
     }
@@ -3629,7 +3629,7 @@ fn hold(path: &Path) -> fs::File {
 
 /// collect asks GitHub about the owners on GitHub of the fleet's clones
 /// under the roots (those with `.toimija/repo.yaml`), each found from its
-/// origin: the fixture's clone of false-systems/sykli. Never the owner of a
+/// origin: the fixture's clone of example-org/sykli. Never the owner of a
 /// clone of someone else's project, on GitHub or elsewhere.
 #[test]
 fn collect_asks_github_about_the_owners_of_the_fleets_clones() {
@@ -3673,7 +3673,7 @@ fn collect_asks_github_about_the_owners_of_the_fleets_clones() {
         asked.contains("api graphql"),
         "GitHub was never asked: {asked}"
     );
-    assert!(asked.contains("q=org:false-systems is:pr"), "{asked}");
+    assert!(asked.contains("q=org:example-org is:pr"), "{asked}");
     assert!(!asked.contains("someone"), "{asked}");
     assert!(!asked.contains("busy-org"), "{asked}");
     fixture.cleanup();
@@ -3752,7 +3752,7 @@ fn what_a_days_digest_left_out_is_kept_past_the_next_day() {
     let (digest, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
     for number in [76, 100, 119] {
         assert!(
-            digest.contains(&format!("#{number} merged by yairfalse")),
+            digest.contains(&format!("#{number} merged by devuser")),
             "#{number}: {digest}"
         );
     }
@@ -3789,7 +3789,7 @@ fn a_pull_request_github_indexes_late_is_in_the_next_digest_once() {
     std::thread::sleep(std::time::Duration::from_millis(1100));
     output_of(fixture.person().arg("collect"));
     let (first, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
-    assert!(first.contains("#76 merged by yairfalse"), "{first}");
+    assert!(first.contains("#76 merged by devuser"), "{first}");
     assert!(!first.contains("#100"), "{first}");
     // #100 merged half an hour ago, before that snapshot, and is only now
     // in GitHub's search.
@@ -3798,13 +3798,13 @@ fn a_pull_request_github_indexes_late_is_in_the_next_digest_once() {
     output_of(fixture.person().arg("collect"));
     assert_eq!(fixture.graphql_calls(), 2, "no call more for the overlap");
     let (next, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
-    assert!(next.contains("#100 merged by yairfalse"), "{next}");
+    assert!(next.contains("#100 merged by devuser"), "{next}");
     // Activity is said once; "Now" is what stands, said each time: #16 is
     // still open, so it is listed there again, never as news.
     let (activity, now) = next.split_once("\nNow\n").expect("a Now section");
     assert!(!activity.contains("#76"), "said already: {next}");
     assert!(!activity.contains("#16"), "said already: {next}");
-    assert!(now.contains("#16 by yairfalse"), "still open: {next}");
+    assert!(now.contains("#16 by devuser"), "still open: {next}");
     fixture.cleanup();
 }
 
@@ -3822,7 +3822,7 @@ fn a_digest_moves_the_cursor_only_under_the_claim() {
     let held = hold(&fixture.human_dir().join("seen.lock"));
     let (said, code) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
     assert_eq!(code, Some(0), "{said}");
-    assert!(said.contains("#76 merged by yairfalse"), "{said}");
+    assert!(said.contains("#76 merged by devuser"), "{said}");
     assert!(
         !fixture.human_dir().join("seen.json").exists(),
         "moved without the claim"
@@ -3830,7 +3830,7 @@ fn a_digest_moves_the_cursor_only_under_the_claim() {
     drop(held);
     let (said, _) = on_a_terminal(fixture.person().args(["digest", "--no-collect"]));
     assert!(
-        said.contains("#76 merged by yairfalse"),
+        said.contains("#76 merged by devuser"),
         "shown again: {said}"
     );
     assert!(fixture.human_dir().join("seen.json").is_file());
@@ -3855,7 +3855,7 @@ fn secret_found(
     rule: &str,
     fingerprint: Option<&str>,
 ) -> serde_json::Value {
-    serde_json::json!({"agent": "claude", "session": session, "cwd": "/p/habitat",
+    serde_json::json!({"agent": "claude", "session": session, "cwd": "/p/carpet",
                        "at": utc(at_s), "where": place, "rule": rule, "count": 1,
                        "fingerprint": fingerprint})
 }

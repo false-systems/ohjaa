@@ -723,8 +723,8 @@ mod tests {
     fn the_search_names_every_owner_and_the_minute() {
         let from = intake::parse_time("2026-10-12T08:30:45Z").unwrap();
         assert_eq!(
-            search(&["false-systems".into(), "yairfalse".into()], from),
-            "org:false-systems org:yairfalse is:pr updated:>=2026-10-12T08:30:00Z \
+            search(&["example-org".into(), "devuser".into()], from),
+            "org:example-org org:devuser is:pr updated:>=2026-10-12T08:30:00Z \
              sort:updated-desc"
         );
     }
@@ -734,12 +734,12 @@ mod tests {
         let node = json!({
             "number": 12,
             "title": "Rename the config module",
-            "url": "https://github.com/false-systems/habitat/pull/12",
+            "url": "https://github.com/example-org/carpet/pull/12",
             "createdAt": "2026-11-08T08:00:00Z",
             "updatedAt": "2026-11-08T09:40:00Z",
             "isDraft": true,
-            "author": { "login": "dima" },
-            "repository": { "nameWithOwner": "false-systems/habitat" },
+            "author": { "login": "sam" },
+            "repository": { "nameWithOwner": "example-org/carpet" },
         });
         let read = pr(&node).unwrap();
         assert!(read.draft && read.open());
@@ -829,7 +829,7 @@ mod tests {
     }
 
     fn found(session: &str, at_ms: i64, place: &str, rule: &str, fingerprint: Value) -> Value {
-        json!({"agent": "claude", "session": session, "cwd": "/p/habitat",
+        json!({"agent": "claude", "session": session, "cwd": "/p/carpet",
                "at": intake::rfc3339(at_ms / 1000), "where": place, "rule": rule,
                "count": 1, "fingerprint": fingerprint})
     }

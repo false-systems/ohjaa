@@ -566,20 +566,20 @@ mod tests {
     fn every_remote_form_names_the_same_repository() {
         let github = Some("github.com".to_owned());
         for url in [
-            "git@github.com:false-systems/ohjaa.git",
-            "git@github.com:false-systems/ohjaa",
-            "github.com:false-systems/ohjaa.git",
-            "ssh://git@github.com/false-systems/ohjaa.git",
-            "ssh://git@github.com:22/false-systems/ohjaa",
-            "https://github.com/false-systems/ohjaa.git",
-            "https://github.com/false-systems/ohjaa/",
-            "https://x-access-token:secret@GitHub.com/false-systems/ohjaa",
-            "git://github.com/false-systems/ohjaa.git",
+            "git@github.com:example-org/ohjaa.git",
+            "git@github.com:example-org/ohjaa",
+            "github.com:example-org/ohjaa.git",
+            "ssh://git@github.com/example-org/ohjaa.git",
+            "ssh://git@github.com:22/example-org/ohjaa",
+            "https://github.com/example-org/ohjaa.git",
+            "https://github.com/example-org/ohjaa/",
+            "https://x-access-token:secret@GitHub.com/example-org/ohjaa",
+            "git://github.com/example-org/ohjaa.git",
         ] {
             let id = RepoId::parse(url).unwrap_or_else(|| panic!("{url}"));
             assert_eq!(id.host, github, "{url}");
-            assert_eq!(id.slug(), "false-systems/ohjaa", "{url}");
-            assert_eq!(id.to_string(), "github.com/false-systems/ohjaa", "{url}");
+            assert_eq!(id.slug(), "example-org/ohjaa", "{url}");
+            assert_eq!(id.to_string(), "github.com/example-org/ohjaa", "{url}");
         }
     }
 

@@ -1534,20 +1534,20 @@ mod tests {
             .propose(sandbox.proposal(Scope::Ours, "use-cell"))
             .unwrap();
         accept(&sandbox.dirs, "use-cell", date("2026-09-01")).unwrap();
-        let mut successor = sandbox.proposal(Scope::Ours, "use-solu");
+        let mut successor = sandbox.proposal(Scope::Ours, "use-unit");
         successor.supersedes = vec!["use-cell".to_owned()];
         sandbox.propose(successor).unwrap();
-        accept(&sandbox.dirs, "use-solu", date("2026-09-24")).unwrap();
+        accept(&sandbox.dirs, "use-unit", date("2026-09-24")).unwrap();
 
         let loaded = load(&sandbox.dirs).unwrap();
         assert_eq!(
             loaded.get("use-cell").unwrap().node.status,
             Status::Superseded
         );
-        assert_eq!(loaded.get("use-solu").unwrap().node.status, Status::Current);
+        assert_eq!(loaded.get("use-unit").unwrap().node.status, Status::Current);
         assert!(fk::validate_set(&loaded.nodes).is_empty());
         let briefing = render(&loaded, &[]);
-        assert!(briefing.contains("use-solu") && !briefing.contains("use-cell"));
+        assert!(briefing.contains("use-unit") && !briefing.contains("use-cell"));
     }
 
     #[test]
@@ -2288,7 +2288,7 @@ mod tests {
     #[test]
     fn repo_paths_encode_to_one_directory_and_back() {
         for path in [
-            "/Users/x/projects/selko",
+            "/home/dev/projects/orbit",
             "/tmp/a%b/c",
             "/with space/x",
             "/a/25b/%2F",

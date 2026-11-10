@@ -3228,7 +3228,7 @@ mod tests {
             "the key thing is to keep the token budget small",
             "password: hunter2",
             "the token count was 1234",
-            "key /Users/yair/.ssh/id_ed25519_github_2026",
+            "key /home/dev/.ssh/id_ed25519_github_2026",
             // Prefixes inside ordinary words, or too short to be keys.
             "use sk-learn, or task-1234567890abcdefghij",
             "the AKIA prefix names an AWS key",
@@ -3241,12 +3241,12 @@ mod tests {
             "image sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
             "a 9f86d081884c7d659a2f.feaa0c55ad01 short id",
             "test_the_cursor_moves_only_past_what_was_handled_and_never_back_2",
-            "/Users/yair/projects/_worktrees/ohjaa-intake-vessa/src/IntakeVessa2/main.rs",
+            "/home/dev/projects/_worktrees/ohjaa-intake-vessa/src/IntakeVessa2/main.rs",
             "~/.codex/sessions/2026/10/26/rollout-2026-10-26T10-00-00-8c1f2e3a.jsonl",
             "ProjectManagementDashboardSettingsController is long but has no digit",
             // A path is judged by the pieces of its names: versioned and dated
             // file names are made of short words.
-            "/Users/yair/Downloads/Ohjaa-1.2.3-macOS-arm64-applesilicon.zip",
+            "/home/dev/Downloads/Ohjaa-1.2.3-macOS-arm64-applesilicon.zip",
             "~/Desktop/2026-10-26T10-20-33Z_Screen-Recording-8c1f2e3a-Final.mov",
         ] {
             assert_eq!(scrub(text), (text.to_owned(), 0), "{text}");
@@ -3444,7 +3444,12 @@ mod tests {
             ),
             (Mine, None, "read-back-briefing", Status::Current),
             (Mine, None, "leave-a-handover-always", Status::Retired),
-            (Repo, Some("/r/rauha"), "rauha-linux-only", Status::Proposed),
+            (
+                Repo,
+                Some("/r/beacon"),
+                "beacon-linux-only",
+                Status::Proposed,
+            ),
         ]);
         let repeats = |proposal: Proposal| present.repeated_by(&proposal).map(str::to_owned);
         let of = |id: &str| Some(id.to_owned());
@@ -3467,15 +3472,15 @@ mod tests {
         assert_eq!(
             repeats(proposing(
                 Repo,
-                Some("/r/rauha"),
-                "rauha-is-linux-only",
+                Some("/r/beacon"),
+                "beacon-is-linux-only",
                 None,
                 &[]
             )),
-            of("rauha-linux-only")
+            of("beacon-linux-only")
         );
         // The same words in another scope, or of another repository, are
-        // another lesson (the review of #61: `tapio-linux-only`).
+        // another lesson (the review of #61: `quarry-linux-only`).
         assert_eq!(
             repeats(proposing(
                 Mine,
@@ -3489,8 +3494,8 @@ mod tests {
         assert_eq!(
             repeats(proposing(
                 Repo,
-                Some("/r/tapio"),
-                "tapio-linux-only",
+                Some("/r/quarry"),
+                "quarry-linux-only",
                 None,
                 &[]
             )),
@@ -3589,11 +3594,11 @@ mod tests {
         let present = known(&[(
             Scope::Repo,
             Some("/r/here"),
-            "rauha-linux-only",
+            "beacon-linux-only",
             Status::Proposed,
         )]);
-        let unnamed = proposing(Scope::Repo, None, "rauha-is-linux-only", None, &[]);
-        assert_eq!(present.repeated_by(&unnamed), Some("rauha-linux-only"));
+        let unnamed = proposing(Scope::Repo, None, "beacon-is-linux-only", None, &[]);
+        assert_eq!(present.repeated_by(&unnamed), Some("beacon-linux-only"));
         let mut empty = Known::of(&Loaded::default(), &[], Some(Path::new("/r/here")));
         let written = empty.present(&unnamed);
         empty.add(written);
@@ -3601,11 +3606,11 @@ mod tests {
             empty.repeated_by(&proposing(
                 Scope::Repo,
                 Some("/r/here"),
-                "rauha-runs-linux-only",
+                "beacon-runs-linux-only",
                 None,
                 &[]
             )),
-            Some("rauha-is-linux-only")
+            Some("beacon-is-linux-only")
         );
     }
 
@@ -3647,9 +3652,14 @@ mod tests {
             waiting(Ours, None, "read-briefing-and-leave-handover", "2026-10-26"),
             waiting(Mine, None, "code-is-rust-or-elixir", "2026-10-27"),
             waiting(Mine, None, "always-leave-a-handover", "2026-10-27"),
-            waiting(Repo, Some("/r/tapio"), "tapio-linux-only", "2026-10-27"),
-            waiting(Repo, Some("/r/rauha"), "rauha-linux-only", "2026-10-26"),
-            waiting(Repo, Some("/r/rauha"), "rauha-is-linux-only", "2026-10-27"),
+            waiting(Repo, Some("/r/quarry"), "quarry-linux-only", "2026-10-27"),
+            waiting(Repo, Some("/r/beacon"), "beacon-linux-only", "2026-10-26"),
+            waiting(
+                Repo,
+                Some("/r/beacon"),
+                "beacon-is-linux-only",
+                "2026-10-27",
+            ),
             // As old as each other: the one stored first came before.
             waiting(Ours, None, "start-sessions-through-ohjaa-run", "2026-10-27"),
             waiting(Ours, None, "start-agents-through-ohjaa-run", "2026-10-27"),
@@ -3668,7 +3678,7 @@ mod tests {
                 // Another repository's words are another lesson.
                 None,
                 None,
-                of("rauha-linux-only"),
+                of("beacon-linux-only"),
                 None,
                 of("start-sessions-through-ohjaa-run"),
             ]
@@ -3684,9 +3694,9 @@ mod tests {
                 "read-back-briefing-and-leave-handover",
                 "code-is-rust-or-elixir",
                 "always-leave-a-handover",
-                "tapio-linux-only",
-                "rauha-linux-only",
-                "rauha-is-linux-only",
+                "quarry-linux-only",
+                "beacon-linux-only",
+                "beacon-is-linux-only",
                 "start-sessions-through-ohjaa-run",
                 "start-agents-through-ohjaa-run",
             ]
@@ -3773,14 +3783,14 @@ mod tests {
             (Scope::Machine, None, "machine-fact", Status::Proposed),
             (
                 Scope::Repo,
-                Some("/r/projects/valvo"),
-                "valvo-lesson",
+                Some("/r/projects/meadow"),
+                "meadow-lesson",
                 Status::Proposed,
             ),
             (
                 Scope::Repo,
-                Some("/r/projects/rauha"),
-                "rauha-lesson",
+                Some("/r/projects/beacon"),
+                "beacon-lesson",
                 Status::Proposed,
             ),
             (
@@ -3806,8 +3816,8 @@ mod tests {
                 "ours-lesson",
                 "mine-lesson",
                 "machine-fact",
-                "valvo-lesson",
-                "rauha-lesson",
+                "meadow-lesson",
+                "beacon-lesson",
                 "ohjaa-lesson",
             ]
             .into_iter()
@@ -3822,8 +3832,8 @@ mod tests {
             ids
         };
         assert_eq!(
-            shown(&[candidate("claude", "/r/projects/valvo/formal", "")]),
-            with("valvo-lesson")
+            shown(&[candidate("claude", "/r/projects/meadow/formal", "")]),
+            with("meadow-lesson")
         );
         // A worktree named after its repository, and a pull request's URL.
         assert_eq!(
@@ -3835,26 +3845,34 @@ mod tests {
             with("ohjaa-lesson")
         );
         assert_eq!(
-            shown(&[candidate("review", "https://github.com/o/rauha/pull/3", "")]),
-            with("rauha-lesson")
+            shown(&[candidate(
+                "review",
+                "https://github.com/o/beacon/pull/3",
+                ""
+            )]),
+            with("beacon-lesson")
         );
         // A review, by the repository it was read from.
         assert_eq!(
             shown(&[candidate(
                 "review",
                 "https://github.com/o/x/pull/1",
-                "/r/projects/rauha"
+                "/r/projects/beacon"
             )]),
-            with("rauha-lesson")
+            with("beacon-lesson")
         );
         // The agent's words before a message are no place.
         assert_eq!(
-            shown(&[candidate("claude", "/r/projects", "see /r/projects/valvo/")]),
+            shown(&[candidate(
+                "claude",
+                "/r/projects",
+                "see /r/projects/meadow/"
+            )]),
             everywhere
         );
-        let (text, _) = prompt(&present, &[candidate("claude", "/r/projects/valvo", "")]);
+        let (text, _) = prompt(&present, &[candidate("claude", "/r/projects/meadow", "")]);
         assert!(
-            text.contains("- valvo-lesson [repo/lesson/proposed] in /r/projects/valvo: A lesson"),
+            text.contains("- meadow-lesson [repo/lesson/proposed] in /r/projects/meadow: A lesson"),
             "a repo node is shown with its repository: {text}"
         );
     }
@@ -3911,8 +3929,8 @@ mod tests {
     #[test]
     fn github_remotes_resolve_to_slugs() {
         assert_eq!(
-            github_slug("git@github.com:false-systems/ohjaa.git").as_deref(),
-            Some("false-systems/ohjaa")
+            github_slug("git@github.com:example-org/ohjaa.git").as_deref(),
+            Some("example-org/ohjaa")
         );
         assert_eq!(
             github_slug("https://github.com/o/r").as_deref(),

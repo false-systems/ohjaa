@@ -4,7 +4,7 @@
 //! diacritics folded to ASCII, combining marks dropped, and, in a second
 //! reading, HTML comments and Markdown emphasis taken out so a name split by
 //! them joins again. A name matches at the start of a word, whatever
-//! follows (`selkod`, `habitats`). What is left outside ASCII is said by
+//! follows (`orbitd`, `carpets`). What is left outside ASCII is said by
 //! [`odd_letter`], since no fold here reads it as a letter inside ASCII.
 //!
 //! No Unicode library: the folds are tables for the Latin letters (Latin-1
@@ -47,8 +47,8 @@ pub fn normalised(text: &str) -> String {
 
 /// `text` without HTML comments (an unclosed one to the end), HTML tags
 /// (`<b>`, `</span>`, `<wbr>`), Markdown link targets (`](…)`) and
-/// Markdown's emphasis and code marks, so that `hab<!-- -->itat`,
-/// `hab<b></b>itat`, `[hab](x)itat` and `**hab**itat` read `habitat`.
+/// Markdown's emphasis and code marks, so that `car<!-- -->pet`,
+/// `car<b></b>pet`, `[car](x)pet` and `**car**pet` read `carpet`.
 fn joined(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -184,7 +184,7 @@ pub fn names_anywhere(haystack: &str, needle: &str) -> bool {
 }
 
 /// Whether `haystack` holds `needle` at the start of a word, letter case not
-/// told apart, whatever follows it (`selkod`, `habitats`): what is before it
+/// told apart, whatever follows it (`orbitd`, `carpets`): what is before it
 /// is no letter or digit, or a small letter before a capital (`myOte`). A
 /// word that is one of `allowed` (the repository's own name, its owner) is
 /// not counted, though `needle` begins it.
@@ -345,23 +345,23 @@ mod tests {
         assert_eq!(normalised("a&b; &auml; x&"), "a&b; &auml; x&");
         assert_eq!(unread_entity("a &auml; b"), Some("&auml;".to_owned()));
         assert_eq!(unread_entity("a & b; c&d"), None);
-        let [base, joined] = readings("**hab**<!-- x -->itat_wal and `ote`");
-        assert_eq!(base, "**hab**<!-- x -->itat_wal and `ote`");
-        assert_eq!(joined, "habitatwal and ote");
-        assert_eq!(normalised("hab\u{200B}i\u{00AD}tat"), "habitat");
-        assert_eq!(normalised("Ha\u{0308}bitat"), "Habitat");
+        let [base, joined] = readings("**car**<!-- x -->pet_wal and `ink`");
+        assert_eq!(base, "**car**<!-- x -->pet_wal and `ink`");
+        assert_eq!(joined, "carpetwal and ink");
+        assert_eq!(normalised("car\u{200B}p\u{00AD}et"), "carpet");
+        assert_eq!(normalised("Ca\u{0308}rpet"), "Carpet");
     }
 
     #[test]
     fn a_name_matches_at_the_start_of_a_word_but_not_the_allowed_one() {
         let none: &[String] = &[];
-        assert!(names_word("selkod and more", "selko", none));
-        assert!(names_word("SelkoClient", "selko", none));
-        assert!(names_word("myOte", "ote", none));
-        assert!(!names_word("remote", "ote", none));
-        assert!(!names_word("Xote", "ote", none));
-        let owner = vec!["yairfalse".to_owned()];
-        assert!(!names_word("a personal yairfalse repo", "yair", &owner));
-        assert!(names_word("yair said", "yair", &owner));
+        assert!(names_word("orbitd and more", "orbit", none));
+        assert!(names_word("OrbitClient", "orbit", none));
+        assert!(names_word("myInk", "ink", none));
+        assert!(!names_word("rethink", "ink", none));
+        assert!(!names_word("Xink", "ink", none));
+        let owner = vec!["devuser".to_owned()];
+        assert!(!names_word("a personal devuser repo", "dev", &owner));
+        assert!(names_word("dev said", "dev", &owner));
     }
 }
