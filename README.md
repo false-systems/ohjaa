@@ -150,3 +150,5 @@ alone.
 - [Ontology](docs/ontology.md): what the concepts mean.
 - [Agent guide](AGENTS.md): for agents that work on ohjaa itself.
 - [Licence](LICENSE): MIT.
+
+<p align="center"><sub>Part of <a href="https://false-systems.com">False Systems</a> · computing as craft</sub></p>
