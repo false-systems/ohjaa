@@ -38,14 +38,11 @@ ohjaa: ~/.local/state/ohjaa/proposals/mine/ask-before-adding-a-dependency.md
 
 $ ohjaa check
 flag     containers-run-in-podman: may no longer hold: command:podman is false
-evidence no intake has run here: how often each was re-taught is unknown, not zero (`ohjaa intake`)
-evidence code-is-rust: re-taught 0 times since 2026-11-10
-evidence containers-run-in-podman: re-taught 0 times since 2026-11-10
 scope    ours     (no home here)
 scope    repo     (no home here)
 scope    mine     ~/.config/ohjaa/mine
 scope    machine  ~/.config/ohjaa/machine
-summary  2 current, 1 waiting for a decision, 0 error(s), 1 flag(s), 0 suggestion(s), briefing 599/8000
+summary  2 current, 1 waiting for a decision, 0 error(s), 1 flag(s), briefing 599/8000
 ```
 
 </details>
@@ -79,10 +76,8 @@ with `v<version>` being the release's tag:
 curl -fsSL https://raw.githubusercontent.com/false-systems/ohjaa/main/install.sh | sh -s -- v<version>
 ```
 
-Ohjaa also needs `git`. Some commands call other programs when they are
-there: `gh` to read pull requests and to deliver a repository's lessons,
-`vessa` to read what people wrote in agent sessions, `toimija` to say who is
-working where, and an agent CLI such as `claude -p` to draft proposals.
+Ohjaa also needs `git`. `ohjaa brief` asks `toimija`, when it is there, who
+is working where. Ohjaa makes no network call.
 
 ## Use
 
@@ -106,14 +101,12 @@ The commands, in the order a person meets them:
   propose knowledge. It waits until a person decides.
 - `ohjaa review`: go through the proposals, one at a time, and accept or
   dismiss each. Only a person at a terminal can.
-- `ohjaa list`: the knowledge that applies where you are, and how often each
-  entry had to be taught again.
+- `ohjaa list`: the knowledge that applies where you are.
 - `ohjaa check`: validate every entry, and flag what may no longer hold.
-- `ohjaa intake`: draft proposals from what people said in agent sessions,
-  on pull requests and by reverting commits.
-- `ohjaa digest`: for the person, what needs attention and what happened
-  since they last looked. `ohjaa line` is its short form for a terminal's
-  opening.
+- `ohjaa lessons`: write a repository's lessons into its `AGENTS.md`, in the
+  working copy you run it in, for you to commit and push like any change.
+- `ohjaa brief`: the briefing an agent gets in this repository.
+- `ohjaa doctor`: what differs from what `apply` would make it.
 
 `ohjaa <command> --help` describes each one, with its exit codes.
 [docs/reference.md](docs/reference.md) has the detail.
@@ -138,10 +131,11 @@ alone.
   read the knowledge from their own instruction files.
 - It runs no checks and blocks no commit or push.
 - It carries no messages between agents, and assigns no work to them.
+- It sends nothing anywhere: no pull request, no network call. What it
+  writes into a repository is in your working copy, for you to read and
+  commit.
 - It cannot stop a determined agent from accepting its own proposal. The
   terminal check stops a careless one; a program can fake a terminal.
-- It removes secret-looking tokens before text goes to the drafter, by
-  known shapes only. A short password gets through.
 
 ## More
 

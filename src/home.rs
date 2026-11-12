@@ -4,19 +4,12 @@
 //! ~/.config/ohjaa/
 //!   mine/ machine/   the person's and this machine's knowledge
 //!   ours             where the team's knowledge is checked out
-//!   drafter          the command intake drafts with, when set
-//!   roots            where ohjaa looks for repositories
 //!   applied.toml     what apply changed, for `apply --undo`
 //!   .git/            the home's history: a local repository, never pushed,
 //!                    one commit per decision on mine or machine and per
 //!                    apply ([`commit`])
 //! ```
-//!
-//! A repository is named by its remote: `git@github.com:o/r.git`,
-//! `https://github.com/o/r` and `ssh://git@github.com/o/r.git` are all
-//! `github.com/o/r` ([`RepoId`]).
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -28,77 +21,6 @@ use crate::process;
 /// `$XDG_CONFIG_HOME/ohjaa`, else `~/.config/ohjaa`.
 pub fn ohjaa_home() -> Result<PathBuf> {
     Ok(config_home()?.join("ohjaa"))
-}
-
-/// A repository as its remote names it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoId {
-    /// `None` for a remote that is a local path.
-    pub host: Option<String>,
-    pub owner: String,
-    pub name: String,
-}
-
-impl fmt::Display for RepoId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.host {
-            Some(host) => write!(f, "{host}/{}/{}", self.owner, self.name),
-            None => write!(f, "{}/{}", self.owner, self.name),
-        }
-    }
-}
-
-impl RepoId {
-    /// Normalise a remote URL in any of git's forms to host, owner and name.
-    ///
-    /// - `scheme://[user@]host[:port]/owner/repo[.git][/]`
-    /// - `[user@]host:owner/repo[.git]` (scp-like: no `/` before the first `:`)
-    /// - `file:///path/owner/repo` and plain paths, which have no host
-    ///
-    /// The owner and name are the last two path components. `None` when there
-    /// are not two, or one could not be a directory name.
-    pub fn parse(url: &str) -> Option<RepoId> {
-        let url = url.trim();
-        let (host, path) = if let Some((scheme, rest)) = url.split_once("://") {
-            if scheme.eq_ignore_ascii_case("file") {
-                (None, rest)
-            } else {
-                let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-                let host = authority.rsplit('@').next().unwrap_or(authority);
-                let host = match host.strip_prefix('[') {
-                    Some(v6) => v6.split(']').next().unwrap_or(v6),
-                    None => host.split(':').next().unwrap_or(host),
-                };
-                (Some(host), path)
-            }
-        } else {
-            match url.split_once(':') {
-                Some((before, after)) if !before.contains('/') && !before.is_empty() => {
-                    (Some(before.rsplit('@').next().unwrap_or(before)), after)
-                }
-                _ => (None, url),
-            }
-        };
-        let path = path.trim_end_matches('/');
-        let path = path.strip_suffix(".git").unwrap_or(path);
-        let mut parts = path.rsplit('/').filter(|part| !part.is_empty());
-        let name = parts.next()?;
-        let owner = parts.next()?;
-        let usable = |part: &str| part != "." && part != ".." && !part.contains('\\');
-        if !usable(owner) || !usable(name) || host.is_some_and(str::is_empty) {
-            return None;
-        }
-        Some(RepoId {
-            host: host.map(str::to_ascii_lowercase),
-            owner: owner.to_owned(),
-            name: name.to_owned(),
-        })
-    }
-
-    /// `owner/name`, which is what an entry is filed under.
-    pub fn slug(&self) -> String {
-        format!("{}/{}", self.owner, self.name)
-    }
 }
 
 /// Run git and return its trimmed stdout, `Ok(None)` when it exits 1 (git
@@ -192,18 +114,15 @@ pub fn lock(home: &Path) -> Option<process::FileLock> {
 const EXCLUDE_BEGIN: &str = "# >>> ohjaa: the home's history holds only what ohjaa keeps here";
 const EXCLUDE_END: &str = "# <<< ohjaa";
 /// Everything is left out, then what ohjaa keeps in the home is let in
-/// (the knowledge scopes, the roots, apply's record, and the `ours` and
-/// `drafter` settings), and what an
-/// editor, the Finder or a half-done write leaves among those is left out
-/// again.
+/// (the knowledge scopes, apply's record, and the `ours` setting), and
+/// what an editor, the Finder or a half-done write leaves among those is
+/// left out again.
 const EXCLUDE: &[&str] = &[
     "/*",
     "!/mine/",
     "!/machine/",
-    "!/roots",
     "!/applied.toml",
     "!/ours",
-    "!/drafter",
     "*.tmp",
     ".*.ohjaa-*",
     ".*.sw?",
@@ -561,53 +480,6 @@ pub fn quote_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_remote_form_names_the_same_repository() {
-        let github = Some("github.com".to_owned());
-        for url in [
-            "git@github.com:example-org/ohjaa.git",
-            "git@github.com:example-org/ohjaa",
-            "github.com:example-org/ohjaa.git",
-            "ssh://git@github.com/example-org/ohjaa.git",
-            "ssh://git@github.com:22/example-org/ohjaa",
-            "https://github.com/example-org/ohjaa.git",
-            "https://github.com/example-org/ohjaa/",
-            "https://x-access-token:secret@GitHub.com/example-org/ohjaa",
-            "git://github.com/example-org/ohjaa.git",
-        ] {
-            let id = RepoId::parse(url).unwrap_or_else(|| panic!("{url}"));
-            assert_eq!(id.host, github, "{url}");
-            assert_eq!(id.slug(), "example-org/ohjaa", "{url}");
-            assert_eq!(id.to_string(), "github.com/example-org/ohjaa", "{url}");
-        }
-    }
-
-    #[test]
-    fn a_local_remote_has_no_host() {
-        for url in [
-            "/tmp/remotes/acme/widget.git",
-            "file:///tmp/remotes/acme/widget.git",
-            "../remotes/acme/widget",
-        ] {
-            let id = RepoId::parse(url).unwrap_or_else(|| panic!("{url}"));
-            assert_eq!(id.host, None, "{url}");
-            assert_eq!(id.slug(), "acme/widget", "{url}");
-        }
-    }
-
-    #[test]
-    fn a_remote_without_owner_and_name_is_not_a_repository() {
-        for url in [
-            "",
-            "widget",
-            "git@github.com:widget.git",
-            "https://github.com/",
-            "/a/..",
-        ] {
-            assert_eq!(RepoId::parse(url), None, "{url:?}");
-        }
-    }
 
     /// A home whose `.git` is a file (a linked worktree of another
     /// repository): the lock goes in the folder it names, and so does the

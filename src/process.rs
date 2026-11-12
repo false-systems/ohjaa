@@ -1,6 +1,6 @@
 //! Running other programs without ever hanging on them.
 //!
-//! Every tool ohjaa asks something of (toimija, git, gh, the drafter) can hang.
+//! Every tool ohjaa asks something of (toimija, git) can hang.
 //! A hang must end as a reported failure, never as a silent wait, so every
 //! child runs under a deadline. The child leads its own process group, so a
 //! deadline kills everything it started, including helpers that inherited its

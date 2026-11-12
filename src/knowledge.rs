@@ -9,7 +9,7 @@
 //! | scope   | lives in                                         | changes by        |
 //! |---------|--------------------------------------------------|-------------------|
 //! | ours    | `<ours checkout>/knowledge/`                     | review (PR)       |
-//! | repo    | `<repo>/AGENTS.md`, `## Lessons` ([`crate::lessons`]) | a PR ohjaa opens |
+//! | repo    | `<repo>/AGENTS.md`, `## Lessons` ([`crate::lessons`]) | `ohjaa lessons`, then a commit |
 //! | mine    | `$XDG_CONFIG_HOME/ohjaa/mine/`                   | its owner         |
 //! | machine | `$XDG_CONFIG_HOME/ohjaa/machine/`                | its owner         |
 //!
@@ -17,8 +17,8 @@
 //! them, so an agent's draft never lands in a shared repository by itself. An
 //! accepted repo node is kept in `$XDG_STATE_HOME/ohjaa/lessons/<clone>/`
 //! ([`accepted_dir`]), with its why, while its line goes to the repository's
-//! AGENTS.md; one accepted before that sits in `<repo>/.ohjaa/knowledge/`
-//! until `ohjaa lessons publish` moves it.
+//! AGENTS.md (`ohjaa lessons`); one accepted before that sits in
+//! `<repo>/.ohjaa/knowledge/`, and is read from there.
 
 use std::fmt::Write as _;
 use std::io::IsTerminal;
@@ -132,8 +132,8 @@ impl Dirs {
     }
 }
 
-/// Where repo knowledge accepted before ohjaa wrote it into AGENTS.md sits:
-/// untracked in the checkout, until `ohjaa lessons publish` moves it.
+/// Where repo knowledge accepted before ohjaa kept it in its state sits:
+/// untracked in the checkout, until a decision on it moves it there.
 pub fn repo_knowledge(root: &Path) -> PathBuf {
     root.join(".ohjaa").join("knowledge")
 }
@@ -151,8 +151,7 @@ pub fn tidy_untracked(root: &Path) {
 
 /// The clone `repo` is a checkout of, as its common git directory read from
 /// git's layout (no git process), else `repo` itself: every worktree of a
-/// clone shares the repo knowledge accepted for it, and what intake saw of it
-/// ([`crate::evidence`]).
+/// clone shares the repo knowledge accepted for it.
 pub fn clone_key(repo: &Path) -> PathBuf {
     let common = repo
         .ancestors()
@@ -163,8 +162,8 @@ pub fn clone_key(repo: &Path) -> PathBuf {
 }
 
 /// Where ohjaa keeps the repo knowledge accepted for `repo`'s clone, each
-/// node with where its line went (`delivery.json`): in ohjaa's state
-/// (`state` is `$XDG_STATE_HOME/ohjaa`), never in the repository.
+/// node with its why: in ohjaa's state (`state` is
+/// `$XDG_STATE_HOME/ohjaa`), never in the repository.
 pub fn accepted_dir(state: &Path, repo: &Path) -> PathBuf {
     state.join("lessons").join(encode_repo(&clone_key(repo)))
 }
@@ -990,7 +989,7 @@ pub fn pending(dirs: &Dirs, loaded: &Loaded) -> Result<(Vec<Pending>, Vec<Broken
     Ok((found, broken))
 }
 
-/// What an agent (or intake) wants to become Knowledge.
+/// What an agent wants to become Knowledge.
 #[derive(Debug, Clone)]
 pub struct Proposal {
     pub scope: Scope,
@@ -1130,7 +1129,7 @@ pub struct Outcome {
     pub written: Vec<PathBuf>,
     pub removed: Vec<PathBuf>,
     /// Shared checkouts that now hold uncommitted Knowledge to review: the
-    /// ours checkout. Repo knowledge goes through a pull request ohjaa opens.
+    /// ours checkout. Repo knowledge reaches its AGENTS.md with `ohjaa lessons`.
     pub review_in: Vec<PathBuf>,
     /// The node decided on, as it now is (a rejected proposal as it was).
     pub decided: Option<Located>,
@@ -1189,8 +1188,8 @@ pub fn decision_message(action: &str, id: &str, outcome: &Outcome, why: Option<&
 }
 
 /// The checkout a decision leaves for the person to commit and review: the
-/// ours checkout. Repo knowledge reaches its repository through the pull
-/// request ohjaa opens ([`crate::lessons`]), and nothing is left in it.
+/// ours checkout. Repo knowledge reaches its repository's AGENTS.md with
+/// `ohjaa lessons` ([`crate::lessons`]), and a decision leaves nothing in it.
 fn shared_checkout(dirs: &Dirs, scope: Scope) -> Option<PathBuf> {
     match scope {
         Scope::Ours => dirs.ours_checkout.clone(),
@@ -1637,7 +1636,7 @@ mod tests {
         );
         assert!(
             outcome.review_in.is_empty(),
-            "ohjaa opens the pull request itself"
+            "nothing is left in a checkout to review"
         );
         // That repository's knowledge has it, current.
         let mut there = sandbox.dirs.clone();

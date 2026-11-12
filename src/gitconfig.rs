@@ -1,14 +1,10 @@
 //! What ohjaa reads of git's config and layout: the global excludes file
-//! (where `apply` keeps its ignore block), a clone's remotes with git's
-//! `insteadOf` applied (where `lessons publish` opens its pull request, and
-//! whose owners `collect` asks GitHub about), and a checkout's common
-//! directory and sibling worktrees from its files.
+//! (where `apply` keeps its ignore block), and a checkout's common directory
+//! and sibling worktrees from its files.
 //!
 //! Facts are read once and passed down: the global config in one `git config
-//! --global --includes -z --list --show-origin`, each clone's in one `git
-//! config -z --list`, and the common directory from the repository's layout.
-//! `insteadOf` is applied here, the way git applies it, instead of asking git
-//! once per remote.
+//! --global --includes -z --list --show-origin`, and the common directory
+//! from the repository's layout.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -72,45 +68,6 @@ impl Listing {
     pub fn last(&self, key: &str) -> Option<&Setting> {
         self.0.iter().rev().find(|setting| setting.key == key)
     }
-
-    /// `url.<base>.<kind>` rules (`insteadof` or `pushinsteadof`).
-    fn rules(&self, kind: &str) -> Vec<Rewrite> {
-        let suffix = format!(".{kind}");
-        self.0
-            .iter()
-            .filter_map(|setting| {
-                let base = setting.key.strip_prefix("url.")?.strip_suffix(&suffix)?;
-                Some(Rewrite {
-                    base: base.to_owned(),
-                    prefix: setting.value.clone(),
-                })
-            })
-            .collect()
-    }
-
-    pub fn rewrites(&self) -> Vec<Rewrite> {
-        self.rules("insteadof")
-    }
-}
-
-/// A remote `url.<base>.insteadOf = <prefix>` rule: a URL written as
-/// `<prefix>rest` means `<base>rest`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Rewrite {
-    pub base: String,
-    pub prefix: String,
-}
-
-/// `url` as git rewrites it: the longest matching prefix wins.
-pub fn rewrite(url: &str, rules: &[Rewrite]) -> String {
-    rules
-        .iter()
-        .filter(|rule| !rule.prefix.is_empty() && url.starts_with(&rule.prefix))
-        .max_by_key(|rule| rule.prefix.len())
-        .map_or_else(
-            || url.to_owned(),
-            |rule| format!("{}{}", rule.base, &url[rule.prefix.len()..]),
-        )
 }
 
 /// Run git, returning stdout as it is, or why it failed.
@@ -218,20 +175,6 @@ pub fn common_dir(repo: &Path) -> Result<PathBuf> {
     ))
 }
 
-/// A clone's config, all scopes and includes, in one process.
-pub fn clone_listing(repo: &Path) -> Result<Listing> {
-    let args = ["config", "-z", "--list"];
-    let mut command = Command::new("git");
-    command.args(args).current_dir(repo);
-    for var in REPO_ENV {
-        command.env_remove(var);
-    }
-    match listing_of(command, &args)? {
-        Ok(text) => Ok(Listing::parse(&text, false)),
-        Err(why) => bail!("git config --list in {} failed: {why}", repo.display()),
-    }
-}
-
 /// The work tree's root and the common git directory of the repository at
 /// or above `start`: the nearest directory holding `.git`, read from its
 /// layout, not above a `GIT_CEILING_DIRECTORIES` entry. Git is asked (one
@@ -272,12 +215,6 @@ pub fn repo_at(start: &Path) -> Result<(PathBuf, PathBuf)> {
         (Some(top), Some(common)) => Ok((PathBuf::from(top), PathBuf::from(common))),
         _ => bail!("git named no work tree for {}", start.display()),
     }
-}
-
-/// The URL `git fetch <remote>` uses: its `url` with `insteadOf`.
-pub fn fetch_url(listing: &Listing, remote: &str) -> Option<String> {
-    let url = &listing.last(&format!("remote.{remote}.url"))?.value;
-    Some(rewrite(url, &listing.rewrites()))
 }
 
 /// The common git directory of the checkout at `cwd`, as git's on-disk
@@ -385,31 +322,5 @@ mod tests {
         assert_eq!(global.0[1].origin.as_deref(), Some("file:/h/inc"));
         assert_eq!(global.last("core.excludesfile").unwrap().value, "~/x");
         assert_eq!(global.last("flag.bare").unwrap().value, "");
-        assert_eq!(
-            global.rewrites(),
-            [Rewrite {
-                base: "git@github.com:".into(),
-                prefix: "gh:".into()
-            }]
-        );
-    }
-
-    #[test]
-    fn fetch_urls_are_worked_out_the_way_git_does() {
-        let listing = Listing::parse(
-            "url.git@github.com:.insteadof\ngh:\0\
-             url.ssh://push.example/.pushinsteadof\nhttps://h/\0\
-             remote.origin.url\ngh:acme/w\0\
-             remote.up.url\nhttps://h/o/r\0\
-             remote.fork.url\nhttps://h/me/r\0\
-             remote.fork.pushurl\ngh:o/p\0",
-            false,
-        );
-        assert_eq!(
-            fetch_url(&listing, "origin").as_deref(),
-            Some("git@github.com:acme/w")
-        );
-        assert_eq!(fetch_url(&listing, "up").as_deref(), Some("https://h/o/r"));
-        assert_eq!(fetch_url(&listing, "none"), None);
     }
 }

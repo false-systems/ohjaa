@@ -1,13 +1,13 @@
-//! The workflow home from outside the repositories: `apply`, `doctor`,
-//! `brief`, `collect` and `shell-init`, run as the real binary against real
-//! git.
+//! The workflow home from outside the repositories: `apply`, `doctor` and
+//! `brief`, run as the real binary against real git.
 //!
 //! Every command runs with an emptied environment: HOME, XDG_CONFIG_HOME,
 //! XDG_STATE_HOME, CARGO_HOME and TMPDIR inside the sandbox,
 //! GIT_CONFIG_GLOBAL at a sandbox file, GIT_CONFIG_NOSYSTEM=1, no ZDOTDIR, and
 //! a PATH of stubs (toimija, claude, codex) plus the system directories.
-//! `apply` writes git's global excludes and ~/.zshrc, so nothing here may reach
-//! the person's real ones, nor run a real agent or tool.
+//! `apply` writes git's global excludes and agents' instruction files, and
+//! takes a line out of ~/.zshrc, so nothing here may reach the person's real
+//! ones, nor run a real agent or tool.
 
 #![cfg(unix)]
 
@@ -26,17 +26,22 @@ case "$1" in
     listed="$SANDBOX/toimija-sessions/$(basename "$PWD")"
     if [ -f "$listed" ]; then cat "$listed"
     else echo '{"sessions":[],"warnings":[],"coverage":{"status":"available"}}'; fi;;
-  context) echo '{}';;
+  enter) echo '{}';;
 esac
 "#;
 
 const CLAUDE_STUB: &str = "#!/bin/sh\necho \"direct $*\"\n";
 const CODEX_STUB: &str = "#!/bin/sh\necho \"direct-codex $*\"\n";
 
-const OLD_ZSHRC: &str = "export PATH=\"$HOME/.local/bin:$PATH\"\n\
-    # Route claude/codex through ohjaa (agent delivery workflow, step 1). Bypass: command claude, or OHJAA_WRAP=0.\n\
-    [[ -r ~/projects/ohjaa-launch.zsh ]] && source ~/projects/ohjaa-launch.zsh\n\
-    alias ll='ls -l'\n";
+/// A person's own `~/.zshrc`.
+const ZSHRC: &str = "export PATH=\"$HOME/.local/bin:$PATH\"\nalias ll='ls -l'\n";
+
+/// The comment an earlier apply wrote above its line in `~/.zshrc`.
+const EARLIER_COMMENT: &str =
+    "# What needs your attention, as a terminal opens (written by `ohjaa apply`).";
+/// What that apply's line replaced when it was written: an earlier launcher.
+const EARLIER_REPLACED: &str = "# Route claude/codex through ohjaa.\n\
+    [[ -r ~/projects/ohjaa-launch.zsh ]] && source ~/projects/ohjaa-launch.zsh";
 
 /// Write an executable that no process holds open for writing when it runs.
 /// Linux refuses to exec a file any process has open for writing (ETXTBSY),
@@ -177,7 +182,8 @@ impl Sandbox {
         self.dir.join("config").join("ohjaa")
     }
 
-    /// The launcher line apply writes: the sandbox's ohjaa, by its path.
+    /// The terminal's line an earlier apply wrote: the sandbox's ohjaa, by
+    /// its path, running `shell-init`, which this ohjaa no longer has.
     fn launch_line(&self) -> String {
         let ohjaa = self.dir.join("bin/ohjaa");
         format!(
@@ -186,8 +192,33 @@ impl Sandbox {
         )
     }
 
-    fn projects(&self) -> String {
-        self.dir.join("projects").to_string_lossy().into_owned()
+    /// `~/.zshrc` and the record as an earlier apply left them: `before`,
+    /// then its comment and its line. It wrote them where the `replaced`
+    /// lines were (an earlier launcher), which the record keeps; when there
+    /// were none, it appended them after a blank line of its own.
+    fn earlier_apply(&self, before: &str, replaced: &str) -> String {
+        let blank = replaced.is_empty();
+        let zshrc = format!(
+            "{before}{}{EARLIER_COMMENT}\n{}\n",
+            if blank { "\n" } else { "" },
+            self.launch_line()
+        );
+        fs::write(self.home().join(".zshrc"), &zshrc).unwrap();
+        fs::create_dir_all(self.config()).unwrap();
+        fs::write(
+            self.config().join("applied.toml"),
+            format!(
+                "schema = \"ohjaa-applied.v1\"\nzshrc = \"{}\"\nzshrc_blank = \"{blank}\"\n\
+                 zshrc_created = \"false\"\nzshrc_newline = \"true\"\nzshrc_replaced = \"{}\"\n",
+                self.home().join(".zshrc").display(),
+                replaced
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+            ),
+        )
+        .unwrap();
+        zshrc
     }
 
     fn command(&self, program: &str, cwd: &Path) -> Command {
@@ -334,7 +365,7 @@ impl Drop for Sandbox {
 #[test]
 fn apply_dry_run_says_every_change_and_makes_none() {
     let sandbox = Sandbox::new("dry");
-    fs::write(sandbox.home().join(".zshrc"), OLD_ZSHRC).unwrap();
+    fs::write(sandbox.home().join(".zshrc"), ZSHRC).unwrap();
     let output = sandbox.ohjaa(&["apply", "--dry-run"]);
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
@@ -343,13 +374,11 @@ fn apply_dry_run_says_every_change_and_makes_none() {
             "would add .sykli/ .ohjaa/ to {}",
             sandbox.dir.join("config/git/ignore").display()
         ),
-        format!("would change {}", sandbox.home().join(".zshrc").display()),
-        "  - [[ -r ~/projects/ohjaa-launch.zsh ]] && source ~/projects/ohjaa-launch.zsh".to_owned(),
-        format!("  + {}", sandbox.launch_line()),
         "dry run; nothing was changed".to_owned(),
     ] {
         assert!(stdout.contains(&said), "missing {said:?} in:\n{stdout}");
     }
+    assert!(!stdout.contains(".zshrc"), "{stdout}");
     assert!(!sandbox.config().exists(), "nothing written in the home");
     assert!(
         !sandbox.dir.join("gitconfig").exists(),
@@ -358,7 +387,170 @@ fn apply_dry_run_says_every_change_and_makes_none() {
     assert!(!sandbox.dir.join("config/git/ignore").exists());
     assert_eq!(
         fs::read_to_string(sandbox.home().join(".zshrc")).unwrap(),
-        OLD_ZSHRC
+        ZSHRC
+    );
+}
+
+/// Apply writes nothing into `~/.zshrc`: a person's own stays as it is, and
+/// none is made. An ohjaa that is not the one on PATH applies too: nothing it
+/// writes runs it.
+#[test]
+fn apply_writes_nothing_into_zshrc() {
+    let sandbox = Sandbox::new("no-zshrc");
+    sandbox.apply();
+    assert!(!sandbox.home().join(".zshrc").exists());
+    fs::write(sandbox.home().join(".zshrc"), ZSHRC).unwrap();
+    let other = sandbox.dir.join("other");
+    fs::create_dir_all(&other).unwrap();
+    copy_executable(Path::new(env!("CARGO_BIN_EXE_ohjaa")), &other.join("ohjaa"));
+    let output = sandbox
+        .command(&other.join("ohjaa").to_string_lossy(), &sandbox.dir)
+        .args(["apply"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("nothing to change"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(sandbox.home().join(".zshrc")).unwrap(),
+        ZSHRC
+    );
+    let output = sandbox.ohjaa(&["doctor"]);
+    let (stdout, _) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "ok     {} runs nothing of ohjaa's",
+            sandbox.home().join(".zshrc").display()
+        )),
+        "{stdout}"
+    );
+}
+
+/// The terminal's line an earlier apply wrote runs `ohjaa shell-init`, which
+/// this ohjaa no longer has: every new terminal would say so. Doctor reports
+/// it, and apply takes it out with its comment and the blank line it put
+/// before it, the person's lines kept byte for byte. What that line replaced
+/// when it was written (an earlier launcher) is not put back, and the record
+/// forgets the line, so a later undo leaves `~/.zshrc` alone.
+#[test]
+fn apply_takes_out_the_terminal_line_an_earlier_apply_wrote() {
+    let sandbox = Sandbox::new("leftover");
+    let zshrc = sandbox.home().join(".zshrc");
+    let earlier = sandbox.earlier_apply(ZSHRC, EARLIER_REPLACED);
+
+    let output = sandbox.ohjaa(&["doctor"]);
+    let (stdout, _) = text(&output);
+    assert_eq!(output.status.code(), Some(4), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "DRIFT  {} line 4 runs `ohjaa shell-init`, which this ohjaa does not have; every \
+             new terminal says so (ohjaa apply takes it out)",
+            zshrc.display()
+        )),
+        "{stdout}"
+    );
+
+    let output = sandbox.ohjaa(&["apply", "--dry-run"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    for said in [
+        format!(
+            "would take the terminal's line out of {}, an earlier apply's:",
+            zshrc.display()
+        ),
+        format!("  - {EARLIER_COMMENT}"),
+        format!("  - {}", sandbox.launch_line()),
+    ] {
+        assert!(stdout.contains(&said), "missing {said:?} in:\n{stdout}");
+    }
+    assert_eq!(fs::read_to_string(&zshrc).unwrap(), earlier);
+
+    let output = sandbox.ohjaa(&["apply"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "took the terminal's line out of {}",
+            zshrc.display()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(fs::read_to_string(&zshrc).unwrap(), ZSHRC);
+    let record = sandbox.read("config/ohjaa/applied.toml");
+    assert!(!record.contains("zshrc"), "{record}");
+    assert!(record.contains("ignore_file"), "{record}");
+
+    let output = sandbox.ohjaa(&["doctor"]);
+    let (stdout, _) = text(&output);
+    assert!(!stdout.contains("DRIFT"), "{stdout}");
+    let output = sandbox.ohjaa(&["apply"]);
+    assert!(text(&output).0.contains("nothing to change"), "{output:?}");
+
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(!stdout.contains(".zshrc"), "{stdout}");
+    assert_eq!(fs::read_to_string(&zshrc).unwrap(), ZSHRC);
+
+    // A line apply appended, after a blank line of its own: both go.
+    let appended = Sandbox::new("leftover-appended");
+    appended.earlier_apply(ZSHRC, "");
+    appended.apply();
+    assert_eq!(
+        fs::read_to_string(appended.home().join(".zshrc")).unwrap(),
+        ZSHRC
+    );
+}
+
+/// Undo still takes back what an earlier apply wrote into `~/.zshrc`, and
+/// puts back exactly what that line replaced.
+#[test]
+fn undo_takes_back_the_terminal_line_an_earlier_apply_wrote() {
+    let sandbox = Sandbox::new("undo-leftover");
+    sandbox.earlier_apply(ZSHRC, EARLIER_REPLACED);
+    let output = sandbox.ohjaa(&["apply", "--undo"]);
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(
+        fs::read_to_string(sandbox.home().join(".zshrc")).unwrap(),
+        format!("{ZSHRC}{EARLIER_REPLACED}\n")
+    );
+    assert!(!sandbox.config().join("applied.toml").exists());
+}
+
+/// The line an earlier apply wrote may have replaced a line of another
+/// ohjaa's (one installed elsewhere then), which the record keeps. Undo puts
+/// that line back once, in its place, and ends: what it puts back is not
+/// taken out again.
+#[test]
+fn undo_puts_back_an_earlier_launcher_line_once_and_ends() {
+    let sandbox = Sandbox::new("undo-older-line");
+    let older = "[[ -x '/old/ohjaa' ]] && eval \"$('/old/ohjaa' shell-init zsh)\"";
+    let replaced = format!("{EARLIER_COMMENT}\n{older}");
+    sandbox.earlier_apply(ZSHRC, &replaced);
+    let mut undo = sandbox
+        .command("ohjaa", &sandbox.dir)
+        .args(["apply", "--undo"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let began = std::time::Instant::now();
+    while undo.try_wait().unwrap().is_none() {
+        if began.elapsed() > std::time::Duration::from_secs(10) {
+            undo.kill().unwrap();
+            undo.wait().unwrap();
+            panic!("apply --undo did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = undo.wait_with_output().unwrap();
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(
+        fs::read_to_string(sandbox.home().join(".zshrc")).unwrap(),
+        format!("{ZSHRC}{replaced}\n")
     );
 }
 
@@ -367,9 +559,7 @@ fn undo_puts_back_exactly_what_apply_changed() {
     let sandbox = Sandbox::new("undo");
     let gitconfig = "[user]\n\tname = Someone\n[alias]\n\tst = status\n";
     fs::write(sandbox.dir.join("gitconfig"), gitconfig).unwrap();
-    // No final newline in either: undo keeps it so.
-    let zshrc = OLD_ZSHRC.trim_end();
-    fs::write(sandbox.home().join(".zshrc"), zshrc).unwrap();
+    // No final newline: undo keeps it so.
     fs::create_dir_all(sandbox.dir.join("config/git")).unwrap();
     fs::write(sandbox.dir.join("config/git/ignore"), "*.swp").unwrap();
     sandbox.apply();
@@ -384,8 +574,6 @@ fn undo_puts_back_exactly_what_apply_changed() {
     let (stdout, _) = text(&output);
     for said in [
         "would remove the \"ohjaa apply\" block from ".to_owned(),
-        "would change ".to_owned(),
-        "  + [[ -r ~/projects/ohjaa-launch.zsh ]] && source ~/projects/ohjaa-launch.zsh".to_owned(),
         format!("would remove {}", record.display()),
         "dry run; nothing was changed".to_owned(),
     ] {
@@ -397,10 +585,6 @@ fn undo_puts_back_exactly_what_apply_changed() {
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
     assert_eq!(sandbox.read("gitconfig"), gitconfig);
-    assert_eq!(
-        fs::read_to_string(sandbox.home().join(".zshrc")).unwrap(),
-        zshrc
-    );
     assert_eq!(sandbox.read("config/git/ignore"), "*.swp");
     assert_eq!(
         names_in(&sandbox.config()),
@@ -415,7 +599,6 @@ fn undo_puts_back_exactly_what_apply_changed() {
 fn undo_removes_the_files_apply_created() {
     let sandbox = Sandbox::new("undo-created");
     sandbox.apply();
-    assert!(sandbox.home().join(".zshrc").exists());
     assert!(sandbox.dir.join("config/git/ignore").exists());
     assert!(
         !sandbox.dir.join("gitconfig").exists(),
@@ -423,7 +606,6 @@ fn undo_removes_the_files_apply_created() {
     );
     let output = sandbox.ohjaa(&["apply", "--undo"]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
-    assert!(!sandbox.home().join(".zshrc").exists());
     assert!(!sandbox.dir.join("config/git/ignore").exists());
     assert_eq!(
         names_in(&sandbox.config()),
@@ -469,33 +651,6 @@ fn undo_keeps_what_it_does_not_take_back_and_says_so() {
     );
 }
 
-/// `apply --root` writes down where the repositories are, which collect and
-/// lessons read wherever they run from; without it and without the file,
-/// apply says how. Undo keeps the roots.
-#[test]
-fn apply_root_writes_the_roots_down() {
-    let sandbox = Sandbox::new("roots");
-    let output = sandbox.ohjaa(&["apply", "--dry-run"]);
-    let (_, stderr) = text(&output);
-    assert!(stderr.contains("ohjaa apply --root <dir>"), "{stderr}");
-    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
-    let (stdout, stderr) = text(&output);
-    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
-    let roots = sandbox.read("config/ohjaa/roots");
-    assert!(
-        roots.lines().any(|line| line == sandbox.projects()),
-        "{roots}"
-    );
-    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
-    assert!(
-        text(&output).0.contains("nothing to change"),
-        "{}",
-        text(&output).0
-    );
-    let output = sandbox.ohjaa(&["apply", "--undo"]);
-    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
-    assert_eq!(sandbox.read("config/ohjaa/roots"), roots);
-}
 /// Each change is recorded before it is made: an apply that fails midway
 /// can still be undone.
 #[test]
@@ -503,12 +658,14 @@ fn an_apply_that_fails_midway_can_be_undone() {
     let sandbox = Sandbox::new("midway");
     fs::create_dir_all(sandbox.dir.join("config/git")).unwrap();
     fs::write(sandbox.dir.join("config/git/ignore"), "*.swp\n").unwrap();
-    // ~/.zshrc's folder cannot be written: apply fails there, after the
-    // ignore block is in git's global excludes.
-    let home = sandbox.home();
-    fs::set_permissions(&home, fs::Permissions::from_mode(0o555)).unwrap();
+    // Claude Code's folder cannot be written: apply fails at its instruction
+    // file, after the ignore block is in git's global excludes.
+    knowledge_node(&sandbox.config().join("mine"), "rust", "decision", "Rust.");
+    sandbox.agent_file(".claude/CLAUDE.md");
+    let claude = sandbox.home().join(".claude");
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o555)).unwrap();
     let output = sandbox.ohjaa(&["apply"]);
-    fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
     assert_ne!(output.status.code(), Some(0), "{}", text(&output).0);
     assert!(sandbox.read("config/git/ignore").contains(".sykli/"));
     assert!(sandbox
@@ -742,8 +899,6 @@ fn the_homes_history_never_takes_a_stray_file() {
     let sandbox = Sandbox::new("strays");
     let config = sandbox.config();
     knowledge_node(&config.join("mine"), "lima", "fact", "Lima is here.");
-    fs::write(config.join("drafter"), "claude -p\n").unwrap();
-    fs::write(config.join("roots"), format!("{}\n", sandbox.projects())).unwrap();
     let strays = [
         ".DS_Store",
         "mine/.DS_Store",
@@ -767,7 +922,7 @@ fn the_homes_history_never_takes_a_stray_file() {
     sandbox.agent_file(".codex/AGENTS.md");
     sandbox.apply();
     let tracked = sandbox.git(&config, &["ls-files"]);
-    for owned in ["mine/lima.md", "drafter", "roots", "applied.toml"] {
+    for owned in ["mine/lima.md", "applied.toml"] {
         assert!(
             tracked.lines().any(|line| line == owned),
             "{owned}: {tracked}"
@@ -1186,9 +1341,6 @@ fn one_broken_agent_file_is_skipped_and_the_rest_is_applied() {
     assert!(fs::read_to_string(&claude)
         .unwrap()
         .contains("- decision: Rust.\n"));
-    assert!(fs::read_to_string(sandbox.home().join(".zshrc"))
-        .unwrap()
-        .contains(&sandbox.launch_line()));
     let history = sandbox.history();
     assert!(
         history[0].starts_with("apply: ")
@@ -1318,41 +1470,6 @@ fn settings_in_an_included_global_file_count() {
     sandbox.git(&repo, &["check-ignore", "-q", ".sykli/receipt.json"]);
 }
 
-#[test]
-fn shell_init_prints_the_line_and_wraps_no_agent() {
-    let sandbox = Sandbox::new("shell");
-    let output = sandbox.ohjaa(&["shell-init", "bash"]);
-    assert_eq!(output.status.code(), Some(2));
-    let output = sandbox.ohjaa(&["shell-init", "zsh"]);
-    assert_eq!(output.status.code(), Some(0));
-    let printed = text(&output).0;
-    assert!(!printed.contains("ohjaa run"), "{printed}");
-
-    if !Path::new("/bin/zsh").exists() && !Path::new("/usr/bin/zsh").exists() {
-        eprintln!("skipping the shell run: zsh is not installed here");
-        return;
-    }
-    let (repo, _) = sandbox.repo("acme", "widget", &[]);
-    // Typed at a terminal, an agent runs as typed: its rules reach it
-    // through its own instruction file, and nothing routes it through ohjaa.
-    let script = r#"
-eval "$(ohjaa shell-init zsh)"
-claude "fix the parser"
-codex "write it"
-"#;
-    let output = sandbox
-        .command("zsh", &repo)
-        .args(["-f", "-c", script])
-        .env("OHJAA_LINE", "0")
-        .output()
-        .unwrap();
-    let (stdout, stderr) = text(&output);
-    assert_eq!(
-        stdout, "direct fix the parser\ndirect-codex write it\n",
-        "{stderr}"
-    );
-}
-
 /// "We don't want to run git git git": each command's own git processes, as
 /// git's trace2 counts them, within its budget. Every case first proves it
 /// measured something real (a positive control): what the command does
@@ -1374,7 +1491,6 @@ fn every_command_stays_within_its_git_budget() {
         eprintln!("{what:<44} {starts} git processes (budget {at_most})");
         report.push((what.to_owned(), starts, at_most));
     };
-    let root = sandbox.projects();
     let ohjaa_here = |args: &[&str]| {
         let mut command = sandbox.command("ohjaa", &sandbox.dir);
         command.args(args);
@@ -1387,7 +1503,7 @@ fn every_command_stays_within_its_git_budget() {
     let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&["apply"]));
     assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
     assert!(
-        text(&output).0.contains("ohjaa apply: changed"),
+        text(&output).0.contains("ohjaa apply: added"),
         "{}",
         text(&output).0
     );
@@ -1414,77 +1530,21 @@ fn every_command_stays_within_its_git_budget() {
     assert!(started(&starts, "--global"), "{starts:#?}");
     budget("ohjaa doctor", starts.len(), 1);
 
-    // brief in a clone: the repository's root, asked once for the knowledge
-    // and once for the roots (2), and no clone read beyond it.
+    // brief in a clone: the repository's root, asked once, and no clone read
+    // beyond it.
     let (starts, output) = sandbox.git_starts(sandbox.command("ohjaa", &widget).arg("brief"));
     let (stdout, stderr) = text(&output);
     assert!(
         stdout.contains("No knowledge recorded yet"),
         "{stdout}{stderr}"
     );
-    budget("ohjaa brief", starts.len(), 2);
-
-    // collect: one `git config` per clone of the fleet under the roots (the
-    // one with `.toimija/repo.yaml`), to find the owners whose pull requests
-    // GitHub is asked about; the other clone is not read.
-    let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&["collect", "--root", &root]));
-    assert!(
-        sandbox
-            .dir
-            .join("state/ohjaa/human/collected.json")
-            .is_file(),
-        "{}",
-        text(&output).1
-    );
-    let listings = starts
-        .iter()
-        .filter(|line| line.contains("\"config\",\"-z\",\"--list\""))
-        .count();
-    assert_eq!(
-        listings, 1,
-        "the fleet clone's config, read once: {starts:#?}"
-    );
-    budget("ohjaa collect (2 clones, 1 of the fleet)", starts.len(), 1);
+    budget("ohjaa brief", starts.len(), 1);
 
     let over: Vec<_> = report
         .iter()
         .filter(|(_, starts, at_most)| starts > at_most)
         .collect();
     assert!(over.is_empty(), "over budget: {over:?}");
-}
-
-/// The ohjaa the terminal's line runs is the one on PATH, unless --bin
-/// names another.
-#[test]
-fn apply_runs_the_ohjaa_on_path_unless_bin_names_another() {
-    let sandbox = Sandbox::new("bin");
-    let other = sandbox.dir.join("other");
-    fs::create_dir_all(&other).unwrap();
-    copy_executable(Path::new(env!("CARGO_BIN_EXE_ohjaa")), &other.join("ohjaa"));
-    let elsewhere = other.join("ohjaa").to_string_lossy().into_owned();
-    let output = sandbox
-        .command(&elsewhere, &sandbox.dir)
-        .args(["apply"])
-        .output()
-        .unwrap();
-    let (_, stderr) = text(&output);
-    assert_eq!(output.status.code(), Some(3), "{stderr}");
-    assert!(stderr.contains("is not the one on PATH"), "{stderr}");
-    assert!(!sandbox.config().exists(), "nothing half applied");
-    assert!(
-        !sandbox.home().join(".zshrc").exists(),
-        "nothing half applied"
-    );
-
-    let output = sandbox
-        .command(&elsewhere, &sandbox.dir)
-        .args(["apply", "--bin", &elsewhere])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
-    assert!(fs::read_to_string(sandbox.home().join(".zshrc"))
-        .unwrap()
-        .contains(&format!("[[ -x '{elsewhere}' ]]")));
 }
 
 /// The ignore block holds `.sykli/` and `.ohjaa/`, and nothing else. A block

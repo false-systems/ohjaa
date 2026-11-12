@@ -10,12 +10,12 @@ These mirror `.toimija/repo.yaml`; keep both in sync.
 
 - One `ohjaa` binary, and beside it the crate of the knowledge-node format, `crates/knowledge-node`. Dependencies: anyhow, clap, serde, serde_json and libc; the format's crate, toml; tests also serde_yaml. Every addition needs a reason.
 - Ohjaa holds Knowledge; toimija reports facts. Never reimplement what toimija derives: shell out to its CLI and read its --json.
-- Ohjaa stores Knowledge, in git. Everything else is derived when asked; the human view's snapshot is the one cache. No knowledge index and no daemon.
-- The workflow lives in the home (~/.config/ohjaa), outside every repository. No file, hook or config of a repository's checkout is written.
+- Ohjaa stores Knowledge, in git. Everything else is derived when asked: no cache, no knowledge index and no daemon.
+- The workflow lives in the home (~/.config/ohjaa), outside every repository. Only `ohjaa lessons`, run by a person, writes into a checkout: the `## Lessons` section of its AGENTS.md, to be committed like any change. No hook or config of a repository is written.
 - Ohjaa checks nothing and refuses nothing for the workflow: the checks a commit must pass, and refusing a push without them, are sykli's, through the repository's own hooks.
-- Agents propose; only a person makes Knowledge current, retires it or rejects it. What ohjaa writes into a repository names no tool, and a public one is sent nothing that names a private one.
+- Agents propose; only a person makes Knowledge current, retires it or rejects it. Ohjaa's own words in a repository (its marks, the Lessons section's intro) name no tool; each line is a node's text as a person accepted it. All of it goes into a working copy, never sent: a person reads it before it is committed.
 - Cross-repo yes, messaging no: no request/response between agents, no presence, no dispatch.
-- Network only through gh, the drafter, and git to GitHub to deliver repo knowledge. Every other command works from the filesystem and local CLIs.
+- No network and no gh: every command works from the filesystem and local CLIs (git, toimija).
 - Failed coverage is never rendered as an empty result. If a scan could not look, it says so and exits non-zero.
 
 ## Working here
@@ -35,5 +35,5 @@ These mirror `.toimija/repo.yaml`; keep both in sync.
 
 ## Lessons
 
-<!-- This repository's accepted knowledge: one line per node, each marked with its id, written here through a pull request when a person accepts one. A line changed here by hand is replaced the next time it is written: change a lesson where it is decided. -->
+<!-- This repository's accepted knowledge: one line per node, each marked with its id. A line changed here by hand is replaced the next time it is written: change a lesson where it is decided. -->
 

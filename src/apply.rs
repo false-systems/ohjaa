@@ -1,17 +1,21 @@
 //! `ohjaa apply` and `ohjaa apply --undo`.
 //!
 //! `apply` changes these things outside the home, and only those: a marked
-//! block in git's global excludes file, the terminal's line in `~/.zshrc`,
-//! and the knowledge block in each agent's own global instruction file that
-//! exists ([`crate::instructions`]). Each is recorded in `applied.toml`
-//! before it is made (what the zshrc line replaced, whether a file, a blank
-//! line or a final newline was there), so `--undo` puts back exactly what
-//! was there, even after an apply that failed midway. What it changed is
-//! then one commit in the home's history ([`home::commit`]); a failed commit
-//! is said, and the change stands.
+//! block in git's global excludes file, and the knowledge block in each
+//! agent's own global instruction file that exists
+//! ([`crate::instructions`]). Each is recorded in `applied.toml` before it
+//! is made (whether a file, a blank line or a final newline was there), so
+//! `--undo` puts back exactly what was there, even after an apply that
+//! failed midway. What it changed is then one commit in the home's history
+//! ([`home::commit`]); a failed commit is said, and the change stands.
 //!
-//! Every change is planned before any is made: a refusal leaves nothing half
-//! applied, and `--dry-run` prints the same plan.
+//! An earlier apply also wrote a line into `~/.zshrc` that ran `ohjaa
+//! shell-init zsh`, which ohjaa no longer has. Apply takes that line out
+//! ([`zshrc_step`]), and `--undo` still takes it back as that apply
+//! recorded it.
+//!
+//! Every change is planned before any is made, and `--dry-run` prints the
+//! same plan.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,28 +26,20 @@ use crate::flat_toml;
 use crate::gitconfig;
 use crate::home;
 
-/// The change was refused.
-const REFUSED: i32 = 3;
-
-/// The launcher line: the ohjaa that ran `apply`, by its path, guarded like
-/// the line it replaces, so a shell where that ohjaa is gone starts quietly.
-pub fn launch_line(ohjaa: &Path) -> String {
+/// The terminal's line an earlier apply wrote for the ohjaa at `ohjaa`.
+fn launch_line(ohjaa: &Path) -> String {
     let quoted = home::quote_path(ohjaa);
     format!("[[ -x {quoted} ]] && eval \"$({quoted} shell-init zsh)\"")
 }
 
-/// The ohjaa a launcher line `apply` wrote runs; `None` for any other line.
+/// The ohjaa a terminal's line an earlier apply wrote runs; `None` for any
+/// other line.
 pub fn launch_target(line: &str) -> Option<PathBuf> {
     let line = line.trim();
     let (path, _) = line.strip_prefix("[[ -x '")?.split_once("' ]] && eval ")?;
     let path = PathBuf::from(path.replace("'\\''", "'"));
     (launch_line(&path) == line).then_some(path)
 }
-
-pub const LAUNCH_COMMENT: &str =
-    "# What needs your attention, as a terminal opens (written by `ohjaa apply`).";
-/// A line that sources a launcher script of this name is replaced by apply's own.
-const OLD_LAUNCHER: &str = "ohjaa-launch.zsh";
 
 pub const IGNORE_BEGIN: &str =
     "# >>> ohjaa apply: workflow files no repository tracks (edits inside are replaced)";
@@ -173,12 +169,10 @@ fn ignore_without_block(current: &str, blank_added: bool) -> Result<Option<Strin
 
 /// A change to `~/.zshrc`: the new text and what it removes and adds.
 #[derive(Debug, PartialEq)]
-pub struct ZshrcPlan {
-    pub contents: String,
-    pub removed: Vec<String>,
-    pub added: Vec<String>,
-    /// A blank line went in before an appended launcher.
-    pub blank: bool,
+struct ZshrcPlan {
+    contents: String,
+    removed: Vec<String>,
+    added: Vec<String>,
 }
 
 /// A comment that names ohjaa: above apply's line, it is apply's own.
@@ -187,86 +181,10 @@ fn ohjaa_comment(line: &str) -> bool {
     line.starts_with('#') && line.to_lowercase().contains("ohjaa")
 }
 
-/// A line that sources the old launcher file: `source …ohjaa-launch.zsh` or
-/// `. …ohjaa-launch.zsh`, alone or after `&&`. Any other line that names the
-/// file (an alias that edits it, a comment) is the person's, and stays.
-pub fn sources_old_launcher(line: &str) -> bool {
-    let line = line.trim();
-    !line.starts_with('#')
-        && line.split("&&").map(str::trim).any(|part| {
-            (part.starts_with("source ") || part.starts_with(". ")) && part.contains(OLD_LAUNCHER)
-        })
-}
-
-/// `current` with the line `desired` (from [`launch_line`]): it replaces a
-/// `source …/ohjaa-launch.zsh` line, or a launcher line an earlier apply
-/// wrote for another path (and the ohjaa comment line just above either),
-/// or is appended when there was none. `None` when nothing needs to change.
-pub fn zshrc_with_launcher(current: &str, desired: &str) -> Option<ZshrcPlan> {
-    let lines: Vec<&str> = current.lines().collect();
-    let launch = lines.iter().position(|line| line.trim() == desired);
-    let has_launch = launch.is_some();
-    let mut drop = vec![false; lines.len()];
-    for (at, line) in lines.iter().enumerate() {
-        let stale_launch = launch_target(line).is_some() && line.trim() != desired;
-        if sources_old_launcher(line) || stale_launch {
-            drop[at] = true;
-            if at > 0 && ohjaa_comment(lines[at - 1]) {
-                drop[at - 1] = true;
-            }
-        }
-    }
-    // Apply's own comment above its line, in other words than these: said
-    // anew in place, as apply's, never kept as a line it replaced.
-    let reworded = launch
-        .filter(|&at| at > 0 && ohjaa_comment(lines[at - 1]) && lines[at - 1] != LAUNCH_COMMENT)
-        .map(|at| at - 1);
-    if has_launch && !drop.contains(&true) && reworded.is_none() {
-        return None;
-    }
-    let insert: Vec<String> = if has_launch {
-        Vec::new()
-    } else {
-        vec![LAUNCH_COMMENT.to_owned(), desired.to_owned()]
-    };
-    let mut added = insert.clone();
-    let mut out: Vec<String> = Vec::new();
-    let mut removed = Vec::new();
-    let mut placed = has_launch;
-    for (at, line) in lines.iter().enumerate() {
-        if drop[at] {
-            removed.push((*line).to_owned());
-            if !placed {
-                out.extend(insert.iter().cloned());
-                placed = true;
-            }
-        } else if reworded == Some(at) {
-            removed.push((*line).to_owned());
-            added.push(LAUNCH_COMMENT.to_owned());
-            out.push(LAUNCH_COMMENT.to_owned());
-        } else {
-            out.push((*line).to_owned());
-        }
-    }
-    let mut blank = false;
-    if !placed {
-        if out.last().is_some_and(|line| !line.trim().is_empty()) {
-            out.push(String::new());
-            blank = true;
-        }
-        out.extend(insert.iter().cloned());
-    }
-    Some(ZshrcPlan {
-        contents: joined(out),
-        removed,
-        added,
-        blank,
-    })
-}
-
-/// `current` with the launcher line (and apply's comment above it) taken
-/// out and `replaced`, the lines it once replaced, put back in its place.
-/// `None` when the launcher line is not there.
+/// `current` with the terminal's line an earlier apply wrote (and apply's
+/// comment above it) taken out, and `replaced`, the lines it once replaced,
+/// put back in its place; else, with `blank`, the blank line apply put
+/// before it taken out too. `None` when no such line is there.
 fn zshrc_without_launcher(current: &str, replaced: &[String], blank: bool) -> Option<ZshrcPlan> {
     let lines: Vec<&str> = current.lines().collect();
     let at = lines
@@ -287,8 +205,98 @@ fn zshrc_without_launcher(current: &str, replaced: &[String], blank: bool) -> Op
         contents: joined(out),
         removed,
         added: replaced.to_vec(),
-        blank,
     })
+}
+
+/// Whether `key` of the record is about `~/.zshrc`.
+fn zshrc_key(key: &str) -> bool {
+    key == "zshrc" || key.starts_with("zshrc_")
+}
+
+/// The step that takes the terminal's line an earlier apply wrote out of
+/// `~/.zshrc` (the one the record names, else zsh's own), with its comment.
+/// That line runs `ohjaa shell-init`, which this ohjaa no longer has, so
+/// every new terminal would say so. For `--undo` (`put_back`), the lines it
+/// replaced when it was written go back in its place, as the record keeps
+/// them. For apply they stay out, since they were an earlier ohjaa launcher,
+/// and the record forgets the line once it is out: there is nothing left in
+/// `~/.zshrc` to undo. `None` when no such line is there.
+fn zshrc_step(home: &Path, record: &Record, put_back: bool) -> Result<Option<Step>> {
+    let yes = |key: &str| record.get(key).is_some_and(|value| value == "true");
+    let zshrc = record
+        .get("zshrc")
+        .map(PathBuf::from)
+        .map_or_else(home::zshrc, Ok)?;
+    let replaced: Vec<String> = record
+        .get("zshrc_replaced")
+        .filter(|_| put_back)
+        .filter(|text| !text.is_empty())
+        .map(|text| text.lines().map(str::to_owned).collect())
+        .unwrap_or_default();
+    let mut text = read_or_empty(&zshrc)?;
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    // Apply takes out every such line, and the blank line it put before its
+    // own, once. Undo takes back the one it recorded, once: what it puts back
+    // in its place may itself be an earlier ohjaa's line, and stays.
+    let mut blank = yes("zshrc_blank");
+    while let Some(plan) = zshrc_without_launcher(&text, &replaced, blank) {
+        text = plan.contents;
+        removed.extend(plan.removed);
+        added.extend(plan.added);
+        blank = false;
+        if put_back {
+            break;
+        }
+    }
+    if removed.is_empty() {
+        return Ok(None);
+    }
+    if put_back && record.is_empty() {
+        eprintln!(
+            "ohjaa apply --undo: no record of what the terminal's line replaced ({} is \
+             missing); nothing is put back in its place",
+            record_path(home).display()
+        );
+    }
+    let newline = record
+        .get("zshrc_newline")
+        .is_none_or(|value| value == "true");
+    let contents = as_it_was(text, newline);
+    let remove_empty = yes("zshrc_created");
+    let mut lines = String::new();
+    for line in &removed {
+        lines.push_str(&format!("\n  - {line}"));
+    }
+    for line in &added {
+        lines.push_str(&format!("\n  + {line}"));
+    }
+    let target = zshrc.clone();
+    Ok(Some(if put_back {
+        step(
+            ("change", "changed"),
+            format!("{}:{lines}", zshrc.display()),
+            Vec::new(),
+            move || write_or_remove(&target, &contents, remove_empty),
+        )
+    } else {
+        let home = home.to_path_buf();
+        step(
+            ("take", "took"),
+            format!(
+                "the terminal's line out of {}, an earlier apply's: it runs `ohjaa shell-init`, \
+                 which this ohjaa does not have:{lines}",
+                zshrc.display()
+            ),
+            Vec::new(),
+            move || {
+                write_or_remove(&target, &contents, remove_empty)?;
+                let mut record = read_record(&home)?;
+                record.retain(|key, _| !zshrc_key(key));
+                write_record(&home, &record)
+            },
+        )
+    }))
 }
 
 pub fn read_or_empty(path: &Path) -> Result<String> {
@@ -344,59 +352,6 @@ fn step(
     }
 }
 
-fn zshrc_lines(plan: &ZshrcPlan) -> String {
-    let mut text = String::new();
-    for line in &plan.removed {
-        text.push_str(&format!("\n  - {line}"));
-    }
-    for line in &plan.added {
-        text.push_str(&format!("\n  + {line}"));
-    }
-    text
-}
-
-pub struct Options<'a> {
-    pub dry_run: bool,
-    /// `--root`: where the repositories are, to write down in the roots file.
-    pub roots: &'a [PathBuf],
-    /// The ohjaa the terminal's line runs, instead of the one on PATH.
-    pub bin: Option<&'a Path>,
-}
-
-/// The ohjaa the terminal's line runs: `--bin`, else the `ohjaa` on PATH as
-/// found (a link kept a link). A different binary running apply (a `cargo
-/// run`, a `target/` build) would point the line at itself, so that is
-/// refused unless `--bin` names it.
-fn chosen_ohjaa(bin: Option<&Path>) -> std::result::Result<PathBuf, String> {
-    if let Some(bin) = bin {
-        let bin = std::path::absolute(bin).unwrap_or_else(|_| bin.to_path_buf());
-        return if gitconfig::executable(&bin) {
-            Ok(bin)
-        } else {
-            Err(format!("--bin {} is not an executable file", bin.display()))
-        };
-    }
-    let Some(found) = home::on_path("ohjaa") else {
-        return Err(
-            "ohjaa is not on PATH, so the terminal's line would have no ohjaa to run; \
-             install it, or name the binary with --bin <path>"
-                .to_owned(),
-        );
-    };
-    let running = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .map_err(|error| format!("cannot tell which ohjaa is running: {error}"))?;
-    if std::fs::canonicalize(&found).ok().as_deref() != Some(running.as_path()) {
-        return Err(format!(
-            "this ohjaa ({}) is not the one on PATH ({}); the terminal's line would run \
-             it. Run the ohjaa on PATH, or name the binary with --bin <path>",
-            running.display(),
-            found.display()
-        ));
-    }
-    Ok(found)
-}
-
 /// The record entries a step makes, kept before the step runs, so an apply
 /// that fails midway can still be undone. The first value of an undo key is
 /// the one undo needs.
@@ -411,73 +366,19 @@ fn keep_record(home: &Path, entries: &[(String, String)]) -> Result<()> {
     write_record(home, &record)
 }
 
-/// The roots file: one directory per line, under a comment.
-fn roots_text(roots: &[PathBuf]) -> String {
-    let mut text = String::from(
-        "# Where ohjaa looks for repositories: one directory per line. Written by\n\
-         # `ohjaa apply --root`; edit it to change them.\n",
-    );
-    for root in roots {
-        text.push_str(&format!("{}\n", root.display()));
-    }
-    text
-}
-
 /// Whether text that is not empty ends without a newline (undo keeps it so).
 fn lacks_final_newline(text: &str) -> bool {
     !text.is_empty() && !text.ends_with('\n')
 }
 
-pub fn apply(options: Options<'_>) -> Result<i32> {
+pub fn apply(dry_run: bool) -> Result<i32> {
     let home = std::path::absolute(home::ohjaa_home()?)?;
-    let ohjaa = match chosen_ohjaa(options.bin) {
-        Ok(ohjaa) => ohjaa,
-        Err(why) => {
-            eprintln!("ohjaa apply: refusing: {why}");
-            return Ok(REFUSED);
-        }
-    };
-    // Past the refusal: what apply plans, makes and commits is one change to
-    // the home, never interleaved with a decision's. A dry run writes
-    // nothing, the lock's file included.
-    let lock = (!options.dry_run).then(|| home::lock(&home)).flatten();
+    // What apply plans, makes and commits is one change to the home, never
+    // interleaved with a decision's. A dry run writes nothing, the lock's
+    // file included.
+    let lock = (!dry_run).then(|| home::lock(&home)).flatten();
     let global = gitconfig::GlobalFacts::read()?;
     let mut steps: Vec<Step> = Vec::new();
-
-    // Where the repositories are, written down when named: collect and
-    // lessons read it, wherever they run from. Kept by --undo.
-    let roots_file = crate::roots::config_path().context("no config home")?;
-    if !options.roots.is_empty() {
-        let roots: Vec<PathBuf> = options
-            .roots
-            .iter()
-            .map(|root| std::path::absolute(root).unwrap_or_else(|_| root.clone()))
-            .collect();
-        if crate::roots::parse_config(&read_or_empty(&roots_file)?) != roots {
-            let said = roots
-                .iter()
-                .map(|root| root.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let (target, text) = (roots_file.clone(), roots_text(&roots));
-            steps.push(step(
-                ("write", "wrote"),
-                format!(
-                    "{} with {said}, where ohjaa looks for repositories",
-                    roots_file.display()
-                ),
-                Vec::new(),
-                move || home::write_file(&target, &text, None),
-            ));
-        }
-    } else if !roots_file.is_file() {
-        eprintln!(
-            "ohjaa apply: note: {} does not exist, so `ohjaa collect` and `ohjaa lessons` \
-             look for repositories from where they run; name the folder that holds them \
-             once: ohjaa apply --root <dir>",
-            roots_file.display()
-        );
-    }
 
     let ignore = global.excludes_file()?;
     let ignore_now = read_or_empty(&ignore)?;
@@ -509,31 +410,12 @@ pub fn apply(options: Options<'_>) -> Result<i32> {
         ));
     }
 
-    let zshrc = home::zshrc()?;
-    let zshrc_now = read_or_empty(&zshrc)?;
-    if let Some(plan) = zshrc_with_launcher(&zshrc_now, &launch_line(&ohjaa)) {
-        let record = vec![
-            ("zshrc".to_owned(), zshrc.to_string_lossy().into_owned()),
-            ("zshrc_created".to_owned(), flag(!zshrc.exists())),
-            ("zshrc_replaced".to_owned(), plan.removed.join("\n")),
-            ("zshrc_blank".to_owned(), flag(plan.blank)),
-            (
-                "zshrc_newline".to_owned(),
-                flag(!lacks_final_newline(&zshrc_now)),
-            ),
-        ];
-        let (target, contents) = (zshrc.clone(), plan.contents.clone());
-        steps.push(step(
-            ("change", "changed"),
-            format!("{}:{}", zshrc.display(), zshrc_lines(&plan)),
-            record,
-            move || home::write_file(&target, &contents, None),
-        ));
-    }
+    let record = read_record(&home)?;
+    steps.extend(zshrc_step(&home, &record, false)?);
 
     // Each agent's file apply could not write: the rest is applied, but
     // apply is not done while one stays unwritten, and every run says so.
-    let (instruction, not_written) = instruction_steps(&read_record(&home)?)?;
+    let (instruction, not_written) = instruction_steps(&record)?;
     steps.extend(instruction);
     let except = (!not_written.is_empty()).then(|| {
         format!(
@@ -559,7 +441,7 @@ pub fn apply(options: Options<'_>) -> Result<i32> {
         }
         return Ok(code);
     }
-    if options.dry_run {
+    if dry_run {
         for step in &steps {
             println!("ohjaa apply: {}", step.will);
         }
@@ -813,33 +695,7 @@ pub fn undo(dry_run: bool) -> Result<i32> {
         ));
     }
 
-    let zshrc = recorded("zshrc")
-        .map(PathBuf::from)
-        .map_or_else(home::zshrc, Ok)?;
-    let replaced: Vec<String> = recorded("zshrc_replaced")
-        .filter(|text| !text.is_empty())
-        .map(|text| text.lines().map(str::to_owned).collect())
-        .unwrap_or_default();
-    if let Some(plan) =
-        zshrc_without_launcher(&read_or_empty(&zshrc)?, &replaced, yes("zshrc_blank"))
-    {
-        if record.is_empty() {
-            eprintln!(
-                "ohjaa apply --undo: no record of what the launcher line replaced \
-                 ({} is missing); nothing is put back in its place",
-                record_path(&home).display()
-            );
-        }
-        let contents = as_it_was(plan.contents.clone(), newline("zshrc_newline"));
-        let remove_empty = yes("zshrc_created");
-        let target = zshrc.clone();
-        steps.push(step(
-            ("change", "changed"),
-            format!("{}:{}", zshrc.display(), zshrc_lines(&plan)),
-            Vec::new(),
-            move || write_or_remove(&target, &contents, remove_empty),
-        ));
-    }
+    steps.extend(zshrc_step(&home, &record, true)?);
 
     // The knowledge block apply wrote, from each agent's own file: each one
     // it wrote into (recorded, wherever the agent's folder was then), and the
@@ -980,27 +836,23 @@ pub fn undo(dry_run: bool) -> Result<i32> {
 /// terminal's line and the agents' knowledge blocks, each as apply wrote
 /// them.
 fn taken_back(key: &str) -> bool {
-    key.starts_with("ignore_")
-        || key == "zshrc"
-        || key.starts_with("zshrc_")
-        || key.starts_with("instructions_")
+    key.starts_with("ignore_") || zshrc_key(key) || key.starts_with("instructions_")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const OLD: &str = "export PATH=\"$HOME/.local/bin:$PATH\"\n\
-        # Route claude/codex through ohjaa (agent delivery workflow, step 1). Bypass: command claude, or OHJAA_WRAP=0.\n\
-        [[ -r ~/projects/ohjaa-launch.zsh ]] && source ~/projects/ohjaa-launch.zsh\n\
-        alias el='vi ~/projects/ohjaa-launch.zsh'\n";
+    /// A comment an earlier apply wrote above its line.
+    const COMMENT: &str =
+        "# What needs your attention, as a terminal opens (written by `ohjaa apply`).";
 
     fn line() -> String {
         launch_line(Path::new("/home/dev/.cargo/bin/ohjaa"))
     }
 
     #[test]
-    fn the_launcher_line_is_guarded_and_names_its_ohjaa() {
+    fn the_terminal_line_an_earlier_apply_wrote_is_known_by_its_ohjaa() {
         assert_eq!(
             line(),
             "[[ -x '/home/dev/.cargo/bin/ohjaa' ]] && eval \"$('/home/dev/.cargo/bin/ohjaa' shell-init zsh)\""
@@ -1009,71 +861,40 @@ mod tests {
             launch_target(&line()).as_deref(),
             Some(Path::new("/home/dev/.cargo/bin/ohjaa"))
         );
+        // A line the person wrote is theirs.
         assert_eq!(launch_target("eval \"$(ohjaa shell-init zsh)\""), None);
     }
 
+    /// Taken out, an ohjaa comment above it goes too, and what it replaced
+    /// comes back in its place when undo asks; a blank line apply put before
+    /// it goes only when it replaced nothing.
     #[test]
-    fn only_the_line_that_sources_the_old_launcher_is_replaced_and_undo_puts_it_back() {
-        let plan = zshrc_with_launcher(OLD, &line()).unwrap();
+    fn the_terminal_line_goes_with_its_comment() {
+        let replaced = [
+            "# Route claude/codex through ohjaa.".to_owned(),
+            "[[ -r ~/p/ohjaa-launch.zsh ]] && source ~/p/ohjaa-launch.zsh".to_owned(),
+        ];
+        let earlier = format!("alias ll='ls -l'\n{COMMENT}\n{}\nalias x=y\n", line());
+        let plan = zshrc_without_launcher(&earlier, &replaced, false).unwrap();
         assert_eq!(
             plan.contents,
-            format!(
-                "export PATH=\"$HOME/.local/bin:$PATH\"\n{LAUNCH_COMMENT}\n{}\nalias el='vi ~/projects/ohjaa-launch.zsh'\n",
-                line()
-            ),
-            "the alias that names the file stays"
+            format!("alias ll='ls -l'\n{}\nalias x=y\n", replaced.join("\n"))
         );
-        assert_eq!(plan.removed.len(), 2);
-        assert!(!plan.blank);
+        assert_eq!(plan.removed, [COMMENT.to_owned(), line()]);
+        assert_eq!(plan.added, replaced);
         assert_eq!(
-            zshrc_with_launcher(&plan.contents, &line()),
-            None,
-            "applied twice"
+            zshrc_without_launcher(&earlier, &[], false)
+                .unwrap()
+                .contents,
+            "alias ll='ls -l'\nalias x=y\n"
         );
-        let undone = zshrc_without_launcher(&plan.contents, &plan.removed, plan.blank).unwrap();
-        assert_eq!(undone.contents, OLD, "undo is exact");
-        for sources in [
-            "source ~/projects/ohjaa-launch.zsh",
-            ". \"$HOME/projects/ohjaa-launch.zsh\"",
-            "[[ -r ~/projects/ohjaa-launch.zsh ]] && . ~/projects/ohjaa-launch.zsh",
-        ] {
-            assert!(sources_old_launcher(sources), "{sources}");
-        }
-        for stays in [
-            "# source ~/projects/ohjaa-launch.zsh",
-            "alias e='vi ~/projects/ohjaa-launch.zsh'",
-        ] {
-            assert!(!sources_old_launcher(stays), "{stays}");
-        }
-    }
-
-    #[test]
-    fn a_launcher_line_for_another_ohjaa_is_rewritten() {
-        let earlier = format!("{LAUNCH_COMMENT}\n{}\n", line());
-        let moved = launch_line(Path::new("/opt/ohjaa"));
-        let plan = zshrc_with_launcher(&earlier, &moved).unwrap();
-        assert_eq!(plan.contents, format!("{LAUNCH_COMMENT}\n{moved}\n"));
-        assert_eq!(plan.removed, [LAUNCH_COMMENT.to_owned(), line()]);
-        assert_eq!(zshrc_with_launcher(&plan.contents, &moved), None);
-    }
-
-    /// Apply's comment above its line, in the words an earlier apply wrote:
-    /// apply says it anew in place, and undo takes it out with the line.
-    #[test]
-    fn an_ohjaa_comment_above_the_line_is_applys_own() {
-        let earlier = format!(
-            "alias ll='ls -l'\n# Route claude/codex through ohjaa (written by `ohjaa apply`).\n{}\n",
-            line()
-        );
-        let plan = zshrc_with_launcher(&earlier, &line()).unwrap();
+        let appended = format!("alias ll='ls -l'\n\n{COMMENT}\n{}\n", line());
         assert_eq!(
-            plan.contents,
-            format!("alias ll='ls -l'\n{LAUNCH_COMMENT}\n{}\n", line())
+            zshrc_without_launcher(&appended, &[], true)
+                .unwrap()
+                .contents,
+            "alias ll='ls -l'\n"
         );
-        assert_eq!(plan.added, [LAUNCH_COMMENT.to_owned()]);
-        assert_eq!(zshrc_with_launcher(&plan.contents, &line()), None);
-        let undone = zshrc_without_launcher(&earlier, &[], false).unwrap();
-        assert_eq!(undone.contents, "alias ll='ls -l'\n");
         // A comment of the person's own, above it, that names no ohjaa stays.
         let theirs = format!("# my shell\n{}\n", line());
         assert_eq!(
@@ -1081,26 +902,6 @@ mod tests {
                 .unwrap()
                 .contents,
             "# my shell\n"
-        );
-    }
-
-    #[test]
-    fn without_an_old_line_the_launcher_is_appended_and_undo_takes_it_out() {
-        let plan = zshrc_with_launcher("alias ll='ls -l'", &line()).unwrap();
-        assert_eq!(
-            plan.contents,
-            format!("alias ll='ls -l'\n\n{LAUNCH_COMMENT}\n{}\n", line())
-        );
-        assert!(plan.removed.is_empty() && plan.blank);
-        let undone = zshrc_without_launcher(&plan.contents, &[], true).unwrap();
-        assert_eq!(undone.contents, "alias ll='ls -l'\n");
-        let empty = zshrc_with_launcher("", &line()).unwrap();
-        assert_eq!(empty.contents, format!("{LAUNCH_COMMENT}\n{}\n", line()));
-        assert_eq!(
-            zshrc_without_launcher(&empty.contents, &[], false)
-                .unwrap()
-                .contents,
-            ""
         );
         assert_eq!(zshrc_without_launcher("alias x=y\n", &[], false), None);
     }

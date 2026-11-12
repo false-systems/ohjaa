@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// How much of a scan actually happened. Mirrors toimija's own vocabulary.
 ///
@@ -16,8 +16,7 @@ use serde::{Deserialize, Serialize};
 /// first means we could not look, the second means we looked and found nobody.
 /// Rendering the first as the second is the failure this whole stack exists to
 /// prevent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Coverage {
     Available,
     Degraded,
@@ -47,7 +46,7 @@ impl Coverage {
 }
 
 /// One session, as toimija reports it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
     pub agent: String,
@@ -79,13 +78,12 @@ impl Session {
 }
 
 /// One repo's scan result, or the scan of sessions outside every repo.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct Scan {
     /// The repo scanned; empty for the scan outside every repo.
     pub repo: PathBuf,
     /// This scan is of the sessions toimija opened outside any Git
     /// repository, not of one repo.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub outside: bool,
     pub sessions: Vec<Session>,
     pub warnings: Vec<String>,
@@ -301,23 +299,6 @@ fn scan(command: &mut Command, repo: &Path) -> Scan {
         Ok(scan) => scan,
         Err(error) => Scan::failed(repo, format!("unreadable sessions output: {error}")),
     }
-}
-
-/// Scan every repo concurrently, and the sessions outside every repo. Order is
-/// preserved so output stays stable; the outside scan comes last.
-pub fn scan_fleet(repos: &[PathBuf]) -> Vec<Scan> {
-    std::thread::scope(|scope| {
-        let outside = scope.spawn(scan_outside);
-        let mut scans: Vec<Scan> = repos
-            .iter()
-            .map(|repo| scope.spawn(move || scan_repo(repo)))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| handle.join().expect("scan thread panicked"))
-            .collect();
-        scans.push(outside.join().expect("scan thread panicked"));
-        scans
-    })
 }
 
 /// Render an age without ever claiming freshness it does not have.

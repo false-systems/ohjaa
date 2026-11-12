@@ -7,23 +7,18 @@
 //! Agents may propose Knowledge; only a person makes it current.
 
 mod apply;
-mod collect;
 mod doctor;
-mod evidence;
+mod duplicates;
 mod flat_toml;
 mod gitconfig;
 mod home;
-mod human;
 mod instructions;
-mod intake;
 mod knowledge;
 mod lessons;
+mod perimeter;
 mod process;
 mod repo_docs;
-mod roots;
 mod scan;
-mod shell_init;
-mod system;
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -51,11 +46,6 @@ const INCOMPLETE: i32 = 4;
                   agent's own instruction file. Agents propose; only a person makes knowledge current."
 )]
 struct Cli {
-    /// Where to look for repositories. Repeatable; defaults to the config file,
-    /// else this repo's siblings.
-    #[arg(long, global = true, value_name = "PATH")]
-    root: Vec<PathBuf>,
-
     #[command(subcommand)]
     command: Cmd,
 }
@@ -82,13 +72,7 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         write: Vec<PathBuf>,
     },
-    /// The system perimeter: what every tool in the fleet is, derived now.
-    System {
-        #[arg(long)]
-        json: bool,
-    },
-    /// List the knowledge that applies here, each current node with how often
-    /// a person had to teach it again since it was accepted.
+    /// List the knowledge that applies here.
     List {
         /// Include superseded and retired knowledge.
         #[arg(long)]
@@ -131,8 +115,7 @@ enum Cmd {
         list: bool,
     },
     /// Make a proposal current. A person only. A repo proposal's line then
-    /// goes into its repository's AGENTS.md, through a pull request ohjaa
-    /// opens (`ohjaa lessons publish` delivers it later when it cannot now).
+    /// goes into its repository's AGENTS.md with `ohjaa lessons`.
     Accept { id: String },
     /// Drop a proposal. A person only.
     Reject { id: String },
@@ -144,13 +127,28 @@ enum Cmd {
     },
     /// Re-confirm that knowledge still holds, as of today. A person only.
     Confirm { id: String },
-    /// Repository knowledge, in each repository's own AGENTS.md.
+    /// Write the repository's lessons into the AGENTS.md of the working copy
+    /// it runs in (or one named), for you to commit and push: current repo
+    /// knowledge in, retired and superseded out. Nothing is committed or sent.
+    #[command(after_help = "Exit codes:\n  \
+        0  written, or nothing to change\n  \
+        1  it could not run: not in a repository, or AGENTS.md cannot be read whole\n     \
+           (one that is not UTF-8 is never written over), or is a link that leads\n     \
+           outside the working copy\n  \
+        4  written, but a repo node could not be read: AGENTS.md keeps what it holds\n     \
+           of it, and each is named\n\n\
+        It writes one file, <working copy>/AGENTS.md, its `## Lessons` section alone:\n\
+        one line per node, each marked with its id. A line of its id written by hand\n\
+        is replaced; every other line stays as it is.")]
     Lessons {
-        #[command(subcommand)]
-        action: LessonsCmd,
+        /// A folder of the working copy. Default: the current folder.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Say what would change, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
-    /// Validate every node, flag what may no longer hold, and suggest what
-    /// to reword or re-confirm (suggestions only: they never fail `--strict`).
+    /// Validate every node, and flag what may no longer hold.
     Check {
         /// Briefing size, in characters, past which it is too long to be read.
         #[arg(long, default_value_t = knowledge::DEFAULT_BUDGET)]
@@ -159,134 +157,37 @@ enum Cmd {
         #[arg(long)]
         strict: bool,
     },
-    /// Draft proposals from what people said: what they wrote in agent
-    /// sessions (through `vessa messages`), pull request comments and reverts.
-    Intake {
-        /// Start here (YYYY-MM-DD or RFC 3339). Default: where the last intake
-        /// stopped, else fourteen days ago.
-        #[arg(long)]
-        since: Option<String>,
-        /// Send every message people wrote, not only those the local
-        /// pre-filter takes for a correction or a repeated instruction.
-        #[arg(long)]
-        no_prefilter: bool,
-        /// transcripts, reviews or reverts (repeatable). Default: all three.
-        #[arg(long = "source", value_name = "SOURCE")]
-        sources: Vec<String>,
-        /// The command that drafts: it reads the prompt on stdin and prints a
-        /// JSON object: its drafts, and what each candidate re-teaches. Default:
-        /// ~/.config/ohjaa/drafter, else `claude -p`.
-        #[arg(long)]
-        drafter: Option<String>,
-        /// Candidates per drafter call.
-        #[arg(long, default_value_t = 40)]
-        batch: usize,
-        /// At most this many batches a run (a batch the drafter refuses is
-        /// sent again in halves); the rest wait for the next run.
-        #[arg(long, default_value_t = 10)]
-        max_batches: usize,
-        /// Show what would be sent, and send nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Send again the candidates set aside after the drafter failed on
-        /// each, alone, three times.
-        #[arg(long)]
-        retry_failed: bool,
-    },
-    /// For a terminal's opening: only matters needing attention or your decision.
-    /// Silent when there are none. Activity stays unread for `ohjaa digest`.
-    #[command(
-        after_help = "Prints, reads and moves nothing unless stdout is a terminal and no agent \
-        session's marker is set (TOIMIJA_SESSION, TOIMIJA_RUN, CLAUDECODE, \
-        CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, CODEX_SESSION_ID, \
-        CODEX_CI, CODEX_SANDBOX, CODEX_SANDBOX_NETWORK_DISABLED, CODEX_MANAGED_BY_NPM, \
-        PI_SESSION_ID, PI_CODING_AGENT, OPENCODE, OPENCODE_SESSION_ID, AI_AGENT): an agent's \
-        shell reads ~/.zshrc too. Terminals opened together say a line once.\n\n\
-        Starts no git and touches no network: it reads the proposals, and \
-        the rest from the snapshot `ohjaa collect` writes, said with its age when it is older \
-        than 15 minutes. Then it starts one `ohjaa collect` in the background, unless one \
-        runs; startup never waits for it. Notices are shown once per day or when they change. \
-        Opening a terminal does not consume pull-request history. Always exits 0."
-    )]
-    Line,
-    /// Attention details and unread activity: pull requests, proposed instructions
-    /// and who is live. Reading it at a terminal marks activity seen.
-    #[command(
-        after_help = "When the snapshot is more than 5 minutes old it starts a collect \
-        and waits for it at most 10 s; past that it shows the snapshot it has, and the collect \
-        goes on in the background. Who is live is asked of each repository's toimija now.\n\n\
-        Exit codes:\n  \
-        0  everything could be read\n  \
-        4  something could not be read (it says what), or nothing was collected yet"
-    )]
-    Digest {
-        /// Show everything since then instead (`7d`, `24h`, a date or an RFC
-        /// 3339 time); the cursor does not move.
-        #[arg(long)]
-        since: Option<String>,
-        /// Use the snapshot as it is, however old.
-        #[arg(long)]
-        no_collect: bool,
-    },
-    /// Gather what `ohjaa line` cannot work out at a terminal's opening into
-    /// its snapshot: GitHub's pull requests and the secret-shaped tokens vessa
-    /// found in agent sessions.
-    #[command(after_help = "Each part asked once, at the same time:\n  \
-        github    gh api graphql: the pull requests updated in the owners of the fleet's\n            \
-        clones under the roots (those with .toimija/repo.yaml; one git config each),\n            \
-        at most 2 calls\n  \
-        secrets   vessa secrets --json --since …: where and how many, never a value\n\
-        A part that fails keeps what it held before, said as of then.\n\
-        Writes $XDG_STATE_HOME/ohjaa/human/collected.json,\n\
-        holding human/collect.lock while it runs.\n\n\
-        Exit codes:\n  \
-        0  every part answered, and read all it asked for\n  \
-        4  a part did not, or could not read all of it (the snapshot says what)\n  \
-        1  the snapshot could not be written")]
-    Collect {
-        /// Started by `line` or `digest`: says nothing.
-        #[arg(long, hide = true)]
-        background: bool,
-    },
-    /// A knowledge node and its neighbours: what it builds on, what builds on
-    /// it and what it replaced.
-    Graph { id: String },
-    /// Write the knowledge into each agent's own instruction file, the line a
-    /// terminal runs as it opens into ~/.zshrc, and the ignore block into
-    /// git's global excludes. Idempotent; --undo takes it all back.
+    /// Write the knowledge into each agent's own instruction file, and the
+    /// ignore block into git's global excludes. Idempotent; --undo takes it
+    /// all back.
     #[command(after_help = "Exit codes:\n  \
         0  applied, undone, or nothing to change\n  \
         1  a change could not be made\n  \
-        3  refused: an ohjaa that is not the one on PATH (see --bin)\n  \
         4  applied, except an agent's own instruction file apply cannot write (a\n     \
            block it cannot tell from the rest): each is named, with why, on every\n     \
            apply and dry run until it is fixed by hand; `ohjaa doctor` names it too;\n     \
            or --undo did not take back all applied.toml holds, and kept the rest\n\n\
         Writes in the home (~/.config/ohjaa):\n  \
-        roots         from --root: where the repositories are (collect and lessons read it)\n  \
         applied.toml  what apply changes outside the home, kept before each change\n  \
         .git/         the home's history: what apply changed, one commit (made on\n                \
         the home's first commit; never pushed)\n\
         Changes outside it, and nothing else:\n  \
         git's global excludes  a block marked \"ohjaa apply\" holding .sykli/ .ohjaa/\n  \
-        ~/.zshrc               [[ -x <ohjaa> ]] && eval \"$(<ohjaa> shell-init zsh)\"\n  \
         each agent's own       a block marked \"ohjaa:knowledge\" holding the team's, mine and machine\n  \
         instruction file       knowledge, in each that exists outside every repository:\n                         \
         ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.pi/agent/AGENTS.md,\n                         \
         ~/.config/opencode/AGENTS.md (none is created); each decision\n                         \
-        rewrites it where it is\n\
-        <ohjaa> is the ohjaa on PATH (or --bin), by absolute path. --undo puts the\n\
-        changes back as they were, and removes applied.toml; the roots and the\n\
-        history stay.\n\n\
+        rewrites it where it is\n  \
+        ~/.zshrc               only taken out of it: the line an earlier apply wrote, which ran\n                         \
+        `ohjaa shell-init`, a command this ohjaa does not have\n\
+        --undo puts the changes back as they were, and removes applied.toml; the\n\
+        history stays.\n\n\
         Checks before a push are sykli's: `sykli hook install --pre-push` in each\n\
         repository.")]
     Apply {
         /// Print every change, and make none.
         #[arg(long)]
         dry_run: bool,
-        /// The ohjaa the terminal's line runs, instead of the one on PATH.
-        #[arg(long, value_name = "PATH", conflicts_with = "undo")]
-        bin: Option<PathBuf>,
         /// Take back what apply changed outside the home.
         #[arg(long)]
         undo: bool,
@@ -296,52 +197,6 @@ enum Cmd {
         0  healthy\n  \
         4  drift: a line marked DRIFT says what, and what fixes it")]
     Doctor,
-    /// Print what a terminal runs as it opens: `ohjaa line`. Load it with:
-    /// eval "$(ohjaa shell-init zsh)"
-    ShellInit {
-        /// zsh is the only one.
-        shell: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum LessonsCmd {
-    /// Deliver repo knowledge accepted but not in its repository's AGENTS.md
-    /// yet: each `<repo>/.ohjaa/knowledge/` file, and each accepted node not
-    /// delivered. One pull request per repository adds their lines to the
-    /// `## Lessons` section of its AGENTS.md; once it is open, each file moves
-    /// out of the checkout into ohjaa's state, recorded with its URL.
-    #[command(after_help = "Exit codes:\n  \
-        0  every line is delivered: in a pull request, or in AGENTS.md already\n  \
-        4  some are not: no GitHub remote, no gh, gh or git could not, or a line held back\n  \
-        1  it could not run\n\n\
-        Per repository, from a checkout of it, never in it:\n  \
-        gh repo view <owner/repo> --json visibility,defaultBranchRef\n  \
-        gh api user, gh api user/repos?… --paginate\n                              \
-        for a repository that is not private, once a run: your login\n                              \
-        and name, and every repository you can see that is not public\n  \
-        gh pr list -R <owner/repo> --author @me\n                              \
-        your open pull request of the lessons gets the next commit\n  \
-        git fetch https://github.com/<owner/repo>.git <branch>, then a worktree off it in\n  \
-        $XDG_STATE_HOME/ohjaa/lessons/.work/, git commit, git push to the same URL\n  \
-        HEAD:refs/heads/agents-md-lessons/<date>-<n>, gh pr create, and the worktree removed;\n  \
-        git reaches GitHub by HTTPS with gh's credentials (no SSH key's prompt holds it up)\n\
-        What goes to a repository names no tool. For one that is not private, all of it is\n\
-        checked first: a line that names ohjaa, one of your repositories that is not public,\n\
-        your home path, your account or your name is held back and said, its text sent\n\
-        nowhere and its file left; anything else that would stops the delivery. AGENTS.md is\n\
-        read whole or not at all. A dry run reads AGENTS.md as last fetched here, and fetches,\n\
-        writes and sends nothing.")]
-    Publish {
-        /// The repositories (any directory inside each). Default: every
-        /// repository under the roots with a `.ohjaa/knowledge/`, and every
-        /// one with accepted lessons not delivered.
-        repos: Vec<PathBuf>,
-        /// Say, per repository, its visibility, each line it would add and
-        /// what a line names that is private; fetch, write and send nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
 }
 
 fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
@@ -380,20 +235,6 @@ fn git_root() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The repository around the current directory, asked of git only when the
-/// roots must be derived from it: none given, and no roots file.
-fn git_root_for_roots(explicit: &[PathBuf]) -> Option<PathBuf> {
-    let configured = roots::config_path().is_some_and(|path| path.is_file());
-    (explicit.is_empty() && !configured)
-        .then(git_root)
-        .flatten()
-}
-
-fn repos(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let roots = roots::load(explicit, git_root().as_deref());
-    roots::toimija_repos(&roots)
-}
-
 /// What to say about an incomplete scan: the failure if there was one, else
 /// the first warning, else the bare verdict.
 fn coverage_detail(scan: &Scan) -> &str {
@@ -401,21 +242,6 @@ fn coverage_detail(scan: &Scan) -> &str {
         .as_deref()
         .or_else(|| scan.warnings.first().map(String::as_str))
         .unwrap_or("degraded coverage")
-}
-
-fn cmd_system(explicit: &[PathBuf], json: bool) -> Result<i32> {
-    let repos = repos(explicit)?;
-    if repos.is_empty() {
-        eprintln!("ohjaa: no toimija-prepared repos under the roots");
-        return Ok(0);
-    }
-    let view = system::system_view(&repos);
-    if json {
-        println!("{}", serde_json::to_string_pretty(&view)?);
-    } else {
-        print!("{}", system::render_system(&view));
-    }
-    Ok(view.exit_code())
 }
 
 // ---- knowledge --------------------------------------------------------------
@@ -453,9 +279,9 @@ fn lessons_line(count: usize, agents_md: &Path, agent: &str, how: &str) -> Strin
 /// not; either way that is said, in one line. Broken files are reported on
 /// stderr, out loud, and so is a briefing the budget cut; a flag is shown
 /// beside its node. With `in_agents_md`, the repository's own lessons that
-/// its AGENTS.md holds as checked out are left to it, but for a flagged
-/// one, and that is said in one line too; every other repo node says why it
-/// is not left to AGENTS.md (a pull request pending, not delivered).
+/// its AGENTS.md holds are left to it, but for a flagged one, and that is
+/// said in one line too; every other repo node says why it is not left to
+/// AGENTS.md (not yet in it, or in other words).
 fn knowledge_briefing_for(
     dirs: &Dirs,
     scopes: &[Scope],
@@ -472,8 +298,8 @@ fn knowledge_briefing_for(
     }
     for left in &loaded.shadowed {
         eprintln!(
-            "ohjaa: left {}: ohjaa's state holds that node, so this copy is not read \
-             (`ohjaa lessons publish` names it until it is taken out)",
+            "ohjaa: left {}: ohjaa's state holds that node, so this copy is not read; \
+             take it out of the checkout",
             left.display()
         );
     }
@@ -511,7 +337,7 @@ fn knowledge_briefing_for(
     // checked out, which the agent reads, or not yet.
     let standing = scopes
         .contains(&Scope::Repo)
-        .then(|| lessons::Standing::read(dirs, &loaded))
+        .then(|| lessons::Standing::read(dirs))
         .flatten();
     let in_file: Vec<&fk::Located> = current
         .iter()
@@ -551,8 +377,8 @@ fn knowledge_briefing_for(
         .iter()
         .filter(|located| located.scope == Scope::Repo)
         .filter_map(|located| {
-            let note = standing.as_ref()?.note(&located.node)?;
-            Some((located.node.id.clone(), note))
+            let note = standing.as_ref()?.note(&located.node);
+            Some((located.node.id.clone(), note.to_owned()))
         })
         .collect();
     let lessons = match (&reads, standing.as_ref()) {
@@ -794,7 +620,7 @@ fn selected_perimeter(
     scoped: &[PathBuf],
     mut scans: Vec<Scan>,
     mut outside: Scan,
-) -> system::SystemView {
+) -> perimeter::Perimeter {
     let selected: Vec<_> = in_repo
         .then(|| root.to_path_buf())
         .into_iter()
@@ -806,15 +632,14 @@ fn selected_perimeter(
             || selected.iter().any(|repo| scope_reaches(s, repo))
     });
     scans.push(outside);
-    system::scoped_view(&selected, scans)
+    perimeter::scoped_view(&selected, scans)
 }
 
-fn scoped_perimeter_text(view: &system::SystemView, here: &Path) -> String {
-    format!("{}\n\nOnly the launch repository, declared scope and sessions reaching them are included.\nOther repositories were not scanned. Use `ohjaa system` or `toimija sessions` for a\nfleet-wide question; after expanding scope, use `ohjaa brief --scope <path>`.\nUse the delivered facts instead of repeating discovery. Refresh session observations\nbefore editing if work has moved on since this briefing.\n", system::briefing(view, here))
+fn scoped_perimeter_text(view: &perimeter::Perimeter, here: &Path) -> String {
+    format!("{}\n\nOnly the launch repository, declared scope and sessions reaching them are included.\nOther repositories were not scanned. Use `toimija sessions` in one for who is live there;\nafter expanding scope, use `ohjaa brief --scope <path>`.\nUse the delivered facts instead of repeating discovery. Refresh session observations\nbefore editing if work has moved on since this briefing.\n", perimeter::briefing(view, here))
 }
 
 fn cmd_brief(
-    roots: &[PathBuf],
     knowledge_only: bool,
     write: &[PathBuf],
     scope: &[String],
@@ -876,8 +701,6 @@ fn cmd_brief(
             print!("\n{siblings}");
         }
     }
-    // Validate configured discovery roots; do not derive unrelated repositories.
-    repos(roots)?;
     let scans = dirs
         .repo_root
         .iter()
@@ -892,96 +715,12 @@ fn cmd_brief(
         scan::scan_outside(),
     );
     println!("\n{}", scoped_perimeter_text(&view, &here));
-    // An incomplete perimeter is said with the exit code, as `system` does.
+    // An incomplete perimeter is said with the exit code.
     Ok(if unscoped.is_empty() {
         view.exit_code()
     } else {
         INCOMPLETE
     })
-}
-
-fn cmd_graph(id: &str) -> Result<i32> {
-    use std::fmt::Write as _;
-    let dirs = dirs()?;
-    let loaded = knowledge::load(&dirs)?;
-    let Some(node) = loaded.get(id) else {
-        bail!("no knowledge named `{id}` here");
-    };
-    let describe = |located: &fk::Located| {
-        format!(
-            "{} [{} · {} · {} · as of {}]",
-            located.node.id,
-            located.scope.name(),
-            located.node.kind.name(),
-            located.node.status.name(),
-            located.node.as_of
-        )
-    };
-    let mut out = String::new();
-    let _ = writeln!(out, "{}", describe(node));
-    for line in node.node.body.lines() {
-        let _ = writeln!(out, "    {line}");
-    }
-    // What it builds on, all the way up; the files are the graph.
-    let mut chain = Vec::new();
-    let mut cursor = node.node.refines.clone();
-    while let Some(base) = cursor {
-        if chain.contains(&base) || chain.len() > 32 {
-            break;
-        }
-        cursor = loaded.get(&base).and_then(|l| l.node.refines.clone());
-        chain.push(base);
-    }
-    let _ = writeln!(
-        out,
-        "builds on     {}",
-        if chain.is_empty() {
-            "—".to_owned()
-        } else {
-            chain.join(" → ")
-        }
-    );
-    let built_on: Vec<&str> = loaded
-        .nodes
-        .iter()
-        .filter(|l| l.node.refines.as_deref() == Some(id))
-        .map(|l| l.node.id.as_str())
-        .collect();
-    let _ = writeln!(
-        out,
-        "built on by   {}",
-        if built_on.is_empty() {
-            "—".to_owned()
-        } else {
-            built_on.join(", ")
-        }
-    );
-    let _ = writeln!(
-        out,
-        "replaced      {}",
-        if node.node.supersedes.is_empty() {
-            "—".to_owned()
-        } else {
-            node.node.supersedes.join(", ")
-        }
-    );
-    let replaced_by: Vec<&str> = loaded
-        .nodes
-        .iter()
-        .filter(|l| l.node.supersedes.iter().any(|s| s == id))
-        .map(|l| l.node.id.as_str())
-        .collect();
-    let _ = writeln!(
-        out,
-        "replaced by   {}",
-        if replaced_by.is_empty() {
-            "—".to_owned()
-        } else {
-            replaced_by.join(", ")
-        }
-    );
-    print!("{out}");
-    Ok(0)
 }
 
 fn scope_arg(name: &str) -> Result<Scope> {
@@ -1006,15 +745,8 @@ fn cmd_list(all: bool) -> Result<i32> {
         (a.scope, a.node.kind, &a.node.id).cmp(&(b.scope, b.node.kind, &b.node.id))
     });
     // Where each of this repository's own current nodes stands: in its
-    // AGENTS.md, in a pull request, or not delivered, and why.
-    let standing = lessons::Standing::read(&dirs, &loaded);
-    // How often each current node was re-taught, and when last touched. A
-    // record that cannot be read is said, never shown as no counts.
-    let evidence = evidence::Evidence::read(&dirs);
-    if let Err(error) = &evidence {
-        eprintln!("ohjaa: {error:#}; how often each node was re-taught is not shown");
-    }
-    let today = knowledge::today();
+    // AGENTS.md, or not yet.
+    let standing = lessons::Standing::read(&dirs);
     for located in &nodes {
         let node = &located.node;
         println!(
@@ -1027,14 +759,10 @@ fn cmd_list(all: bool) -> Result<i32> {
             node.body.lines().next().unwrap_or("")
         );
         let status = (located.scope == Scope::Repo && node.status == Status::Current)
-            .then(|| standing.as_ref()?.status(node))
+            .then(|| standing.as_ref().map(|standing| standing.status(node)))
             .flatten();
         if let Some(status) = status {
             println!("{:<8} {status}", "");
-        }
-        if let (Ok(evidence), Status::Current) = (&evidence, node.status) {
-            let tally = evidence.tally(located.scope, dirs.repo_root.as_deref(), node, today);
-            println!("{:<8} {}", "", tally.line());
         }
     }
     if nodes.is_empty() {
@@ -1047,11 +775,7 @@ fn cmd_list(all: bool) -> Result<i32> {
             broken.reason
         );
     }
-    Ok(if loaded.broken.is_empty() && evidence.is_ok() {
-        0
-    } else {
-        1
-    })
+    Ok(if loaded.broken.is_empty() { 0 } else { 1 })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1120,73 +844,17 @@ fn decision_lock() -> Option<process::FileLock> {
     }
 }
 
-/// Before a repo proposal is accepted: what delivering it needs, asked now.
-/// Refused, so that nothing is accepted and it stays waiting, when its line
-/// would go to a repository that is not private and names something private.
-/// `None` for any other proposal.
-fn screen_accept(
-    dirs: &Dirs,
-    id: &str,
-    asker: &mut lessons::Asker,
-) -> Result<Option<Result<lessons::Ready, String>>> {
-    let loaded = knowledge::load(dirs)?;
-    let (waiting, _) = knowledge::pending(dirs, &loaded)?;
-    let Some(pending) = waiting
-        .iter()
-        .find(|pending| pending.node.id == id && pending.scope == Scope::Repo)
-    else {
-        return Ok(None);
-    };
-    let Some(checkout) = pending.repo.clone().or_else(|| dirs.repo_root.clone()) else {
-        return Ok(None);
-    };
-    lessons::screen(asker, &checkout, &pending.node).map(Some)
-}
-
-/// After a person's decision on repo knowledge ohjaa's state holds (an
-/// accept, a retirement, a confirmation): its repository's AGENTS.md is
-/// brought in line with it through the pull request (`lessons::deliver`),
-/// with `ready` when it was asked before the decision. It never undoes or
-/// fails the decision: what could not be delivered is said, and `ohjaa
-/// list` says it after, until `ohjaa lessons publish` delivers it. Called
-/// once the home's lock is let go: the delivery holds only the lessons lock
-/// (`lessons::deliver`), so no other change to the home waits on it.
-fn deliver_decided(
-    dirs: &Dirs,
-    outcome: &Outcome,
-    ready: Option<Result<lessons::Ready, String>>,
-    asker: &mut lessons::Asker,
-    today: fk::Date,
-) {
-    let Some(repo) = outcome.repo.as_deref() else {
-        return;
-    };
-    let accepted = knowledge::accepted_dir(&dirs.state, repo);
-    if !outcome
-        .written
-        .iter()
-        .any(|path| path.starts_with(&accepted))
-    {
-        println!(
-            "  lessons: it is still untracked in {}; `ohjaa lessons publish` delivers it to \
-             AGENTS.md",
-            knowledge::repo_knowledge(repo).display()
-        );
-        return;
-    }
-    let ready = ready.unwrap_or_else(|| asker.ready(repo));
-    println!(
-        "  lessons: delivering, with the home's lock let go: no other change to the home waits \
-         on the repository's hooks"
-    );
-    let delivered = lessons::deliver(&dirs.state, repo, ready, Vec::new(), false, today);
-    for line in &delivered.said {
-        println!("  lessons: {line}");
-    }
-    if !delivered.complete {
-        println!(
-            "  lessons: the decision stands; `ohjaa list` says where its line is, and `ohjaa \
-             lessons publish` delivers it once that is fixed"
+/// After a person's decision on repo knowledge (an accept, a retirement, a
+/// confirmation): how its line reaches the repository's AGENTS.md.
+fn say_lessons(outcome: &Outcome) {
+    if let Some(repo) = outcome.repo.as_deref() {
+        review_text(
+            "  ",
+            &format!(
+                "Run `ohjaa lessons` in a working copy of {} to bring its AGENTS.md in line, \
+                 then commit and push it like any change.",
+                repo.display()
+            ),
         );
     }
 }
@@ -1196,11 +864,6 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     let lock = decision_lock();
     let dirs = dirs()?;
     let today = knowledge::today();
-    let mut asker = lessons::Asker::new(roots::load(&[], dirs.repo_root.as_deref()));
-    let ready = match action {
-        "accept" => screen_accept(&dirs, id, &mut asker)?,
-        _ => None,
-    };
     let (outcome, done) = match action {
         "accept" => (knowledge::accept(&dirs, id, today)?, "accepted"),
         "reject" => (knowledge::reject(&dirs, id)?, "rejected"),
@@ -1214,11 +877,8 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     println!("{done} {id}");
     report(&outcome);
     after_decision(action, id, &outcome, why, lock.as_ref(), false);
-    // The decision is made and recorded: the home's lock goes before a
-    // delivery, which may run a repository's hooks for minutes.
-    drop(lock);
     if action != "reject" {
-        deliver_decided(&dirs, &outcome, ready, &mut asker, today);
+        say_lessons(&outcome);
     }
     Ok(0)
 }
@@ -1260,14 +920,11 @@ fn after_decision(
     }
 }
 
-/// `tally` says, of a current node, how often it was re-taught (see
-/// [`evidence::Tally::line`]); `None` for any other.
 fn show_pending(
     pending: &knowledge::Pending,
     duplicate_of: Option<&str>,
     loaded: &knowledge::Loaded,
     waiting: &[knowledge::Pending],
-    tally: &dyn Fn(&str) -> Option<String>,
 ) {
     let node = &pending.node;
     let place = match &pending.repo {
@@ -1281,7 +938,7 @@ fn show_pending(
     for why in &node.origin {
         println!("    why: {why}");
     }
-    show_pending_relationships(pending, duplicate_of, loaded, waiting, tally, false);
+    show_pending_relationships(pending, duplicate_of, loaded, waiting, false);
 }
 
 fn show_pending_relationships(
@@ -1289,7 +946,6 @@ fn show_pending_relationships(
     duplicate_of: Option<&str>,
     loaded: &knowledge::Loaded,
     waiting: &[knowledge::Pending],
-    tally: &dyn Fn(&str) -> Option<String>,
     plain: bool,
 ) {
     let node = &pending.node;
@@ -1320,9 +976,6 @@ fn show_pending_relationships(
         } else {
             println!("    refines: {relation}");
         }
-        if let Some(line) = tally(base) {
-            println!("    {base}: {line}");
-        }
     }
     if !node.supersedes.is_empty() {
         if plain {
@@ -1345,9 +998,6 @@ fn show_pending_relationships(
             review_text("  May repeat existing knowledge: ", &relation);
         } else {
             println!("    possible duplicate of: {relation}");
-        }
-        if let Some(line) = tally(of) {
-            println!("    {of}: {line}");
         }
     }
 }
@@ -1392,7 +1042,10 @@ fn show_review_card(pending: &knowledge::Pending, index: usize, total: usize) {
         Scope::Ours => {
             "Accept to stage shared knowledge; the team must review it in a pull request."
         }
-        Scope::Repo => "Accept to prepare a pull request; it is not a repository merge.",
+        Scope::Repo => {
+            "Accept to keep it for this repository; `ohjaa lessons` then writes it into its \
+             AGENTS.md, for you to commit."
+        }
     };
     review_text("  ", effect);
     if let Some(repo) = &pending.repo {
@@ -1405,8 +1058,8 @@ fn cmd_review(list: bool) -> Result<i32> {
     let loaded = knowledge::load(&dirs)?;
     let (waiting, broken) = knowledge::pending(&dirs, &loaded)?;
     // What each may repeat, derived now, and each right after that one.
-    let marks = intake::possible_duplicates(&loaded, &waiting, dirs.repo_root.as_deref());
-    let reviewed = intake::review_order(waiting.iter().cloned().zip(marks).collect());
+    let marks = duplicates::possible_duplicates(&loaded, &waiting, dirs.repo_root.as_deref());
+    let reviewed = duplicates::review_order(waiting.iter().cloned().zip(marks).collect());
     for broken in &broken {
         eprintln!(
             "ohjaa: unreadable proposal {}: {}",
@@ -1422,34 +1075,10 @@ fn cmd_review(list: bool) -> Result<i32> {
         println!("No readable proposals; {} could not be read. Fix the files reported above, then run `ohjaa review` again.", broken.len());
         return Ok(INCOMPLETE);
     }
-    // How often a current node a proposal names was re-taught: the person
-    // decides with it in view.
-    let evidence = evidence::Evidence::read(&dirs);
-    if let Err(error) = &evidence {
-        eprintln!("ohjaa: {error:#}; how often a node was re-taught is not shown");
-    }
-    let mut incomplete = !broken.is_empty() || evidence.is_err();
-    let today = knowledge::today();
-    let tally = |id: &str| -> Option<String> {
-        let evidence = evidence.as_ref().ok()?;
-        let located = loaded
-            .nodes
-            .iter()
-            .find(|l| l.node.id == id && l.node.status == Status::Current)?;
-        Some(
-            evidence
-                .tally(
-                    located.scope,
-                    dirs.repo_root.as_deref(),
-                    &located.node,
-                    today,
-                )
-                .line(),
-        )
-    };
+    let mut incomplete = !broken.is_empty();
     if list {
         for (pending, of) in &reviewed {
-            show_pending(pending, of.as_deref(), &loaded, &waiting, &tally);
+            show_pending(pending, of.as_deref(), &loaded, &waiting);
         }
         println!(
             "\n{} waiting; decide with `ohjaa review` at a terminal",
@@ -1461,7 +1090,6 @@ fn cmd_review(list: bool) -> Result<i32> {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     let today = knowledge::today();
-    let mut asker = lessons::Asker::new(roots::load(&[], dirs.repo_root.as_deref()));
     println!("Review knowledge proposals — nothing changes until you accept or reject.");
     println!(
         "Reject dismisses a proposal. Skip or Enter leaves it for later. Quit keeps the rest."
@@ -1472,14 +1100,7 @@ fn cmd_review(list: bool) -> Result<i32> {
         let current = knowledge::load(&dirs)?;
         let (still_waiting, _) = knowledge::pending(&dirs, &current)?;
         show_review_card(pending, index + 1, reviewed.len());
-        show_pending_relationships(
-            pending,
-            of.as_deref(),
-            &current,
-            &still_waiting,
-            &tally,
-            true,
-        );
+        show_pending_relationships(pending, of.as_deref(), &current, &still_waiting, true);
         let accepting = loop {
             print!("\n  [a]ccept  [r]eject  [s]kip  [d]etails  [q]uit > ");
             std::io::stdout().flush()?;
@@ -1496,7 +1117,7 @@ fn cmd_review(list: bool) -> Result<i32> {
                 }
                 "q" | "quit" => break 'proposals,
                 "d" | "details" => {
-                    show_pending(pending, of.as_deref(), &current, &still_waiting, &tally);
+                    show_pending(pending, of.as_deref(), &current, &still_waiting);
                     println!("  Proposal file: {}", pending.path.display());
                 }
                 _ => println!("  Choose one action: a, r, s, d or q, then Enter. Nothing changed."),
@@ -1505,13 +1126,9 @@ fn cmd_review(list: bool) -> Result<i32> {
         let id = &pending.node.id;
         // Held for the decision, never while the person thinks.
         let lock = decision_lock();
-        let mut ready = None;
         let action = if accepting { "accept" } else { "reject" };
         let result = if accepting {
-            screen_accept(&dirs, id, &mut asker).and_then(|screened| {
-                ready = screened;
-                knowledge::accept(&dirs, id, today)
-            })
+            knowledge::accept(&dirs, id, today)
         } else {
             knowledge::reject(&dirs, id)
         };
@@ -1537,7 +1154,7 @@ fn cmd_review(list: bool) -> Result<i32> {
                 after_decision(action, id, &outcome, None, lock.as_ref(), true);
                 drop(lock);
                 if action == "accept" {
-                    deliver_decided(&dirs, &outcome, ready.take(), &mut asker, today);
+                    say_lessons(&outcome);
                 }
             }
             Err(error) => {
@@ -1567,52 +1184,6 @@ fn cmd_review(list: bool) -> Result<i32> {
     }
     println!("Inspect saved knowledge with `ohjaa list`.");
     Ok(if incomplete { INCOMPLETE } else { 0 })
-}
-
-/// `ohjaa lessons publish`: per repository, its accepted lessons not in its
-/// AGENTS.md yet, delivered through one pull request (`lessons::deliver`).
-fn cmd_lessons_publish(roots: &[PathBuf], repos: &[PathBuf], dry_run: bool) -> Result<i32> {
-    let dirs = dirs()?;
-    let today = knowledge::today();
-    let mut checkouts = Vec::new();
-    let mut complete = true;
-    let roots = roots::load(roots, dirs.repo_root.as_deref());
-    if repos.is_empty() {
-        checkouts = lessons::waiting(&dirs.state, &roots::git_repos(&roots)?);
-    } else {
-        for repo in repos {
-            match gitconfig::repo_at(repo) {
-                Ok((top, _)) => checkouts.push(top),
-                Err(error) => {
-                    eprintln!("ohjaa: {error:#}");
-                    complete = false;
-                }
-            }
-        }
-    }
-    if checkouts.is_empty() && complete {
-        println!(
-            "nothing waits to be delivered: no repository under the roots has a \
-             .ohjaa/knowledge/, and every accepted lesson is delivered"
-        );
-        return Ok(0);
-    }
-    let mut asker = lessons::Asker::new(roots);
-    for checkout in &checkouts {
-        let mut said = Vec::new();
-        let extra = lessons::untracked(checkout, &mut said);
-        let ready = asker.ready(checkout);
-        let delivered = lessons::deliver(&dirs.state, checkout, ready, extra, dry_run, today);
-        println!("{}", checkout.display());
-        for line in said.iter().chain(&delivered.said) {
-            println!("  {line}");
-        }
-        complete &= delivered.complete;
-    }
-    if dry_run {
-        println!("(a dry run: nothing was fetched, written or sent)");
-    }
-    Ok(if complete { 0 } else { INCOMPLETE })
 }
 
 /// The commands this ohjaa has, as clap knows them.
@@ -1670,63 +1241,6 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
         .iter()
         .filter(|l| l.node.status == Status::Current)
         .count();
-    // Does it work? Per current node, how often a person had to teach it
-    // again, and what that suggests. Suggestions only: never a flag, and
-    // ohjaa never changes a node itself.
-    let mut suggestions = 0;
-    match evidence::Evidence::read(&dirs) {
-        Err(error) => {
-            println!("error    {error:#}");
-            errors += 1;
-        }
-        Ok(evidence) => {
-            let today = knowledge::today();
-            // How far the counts reach: a count from an intake that has not
-            // read lately is not measured, and must not read as zero.
-            match intake::read_cursor(&dirs) {
-                Ok(None) => println!(
-                    "evidence no intake has run here: how often each was re-taught is unknown, \
-                     not zero (`ohjaa intake`)"
-                ),
-                Ok(Some(at)) => println!(
-                    "evidence counted from what people said up to {}; nothing later was read \
-                     (`ohjaa intake`)",
-                    intake::clock(at)
-                ),
-                Err(error) => {
-                    println!("error    {error:#}");
-                    errors += 1;
-                }
-            }
-            let mut nodes: Vec<&fk::Located> = loaded
-                .nodes
-                .iter()
-                .filter(|l| l.node.status == Status::Current)
-                .collect();
-            nodes.sort_by(|a, b| {
-                (a.scope, a.node.kind, &a.node.id).cmp(&(b.scope, b.node.kind, &b.node.id))
-            });
-            let mut suggested = Vec::new();
-            for located in nodes {
-                let node = &located.node;
-                let tally = evidence.tally(located.scope, dirs.repo_root.as_deref(), node, today);
-                println!("evidence {}: {}", node.id, tally.line());
-                // A fact flagged as not re-confirmed already asks.
-                let flagged_stale = flags.iter().any(
-                    |flag| matches!(flag, knowledge::Flag::Stale { id, .. } if *id == node.id),
-                );
-                match tally.suggestion() {
-                    Some(evidence::Suggestion::StillTrue) if flagged_stale => {}
-                    Some(suggestion) => suggested.push((&node.id, suggestion)),
-                    None => {}
-                }
-            }
-            for (id, suggestion) in &suggested {
-                println!("suggest  {id}: {}", suggestion.describe());
-            }
-            suggestions = suggested.len();
-        }
-    }
     for scope in Scope::ALL {
         match (scope, dirs.scope_dir(scope), dirs.repo_root.as_deref()) {
             (Scope::Repo, Some(legacy), Some(root)) => {
@@ -1739,8 +1253,7 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
                 );
                 if legacy.is_dir() {
                     println!(
-                        "scope    {:<8} {} (accepted before, not yet in AGENTS.md: `ohjaa \
-                         lessons publish`)",
+                        "scope    {:<8} {} (accepted before ohjaa kept them in its state)",
                         scope.name(),
                         legacy.display()
                     );
@@ -1752,7 +1265,7 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
     }
     println!(
         "summary  {current} current, {} waiting for a decision, {errors} error(s), {} flag(s), \
-         {suggestions} suggestion(s), briefing {size}/{budget}",
+         briefing {size}/{budget}",
         waiting.len(),
         flags.len() + usize::from(over)
     );
@@ -1761,478 +1274,6 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
     } else {
         0
     })
-}
-
-fn default_drafter() -> String {
-    knowledge::config_home()
-        .ok()
-        .and_then(|config| std::fs::read_to_string(config.join("ohjaa").join("drafter")).ok())
-        .map(|text| text.trim().to_owned())
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| "claude -p".to_owned())
-}
-
-/// The git repositories under the roots, for `collect`.
-fn repos_under_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    roots::git_repos(&roots::load(roots, git_root_for_roots(roots).as_deref()))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cmd_intake(
-    roots: &[PathBuf],
-    since: Option<&str>,
-    sources: &[String],
-    drafter: Option<&str>,
-    batch: usize,
-    max_batches: usize,
-    dry_run: bool,
-    retry_failed: bool,
-    prefilter: bool,
-) -> Result<i32> {
-    let dirs = dirs()?;
-    // One intake at a time: two would send the same candidates and overwrite
-    // each other's progress. A dry run writes nothing, and takes no lock.
-    let _lock = if dry_run {
-        None
-    } else {
-        match process::lock_file(&dirs.state.join("intake.lock"), std::time::Duration::ZERO) {
-            Ok(lock) => Some(lock),
-            Err(why) if why.contains("held by another") => {
-                eprintln!("ohjaa: intake already running ({why}); nothing was done");
-                return Ok(REFUSED);
-            }
-            Err(why) => bail!(why),
-        }
-    };
-    let started = intake::now_seconds() * 1000;
-    let explicit = since.map(intake::normalize_since).transpose()?;
-    let cursor = match explicit {
-        Some(_) => None,
-        None => intake::read_cursor(&dirs)?,
-    };
-    let (since, keep) = intake::window_start(explicit, cursor, started, 14 * 86_400_000);
-    if let Some(since) = keep.filter(|_| !dry_run) {
-        intake::write_cursor(&dirs, since)?;
-    }
-    let sources: Vec<&str> = if sources.is_empty() {
-        vec!["transcripts", "reviews", "reverts"]
-    } else {
-        sources.iter().map(String::as_str).collect()
-    };
-    // What earlier runs handled, read first: a retry reads back to the oldest
-    // candidate set aside.
-    let mut handled = intake::read_handled(&dirs)?;
-    // What was seen of each node, before anything is sent: a damaged record
-    // stops the run, and is never replaced. A dry run records nothing.
-    let mut evidence = if dry_run {
-        evidence::Evidence::default()
-    } else {
-        evidence::Evidence::read(&dirs)?
-    };
-    let retry: std::collections::HashSet<intake::Key> = if retry_failed {
-        handled.set_aside().map(|(key, _)| *key).collect()
-    } else {
-        std::collections::HashSet::new()
-    };
-    let read_back = retry
-        .iter()
-        .map(|key| key.at_ms - 1)
-        .min()
-        .filter(|floor| *floor < since);
-    let mut warnings = Vec::new();
-    // Stores vessa knows of and does not read: said, and holding nothing.
-    let mut gaps: Vec<String> = Vec::new();
-    // The sources that could not all be read: they hold the cursor.
-    let mut warned: Vec<&str> = Vec::new();
-    let mut candidates = Vec::new();
-    let git_repos = || -> Result<Vec<PathBuf>> {
-        let roots = roots::load(roots, git_root().as_deref());
-        roots::git_repos(&roots)
-    };
-    // One source, from `from`, unfiltered: what vessa lists of what people
-    // wrote is pre-filtered in the pass below, not when read back for a
-    // retry, which takes only candidates already sent.
-    let read = |source: &str,
-                from: i64,
-                warnings: &mut Vec<String>,
-                gaps: &mut Vec<String>|
-     -> Result<Vec<_>> {
-        Ok(match source {
-            "transcripts" => intake::transcripts(from, warnings, gaps)
-                .into_iter()
-                .filter(|said| !said.long)
-                .map(|said| said.candidate)
-                .collect(),
-            "reviews" | "reverts" => {
-                let repos = git_repos()?;
-                if repos.is_empty() {
-                    // Nothing read is not nothing there: the cursor stays.
-                    warnings.push(format!("{source}: no git repositories under the roots"));
-                    Vec::new()
-                } else if source == "reviews" {
-                    intake::reviews(&repos, from, warnings)
-                } else {
-                    intake::reverts(&repos, from, warnings)
-                }
-            }
-            other => bail!("`{other}` is not a source: transcripts, reviews or reverts"),
-        })
-    };
-    for source in &sources {
-        let before = warnings.len();
-        if *source == "transcripts" {
-            let said = intake::transcripts(since, &mut warnings, &mut gaps);
-            let transcripts_read_cleanly = warnings.len() == before;
-            let said: Vec<intake::Said> = said
-                .into_iter()
-                .filter(|said| said.candidate.at_ms > since)
-                .collect();
-            let (kept, sifted) = intake::sift(said, prefilter);
-            // A vessa that listed nothing because it failed has said so; no
-            // count of nothing is shown for it.
-            if transcripts_read_cleanly || sifted.read > 0 {
-                eprintln!("ohjaa: intake: {}", sifted.said());
-            }
-            candidates.extend(kept);
-        } else {
-            candidates.extend(read(source, since, &mut warnings, &mut gaps)?);
-        }
-        if warnings.len() > before {
-            warned.push(source);
-        }
-    }
-    // A retry reads back to the oldest candidate set aside, for those alone:
-    // the cursor may have passed them, and they are not a session's.
-    if let Some(floor) = read_back {
-        for source in &sources {
-            let before = warnings.len();
-            let back = read(source, floor, &mut warnings, &mut gaps)?;
-            candidates.extend(back.into_iter().filter(|c| retry.contains(&c.key())));
-            if warnings.len() > before && !warned.contains(source) {
-                warned.push(source);
-            }
-        }
-    }
-    for warning in &warnings {
-        eprintln!("ohjaa: intake: {warning}");
-    }
-    // Said on every run, once (a retry asks vessa twice); never a warning.
-    gaps.sort();
-    gaps.dedup();
-    for gap in &gaps {
-        eprintln!(
-            "ohjaa: intake: {gap} (a store vessa does not read: nothing in it is drafted \
-             from, and it does not hold the cursor)"
-        );
-    }
-    let found = intake::found(candidates);
-    // What earlier runs handled is never sent again: a run takes the oldest
-    // candidates not handled yet, so every run makes progress.
-    if retry_failed {
-        let reached = found.iter().filter(|c| retry.contains(&c.key())).count();
-        eprintln!(
-            "ohjaa: {reached} of {} candidate(s) set aside are sent again{}",
-            retry.len(),
-            if reached < retry.len() {
-                "; the others no source reads any more, and they stay set aside"
-            } else {
-                ""
-            }
-        );
-        handled.retry_failed();
-    }
-    let left = found.iter().filter(|c| !handled.contains(c)).count();
-    let batch = batch.max(1);
-    let limit = batch.saturating_mul(max_batches);
-    let taken = left.min(limit);
-    eprintln!(
-        "ohjaa: {} candidate(s) since {}, {} handled by earlier runs; drafting from {taken}",
-        found.len(),
-        intake::rfc3339(since.div_euclid(1000)),
-        found.len() - left,
-    );
-    // What could not be read is never rendered as nothing new.
-    let nothing = if warnings.is_empty() && gaps.is_empty() {
-        "nothing new to draft from".to_owned()
-    } else if warnings.is_empty() {
-        format!(
-            "nothing new to draft from in what vessa reads (it does not read {} store(s), \
-             said above)",
-            gaps.len()
-        )
-    } else {
-        format!(
-            "nothing found to draft from in what could be read ({} warning(s) above)",
-            warnings.len()
-        )
-    };
-    if dry_run {
-        if left == 0 {
-            println!("{nothing}");
-            return Ok(if warnings.is_empty() { 0 } else { INCOMPLETE });
-        }
-        let loaded = knowledge::load(&dirs)?;
-        let known = intake::Known::read(&dirs, &loaded)?;
-        let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
-        let first: Vec<intake::Candidate> = found
-            .iter()
-            .filter(|c| !handled.contains(c))
-            .take(batch)
-            .cloned()
-            .collect();
-        let (prompt, redacted) = intake::prompt(&known, &first);
-        println!("{prompt}");
-        eprintln!(
-            "ohjaa: dry-run; would send {} batch(es) to `{drafter}`; {redacted} \
-             secret-looking token(s) redacted from the batch shown",
-            taken.div_ceil(batch)
-        );
-        return Ok(0);
-    }
-
-    let today = knowledge::today();
-    let (mut proposed, mut refused, mut redacted) = (0, 0, 0);
-    // Proposals that may repeat what was present, by the id of what each may
-    // repeat.
-    let mut possible: std::collections::BTreeMap<String, usize> = Default::default();
-    // Re-teachings recorded in this run, by node id; and those dropped.
-    let mut recorded: std::collections::BTreeMap<String, usize> = Default::default();
-    let mut dropped = intake::Dropped::default();
-    let mut drafted = intake::Drafted::default();
-    if left > 0 {
-        let drafter = drafter.map(str::to_owned).unwrap_or_else(default_drafter);
-        drafted = intake::draft_pending(
-            &found,
-            &mut handled,
-            batch,
-            limit,
-            |chunk| {
-                // Re-read each time, so a draft from an earlier batch counts
-                // as present.
-                let loaded = knowledge::load(&dirs).map_err(intake::Failure::Silent)?;
-                let mut known =
-                    intake::Known::read(&dirs, &loaded).map_err(intake::Failure::Silent)?;
-                // Scrubbed of secrets, whatever the source or the filter.
-                let (prompt, scrubbed, shown) = intake::prompt_with_evidence(&known, chunk);
-                redacted += scrubbed;
-                let answer = intake::draft(&drafter, &prompt)?;
-                // Checked against what the drafter was shown, before the
-                // drafts of this answer join it.
-                let (retaught, dropped_here) = shown.retaught(&answer.reteaches, chunk);
-                dropped.add(dropped_here);
-                // The nodes the drafts written refine or supersede.
-                let mut named: Vec<String> = Vec::new();
-                for draft in answer.drafts {
-                    let id = draft.id.clone();
-                    let result = draft.into_proposal().and_then(|proposal| {
-                        let near = known.repeated_by(&proposal).map(str::to_owned);
-                        let present = known.present(&proposal);
-                        let names: Vec<String> = proposal
-                            .refines
-                            .iter()
-                            .chain(&proposal.supersedes)
-                            .cloned()
-                            .collect();
-                        knowledge::propose(&dirs, &loaded, proposal, today)
-                            .map(|_| (present, near, names))
-                    });
-                    match result {
-                        Ok((present, near, names)) => {
-                            named.extend(names);
-                            // Present for the drafts after it in this answer.
-                            known.add(present);
-                            proposed += 1;
-                            // Written, so never lost; said, and stored never:
-                            // a person decides.
-                            match near {
-                                None => println!("proposed {id}"),
-                                Some(of) => {
-                                    println!("proposed {id}, a possible duplicate of {of}");
-                                    *possible.entry(of).or_default() += 1;
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            refused += 1;
-                            eprintln!("ohjaa: draft `{id}` refused: {error:#}");
-                        }
-                    }
-                }
-                // Kept before the batch is handled: a run killed between
-                // the two sends it again, and a message counts once.
-                let mut new = Vec::new();
-                for r in &retaught {
-                    if evidence.retaught(&r.node, r.key, r.session.as_deref()) {
-                        new.push(r);
-                    }
-                }
-                let mut changed = !new.is_empty();
-                // A citation is as of the newest message of its batch.
-                if let Some(newest) = chunk.iter().map(|c| c.at_ms).max() {
-                    for node in shown.cited(&named, chunk) {
-                        changed |= evidence.cited(&node, newest);
-                    }
-                }
-                if changed {
-                    evidence.write(&dirs).map_err(|error| {
-                        intake::Failure::Silent(error.context("cannot keep the knowledge evidence"))
-                    })?;
-                }
-                // Said by node, time and source, never by the words.
-                for r in new {
-                    println!("re-taught {} ({} {})", r.node.id, r.at, r.source);
-                    *recorded.entry(r.node.id.clone()).or_default() += 1;
-                }
-                Ok(())
-            },
-            |handled| intake::write_handled(&dirs, handled),
-        );
-        // Said by time and source, never by its words.
-        for (key, failing) in &drafted.failed {
-            let at = intake::rfc3339(key.at_ms.div_euclid(1000));
-            if failing.attempts >= intake::MAX_ATTEMPTS {
-                eprintln!(
-                    "ohjaa: intake: set aside {at} {}: the drafter failed on it alone {} times \
-                     ({}); `ohjaa intake --retry-failed` sends it again",
-                    failing.source, failing.attempts, failing.why
-                );
-            } else {
-                eprintln!(
-                    "ohjaa: intake: the drafter failed on {at} {} alone (attempt {} of {}: {}); \
-                     it is tried again next run",
-                    failing.source,
-                    failing.attempts,
-                    intake::MAX_ATTEMPTS,
-                    failing.why
-                );
-            }
-        }
-        if let Some(error) = &drafted.stopped {
-            eprintln!("ohjaa: intake stopped: {error:#}");
-        }
-        eprintln!(
-            "ohjaa: intake: the drafter answered for {} candidate(s) in this run; {redacted} \
-             secret-looking token(s) were redacted from what it was sent",
-            drafted.sent
-        );
-        if dropped.total() > 0 {
-            eprintln!(
-                "ohjaa: intake: {} re-teaching(s) the drafter named were dropped: {}",
-                dropped.total(),
-                dropped.describe()
-            );
-        }
-    }
-    handled.done_retrying();
-    // The cursor is one for every source: it moves only after a run that
-    // read them all, none with a warning.
-    let every_source = ["transcripts", "reviews", "reverts"]
-        .iter()
-        .all(|source| sources.contains(source));
-    let window = intake::Window {
-        since,
-        started,
-        complete: every_source && warnings.is_empty(),
-    };
-    let settled = intake::settle(&found, &mut handled, window);
-    if let Some(cursor) = settled.cursor {
-        intake::write_cursor(&dirs, cursor)?;
-    }
-    intake::write_handled(&dirs, &handled)?;
-    // Every run says what is set aside, by time and source.
-    let aside: Vec<String> = handled
-        .set_aside()
-        .map(|(key, failing)| {
-            format!(
-                "{} {}",
-                intake::rfc3339(key.at_ms.div_euclid(1000)),
-                failing.source
-            )
-        })
-        .collect();
-    if !aside.is_empty() {
-        let more = aside.len().saturating_sub(5);
-        eprintln!(
-            "ohjaa: {} candidate(s) set aside, the drafter failed on each alone {} times: {}{} \
-             (`ohjaa intake --retry-failed` sends them again)",
-            aside.len(),
-            intake::MAX_ATTEMPTS,
-            aside[..aside.len() - more].join(", "),
-            if more > 0 {
-                format!(" and {more} more")
-            } else {
-                String::new()
-            }
-        );
-    }
-    // A held cursor is said: where it stays, since when, and what holds it.
-    if !window.complete {
-        let mut why = Vec::new();
-        if !every_source {
-            why.push(format!(
-                "this run read only {}, and the cursor is one for every source, so a run of \
-                 some sources does not move it",
-                sources.join(", ")
-            ));
-        }
-        if !warned.is_empty() {
-            why.push(format!(
-                "{} could not all be read (see above); it moves after a run that reads every \
-                 source",
-                warned.join(", ")
-            ));
-        }
-        match intake::read_cursor(&dirs)? {
-            Some(at) => eprintln!(
-                "ohjaa: intake: the cursor stays at {} ({}): {}",
-                intake::rfc3339(at.div_euclid(1000)),
-                scan::ago((started - at).div_euclid(1000)),
-                why.join("; ")
-            ),
-            None => eprintln!("ohjaa: intake: no cursor is kept yet: {}", why.join("; ")),
-        }
-    }
-    let newly_aside = drafted
-        .failed
-        .iter()
-        .any(|(_, failing)| failing.attempts >= intake::MAX_ATTEMPTS);
-    if left == 0 {
-        println!("{nothing}");
-    } else {
-        let marked: usize = possible.values().sum();
-        println!(
-            "{proposed} proposal(s) waiting for review (`ohjaa review`), {marked} of them \
-             possible duplicates, {refused} draft(s) refused"
-        );
-        if marked > 0 {
-            let of: Vec<String> = possible
-                .iter()
-                .map(|(id, n)| format!("of {id} ×{n}"))
-                .collect();
-            println!(
-                "possible duplicates: {} (`ohjaa review` shows each after what it may repeat)",
-                of.join(", ")
-            );
-        }
-        let retaught: usize = recorded.values().sum();
-        if retaught > 0 {
-            let by: Vec<String> = recorded
-                .iter()
-                .map(|(id, n)| format!("{id} ×{n}"))
-                .collect();
-            println!(
-                "{retaught} re-teaching(s) of current knowledge recorded: {} (`ohjaa check` shows \
-                 each node's count)",
-                by.join(", ")
-            );
-        }
-    }
-    if settled.left > 0 {
-        eprintln!("ohjaa: {} candidate(s) wait for the next run", settled.left);
-    }
-    let finished =
-        settled.left == 0 && drafted.stopped.is_none() && !newly_aside && warnings.is_empty();
-    Ok(if finished { 0 } else { INCOMPLETE })
 }
 
 // ---- the briefing's scope ------------------------------------------------------
@@ -2293,8 +1334,7 @@ fn main() {
             write,
             scope,
             agent,
-        } => cmd_brief(&cli.root, *knowledge_only, write, scope, agent.as_deref()),
-        Cmd::System { json } => cmd_system(&cli.root, *json),
+        } => cmd_brief(*knowledge_only, write, scope, agent.as_deref()),
         Cmd::List { all } => cmd_list(*all),
         Cmd::Propose {
             scope,
@@ -2323,53 +1363,20 @@ fn main() {
         Cmd::Retire { id, why } => cmd_decide("retire", id, Some(why)),
         Cmd::Confirm { id } => cmd_decide("confirm", id, None),
         Cmd::Check { budget, strict } => cmd_check(*budget, *strict),
-        Cmd::Lessons {
-            action: LessonsCmd::Publish { repos, dry_run },
-        } => cmd_lessons_publish(&cli.root, repos, *dry_run),
-        Cmd::Line => {
-            human::line(&cli.root);
-            Ok(0)
-        }
-        Cmd::Digest { since, no_collect } => {
-            human::digest(&cli.root, repos(&cli.root), since.as_deref(), *no_collect)
-        }
-        Cmd::Collect { background } => {
-            human::collect_now(repos_under_roots(&cli.root), *background)
-        }
-        Cmd::Graph { id } => cmd_graph(id),
-        Cmd::Apply { dry_run, bin, undo } => {
+        Cmd::Lessons { path, dry_run } => match path {
+            Some(path) => lessons::write(path, *dry_run),
+            None => std::env::current_dir()
+                .context("cannot tell the current folder")
+                .and_then(|here| lessons::write(&here, *dry_run)),
+        },
+        Cmd::Apply { dry_run, undo } => {
             if *undo {
                 apply::undo(*dry_run)
             } else {
-                apply::apply(apply::Options {
-                    dry_run: *dry_run,
-                    roots: &cli.root,
-                    bin: bin.as_deref(),
-                })
+                apply::apply(*dry_run)
             }
         }
         Cmd::Doctor => doctor::doctor(),
-        Cmd::ShellInit { shell } => shell_init::shell_init(shell),
-        Cmd::Intake {
-            since,
-            no_prefilter,
-            sources,
-            drafter,
-            batch,
-            max_batches,
-            dry_run,
-            retry_failed,
-        } => cmd_intake(
-            &cli.root,
-            since.as_deref(),
-            sources,
-            drafter.as_deref(),
-            *batch,
-            *max_batches,
-            *dry_run,
-            *retry_failed,
-            !*no_prefilter,
-        ),
     };
     match result {
         Ok(code) => std::process::exit(code),

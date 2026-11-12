@@ -1,15 +1,12 @@
 //! `ohjaa doctor`: what differs from what `apply` would make it. Read-only.
 //!
 //! It reads its facts once: git's global config in one process, then the
-//! files apply writes into.
-
-use std::path::PathBuf;
+//! files apply writes into, and `~/.zshrc`, where an earlier apply wrote a
+//! line that apply now takes out.
 
 use anyhow::Result;
 
-use crate::apply::{
-    ignore_with_block, launch_target, read_or_empty, sources_old_launcher, IGNORED, IGNORE_BEGIN,
-};
+use crate::apply::{ignore_with_block, launch_target, read_or_empty, IGNORED, IGNORE_BEGIN};
 use crate::gitconfig;
 use crate::home::{self, absolute};
 
@@ -134,39 +131,25 @@ pub fn doctor() -> Result<i32> {
         }
         None => {}
     }
+    // The terminal's line an earlier apply wrote runs a command this ohjaa
+    // does not have: every new terminal would say so.
     match home::zshrc().and_then(|path| read_or_empty(&path).map(|text| (path, text))) {
         Ok((path, text)) => {
-            let targets: Vec<PathBuf> = text.lines().filter_map(launch_target).collect();
-            if targets.is_empty() {
+            let left: Vec<usize> = text
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| launch_target(line).is_some())
+                .map(|(at, _)| at + 1)
+                .collect();
+            if left.is_empty() {
+                found.ok(format!("{} runs nothing of ohjaa's", path.display()));
+            }
+            for at in left {
                 found.drift(format!(
-                    "{} does not run the terminal's line (ohjaa apply)",
+                    "{} line {at} runs `ohjaa shell-init`, which this ohjaa does not have; \
+                     every new terminal says so (ohjaa apply takes it out)",
                     path.display()
                 ));
-            }
-            for target in targets {
-                if gitconfig::executable(&target) {
-                    found.ok(format!(
-                        "{} runs the terminal's line from {}",
-                        path.display(),
-                        target.display()
-                    ));
-                } else {
-                    found.drift(format!(
-                        "{} runs the terminal's line from {}, which is gone (ohjaa apply)",
-                        path.display(),
-                        target.display()
-                    ));
-                }
-            }
-            for (at, line) in text.lines().enumerate() {
-                if sources_old_launcher(line) {
-                    found.drift(format!(
-                        "{} line {} still loads the old launcher: {} (ohjaa apply)",
-                        path.display(),
-                        at + 1,
-                        line.trim()
-                    ));
-                }
             }
         }
         Err(error) => found.drift(format!("cannot read ~/.zshrc: {error:#}")),

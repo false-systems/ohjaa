@@ -1,30 +1,28 @@
-//! The system perimeter, derived at the moment it is asked for.
+//! The briefing's perimeter, derived at the moment it is asked for.
 //!
-//! Every repo in the fleet self-declares its identity in `.toimija/repo.yaml`,
-//! and toimija surfaces that as the `repo` object of `context --identity
-//! --json` (one git process; the same object `context --json` carries). Ohjaa
-//! derives the fleet's shape from those declarations plus live occupancy:
-//! nothing is stored, and the view cannot be staler than the moment it was
-//! computed. An agent gets this perimeter at launch (inside toimija's
-//! composed launch prompt) and can re-derive it any time with `ohjaa system`
-//! and `toimija sessions` — pull, never push.
+//! Every repo self-declares its identity in `.toimija/repo.yaml`, and
+//! toimija surfaces that as the `repo` object of `toimija enter --identity
+//! --json` (`toimija-identity.v1`; one git process, no side effects).
+//! `ohjaa brief` derives the launch repository's and each scoped
+//! repository's role from those declarations, plus who is
+//! live there from `toimija sessions`: nothing is stored, and the view
+//! cannot be staler than the moment it was computed. An agent gets this
+//! perimeter at launch (inside toimija's composed launch prompt) and can
+//! ask `toimija sessions` again any time: pull, never push.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::scan::{scan_fleet, Scan, Session};
+use crate::scan::{Scan, Session};
 
-/// One tool repo in the fleet, as it declares itself.
-#[derive(Debug, Clone, Serialize)]
+/// One repository, as it declares itself.
+#[derive(Debug, Clone)]
 pub struct Tool {
     pub path: PathBuf,
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub not: Vec<String>,
 }
 
 impl Tool {
@@ -40,11 +38,10 @@ impl Tool {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| repo.display().to_string()),
             role: None,
-            not: Vec::new(),
         };
         let Ok(output) = crate::process::run(
             Command::new("toimija")
-                .args(["context", "--identity", "--json"])
+                .args(["enter", "--identity", "--json"])
                 .current_dir(repo),
             None,
             crate::process::LOCAL,
@@ -54,26 +51,25 @@ impl Tool {
         if !output.status.success() {
             return unknown();
         }
-        match parse_context(repo, &String::from_utf8_lossy(&output.stdout)) {
+        match parse_identity(repo, &String::from_utf8_lossy(&output.stdout)) {
             Some(tool) => tool,
             None => unknown(),
         }
     }
 }
 
-fn parse_context(repo: &Path, stdout: &str) -> Option<Tool> {
-    let payload: ContextPayload = serde_json::from_str(stdout).ok()?;
+fn parse_identity(repo: &Path, stdout: &str) -> Option<Tool> {
+    let payload: IdentityPayload = serde_json::from_str(stdout).ok()?;
     let repo_section = payload.repo?;
     Some(Tool {
         path: repo.to_path_buf(),
         name: repo_section.name,
         role: repo_section.role.filter(|role| !role.is_empty()),
-        not: repo_section.not_roles,
     })
 }
 
 #[derive(Debug, Deserialize)]
-struct ContextPayload {
+struct IdentityPayload {
     repo: Option<RepoSection>,
 }
 
@@ -83,13 +79,11 @@ struct RepoSection {
     /// toimija writes `null` for a repo.yaml that declares no role.
     #[serde(default)]
     role: Option<String>,
-    #[serde(default)]
-    not_roles: Vec<String>,
 }
 
-/// The fleet's derived shape: what each repo is, and who is live where.
-#[derive(Debug, Serialize)]
-pub struct SystemView {
+/// The perimeter: what each repository is, and who is live where.
+#[derive(Debug)]
+pub struct Perimeter {
     pub tools: Vec<Tool>,
     /// Repos whose role could not be derived. Absence is not evidence — a
     /// repo with an unreadable identity is reported, never silently skipped.
@@ -97,33 +91,9 @@ pub struct SystemView {
     pub scans: Vec<Scan>,
 }
 
-/// Derive the whole system concurrently: one `toimija context` and one
-/// `toimija sessions` per repo, in parallel, order preserved.
-pub fn system_view(repos: &[PathBuf]) -> SystemView {
-    std::thread::scope(|scope| {
-        let tools_handle = scope.spawn(|| {
-            let mut tools: Vec<Tool> = repos.iter().map(|repo| Tool::derive(repo)).collect();
-            tools.sort_by(|a, b| a.name.cmp(&b.name));
-            tools
-        });
-        let scans = scan_fleet(repos);
-        let tools = tools_handle.join().expect("tool derivation panicked");
-        let unknown = tools
-            .iter()
-            .filter(|tool| tool.role.is_none())
-            .map(|tool| tool.path.clone())
-            .collect();
-        SystemView {
-            tools,
-            unknown,
-            scans,
-        }
-    })
-}
-
-/// Use the launch preflight's observations instead of scanning the fleet again.
-/// Repositories not selected are unobserved, not empty.
-pub fn scoped_view(repos: &[PathBuf], scans: Vec<Scan>) -> SystemView {
+/// The perimeter of `repos`, with the sessions the launch already asked
+/// about. Repositories not selected are unobserved, not empty.
+pub fn scoped_view(repos: &[PathBuf], scans: Vec<Scan>) -> Perimeter {
     let mut tools: Vec<_> = repos.iter().map(|repo| Tool::derive(repo)).collect();
     tools.sort_by(|a, b| a.name.cmp(&b.name));
     let unknown = tools
@@ -131,20 +101,16 @@ pub fn scoped_view(repos: &[PathBuf], scans: Vec<Scan>) -> SystemView {
         .filter(|t| t.role.is_none())
         .map(|t| t.path.clone())
         .collect();
-    SystemView {
+    Perimeter {
         tools,
         unknown,
         scans,
     }
 }
 
-impl SystemView {
-    fn scan_for(&self, tool: &Tool) -> Option<&Scan> {
-        self.scans.iter().find(|scan| scan.repo == tool.path)
-    }
-
+impl Perimeter {
     /// Exit code: 0 when every role was derived and every scan saw clearly,
-    /// 4 otherwise. Same honesty rule as `fleet`.
+    /// 4 otherwise.
     pub fn exit_code(&self) -> i32 {
         let scans_incomplete = self
             .scans
@@ -158,88 +124,18 @@ impl SystemView {
     }
 }
 
-/// Render `ohjaa system` for humans.
-pub fn render_system(view: &SystemView) -> String {
-    use std::fmt::Write;
-
-    let mut out = String::from("system perimeter — derived now, stored never\n\n");
-    for tool in &view.tools {
-        let _ = writeln!(out, "{}", tool.name);
-        let _ = writeln!(out, "  path: {}", tool.path.display());
-        match &tool.role {
-            Some(role) => {
-                let _ = writeln!(out, "  role: {role}");
-                if !tool.not.is_empty() {
-                    let _ = writeln!(out, "  not:  {}", tool.not.join(", "));
-                }
-            }
-            None => {
-                let _ = writeln!(out, "  role: unknown — could not be derived");
-            }
-        }
-        if let Some(scan) = view.scan_for(tool) {
-            if scan.coverage != crate::scan::Coverage::Available {
-                let _ = writeln!(
-                    out,
-                    "  sessions: incomplete — {}",
-                    crate::coverage_detail(scan)
-                );
-            }
-            let occupying: Vec<&Session> = scan.occupying().collect();
-            if occupying.is_empty() && scan.coverage == crate::scan::Coverage::Available {
-                let _ = writeln!(out, "  sessions: none reported");
-            } else if !occupying.is_empty() {
-                let _ = writeln!(out, "  possibly running sessions: {}", occupying.len());
-                for session in occupying {
-                    let intent = if session.intent.is_empty() {
-                        "(undeclared)"
-                    } else {
-                        &session.intent
-                    };
-                    let _ = writeln!(
-                        out,
-                        "    {}  {}  \"{}\"  {}  seen {}",
-                        session.agent,
-                        session.id,
-                        intent,
-                        session.liveness,
-                        crate::scan::ago(session.idle_seconds)
-                    );
-                }
-            }
-        } else {
-            out.push_str("  sessions: unknown — no scan available\n");
-        }
-        out.push('\n');
-    }
-    if !view.unknown.is_empty() {
-        out.push_str(
-            "roles could not be derived for every repo — absence here is not\n\
-             evidence of absence:\n",
-        );
-        for path in &view.unknown {
-            let _ = writeln!(out, "  {}", path.display());
-        }
-    }
-    out
-}
-
 /// Compose the launch perimeter: a compact part of the briefing that travels
 /// in `toimija run --briefing`, so the agent starts already knowing what system it
 /// operates in — and how to re-derive every claim in it.
-pub fn briefing(view: &SystemView, here: &Path) -> String {
+pub fn briefing(view: &Perimeter, here: &Path) -> String {
     use std::fmt::Write;
 
     let mut out = String::from(
-        "System perimeter (derived by ohjaa at launch; re-derive with\n\
-         `ohjaa system`, who is live via `toimija sessions`):\n\n\
+        "System perimeter (derived by ohjaa at launch; who is live: `toimija sessions`):\n\n\
          Repositories — each tool self-declares its role in its repo:\n",
     );
     for tool in &view.tools {
-        let role = tool
-            .role
-            .as_deref()
-            .unwrap_or("role not derivable — see `ohjaa system`");
+        let role = tool.role.as_deref().unwrap_or("role not derivable");
         let marker = if tool.path == here {
             "  <- you are here"
         } else {
@@ -327,7 +223,7 @@ mod tests {
     use super::*;
     use crate::scan::Coverage;
 
-    const CONTEXT: &str =
+    const IDENTITY: &str =
         r#"{"repo":{"name":"tasker","role":"durable task contract","not_roles":["inbox"]}}"#;
 
     fn tool(name: &str, role: Option<&str>) -> Tool {
@@ -335,30 +231,28 @@ mod tests {
             path: PathBuf::from(format!("/fleet/{name}")),
             name: name.into(),
             role: role.map(String::from),
-            not: vec!["inbox".into()],
         }
     }
 
     #[test]
-    fn a_tool_identity_comes_from_its_own_context_json() {
-        let tool = parse_context(Path::new("/fleet/tasker"), CONTEXT).unwrap();
+    fn a_tool_identity_comes_from_its_own_identity_json() {
+        let tool = parse_identity(Path::new("/fleet/tasker"), IDENTITY).unwrap();
         assert_eq!(tool.name, "tasker");
         assert_eq!(tool.role.as_deref(), Some("durable task contract"));
-        assert_eq!(tool.not, vec!["inbox".to_string()]);
 
-        // Nothing derivable is not a wrong guess: a context without a repo
-        // section is not an identity, and unparseable output is nothing at
+        // Nothing derivable is not a wrong guess: an identity without a repo
+        // section is not one, and unparseable output is nothing at
         // all — both fall back to an unknown role in `Tool::derive`.
-        assert!(parse_context(Path::new("/fleet/x"), "{}").is_none());
-        assert!(parse_context(Path::new("/fleet/x"), "not json").is_none());
+        assert!(parse_identity(Path::new("/fleet/x"), "{}").is_none());
+        assert!(parse_identity(Path::new("/fleet/x"), "not json").is_none());
     }
 
     /// toimija writes `"role": null` for a repo.yaml that declares no role
-    /// (its `RepoInfo.role` is an `Option`): the repo keeps its name and what
-    /// it is not, and only its role is unknown. This is toimija's own output,
+    /// (its `RepoInfo.role` is an `Option`): the repo keeps its name, and only
+    /// its role is unknown. This is toimija's own output,
     /// byte for byte, for `name: tasker` and `not: [inbox]`.
     #[test]
-    fn a_repo_that_declares_no_role_keeps_its_name_and_what_it_is_not() {
+    fn a_repo_that_declares_no_role_keeps_its_name() {
         const NO_ROLE: &str = r#"{
   "schema": "toimija-identity.v1",
   "repo": {
@@ -374,16 +268,15 @@ mod tests {
   }
 }
 "#;
-        let tool = parse_context(Path::new("/fleet/tasker-checkout"), NO_ROLE)
+        let tool = parse_identity(Path::new("/fleet/tasker-checkout"), NO_ROLE)
             .expect("an identity with no role is still an identity");
         assert_eq!(tool.name, "tasker");
         assert_eq!(tool.role, None);
-        assert_eq!(tool.not, vec!["inbox".to_string()]);
     }
 
     #[test]
     fn the_briefing_preserves_session_liveness_and_marks_home() {
-        let mut view = SystemView {
+        let mut view = Perimeter {
             tools: vec![
                 tool("tasker", Some("durable task contract")),
                 tool("kelo", None),
@@ -433,33 +326,21 @@ mod tests {
             "an underivable role makes it incomplete"
         );
 
-        let rendered = render_system(&view);
-        assert!(rendered.contains("role: unknown"), "{rendered}");
-        assert!(
-            rendered.contains("possibly running sessions: 1"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("stale  seen 10m ago"), "{rendered}");
-
         for liveness in ["active", "unknown", "suspended", "closed"] {
             view.scans[0].sessions[0].liveness = liveness.into();
-            for text in [
-                briefing(&view, Path::new("/fleet/tasker")),
-                render_system(&view),
-            ] {
-                assert!(!text.contains("Live now"), "{text}");
-                if liveness == "closed" {
-                    assert!(!text.contains("change the parser"), "{text}");
-                } else {
-                    assert!(text.contains(liveness), "{text}");
-                }
+            let text = briefing(&view, Path::new("/fleet/tasker"));
+            assert!(!text.contains("Live now"), "{text}");
+            if liveness == "closed" {
+                assert!(!text.contains("change the parser"), "{text}");
+            } else {
+                assert!(text.contains(liveness), "{text}");
             }
         }
     }
 
     #[test]
     fn a_fully_derived_quiet_fleet_is_complete() {
-        let mut view = SystemView {
+        let mut view = Perimeter {
             tools: vec![tool("tasker", Some("durable task contract"))],
             unknown: vec![],
             scans: vec![Scan {
@@ -483,17 +364,12 @@ mod tests {
             view.scans[0].coverage = coverage;
             view.scans[0].error = Some("cannot inspect sessions".into());
             assert_eq!(view.exit_code(), 4);
-            for text in [
-                briefing(&view, Path::new("/fleet/tasker")),
-                render_system(&view),
-            ] {
-                assert!(
-                    text.contains("incomplete — cannot inspect sessions"),
-                    "{text}"
-                );
-                assert!(!text.contains("sessions: none reported"), "{text}");
-                assert!(!text.contains("nobody"), "{text}");
-            }
+            let text = briefing(&view, Path::new("/fleet/tasker"));
+            assert!(
+                text.contains("incomplete — cannot inspect sessions"),
+                "{text}"
+            );
+            assert!(!text.contains("nobody"), "{text}");
         }
     }
 }

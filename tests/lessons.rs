@@ -1,14 +1,13 @@
-//! Repository knowledge reaches the repository's own AGENTS.md through a
-//! pull request: `ohjaa lessons publish` for the nodes accepted before, still
-//! in `<repo>/.ohjaa/knowledge/`, and a person's `ohjaa accept` (at a real
-//! terminal) for a repo proposal.
+//! Repository knowledge reaches the repository's own AGENTS.md through
+//! `ohjaa lessons`, which writes the `## Lessons` section into a working
+//! copy for the person to commit and push. A person's `ohjaa accept` (at a
+//! real terminal) keeps a repo node in ohjaa's state, and writes nothing
+//! into the repository.
 //!
-//! Never the real gh and never the network: a stub gh on PATH, a local bare
-//! repository as the remote (git's `insteadOf` turns the GitHub URL the
-//! checkout names into it), and `GIT_ALLOW_PROTOCOL=file`, so a rule that did
-//! not apply fails instead of reaching GitHub. Sandboxed as the CLI tests
-//! are, in an emptied environment: HOME, XDG_CONFIG_HOME, XDG_STATE_HOME,
-//! OHJAA_OURS and git's global config are all the test's own.
+//! Never the network: the checkout's origin is a local bare repository, and
+//! a gh stub first on PATH records any call, which no test may see. Sandboxed
+//! as the CLI tests are, in an emptied environment: HOME, XDG_CONFIG_HOME,
+//! XDG_STATE_HOME, OHJAA_OURS and git's global config are all the test's own.
 
 #![cfg(unix)]
 
@@ -22,82 +21,30 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Never the real gh. Each call's arguments go to `$STUB_GH/calls`.
-/// `repo view <owner>/<name>` says the visibility in
-/// `$STUB_GH/visibility.<owner>.<name>`, else `$STUB_GH/visibility` (and
-/// `main`), or, with `$STUB_GH/signed-out`, that gh is not signed in; `api
-/// user` prints `$STUB_GH/user.json` and `api user/repos?…`
-/// `$STUB_GH/repos.json`; `pr list` prints `$STUB_GH/open.json`; `pr create`
-/// keeps its body (stdin) in `$STUB_GH/body-<n>`, its repo, base and head in
-/// `$STUB_GH/created`, makes it the open one and prints its URL. With
-/// STUB_PROBE set, `pr create` first runs `$STUB_PROBE apply --undo` (an
-/// ohjaa change to the home: it waits while another holds the home's lock)
-/// into `$STUB_GH/probe`.
+/// Never the real gh: each call's arguments go to `$STUB_GH/calls`, and it
+/// fails. Ohjaa calls no gh, so no test may find that file.
 const GH_STUB: &str = r#"#!/bin/sh
-d="$STUB_GH"
-printf '%s\n' "$*" >> "$d/calls"
-case "$1 $2" in
-  "repo view")
-    if [ -f "$d/signed-out" ]; then
-      echo "To get started with GitHub CLI, please run:  gh auth login" >&2
-      exit 4
-    fi
-    own="$d/visibility.$(printf '%s' "$3" | tr '/' '.')"
-    if [ -f "$own" ]; then visibility=$(cat "$own"); else visibility=$(cat "$d/visibility"); fi
-    printf '{"visibility":"%s","defaultBranchRef":{"name":"main"}}\n' "$visibility"
-    exit 0;;
-  "api user") cat "$d/user.json"; exit 0;;
-  "api user/repos"*) cat "$d/repos.json"; exit 0;;
-  "pr list") cat "$d/open.json"; exit 0;;
-  "pr create")
-    if [ -n "${STUB_PROBE:-}" ]; then "$STUB_PROBE" apply --undo > "$d/probe" 2>&1; fi
-    repo=""; head=""; base=""
-    while [ $# -gt 0 ]; do
-      case "$1" in
-        -R|--repo) repo="$2"; shift;;
-        --head) head="$2"; shift;;
-        --base) base="$2"; shift;;
-      esac
-      shift
-    done
-    n=$(( $(cat "$d/created" 2>/dev/null | wc -l) + 41 ))
-    cat > "$d/body-$n"
-    printf '%s %s %s\n' "$repo" "$base" "$head" >> "$d/created"
-    printf '[{"number":%s,"url":"https://github.com/%s/pull/%s","headRefName":"%s","isCrossRepository":false}]\n' \
-      "$n" "$repo" "$n" "$head" > "$d/open.json"
-    printf 'https://github.com/%s/pull/%s\n' "$repo" "$n"
-    exit 0;;
-esac
+printf '%s\n' "$*" >> "$STUB_GH/calls"
 echo "gh stub: not expected: $*" >&2
 exit 64
 "#;
 
-/// The person, as gh is signed in.
-const USER: &str = r#"{"login":"octo-gh","name":"Octo Cat"}"#;
-
-/// The person's repositories, as GitHub lists them to gh: two pages, with
-/// a public one. `widget` is also the name of the repository the lessons go
-/// to: its own name is no secret there.
-const REPOS: &str = concat!(
-    r#"[{"name":"secret-thing","full_name":"octo-gh/secret-thing","visibility":"private"},"#,
-    r#"{"name":"ink","full_name":"acme/ink","visibility":"internal"},"#,
-    r#"{"name":"open-thing","full_name":"acme/open-thing","visibility":"public"}]"#,
-    "\n",
-    r#"[{"name":"widget","full_name":"acme/widget"},"#,
-    r#"{"name":"ohjaa","full_name":"acme/ohjaa","visibility":"private"}]"#,
-    "\n"
-);
-
 const AGENTS: &str = "# Agent guide\n\nRead this first.\n\n## Languages\n\nRust.\n";
 
-/// Never the real toimija: no sessions anywhere, no context.
+/// Never the real toimija: no sessions anywhere, no identity.
 const TOIMIJA_STUB: &str = r#"#!/bin/sh
 case "$1" in
   sessions) echo '{"sessions":[],"warnings":[],"coverage":{"status":"available"}}';;
-  context) echo '{}';;
+  enter) echo '{}';;
 esac
 exit 0
 "#;
+
+/// The node most tests write into AGENTS.md.
+const RUST: &str = "Widget code is Rust.";
+/// Its line in the section.
+const RUST_LINE: &str =
+    "- <!-- lesson: widget-uses-rust --> **decision**: Widget code is Rust. (as of 2026-10-20)";
 
 /// Write an executable that no process holds open for writing when it runs:
 /// this process writes only the text, beside it, and `cp` writes the
@@ -113,8 +60,7 @@ fn write_executable(path: &Path, text: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A git this machine has, by absolute path, for a PATH that holds nothing
-/// else.
+/// A git this machine has, by absolute path.
 fn real_git() -> PathBuf {
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
@@ -151,68 +97,31 @@ impl World {
         ));
         fs::create_dir_all(&dir).unwrap();
         let dir = fs::canonicalize(&dir).unwrap();
-        // The home folder's name is the person's account: `octocat`.
         let home = dir.join("homes/octocat");
-        for sub in [
-            "config",
-            "state",
-            "bin",
-            "only-git",
-            "ours",
-            "gh",
-            "projects",
-            "remote/acme",
-        ] {
+        for sub in ["config", "state", "bin", "ours", "gh", "projects", "remote"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
         fs::create_dir_all(&home).unwrap();
-        let remote = dir.join("remote/acme/widget.git");
         fs::write(
             home.join("gitconfig"),
-            format!(
-                "[user]\n\tname = Octo Cat\n\temail = octo@example.invalid\n\
-                 [init]\n\tdefaultBranch = main\n\
-                 [url \"file://{}\"]\n\tinsteadOf = https://github.com/acme/widget.git\n",
-                remote.display()
-            ),
+            "[user]\n\tname = Octo Cat\n\temail = octo@example.invalid\n\
+             [init]\n\tdefaultBranch = main\n",
         )
         .unwrap();
         write_executable(&dir.join("bin/gh"), GH_STUB);
         write_executable(&dir.join("bin/toimija"), TOIMIJA_STUB);
-        write_executable(
-            &dir.join("only-git/git"),
-            &format!("#!/bin/sh\nexec {} \"$@\"\n", real_git().display()),
-        );
-        fs::write(dir.join("gh/visibility"), "PRIVATE").unwrap();
-        fs::write(dir.join("gh/user.json"), USER).unwrap();
-        fs::write(dir.join("gh/repos.json"), REPOS).unwrap();
-        fs::write(dir.join("gh/open.json"), "[]\n").unwrap();
         let world = World {
+            remote: dir.join("remote/widget.git"),
             checkout: dir.join("projects/widget"),
             dir,
             home,
-            remote,
         };
-        world.git(
-            &world.dir,
-            &[
-                "init",
-                "-q",
-                "--bare",
-                "-b",
-                "main",
-                world.remote.to_str().unwrap(),
-            ],
-        );
+        let remote = world.remote.to_str().unwrap().to_owned();
+        world.git(&world.dir, &["init", "-q", "--bare", "-b", "main", &remote]);
         let seed = world.dir.join("seed");
         world.git(
             &world.dir,
-            &[
-                "clone",
-                "-q",
-                "https://github.com/acme/widget.git",
-                seed.to_str().unwrap(),
-            ],
+            &["clone", "-q", &remote, seed.to_str().unwrap()],
         );
         fs::write(seed.join("AGENTS.md"), AGENTS).unwrap();
         world.git(&seed, &["add", "AGENTS.md"]);
@@ -220,12 +129,7 @@ impl World {
         world.git(&seed, &["push", "-q", "origin", "HEAD:main"]);
         world.git(
             &world.dir.join("projects"),
-            &[
-                "clone",
-                "-q",
-                "https://github.com/acme/widget.git",
-                "widget",
-            ],
+            &["clone", "-q", &remote, "widget"],
         );
         world
     }
@@ -285,13 +189,6 @@ impl World {
         command
     }
 
-    /// [`World::ohjaa`] with a PATH that has git and no gh at all.
-    fn ohjaa_without_gh(&self, cwd: &Path) -> Command {
-        let mut command = self.ohjaa(cwd);
-        command.env("PATH", self.dir.join("only-git"));
-        command
-    }
-
     fn run(&self, command: &mut Command) -> (String, String, Option<i32>) {
         let output = command.output().unwrap();
         (
@@ -301,13 +198,19 @@ impl World {
         )
     }
 
-    fn publish(&self, args: &[&str]) -> (String, String, Option<i32>) {
-        let mut command = self.ohjaa(&self.checkout);
-        command.args(["lessons", "publish"]).args(args);
+    /// `ohjaa lessons` with `args`, run in `cwd`.
+    fn lessons_in(&self, cwd: &Path, args: &[&str]) -> (String, String, Option<i32>) {
+        let mut command = self.ohjaa(cwd);
+        command.arg("lessons").args(args);
         self.run(&mut command)
     }
 
-    /// A node accepted before ohjaa wrote lessons into AGENTS.md: an
+    /// `ohjaa lessons` with `args`, run in the checkout.
+    fn lessons(&self, args: &[&str]) -> (String, String, Option<i32>) {
+        self.lessons_in(&self.checkout, args)
+    }
+
+    /// A node accepted before ohjaa kept repo knowledge in its state: an
     /// untracked file in the checkout.
     fn legacy(&self, id: &str, kind: &str, body: &str) -> PathBuf {
         let dir = self.checkout.join(".ohjaa/knowledge");
@@ -317,28 +220,21 @@ impl World {
         path
     }
 
-    fn set_visibility(&self, visibility: &str) {
-        fs::write(self.dir.join("gh/visibility"), visibility).unwrap();
+    /// The checkout's AGENTS.md as it is now.
+    fn agents_md(&self) -> String {
+        fs::read_to_string(self.checkout.join("AGENTS.md")).unwrap()
     }
 
-    fn gh_calls(&self) -> String {
-        fs::read_to_string(self.dir.join("gh/calls")).unwrap_or_default()
-    }
-
-    fn created(&self) -> Vec<String> {
-        fs::read_to_string(self.dir.join("gh/created"))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    }
-
-    fn body(&self, number: u32) -> String {
-        fs::read_to_string(self.dir.join(format!("gh/body-{number}"))).unwrap()
-    }
-
-    fn remote_heads(&self) -> Vec<String> {
-        self.git(
+    /// Ohjaa called no gh, and pushed nothing: the remote's main is where
+    /// the seed put it.
+    fn sent_nothing(&self) {
+        let calls = self.dir.join("gh/calls");
+        assert!(
+            !calls.exists(),
+            "gh was called: {}",
+            fs::read_to_string(&calls).unwrap_or_default()
+        );
+        let heads = self.git(
             &self.dir,
             &[
                 "--git-dir",
@@ -347,46 +243,20 @@ impl World {
                 "--format=%(refname:short)",
                 "refs/heads",
             ],
-        )
-        .lines()
-        .map(str::to_owned)
-        .collect()
-    }
-
-    /// The one branch ohjaa pushed for lessons.
-    fn lessons_branch(&self) -> String {
-        let heads: Vec<String> = self
-            .remote_heads()
-            .into_iter()
-            .filter(|head| head.starts_with("agents-md-lessons/"))
-            .collect();
-        assert_eq!(heads.len(), 1, "{heads:?}");
-        heads[0].clone()
-    }
-
-    fn remote_show(&self, rev: &str) -> String {
-        self.git(
-            &self.dir,
-            &[
-                "--git-dir",
-                self.remote.to_str().unwrap(),
-                "show",
-                &format!("{rev}:AGENTS.md"),
-            ],
-        )
-    }
-
-    fn remote_log(&self, rev: &str) -> String {
-        self.git(
-            &self.dir,
-            &[
-                "--git-dir",
-                self.remote.to_str().unwrap(),
-                "log",
-                "--format=%H %P%n%B",
-                rev,
-            ],
-        )
+        );
+        assert_eq!(heads, "main\n", "nothing is pushed");
+        assert_eq!(
+            self.git(
+                &self.dir,
+                &[
+                    "--git-dir",
+                    self.remote.to_str().unwrap(),
+                    "show",
+                    "main:AGENTS.md"
+                ]
+            ),
+            AGENTS
+        );
     }
 
     /// The folder ohjaa keeps the checkout's accepted lessons in.
@@ -395,82 +265,14 @@ impl World {
         let clones: Vec<PathBuf> = fs::read_dir(&dir)
             .unwrap_or_else(|_| panic!("no {}", dir.display()))
             .map(|entry| entry.unwrap().path())
-            .filter(|path| {
-                path.is_dir() && !path.file_name().unwrap().to_string_lossy().starts_with('.')
-            })
+            .filter(|path| path.is_dir())
             .collect();
         assert_eq!(clones.len(), 1, "{clones:?}");
         clones[0].clone()
     }
 
-    fn delivery(&self) -> serde_json::Value {
-        serde_json::from_str(&fs::read_to_string(self.accepted().join("delivery.json")).unwrap())
-            .unwrap()
-    }
-
-    /// Every file under the sandbox with its bytes, but the stub's own log:
-    /// what a run that writes nothing leaves exactly as it was.
-    fn snapshot(&self) -> Vec<(PathBuf, Vec<u8>)> {
-        fn walk(dir: &Path, skip: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
-            let mut entries: Vec<PathBuf> = fs::read_dir(dir)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .collect();
-            entries.sort();
-            for path in entries {
-                if path == skip {
-                    continue;
-                }
-                let meta = fs::symlink_metadata(&path).unwrap();
-                if meta.is_dir() {
-                    out.push((path.clone(), Vec::new()));
-                    walk(&path, skip, out);
-                } else {
-                    out.push((path.clone(), fs::read(&path).unwrap_or_default()));
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(&self.dir, &self.dir.join("gh/calls"), &mut out);
-        out
-    }
-
-    /// Delivered, merged into main and pulled into the checkout: AGENTS.md
-    /// as checked out holds the lines.
-    fn merged(&self) {
-        let (stdout, stderr, code) = self.publish(&[]);
-        assert_eq!(code, Some(0), "{stdout}{stderr}");
-        let branch = self.lessons_branch();
-        self.git(
-            &self.dir,
-            &[
-                "--git-dir",
-                self.remote.to_str().unwrap(),
-                "update-ref",
-                "refs/heads/main",
-                &format!("refs/heads/{branch}"),
-            ],
-        );
-        self.git(&self.checkout, &["pull", "-q", "--ff-only"]);
-    }
-
-    /// `ohjaa brief --knowledge-only [--agent <agent>]` in the checkout, with
-    /// `env` set: what it printed.
-    fn brief(&self, agent: Option<&str>, env: &[(&str, &str)]) -> String {
-        let mut brief = self.ohjaa(&self.checkout);
-        brief.args(["brief", "--knowledge-only"]);
-        if let Some(agent) = agent {
-            brief.args(["--agent", agent]);
-        }
-        for (key, value) in env {
-            brief.env(key, value);
-        }
-        let (briefing, stderr, code) = self.run(&mut brief);
-        assert_eq!(code, Some(0), "{stderr}");
-        briefing
-    }
-
-    /// [`World::brief`], launched in `dir` (a folder of the checkout).
+    /// `ohjaa brief --knowledge-only [--agent <agent>]` in `dir`, with `env`
+    /// set: what it printed.
     fn brief_in(&self, dir: &Path, agent: Option<&str>, env: &[(&str, &str)]) -> String {
         let mut brief = self.ohjaa(dir);
         brief.args(["brief", "--knowledge-only"]);
@@ -485,6 +287,19 @@ impl World {
         briefing
     }
 
+    /// [`World::brief_in`], in the checkout.
+    fn brief(&self, agent: Option<&str>, env: &[(&str, &str)]) -> String {
+        self.brief_in(&self.checkout, agent, env)
+    }
+
+    fn list(&self) -> String {
+        let mut list = self.ohjaa(&self.checkout);
+        list.arg("list");
+        let (listed, stderr, code) = self.run(&mut list);
+        assert_eq!(code, Some(0), "{stderr}");
+        listed
+    }
+
     /// Write `text` at `path` in the checkout, its folders made.
     fn put(&self, path: &str, text: &str) {
         let file = self.checkout.join(path);
@@ -492,11 +307,13 @@ impl World {
         fs::write(file, text).unwrap();
     }
 
-    fn worktrees(&self) -> usize {
-        self.git(&self.checkout, &["worktree", "list", "--porcelain"])
-            .lines()
-            .filter(|line| line.starts_with("worktree "))
-            .count()
+    /// A decision at a terminal, as a person makes it.
+    fn decide(&self, args: &[&str]) -> String {
+        let mut decide = self.ohjaa(&self.checkout);
+        decide.args(args);
+        let (said, code) = at_terminal(decide);
+        assert_eq!(code, Some(0), "{args:?}: {said}");
+        said
     }
 }
 
@@ -595,427 +412,7 @@ fn at_terminal(mut command: Command) -> (String, Option<i32>) {
     (said, code)
 }
 
-#[test]
-fn a_dry_run_says_what_it_would_write_and_changes_nothing() {
-    let world = World::new("dry");
-    world.legacy("widget-uses-rust", "decision", "Widget code is Rust.");
-    world.legacy(
-        "widget-tests-first",
-        "lesson",
-        "Write the failing test first.",
-    );
-    let before = world.snapshot();
-    let (stdout, stderr, code) = world.publish(&["--dry-run"]);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    assert!(stdout.contains("acme/widget"), "{stdout}");
-    assert!(stdout.contains("private"), "{stdout}");
-    for line in [
-        "- <!-- lesson: widget-uses-rust --> **decision**: Widget code is Rust. (as of 2026-10-20)",
-        "- <!-- lesson: widget-tests-first --> **lesson**: Write the failing test first. (as of 2026-10-20)",
-    ] {
-        assert!(stdout.contains(line), "the line it would add: {stdout}");
-    }
-    assert!(stdout.contains("would open a pull request"), "{stdout}");
-    // What each agent would get once it merges: no CLAUDE.md imports it here.
-    assert!(
-        stdout.contains("once merged, Claude Code: carried in the briefing"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("once merged, Codex: left to AGENTS.md"),
-        "{stdout}"
-    );
-    assert!(
-        world.snapshot() == before,
-        "a dry run writes nothing: no state, no file, no ref, no worktree"
-    );
-    assert!(!world.dir.join("state/ohjaa").exists());
-    let calls = world.gh_calls();
-    assert!(!calls.contains("pr create"), "{calls}");
-    assert_eq!(world.remote_heads(), vec!["main"]);
-}
-
-#[test]
-fn publish_opens_one_pull_request_then_moves_each_file_out_of_the_checkout() {
-    let world = World::new("publish");
-    let rust = world.legacy("widget-uses-rust", "decision", "Widget code is Rust.");
-    let first = world.legacy(
-        "widget-tests-first",
-        "lesson",
-        "Write the failing test\nfirst.",
-    );
-    let head = world.git(&world.checkout, &["rev-parse", "HEAD"]);
-    // Where origin pushes to is not where the pull request is: git goes to
-    // the repository on GitHub itself.
-    world.git(
-        &world.checkout,
-        &[
-            "config",
-            "remote.origin.pushurl",
-            "file:///nowhere/at/all.git",
-        ],
-    );
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    assert!(
-        stdout.contains("opened https://github.com/acme/widget/pull/41"),
-        "{stdout}"
-    );
-
-    // One pull request, from a branch of its own, onto main.
-    let branch = world.lessons_branch();
-    assert_eq!(
-        world.created(),
-        vec![format!("acme/widget main {branch}")],
-        "{}",
-        world.gh_calls()
-    );
-    // The section, after everything the file held, kept as it was; one line
-    // per node, decisions first, the body on one line.
-    let agents = world.remote_show(&branch);
-    assert!(agents.starts_with(AGENTS), "{agents}");
-    let section = &agents[AGENTS.len()..];
-    assert!(
-        section.starts_with("\n## Lessons\n\n<!-- This repository's accepted knowledge"),
-        "{agents}"
-    );
-    let decision = section
-        .find("- <!-- lesson: widget-uses-rust --> **decision**: Widget code is Rust. (as of 2026-10-20)\n")
-        .expect(&agents);
-    let lesson = section
-        .find("- <!-- lesson: widget-tests-first --> **lesson**: Write the failing test first. (as of 2026-10-20)\n")
-        .expect(&agents);
-    assert!(decision < lesson, "{agents}");
-    assert!(agents.ends_with("(as of 2026-10-20)\n"), "{agents}");
-    // A private repository's pull request says why each was accepted.
-    let body = world.body(41);
-    assert!(body.contains("widget-uses-rust"), "{body}");
-    assert!(body.contains("why widget-uses-rust was accepted"), "{body}");
-    // The person's main is untouched: only the branch moved.
-    assert_eq!(world.remote_show("main"), AGENTS);
-
-    // Nothing is left in the checkout, and nothing is lost.
-    assert!(!rust.exists() && !first.exists());
-    assert!(!world.checkout.join(".ohjaa").exists());
-    assert_eq!(world.git(&world.checkout, &["rev-parse", "HEAD"]), head);
-    assert_eq!(
-        world.git(&world.checkout, &["status", "--porcelain"]),
-        "",
-        "the person's checkout is as it was"
-    );
-    assert_eq!(world.worktrees(), 1, "the worktree it wrote in is gone");
-    let accepted = world.accepted();
-    assert_eq!(
-        fs::read_to_string(accepted.join("widget-uses-rust.md")).unwrap(),
-        node_text("widget-uses-rust", "decision", "Widget code is Rust.")
-    );
-    let delivery = world.delivery();
-    let entry = &delivery["nodes"]["widget-uses-rust"];
-    assert_eq!(entry["state"], "pr", "{delivery}");
-    assert_eq!(entry["url"], "https://github.com/acme/widget/pull/41");
-    let moved = &delivery["moved"]["widget-uses-rust"];
-    assert_eq!(moved["from"], rust.to_str().unwrap(), "{delivery}");
-    assert_eq!(moved["url"], "https://github.com/acme/widget/pull/41");
-
-    // Until it merges, the briefing carries them, marked; `list` says so.
-    let mut brief = world.ohjaa(&world.checkout);
-    brief.args(["brief", "--knowledge-only"]);
-    let (briefing, stderr, code) = world.run(&mut brief);
-    assert_eq!(code, Some(0), "{stderr}");
-    assert!(briefing.contains("Widget code is Rust."), "{briefing}");
-    assert!(
-        briefing.contains("pending PR https://github.com/acme/widget/pull/41"),
-        "{briefing}"
-    );
-    let mut list = world.ohjaa(&world.checkout);
-    list.arg("list");
-    let (listed, stderr, code) = world.run(&mut list);
-    assert_eq!(code, Some(0), "{stderr}");
-    assert!(
-        listed.contains("pending PR https://github.com/acme/widget/pull/41"),
-        "{listed}"
-    );
-
-    // Merged and pulled: the agent reads them in AGENTS.md, so the briefing
-    // no longer repeats them, and says where they are.
-    world.git(
-        &world.dir,
-        &[
-            "--git-dir",
-            world.remote.to_str().unwrap(),
-            "update-ref",
-            "refs/heads/main",
-            &format!("refs/heads/{branch}"),
-        ],
-    );
-    world.git(&world.checkout, &["pull", "-q", "--ff-only"]);
-    // For an agent that reads AGENTS.md (Codex).
-    let briefing = world.brief(Some("codex"), &[]);
-    assert!(!briefing.contains("Widget code is Rust."), "{briefing}");
-    assert!(!briefing.contains("failing test"), "{briefing}");
-    assert!(briefing.contains("AGENTS.md"), "{briefing}");
-    let mut list = world.ohjaa(&world.checkout);
-    list.arg("list");
-    let (listed, _, _) = world.run(&mut list);
-    assert!(listed.contains("in AGENTS.md"), "{listed}");
-    // Only the person's own lessons pull request is added to.
-    assert!(
-        world
-            .gh_calls()
-            .lines()
-            .filter(|call| call.starts_with("pr list"))
-            .all(|call| call.contains("--author @me")),
-        "{}",
-        world.gh_calls()
-    );
-
-    // A line edited by hand is not the node: the briefing carries it again.
-    let agents = world.checkout.join("AGENTS.md");
-    let edited = fs::read_to_string(&agents)
-        .unwrap()
-        .replace("Widget code is Rust.", "Widget code is anything.");
-    fs::write(&agents, edited).unwrap();
-    let briefing = world.brief(Some("codex"), &[]);
-    assert!(briefing.contains("Widget code is Rust."), "{briefing}");
-    assert!(
-        briefing.contains("AGENTS.md holds another line of it"),
-        "{briefing}"
-    );
-    assert!(!briefing.contains("failing test"), "{briefing}");
-}
-
-#[test]
-fn a_later_publish_adds_to_the_open_pull_request_and_one_with_nothing_new_changes_nothing() {
-    let world = World::new("again");
-    world.legacy("widget-uses-rust", "decision", "Widget code is Rust.");
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let branch = world.lessons_branch();
-    let tip = world.git(
-        &world.dir,
-        &[
-            "--git-dir",
-            world.remote.to_str().unwrap(),
-            "rev-parse",
-            &format!("refs/heads/{branch}"),
-        ],
-    );
-
-    world.legacy("widget-no-unwrap", "taste", "No unwrap outside tests.");
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    assert!(
-        stdout.contains("added to https://github.com/acme/widget/pull/41"),
-        "{stdout}"
-    );
-    assert_eq!(world.created().len(), 1, "no second pull request");
-    assert_eq!(world.lessons_branch(), branch, "the same branch");
-    let log = world.remote_log(&format!("refs/heads/{branch}"));
-    let newest = log.lines().next().unwrap();
-    assert!(
-        newest.ends_with(tip.trim()),
-        "a commit on top of the one before, never a force: {log}"
-    );
-    let agents = world.remote_show(&branch);
-    assert_eq!(agents.matches("<!-- lesson: ").count(), 2, "{agents}");
-    assert!(agents.contains("No unwrap outside tests."), "{agents}");
-    assert!(!world.checkout.join(".ohjaa").exists());
-    assert_eq!(
-        world.delivery()["nodes"]["widget-no-unwrap"]["url"],
-        "https://github.com/acme/widget/pull/41"
-    );
-
-    // Named again, with nothing new: no commit, no pull request.
-    let before = world.remote_log(&format!("refs/heads/{branch}"));
-    let (stdout, stderr, code) = world.publish(&[world.checkout.to_str().unwrap()]);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    assert_eq!(world.remote_log(&format!("refs/heads/{branch}")), before);
-    assert_eq!(world.created().len(), 1);
-    assert_eq!(world.worktrees(), 1);
-}
-
-#[test]
-fn a_public_repository_gets_no_line_that_names_something_private() {
-    let world = World::new("public");
-    world.set_visibility("PUBLIC");
-    world.legacy("widget-uses-rust", "decision", "Widget code is Rust.");
-    world.legacy(
-        "widget-own-name",
-        "fact",
-        "The widget repository builds a remote note: neither is private.",
-    );
-    let secret = world.legacy(
-        "widget-calls-secret",
-        "fact",
-        "The widget calls Secret-Thing's API.",
-    );
-    let path = world.legacy(
-        "widget-local-path",
-        "fact",
-        &format!("Builds land in {}/cache.", world.home.display()),
-    );
-    let person = world.legacy("widget-owner", "fact", "Octocat decides what ships.");
-
-    let (dry, stderr, code) = world.publish(&["--dry-run"]);
-    assert_eq!(code, Some(4), "held lines are not delivered: {dry}{stderr}");
-    assert!(dry.contains("PUBLIC"), "{dry}");
-    assert!(
-        dry.contains("`secret-thing`"),
-        "what matched is said: {dry}"
-    );
-    assert!(
-        dry.contains(&format!("`{}`", world.home.display())),
-        "{dry}"
-    );
-    assert!(dry.contains("`octocat`"), "{dry}");
-    assert!(!world.dir.join("state/ohjaa").exists());
-
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(stdout.contains("widget-calls-secret"), "{stdout}");
-    let branch = world.lessons_branch();
-    let agents = world.remote_show(&branch);
-    assert!(agents.contains("Widget code is Rust."), "{agents}");
-    assert!(
-        agents.contains("remote note"),
-        "its own name, and a word that only holds a private one, go: {agents}"
-    );
-    for private in ["Secret-Thing", "secret-thing", "Octocat", "octocat"] {
-        assert!(!agents.contains(private), "{private}: {agents}");
-    }
-    assert!(
-        !agents.contains(&world.home.display().to_string()),
-        "{agents}"
-    );
-    let log = world.remote_log(&format!("refs/heads/{branch}"));
-    let body = world.body(41);
-    // `pr create`'s arguments: its title among them.
-    let created = world
-        .gh_calls()
-        .lines()
-        .find(|call| call.starts_with("pr create"))
-        .unwrap()
-        .to_owned();
-    for sent in [&log, &body, &agents, &branch, &created] {
-        assert!(!sent.to_lowercase().contains("secret-thing"), "{sent}");
-        assert!(!sent.contains("widget-calls-secret"), "{sent}");
-        assert!(
-            !sent.contains("was accepted"),
-            "no origins go to a public repo: {sent}"
-        );
-        // The tool is private too: what it writes names no tool.
-        assert!(!sent.to_lowercase().contains("ohjaa"), "{sent}");
-    }
-    // What was held stays where it was, and waits; the rest moved.
-    assert!(secret.exists() && path.exists() && person.exists());
-    assert!(!world
-        .checkout
-        .join(".ohjaa/knowledge/widget-uses-rust.md")
-        .exists());
-    // `list` says why it waits.
-    let mut list = world.ohjaa(&world.checkout);
-    list.arg("list");
-    let (listed, _, _) = world.run(&mut list);
-    let held = listed
-        .lines()
-        .skip_while(|line| !line.contains("widget-calls-secret"))
-        .nth(1)
-        .unwrap_or_default()
-        .to_owned();
-    assert!(
-        held.contains("held back") && held.contains("`secret-thing`"),
-        "{listed}"
-    );
-}
-
-#[test]
-fn a_scoped_repositorys_lessons_are_carried_though_its_agents_md_holds_them() {
-    let world = World::new("scoped");
-    world.legacy("widget-uses-rust", "decision", "Widget code is Rust.");
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let branch = world.lessons_branch();
-    world.git(
-        &world.dir,
-        &[
-            "--git-dir",
-            world.remote.to_str().unwrap(),
-            "update-ref",
-            "refs/heads/main",
-            &format!("refs/heads/{branch}"),
-        ],
-    );
-    world.git(&world.checkout, &["pull", "-q", "--ff-only"]);
-    // Briefed from elsewhere, with the repository in scope: the agent is not
-    // working there, and need not read its AGENTS.md.
-    let mut brief = world.ohjaa(&world.dir);
-    brief.args([
-        "brief",
-        "--knowledge-only",
-        "--scope",
-        world.checkout.to_str().unwrap(),
-    ]);
-    let (briefing, stderr, code) = world.run(&mut brief);
-    assert_eq!(code, Some(0), "{stderr}");
-    assert!(briefing.contains("Widget code is Rust."), "{briefing}");
-    assert!(briefing.contains("in AGENTS.md too"), "{briefing}");
-}
-
-#[test]
-fn when_every_line_is_held_nothing_is_pushed() {
-    let world = World::new("allheld");
-    world.set_visibility("PUBLIC");
-    // gh does not list the tool's own repository: it is held back anyway.
-    fs::write(world.dir.join("gh/repos.json"), "[{\"name\":\"ink\"}]\n").unwrap();
-    let held = world.legacy("widget-calls-ink", "fact", "Widget calls ink.");
-    let tool = world.legacy(
-        "widget-knowledge-folder",
-        "fact",
-        "Accepted lessons sat in .ohjaa/knowledge/ before.",
-    );
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(stdout.contains("`ink`"), "{stdout}");
-    assert!(
-        stdout.contains("`ohjaa` (the name of this tool, which is private)"),
-        "{stdout}"
-    );
-    assert_eq!(world.remote_heads(), vec!["main"]);
-    assert!(!world.gh_calls().contains("pr create"));
-    assert!(held.exists() && tool.exists());
-    assert_eq!(world.worktrees(), 1);
-}
-
-#[test]
-fn without_a_remote_or_gh_nothing_moves_and_the_reason_is_said() {
-    let world = World::new("nogh");
-    let file = world.legacy("widget-uses-rust", "decision", "Widget code is Rust.");
-    let mut publish = world.ohjaa_without_gh(&world.checkout);
-    publish.args(["lessons", "publish"]);
-    let (stdout, stderr, code) = world.run(&mut publish);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(
-        format!("{stdout}{stderr}").contains("gh"),
-        "{stdout}{stderr}"
-    );
-    assert!(file.exists());
-    assert_eq!(world.remote_heads(), vec!["main"]);
-
-    world.git(&world.checkout, &["remote", "remove", "origin"]);
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(
-        format!("{stdout}{stderr}").contains("no remote named origin"),
-        "{stdout}{stderr}"
-    );
-    assert!(file.exists());
-    let mut list = world.ohjaa(&world.checkout);
-    list.arg("list");
-    let (listed, _, _) = world.run(&mut list);
-    assert!(listed.contains("not yet in AGENTS.md"), "{listed}");
-}
-
-fn propose(world: &World, id: &str, body: &str) {
+fn propose(world: &World, id: &str, body: &str, supersedes: Option<&str>) {
     let mut propose = world.ohjaa(&world.checkout);
     propose.args([
         "propose",
@@ -1027,191 +424,22 @@ fn propose(world: &World, id: &str, body: &str) {
         "decision",
         "--origin",
         "a person said so",
-        body,
     ]);
+    if let Some(old) = supersedes {
+        propose.args(["--supersedes", old]);
+    }
+    propose.arg(body);
     let (stdout, stderr, code) = world.run(&mut propose);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
 }
 
-#[test]
-fn accepting_a_repo_proposal_at_a_terminal_opens_the_pull_request() {
-    let world = World::new("accept");
-    propose(&world, "widget-uses-rust", "Widget code is Rust.");
-    let mut accept = world.ohjaa(&world.checkout);
-    accept.args(["accept", "widget-uses-rust"]);
-    let (said, code) = at_terminal(accept);
-    assert_eq!(code, Some(0), "{said}");
-    assert!(
-        said.contains("opened https://github.com/acme/widget/pull/41"),
-        "{said}"
-    );
-    assert!(
-        !said.contains("commit it and open a pull request"),
-        "ohjaa opened it: {said}"
-    );
-    assert!(
-        !world.checkout.join(".ohjaa").exists(),
-        "nothing is written into the checkout"
-    );
-    let branch = world.lessons_branch();
-    let agents = world.remote_show(&branch);
-    assert!(
-        agents.contains(
-            "- <!-- lesson: widget-uses-rust --> **decision**: Widget code is Rust. (as of 2026-10-27)"
-        ),
-        "{agents}"
-    );
-    assert!(world.accepted().join("widget-uses-rust.md").is_file());
-    assert_eq!(world.delivery()["nodes"]["widget-uses-rust"]["state"], "pr");
-    assert_eq!(world.worktrees(), 1);
-
-    // Retired, its line leaves the open pull request's branch.
-    let mut retire = world.ohjaa(&world.checkout);
-    retire.args(["retire", "widget-uses-rust", "--why", "the widget is gone"]);
-    let (said, code) = at_terminal(retire);
-    assert_eq!(code, Some(0), "{said}");
-    assert!(
-        said.contains("added to https://github.com/acme/widget/pull/41"),
-        "{said}"
-    );
-    assert!(!world.remote_show(&branch).contains("widget-uses-rust"));
-    assert_eq!(world.created().len(), 1);
-}
-
-#[test]
-fn an_accept_whose_line_names_something_private_is_refused_and_stays_waiting() {
-    let world = World::new("refused");
-    world.set_visibility("PUBLIC");
-    propose(&world, "widget-calls-secret", "Widget calls secret-thing.");
-    let mut accept = world.ohjaa(&world.checkout);
-    accept.args(["accept", "widget-calls-secret"]);
-    let (said, code) = at_terminal(accept);
-    assert_eq!(code, Some(3), "{said}");
-    assert!(said.contains("`secret-thing`"), "{said}");
-    assert!(said.contains("stays waiting"), "{said}");
-    let mut review = world.ohjaa(&world.checkout);
-    review.args(["review", "--list"]);
-    let (waiting, _, _) = world.run(&mut review);
-    assert!(waiting.contains("widget-calls-secret"), "{waiting}");
-    assert_eq!(world.remote_heads(), vec!["main"]);
-    assert!(!world.gh_calls().contains("pr create"));
-    assert!(!world.dir.join("state/ohjaa/lessons").exists());
-}
-
-#[test]
-fn an_accept_gh_cannot_deliver_stays_accepted_and_undelivered_until_publish() {
-    let world = World::new("later");
-    fs::write(world.dir.join("gh/signed-out"), "").unwrap();
-    propose(&world, "widget-uses-rust", "Widget code is Rust.");
-    let mut accept = world.ohjaa(&world.checkout);
-    accept.args(["accept", "widget-uses-rust"]);
-    let (said, code) = at_terminal(accept);
-    assert_eq!(code, Some(0), "the decision stands: {said}");
-    assert!(said.contains("not delivered"), "{said}");
-    assert!(said.contains("gh auth login"), "{said}");
-    assert_eq!(world.remote_heads(), vec!["main"]);
-    assert_eq!(
-        world.delivery()["nodes"]["widget-uses-rust"]["state"],
-        "undelivered"
-    );
-    let mut list = world.ohjaa(&world.checkout);
-    list.arg("list");
-    let (listed, _, _) = world.run(&mut list);
-    assert!(listed.contains("not delivered"), "{listed}");
-    let mut brief = world.ohjaa(&world.checkout);
-    brief.args(["brief", "--knowledge-only"]);
-    let (briefing, _, _) = world.run(&mut brief);
-    assert!(
-        briefing.contains("Widget code is Rust.") && briefing.contains("not delivered"),
-        "{briefing}"
-    );
-
-    // Signed in again, publish (named nothing) finds it and delivers it.
-    fs::remove_file(world.dir.join("gh/signed-out")).unwrap();
-    let mut publish = world.ohjaa(&world.dir);
-    publish
-        .args(["--root", world.dir.join("projects").to_str().unwrap()])
-        .args(["lessons", "publish"]);
-    let (stdout, stderr, code) = world.run(&mut publish);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    assert!(
-        stdout.contains("opened https://github.com/acme/widget/pull/41"),
-        "{stdout}"
-    );
-    assert_eq!(world.delivery()["nodes"]["widget-uses-rust"]["state"], "pr");
-}
-
-#[test]
-fn when_what_ohjaa_itself_writes_names_something_private_nothing_is_sent() {
-    let world = World::new("ownwords");
-    world.set_visibility("PUBLIC");
-    // A private repository named like the section's heading.
-    fs::write(
-        world.dir.join("gh/repos.json"),
-        "[{\"name\":\"lessons\"}]\n",
-    )
-    .unwrap();
-    let file = world.legacy("widget-uses-rust", "decision", "Widget code is Rust.");
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(stdout.contains("`lessons`"), "{stdout}");
-    assert!(stdout.contains("nothing was sent"), "{stdout}");
-    assert_eq!(world.remote_heads(), vec!["main"]);
-    assert!(!world.gh_calls().contains("pr create"));
-    assert!(file.exists());
-    assert_eq!(world.worktrees(), 1);
-}
-
-#[test]
-fn an_agents_md_that_cannot_be_read_whole_is_never_written_over() {
-    let world = World::new("notutf8");
-    // main's AGENTS.md, with a byte that is no UTF-8.
-    let seed = world.dir.join("seed");
-    fs::write(
-        seed.join("AGENTS.md"),
-        b"# Agent guide\n\nLatin-1: caf\xe9\n",
-    )
-    .unwrap();
-    world.git(&seed, &["commit", "-q", "-am", "latin-1"]);
-    world.git(&seed, &["push", "-q", "origin", "HEAD:main"]);
-    let file = world.legacy("widget-uses-rust", "decision", "Widget code is Rust.");
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(stdout.contains("not UTF-8"), "{stdout}");
-    assert_eq!(world.remote_heads(), vec!["main"], "nothing is pushed");
-    assert!(!world.gh_calls().contains("pr create"));
-    assert!(file.exists());
-    assert_eq!(world.worktrees(), 1);
-}
-
-#[test]
-fn retiring_an_untracked_node_at_a_terminal_takes_it_out_of_the_checkout() {
-    let world = World::new("retire-untracked");
-    world.legacy("widget-old-rule", "decision", "An old rule.");
-    let mut retire = world.ohjaa(&world.checkout);
-    retire.args(["retire", "widget-old-rule", "--why", "no longer"]);
-    let (said, code) = at_terminal(retire);
-    assert_eq!(code, Some(0), "{said}");
-    assert!(
-        !world.checkout.join(".ohjaa").exists(),
-        "nothing is written into the checkout: {said}"
-    );
-    let node = fs::read_to_string(world.accepted().join("widget-old-rule.md")).unwrap();
-    assert!(node.contains("status = \"retired\""), "{node}");
-    assert!(node.contains("retired: no longer"), "{node}");
-    assert!(
-        !world.gh_calls().contains("pr create"),
-        "a retired node that never had a line opens nothing"
-    );
-}
-
-/// The node every briefing test delivers, merges and pulls.
-const RUST: &str = "Widget code is Rust.";
-
-fn merged_world(tag: &str) -> World {
+/// A world whose checkout's AGENTS.md holds the line of [`RUST`], written by
+/// `ohjaa lessons` and not committed.
+fn written_world(tag: &str) -> World {
     let world = World::new(tag);
     world.legacy("widget-uses-rust", "decision", RUST);
-    world.merged();
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
     world
 }
 
@@ -1227,9 +455,340 @@ fn carried(briefing: &str, why: &str) -> bool {
         && briefing.contains(why)
 }
 
+/// `ohjaa lessons` writes the section into the working copy's AGENTS.md, one
+/// line per node, decisions first, after everything the file held, kept as
+/// it was. It commits nothing, pushes nothing, calls no gh and writes no
+/// state; the person reads it, then commits and pushes it. Written again,
+/// nothing changes.
+#[test]
+fn lessons_writes_the_section_into_the_working_copy_and_nothing_else() {
+    let world = World::new("write");
+    let rust = world.legacy("widget-uses-rust", "decision", RUST);
+    world.legacy(
+        "widget-tests-first",
+        "lesson",
+        "Write the failing test\nfirst.",
+    );
+    let head = world.git(&world.checkout, &["rev-parse", "HEAD"]);
+    let agents_md = world.checkout.join("AGENTS.md");
+    let tests_line = "- <!-- lesson: widget-tests-first --> **lesson**: Write the failing test \
+                      first. (as of 2026-10-20)";
+
+    let (stdout, stderr, code) = world.lessons(&["--dry-run"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    for said in [
+        format!("+ {RUST_LINE}"),
+        format!("+ {tests_line}"),
+        format!("dry run; {} is unchanged", agents_md.display()),
+    ] {
+        assert!(stdout.contains(&said), "missing {said:?} in:\n{stdout}");
+    }
+    assert_eq!(world.agents_md(), AGENTS);
+
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "wrote the lessons into {}: review it, then commit and push it like any change",
+            agents_md.display()
+        )),
+        "{stdout}"
+    );
+    let written = world.agents_md();
+    assert!(written.starts_with(AGENTS), "{written}");
+    let section = &written[AGENTS.len()..];
+    assert!(
+        section.starts_with("\n## Lessons\n\n<!-- This repository's accepted knowledge"),
+        "{written}"
+    );
+    let decision = section.find(RUST_LINE).expect(&written);
+    let lesson = section.find(tests_line).expect(&written);
+    assert!(decision < lesson, "{written}");
+    assert!(written.ends_with("(as of 2026-10-20)\n"), "{written}");
+    // Ohjaa's own words name no tool (these nodes' words name none either),
+    // and no why goes with a line.
+    assert!(!written.to_lowercase().contains("ohjaa"), "{written}");
+    assert!(!written.contains("was accepted"), "{written}");
+
+    // Nothing committed, pushed, sent or kept: the file is the person's to
+    // commit, and the nodes stay where they were.
+    assert_eq!(world.git(&world.checkout, &["rev-parse", "HEAD"]), head);
+    let status = world.git(&world.checkout, &["status", "--porcelain"]);
+    assert!(
+        status.lines().any(|line| line == " M AGENTS.md"),
+        "{status}"
+    );
+    assert!(rust.exists());
+    assert!(!world.dir.join("state/ohjaa").exists());
+    world.sent_nothing();
+
+    // Again: nothing to change.
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("nothing to change"), "{stdout}");
+    assert_eq!(world.agents_md(), written);
+
+    // The agent reads them in AGENTS.md, so the briefing no longer repeats
+    // them, and says where they are; `list` says so too.
+    let briefing = world.brief(Some("codex"), &[]);
+    assert!(left(&briefing), "{briefing}");
+    assert!(!briefing.contains("failing test"), "{briefing}");
+    let listed = world.list();
+    assert!(
+        listed.contains(&format!("in AGENTS.md ({})", agents_md.display())),
+        "{listed}"
+    );
+
+    // A line edited by hand is not the node: the briefing carries it again,
+    // and `ohjaa lessons` puts the node's line back.
+    fs::write(
+        &agents_md,
+        written.replace("Widget code is Rust.", "Widget code is anything."),
+    )
+    .unwrap();
+    let briefing = world.brief(Some("codex"), &[]);
+    assert!(briefing.contains(RUST), "{briefing}");
+    assert!(
+        briefing.contains("AGENTS.md holds another line of it"),
+        "{briefing}"
+    );
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains(&format!("~ {RUST_LINE}")), "{stdout}");
+    assert_eq!(world.agents_md(), written);
+    world.sent_nothing();
+}
+
+/// Until `ohjaa lessons` writes it, a current repo node is carried in the
+/// briefing, marked, and `list` says how it gets there.
+#[test]
+fn a_node_not_yet_in_agents_md_is_carried_and_list_says_how_it_gets_there() {
+    let world = World::new("notyet");
+    world.legacy("widget-uses-rust", "decision", RUST);
+    let briefing = world.brief(None, &[]);
+    assert!(
+        briefing.contains(RUST) && briefing.contains("not yet in AGENTS.md"),
+        "{briefing}"
+    );
+    let listed = world.list();
+    assert!(
+        listed.contains("not yet in AGENTS.md: `ohjaa lessons` writes it there"),
+        "{listed}"
+    );
+}
+
+/// The working copy can be named, by any folder inside it, from anywhere;
+/// a linked worktree of the clone gets the lessons accepted for the clone.
+/// A folder in no repository is said, and nothing is written.
+#[test]
+fn lessons_writes_into_a_named_working_copy_or_a_worktree_of_the_clone() {
+    let world = World::new("named");
+    propose(&world, "widget-uses-rust", RUST, None);
+    world.decide(&["accept", "widget-uses-rust"]);
+    fs::create_dir_all(world.checkout.join("src")).unwrap();
+    let inside = world.checkout.join("src");
+    let (stdout, stderr, code) = world.lessons_in(&world.dir, &[inside.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let accepted_line = RUST_LINE.replace("2026-10-20", "2026-10-27");
+    assert!(world.agents_md().contains(&accepted_line));
+
+    let worktree = world.dir.join("projects/widget-other");
+    world.git(
+        &world.checkout,
+        &["worktree", "add", "-q", worktree.to_str().unwrap()],
+    );
+    let (stdout, stderr, code) = world.lessons_in(&worktree, &[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        fs::read_to_string(worktree.join("AGENTS.md"))
+            .unwrap()
+            .contains(&accepted_line),
+        "the clone's lessons, in its other worktree"
+    );
+
+    let nowhere = world.dir.join("nowhere");
+    fs::create_dir_all(&nowhere).unwrap();
+    let (stdout, stderr, code) = world.lessons_in(&world.dir, &[nowhere.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("is not inside a git repository"),
+        "{stderr}"
+    );
+    assert!(!nowhere.join("AGENTS.md").exists());
+    world.sent_nothing();
+}
+
+/// A person accepts a repo proposal at a terminal: it is kept in ohjaa's
+/// state, nothing is written into the repository, and the person is told how
+/// its line gets there. Retired, AGENTS.md still says it until `ohjaa
+/// lessons` takes it out, and every briefing says not to follow it.
+#[test]
+fn an_accepted_or_retired_repo_node_reaches_agents_md_through_lessons() {
+    let world = World::new("accept");
+    propose(&world, "widget-uses-rust", RUST, None);
+    let said = world.decide(&["accept", "widget-uses-rust"]);
+    assert!(
+        said.contains(&format!(
+            "Run `ohjaa lessons` in a working copy of {} to bring its AGENTS.md in line, then \
+             commit and push it like any change.",
+            world.checkout.display()
+        )),
+        "{said}"
+    );
+    assert_eq!(world.agents_md(), AGENTS, "nothing is written into it");
+    assert!(!world.checkout.join(".ohjaa").exists());
+    assert!(world.accepted().join("widget-uses-rust.md").is_file());
+    world.sent_nothing();
+
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(world
+        .agents_md()
+        .contains(&RUST_LINE.replace("2026-10-20", "2026-10-27")));
+
+    let said = world.decide(&["retire", "widget-uses-rust", "--why", "the widget is gone"]);
+    assert!(said.contains("Run `ohjaa lessons`"), "{said}");
+    assert!(world.agents_md().contains("widget-uses-rust"));
+    let still = "AGENTS.md still says `widget-uses-rust`, but it was retired on 2026-10-27 (the \
+                 widget is gone); `ohjaa lessons` takes its line out: do not follow it.";
+    // So does a claude session, which reads AGENTS.md only by chance.
+    for agent in ["codex", "claude"] {
+        let briefing = world.brief(Some(agent), &[]);
+        assert!(briefing.contains(still), "{agent}: {briefing}");
+    }
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("- the line of `widget-uses-rust`"),
+        "{stdout}"
+    );
+    assert!(!world.agents_md().contains("widget-uses-rust"));
+    assert!(!world.brief(Some("codex"), &[]).contains("still says"));
+    world.sent_nothing();
+}
+
+#[test]
+fn a_superseded_line_still_in_agents_md_names_its_successor() {
+    let world = written_world("superseded");
+    propose(
+        &world,
+        "widget-uses-go",
+        "Widget code is Go.",
+        Some("widget-uses-rust"),
+    );
+    world.decide(&["accept", "widget-uses-go"]);
+    let briefing = world.brief(Some("codex"), &[]);
+    assert!(
+        briefing.contains("AGENTS.md still says `widget-uses-rust`"),
+        "{briefing}"
+    );
+    assert!(
+        briefing.contains("superseded by `widget-uses-go`"),
+        "{briefing}"
+    );
+    assert!(briefing.contains("Widget code is Go."), "{briefing}");
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let written = world.agents_md();
+    assert!(
+        written.contains("Widget code is Go.") && !written.contains(RUST),
+        "{written}"
+    );
+}
+
+/// AGENTS.md is read whole or not at all: one that is not UTF-8 is never
+/// written over.
+#[test]
+fn an_agents_md_that_cannot_be_read_whole_is_never_written_over() {
+    let world = World::new("notutf8");
+    let latin1: &[u8] = b"# Agent guide\n\nLatin-1: caf\xe9\n";
+    fs::write(world.checkout.join("AGENTS.md"), latin1).unwrap();
+    world.legacy("widget-uses-rust", "decision", RUST);
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("not UTF-8"), "{stderr}");
+    assert_eq!(fs::read(world.checkout.join("AGENTS.md")).unwrap(), latin1);
+}
+
+/// A repo node that cannot be read is no node gone: AGENTS.md keeps its
+/// line, the file is named, and `ohjaa lessons` exits 4.
+#[test]
+fn an_unreadable_repo_node_keeps_its_line_and_is_said() {
+    let world = written_world("unreadable");
+    let written = world.agents_md();
+    let file = world.checkout.join(".ohjaa/knowledge/widget-uses-rust.md");
+    fs::write(&file, "not a knowledge node\n").unwrap();
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    assert!(
+        stderr.contains(&format!("unreadable {}", file.display())),
+        "{stderr}"
+    );
+    assert_eq!(world.agents_md(), written);
+}
+
+#[test]
+fn a_scoped_repositorys_lessons_are_carried_though_its_agents_md_holds_them() {
+    let world = written_world("scoped");
+    // Briefed from elsewhere, with the repository in scope: the agent is not
+    // working there, and need not read its AGENTS.md.
+    let mut brief = world.ohjaa(&world.dir);
+    brief.args([
+        "brief",
+        "--knowledge-only",
+        "--scope",
+        world.checkout.to_str().unwrap(),
+    ]);
+    let (briefing, stderr, code) = world.run(&mut brief);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(briefing.contains(RUST), "{briefing}");
+    assert!(briefing.contains("in AGENTS.md too"), "{briefing}");
+}
+
+#[test]
+fn retiring_an_untracked_node_at_a_terminal_takes_it_out_of_the_checkout() {
+    let world = World::new("retire-untracked");
+    world.legacy("widget-old-rule", "decision", "An old rule.");
+    let said = world.decide(&["retire", "widget-old-rule", "--why", "no longer"]);
+    assert!(
+        !world.checkout.join(".ohjaa").exists(),
+        "nothing is left in the checkout: {said}"
+    );
+    let node = fs::read_to_string(world.accepted().join("widget-old-rule.md")).unwrap();
+    assert!(node.contains("status = \"retired\""), "{node}");
+    assert!(node.contains("retired: no longer"), "{node}");
+    world.sent_nothing();
+}
+
+#[test]
+fn a_node_in_both_the_checkout_and_ohjaas_state_is_ohjaas() {
+    let world = World::new("both");
+    let file = world.legacy("widget-uses-rust", "decision", RUST);
+    let text = fs::read_to_string(&file).unwrap();
+    world.decide(&["retire", "widget-uses-rust", "--why", "gone"]);
+    // A move that was cut short: the checkout's copy back beside the state's.
+    world.put(".ohjaa/knowledge/widget-uses-rust.md", &text);
+    let mut brief = world.ohjaa(&world.checkout);
+    brief.args(["brief", "--knowledge-only", "--agent", "codex"]);
+    let (briefing, stderr, code) = world.run(&mut brief);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        !briefing.contains(RUST),
+        "the retired node stays retired: {briefing}"
+    );
+    assert!(!stderr.contains("duplicate"), "{stderr}");
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stderr.contains(&format!("left {}", file.display())),
+        "{stderr}"
+    );
+    assert!(!world.agents_md().contains(RUST));
+}
+
 #[test]
 fn codex_is_left_the_lessons_unless_an_override_or_its_byte_cap_hides_them() {
-    let world = merged_world("codex");
+    let world = written_world("codex");
     let briefing = world.brief(Some("codex"), &[]);
     assert!(left(&briefing), "{briefing}");
     world.put("AGENTS.override.md", "Read this instead.\n");
@@ -1249,215 +808,8 @@ fn codex_is_left_the_lessons_unless_an_override_or_its_byte_cap_hides_them() {
 }
 
 #[test]
-fn a_retired_or_superseded_line_still_in_agents_md_is_said_not_to_be_followed() {
-    let world = merged_world("stale");
-    let mut retire = world.ohjaa(&world.checkout);
-    retire.args(["retire", "widget-uses-rust", "--why", "the widget is gone"]);
-    let (said, code) = at_terminal(retire);
-    assert_eq!(code, Some(0), "{said}");
-    // The removal waits in a pull request: AGENTS.md still holds the line.
-    assert!(fs::read_to_string(world.checkout.join("AGENTS.md"))
-        .unwrap()
-        .contains("widget-uses-rust"));
-    let briefing = world.brief(Some("codex"), &[]);
-    assert!(
-        briefing.contains("AGENTS.md still says `widget-uses-rust`"),
-        "{briefing}"
-    );
-    assert!(briefing.contains("retired"), "{briefing}");
-    assert!(briefing.contains("do not follow it"), "{briefing}");
-    assert!(
-        briefing.contains("https://github.com/acme/widget/pull/4"),
-        "{briefing}"
-    );
-    // So does a claude session, which reads AGENTS.md only by chance.
-    let briefing = world.brief(Some("claude"), &[]);
-    assert!(briefing.contains("do not follow it"), "{briefing}");
-}
-
-#[test]
-fn a_superseded_line_still_in_agents_md_names_its_successor() {
-    let world = merged_world("superseded");
-    let mut propose = world.ohjaa(&world.checkout);
-    propose.args([
-        "propose",
-        "--scope",
-        "repo",
-        "--id",
-        "widget-uses-go",
-        "--kind",
-        "decision",
-        "--origin",
-        "a person said so",
-        "--supersedes",
-        "widget-uses-rust",
-        "Widget code is Go.",
-    ]);
-    let (stdout, stderr, code) = world.run(&mut propose);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let mut accept = world.ohjaa(&world.checkout);
-    accept.args(["accept", "widget-uses-go"]);
-    let (said, code) = at_terminal(accept);
-    assert_eq!(code, Some(0), "{said}");
-    let briefing = world.brief(Some("codex"), &[]);
-    assert!(
-        briefing.contains("AGENTS.md still says `widget-uses-rust`"),
-        "{briefing}"
-    );
-    assert!(
-        briefing.contains("superseded by `widget-uses-go`"),
-        "{briefing}"
-    );
-    assert!(briefing.contains("Widget code is Go."), "{briefing}");
-}
-
-#[test]
-fn an_empty_or_partial_list_of_private_repositories_sends_nothing_public() {
-    let world = World::new("emptylist");
-    world.set_visibility("PUBLIC");
-    let file = world.legacy("widget-calls-secret", "fact", "Widget calls secret-thing.");
-    fs::write(world.dir.join("gh/repos.json"), "[]\n").unwrap();
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(stdout.contains("lists none"), "{stdout}");
-    assert_eq!(world.remote_heads(), vec!["main"], "nothing is pushed");
-    assert!(file.exists());
-
-    // A list without a private repository found under the roots.
-    fs::write(world.dir.join("gh/repos.json"), REPOS).unwrap();
-    let other = world.dir.join("projects/otherthing");
-    fs::create_dir_all(&other).unwrap();
-    world.git(&other, &["init", "-q"]);
-    world.git(
-        &other,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/acme/otherthing.git",
-        ],
-    );
-    fs::write(world.dir.join("gh/visibility.acme.otherthing"), "PRIVATE").unwrap();
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(stdout.contains("acme/otherthing"), "{stdout}");
-    assert!(stdout.contains("not complete"), "{stdout}");
-    assert_eq!(world.remote_heads(), vec!["main"]);
-    assert!(!world.gh_calls().contains("pr create"));
-}
-
-#[test]
-fn a_repository_under_the_roots_of_unknown_visibility_counts_as_private() {
-    let world = World::new("unknownvis");
-    world.set_visibility("PUBLIC");
-    // No remote at all: gh cannot say it is public.
-    let hidden = world.dir.join("projects/secret-proj");
-    fs::create_dir_all(&hidden).unwrap();
-    world.git(&hidden, &["init", "-q"]);
-    let held = world.legacy(
-        "widget-uses-proj",
-        "fact",
-        "Widget reads secret-proj's output.",
-    );
-    world.legacy("widget-uses-rust", "decision", RUST);
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(stdout.contains("`secret-proj`"), "{stdout}");
-    assert!(held.exists());
-    let agents = world.remote_show(&world.lessons_branch());
-    assert!(
-        agents.contains(RUST) && !agents.contains("secret-proj"),
-        "{agents}"
-    );
-}
-
-#[test]
-fn a_node_in_both_the_checkout_and_ohjaas_state_is_ohjaas() {
-    let world = World::new("both");
-    let file = world.legacy("widget-uses-rust", "decision", RUST);
-    let text = fs::read_to_string(&file).unwrap();
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let mut retire = world.ohjaa(&world.checkout);
-    retire.args(["retire", "widget-uses-rust", "--why", "gone"]);
-    let (said, code) = at_terminal(retire);
-    assert_eq!(code, Some(0), "{said}");
-    // A move that was cut short: the checkout's copy back beside the state's.
-    world.put(".ohjaa/knowledge/widget-uses-rust.md", &text);
-    let mut brief = world.ohjaa(&world.checkout);
-    brief.args(["brief", "--knowledge-only", "--agent", "codex"]);
-    let (briefing, stderr, code) = world.run(&mut brief);
-    assert_eq!(code, Some(0), "{stderr}");
-    assert!(
-        !briefing.contains(RUST),
-        "the retired node stays retired: {briefing}"
-    );
-    assert!(!stderr.contains("duplicate"), "{stderr}");
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(
-        code,
-        Some(4),
-        "a file left is not delivered: {stdout}{stderr}"
-    );
-    assert!(stdout.contains("left"), "{stdout}");
-}
-
-#[test]
-fn a_failing_pre_push_hook_is_said_in_its_own_words() {
-    let world = World::new("prepush");
-    write_executable(
-        &world.checkout.join(".git/hooks/pre-push"),
-        "#!/bin/sh\necho 'pre-push says no: run the gate first' >&2\nexit 1\n",
-    );
-    let file = world.legacy("widget-uses-rust", "decision", RUST);
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(
-        stdout.contains("pre-push says no: run the gate first"),
-        "{stdout}"
-    );
-    assert!(file.exists());
-}
-
-#[test]
-fn a_commit_that_holds_more_than_agents_md_is_never_pushed() {
-    let world = World::new("extra");
-    write_executable(
-        &world.checkout.join(".git/hooks/pre-commit"),
-        "#!/bin/sh\necho stray > stray.txt\ngit add stray.txt\n",
-    );
-    let file = world.legacy("widget-uses-rust", "decision", RUST);
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(stdout.contains("more than AGENTS.md"), "{stdout}");
-    assert_eq!(world.remote_heads(), vec!["main"], "nothing is pushed");
-    assert!(file.exists());
-}
-
-#[test]
-fn an_accept_delivers_without_holding_the_homes_lock() {
-    let world = World::new("homelock");
-    propose(&world, "widget-uses-rust", RUST);
-    let mut accept = world.ohjaa(&world.checkout);
-    accept
-        .args(["accept", "widget-uses-rust"])
-        .env("STUB_PROBE", env!("CARGO_BIN_EXE_ohjaa"));
-    let (said, code) = at_terminal(accept);
-    assert_eq!(code, Some(0), "{said}");
-    let probe = fs::read_to_string(world.dir.join("gh/probe")).unwrap();
-    assert!(
-        !probe.contains("waiting for another ohjaa"),
-        "another change to the home waited on the delivery: {probe}"
-    );
-    assert!(
-        said.contains("opened https://github.com/acme/widget/pull/41"),
-        "{said}"
-    );
-}
-
-#[test]
 fn claude_launched_in_a_subfolder_skips_the_roots_import_unless_its_project_approved_them() {
-    let world = merged_world("subfolder");
+    let world = written_world("subfolder");
     world.put("CLAUDE.md", "@AGENTS.md\n");
     fs::create_dir_all(world.checkout.join("src")).unwrap();
     assert!(
@@ -1494,7 +846,7 @@ fn claude_launched_in_a_subfolder_skips_the_roots_import_unless_its_project_appr
 
 #[test]
 fn an_import_claude_code_ignores_does_not_count() {
-    let world = merged_world("ignored");
+    let world = written_world("ignored");
     for (name, text) in [
         ("a comment", "<!-- @AGENTS.md -->\n"),
         ("a comment over lines", "<!--\n@AGENTS.md\n-->\n"),
@@ -1516,31 +868,50 @@ fn an_import_claude_code_ignores_does_not_count() {
     );
 }
 
+/// `ohjaa lessons` writes into the working copy and nowhere else: an
+/// `AGENTS.md` that is a link leading outside it is refused and left as it
+/// is, the file it leads to untouched. A link to a file inside the working
+/// copy is written through, and stays a link.
 #[test]
-fn a_hook_that_changes_the_commit_after_the_check_stops_the_push() {
-    let world = World::new("commitmsg");
-    world.set_visibility("PUBLIC");
-    // A commit-msg hook that adds a trailer naming a private path.
-    write_executable(
-        &world.checkout.join(".git/hooks/commit-msg"),
-        "#!/bin/sh\nprintf '\\nSeen-in: %s/projects/secret-thing\\n' \"$HOME\" >> \"$1\"\n",
+fn an_agents_md_that_leads_outside_the_working_copy_is_never_written() {
+    let world = World::new("symlink");
+    world.legacy("widget-uses-rust", "decision", RUST);
+    let agents_md = world.checkout.join("AGENTS.md");
+    let outside = world.dir.join("elsewhere.md");
+    fs::write(&outside, AGENTS).unwrap();
+    fs::remove_file(&agents_md).unwrap();
+    std::os::unix::fs::symlink(&outside, &agents_md).unwrap();
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("outside the working copy"),
+        "{stdout}{stderr}"
     );
-    let file = world.legacy("widget-uses-rust", "decision", RUST);
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(stdout.contains("changed the commit message"), "{stdout}");
-    assert_eq!(world.remote_heads(), vec!["main"], "nothing is pushed");
-    assert!(!world.gh_calls().contains("pr create"));
-    assert!(file.exists());
+    assert_eq!(fs::read_to_string(&outside).unwrap(), AGENTS);
+    assert_eq!(fs::read_link(&agents_md).unwrap(), outside);
 
-    // A post-commit hook that makes a second commit.
-    fs::remove_file(world.checkout.join(".git/hooks/commit-msg")).unwrap();
-    write_executable(
-        &world.checkout.join(".git/hooks/post-commit"),
-        "#!/bin/sh\n[ -n \"$IN_HOOK\" ] || IN_HOOK=1 git commit -q --allow-empty -m extra\n",
-    );
-    let (stdout, stderr, code) = world.publish(&[]);
-    assert_eq!(code, Some(4), "{stdout}{stderr}");
-    assert!(stdout.contains("more than one commit"), "{stdout}");
-    assert_eq!(world.remote_heads(), vec!["main"]);
+    // A link that leads nowhere is refused too: writing would replace it.
+    fs::remove_file(&agents_md).unwrap();
+    std::os::unix::fs::symlink(world.dir.join("gone.md"), &agents_md).unwrap();
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(fs::symlink_metadata(&agents_md)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(!world.dir.join("gone.md").exists());
+
+    // A link to a file inside the working copy is written through.
+    fs::remove_file(&agents_md).unwrap();
+    world.put("docs/guide.md", AGENTS);
+    std::os::unix::fs::symlink("docs/guide.md", &agents_md).unwrap();
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(fs::read_to_string(world.checkout.join("docs/guide.md"))
+        .unwrap()
+        .contains(RUST_LINE));
+    assert!(fs::symlink_metadata(&agents_md)
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
