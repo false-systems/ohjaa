@@ -867,3 +867,51 @@ fn an_import_claude_code_ignores_does_not_count() {
         "{briefing}"
     );
 }
+
+/// `ohjaa lessons` writes into the working copy and nowhere else: an
+/// `AGENTS.md` that is a link leading outside it is refused and left as it
+/// is, the file it leads to untouched. A link to a file inside the working
+/// copy is written through, and stays a link.
+#[test]
+fn an_agents_md_that_leads_outside_the_working_copy_is_never_written() {
+    let world = World::new("symlink");
+    world.legacy("widget-uses-rust", "decision", RUST);
+    let agents_md = world.checkout.join("AGENTS.md");
+    let outside = world.dir.join("elsewhere.md");
+    fs::write(&outside, AGENTS).unwrap();
+    fs::remove_file(&agents_md).unwrap();
+    std::os::unix::fs::symlink(&outside, &agents_md).unwrap();
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("outside the working copy"),
+        "{stdout}{stderr}"
+    );
+    assert_eq!(fs::read_to_string(&outside).unwrap(), AGENTS);
+    assert_eq!(fs::read_link(&agents_md).unwrap(), outside);
+
+    // A link that leads nowhere is refused too: writing would replace it.
+    fs::remove_file(&agents_md).unwrap();
+    std::os::unix::fs::symlink(world.dir.join("gone.md"), &agents_md).unwrap();
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(fs::symlink_metadata(&agents_md)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(!world.dir.join("gone.md").exists());
+
+    // A link to a file inside the working copy is written through.
+    fs::remove_file(&agents_md).unwrap();
+    world.put("docs/guide.md", AGENTS);
+    std::os::unix::fs::symlink("docs/guide.md", &agents_md).unwrap();
+    let (stdout, stderr, code) = world.lessons(&[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(fs::read_to_string(world.checkout.join("docs/guide.md"))
+        .unwrap()
+        .contains(RUST_LINE));
+    assert!(fs::symlink_metadata(&agents_md)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}

@@ -390,6 +390,32 @@ fn said(changes: &Changes, lines: &[(String, String)]) -> Vec<String> {
     said
 }
 
+/// That `agents_md` is the working copy `root`'s own: when it is a link, one
+/// that leads to a file inside `root` (both canonical). A link that leads
+/// outside it, or to nothing, is refused: writing would change a file
+/// outside the working copy, or replace the link.
+fn within(root: &Path, agents_md: &Path) -> Result<()> {
+    let linked =
+        std::fs::symlink_metadata(agents_md).is_ok_and(|meta| meta.file_type().is_symlink());
+    if !linked {
+        return Ok(());
+    }
+    let root = std::fs::canonicalize(root)
+        .with_context(|| format!("cannot resolve {}", root.display()))?;
+    match std::fs::canonicalize(agents_md) {
+        Ok(target) if target.starts_with(&root) => Ok(()),
+        Ok(target) => anyhow::bail!(
+            "{} is a link that leads outside the working copy, to {}, so it is not written",
+            agents_md.display(),
+            target.display()
+        ),
+        Err(_) => anyhow::bail!(
+            "{} is a link that leads to no file, so it is not written over",
+            agents_md.display()
+        ),
+    }
+}
+
 /// `ohjaa lessons [<path>]`: the Lessons section of the AGENTS.md of the
 /// working copy at or above `at`, brought in line with the repository's
 /// knowledge (current nodes' lines in, retired and superseded ones' out),
@@ -440,6 +466,7 @@ pub fn write(at: &Path, dry_run: bool) -> Result<i32> {
         .map(|located| located.node.id.clone())
         .collect();
     let agents_md = root.join("AGENTS.md");
+    within(&root, &agents_md)?;
     let existing = match std::fs::read(&agents_md) {
         Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
             anyhow::anyhow!(

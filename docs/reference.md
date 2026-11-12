@@ -426,7 +426,8 @@ into the state.
   accepted it: ohjaa checks it for nothing, so a line that names a tool or a
   private repository is yours to reword before you commit it.
 - `AGENTS.md` is read whole or not at all. A file that is not UTF-8 is never
-  written over.
+  written over, and neither is a link that leads outside the working copy,
+  or to no file.
 - Nothing is committed, pushed or sent. Ohjaa makes no network call and runs
   no `gh`: what reaches the repository is what you commit.
 

@@ -133,7 +133,8 @@ enum Cmd {
     #[command(after_help = "Exit codes:\n  \
         0  written, or nothing to change\n  \
         1  it could not run: not in a repository, or AGENTS.md cannot be read whole\n     \
-           (one that is not UTF-8 is never written over)\n  \
+           (one that is not UTF-8 is never written over), or is a link that leads\n     \
+           outside the working copy\n  \
         4  written, but a repo node could not be read: AGENTS.md keeps what it holds\n     \
            of it, and each is named\n\n\
         It writes one file, <working copy>/AGENTS.md, its `## Lessons` section alone:\n\
