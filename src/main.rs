@@ -251,13 +251,12 @@ enum Cmd {
     /// A knowledge node and its neighbours: what it builds on, what builds on
     /// it and what it replaced.
     Graph { id: String },
-    /// Write the knowledge into each agent's own instruction file, the line a
-    /// terminal runs as it opens into ~/.zshrc, and the ignore block into
-    /// git's global excludes. Idempotent; --undo takes it all back.
+    /// Write the knowledge into each agent's own instruction file, and the
+    /// ignore block into git's global excludes. Idempotent; --undo takes it
+    /// all back.
     #[command(after_help = "Exit codes:\n  \
         0  applied, undone, or nothing to change\n  \
         1  a change could not be made\n  \
-        3  refused: an ohjaa that is not the one on PATH (see --bin)\n  \
         4  applied, except an agent's own instruction file apply cannot write (a\n     \
            block it cannot tell from the rest): each is named, with why, on every\n     \
            apply and dry run until it is fixed by hand; `ohjaa doctor` names it too;\n     \
@@ -269,24 +268,21 @@ enum Cmd {
         the home's first commit; never pushed)\n\
         Changes outside it, and nothing else:\n  \
         git's global excludes  a block marked \"ohjaa apply\" holding .sykli/ .ohjaa/\n  \
-        ~/.zshrc               [[ -x <ohjaa> ]] && eval \"$(<ohjaa> shell-init zsh)\"\n  \
         each agent's own       a block marked \"ohjaa:knowledge\" holding the team's, mine and machine\n  \
         instruction file       knowledge, in each that exists outside every repository:\n                         \
         ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.pi/agent/AGENTS.md,\n                         \
         ~/.config/opencode/AGENTS.md (none is created); each decision\n                         \
-        rewrites it where it is\n\
-        <ohjaa> is the ohjaa on PATH (or --bin), by absolute path. --undo puts the\n\
-        changes back as they were, and removes applied.toml; the roots and the\n\
-        history stay.\n\n\
+        rewrites it where it is\n  \
+        ~/.zshrc               only taken out of it: the line an earlier apply wrote, which ran\n                         \
+        `ohjaa shell-init`, a command this ohjaa does not have\n\
+        --undo puts the changes back as they were, and removes applied.toml; the roots\n\
+        and the history stay.\n\n\
         Checks before a push are sykli's: `sykli hook install --pre-push` in each\n\
         repository.")]
     Apply {
         /// Print every change, and make none.
         #[arg(long)]
         dry_run: bool,
-        /// The ohjaa the terminal's line runs, instead of the one on PATH.
-        #[arg(long, value_name = "PATH", conflicts_with = "undo")]
-        bin: Option<PathBuf>,
         /// Take back what apply changed outside the home.
         #[arg(long)]
         undo: bool,
@@ -2337,14 +2333,13 @@ fn main() {
             human::collect_now(repos_under_roots(&cli.root), *background)
         }
         Cmd::Graph { id } => cmd_graph(id),
-        Cmd::Apply { dry_run, bin, undo } => {
+        Cmd::Apply { dry_run, undo } => {
             if *undo {
                 apply::undo(*dry_run)
             } else {
                 apply::apply(apply::Options {
                     dry_run: *dry_run,
                     roots: &cli.root,
-                    bin: bin.as_deref(),
                 })
             }
         }
