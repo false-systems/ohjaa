@@ -16,11 +16,11 @@ mod instructions;
 mod intake;
 mod knowledge;
 mod lessons;
+mod perimeter;
 mod process;
 mod repo_docs;
 mod roots;
 mod scan;
-mod system;
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -78,11 +78,6 @@ enum Cmd {
         /// keeping everything else in it.
         #[arg(long, value_name = "FILE")]
         write: Vec<PathBuf>,
-    },
-    /// The system perimeter: what every tool in the fleet is, derived now.
-    System {
-        #[arg(long)]
-        json: bool,
     },
     /// List the knowledge that applies here, each current node with how often
     /// a person had to teach it again since it was accepted.
@@ -190,9 +185,6 @@ enum Cmd {
         #[arg(long)]
         retry_failed: bool,
     },
-    /// A knowledge node and its neighbours: what it builds on, what builds on
-    /// it and what it replaced.
-    Graph { id: String },
     /// Write the knowledge into each agent's own instruction file, and the
     /// ignore block into git's global excludes. Idempotent; --undo takes it
     /// all back.
@@ -324,21 +316,6 @@ fn coverage_detail(scan: &Scan) -> &str {
         .as_deref()
         .or_else(|| scan.warnings.first().map(String::as_str))
         .unwrap_or("degraded coverage")
-}
-
-fn cmd_system(explicit: &[PathBuf], json: bool) -> Result<i32> {
-    let repos = repos(explicit)?;
-    if repos.is_empty() {
-        eprintln!("ohjaa: no toimija-prepared repos under the roots");
-        return Ok(0);
-    }
-    let view = system::system_view(&repos);
-    if json {
-        println!("{}", serde_json::to_string_pretty(&view)?);
-    } else {
-        print!("{}", system::render_system(&view));
-    }
-    Ok(view.exit_code())
 }
 
 // ---- knowledge --------------------------------------------------------------
@@ -717,7 +694,7 @@ fn selected_perimeter(
     scoped: &[PathBuf],
     mut scans: Vec<Scan>,
     mut outside: Scan,
-) -> system::SystemView {
+) -> perimeter::Perimeter {
     let selected: Vec<_> = in_repo
         .then(|| root.to_path_buf())
         .into_iter()
@@ -729,11 +706,11 @@ fn selected_perimeter(
             || selected.iter().any(|repo| scope_reaches(s, repo))
     });
     scans.push(outside);
-    system::scoped_view(&selected, scans)
+    perimeter::scoped_view(&selected, scans)
 }
 
-fn scoped_perimeter_text(view: &system::SystemView, here: &Path) -> String {
-    format!("{}\n\nOnly the launch repository, declared scope and sessions reaching them are included.\nOther repositories were not scanned. Use `ohjaa system` or `toimija sessions` for a\nfleet-wide question; after expanding scope, use `ohjaa brief --scope <path>`.\nUse the delivered facts instead of repeating discovery. Refresh session observations\nbefore editing if work has moved on since this briefing.\n", system::briefing(view, here))
+fn scoped_perimeter_text(view: &perimeter::Perimeter, here: &Path) -> String {
+    format!("{}\n\nOnly the launch repository, declared scope and sessions reaching them are included.\nOther repositories were not scanned. Use `toimija sessions` in one for who is live there;\nafter expanding scope, use `ohjaa brief --scope <path>`.\nUse the delivered facts instead of repeating discovery. Refresh session observations\nbefore editing if work has moved on since this briefing.\n", perimeter::briefing(view, here))
 }
 
 fn cmd_brief(
@@ -815,96 +792,12 @@ fn cmd_brief(
         scan::scan_outside(),
     );
     println!("\n{}", scoped_perimeter_text(&view, &here));
-    // An incomplete perimeter is said with the exit code, as `system` does.
+    // An incomplete perimeter is said with the exit code.
     Ok(if unscoped.is_empty() {
         view.exit_code()
     } else {
         INCOMPLETE
     })
-}
-
-fn cmd_graph(id: &str) -> Result<i32> {
-    use std::fmt::Write as _;
-    let dirs = dirs()?;
-    let loaded = knowledge::load(&dirs)?;
-    let Some(node) = loaded.get(id) else {
-        bail!("no knowledge named `{id}` here");
-    };
-    let describe = |located: &fk::Located| {
-        format!(
-            "{} [{} · {} · {} · as of {}]",
-            located.node.id,
-            located.scope.name(),
-            located.node.kind.name(),
-            located.node.status.name(),
-            located.node.as_of
-        )
-    };
-    let mut out = String::new();
-    let _ = writeln!(out, "{}", describe(node));
-    for line in node.node.body.lines() {
-        let _ = writeln!(out, "    {line}");
-    }
-    // What it builds on, all the way up; the files are the graph.
-    let mut chain = Vec::new();
-    let mut cursor = node.node.refines.clone();
-    while let Some(base) = cursor {
-        if chain.contains(&base) || chain.len() > 32 {
-            break;
-        }
-        cursor = loaded.get(&base).and_then(|l| l.node.refines.clone());
-        chain.push(base);
-    }
-    let _ = writeln!(
-        out,
-        "builds on     {}",
-        if chain.is_empty() {
-            "—".to_owned()
-        } else {
-            chain.join(" → ")
-        }
-    );
-    let built_on: Vec<&str> = loaded
-        .nodes
-        .iter()
-        .filter(|l| l.node.refines.as_deref() == Some(id))
-        .map(|l| l.node.id.as_str())
-        .collect();
-    let _ = writeln!(
-        out,
-        "built on by   {}",
-        if built_on.is_empty() {
-            "—".to_owned()
-        } else {
-            built_on.join(", ")
-        }
-    );
-    let _ = writeln!(
-        out,
-        "replaced      {}",
-        if node.node.supersedes.is_empty() {
-            "—".to_owned()
-        } else {
-            node.node.supersedes.join(", ")
-        }
-    );
-    let replaced_by: Vec<&str> = loaded
-        .nodes
-        .iter()
-        .filter(|l| l.node.supersedes.iter().any(|s| s == id))
-        .map(|l| l.node.id.as_str())
-        .collect();
-    let _ = writeln!(
-        out,
-        "replaced by   {}",
-        if replaced_by.is_empty() {
-            "—".to_owned()
-        } else {
-            replaced_by.join(", ")
-        }
-    );
-    print!("{out}");
-    Ok(0)
 }
 
 fn scope_arg(name: &str) -> Result<Scope> {
@@ -2212,7 +2105,6 @@ fn main() {
             scope,
             agent,
         } => cmd_brief(&cli.root, *knowledge_only, write, scope, agent.as_deref()),
-        Cmd::System { json } => cmd_system(&cli.root, *json),
         Cmd::List { all } => cmd_list(*all),
         Cmd::Propose {
             scope,
@@ -2244,7 +2136,6 @@ fn main() {
         Cmd::Lessons {
             action: LessonsCmd::Publish { repos, dry_run },
         } => cmd_lessons_publish(&cli.root, repos, *dry_run),
-        Cmd::Graph { id } => cmd_graph(id),
         Cmd::Apply { dry_run, undo } => {
             if *undo {
                 apply::undo(*dry_run)

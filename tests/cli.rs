@@ -349,63 +349,6 @@ fn applied_block(lines: &[&str]) -> String {
 }
 
 #[test]
-fn system_derives_the_fleet_and_exits_incomplete_when_a_role_is_missing() {
-    let fixture = Fixture::new("system");
-    fixture.make_repo("tasker");
-    fixture.make_repo("kelo");
-    fixture.set_context(
-        r#"{"repo":{"name":"tasker","role":"durable task contract","not_roles":["inbox"]}}"#,
-    );
-    // One canned context for every repo: tasker parses, the "kelo" copy does
-    // not (its name mismatches nothing — the stub serves the same file, so
-    // kelo derives with the wrong name and no role of its own). To keep the
-    // test honest, give kelo an empty repo object instead.
-    fs::write(
-        fixture.dir.join("context.json"),
-        r#"{"repo":{"name":"tasker","role":"durable task contract","not_roles":["inbox"]}}"#,
-    )
-    .unwrap();
-
-    let (stdout, _, code) = output_of(
-        fixture
-            .ohjaa()
-            .args(["system", "--root"])
-            .arg(fixture.dir.clone()),
-    );
-    fixture.cleanup();
-
-    assert!(stdout.contains("tasker"), "{stdout}");
-    assert!(stdout.contains("role: durable task contract"), "{stdout}");
-    assert!(stdout.contains("not:  inbox"), "{stdout}");
-    // Both repos derive the same canned context, so no role is missing here;
-    // the incomplete path is covered by the unit test. The command must not
-    // fail on a healthy fleet.
-    assert_eq!(code, Some(0), "{stdout}");
-}
-
-#[test]
-fn system_json_lists_tools_with_their_roles() {
-    let fixture = Fixture::new("system-json");
-    fixture.make_repo("tasker");
-    fixture
-        .set_context(r#"{"repo":{"name":"tasker","role":"durable task contract","not_roles":[]}}"#);
-
-    let (stdout, _, code) = output_of(
-        fixture
-            .ohjaa()
-            .args(["system", "--json", "--root"])
-            .arg(fixture.dir.clone()),
-    );
-    fixture.cleanup();
-
-    assert_eq!(code, Some(0));
-    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let tool = &value["tools"][0];
-    assert_eq!(tool["name"], "tasker");
-    assert_eq!(tool["role"], "durable task contract");
-}
-
-#[test]
 fn an_agent_proposes_and_only_a_person_accepts() {
     if !git_available() {
         return;
@@ -2196,37 +2139,6 @@ fn check_counts_an_unreadable_proposal_as_an_error() {
         stdout.contains("proposal") && stdout.contains("half.md"),
         "{stdout}"
     );
-    fixture.cleanup();
-}
-
-#[test]
-fn graph_shows_a_nodes_neighbours() {
-    if !git_available() {
-        return;
-    }
-    let fixture = Fixture::new("graph");
-    let repo = fixture.make_git_repo("work");
-    let ours = fixture.dir.join("ours/knowledge");
-    fixture.node(&ours, "lean", "taste", "Lean first.");
-    fs::write(
-        ours.join("rust.md"),
-        "+++\nid = \"rust\"\nkind = \"decision\"\nstatus = \"current\"\nas_of = 2026-09-20\n\
-         origin = [\"t\"]\nrefines = \"lean\"\nsupersedes = [\"go-ok\"]\n+++\nRust only.\n",
-    )
-    .unwrap();
-    fs::write(
-        ours.join("go-ok.md"),
-        "+++\nid = \"go-ok\"\nkind = \"decision\"\nstatus = \"superseded\"\nas_of = 2026-01-01\n\
-         origin = [\"t\"]\n+++\nGo is fine.\n",
-    )
-    .unwrap();
-    let (stdout, stderr, code) =
-        output_of(fixture.ohjaa().args(["graph", "rust"]).current_dir(&repo));
-    assert_eq!(code, Some(0), "{stdout}{stderr}");
-    assert!(stdout.contains("builds on     lean"), "{stdout}");
-    assert!(stdout.contains("replaced      go-ok"), "{stdout}");
-    let (stdout, _, _) = output_of(fixture.ohjaa().args(["graph", "lean"]).current_dir(&repo));
-    assert!(stdout.contains("built on by   rust"), "{stdout}");
     fixture.cleanup();
 }
 
