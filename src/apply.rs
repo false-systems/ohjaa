@@ -393,8 +393,8 @@ pub fn apply(options: Options<'_>) -> Result<i32> {
     let global = gitconfig::GlobalFacts::read()?;
     let mut steps: Vec<Step> = Vec::new();
 
-    // Where the repositories are, written down when named: collect and
-    // lessons read it, wherever they run from. Kept by --undo.
+    // Where the repositories are, written down when named: lessons reads
+    // it, wherever it runs from. Kept by --undo.
     let roots_file = crate::roots::config_path().context("no config home")?;
     if !options.roots.is_empty() {
         let roots: Vec<PathBuf> = options
@@ -421,8 +421,8 @@ pub fn apply(options: Options<'_>) -> Result<i32> {
         }
     } else if !roots_file.is_file() {
         eprintln!(
-            "ohjaa apply: note: {} does not exist, so `ohjaa collect` and `ohjaa lessons` \
-             look for repositories from where they run; name the folder that holds them \
+            "ohjaa apply: note: {} does not exist, so `ohjaa lessons` looks for \
+             repositories from where it runs; name the folder that holds them \
              once: ohjaa apply --root <dir>",
             roots_file.display()
         );

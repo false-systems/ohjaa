@@ -7,13 +7,11 @@
 //! Agents may propose Knowledge; only a person makes it current.
 
 mod apply;
-mod collect;
 mod doctor;
 mod evidence;
 mod flat_toml;
 mod gitconfig;
 mod home;
-mod human;
 mod instructions;
 mod intake;
 mod knowledge;
@@ -22,7 +20,6 @@ mod process;
 mod repo_docs;
 mod roots;
 mod scan;
-mod shell_init;
 mod system;
 
 use std::io::{BufRead, Write};
@@ -193,61 +190,6 @@ enum Cmd {
         #[arg(long)]
         retry_failed: bool,
     },
-    /// For a terminal's opening: only matters needing attention or your decision.
-    /// Silent when there are none. Activity stays unread for `ohjaa digest`.
-    #[command(
-        after_help = "Prints, reads and moves nothing unless stdout is a terminal and no agent \
-        session's marker is set (TOIMIJA_SESSION, TOIMIJA_RUN, CLAUDECODE, \
-        CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, CODEX_SESSION_ID, \
-        CODEX_CI, CODEX_SANDBOX, CODEX_SANDBOX_NETWORK_DISABLED, CODEX_MANAGED_BY_NPM, \
-        PI_SESSION_ID, PI_CODING_AGENT, OPENCODE, OPENCODE_SESSION_ID, AI_AGENT): an agent's \
-        shell reads ~/.zshrc too. Terminals opened together say a line once.\n\n\
-        Starts no git and touches no network: it reads the proposals, and \
-        the rest from the snapshot `ohjaa collect` writes, said with its age when it is older \
-        than 15 minutes. Then it starts one `ohjaa collect` in the background, unless one \
-        runs; startup never waits for it. Notices are shown once per day or when they change. \
-        Opening a terminal does not consume pull-request history. Always exits 0."
-    )]
-    Line,
-    /// Attention details and unread activity: pull requests, proposed instructions
-    /// and who is live. Reading it at a terminal marks activity seen.
-    #[command(
-        after_help = "When the snapshot is more than 5 minutes old it starts a collect \
-        and waits for it at most 10 s; past that it shows the snapshot it has, and the collect \
-        goes on in the background. Who is live is asked of each repository's toimija now.\n\n\
-        Exit codes:\n  \
-        0  everything could be read\n  \
-        4  something could not be read (it says what), or nothing was collected yet"
-    )]
-    Digest {
-        /// Show everything since then instead (`7d`, `24h`, a date or an RFC
-        /// 3339 time); the cursor does not move.
-        #[arg(long)]
-        since: Option<String>,
-        /// Use the snapshot as it is, however old.
-        #[arg(long)]
-        no_collect: bool,
-    },
-    /// Gather what `ohjaa line` cannot work out at a terminal's opening into
-    /// its snapshot: GitHub's pull requests and the secret-shaped tokens vessa
-    /// found in agent sessions.
-    #[command(after_help = "Each part asked once, at the same time:\n  \
-        github    gh api graphql: the pull requests updated in the owners of the fleet's\n            \
-        clones under the roots (those with .toimija/repo.yaml; one git config each),\n            \
-        at most 2 calls\n  \
-        secrets   vessa secrets --json --since …: where and how many, never a value\n\
-        A part that fails keeps what it held before, said as of then.\n\
-        Writes $XDG_STATE_HOME/ohjaa/human/collected.json,\n\
-        holding human/collect.lock while it runs.\n\n\
-        Exit codes:\n  \
-        0  every part answered, and read all it asked for\n  \
-        4  a part did not, or could not read all of it (the snapshot says what)\n  \
-        1  the snapshot could not be written")]
-    Collect {
-        /// Started by `line` or `digest`: says nothing.
-        #[arg(long, hide = true)]
-        background: bool,
-    },
     /// A knowledge node and its neighbours: what it builds on, what builds on
     /// it and what it replaced.
     Graph { id: String },
@@ -262,7 +204,7 @@ enum Cmd {
            apply and dry run until it is fixed by hand; `ohjaa doctor` names it too;\n     \
            or --undo did not take back all applied.toml holds, and kept the rest\n\n\
         Writes in the home (~/.config/ohjaa):\n  \
-        roots         from --root: where the repositories are (collect and lessons read it)\n  \
+        roots         from --root: where the repositories are (lessons reads it)\n  \
         applied.toml  what apply changes outside the home, kept before each change\n  \
         .git/         the home's history: what apply changed, one commit (made on\n                \
         the home's first commit; never pushed)\n\
@@ -292,12 +234,6 @@ enum Cmd {
         0  healthy\n  \
         4  drift: a line marked DRIFT says what, and what fixes it")]
     Doctor,
-    /// Print what a terminal runs as it opens: `ohjaa line`. Load it with:
-    /// eval "$(ohjaa shell-init zsh)"
-    ShellInit {
-        /// zsh is the only one.
-        shell: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -374,15 +310,6 @@ fn git_root() -> Option<PathBuf> {
     git(&["rev-parse", "--show-toplevel"], None)
         .ok()
         .map(PathBuf::from)
-}
-
-/// The repository around the current directory, asked of git only when the
-/// roots must be derived from it: none given, and no roots file.
-fn git_root_for_roots(explicit: &[PathBuf]) -> Option<PathBuf> {
-    let configured = roots::config_path().is_some_and(|path| path.is_file());
-    (explicit.is_empty() && !configured)
-        .then(git_root)
-        .flatten()
 }
 
 fn repos(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -1768,11 +1695,6 @@ fn default_drafter() -> String {
         .unwrap_or_else(|| "claude -p".to_owned())
 }
 
-/// The git repositories under the roots, for `collect`.
-fn repos_under_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    roots::git_repos(&roots::load(roots, git_root_for_roots(roots).as_deref()))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn cmd_intake(
     roots: &[PathBuf],
@@ -2322,16 +2244,6 @@ fn main() {
         Cmd::Lessons {
             action: LessonsCmd::Publish { repos, dry_run },
         } => cmd_lessons_publish(&cli.root, repos, *dry_run),
-        Cmd::Line => {
-            human::line(&cli.root);
-            Ok(0)
-        }
-        Cmd::Digest { since, no_collect } => {
-            human::digest(&cli.root, repos(&cli.root), since.as_deref(), *no_collect)
-        }
-        Cmd::Collect { background } => {
-            human::collect_now(repos_under_roots(&cli.root), *background)
-        }
         Cmd::Graph { id } => cmd_graph(id),
         Cmd::Apply { dry_run, undo } => {
             if *undo {
@@ -2344,7 +2256,6 @@ fn main() {
             }
         }
         Cmd::Doctor => doctor::doctor(),
-        Cmd::ShellInit { shell } => shell_init::shell_init(shell),
         Cmd::Intake {
             since,
             no_prefilter,

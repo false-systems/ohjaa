@@ -1,13 +1,13 @@
-//! The workflow home from outside the repositories: `apply`, `doctor`,
-//! `brief`, `collect` and `shell-init`, run as the real binary against real
-//! git.
+//! The workflow home from outside the repositories: `apply`, `doctor` and
+//! `brief`, run as the real binary against real git.
 //!
 //! Every command runs with an emptied environment: HOME, XDG_CONFIG_HOME,
 //! XDG_STATE_HOME, CARGO_HOME and TMPDIR inside the sandbox,
 //! GIT_CONFIG_GLOBAL at a sandbox file, GIT_CONFIG_NOSYSTEM=1, no ZDOTDIR, and
 //! a PATH of stubs (toimija, claude, codex) plus the system directories.
-//! `apply` writes git's global excludes and ~/.zshrc, so nothing here may reach
-//! the person's real ones, nor run a real agent or tool.
+//! `apply` writes git's global excludes and agents' instruction files, and
+//! takes a line out of ~/.zshrc, so nothing here may reach the person's real
+//! ones, nor run a real agent or tool.
 
 #![cfg(unix)]
 
@@ -1465,41 +1465,6 @@ fn settings_in_an_included_global_file_count() {
     sandbox.git(&repo, &["check-ignore", "-q", ".sykli/receipt.json"]);
 }
 
-#[test]
-fn shell_init_prints_the_line_and_wraps_no_agent() {
-    let sandbox = Sandbox::new("shell");
-    let output = sandbox.ohjaa(&["shell-init", "bash"]);
-    assert_eq!(output.status.code(), Some(2));
-    let output = sandbox.ohjaa(&["shell-init", "zsh"]);
-    assert_eq!(output.status.code(), Some(0));
-    let printed = text(&output).0;
-    assert!(!printed.contains("ohjaa run"), "{printed}");
-
-    if !Path::new("/bin/zsh").exists() && !Path::new("/usr/bin/zsh").exists() {
-        eprintln!("skipping the shell run: zsh is not installed here");
-        return;
-    }
-    let (repo, _) = sandbox.repo("acme", "widget", &[]);
-    // Typed at a terminal, an agent runs as typed: its rules reach it
-    // through its own instruction file, and nothing routes it through ohjaa.
-    let script = r#"
-eval "$(ohjaa shell-init zsh)"
-claude "fix the parser"
-codex "write it"
-"#;
-    let output = sandbox
-        .command("zsh", &repo)
-        .args(["-f", "-c", script])
-        .env("OHJAA_LINE", "0")
-        .output()
-        .unwrap();
-    let (stdout, stderr) = text(&output);
-    assert_eq!(
-        stdout, "direct fix the parser\ndirect-codex write it\n",
-        "{stderr}"
-    );
-}
-
 /// "We don't want to run git git git": each command's own git processes, as
 /// git's trace2 counts them, within its budget. Every case first proves it
 /// measured something real (a positive control): what the command does
@@ -1521,7 +1486,6 @@ fn every_command_stays_within_its_git_budget() {
         eprintln!("{what:<44} {starts} git processes (budget {at_most})");
         report.push((what.to_owned(), starts, at_most));
     };
-    let root = sandbox.projects();
     let ohjaa_here = |args: &[&str]| {
         let mut command = sandbox.command("ohjaa", &sandbox.dir);
         command.args(args);
@@ -1570,28 +1534,6 @@ fn every_command_stays_within_its_git_budget() {
         "{stdout}{stderr}"
     );
     budget("ohjaa brief", starts.len(), 2);
-
-    // collect: one `git config` per clone of the fleet under the roots (the
-    // one with `.toimija/repo.yaml`), to find the owners whose pull requests
-    // GitHub is asked about; the other clone is not read.
-    let (starts, output) = sandbox.git_starts(&mut ohjaa_here(&["collect", "--root", &root]));
-    assert!(
-        sandbox
-            .dir
-            .join("state/ohjaa/human/collected.json")
-            .is_file(),
-        "{}",
-        text(&output).1
-    );
-    let listings = starts
-        .iter()
-        .filter(|line| line.contains("\"config\",\"-z\",\"--list\""))
-        .count();
-    assert_eq!(
-        listings, 1,
-        "the fleet clone's config, read once: {starts:#?}"
-    );
-    budget("ohjaa collect (2 clones, 1 of the fleet)", starts.len(), 1);
 
     let over: Vec<_> = report
         .iter()
