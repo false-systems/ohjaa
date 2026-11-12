@@ -73,11 +73,6 @@ pub fn toimija_repos(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     repos_under(roots, |path| path.join(".toimija").is_dir())
 }
 
-/// Every Git repository under the roots. A root may itself be one.
-pub fn git_repos(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    repos_under(roots, |path| path.join(".git").exists())
-}
-
 /// A root that is not a directory is an error, never an empty fleet: a typo in
 /// `--root` must not read as "nobody is working anywhere".
 fn repos_under(roots: &[PathBuf], is_repo: impl Fn(&Path) -> bool) -> Result<Vec<PathBuf>> {

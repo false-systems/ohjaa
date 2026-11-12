@@ -121,8 +121,7 @@ enum Cmd {
         list: bool,
     },
     /// Make a proposal current. A person only. A repo proposal's line then
-    /// goes into its repository's AGENTS.md, through a pull request ohjaa
-    /// opens (`ohjaa lessons publish` delivers it later when it cannot now).
+    /// goes into its repository's AGENTS.md with `ohjaa lessons`.
     Accept { id: String },
     /// Drop a proposal. A person only.
     Reject { id: String },
@@ -134,10 +133,25 @@ enum Cmd {
     },
     /// Re-confirm that knowledge still holds, as of today. A person only.
     Confirm { id: String },
-    /// Repository knowledge, in each repository's own AGENTS.md.
+    /// Write the repository's lessons into the AGENTS.md of the working copy
+    /// it runs in (or one named), for you to commit and push: current repo
+    /// knowledge in, retired and superseded out. Nothing is committed or sent.
+    #[command(after_help = "Exit codes:\n  \
+        0  written, or nothing to change\n  \
+        1  it could not run: not in a repository, or AGENTS.md cannot be read whole\n     \
+           (one that is not UTF-8 is never written over)\n  \
+        4  written, but a repo node could not be read: AGENTS.md keeps what it holds\n     \
+           of it, and each is named\n\n\
+        It writes one file, <working copy>/AGENTS.md, its `## Lessons` section alone:\n\
+        one line per node, each marked with its id. A line of its id written by hand\n\
+        is replaced; every other line stays as it is.")]
     Lessons {
-        #[command(subcommand)]
-        action: LessonsCmd,
+        /// A folder of the working copy. Default: the current folder.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Say what would change, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Validate every node, and flag what may no longer hold.
     Check {
@@ -189,46 +203,6 @@ enum Cmd {
         0  healthy\n  \
         4  drift: a line marked DRIFT says what, and what fixes it")]
     Doctor,
-}
-
-#[derive(Subcommand)]
-enum LessonsCmd {
-    /// Deliver repo knowledge accepted but not in its repository's AGENTS.md
-    /// yet: each `<repo>/.ohjaa/knowledge/` file, and each accepted node not
-    /// delivered. One pull request per repository adds their lines to the
-    /// `## Lessons` section of its AGENTS.md; once it is open, each file moves
-    /// out of the checkout into ohjaa's state, recorded with its URL.
-    #[command(after_help = "Exit codes:\n  \
-        0  every line is delivered: in a pull request, or in AGENTS.md already\n  \
-        4  some are not: no GitHub remote, no gh, gh or git could not, or a line held back\n  \
-        1  it could not run\n\n\
-        Per repository, from a checkout of it, never in it:\n  \
-        gh repo view <owner/repo> --json visibility,defaultBranchRef\n  \
-        gh api user, gh api user/repos?… --paginate\n                              \
-        for a repository that is not private, once a run: your login\n                              \
-        and name, and every repository you can see that is not public\n  \
-        gh pr list -R <owner/repo> --author @me\n                              \
-        your open pull request of the lessons gets the next commit\n  \
-        git fetch https://github.com/<owner/repo>.git <branch>, then a worktree off it in\n  \
-        $XDG_STATE_HOME/ohjaa/lessons/.work/, git commit, git push to the same URL\n  \
-        HEAD:refs/heads/agents-md-lessons/<date>-<n>, gh pr create, and the worktree removed;\n  \
-        git reaches GitHub by HTTPS with gh's credentials (no SSH key's prompt holds it up)\n\
-        What goes to a repository names no tool. For one that is not private, all of it is\n\
-        checked first: a line that names ohjaa, one of your repositories that is not public,\n\
-        your home path, your account or your name is held back and said, its text sent\n\
-        nowhere and its file left; anything else that would stops the delivery. AGENTS.md is\n\
-        read whole or not at all. A dry run reads AGENTS.md as last fetched here, and fetches,\n\
-        writes and sends nothing.")]
-    Publish {
-        /// The repositories (any directory inside each). Default: every
-        /// repository under the roots with a `.ohjaa/knowledge/`, and every
-        /// one with accepted lessons not delivered.
-        repos: Vec<PathBuf>,
-        /// Say, per repository, its visibility, each line it would add and
-        /// what a line names that is private; fetch, write and send nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
 }
 
 fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
@@ -316,9 +290,9 @@ fn lessons_line(count: usize, agents_md: &Path, agent: &str, how: &str) -> Strin
 /// not; either way that is said, in one line. Broken files are reported on
 /// stderr, out loud, and so is a briefing the budget cut; a flag is shown
 /// beside its node. With `in_agents_md`, the repository's own lessons that
-/// its AGENTS.md holds as checked out are left to it, but for a flagged
-/// one, and that is said in one line too; every other repo node says why it
-/// is not left to AGENTS.md (a pull request pending, not delivered).
+/// its AGENTS.md holds are left to it, but for a flagged one, and that is
+/// said in one line too; every other repo node says why it is not left to
+/// AGENTS.md (not yet in it, or in other words).
 fn knowledge_briefing_for(
     dirs: &Dirs,
     scopes: &[Scope],
@@ -335,8 +309,8 @@ fn knowledge_briefing_for(
     }
     for left in &loaded.shadowed {
         eprintln!(
-            "ohjaa: left {}: ohjaa's state holds that node, so this copy is not read \
-             (`ohjaa lessons publish` names it until it is taken out)",
+            "ohjaa: left {}: ohjaa's state holds that node, so this copy is not read; \
+             take it out of the checkout",
             left.display()
         );
     }
@@ -374,7 +348,7 @@ fn knowledge_briefing_for(
     // checked out, which the agent reads, or not yet.
     let standing = scopes
         .contains(&Scope::Repo)
-        .then(|| lessons::Standing::read(dirs, &loaded))
+        .then(|| lessons::Standing::read(dirs))
         .flatten();
     let in_file: Vec<&fk::Located> = current
         .iter()
@@ -414,8 +388,8 @@ fn knowledge_briefing_for(
         .iter()
         .filter(|located| located.scope == Scope::Repo)
         .filter_map(|located| {
-            let note = standing.as_ref()?.note(&located.node)?;
-            Some((located.node.id.clone(), note))
+            let note = standing.as_ref()?.note(&located.node);
+            Some((located.node.id.clone(), note.to_owned()))
         })
         .collect();
     let lessons = match (&reads, standing.as_ref()) {
@@ -785,8 +759,8 @@ fn cmd_list(all: bool) -> Result<i32> {
         (a.scope, a.node.kind, &a.node.id).cmp(&(b.scope, b.node.kind, &b.node.id))
     });
     // Where each of this repository's own current nodes stands: in its
-    // AGENTS.md, in a pull request, or not delivered, and why.
-    let standing = lessons::Standing::read(&dirs, &loaded);
+    // AGENTS.md, or not yet.
+    let standing = lessons::Standing::read(&dirs);
     for located in &nodes {
         let node = &located.node;
         println!(
@@ -799,7 +773,7 @@ fn cmd_list(all: bool) -> Result<i32> {
             node.body.lines().next().unwrap_or("")
         );
         let status = (located.scope == Scope::Repo && node.status == Status::Current)
-            .then(|| standing.as_ref()?.status(node))
+            .then(|| standing.as_ref().map(|standing| standing.status(node)))
             .flatten();
         if let Some(status) = status {
             println!("{:<8} {status}", "");
@@ -884,73 +858,17 @@ fn decision_lock() -> Option<process::FileLock> {
     }
 }
 
-/// Before a repo proposal is accepted: what delivering it needs, asked now.
-/// Refused, so that nothing is accepted and it stays waiting, when its line
-/// would go to a repository that is not private and names something private.
-/// `None` for any other proposal.
-fn screen_accept(
-    dirs: &Dirs,
-    id: &str,
-    asker: &mut lessons::Asker,
-) -> Result<Option<Result<lessons::Ready, String>>> {
-    let loaded = knowledge::load(dirs)?;
-    let (waiting, _) = knowledge::pending(dirs, &loaded)?;
-    let Some(pending) = waiting
-        .iter()
-        .find(|pending| pending.node.id == id && pending.scope == Scope::Repo)
-    else {
-        return Ok(None);
-    };
-    let Some(checkout) = pending.repo.clone().or_else(|| dirs.repo_root.clone()) else {
-        return Ok(None);
-    };
-    lessons::screen(asker, &checkout, &pending.node).map(Some)
-}
-
-/// After a person's decision on repo knowledge ohjaa's state holds (an
-/// accept, a retirement, a confirmation): its repository's AGENTS.md is
-/// brought in line with it through the pull request (`lessons::deliver`),
-/// with `ready` when it was asked before the decision. It never undoes or
-/// fails the decision: what could not be delivered is said, and `ohjaa
-/// list` says it after, until `ohjaa lessons publish` delivers it. Called
-/// once the home's lock is let go: the delivery holds only the lessons lock
-/// (`lessons::deliver`), so no other change to the home waits on it.
-fn deliver_decided(
-    dirs: &Dirs,
-    outcome: &Outcome,
-    ready: Option<Result<lessons::Ready, String>>,
-    asker: &mut lessons::Asker,
-    today: fk::Date,
-) {
-    let Some(repo) = outcome.repo.as_deref() else {
-        return;
-    };
-    let accepted = knowledge::accepted_dir(&dirs.state, repo);
-    if !outcome
-        .written
-        .iter()
-        .any(|path| path.starts_with(&accepted))
-    {
-        println!(
-            "  lessons: it is still untracked in {}; `ohjaa lessons publish` delivers it to \
-             AGENTS.md",
-            knowledge::repo_knowledge(repo).display()
-        );
-        return;
-    }
-    let ready = ready.unwrap_or_else(|| asker.ready(repo));
-    println!(
-        "  lessons: delivering, with the home's lock let go: no other change to the home waits \
-         on the repository's hooks"
-    );
-    let delivered = lessons::deliver(&dirs.state, repo, ready, Vec::new(), false, today);
-    for line in &delivered.said {
-        println!("  lessons: {line}");
-    }
-    if !delivered.complete {
-        println!(
-            "  lessons: the decision stands; `ohjaa list` says where its line is, and `ohjaa \
-             lessons publish` delivers it once that is fixed"
+/// After a person's decision on repo knowledge (an accept, a retirement, a
+/// confirmation): how its line reaches the repository's AGENTS.md.
+fn say_lessons(outcome: &Outcome) {
+    if let Some(repo) = outcome.repo.as_deref() {
+        review_text(
+            "  ",
+            &format!(
+                "Run `ohjaa lessons` in a working copy of {} to bring its AGENTS.md in line, \
+                 then commit and push it like any change.",
+                repo.display()
+            ),
         );
     }
 }
@@ -960,11 +878,6 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     let lock = decision_lock();
     let dirs = dirs()?;
     let today = knowledge::today();
-    let mut asker = lessons::Asker::new(roots::load(&[], dirs.repo_root.as_deref()));
-    let ready = match action {
-        "accept" => screen_accept(&dirs, id, &mut asker)?,
-        _ => None,
-    };
     let (outcome, done) = match action {
         "accept" => (knowledge::accept(&dirs, id, today)?, "accepted"),
         "reject" => (knowledge::reject(&dirs, id)?, "rejected"),
@@ -978,11 +891,8 @@ fn cmd_decide(action: &str, id: &str, why: Option<&str>) -> Result<i32> {
     println!("{done} {id}");
     report(&outcome);
     after_decision(action, id, &outcome, why, lock.as_ref(), false);
-    // The decision is made and recorded: the home's lock goes before a
-    // delivery, which may run a repository's hooks for minutes.
-    drop(lock);
     if action != "reject" {
-        deliver_decided(&dirs, &outcome, ready, &mut asker, today);
+        say_lessons(&outcome);
     }
     Ok(0)
 }
@@ -1146,7 +1056,10 @@ fn show_review_card(pending: &knowledge::Pending, index: usize, total: usize) {
         Scope::Ours => {
             "Accept to stage shared knowledge; the team must review it in a pull request."
         }
-        Scope::Repo => "Accept to prepare a pull request; it is not a repository merge.",
+        Scope::Repo => {
+            "Accept to keep it for this repository; `ohjaa lessons` then writes it into its \
+             AGENTS.md, for you to commit."
+        }
     };
     review_text("  ", effect);
     if let Some(repo) = &pending.repo {
@@ -1191,7 +1104,6 @@ fn cmd_review(list: bool) -> Result<i32> {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     let today = knowledge::today();
-    let mut asker = lessons::Asker::new(roots::load(&[], dirs.repo_root.as_deref()));
     println!("Review knowledge proposals — nothing changes until you accept or reject.");
     println!(
         "Reject dismisses a proposal. Skip or Enter leaves it for later. Quit keeps the rest."
@@ -1228,13 +1140,9 @@ fn cmd_review(list: bool) -> Result<i32> {
         let id = &pending.node.id;
         // Held for the decision, never while the person thinks.
         let lock = decision_lock();
-        let mut ready = None;
         let action = if accepting { "accept" } else { "reject" };
         let result = if accepting {
-            screen_accept(&dirs, id, &mut asker).and_then(|screened| {
-                ready = screened;
-                knowledge::accept(&dirs, id, today)
-            })
+            knowledge::accept(&dirs, id, today)
         } else {
             knowledge::reject(&dirs, id)
         };
@@ -1260,7 +1168,7 @@ fn cmd_review(list: bool) -> Result<i32> {
                 after_decision(action, id, &outcome, None, lock.as_ref(), true);
                 drop(lock);
                 if action == "accept" {
-                    deliver_decided(&dirs, &outcome, ready.take(), &mut asker, today);
+                    say_lessons(&outcome);
                 }
             }
             Err(error) => {
@@ -1290,52 +1198,6 @@ fn cmd_review(list: bool) -> Result<i32> {
     }
     println!("Inspect saved knowledge with `ohjaa list`.");
     Ok(if incomplete { INCOMPLETE } else { 0 })
-}
-
-/// `ohjaa lessons publish`: per repository, its accepted lessons not in its
-/// AGENTS.md yet, delivered through one pull request (`lessons::deliver`).
-fn cmd_lessons_publish(roots: &[PathBuf], repos: &[PathBuf], dry_run: bool) -> Result<i32> {
-    let dirs = dirs()?;
-    let today = knowledge::today();
-    let mut checkouts = Vec::new();
-    let mut complete = true;
-    let roots = roots::load(roots, dirs.repo_root.as_deref());
-    if repos.is_empty() {
-        checkouts = lessons::waiting(&dirs.state, &roots::git_repos(&roots)?);
-    } else {
-        for repo in repos {
-            match gitconfig::repo_at(repo) {
-                Ok((top, _)) => checkouts.push(top),
-                Err(error) => {
-                    eprintln!("ohjaa: {error:#}");
-                    complete = false;
-                }
-            }
-        }
-    }
-    if checkouts.is_empty() && complete {
-        println!(
-            "nothing waits to be delivered: no repository under the roots has a \
-             .ohjaa/knowledge/, and every accepted lesson is delivered"
-        );
-        return Ok(0);
-    }
-    let mut asker = lessons::Asker::new(roots);
-    for checkout in &checkouts {
-        let mut said = Vec::new();
-        let extra = lessons::untracked(checkout, &mut said);
-        let ready = asker.ready(checkout);
-        let delivered = lessons::deliver(&dirs.state, checkout, ready, extra, dry_run, today);
-        println!("{}", checkout.display());
-        for line in said.iter().chain(&delivered.said) {
-            println!("  {line}");
-        }
-        complete &= delivered.complete;
-    }
-    if dry_run {
-        println!("(a dry run: nothing was fetched, written or sent)");
-    }
-    Ok(if complete { 0 } else { INCOMPLETE })
 }
 
 /// The commands this ohjaa has, as clap knows them.
@@ -1405,8 +1267,7 @@ fn cmd_check(budget: usize, strict: bool) -> Result<i32> {
                 );
                 if legacy.is_dir() {
                     println!(
-                        "scope    {:<8} {} (accepted before, not yet in AGENTS.md: `ohjaa \
-                         lessons publish`)",
+                        "scope    {:<8} {} (accepted before ohjaa kept them in its state)",
                         scope.name(),
                         legacy.display()
                     );
@@ -1516,9 +1377,12 @@ fn main() {
         Cmd::Retire { id, why } => cmd_decide("retire", id, Some(why)),
         Cmd::Confirm { id } => cmd_decide("confirm", id, None),
         Cmd::Check { budget, strict } => cmd_check(*budget, *strict),
-        Cmd::Lessons {
-            action: LessonsCmd::Publish { repos, dry_run },
-        } => cmd_lessons_publish(&cli.root, repos, *dry_run),
+        Cmd::Lessons { path, dry_run } => match path {
+            Some(path) => lessons::write(path, *dry_run),
+            None => std::env::current_dir()
+                .context("cannot tell the current folder")
+                .and_then(|here| lessons::write(&here, *dry_run)),
+        },
         Cmd::Apply { dry_run, undo } => {
             if *undo {
                 apply::undo(*dry_run)

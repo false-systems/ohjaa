@@ -39,13 +39,6 @@ esac
 exit 0
 "#;
 
-/// Never the real gh: no network, and gh is not logged in.
-const GH_STUB: &str = r#"#!/bin/sh
-printf '%s|%s\n' "$PWD" "$*" >> "${OHJAA_STUB_GH_CALLS:-/dev/null}"
-echo "gh: To get started with GitHub CLI, please run:  gh auth login" >&2
-exit 4
-"#;
-
 /// A session payload exactly as `toimija sessions --json` emits it.
 fn sessions_json(sessions: &str, coverage: &str) -> String {
     format!(
@@ -126,9 +119,6 @@ impl Fixture {
         fs::create_dir_all(dir.join("home")).unwrap();
         let stub = stub_dir.join("toimija");
         write_executable(&stub, STUB);
-        // Never the real gh: no network, and a controlled answer.
-        let gh = stub_dir.join("gh");
-        write_executable(&gh, GH_STUB);
         let fixture = Fixture { dir, stub_dir };
         // Default: an empty, fully available scan, in repos and outside them.
         fixture.set_sessions(&sessions_json("", "available"));
