@@ -1,6 +1,6 @@
 # Agent guide
 
-Read `.toimija/current.md` before anything else in this repo; it is your workset contract. Under a toimija session your launch prompt names your live packet, which supersedes it.
+Run `toimija enter` first in this repo, and again after HEAD or the branch changes: it tells you where the work stands. Under `toimija run` your launch prompt already carries it.
 
 This is **ohjaa**. Toimija reports facts and refuses to decide; ohjaa holds what people decided and know (knowledge-node.v1) and writes it into each agent's own instruction file. It runs no sessions and no checks: the gate is sykli's, from each repository's own `sykli.json`. Keep changes small: the value of this repo is what it refuses to become. `docs/reference.md` says how each command behaves, and its "Boundaries in full" says what ohjaa keeps where; the README is the short introduction for a person.
 

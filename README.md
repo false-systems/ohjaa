@@ -113,15 +113,15 @@ The commands, in the order a person meets them:
 
 ## How it fits
 
-Ohjaa is one of four small tools for working with coding agents. Each one works
-alone.
+Ohjaa is one of four small tools for working with coding agents. Each one does
+one job and works alone.
 
-<img src="docs/assets/loop.svg" alt="A piece of work moves through five steps: start, check, review, land, deploy. toimija starts it, sykli does the other four, ohjaa holds what agents know, and vessa counts what agents used." width="100%">
+<img src="docs/assets/loop.svg" alt="A piece of work moves through five steps: start, check, review, land, deploy. toimija starts it. sykli checks and reviews it, lets it land on main only with proof and a review, and runs the deploy. ohjaa holds what agents know, and vessa counts what agents used and points each commit back to its session." width="100%">
 
-- **toimija** starts the session and gives the agent the facts of the repository.
-- **sykli** runs the declared checks, keeps the proof, and reviews, lands and deploys the work.
-- **ohjaa** holds what agents are told. A person decides it.
-- **vessa** counts what agents used.
+- **toimija** starts the session and tells the agent where the work stands.
+- **sykli** decides whether a change may reach main: it runs the declared checks, keeps the proof and has a second agent review the change, and its hook refuses a push to main without both. Deploys run through it too.
+- **ohjaa** holds what agents are told, and writes it into each agent's own instruction file. A person decides it.
+- **vessa** counts what agents used, and points each commit back to the agent sessions behind it.
 
 [Your first loop](https://github.com/false-systems/toimija/blob/main/docs/first-loop.md) walks one change through all four tools.
 
