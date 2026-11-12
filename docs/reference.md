@@ -365,7 +365,7 @@ Without `--knowledge-only`, the briefing ends with the perimeter: what the
 launch repository and each scoped one is, and who is working there.
 
 - Each repository's role comes from its own `.toimija/repo.yaml`, through
-  `toimija context --identity --json` in it. A role that cannot be derived
+  `toimija enter --identity --json` in it. A role that cannot be derived
   is said, never guessed, and `brief` exits 4.
 - Who is working comes from `toimija sessions --json` in each, and in the
   other worktrees of the launch clone, and `toimija sessions --json

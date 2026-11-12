@@ -26,7 +26,7 @@ case "$1" in
     listed="$SANDBOX/toimija-sessions/$(basename "$PWD")"
     if [ -f "$listed" ]; then cat "$listed"
     else echo '{"sessions":[],"warnings":[],"coverage":{"status":"available"}}'; fi;;
-  context) echo '{}';;
+  enter) echo '{}';;
 esac
 "#;
 

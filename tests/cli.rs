@@ -34,7 +34,10 @@ case "$1" in
     fi
     cat "${OHJAA_STUB_SESSIONS:?}"
     exit 0;;
-  context) cat "${OHJAA_STUB_CONTEXT:?}"; exit 0;;
+  enter)
+    if [ "$*" = "enter --identity --json" ]; then cat "${OHJAA_STUB_IDENTITY:?}"; exit 0; fi
+    echo "toimija stub: not expected: $*" >&2
+    exit 2;;
 esac
 exit 0
 "#;
@@ -146,8 +149,9 @@ impl Fixture {
         command
     }
 
-    fn set_context(&self, json: &str) {
-        fs::write(self.dir.join("context.json"), json).unwrap();
+    /// What `toimija enter --identity --json` reports.
+    fn set_identity(&self, json: &str) {
+        fs::write(self.dir.join("identity.json"), json).unwrap();
     }
 
     /// A directory toimija-prepared for fleet discovery.
@@ -200,7 +204,7 @@ impl Fixture {
             .env("OHJAA_STUB_CALLS", self.dir.join("calls.txt"))
             .env("OHJAA_STUB_SESSIONS", self.dir.join("sessions.json"))
             .env("OHJAA_STUB_OUTSIDE_SESSIONS", self.dir.join("outside.json"))
-            .env("OHJAA_STUB_CONTEXT", self.dir.join("context.json"));
+            .env("OHJAA_STUB_IDENTITY", self.dir.join("identity.json"));
         command
     }
 
@@ -805,7 +809,7 @@ fn the_line_about_mine_and_machine_is_inside_the_budget() {
 fn a_scoped_repositorys_knowledge_alone_still_opens_with_the_preamble() {
     let fixture = Fixture::new("preamble-alone");
     let repo = fixture.make_git_repo("selected");
-    fixture.set_context(r#"{"repo":{"name":"selected","role":"selected role","not_roles":[]}}"#);
+    fixture.set_identity(r#"{"repo":{"name":"selected","role":"selected role","not_roles":[]}}"#);
     // No ours, mine or machine knowledge at all: only the scoped repository's.
     fixture.node(
         &repo.join(".ohjaa/knowledge"),
@@ -833,6 +837,8 @@ fn a_scoped_repositorys_knowledge_alone_still_opens_with_the_preamble() {
         preamble < brief.find("Selected repository rule.").unwrap(),
         "said once, before the first knowledge: {brief}"
     );
+    // Its role, as `toimija enter --identity --json` declares it.
+    assert!(brief.contains("- selected — selected role ("), "{brief}");
     fixture.cleanup();
 }
 

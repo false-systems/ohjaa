@@ -1,9 +1,10 @@
 //! The briefing's perimeter, derived at the moment it is asked for.
 //!
 //! Every repo self-declares its identity in `.toimija/repo.yaml`, and
-//! toimija surfaces that as the `repo` object of `context --identity
-//! --json` (one git process). `ohjaa brief` derives the launch repository's
-//! and each scoped repository's role from those declarations, plus who is
+//! toimija surfaces that as the `repo` object of `toimija enter --identity
+//! --json` (`toimija-identity.v1`; one git process, no side effects).
+//! `ohjaa brief` derives the launch repository's and each scoped
+//! repository's role from those declarations, plus who is
 //! live there from `toimija sessions`: nothing is stored, and the view
 //! cannot be staler than the moment it was computed. An agent gets this
 //! perimeter at launch (inside toimija's composed launch prompt) and can
@@ -40,7 +41,7 @@ impl Tool {
         };
         let Ok(output) = crate::process::run(
             Command::new("toimija")
-                .args(["context", "--identity", "--json"])
+                .args(["enter", "--identity", "--json"])
                 .current_dir(repo),
             None,
             crate::process::LOCAL,
@@ -50,15 +51,15 @@ impl Tool {
         if !output.status.success() {
             return unknown();
         }
-        match parse_context(repo, &String::from_utf8_lossy(&output.stdout)) {
+        match parse_identity(repo, &String::from_utf8_lossy(&output.stdout)) {
             Some(tool) => tool,
             None => unknown(),
         }
     }
 }
 
-fn parse_context(repo: &Path, stdout: &str) -> Option<Tool> {
-    let payload: ContextPayload = serde_json::from_str(stdout).ok()?;
+fn parse_identity(repo: &Path, stdout: &str) -> Option<Tool> {
+    let payload: IdentityPayload = serde_json::from_str(stdout).ok()?;
     let repo_section = payload.repo?;
     Some(Tool {
         path: repo.to_path_buf(),
@@ -68,7 +69,7 @@ fn parse_context(repo: &Path, stdout: &str) -> Option<Tool> {
 }
 
 #[derive(Debug, Deserialize)]
-struct ContextPayload {
+struct IdentityPayload {
     repo: Option<RepoSection>,
 }
 
@@ -222,7 +223,7 @@ mod tests {
     use super::*;
     use crate::scan::Coverage;
 
-    const CONTEXT: &str =
+    const IDENTITY: &str =
         r#"{"repo":{"name":"tasker","role":"durable task contract","not_roles":["inbox"]}}"#;
 
     fn tool(name: &str, role: Option<&str>) -> Tool {
@@ -234,16 +235,16 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_identity_comes_from_its_own_context_json() {
-        let tool = parse_context(Path::new("/fleet/tasker"), CONTEXT).unwrap();
+    fn a_tool_identity_comes_from_its_own_identity_json() {
+        let tool = parse_identity(Path::new("/fleet/tasker"), IDENTITY).unwrap();
         assert_eq!(tool.name, "tasker");
         assert_eq!(tool.role.as_deref(), Some("durable task contract"));
 
-        // Nothing derivable is not a wrong guess: a context without a repo
-        // section is not an identity, and unparseable output is nothing at
+        // Nothing derivable is not a wrong guess: an identity without a repo
+        // section is not one, and unparseable output is nothing at
         // all — both fall back to an unknown role in `Tool::derive`.
-        assert!(parse_context(Path::new("/fleet/x"), "{}").is_none());
-        assert!(parse_context(Path::new("/fleet/x"), "not json").is_none());
+        assert!(parse_identity(Path::new("/fleet/x"), "{}").is_none());
+        assert!(parse_identity(Path::new("/fleet/x"), "not json").is_none());
     }
 
     /// toimija writes `"role": null` for a repo.yaml that declares no role
@@ -267,7 +268,7 @@ mod tests {
   }
 }
 "#;
-        let tool = parse_context(Path::new("/fleet/tasker-checkout"), NO_ROLE)
+        let tool = parse_identity(Path::new("/fleet/tasker-checkout"), NO_ROLE)
             .expect("an identity with no role is still an identity");
         assert_eq!(tool.name, "tasker");
         assert_eq!(tool.role, None);

@@ -18,11 +18,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Never the real toimija: no sessions anywhere, no context.
+/// Never the real toimija: no sessions anywhere, no identity.
 const TOIMIJA_STUB: &str = r#"#!/bin/sh
 case "$1" in
   sessions) echo '{"sessions":[],"warnings":[],"coverage":{"status":"available"}}';;
-  context) echo '{}';;
+  enter) echo '{}';;
 esac
 "#;
 
