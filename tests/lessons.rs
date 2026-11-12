@@ -505,7 +505,8 @@ fn lessons_writes_the_section_into_the_working_copy_and_nothing_else() {
     let lesson = section.find(tests_line).expect(&written);
     assert!(decision < lesson, "{written}");
     assert!(written.ends_with("(as of 2026-10-20)\n"), "{written}");
-    // What ohjaa writes into a repository names no tool, and carries no why.
+    // Ohjaa's own words name no tool (these nodes' words name none either),
+    // and no why goes with a line.
     assert!(!written.to_lowercase().contains("ohjaa"), "{written}");
     assert!(!written.contains("was accepted"), "{written}");
 

@@ -421,7 +421,10 @@ into the state.
   So does the line of a node whose file cannot be read: it is named, and
   `ohjaa lessons` exits 4.
 - Writing the same nodes again changes nothing.
-- What ohjaa writes into a repository names no tool, and carries no why.
+- Ohjaa's own words there (its marks and the section's intro) name no tool,
+  and no why goes with a line. A line is the node's text as a person
+  accepted it: ohjaa checks it for nothing, so a line that names a tool or a
+  private repository is yours to reword before you commit it.
 - `AGENTS.md` is read whole or not at all. A file that is not UTF-8 is never
   written over.
 - Nothing is committed, pushed or sent. Ohjaa makes no network call and runs
@@ -514,9 +517,10 @@ is each in full, with what ohjaa keeps where.
   knowledge from their own instruction files. The note for the next agent is
   `toimija handover`. What agents used is vessa's.
 - **Agents propose; only a person makes knowledge current**, retires it or
-  rejects it. What ohjaa writes into a repository names no tool, and goes
-  into a working copy, never sent: a person reads it before it is
-  committed.
+  rejects it. Ohjaa's own words in a repository (its marks and the Lessons
+  section's intro) name no tool; each line is a node's text as a person
+  accepted it. All of it goes into a working copy, never sent: a person
+  reads it before it is committed.
 - **Cross-repo yes, messaging no.** There is no request and response between
   agents, no presence and no dispatch.
 - **No network and no gh.** Every command works from the filesystem and

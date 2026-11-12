@@ -13,7 +13,7 @@ These mirror `.toimija/repo.yaml`; keep both in sync.
 - Ohjaa stores Knowledge, in git. Everything else is derived when asked: no cache, no knowledge index and no daemon.
 - The workflow lives in the home (~/.config/ohjaa), outside every repository. Only `ohjaa lessons`, run by a person, writes into a checkout: the `## Lessons` section of its AGENTS.md, to be committed like any change. No hook or config of a repository is written.
 - Ohjaa checks nothing and refuses nothing for the workflow: the checks a commit must pass, and refusing a push without them, are sykli's, through the repository's own hooks.
-- Agents propose; only a person makes Knowledge current, retires it or rejects it. What ohjaa writes into a repository names no tool, and goes into a working copy, never sent: a person reads it before it is committed.
+- Agents propose; only a person makes Knowledge current, retires it or rejects it. Ohjaa's own words in a repository (its marks, the Lessons section's intro) name no tool; each line is a node's text as a person accepted it. All of it goes into a working copy, never sent: a person reads it before it is committed.
 - Cross-repo yes, messaging no: no request/response between agents, no presence, no dispatch.
 - No network and no gh: every command works from the filesystem and local CLIs (git, toimija).
 - Failed coverage is never rendered as an empty result. If a scan could not look, it says so and exits non-zero.
