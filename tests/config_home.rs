@@ -211,7 +211,10 @@ impl Sandbox {
                 "schema = \"ohjaa-applied.v1\"\nzshrc = \"{}\"\nzshrc_blank = \"{blank}\"\n\
                  zshrc_created = \"false\"\nzshrc_newline = \"true\"\nzshrc_replaced = \"{}\"\n",
                 self.home().join(".zshrc").display(),
-                replaced.replace('\n', "\\n")
+                replaced
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
             ),
         )
         .unwrap();
@@ -514,6 +517,41 @@ fn undo_takes_back_the_terminal_line_an_earlier_apply_wrote() {
         format!("{ZSHRC}{EARLIER_REPLACED}\n")
     );
     assert!(!sandbox.config().join("applied.toml").exists());
+}
+
+/// The line an earlier apply wrote may have replaced a line of another
+/// ohjaa's (one installed elsewhere then), which the record keeps. Undo puts
+/// that line back once, in its place, and ends: what it puts back is not
+/// taken out again.
+#[test]
+fn undo_puts_back_an_earlier_launcher_line_once_and_ends() {
+    let sandbox = Sandbox::new("undo-older-line");
+    let older = "[[ -x '/old/ohjaa' ]] && eval \"$('/old/ohjaa' shell-init zsh)\"";
+    let replaced = format!("{EARLIER_COMMENT}\n{older}");
+    sandbox.earlier_apply(ZSHRC, &replaced);
+    let mut undo = sandbox
+        .command("ohjaa", &sandbox.dir)
+        .args(["apply", "--undo"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let began = std::time::Instant::now();
+    while undo.try_wait().unwrap().is_none() {
+        if began.elapsed() > std::time::Duration::from_secs(10) {
+            undo.kill().unwrap();
+            undo.wait().unwrap();
+            panic!("apply --undo did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = undo.wait_with_output().unwrap();
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(
+        fs::read_to_string(sandbox.home().join(".zshrc")).unwrap(),
+        format!("{ZSHRC}{replaced}\n")
+    );
 }
 
 #[test]

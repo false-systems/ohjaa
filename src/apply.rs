@@ -236,13 +236,18 @@ fn zshrc_step(home: &Path, record: &Record, put_back: bool) -> Result<Option<Ste
     let mut text = read_or_empty(&zshrc)?;
     let mut removed = Vec::new();
     let mut added = Vec::new();
-    // Every such line; the blank line apply put before its own, once.
+    // Apply takes out every such line, and the blank line it put before its
+    // own, once. Undo takes back the one it recorded, once: what it puts back
+    // in its place may itself be an earlier ohjaa's line, and stays.
     let mut blank = yes("zshrc_blank");
     while let Some(plan) = zshrc_without_launcher(&text, &replaced, blank) {
         text = plan.contents;
         removed.extend(plan.removed);
         added.extend(plan.added);
         blank = false;
+        if put_back {
+            break;
+        }
     }
     if removed.is_empty() {
         return Ok(None);
