@@ -151,8 +151,7 @@ pub fn tidy_untracked(root: &Path) {
 
 /// The clone `repo` is a checkout of, as its common git directory read from
 /// git's layout (no git process), else `repo` itself: every worktree of a
-/// clone shares the repo knowledge accepted for it, and what intake saw of it
-/// ([`crate::evidence`]).
+/// clone shares the repo knowledge accepted for it.
 pub fn clone_key(repo: &Path) -> PathBuf {
     let common = repo
         .ancestors()
@@ -990,7 +989,7 @@ pub fn pending(dirs: &Dirs, loaded: &Loaded) -> Result<(Vec<Pending>, Vec<Broken
     Ok((found, broken))
 }
 
-/// What an agent (or intake) wants to become Knowledge.
+/// What an agent wants to become Knowledge.
 #[derive(Debug, Clone)]
 pub struct Proposal {
     pub scope: Scope,

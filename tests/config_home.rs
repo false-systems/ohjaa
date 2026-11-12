@@ -892,7 +892,6 @@ fn the_homes_history_never_takes_a_stray_file() {
     let sandbox = Sandbox::new("strays");
     let config = sandbox.config();
     knowledge_node(&config.join("mine"), "lima", "fact", "Lima is here.");
-    fs::write(config.join("drafter"), "claude -p\n").unwrap();
     fs::write(config.join("roots"), format!("{}\n", sandbox.projects())).unwrap();
     let strays = [
         ".DS_Store",
@@ -917,7 +916,7 @@ fn the_homes_history_never_takes_a_stray_file() {
     sandbox.agent_file(".codex/AGENTS.md");
     sandbox.apply();
     let tracked = sandbox.git(&config, &["ls-files"]);
-    for owned in ["mine/lima.md", "drafter", "roots", "applied.toml"] {
+    for owned in ["mine/lima.md", "roots", "applied.toml"] {
         assert!(
             tracked.lines().any(|line| line == owned),
             "{owned}: {tracked}"

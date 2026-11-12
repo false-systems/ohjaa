@@ -4,7 +4,6 @@
 //! ~/.config/ohjaa/
 //!   mine/ machine/   the person's and this machine's knowledge
 //!   ours             where the team's knowledge is checked out
-//!   drafter          the command intake drafts with, when set
 //!   roots            where ohjaa looks for repositories
 //!   applied.toml     what apply changed, for `apply --undo`
 //!   .git/            the home's history: a local repository, never pushed,
@@ -192,10 +191,9 @@ pub fn lock(home: &Path) -> Option<process::FileLock> {
 const EXCLUDE_BEGIN: &str = "# >>> ohjaa: the home's history holds only what ohjaa keeps here";
 const EXCLUDE_END: &str = "# <<< ohjaa";
 /// Everything is left out, then what ohjaa keeps in the home is let in
-/// (the knowledge scopes, the roots, apply's record, and the `ours` and
-/// `drafter` settings), and what an
-/// editor, the Finder or a half-done write leaves among those is left out
-/// again.
+/// (the knowledge scopes, the roots, apply's record, and the `ours`
+/// setting), and what an editor, the Finder or a half-done write leaves
+/// among those is left out again.
 const EXCLUDE: &[&str] = &[
     "/*",
     "!/mine/",
@@ -203,7 +201,6 @@ const EXCLUDE: &[&str] = &[
     "!/roots",
     "!/applied.toml",
     "!/ours",
-    "!/drafter",
     "*.tmp",
     ".*.ohjaa-*",
     ".*.sw?",
