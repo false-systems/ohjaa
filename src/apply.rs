@@ -347,12 +347,6 @@ fn step(
     }
 }
 
-pub struct Options<'a> {
-    pub dry_run: bool,
-    /// `--root`: where the repositories are, to write down in the roots file.
-    pub roots: &'a [PathBuf],
-}
-
 /// The record entries a step makes, kept before the step runs, so an apply
 /// that fails midway can still be undone. The first value of an undo key is
 /// the one undo needs.
@@ -367,66 +361,19 @@ fn keep_record(home: &Path, entries: &[(String, String)]) -> Result<()> {
     write_record(home, &record)
 }
 
-/// The roots file: one directory per line, under a comment.
-fn roots_text(roots: &[PathBuf]) -> String {
-    let mut text = String::from(
-        "# Where ohjaa looks for repositories: one directory per line. Written by\n\
-         # `ohjaa apply --root`; edit it to change them.\n",
-    );
-    for root in roots {
-        text.push_str(&format!("{}\n", root.display()));
-    }
-    text
-}
-
 /// Whether text that is not empty ends without a newline (undo keeps it so).
 fn lacks_final_newline(text: &str) -> bool {
     !text.is_empty() && !text.ends_with('\n')
 }
 
-pub fn apply(options: Options<'_>) -> Result<i32> {
+pub fn apply(dry_run: bool) -> Result<i32> {
     let home = std::path::absolute(home::ohjaa_home()?)?;
     // What apply plans, makes and commits is one change to the home, never
     // interleaved with a decision's. A dry run writes nothing, the lock's
     // file included.
-    let lock = (!options.dry_run).then(|| home::lock(&home)).flatten();
+    let lock = (!dry_run).then(|| home::lock(&home)).flatten();
     let global = gitconfig::GlobalFacts::read()?;
     let mut steps: Vec<Step> = Vec::new();
-
-    // Where the repositories are, written down when named: lessons reads
-    // it, wherever it runs from. Kept by --undo.
-    let roots_file = crate::roots::config_path().context("no config home")?;
-    if !options.roots.is_empty() {
-        let roots: Vec<PathBuf> = options
-            .roots
-            .iter()
-            .map(|root| std::path::absolute(root).unwrap_or_else(|_| root.clone()))
-            .collect();
-        if crate::roots::parse_config(&read_or_empty(&roots_file)?) != roots {
-            let said = roots
-                .iter()
-                .map(|root| root.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let (target, text) = (roots_file.clone(), roots_text(&roots));
-            steps.push(step(
-                ("write", "wrote"),
-                format!(
-                    "{} with {said}, where ohjaa looks for repositories",
-                    roots_file.display()
-                ),
-                Vec::new(),
-                move || home::write_file(&target, &text, None),
-            ));
-        }
-    } else if !roots_file.is_file() {
-        eprintln!(
-            "ohjaa apply: note: {} does not exist, so `ohjaa lessons` looks for \
-             repositories from where it runs; name the folder that holds them \
-             once: ohjaa apply --root <dir>",
-            roots_file.display()
-        );
-    }
 
     let ignore = global.excludes_file()?;
     let ignore_now = read_or_empty(&ignore)?;
@@ -489,7 +436,7 @@ pub fn apply(options: Options<'_>) -> Result<i32> {
         }
         return Ok(code);
     }
-    if options.dry_run {
+    if dry_run {
         for step in &steps {
             println!("ohjaa apply: {}", step.will);
         }

@@ -18,7 +18,6 @@ mod lessons;
 mod perimeter;
 mod process;
 mod repo_docs;
-mod roots;
 mod scan;
 
 use std::io::{BufRead, Write};
@@ -47,11 +46,6 @@ const INCOMPLETE: i32 = 4;
                   agent's own instruction file. Agents propose; only a person makes knowledge current."
 )]
 struct Cli {
-    /// Where to look for repositories. Repeatable; defaults to the config file,
-    /// else this repo's siblings.
-    #[arg(long, global = true, value_name = "PATH")]
-    root: Vec<PathBuf>,
-
     #[command(subcommand)]
     command: Cmd,
 }
@@ -173,7 +167,6 @@ enum Cmd {
            apply and dry run until it is fixed by hand; `ohjaa doctor` names it too;\n     \
            or --undo did not take back all applied.toml holds, and kept the rest\n\n\
         Writes in the home (~/.config/ohjaa):\n  \
-        roots         from --root: where the repositories are (lessons reads it)\n  \
         applied.toml  what apply changes outside the home, kept before each change\n  \
         .git/         the home's history: what apply changed, one commit (made on\n                \
         the home's first commit; never pushed)\n\
@@ -186,8 +179,8 @@ enum Cmd {
         rewrites it where it is\n  \
         ~/.zshrc               only taken out of it: the line an earlier apply wrote, which ran\n                         \
         `ohjaa shell-init`, a command this ohjaa does not have\n\
-        --undo puts the changes back as they were, and removes applied.toml; the roots\n\
-        and the history stay.\n\n\
+        --undo puts the changes back as they were, and removes applied.toml; the\n\
+        history stays.\n\n\
         Checks before a push are sykli's: `sykli hook install --pre-push` in each\n\
         repository.")]
     Apply {
@@ -239,11 +232,6 @@ fn git_root() -> Option<PathBuf> {
     git(&["rev-parse", "--show-toplevel"], None)
         .ok()
         .map(PathBuf::from)
-}
-
-fn repos(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let roots = roots::load(explicit, git_root().as_deref());
-    roots::toimija_repos(&roots)
 }
 
 /// What to say about an incomplete scan: the failure if there was one, else
@@ -651,7 +639,6 @@ fn scoped_perimeter_text(view: &perimeter::Perimeter, here: &Path) -> String {
 }
 
 fn cmd_brief(
-    roots: &[PathBuf],
     knowledge_only: bool,
     write: &[PathBuf],
     scope: &[String],
@@ -713,8 +700,6 @@ fn cmd_brief(
             print!("\n{siblings}");
         }
     }
-    // Validate configured discovery roots; do not derive unrelated repositories.
-    repos(roots)?;
     let scans = dirs
         .repo_root
         .iter()
@@ -1348,7 +1333,7 @@ fn main() {
             write,
             scope,
             agent,
-        } => cmd_brief(&cli.root, *knowledge_only, write, scope, agent.as_deref()),
+        } => cmd_brief(*knowledge_only, write, scope, agent.as_deref()),
         Cmd::List { all } => cmd_list(*all),
         Cmd::Propose {
             scope,
@@ -1387,10 +1372,7 @@ fn main() {
             if *undo {
                 apply::undo(*dry_run)
             } else {
-                apply::apply(apply::Options {
-                    dry_run: *dry_run,
-                    roots: &cli.root,
-                })
+                apply::apply(*dry_run)
             }
         }
         Cmd::Doctor => doctor::doctor(),

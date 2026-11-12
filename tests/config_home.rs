@@ -218,10 +218,6 @@ impl Sandbox {
         zshrc
     }
 
-    fn projects(&self) -> String {
-        self.dir.join("projects").to_string_lossy().into_owned()
-    }
-
     fn command(&self, program: &str, cwd: &Path) -> Command {
         let mut command = Command::new(program);
         command
@@ -617,33 +613,6 @@ fn undo_keeps_what_it_does_not_take_back_and_says_so() {
     );
 }
 
-/// `apply --root` writes down where the repositories are, which collect and
-/// lessons read wherever they run from; without it and without the file,
-/// apply says how. Undo keeps the roots.
-#[test]
-fn apply_root_writes_the_roots_down() {
-    let sandbox = Sandbox::new("roots");
-    let output = sandbox.ohjaa(&["apply", "--dry-run"]);
-    let (_, stderr) = text(&output);
-    assert!(stderr.contains("ohjaa apply --root <dir>"), "{stderr}");
-    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
-    let (stdout, stderr) = text(&output);
-    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
-    let roots = sandbox.read("config/ohjaa/roots");
-    assert!(
-        roots.lines().any(|line| line == sandbox.projects()),
-        "{roots}"
-    );
-    let output = sandbox.ohjaa(&["apply", "--root", &sandbox.projects()]);
-    assert!(
-        text(&output).0.contains("nothing to change"),
-        "{}",
-        text(&output).0
-    );
-    let output = sandbox.ohjaa(&["apply", "--undo"]);
-    assert_eq!(output.status.code(), Some(0), "{}", text(&output).1);
-    assert_eq!(sandbox.read("config/ohjaa/roots"), roots);
-}
 /// Each change is recorded before it is made: an apply that fails midway
 /// can still be undone.
 #[test]
@@ -892,7 +861,6 @@ fn the_homes_history_never_takes_a_stray_file() {
     let sandbox = Sandbox::new("strays");
     let config = sandbox.config();
     knowledge_node(&config.join("mine"), "lima", "fact", "Lima is here.");
-    fs::write(config.join("roots"), format!("{}\n", sandbox.projects())).unwrap();
     let strays = [
         ".DS_Store",
         "mine/.DS_Store",
@@ -916,7 +884,7 @@ fn the_homes_history_never_takes_a_stray_file() {
     sandbox.agent_file(".codex/AGENTS.md");
     sandbox.apply();
     let tracked = sandbox.git(&config, &["ls-files"]);
-    for owned in ["mine/lima.md", "roots", "applied.toml"] {
+    for owned in ["mine/lima.md", "applied.toml"] {
         assert!(
             tracked.lines().any(|line| line == owned),
             "{owned}: {tracked}"
@@ -1524,15 +1492,15 @@ fn every_command_stays_within_its_git_budget() {
     assert!(started(&starts, "--global"), "{starts:#?}");
     budget("ohjaa doctor", starts.len(), 1);
 
-    // brief in a clone: the repository's root, asked once for the knowledge
-    // and once for the roots (2), and no clone read beyond it.
+    // brief in a clone: the repository's root, asked once, and no clone read
+    // beyond it.
     let (starts, output) = sandbox.git_starts(sandbox.command("ohjaa", &widget).arg("brief"));
     let (stdout, stderr) = text(&output);
     assert!(
         stdout.contains("No knowledge recorded yet"),
         "{stdout}{stderr}"
     );
-    budget("ohjaa brief", starts.len(), 2);
+    budget("ohjaa brief", starts.len(), 1);
 
     let over: Vec<_> = report
         .iter()
