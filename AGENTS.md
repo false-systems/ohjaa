@@ -26,7 +26,7 @@ These mirror `.toimija/repo.yaml`; keep both in sync.
 - `knowledge-node.v1` is frozen: never edit `fixtures/knowledge-node.v1/`. A change to what a valid node is makes a new format version, with fixtures of its own.
 - Tests never touch the person's real state (the "Tests" section of `docs/reference.md` says what each suite sandboxes), and write a file they will run only through `write_executable`.
 - The gate is this repository's own `sykli.json`, pinned by `sykli.lock`: `sykli run` proves HEAD. After adding a source or test file, add it to every task's inputs and run `sykli lock sykli.json`. A new git process on a hot path needs its budget in `tests/config_home.rs`.
-- Code is Rust or Elixir/Erlang; never add Python, Go or Node.
+- Prefer Rust or Elixir/Erlang; Python and Go are allowed, not preferred.
 - To update a branch under review, merge `origin/main` into it; never rebase or force-push it. `toimija sessions` shows who else is live.
 
 ## Validation
